@@ -307,7 +307,7 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             .map(|participant| {
                 (
                     participant.target.backend_idx(),
-                    participant.target.start_epoch(),
+                    participant.target.process_id(),
                 )
             })
             .collect::<Vec<_>>();
@@ -317,7 +317,7 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             .registry
             .extend_attempt_backend_ownership(execution_id.query_id(), &ownership)
         {
-            if error.is_backend_epoch_mismatch() {
+            if error.is_backend_process_mismatch() {
                 self.metrics.backend_epoch_mismatch();
             }
             let error = error.into_error();
@@ -741,8 +741,8 @@ fn init_all(
                         query_id_high = participant_execution_id(participant).query_id().high(),
                         query_id_low = participant_execution_id(participant).query_id().low(),
                         attempt_id = participant_execution_id(participant).attempt_id().get(),
-                        backend_id = participant.target.backend_idx(),
-                        backend_start_epoch = participant.target.start_epoch(),
+                        backend_idx = participant.target.backend_idx(),
+                        backend_process_id = %participant.target.process_id(),
                         participant_digest = %hex::encode(participant.digest.as_bytes()),
                         outcome = ?result,
                         latency_micros = latency.as_micros() as u64,
@@ -912,8 +912,8 @@ pub(super) fn attach_all(
                         query_id_high = participant_execution_id(participant).query_id().high(),
                         query_id_low = participant_execution_id(participant).query_id().low(),
                         attempt_id = participant_execution_id(participant).attempt_id().get(),
-                        backend_id = participant.target.backend_idx(),
-                        backend_start_epoch = participant.target.start_epoch(),
+                        backend_idx = participant.target.backend_idx(),
+                        backend_process_id = %participant.target.process_id(),
                         participant_digest = %hex::encode(participant.digest.as_bytes()),
                         ready = outcome.is_ok(),
                         latency_micros = latency.as_micros() as u64,

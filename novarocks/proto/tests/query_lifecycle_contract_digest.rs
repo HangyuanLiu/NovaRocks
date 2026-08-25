@@ -23,7 +23,7 @@ use novarocks_proto::lifecycle::{
     RuntimeFilterContribution,
 };
 use novarocks_proto_models::novarocks;
-use novarocks_types::QueryId;
+use novarocks_types::{BackendProcessId, QueryId};
 
 fn request_with_runtime_filter() -> QueryInitRequest {
     let execution_id = QueryExecutionId::new(
@@ -39,9 +39,8 @@ fn request_with_runtime_filter() -> QueryInitRequest {
     let manifest = ParticipantManifest::new(
         execution_id,
         ParticipantBackendIdentity::new(
-            2,
+            BackendProcessId::new_v7(),
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
-            11,
         )
         .expect("valid backend"),
         [ParticipantRole::RuntimeFilterService],

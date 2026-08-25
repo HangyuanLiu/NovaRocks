@@ -16,6 +16,8 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::net::SocketAddr;
 
 use crate::common::backend_topology::LiveBackendTarget;
 use crate::query_execution::artifact::{
@@ -23,96 +25,94 @@ use crate::query_execution::artifact::{
     SchedulingStreamKind, ValidatedFragmentSchedule,
 };
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 #[cfg(debug_assertions)]
 use novarocks_failpoint::{QueryLifecycleFaultKind, arm_path, configured_root};
+#[cfg(test)]
+use novarocks_proto::lifecycle::QueryControlEndpoint;
 use novarocks_proto::lifecycle::QueryExecutionId;
+#[cfg(test)]
+use novarocks_proto::membership::BackendProcessDescriptor;
+use novarocks_types::BackendProcessId;
 
 #[derive(Clone)]
 pub struct FrontendBackendSnapshot {
-    entries: Vec<(usize, RuntimeEndpoint)>,
-    generations: BTreeMap<usize, u64>,
+    entries: Vec<LiveBackendTarget>,
 }
 
 impl FrontendBackendSnapshot {
     #[cfg(test)]
-    pub fn for_test(entries: Vec<(usize, RuntimeEndpoint)>) -> Result<Self, DistributedQueryError> {
-        let generations = entries
-            .iter()
-            .map(|(backend_idx, _)| {
-                (
-                    *backend_idx,
-                    u64::try_from(*backend_idx)
-                        .expect("test backend index fits u64")
-                        .saturating_add(1),
+    pub fn for_test(entries: Vec<(usize, SocketAddr)>) -> Result<Self, DistributedQueryError> {
+        let targets = entries
+            .into_iter()
+            .map(|(backend_idx, endpoint)| {
+                let endpoint =
+                    QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port())
+                        .map_err(|error| contract_error(error.to_string()))?;
+                let descriptor = BackendProcessDescriptor::new(
+                    BackendProcessId::new_v7(),
+                    endpoint,
+                    "scheduler-test",
+                    "scheduler-test",
                 )
+                .map_err(|error| contract_error(error.to_string()))?;
+                Ok(LiveBackendTarget::new(backend_idx, descriptor))
             })
-            .collect();
-        Self::validate(entries, generations)
+            .collect::<Result<Vec<_>, DistributedQueryError>>()?;
+        Self::validate(targets)
     }
 
     pub(crate) fn from_live_targets(
         targets: Vec<LiveBackendTarget>,
     ) -> Result<Self, DistributedQueryError> {
-        let entries = targets
-            .iter()
-            .map(|target| (target.backend_idx(), target.endpoint().clone()))
-            .collect();
-        let generations = targets
-            .into_iter()
-            .map(|target| (target.backend_idx(), target.start_epoch()))
-            .collect();
-        Self::validate(entries, generations)
+        Self::validate(targets)
     }
 
-    fn validate(
-        entries: Vec<(usize, RuntimeEndpoint)>,
-        generations: BTreeMap<usize, u64>,
-    ) -> Result<Self, DistributedQueryError> {
+    fn validate(entries: Vec<LiveBackendTarget>) -> Result<Self, DistributedQueryError> {
         if entries.is_empty() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::Rejected,
                 "no live backend available",
             ));
         }
-        let ids = entries.iter().map(|(id, _)| *id).collect::<BTreeSet<_>>();
+        let ids = entries
+            .iter()
+            .map(LiveBackendTarget::backend_idx)
+            .collect::<BTreeSet<_>>();
         if ids.len() != entries.len() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
                 "frontend backend snapshot contains duplicate backend ids",
             ));
         }
-        if generations.len() != entries.len() {
+        let process_ids = entries
+            .iter()
+            .map(|target| {
+                target
+                    .process_id()
+                    .map_err(|error| contract_error(error.to_string()))
+            })
+            .collect::<Result<BTreeSet<_>, DistributedQueryError>>()?;
+        if process_ids.len() != entries.len() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
-                "frontend backend snapshot contains duplicate backend generations",
+                "frontend backend snapshot contains duplicate backend process identities",
             ));
         }
-        Ok(Self {
-            entries,
-            generations,
-        })
+        Ok(Self { entries })
     }
 
-    pub fn entries(&self) -> &[(usize, RuntimeEndpoint)] {
+    pub fn entries(&self) -> &[LiveBackendTarget] {
         &self.entries
     }
 
-    fn generation(&self, backend_idx: usize) -> Option<u64> {
-        self.generations.get(&backend_idx).copied()
+    fn target(&self, backend_idx: usize) -> Option<&LiveBackendTarget> {
+        self.entries
+            .iter()
+            .find(|target| target.backend_idx() == backend_idx)
     }
 
     fn live_targets(&self) -> Vec<LiveBackendTarget> {
-        self.entries
-            .iter()
-            .map(|(backend_idx, endpoint)| {
-                LiveBackendTarget::new(
-                    *backend_idx,
-                    endpoint.clone(),
-                    self.generations[backend_idx],
-                )
-            })
-            .collect()
+        self.entries.clone()
     }
 }
 
@@ -126,7 +126,7 @@ impl FrontendFragmentScheduler {
         Self { backends }
     }
 
-    pub fn backend_entries(&self) -> &[(usize, RuntimeEndpoint)] {
+    pub fn backend_entries(&self) -> &[LiveBackendTarget] {
         self.backends.entries()
     }
 
@@ -138,13 +138,19 @@ impl FrontendFragmentScheduler {
     pub(crate) fn scheduled_backend_ownership(
         &self,
         backend_ids: &[usize],
-    ) -> Result<Vec<(usize, u64)>, DistributedQueryError> {
+    ) -> Result<Vec<(usize, BackendProcessId)>, DistributedQueryError> {
         backend_ids
             .iter()
             .map(|&backend_idx| {
                 self.backends
-                    .generation(backend_idx)
-                    .map(|generation| (backend_idx, generation))
+                    .target(backend_idx)
+                    .map(|target| {
+                        target
+                            .process_id()
+                            .map(|process_id| (backend_idx, process_id))
+                            .map_err(|error| contract_error(error.to_string()))
+                    })
+                    .transpose()?
                     .ok_or_else(|| {
                         DistributedQueryError::new(
                             DistributedQueryErrorKind::ContractViolation,
@@ -276,10 +282,13 @@ impl FrontendFragmentScheduler {
                     } else {
                         (preferred + instance_index) % backend_count
                     };
-                    let (backend_idx, endpoint) = &self.backends.entries[live_index];
-                    BackendPlacement::new(*backend_idx, endpoint.clone())
+                    let target = &self.backends.entries[live_index];
+                    let endpoint = target
+                        .endpoint()
+                        .map_err(|error| contract_error(error.to_string()))?;
+                    Ok(BackendPlacement::new(target.backend_idx(), endpoint))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, DistributedQueryError>>()?;
             draft.assign_fragment(fragment_id, placements)?;
         }
         let schedule = ValidatedFragmentSchedule::validate(view, execution_id, draft)?;
@@ -298,18 +307,11 @@ fn bind_query_lifecycle_fault_scopes(
     let Some(root) = novarocks_failpoint::configured_root() else {
         return Ok(());
     };
-    for &(backend_index, _) in &backends.entries {
-        let start_epoch = backends
-            .generations
-            .get(&backend_index)
-            .copied()
-            .ok_or_else(|| {
-                contract_error(format!(
-                    "runner-owned lifecycle fault binding has no generation for backend {backend_index}"
-                ))
-            })?;
-        let backend_id = u64::try_from(backend_index)
-            .map_err(|_| contract_error("backend index does not fit u64"))?;
+    for target in &backends.entries {
+        let backend_index = target.backend_idx();
+        let process_id = target
+            .process_id()
+            .map_err(|error| contract_error(error.to_string()))?;
         for kind in [
             QueryLifecycleFaultKind::InitAckDrop,
             QueryLifecycleFaultKind::StageAckDrop,
@@ -338,20 +340,18 @@ fn bind_query_lifecycle_fault_scopes(
                 kind,
                 protocol_execution_id(execution_id)?,
                 backend_index,
-                backend_id,
-                start_epoch,
+                process_id,
             )
             .map_err(contract_error)?
             {
                 eprintln!(
-                    "NOVAROCKS_QUERY_FAULT_BOUND kind={} execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+                    "NOVAROCKS_QUERY_FAULT_BOUND kind={} execution_id={}:{}:{} backend_index={} process_id={} token={}",
                     kind.file_stem(),
                     execution_id.query_id().high(),
                     execution_id.query_id().low(),
                     execution_id.attempt_id().get(),
                     scope.backend_index,
-                    scope.backend_id,
-                    scope.start_epoch,
+                    scope.process_id,
                     scope.token
                 );
             }
@@ -404,10 +404,10 @@ fn query_lifecycle_fault_preferred_live_index(
         .entries
         .iter()
         .enumerate()
-        .filter_map(|(live_index, (backend_index, _))| {
+        .filter_map(|(live_index, target)| {
             fault_kinds
                 .iter()
-                .any(|kind| arm_path(&root, *backend_index, *kind).exists())
+                .any(|kind| arm_path(&root, target.backend_idx(), *kind).exists())
                 .then_some(live_index)
         })
         .collect::<Vec<_>>();

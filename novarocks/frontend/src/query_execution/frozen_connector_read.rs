@@ -316,12 +316,14 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
-    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+    use novarocks_proto::lifecycle::QueryControlEndpoint;
+    use novarocks_proto::membership::BackendProcessDescriptor;
     use novarocks_spi::connector::{
         ConnectorControlPlanningLease, ConnectorExecutionDeclaration, ConnectorInstanceId,
         ConnectorInstanceIncarnation, ConnectorSplit, ConnectorTableIdentity,
         ConnectorTableRequest, ConnectorTableResolution,
     };
+    use novarocks_types::BackendProcessId;
 
     use super::*;
     use crate::common::backend_topology::LiveBackendTarget;
@@ -332,8 +334,13 @@ mod tests {
             7,
             vec![LiveBackendTarget::new(
                 3,
-                RuntimeEndpoint::parse("127.0.0.1:19030").expect("endpoint"),
-                11,
+                BackendProcessDescriptor::new(
+                    BackendProcessId::new_v7(),
+                    QueryControlEndpoint::new("127.0.0.1", 19030).expect("valid loopback endpoint"),
+                    "test-deployment",
+                    "test-build",
+                )
+                .expect("valid test descriptor"),
             )],
         )
         .expect("fixture topology")

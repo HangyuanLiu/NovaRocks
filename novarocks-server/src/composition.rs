@@ -531,22 +531,11 @@ pub fn compose_frontend_server_config(
             ),
         );
     }
-    let backend_seeds = config
-        .cluster
-        .backends
-        .iter()
-        .map(|endpoint| {
-            endpoint.parse().map_err(|error| {
-                anyhow::anyhow!("parse configured backend endpoint '{endpoint}' failed: {error}")
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let backend_open = ClusterBackendOpenConfig::new(
         config.cluster.role,
-        backend_seeds,
         Duration::from_millis(config.cluster.heartbeat_interval_ms),
         config.cluster.heartbeat_timeout_retries,
-        Duration::from_secs(config.cluster.decommission_timeout_secs),
+        Duration::from_millis(config.cluster.backend_announce_lease_ttl_ms),
     )
     .map_err(|error| anyhow::anyhow!("open frontend backend cluster configuration: {error}"))?;
     let mysql_listener = novarocks_frontend::resolve_mysql_listener_settings(

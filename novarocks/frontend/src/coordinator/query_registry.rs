@@ -26,7 +26,7 @@ use crate::query_execution::contract::{
 };
 use crate::query_execution::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
 use novarocks_proto::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
-use novarocks_types::{QueryId, QueryProcessNamespace};
+use novarocks_types::{BackendProcessId, QueryId, QueryProcessNamespace};
 
 type QueryKey = (i64, i64);
 
@@ -111,7 +111,10 @@ struct RetainedTerminalIngress {
 }
 
 struct ActiveQuery {
-    scheduled_backends: BTreeMap<usize, u64>,
+    /// Process identities, not durable membership ids. A `backend_idx` is a
+    /// round-local scheduling ordinal and must never identify an active
+    /// attempt after topology publication.
+    scheduled_backends: BTreeSet<BackendProcessId>,
     /// The user-visible failure is the lexical minimum of all reported
     /// failures.  This deliberately makes concurrent failure reporting
     /// independent of arrival order until T9 introduces the richer typed
@@ -153,7 +156,7 @@ impl ActiveQuery {
 struct BackendTopologyState {
     initialized: bool,
     revision: u64,
-    live_generations: BTreeMap<usize, u64>,
+    live_process_ids: BTreeMap<usize, BackendProcessId>,
 }
 
 pub(crate) struct FrontendQueryRegistry {
@@ -166,19 +169,19 @@ pub(crate) struct FrontendQueryRegistry {
 
 pub(crate) struct AttemptBackendOwnershipError {
     error: DistributedQueryError,
-    backend_epoch_mismatch: bool,
+    backend_process_mismatch: bool,
 }
 
 impl AttemptBackendOwnershipError {
-    fn new(error: DistributedQueryError, backend_epoch_mismatch: bool) -> Self {
+    fn new(error: DistributedQueryError, backend_process_mismatch: bool) -> Self {
         Self {
             error,
-            backend_epoch_mismatch,
+            backend_process_mismatch,
         }
     }
 
-    pub(crate) const fn is_backend_epoch_mismatch(&self) -> bool {
-        self.backend_epoch_mismatch
+    pub(crate) const fn is_backend_process_mismatch(&self) -> bool {
+        self.backend_process_mismatch
     }
 
     pub(crate) fn into_error(self) -> DistributedQueryError {
@@ -239,7 +242,7 @@ impl FrontendQueryRegistry {
         match active.entry(key) {
             Entry::Vacant(entry) => {
                 entry.insert(ActiveQuery {
-                    scheduled_backends: BTreeMap::new(),
+                    scheduled_backends: BTreeSet::new(),
                     first_failure: None,
                     secondary_failures: BTreeSet::new(),
                     cancellation_requested: false,
@@ -299,22 +302,22 @@ impl FrontendQueryRegistry {
     pub(crate) fn extend_attempt_backend_ownership(
         &self,
         query_id: QueryId,
-        backend_ownership: &[(usize, u64)],
+        backend_ownership: &[(usize, BackendProcessId)],
     ) -> Result<(), AttemptBackendOwnershipError> {
         let topology = self
             .backend_topology
             .lock()
             .expect("frontend backend topology gate lock");
         if topology.initialized {
-            for &(backend_idx, start_epoch) in backend_ownership {
-                match topology.live_generations.get(&backend_idx) {
-                    Some(current_epoch) if *current_epoch == start_epoch => {}
-                    Some(current_epoch) => {
+            for &(backend_idx, process_id) in backend_ownership {
+                match topology.live_process_ids.get(&backend_idx) {
+                    Some(current_process_id) if *current_process_id == process_id => {}
+                    Some(current_process_id) => {
                         return Err(AttemptBackendOwnershipError::new(
                             DistributedQueryError::new(
                                 DistributedQueryErrorKind::Rejected,
                                 format!(
-                                    "query lifecycle backend {backend_idx} generation {start_epoch} is stale; current generation is {current_epoch}"
+                                    "query lifecycle backend ordinal {backend_idx} process identity {process_id} is stale; current process identity is {current_process_id}"
                                 ),
                             ),
                             true,
@@ -325,7 +328,7 @@ impl FrontendQueryRegistry {
                             DistributedQueryError::new(
                                 DistributedQueryErrorKind::Rejected,
                                 format!(
-                                    "query lifecycle backend {backend_idx} is no longer live in the current frontend topology"
+                                    "query lifecycle backend ordinal {backend_idx} process identity {process_id} is no longer live in the current frontend topology"
                                 ),
                             ),
                             false,
@@ -340,21 +343,8 @@ impl FrontendQueryRegistry {
         let query = active.get_mut(&query_key(query_id)).ok_or_else(|| {
             AttemptBackendOwnershipError::new(self.inactive_query(query_id), false)
         })?;
-        for &(backend_idx, start_epoch) in backend_ownership {
-            match query.scheduled_backends.entry(backend_idx) {
-                Entry::Vacant(entry) => {
-                    entry.insert(start_epoch);
-                }
-                Entry::Occupied(entry) if *entry.get() == start_epoch => {}
-                Entry::Occupied(_) => {
-                    return Err(AttemptBackendOwnershipError::new(
-                        contract_violation(format!(
-                            "frontend query lifecycle backend {backend_idx} generation conflicts with scheduled ownership"
-                        )),
-                        false,
-                    ));
-                }
-            }
+        for &(_, process_id) in backend_ownership {
+            query.scheduled_backends.insert(process_id);
         }
         Ok(())
     }
@@ -404,21 +394,21 @@ impl FrontendQueryRegistry {
     pub(crate) fn set_scheduled_backend_ownership(
         &self,
         query_id: QueryId,
-        backend_ownership: &[(usize, u64)],
+        backend_ownership: &[(usize, BackendProcessId)],
     ) -> Result<(), DistributedQueryError> {
         let topology = self
             .backend_topology
             .lock()
             .expect("frontend backend topology gate lock");
         if topology.initialized {
-            for &(backend_idx, start_epoch) in backend_ownership {
-                match topology.live_generations.get(&backend_idx) {
-                    Some(current_epoch) if *current_epoch == start_epoch => {}
-                    Some(current_epoch) => {
+            for &(backend_idx, process_id) in backend_ownership {
+                match topology.live_process_ids.get(&backend_idx) {
+                    Some(current_process_id) if *current_process_id == process_id => {}
+                    Some(current_process_id) => {
                         return Err(DistributedQueryError::new(
                             DistributedQueryErrorKind::Rejected,
                             format!(
-                                "scheduled backend {backend_idx} generation {start_epoch} is stale; current generation is {current_epoch}"
+                                "scheduled backend ordinal {backend_idx} process identity {process_id} is stale; current process identity is {current_process_id}"
                             ),
                         ));
                     }
@@ -426,7 +416,7 @@ impl FrontendQueryRegistry {
                         return Err(DistributedQueryError::new(
                             DistributedQueryErrorKind::Rejected,
                             format!(
-                                "scheduled backend {backend_idx} is no longer live in the current frontend topology"
+                                "scheduled backend ordinal {backend_idx} process identity {process_id} is no longer live in the current frontend topology"
                             ),
                         ));
                     }
@@ -442,14 +432,10 @@ impl FrontendQueryRegistry {
                 "frontend query scheduled backend ownership is already registered",
             ));
         }
-        for &(backend_idx, start_epoch) in backend_ownership {
-            if query
-                .scheduled_backends
-                .insert(backend_idx, start_epoch)
-                .is_some()
-            {
+        for &(_, process_id) in backend_ownership {
+            if !query.scheduled_backends.insert(process_id) {
                 return Err(contract_violation(
-                    "frontend query scheduled backend ownership contains duplicate backend ids",
+                    "frontend query scheduled backend ownership contains duplicate backend process identities",
                 ));
             }
         }
@@ -464,54 +450,25 @@ impl FrontendQueryRegistry {
         if topology.initialized && revision < topology.revision {
             return;
         }
-        let previous_revision = topology.revision;
-        let revision_changed = topology.initialized && revision != previous_revision;
         topology.initialized = true;
         topology.revision = revision;
-        topology.live_generations = backends
+        topology.live_process_ids = backends
             .iter()
-            .map(|target| (target.backend_idx(), target.start_epoch()))
+            .map(|target| {
+                (
+                    target.backend_idx(),
+                    target
+                        .process_id()
+                        .expect("published live backend target has a validated process id"),
+                )
+            })
             .collect();
         drop(topology);
 
-        // A captured statement is only valid for one revision. This includes a
-        // backend join: accepting a new target mid-query would make planning,
-        // scheduling and ownership disagree about the same request.
-        if !revision_changed {
-            return;
-        }
-        let cancellations = {
-            let mut active = self.active.lock().expect("frontend query registry lock");
-            active
-                .values_mut()
-                .map(|query| {
-                    query.record_failure(format!(
-                        "backend topology revision changed from {previous_revision} to {revision}"
-                    ));
-                    request_cancellation(query)
-                })
-                .collect::<Vec<_>>()
-        };
-        for cancellation in cancellations {
-            dispatch_cancellation(Some(cancellation));
-        }
-    }
-
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "Registry test helper preserves explicit backend ownership setup."
-    )]
-    pub(crate) fn set_scheduled_backends(
-        &self,
-        query_id: QueryId,
-        backend_ids: &[usize],
-    ) -> Result<(), DistributedQueryError> {
-        let ownership = backend_ids
-            .iter()
-            .map(|&backend_idx| (backend_idx, 0))
-            .collect::<Vec<_>>();
-        self.set_scheduled_backend_ownership(query_id, &ownership)
+        // A topology revision governs future statement admission only. Existing
+        // attempts retain their frozen participant manifest and are failed only
+        // by lifecycle/control/transport evidence, or an exact replacement
+        // event for one of their process identities.
     }
 
     #[cfg(test)]
@@ -586,13 +543,17 @@ impl FrontendQueryRegistry {
         Ok(message)
     }
 
-    pub(crate) fn backend_failed(&self, backend_idx: usize, message: String) -> Vec<QueryId> {
+    pub(crate) fn backend_failed(
+        &self,
+        process_id: BackendProcessId,
+        message: String,
+    ) -> Vec<QueryId> {
         let (affected, cancellations) = {
             let mut active = self.active.lock().expect("frontend query registry lock");
             let mut affected = Vec::new();
             let mut cancellations = Vec::new();
             for (&(high, low), query) in active.iter_mut() {
-                if !query.scheduled_backends.contains_key(&backend_idx) {
+                if !query.scheduled_backends.contains(&process_id) {
                     continue;
                 }
                 if query.first_failure.is_none() {
@@ -614,8 +575,7 @@ impl FrontendQueryRegistry {
 
     pub(crate) fn backend_restarted(
         &self,
-        backend_idx: usize,
-        old_epoch: u64,
+        old_process_id: BackendProcessId,
         message: String,
     ) -> Vec<QueryId> {
         let (affected, cancellations) = {
@@ -623,7 +583,7 @@ impl FrontendQueryRegistry {
             let mut affected = Vec::new();
             let mut cancellations = Vec::new();
             for (&(high, low), query) in active.iter_mut() {
-                if query.scheduled_backends.get(&backend_idx) != Some(&old_epoch) {
+                if !query.scheduled_backends.contains(&old_process_id) {
                     continue;
                 }
                 if query.first_failure.is_none() {
@@ -643,12 +603,12 @@ impl FrontendQueryRegistry {
         affected
     }
 
-    pub(crate) fn backend_has_active_queries(&self, backend_idx: usize) -> bool {
+    pub(crate) fn backend_has_active_queries(&self, process_id: BackendProcessId) -> bool {
         self.active
             .lock()
             .expect("frontend query registry lock")
             .values()
-            .any(|query| query.scheduled_backends.contains_key(&backend_idx))
+            .any(|query| query.scheduled_backends.contains(&process_id))
     }
 
     fn unregister(&self, key: QueryKey) {
@@ -825,7 +785,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use novarocks_proto::lifecycle::{
-        AttemptId, ParticipantTerminalOutcome, QueryTerminalSnapshot, TerminalizationProof,
+        AttemptId, ParticipantBackendIdentity, ParticipantTerminalOutcome, QueryControlEndpoint,
+        QueryTerminalSnapshot, TerminalizationProof,
     };
     use novarocks_proto_models::{common, novarocks as proto};
 
@@ -868,14 +829,13 @@ mod tests {
     }
 
     fn terminal_outcome(execution_id: QueryExecutionId) -> ParticipantTerminalOutcome {
-        let backend = proto::ParticipantBackendIdentity {
-            backend_id: 7,
-            endpoint: Some(proto::QueryControlEndpoint {
-                host: "127.0.0.1".into(),
-                port: 9030,
-            }),
-            start_epoch: 11,
-        };
+        let backend = ParticipantBackendIdentity::new(
+            BackendProcessId::new_v7(),
+            QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
+        )
+        .expect("valid backend identity")
+        .as_proto()
+        .clone();
         let fragment = proto::QueryTerminalFragmentSnapshot {
             fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
             backend_num: 7,
@@ -984,7 +944,7 @@ mod tests {
                 .insert(
                     query_key(query_id),
                     ActiveQuery {
-                        scheduled_backends: BTreeMap::new(),
+                        scheduled_backends: BTreeSet::new(),
                         first_failure: None,
                         secondary_failures: BTreeSet::new(),
                         cancellation_requested: false,

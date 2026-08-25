@@ -135,7 +135,7 @@ impl CoreCommandRoute for TypedCommandRoute {
         query_options: QueryOptions,
     ) -> Result<StatementResult, String> {
         match statement {
-            ParsedStatement::Backend(statement) => {
+            ParsedStatement::ShowBackends(statement) => {
                 self.backend.execute(statement, context.execution().role())
             }
             ParsedStatement::Statistics(statement) => self.statistics.execute(
@@ -464,9 +464,7 @@ fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
                 | ast::StatisticsStatement::DropHistogram(_)
                 | ast::StatisticsStatement::DropMultipleColumnsStats(_)
         ),
-        ParsedStatement::Backend(statement) => {
-            !matches!(statement, ast::BackendStatement::ShowBackends(_))
-        }
+        ParsedStatement::ShowBackends(_) => false,
         ParsedStatement::Session(_)
         | ParsedStatement::Query(_)
         | ParsedStatement::ExplainQuery(_) => false,

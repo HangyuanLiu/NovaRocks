@@ -138,8 +138,7 @@ struct RuntimeFilterParticipantTerminalDebug {
 
 #[derive(serde::Serialize)]
 struct RuntimeFilterParticipantDebug {
-    backend_id: u64,
-    start_epoch: u64,
+    process_id: String,
 }
 
 #[derive(serde::Serialize)]
@@ -424,8 +423,7 @@ fn runtime_filter_participant_debug(
     participant: RuntimeFilterParticipantTerminalTelemetry,
 ) -> RuntimeFilterParticipantTerminalDebug {
     let participant_identity = RuntimeFilterParticipantDebug {
-        backend_id: participant.participant.backend_id,
-        start_epoch: participant.participant.start_epoch,
+        process_id: participant.participant.process_id.to_string(),
     };
     let telemetry = match participant.telemetry {
         RuntimeFilterParticipantTerminalTelemetryValue::Available(details) => {
@@ -739,6 +737,13 @@ impl NovaRocksGrpc for FrontendReportService {
         >,
     >;
 
+    async fn announce_backend(
+        &self,
+        _request: tonic::Request<proto::AnnounceBackendRequest>,
+    ) -> Result<tonic::Response<proto::AnnounceBackendResponse>, tonic::Status> {
+        Err(Self::rejected("AnnounceBackend"))
+    }
+
     async fn exchange(
         &self,
         _request: tonic::Request<tonic::Streaming<proto::ExchangeRequest>>,
@@ -955,12 +960,15 @@ mod tests {
         )
         .expect("execution id");
         let backend = ParticipantBackendIdentity::parse(proto::ParticipantBackendIdentity {
-            backend_id: 7,
             endpoint: Some(proto::QueryControlEndpoint {
                 host: "127.0.0.1".into(),
                 port: 9030,
             }),
-            start_epoch: 11,
+            process_id: Some(proto::BackendProcessId {
+                value: novarocks_types::BackendProcessId::new_v7()
+                    .to_bytes()
+                    .to_vec(),
+            }),
         })
         .expect("backend identity");
         let attestation = NegativeAttestation::parse(proto::NegativeAttestation {
@@ -1008,8 +1016,7 @@ mod tests {
         RuntimeFilterTerminalRollup {
             participants: vec![RuntimeFilterParticipantTerminalTelemetry {
                 participant: RuntimeFilterTerminalParticipant {
-                    backend_id: 7,
-                    start_epoch: 11,
+                    process_id: novarocks_types::BackendProcessId::new_v7(),
                 },
                 telemetry: RuntimeFilterParticipantTerminalTelemetryValue::Available(
                     RuntimeFilterParticipantTerminalDetails {
@@ -1106,9 +1113,10 @@ mod tests {
         assert_eq!(value["query_local_sequence"], 52);
         assert_eq!(value["query_attempt_id"], 1);
         assert_eq!(value["runtime_filter"]["kind"], "available");
-        assert_eq!(
-            value["runtime_filter"]["participants"][0]["participant"]["backend_id"],
-            7
+        assert!(
+            value["runtime_filter"]["participants"][0]["participant"]["process_id"]
+                .as_str()
+                .is_some()
         );
         assert_eq!(
             value["runtime_filter"]["participants"][0]["telemetry"]["channels"][0]["terminal_state"],

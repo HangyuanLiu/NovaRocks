@@ -2,12 +2,11 @@ use std::sync::Arc;
 
 use novarocks_execution::runtime::fragment::io::{
     FragmentIoError, FragmentIoErrorKind, FragmentIoOperation, FragmentLookupClient, LookupBatch,
-    LookupColumn, LookupKind, LookupRequest,
+    LookupColumn, LookupRequest,
 };
 
 use crate::BackendDataRuntime;
 use crate::rpc::client::BackendRpcClient;
-use crate::runtime::backend_id;
 
 pub(crate) fn grpc_fragment_lookup_client(
     runtime: BackendDataRuntime,
@@ -21,25 +20,6 @@ struct GrpcFragmentLookupClient {
 
 impl FragmentLookupClient for GrpcFragmentLookupClient {
     fn lookup(&self, request: LookupRequest) -> Result<LookupBatch, FragmentIoError> {
-        let local_backend_id = backend_id::backend_id()
-            .ok_or_else(|| {
-                lookup_error(
-                    FragmentIoErrorKind::Unavailable,
-                    "backend_id is not initialized",
-                )
-            })
-            .and_then(|id| {
-                i32::try_from(id).map_err(|error| {
-                    lookup_error(
-                        FragmentIoErrorKind::Internal,
-                        format!("backend_id does not fit in int32: {error}"),
-                    )
-                })
-            })?;
-        if request.target().backend_id() == local_backend_id {
-            return local_lookup(request);
-        }
-
         let endpoint = request.target().endpoint().ok_or_else(|| {
             lookup_error(
                 FragmentIoErrorKind::InvalidResponse,
@@ -65,33 +45,6 @@ impl FragmentLookupClient for GrpcFragmentLookupClient {
         .map_err(|error| lookup_error(FragmentIoErrorKind::Unavailable, error))?;
         decode_response(response)
     }
-}
-
-fn local_lookup(request: LookupRequest) -> Result<LookupBatch, FragmentIoError> {
-    let output = match request.kind() {
-        LookupKind::PrimaryKey => crate::runtime::lookup::execute_lookup_request(
-            request.query_id(),
-            request.tuple_id(),
-            request
-                .columns()
-                .iter()
-                .map(|column| (column.slot_id(), column.values().clone()))
-                .collect(),
-        ),
-        LookupKind::Lake => {
-            return Err(lookup_error(
-                FragmentIoErrorKind::Internal,
-                "lake late-materialization lookup is retired",
-            ));
-        }
-    }
-    .map_err(|error| lookup_error(FragmentIoErrorKind::Internal, error))?;
-    Ok(LookupBatch::new(
-        output
-            .into_iter()
-            .map(|(slot_id, values)| LookupColumn::new(slot_id, values))
-            .collect(),
-    ))
 }
 
 fn remote_request(

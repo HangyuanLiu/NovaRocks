@@ -262,7 +262,7 @@ static NEXT_CLAIM: AtomicU64 = AtomicU64::new(1);
 #[cfg(feature = "typed")]
 mod typed {
     use super::*;
-    use novarocks_types::{AttemptId, QueryExecutionId};
+    use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId};
     use std::collections::BTreeMap;
     use std::io::Write;
 
@@ -271,8 +271,7 @@ mod typed {
         pub token: String,
         pub execution_id: QueryExecutionId,
         pub backend_index: usize,
-        pub backend_id: u64,
-        pub start_epoch: u64,
+        pub process_id: BackendProcessId,
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -314,8 +313,7 @@ mod typed {
         kind: QueryLifecycleFaultKind,
         execution_id: QueryExecutionId,
         backend_index: usize,
-        backend_id: u64,
-        start_epoch: u64,
+        process_id: BackendProcessId,
     ) -> Result<Option<QueryLifecycleFaultScope>, String> {
         let arm = arm_path(root, backend_index, kind);
         let contents = match fs::read_to_string(&arm) {
@@ -335,8 +333,7 @@ mod typed {
             token,
             execution_id,
             backend_index,
-            backend_id,
-            start_epoch,
+            process_id,
         };
         let trigger = trigger_path(root, backend_index, kind);
         publish_new(&trigger, serialize_scope(&scope).as_bytes())?;
@@ -349,8 +346,7 @@ mod typed {
         kind: QueryLifecycleFaultKind,
         execution_id: QueryExecutionId,
         backend_index: usize,
-        backend_id: u64,
-        start_epoch: u64,
+        process_id: BackendProcessId,
     ) -> Result<Option<QueryLifecycleFaultScope>, String> {
         let trigger = trigger_path(root, backend_index, kind);
         let contents = match fs::read_to_string(&trigger) {
@@ -361,8 +357,7 @@ mod typed {
         let scope = parse_scope(&contents)?;
         if scope.execution_id != execution_id
             || scope.backend_index != backend_index
-            || scope.backend_id != backend_id
-            || scope.start_epoch != start_epoch
+            || scope.process_id != process_id
         {
             return Ok(None);
         }
@@ -372,6 +367,44 @@ mod typed {
             Err(error) => return Err(format!("consume {}: {error}", trigger.display())),
         }
         Ok(Some(scope))
+    }
+
+    /// Claims a runner fault by its authoritative process identity. The file
+    /// name keeps the runner's local backend index solely as an arm location;
+    /// a BE never treats that ordinal as membership identity.
+    pub fn claim_matching_fault_for_process(
+        root: &Path,
+        kind: QueryLifecycleFaultKind,
+        execution_id: QueryExecutionId,
+        process_id: BackendProcessId,
+    ) -> Result<Option<QueryLifecycleFaultScope>, String> {
+        let suffix = format!(".{}.trigger", kind.file_stem());
+        for entry in
+            fs::read_dir(root).map_err(|error| format!("read {}: {error}", root.display()))?
+        {
+            let entry = entry.map_err(|error| format!("read {} entry: {error}", root.display()))?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.starts_with("be-") || !name.ends_with(&suffix) {
+                continue;
+            }
+            let path = entry.path();
+            let contents = match fs::read_to_string(&path) {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("read {}: {error}", path.display())),
+            };
+            let scope = parse_scope(&contents)?;
+            if scope.execution_id != execution_id || scope.process_id != process_id {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => return Ok(Some(scope)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("consume {}: {error}", path.display())),
+            }
+        }
+        Ok(None)
     }
 
     /// Claims an arm-bound token from the first receiver that has accepted a
@@ -418,8 +451,7 @@ mod typed {
         kind: QueryLifecycleFaultKind,
         execution_id: QueryExecutionId,
         backend_index: usize,
-        backend_id: u64,
-        start_epoch: u64,
+        process_id: BackendProcessId,
     ) -> Result<Option<QueryLifecycleFaultScope>, String> {
         let trigger = trigger_path(root, backend_index, kind);
         let contents = match fs::read_to_string(&trigger) {
@@ -430,8 +462,7 @@ mod typed {
         let scope = parse_scope(&contents)?;
         if scope.execution_id != execution_id
             || scope.backend_index != backend_index
-            || scope.backend_id != backend_id
-            || scope.start_epoch != start_epoch
+            || scope.process_id != process_id
         {
             return Ok(None);
         }
@@ -440,14 +471,13 @@ mod typed {
 
     fn serialize_scope(scope: &QueryLifecycleFaultScope) -> String {
         format!(
-            "token={}\nexecution_hi={}\nexecution_lo={}\nattempt={}\nbackend_index={}\nbackend_id={}\nstart_epoch={}\n",
+            "token={}\nexecution_hi={}\nexecution_lo={}\nattempt={}\nbackend_index={}\nprocess_id={}\n",
             scope.token,
             scope.execution_id.query_id().high(),
             scope.execution_id.query_id().low(),
             scope.execution_id.attempt_id().get(),
             scope.backend_index,
-            scope.backend_id,
-            scope.start_epoch
+            scope.process_id
         )
     }
     fn parse_scope(contents: &str) -> Result<QueryLifecycleFaultScope, String> {
@@ -464,8 +494,11 @@ mod typed {
             token: required_token(&fields)?,
             execution_id,
             backend_index: required_usize(&fields, "backend_index")?,
-            backend_id: required_u64(&fields, "backend_id")?,
-            start_epoch: required_u64(&fields, "start_epoch")?,
+            process_id: fields
+                .get("process_id")
+                .ok_or_else(|| "missing fault field \"process_id\"".to_string())?
+                .parse::<BackendProcessId>()
+                .map_err(|error| format!("invalid fault process_id: {error}"))?,
         })
     }
     fn parse_fields(contents: &str) -> Result<BTreeMap<&str, &str>, String> {
@@ -600,7 +633,7 @@ mod tests {
     #[cfg(feature = "typed")]
     #[test]
     fn typed_scope_keeps_the_existing_token_text_and_identity_contract() {
-        use novarocks_types::{AttemptId, QueryExecutionId};
+        use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId};
 
         let root = unique_temp_root("scope");
         std::fs::create_dir_all(&root).expect("create root");
@@ -612,16 +645,19 @@ mod tests {
             AttemptId::new(1).expect("attempt"),
         )
         .expect("execution id");
-        let scope = bind_armed_fault(&root, kind, execution_id, 1, 17, 23)
+        let process_id = "018f3d8a-2b4c-7d6e-8f90-123456789abc"
+            .parse::<BackendProcessId>()
+            .expect("UUIDv7 process id");
+        let scope = bind_armed_fault(&root, kind, execution_id, 1, process_id)
             .expect("bind")
             .expect("armed");
         assert_eq!(scope.token, "abc-123");
         assert_eq!(
             std::fs::read_to_string(trigger_path(&root, 1, kind)).expect("trigger"),
-            "token=abc-123\nexecution_hi=7\nexecution_lo=9\nattempt=1\nbackend_index=1\nbackend_id=17\nstart_epoch=23\n"
+            "token=abc-123\nexecution_hi=7\nexecution_lo=9\nattempt=1\nbackend_index=1\nprocess_id=018f3d8a-2b4c-7d6e-8f90-123456789abc\n"
         );
         assert!(
-            claim_matching_fault(&root, kind, execution_id, 1, 17, 23)
+            claim_matching_fault(&root, kind, execution_id, 1, process_id)
                 .expect("claim")
                 .is_some()
         );
@@ -631,7 +667,7 @@ mod tests {
     #[cfg(feature = "typed")]
     #[test]
     fn receiver_agnostic_contribution_fault_claims_once_for_the_exact_execution() {
-        use novarocks_types::{AttemptId, QueryExecutionId};
+        use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId};
 
         let root = unique_temp_root("receiver-agnostic");
         std::fs::create_dir_all(&root).expect("create root");
@@ -651,7 +687,10 @@ mod tests {
             AttemptId::new(1).expect("attempt"),
         )
         .expect("other execution id");
-        bind_armed_fault(&root, kind, execution_id, 1, 17, 23)
+        let process_id = "018f3d8a-2b4c-7d6e-8f90-123456789abc"
+            .parse::<BackendProcessId>()
+            .expect("UUIDv7 process id");
+        bind_armed_fault(&root, kind, execution_id, 1, process_id)
             .expect("bind")
             .expect("armed");
 
@@ -664,7 +703,7 @@ mod tests {
             .expect("matching accepted receiver can claim")
             .expect("matching execution claims");
         assert_eq!(claimed.backend_index, 1);
-        assert_eq!(claimed.backend_id, 17);
+        assert_eq!(claimed.process_id, process_id);
         assert!(
             claim_matching_receiver_agnostic_fault(&root, kind, execution_id)
                 .expect("second receiver observes consumed token")

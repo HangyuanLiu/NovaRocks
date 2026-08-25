@@ -145,23 +145,36 @@ impl FragmentLifecycleProjection {
             ));
         }
         let mut endpoints = BTreeSet::new();
+        let mut process_ids = BTreeSet::new();
         for target in live_backends {
-            if target.start_epoch() == 0 {
-                return Err(DistributedQueryError::new(
+            let process_id = target.process_id().map_err(|error| {
+                DistributedQueryError::new(
                     DistributedQueryErrorKind::ContractViolation,
                     format!(
-                        "lifecycle projection backend {} has zero start epoch",
-                        target.backend_idx()
+                        "lifecycle projection backend {} has invalid process identity: {error}",
+                        target.backend_idx(),
                     ),
+                )
+            })?;
+            let endpoint = target.endpoint().map_err(|error| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    format!(
+                        "lifecycle projection backend {} has invalid endpoint: {error}",
+                        target.backend_idx(),
+                    ),
+                )
+            })?;
+            if !process_ids.insert(process_id) {
+                return Err(DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    format!("lifecycle projection repeats backend process identity {process_id}"),
                 ));
             }
-            if !endpoints.insert(target.endpoint().clone()) {
+            if !endpoints.insert(endpoint) {
                 return Err(DistributedQueryError::new(
                     DistributedQueryErrorKind::ContractViolation,
-                    format!(
-                        "lifecycle projection repeats endpoint {}",
-                        target.endpoint()
-                    ),
+                    format!("lifecycle projection repeats endpoint {}", endpoint),
                 ));
             }
             let backend_idx = target.backend_idx();
@@ -183,7 +196,13 @@ impl FragmentLifecycleProjection {
                     format!("scheduled backend {backend_idx} is absent from frozen topology"),
                 )
             })?;
-            if target.endpoint() != endpoint {
+            let target_endpoint = target.endpoint().map_err(|error| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::ContractViolation,
+                    format!("scheduled backend {backend_idx} has invalid frozen endpoint: {error}"),
+                )
+            })?;
+            if RuntimeEndpoint::from_socket_addr(target_endpoint) != *endpoint {
                 return Err(DistributedQueryError::new(
                     DistributedQueryErrorKind::ContractViolation,
                     format!(

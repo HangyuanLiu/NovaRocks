@@ -57,32 +57,34 @@ pub(crate) fn handle_init_query(
         .map_err(status_from_contract_error)?;
     let ack = ingress.init_query(request);
     if matches!(ack.outcome(), Ok(QueryInitOutcome::QueryInitApplied)) {
-        if let Some(scope) =
-            claim_backend_fault(QueryLifecycleFaultKind::RestartAfterInitAck, execution_id)?
-        {
+        if let Some(scope) = claim_backend_fault(
+            QueryLifecycleFaultKind::RestartAfterInitAck,
+            execution_id,
+            ingress.backend_process_id(),
+        )? {
             eprintln!(
-                "NOVAROCKS_QUERY_INIT_ACK_OBSERVED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+                "NOVAROCKS_QUERY_INIT_ACK_OBSERVED execution_id={}:{}:{} backend_index={} process_id={} token={}",
                 execution_id.query_id().high(),
                 execution_id.query_id().low(),
                 execution_id.attempt_id().get(),
                 scope.backend_index,
-                scope.backend_id,
-                scope.start_epoch,
+                scope.process_id,
                 scope.token
             );
             wait_for_runner_owned_restart(&scope);
         }
-        if let Some(scope) =
-            claim_backend_fault(QueryLifecycleFaultKind::InitAckDrop, execution_id)?
-        {
+        if let Some(scope) = claim_backend_fault(
+            QueryLifecycleFaultKind::InitAckDrop,
+            execution_id,
+            ingress.backend_process_id(),
+        )? {
             eprintln!(
-                "NOVAROCKS_QUERY_INIT_ACK_DROPPED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+                "NOVAROCKS_QUERY_INIT_ACK_DROPPED execution_id={}:{}:{} backend_index={} process_id={} token={}",
                 execution_id.query_id().high(),
                 execution_id.query_id().low(),
                 execution_id.attempt_id().get(),
                 scope.backend_index,
-                scope.backend_id,
-                scope.start_epoch,
+                scope.process_id,
                 scope.token
             );
             return Err(tonic::Status::deadline_exceeded(
@@ -131,13 +133,17 @@ pub(crate) fn handle_stage_fragments(
         && let Some(scope) = claim_backend_fault(
             QueryLifecycleFaultKind::HeartbeatStopAfterStage,
             execution_id,
+            ingress.backend_process_id(),
         )?
     {
         register_staged_heartbeat_stop(scope);
     }
     if response.outcome().is_staged()
-        && let Some(scope) =
-            claim_backend_fault(QueryLifecycleFaultKind::StageAckDrop, execution_id)?
+        && let Some(scope) = claim_backend_fault(
+            QueryLifecycleFaultKind::StageAckDrop,
+            execution_id,
+            ingress.backend_process_id(),
+        )?
     {
         eprintln!(
             "NOVAROCKS_STAGE_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={}",
@@ -166,8 +172,11 @@ pub(crate) fn handle_start_prepared_query(
     let execution_id = request.execution_id();
     let response = ingress.start_prepared_query(request);
     if response.outcome().is_running()
-        && let Some(scope) =
-            claim_backend_fault(QueryLifecycleFaultKind::StartAckDrop, execution_id)?
+        && let Some(scope) = claim_backend_fault(
+            QueryLifecycleFaultKind::StartAckDrop,
+            execution_id,
+            ingress.backend_process_id(),
+        )?
     {
         eprintln!(
             "NOVAROCKS_START_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={}",
@@ -182,8 +191,11 @@ pub(crate) fn handle_start_prepared_query(
         ));
     }
     if response.outcome().is_running()
-        && let Some(scope) =
-            observe_backend_fault(QueryLifecycleFaultKind::StartAckSuppress, execution_id)?
+        && let Some(scope) = observe_backend_fault(
+            QueryLifecycleFaultKind::StartAckSuppress,
+            execution_id,
+            ingress.backend_process_id(),
+        )?
     {
         eprintln!(
             "NOVAROCKS_START_ACK_SUPPRESSED execution_id={}:{}:{} backend_index={} token={}",
@@ -236,16 +248,16 @@ pub(crate) async fn handle_query_control_stream(
         QueryLifecycleFaultKind::TerminalP0BytesExhausted,
         QueryLifecycleFaultKind::TerminalP0DeliveryPermitExhausted,
     ] {
-        if let Some(scope) = claim_backend_fault(kind, execution_id)? {
+        if let Some(scope) = claim_backend_fault(kind, execution_id, ingress.backend_process_id())?
+        {
             eprintln!(
-                "NOVAROCKS_QUERY_TERMINAL_ATTACH_REJECTED kind={} execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+                "NOVAROCKS_QUERY_TERMINAL_ATTACH_REJECTED kind={} execution_id={}:{}:{} backend_index={} process_id={} token={}",
                 kind.file_stem(),
                 scope.execution_id.query_id().high(),
                 scope.execution_id.query_id().low(),
                 scope.execution_id.attempt_id().get(),
                 scope.backend_index,
-                scope.backend_id,
-                scope.start_epoch,
+                scope.process_id,
                 scope.token,
             );
             return Err(tonic::Status::resource_exhausted(format!(
@@ -254,18 +266,25 @@ pub(crate) async fn handle_query_control_stream(
             )));
         }
     }
-    let heartbeat_stop = claim_backend_fault(QueryLifecycleFaultKind::HeartbeatStop, execution_id)?;
+    let heartbeat_stop = claim_backend_fault(
+        QueryLifecycleFaultKind::HeartbeatStop,
+        execution_id,
+        ingress.backend_process_id(),
+    )?;
     let terminal_snapshot_stream_drop = claim_backend_fault(
         QueryLifecycleFaultKind::TerminalSnapshotStreamDrop,
         execution_id,
+        ingress.backend_process_id(),
     )?;
     let terminal_proof_stream_drop = claim_backend_fault(
         QueryLifecycleFaultKind::TerminalProofStreamDrop,
         execution_id,
+        ingress.backend_process_id(),
     )?;
     let terminal_attestation_stream_drop = claim_backend_fault(
         QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
         execution_id,
+        ingress.backend_process_id(),
     )?;
     let attachment = ingress
         .attach_control(attach)
@@ -402,13 +421,12 @@ async fn run_attached_control_stream(
                         {
                             if !heartbeat_stop_logged {
                                 eprintln!(
-                                    "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+                                    "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED execution_id={}:{}:{} backend_index={} process_id={} token={}",
                                     scope.execution_id.query_id().high(),
                                     scope.execution_id.query_id().low(),
                                     scope.execution_id.attempt_id().get(),
                                     scope.backend_index,
-                                    scope.backend_id,
-                                    scope.start_epoch,
+                                    scope.process_id,
                                     scope.token
                                 );
                                 heartbeat_stop_logged = true;
@@ -485,13 +503,12 @@ async fn run_attached_control_stream(
                 };
                 if let Some(scope) = terminal_stream_drop {
                     eprintln!(
-                        "NOVAROCKS_QUERY_TERMINAL_STREAM_DROPPED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+                        "NOVAROCKS_QUERY_TERMINAL_STREAM_DROPPED execution_id={}:{}:{} backend_index={} process_id={} token={}",
                         scope.execution_id.query_id().high(),
                         scope.execution_id.query_id().low(),
                         scope.execution_id.attempt_id().get(),
                         scope.backend_index,
-                        scope.backend_id,
-                        scope.start_epoch,
+                        scope.process_id,
                         scope.token,
                     );
                     break;
@@ -575,6 +592,7 @@ fn staged_heartbeat_stop(_execution_id: QueryExecutionId) -> Option<QueryLifecyc
 fn claim_backend_fault(
     kind: QueryLifecycleFaultKind,
     execution_id: QueryExecutionId,
+    process_id: novarocks_types::BackendProcessId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
     let Some(root) = novarocks_failpoint::configured_root() else {
         return Ok(None);
@@ -587,18 +605,8 @@ fn claim_backend_fault(
                 "invalid lifecycle fault backend index: {error}"
             ))
         })?;
-    let backend_id = crate::runtime::backend_id::backend_id()
-        .and_then(|id| u64::try_from(id).ok())
-        .ok_or_else(|| tonic::Status::failed_precondition("backend identity is not bound"))?;
-    claim_matching_fault(
-        &root,
-        kind,
-        execution_id,
-        backend_index,
-        backend_id,
-        crate::runtime::start_epoch::start_epoch(),
-    )
-    .map_err(tonic::Status::failed_precondition)
+    claim_matching_fault(&root, kind, execution_id, backend_index, process_id)
+        .map_err(tonic::Status::failed_precondition)
 }
 
 /// `RestartAfterInitAck` is a runner-owned rendezvous: the BE emits its
@@ -642,6 +650,7 @@ fn wait_for_runner_owned_restart(_scope: &QueryLifecycleFaultScope) {}
 fn observe_backend_fault(
     kind: QueryLifecycleFaultKind,
     execution_id: QueryExecutionId,
+    process_id: novarocks_types::BackendProcessId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
     let Some(root) = novarocks_failpoint::configured_root() else {
         return Ok(None);
@@ -654,24 +663,15 @@ fn observe_backend_fault(
                 "invalid lifecycle fault backend index: {error}"
             ))
         })?;
-    let backend_id = crate::runtime::backend_id::backend_id()
-        .and_then(|id| u64::try_from(id).ok())
-        .ok_or_else(|| tonic::Status::failed_precondition("backend identity is not bound"))?;
-    observe_matching_fault(
-        &root,
-        kind,
-        execution_id,
-        backend_index,
-        backend_id,
-        crate::runtime::start_epoch::start_epoch(),
-    )
-    .map_err(tonic::Status::failed_precondition)
+    observe_matching_fault(&root, kind, execution_id, backend_index, process_id)
+        .map_err(tonic::Status::failed_precondition)
 }
 
 #[cfg(not(debug_assertions))]
 fn claim_backend_fault(
     _kind: QueryLifecycleFaultKind,
     _execution_id: QueryExecutionId,
+    _process_id: novarocks_types::BackendProcessId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
     Ok(None)
 }
@@ -680,6 +680,7 @@ fn claim_backend_fault(
 fn observe_backend_fault(
     _kind: QueryLifecycleFaultKind,
     _execution_id: QueryExecutionId,
+    _process_id: novarocks_types::BackendProcessId,
 ) -> Result<Option<QueryLifecycleFaultScope>, tonic::Status> {
     Ok(None)
 }

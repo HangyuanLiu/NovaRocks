@@ -24,13 +24,14 @@
 //! lifecycle owner.
 
 use novarocks_proto_models::novarocks;
+use novarocks_types::BackendProcessId;
 
 use super::terminal_set::QueryTerminalSet;
 
 /// A deterministic, query-scoped projection of Runtime Filter terminal facts.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RuntimeFilterTerminalRollup {
-    /// Ordered by `(backend_id, start_epoch)`, as provided by `QueryTerminalSet`.
+    /// Ordered by backend process id, as provided by `QueryTerminalSet`.
     pub(crate) participants: Vec<RuntimeFilterParticipantTerminalTelemetry>,
     pub(crate) totals: RuntimeFilterTerminalTotalsTelemetry,
 }
@@ -38,8 +39,7 @@ pub(crate) struct RuntimeFilterTerminalRollup {
 /// Participant identity prefixes every owner-local Runtime Filter detail.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct RuntimeFilterTerminalParticipant {
-    pub(crate) backend_id: u64,
-    pub(crate) start_epoch: u64,
+    pub(crate) process_id: BackendProcessId,
 }
 
 /// The explicit P2 telemetry variant emitted by one terminal participant.
@@ -168,8 +168,9 @@ pub(crate) fn rollup(set: &QueryTerminalSet) -> RuntimeFilterTerminalRollup {
     for snapshot in set.snapshots() {
         let backend = snapshot.backend();
         let participant = RuntimeFilterTerminalParticipant {
-            backend_id: backend.backend_id(),
-            start_epoch: backend.start_epoch(),
+            process_id: backend
+                .process_id()
+                .expect("validated terminal snapshot always has a backend process id"),
         };
         let telemetry = snapshot.profile_contribution_telemetry();
 
@@ -385,8 +386,17 @@ mod tests {
             .expect("execution id")
     }
 
+    fn test_backend_process_id(participant_seed: u64) -> novarocks::BackendProcessId {
+        let mut value = vec![
+            0x01, 0x9c, 0x98, 0xa9, 0x33, 0x90, 0x75, 0x76, 0x97, 0x7b, 0x33, 0xd1, 0x88, 0xad,
+            0x1f, 0x00,
+        ];
+        value[15] = participant_seed as u8;
+        novarocks::BackendProcessId { value }
+    }
+
     fn available_snapshot(
-        backend_id: u64,
+        participant_seed: u64,
         channel_id: u32,
         transport_sent_count: u64,
     ) -> QueryTerminalSnapshot {
@@ -394,14 +404,13 @@ mod tests {
             version: 1,
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(execution_id())),
             backend: Some(novarocks::ParticipantBackendIdentity {
-                backend_id,
                 endpoint: Some(novarocks::QueryControlEndpoint {
                     host: "127.0.0.1".to_string(),
-                    port: 19_000 + backend_id as u32,
+                    port: 19_000 + participant_seed as u32,
                 }),
-                start_epoch: 1,
+                process_id: Some(test_backend_process_id(participant_seed)),
             }),
-            init_digest: vec![backend_id as u8; 32],
+            init_digest: vec![participant_seed as u8; 32],
             profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
                     novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
@@ -421,7 +430,7 @@ mod tests {
                             producer_streams: vec![novarocks::QueryTerminalRuntimeFilterProducerStreamV1 {
                                 channel_binding_id: 7,
                                 channel_id,
-                                producer_fragment_instance_id: Some(common::UniqueId { hi: backend_id as i64, lo: 41 }),
+                                producer_fragment_instance_id: Some(common::UniqueId { hi: participant_seed as i64, lo: 41 }),
                                 partition_id: 3,
                                 latest_accepted_sequence: Some(0),
                                 accepted_count: 1,
@@ -447,7 +456,7 @@ mod tests {
                                 channel_binding_id: 7,
                                 channel_id,
                                 consumer_binding_id: 5,
-                                fragment_instance_id: Some(common::UniqueId { hi: backend_id as i64, lo: 51 }),
+                                fragment_instance_id: Some(common::UniqueId { hi: participant_seed as i64, lo: 51 }),
                                 latest_delivered_logical_version: Some(4),
                                 latest_applied_logical_version: Some(4),
                                 subscription_terminal: novarocks::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed as i32,
@@ -478,19 +487,18 @@ mod tests {
         .expect("terminal snapshot")
     }
 
-    fn unavailable_snapshot(backend_id: u64) -> QueryTerminalSnapshot {
+    fn unavailable_snapshot(participant_seed: u64) -> QueryTerminalSnapshot {
         QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(execution_id())),
             backend: Some(novarocks::ParticipantBackendIdentity {
-                backend_id,
                 endpoint: Some(novarocks::QueryControlEndpoint {
                     host: "127.0.0.1".to_string(),
-                    port: 19_000 + backend_id as u32,
+                    port: 19_000 + participant_seed as u32,
                 }),
-                start_epoch: 1,
+                process_id: Some(test_backend_process_id(participant_seed)),
             }),
-            init_digest: vec![backend_id as u8; 32],
+            init_digest: vec![participant_seed as u8; 32],
             profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
                     novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(
@@ -516,8 +524,14 @@ mod tests {
 
         let rollup = set.runtime_filter_terminal_rollup();
         assert_eq!(rollup.participants.len(), 2);
-        assert_eq!(rollup.participants[0].participant.backend_id, 1);
-        assert_eq!(rollup.participants[1].participant.backend_id, 2);
+        assert_eq!(
+            rollup.participants[0].participant.process_id.to_bytes()[15],
+            1
+        );
+        assert_eq!(
+            rollup.participants[1].participant.process_id.to_bytes()[15],
+            2
+        );
         for participant in &rollup.participants {
             let RuntimeFilterParticipantTerminalTelemetryValue::Available(details) =
                 &participant.telemetry
@@ -567,7 +581,7 @@ mod tests {
                     panic!("fixture telemetry must be available");
                 };
                 assert_eq!(details.transport_routes[0].route_edge_id, 9);
-                participant.participant.backend_id
+                participant.participant.process_id.to_bytes()[15]
             })
             .collect::<Vec<_>>();
         route_prefixes.sort_unstable();

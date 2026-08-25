@@ -25,6 +25,7 @@ pub use native_submission::{
 };
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -61,8 +62,7 @@ use novarocks_proto::lifecycle::{ExchangeRouteManifest, QueryExecutionId, StageF
 use novarocks_proto_models::plan::RuntimeFilterBindingTable;
 use novarocks_proto_models::{common, novarocks};
 use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
-use novarocks_types::SlotId;
-use novarocks_types::UniqueId;
+use novarocks_types::{BackendProcessId, SlotId, UniqueId};
 
 pub use crate::query_execution::connector_binding::{
     ConnectorBindingBackendInstallPlan, ConnectorBindingDispatcher, ConnectorBindingInstallBarrier,
@@ -354,8 +354,33 @@ pub struct ScheduleBoundDistributedQuery {
 }
 
 impl ScheduleBoundDistributedQuery {
-    pub fn runtime_filter_scheduled_view(&self) -> RuntimeFilterScheduledView<'_> {
-        RuntimeFilterScheduledView {
+    pub fn runtime_filter_scheduled_view(
+        &self,
+    ) -> Result<RuntimeFilterScheduledView<'_>, DistributedQueryError> {
+        let frozen_live_backends = self
+            .schedule
+            .lifecycle
+            .frozen_live_backends
+            .values()
+            .map(|target| {
+                Ok(RuntimeFilterBackendTopologyEntry {
+                    backend_idx: target.backend_idx(),
+                    endpoint: target.endpoint().map_err(|error| {
+                        contract_error(format!(
+                            "runtime filter frozen backend {} has invalid endpoint: {error}",
+                            target.backend_idx()
+                        ))
+                    })?,
+                    process_id: target.process_id().map_err(|error| {
+                        contract_error(format!(
+                            "runtime filter frozen backend {} has invalid process identity: {error}",
+                            target.backend_idx()
+                        ))
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, DistributedQueryError>>()?;
+        Ok(RuntimeFilterScheduledView {
             artifact_id: RuntimeFilterArtifactId(self.schedule.handoff_id),
             execution_id: self.schedule.execution_id,
             scheduled_backend_ids: self.schedule.backend_ids(),
@@ -366,24 +391,14 @@ impl ScheduleBoundDistributedQuery {
                 .keys()
                 .copied()
                 .collect(),
-            frozen_live_backends: self
-                .schedule
-                .lifecycle
-                .frozen_live_backends
-                .values()
-                .map(|target| RuntimeFilterBackendTopologyEntry {
-                    backend_idx: target.backend_idx(),
-                    endpoint: target.endpoint().clone(),
-                    start_epoch: target.start_epoch(),
-                })
-                .collect(),
+            frozen_live_backends,
             has_runtime_filter_channels: self.prepared.runtime_filter_facts().has_channels(),
             deployment_facts: RuntimeFilterDeploymentFactsView::new(
                 &self.prepared,
                 self.schedule.planning_schedule(),
             ),
             _private: std::marker::PhantomData,
-        }
+        })
     }
 
     pub fn seal_runtime_filter_deployment(
@@ -395,7 +410,7 @@ impl ScheduleBoundDistributedQuery {
             ),
         >,
     ) -> Result<RuntimeFilterDeploymentAttachment, DistributedQueryError> {
-        self.runtime_filter_scheduled_view().seal(contributions)
+        self.runtime_filter_scheduled_view()?.seal(contributions)
     }
 
     pub fn attach_runtime_filter_deployment(
@@ -575,24 +590,24 @@ impl<'a> RuntimeFilterScheduledView<'a> {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeFilterBackendTopologyEntry {
     backend_idx: usize,
-    endpoint: RuntimeEndpoint,
-    start_epoch: u64,
+    endpoint: SocketAddr,
+    process_id: BackendProcessId,
 }
 
 impl RuntimeFilterBackendTopologyEntry {
-    pub const fn backend_idx(&self) -> usize {
+    pub const fn backend_idx(self) -> usize {
         self.backend_idx
     }
 
-    pub fn endpoint(&self) -> &RuntimeEndpoint {
-        &self.endpoint
+    pub const fn endpoint(self) -> SocketAddr {
+        self.endpoint
     }
 
-    pub const fn start_epoch(&self) -> u64 {
-        self.start_epoch
+    pub const fn process_id(self) -> BackendProcessId {
+        self.process_id
     }
 }
 
@@ -976,11 +991,11 @@ impl SchedulingEdgeView<'_> {
 /// remains core-private.
 pub struct BackendPlacement {
     backend_idx: usize,
-    endpoint: RuntimeEndpoint,
+    endpoint: SocketAddr,
 }
 
 impl BackendPlacement {
-    pub fn new(backend_idx: usize, endpoint: RuntimeEndpoint) -> Self {
+    pub const fn new(backend_idx: usize, endpoint: SocketAddr) -> Self {
         Self {
             backend_idx,
             endpoint,
@@ -1018,17 +1033,29 @@ impl FragmentScheduleDraft {
         }
         let mut by_backend = BTreeMap::new();
         let mut endpoints = BTreeSet::new();
+        let mut process_ids = BTreeSet::new();
         for target in live_backends {
-            if target.start_epoch() == 0 {
-                return Err(contract_error(format!(
-                    "frontend schedule live backend {} has zero start epoch",
+            let process_id = target.process_id().map_err(|error| {
+                contract_error(format!(
+                    "frontend schedule live backend {} has invalid process identity: {error}",
                     target.backend_idx()
+                ))
+            })?;
+            let endpoint = target.endpoint().map_err(|error| {
+                contract_error(format!(
+                    "frontend schedule live backend {} has invalid endpoint: {error}",
+                    target.backend_idx()
+                ))
+            })?;
+            if !process_ids.insert(process_id) {
+                return Err(contract_error(format!(
+                    "frontend schedule live topology repeats backend process identity {process_id}"
                 )));
             }
-            if !endpoints.insert(target.endpoint().clone()) {
+            if !endpoints.insert(endpoint) {
                 return Err(contract_error(format!(
                     "frontend schedule live topology repeats endpoint {}",
-                    target.endpoint()
+                    endpoint
                 )));
             }
             let backend_idx = target.backend_idx();
@@ -1124,10 +1151,16 @@ impl ValidatedFragmentSchedule {
                                 placement.backend_idx
                             ))
                         })?;
-                    if frozen.endpoint() != &placement.endpoint {
+                    let frozen_endpoint = frozen.endpoint().map_err(|error| {
+                        contract_error(format!(
+                            "frontend schedule frozen backend {} has invalid endpoint: {error}",
+                            placement.backend_idx
+                        ))
+                    })?;
+                    if frozen_endpoint != placement.endpoint {
                         return Err(contract_error(format!(
                             "frontend schedule placement backend {} endpoint {} differs from frozen topology endpoint {}",
-                            placement.backend_idx, placement.endpoint, frozen.endpoint()
+                            placement.backend_idx, placement.endpoint, frozen_endpoint
                         )));
                     }
                     Ok(FragmentInstancePlacement {
@@ -1139,7 +1172,7 @@ impl ValidatedFragmentSchedule {
                             instance_index,
                         )?,
                         backend_idx: placement.backend_idx,
-                        endpoint: placement.endpoint.clone(),
+                        endpoint: RuntimeEndpoint::from_socket_addr(placement.endpoint),
                         scan_ranges: BTreeMap::new(),
                         connector_splits: BTreeMap::new(),
                         destinations: Vec::new(),
@@ -2013,12 +2046,27 @@ mod tests {
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-    use novarocks_proto::lifecycle::{AttemptId, ExchangeRouteManifest, QueryExecutionId};
+    use novarocks_proto::lifecycle::{
+        AttemptId, ExchangeRouteManifest, QueryControlEndpoint, QueryExecutionId,
+    };
+    use novarocks_proto::membership::BackendProcessDescriptor;
     use novarocks_proto_models::{common, novarocks};
     use novarocks_sql::plan_read::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
-    use novarocks_types::UniqueId;
+    use novarocks_types::{BackendProcessId, UniqueId};
+
+    fn live_backend(backend_idx: usize, endpoint: std::net::SocketAddr) -> LiveBackendTarget {
+        let descriptor = BackendProcessDescriptor::new(
+            BackendProcessId::new_v7(),
+            QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port())
+                .expect("valid endpoint"),
+            "artifact-test-deployment",
+            "artifact-test-build",
+        )
+        .expect("valid backend descriptor");
+        LiveBackendTarget::new(backend_idx, descriptor)
+    }
 
     fn placement(
         fragment_id: u32,
@@ -2662,11 +2710,11 @@ mod tests {
         let live_backends = BTreeMap::from([
             (
                 0,
-                LiveBackendTarget::new(0, "127.0.0.1:19040".parse().expect("valid endpoint"), 100),
+                live_backend(0, "127.0.0.1:19040".parse().expect("valid endpoint")),
             ),
             (
                 1,
-                LiveBackendTarget::new(1, "127.0.0.1:19041".parse().expect("valid endpoint"), 101),
+                live_backend(1, "127.0.0.1:19041".parse().expect("valid endpoint")),
             ),
         ]);
 

@@ -549,10 +549,10 @@ fn parse_query_terminal_ack_markers(log: &str) -> Result<Vec<QueryIdentity>> {
                 .parse::<u64>()
                 .with_context(|| format!("{MARKER} has invalid attempt"))?;
             fields
-                .get("backend_id")
-                .with_context(|| format!("{MARKER} is missing backend_id"))?
-                .parse::<u64>()
-                .with_context(|| format!("{MARKER} has invalid backend_id"))?;
+                .get("process_id")
+                .with_context(|| format!("{MARKER} is missing process_id"))?
+                .parse::<novarocks_types::BackendProcessId>()
+                .with_context(|| format!("{MARKER} has invalid process_id"))?;
             Ok(QueryIdentity {
                 hi: parse_i64_field(&fields, MARKER, "query_hi")?,
                 lo: parse_i64_field(&fields, MARKER, "query_lo")?,
@@ -1223,7 +1223,7 @@ mod tests {
     #[test]
     fn exact_injected_query_cancellation_compares_per_be_identity_multisets() {
         let handle = FakeBeLogHandle::new(vec![
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=1:2:1 backend_id=0 finst_id=00000000-0000-0003-0000-000000000004\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=1:2:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc finst_id=00000000-0000-0003-0000-000000000004\n",
             "",
             "",
         ])
@@ -1236,19 +1236,19 @@ mod tests {
         let before = snapshot(&step.meta, &handle).expect("capture armed trigger token");
         handle.append_log(
             0,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=7:8:1 backend_id=0 finst_id=00000000-0000-0009-0000-00000000000a\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=7:8:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc finst_id=00000000-0000-0009-0000-00000000000a\n",
         );
         handle.append_log(
             0,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=0 finst_id=00000000-0000-0065-0000-0000000000c9\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc finst_id=00000000-0000-0065-0000-0000000000c9\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
         );
         handle.append_log(
             1,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=1 finst_id=00000000-0000-0066-0000-0000000000ca\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=step-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FAILED_FRAGMENT_REPORT_ACK query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd finst_id=00000000-0000-0066-0000-0000000000ca\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=step-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_FAILED_FRAGMENT_REPORT_ACK query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
         );
         handle.append_log(
             2,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=2 finst_id=00000000-0000-0067-0000-0000000000cb\nNOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=2 finst_id=00000000-0000-0068-0000-0000000000cc\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=104 finst_lo=204\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe finst_id=00000000-0000-0067-0000-0000000000cb\nNOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe finst_id=00000000-0000-0068-0000-0000000000cc\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=104 finst_lo=204\n",
         );
         let mut log = String::new();
 
@@ -1275,15 +1275,15 @@ mod tests {
         let before = snapshot(&step.meta, &handle).expect("capture armed trigger token");
         handle.append_log(
             0,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=0 finst_id=00000000-0000-0065-0000-0000000000c9\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc finst_id=00000000-0000-0065-0000-0000000000c9\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=101 finst_lo=201\n",
         );
         handle.append_log(
             1,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=1 finst_id=00000000-0000-0066-0000-0000000000ca\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=terminal-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_QUERY_TERMINAL_ACK query_hi=10 query_lo=20 attempt=1 backend_id=1\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd finst_id=00000000-0000-0066-0000-0000000000ca\nNOVAROCKS_FRAGMENT_EXECUTOR_FAILURE_INJECTED token=terminal-token query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\nNOVAROCKS_QUERY_TERMINAL_ACK query_hi=10 query_lo=20 attempt=1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=102 finst_lo=202\n",
         );
         handle.append_log(
             2,
-            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 backend_id=2 finst_id=00000000-0000-0067-0000-0000000000cb\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\n",
+            "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe finst_id=00000000-0000-0067-0000-0000000000cb\nNOVAROCKS_CANCEL_FINST query_hi=10 query_lo=20 finst_hi=103 finst_lo=203\n",
         );
 
         run(&step, &handle, &before, &mut String::new())
@@ -1577,13 +1577,13 @@ mod tests {
     fn service_only_evidence_correlates_one_execution_and_exact_backend_roles() {
         let execution = "10:20:1";
         let be0 = format!(
-            "NOVAROCKS_QUERY_CONTROL_READY execution_id={execution} backend_id=0 expected_fragments=1\nNOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={execution} backend_id=0 finst_id=1:1\n"
+            "NOVAROCKS_QUERY_CONTROL_READY execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc expected_fragments=1\nNOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc finst_id=1:1\n"
         );
         let be1 = format!(
-            "NOVAROCKS_QUERY_CONTROL_READY execution_id={execution} backend_id=1 expected_fragments=1\nNOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={execution} backend_id=1 finst_id=1:2\n"
+            "NOVAROCKS_QUERY_CONTROL_READY execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd expected_fragments=1\nNOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd finst_id=1:2\n"
         );
         let be2 = format!(
-            "NOVAROCKS_QUERY_CONTROL_READY execution_id={execution} backend_id=2 expected_fragments=0\n"
+            "NOVAROCKS_QUERY_CONTROL_READY execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe expected_fragments=0\n"
         );
         let handle = FakeBeLogHandle::new(vec![&be0, &be1, &be2]);
         let step = step(QueryMeta {
@@ -1603,13 +1603,19 @@ mod tests {
     fn heartbeat_evidence_requires_token_anchor_terminal_and_cleanup_on_same_execution() {
         let execution = "10:20:1";
         let terminal = format!(
-            "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} backend_id=0 reason=CoordinatorHeartbeatTimeout expected_fragments=1\nNOVAROCKS_QUERY_LIFECYCLE_CLEANUP execution_id={execution} backend_id=0 active=false tombstone=true reason=CoordinatorHeartbeatTimeout\n"
+            "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc reason=CoordinatorHeartbeatTimeout expected_fragments=1\nNOVAROCKS_QUERY_LIFECYCLE_CLEANUP execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc active=false tombstone=true reason=CoordinatorHeartbeatTimeout\n"
         );
         let be1 = format!(
-            "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED execution_id={execution} backend_index=1 backend_id=1 start_epoch=17 token=step-token\n{}",
-            terminal.replace("backend_id=0", "backend_id=1")
+            "NOVAROCKS_QUERY_CONTROL_HEARTBEAT_STOPPED execution_id={execution} backend_index=1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd token=step-token\n{}",
+            terminal.replace(
+                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc",
+                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd"
+            )
         );
-        let be2 = terminal.replace("backend_id=0", "backend_id=2");
+        let be2 = terminal.replace(
+            "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc",
+            "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe",
+        );
         let handle = FakeBeLogHandle::new(vec![&terminal, &be1, &be2]);
         let step = step(QueryMeta {
             stop_query_control_heartbeat_be_index: Some(1),
@@ -1631,12 +1637,18 @@ mod tests {
     fn fe_crash_evidence_rejects_terminal_without_cleanup_on_every_backend() {
         let execution = "10:20:1";
         let terminal = format!(
-            "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST execution_id={execution} backend_id=0 reason=CoordinatorStreamLost\nNOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} backend_id=0 reason=CoordinatorStreamLost expected_fragments=1\n"
+            "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc reason=CoordinatorStreamLost\nNOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc reason=CoordinatorStreamLost expected_fragments=1\n"
         );
         let handle = FakeBeLogHandle::new(vec![
             &terminal,
-            &terminal.replace("backend_id=0", "backend_id=1"),
-            &terminal.replace("backend_id=0", "backend_id=2"),
+            &terminal.replace(
+                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc",
+                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd",
+            ),
+            &terminal.replace(
+                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc",
+                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe",
+            ),
         ]);
         let step = step(QueryMeta {
             kill_fe_after_control_ready_count: Some(3),
@@ -1654,12 +1666,18 @@ mod tests {
     fn kill_query_evidence_rejects_terminal_without_cleanup_on_every_backend() {
         let execution = "10:20:1";
         let terminal = format!(
-            "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} backend_id=0 reason=CoordinatorAbort expected_fragments=1\n"
+            "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc reason=CoordinatorAbort expected_fragments=1\n"
         );
         let handle = FakeBeLogHandle::new(vec![
             &terminal,
-            &terminal.replace("backend_id=0", "backend_id=1"),
-            &terminal.replace("backend_id=0", "backend_id=2"),
+            &terminal.replace(
+                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc",
+                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd",
+            ),
+            &terminal.replace(
+                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abc",
+                "process_id=018f3d8a-2b4c-7d6e-8f90-123456789abe",
+            ),
         ]);
         let step = step(QueryMeta {
             kill_query_after_control_ready_count: Some(3),

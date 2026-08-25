@@ -20,7 +20,6 @@
 //! The public statement `parse()` entry point is added by SQLP-1 T6 after the
 //! expression and printer foundations have converged.
 
-mod backend;
 mod catalog;
 mod command;
 mod dml;
@@ -98,7 +97,7 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
     fn parse_statement(&mut self) -> Result<Statement, ParserError> {
         for parser in [
             view::parse as FamilyParser,
-            backend::parse,
+            show_backends::parse,
             statistics::parse,
             session::parse,
             catalog::parse,
@@ -438,7 +437,7 @@ fn hex_string_literal(source: &str) -> Option<String> {
 mod tests {
     use crate::{
         ParserError, Span,
-        ast::{BackendStatement, DmlStatement, ShowBackends, Statement},
+        ast::{DmlStatement, ShowBackends, Statement},
         lex,
         printer::print_statements,
     };
@@ -501,11 +500,9 @@ mod tests {
         );
         assert_eq!(
             parse("SHOW BACKENDS").unwrap(),
-            vec![Statement::Backend(BackendStatement::ShowBackends(
-                ShowBackends {
-                    span: Span::new(0, 13),
-                },
-            ))]
+            vec![Statement::ShowBackends(ShowBackends {
+                span: Span::new(0, 13),
+            })]
         );
     }
 
@@ -549,8 +546,7 @@ mod tests {
         statements
             .iter()
             .map(|statement| match statement {
-                Statement::Backend(BackendStatement::ShowBackends(_)) => "SHOW BACKENDS",
-                Statement::Backend(_) => "BACKEND",
+                Statement::ShowBackends(_) => "SHOW BACKENDS",
                 Statement::Statistics(_) => "STATISTICS",
                 Statement::Catalog(_) => "CATALOG",
                 Statement::Iceberg(_) => "ICEBERG",

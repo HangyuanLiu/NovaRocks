@@ -56,6 +56,33 @@ impl ScanBindingResolver for EmptyResolver {
     }
 }
 
+/// A topology-only planning pass must not reacquire a connector's current
+/// control generation. It has to use the exact table handle and planning
+/// lease admitted with the statement's query-local binding store instead.
+struct RejectCurrentControlResolver;
+
+impl novarocks_spi::connector::ConnectorControlResolver for RejectCurrentControlResolver {
+    fn observe_current_binding(
+        &self,
+        _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorExecutionBindingKey,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        panic!("topology-only re-planning must not observe a current connector binding")
+    }
+
+    fn acquire_current(
+        &self,
+        _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorControlPlanningLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        panic!("topology-only re-planning must not acquire a current connector binding")
+    }
+}
+
 struct JoinRefreshDeltaResolver;
 
 impl ScanBindingResolver for JoinRefreshDeltaResolver {
@@ -277,6 +304,90 @@ fn ordinary_current_snapshot_is_immutable_and_does_not_invoke_resolver() {
             .len(),
         1
     );
+}
+
+#[test]
+fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed ordinary fixture");
+    let registry = FixtureConnectorRegistry::new();
+    crate::connector::scan_model::register_planned_files_fixture(
+        &registry,
+        "test_catalog",
+        vec![data_file("s3://bucket/first-admission.parquet")],
+        None,
+    );
+    let admission_controls = crate::connector::FixtureControlResolver::new(registry.clone());
+    let bindings = fixture_query_table_bindings(&plan, &admission_controls);
+    let DistributedNodeKind::Scan(scan) = &plan.fragments()[0].root.payload else {
+        panic!("ordinary fixture must retain a scan root");
+    };
+    let admitted = bindings
+        .binding(scan_preparation_facts(scan).binding())
+        .expect("first admission binding");
+    assert_eq!(
+        admitted
+            .scan_materialization
+            .as_ref()
+            .expect("first admission scan materialization")
+            .selector,
+        novarocks_spi::connector::ConnectorReadSelector::Current
+    );
+
+    // This is what would be visible if the second pass resolved Current again.
+    // The re-plan must instead retain the table handle and exact planning lease
+    // stored above, so it cannot observe this replacement.
+    crate::connector::scan_model::register_planned_files_fixture(
+        &registry,
+        "test_catalog",
+        vec![data_file("s3://bucket/new-current.parquet")],
+        None,
+    );
+    let reject_current = RejectCurrentControlResolver;
+    let context = crate::connector::test_request_context();
+
+    let first = super::super::prepare_scan_bindings(
+        &plan,
+        &reject_current,
+        &context,
+        Some(&bindings),
+        None,
+        super::super::ScanPreparationOptions::single_backend_fixture(),
+    )
+    .expect("first preparation must use its admitted binding");
+    let second = super::super::prepare_scan_bindings(
+        &plan,
+        &reject_current,
+        &context,
+        Some(&bindings),
+        None,
+        super::super::ScanPreparationOptions::new(
+            true,
+            std::num::NonZeroUsize::new(3).expect("non-zero topology target"),
+            None,
+        ),
+    )
+    .expect("topology-only re-planning must reuse its admitted binding");
+
+    let first_path = crate::connector::scan_model::planned_split_file_for_test(
+        &first
+            .connector_read(0, 10)
+            .expect("first connector read")
+            .splits[0],
+    )
+    .expect("first split payload")
+    .path;
+    let second_path = crate::connector::scan_model::planned_split_file_for_test(
+        &second
+            .connector_read(0, 10)
+            .expect("second connector read")
+            .splits[0],
+    )
+    .expect("second split payload")
+    .path;
+
+    assert_eq!(first_path, "s3://bucket/first-admission.parquet");
+    assert_eq!(second_path, first_path);
 }
 
 #[test]

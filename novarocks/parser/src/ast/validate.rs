@@ -44,7 +44,7 @@ pub fn validate_statement(statement: &Statement) -> Result<(), ValidateError> {
         Statement::Query(query) => validate_query(query),
         Statement::ExplainQuery(explain) => validate_query(&explain.query),
         Statement::Table(TableStatement::Create(table)) => validate_create_table(table),
-        Statement::Backend(_)
+        Statement::ShowBackends(_)
         | Statement::Statistics(_)
         | Statement::Catalog(_)
         | Statement::Iceberg(_)

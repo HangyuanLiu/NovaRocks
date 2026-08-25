@@ -18,7 +18,6 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(test)]
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -43,7 +42,6 @@ use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use crate::query_execution::lifecycle_plan::{QueryInitOptions, QueryLifecycleLease};
 use crate::query_execution::write::WriteTerminalBuilder;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
-use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::lifecycle::QueryOptions as ProtocolQueryOptions;
 use novarocks_spi::connector::ConnectorWriteLease;
 use novarocks_types::{
@@ -174,7 +172,7 @@ impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
         &self,
         _execution_id: QueryExecutionId,
         _backend_idx: usize,
-        _endpoint: RuntimeEndpoint,
+        _endpoint: SocketAddr,
         _declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
     ) -> Result<(), crate::query_execution::connector_binding::ConnectorBindingDispatchError> {
         Ok(())
@@ -182,7 +180,7 @@ impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
 
     fn retire(
         &self,
-        _endpoint: RuntimeEndpoint,
+        _endpoint: SocketAddr,
         _key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
     ) -> Result<(), crate::query_execution::connector_binding::ConnectorBindingRetirementError>
     {
@@ -204,7 +202,7 @@ impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
             .installed_backends
             .iter()
             .enumerate()
-            .filter_map(|(index, endpoint)| match RuntimeEndpoint::parse(endpoint) {
+            .filter_map(|(index, endpoint)| match endpoint.parse::<SocketAddr>() {
                 Ok(endpoint) => Some((index, endpoint)),
                 Err(error) => {
                     tracing::warn!(
@@ -232,11 +230,11 @@ impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
                 }
             };
         for (_, endpoint) in endpoints {
-            if let Err(error) = dispatcher.retire(endpoint.clone(), &retirement.key) {
+            if let Err(error) = dispatcher.retire(endpoint, &retirement.key) {
                 tracing::warn!(
                     instance_id = %retirement.key.instance_id.as_str(),
                     incarnation = ?retirement.key.incarnation,
-                    endpoint = %endpoint.as_host_port(),
+                    %endpoint,
                     %error,
                     "connector execution binding retirement was not acknowledged"
                 );
@@ -248,13 +246,13 @@ impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
 impl ConnectorBindingInstallObserver for FrontendConnectorBindingInstallObserver {
     fn installed(
         &self,
-        endpoint: RuntimeEndpoint,
+        endpoint: std::net::SocketAddr,
         declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
     ) -> Result<(), String> {
         self.control
             .record_installed_backend(
                 &novarocks_spi::connector::ConnectorExecutionBindingKey::from(declaration),
-                endpoint.as_host_port(),
+                endpoint.to_string(),
             )
             .map_err(|error| error.to_string())
     }
@@ -628,8 +626,13 @@ fn production_backend_services(
 ) -> Result<QueryBackendServices, DistributedQueryError> {
     let entries = topology
         .iter()
-        .map(|target| (target.backend_idx(), target.endpoint().clone()))
-        .collect::<Vec<_>>();
+        .map(|target| {
+            target
+                .endpoint()
+                .map(|endpoint| (target.backend_idx(), endpoint))
+                .map_err(|error| failed(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let snapshot = FrontendBackendSnapshot::from_live_targets(topology.to_vec())?;
     Ok(QueryBackendServices {
         scheduler: FrontendFragmentScheduler::new(snapshot),
@@ -881,7 +884,7 @@ impl FrontendDistributedQueryCoordinator {
         };
         for retirement in ready {
             for endpoint in retirement.installed_backends {
-                let endpoint = match RuntimeEndpoint::parse(&endpoint) {
+                let endpoint = match endpoint.parse::<SocketAddr>() {
                     Ok(endpoint) => endpoint,
                     Err(error) => {
                         tracing::warn!(
@@ -894,11 +897,11 @@ impl FrontendDistributedQueryCoordinator {
                         continue;
                     }
                 };
-                if let Err(error) = dispatcher.retire(endpoint.clone(), &retirement.key) {
+                if let Err(error) = dispatcher.retire(endpoint, &retirement.key) {
                     tracing::warn!(
                         instance_id = %retirement.key.instance_id.as_str(),
                         incarnation = ?retirement.key.incarnation,
-                        endpoint = %endpoint.as_host_port(),
+                        %endpoint,
                         %error,
                         "connector execution binding retirement was not acknowledged"
                     );
@@ -1007,7 +1010,7 @@ impl FrontendDistributedQueryCoordinator {
             None => scheduled,
         };
         let deployment = compile_scheduled_runtime_filter_deployment(
-            scheduled.runtime_filter_scheduled_view(),
+            scheduled.runtime_filter_scheduled_view()?,
             FrontendRuntimeFilterDeploymentCompilerConfig::from_query_lifecycle(
                 parts.options.runtime_filter_lifecycle(),
                 self.runtime_filter_worker_count.get(),

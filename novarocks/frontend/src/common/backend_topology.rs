@@ -18,9 +18,12 @@
 //! Neutral frontend-facing backend topology and lifecycle boundary.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+use novarocks_proto::membership::{BackendProcessDescriptor, BackendReportedState};
+use novarocks_types::BackendProcessId;
 
 /// Frontend-owned topology and backend-management boundary consumed by core.
 ///
@@ -38,10 +41,6 @@ pub trait BackendTopologyPort: Send + Sync + 'static {
     /// remains separate from the batch boundary so service-only participants
     /// are visible to lifecycle accounting without inflating fragment counts.
     fn record_successful_stage(&self, backend_idx: usize, fragment_count: usize);
-
-    fn add_backend(&self, endpoint: RuntimeEndpoint) -> Result<(), String>;
-
-    fn drop_backend(&self, endpoint: RuntimeEndpoint, force: bool) -> Result<(), String>;
 
     fn show_backends(&self) -> Result<crate::runtime::query_result::QueryResult, String>;
 }
@@ -83,14 +82,14 @@ pub enum BackendTopologyValidationError {
     },
     GenerationChanged {
         backend_idx: usize,
-        captured_generation: u64,
-        current_generation: u64,
+        captured_generation: BackendProcessId,
+        current_generation: BackendProcessId,
         captured_revision: u64,
         current_revision: u64,
     },
     TargetMissing {
         backend_idx: usize,
-        captured_generation: u64,
+        captured_generation: BackendProcessId,
         captured_revision: u64,
         current_revision: u64,
     },
@@ -172,19 +171,19 @@ pub fn publish_backend_topology_metrics(snapshot: BackendTopologyMetricsSnapshot
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveBackendSnapshot {
-    entries: Vec<(usize, RuntimeEndpoint)>,
+    entries: Vec<(usize, SocketAddr)>,
 }
 
 impl LiveBackendSnapshot {
-    pub fn new(entries: Vec<(usize, RuntimeEndpoint)>) -> Self {
+    pub fn new(entries: Vec<(usize, SocketAddr)>) -> Self {
         Self { entries }
     }
 
-    pub fn from_endpoints(backends: Vec<RuntimeEndpoint>) -> Self {
+    pub fn from_endpoints(backends: Vec<SocketAddr>) -> Self {
         Self::new(backends.into_iter().enumerate().collect())
     }
 
-    pub fn entries(&self) -> &[(usize, RuntimeEndpoint)] {
+    pub fn entries(&self) -> &[(usize, SocketAddr)] {
         &self.entries
     }
 }
@@ -192,8 +191,11 @@ impl LiveBackendSnapshot {
 #[derive(Clone, Debug)]
 pub enum HeartbeatOutcome {
     Ok {
-        start_epoch: u64,
-        version: String,
+        /// The descriptor returned by the backend after it verified the
+        /// process id supplied by the frontend.  The caller must compare it
+        /// with the announced descriptor before changing eligibility.
+        descriptor: BackendProcessDescriptor,
+        reported_state: BackendReportedState,
         num_cores: u32,
         now_ms: i64,
     },
@@ -223,7 +225,7 @@ impl CoordinatorReportEndpoint {
         })
     }
 
-    pub fn from_socket_addr(endpoint: std::net::SocketAddr) -> Self {
+    pub fn from_socket_addr(endpoint: SocketAddr) -> Self {
         Self {
             endpoint: RuntimeEndpoint::from_socket_addr(endpoint),
         }
@@ -237,29 +239,26 @@ impl CoordinatorReportEndpoint {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BackendQueryEvent {
     Unavailable {
-        backend_idx: usize,
+        process_id: BackendProcessId,
         reason: String,
     },
     Restarted {
-        backend_idx: usize,
-        old_epoch: u64,
-        new_epoch: u64,
+        old_process_id: BackendProcessId,
+        new_process_id: BackendProcessId,
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct LiveBackendTarget {
     backend_idx: usize,
-    endpoint: RuntimeEndpoint,
-    start_epoch: u64,
+    descriptor: BackendProcessDescriptor,
 }
 
 impl LiveBackendTarget {
-    pub fn new(backend_idx: usize, endpoint: RuntimeEndpoint, start_epoch: u64) -> Self {
+    pub fn new(backend_idx: usize, descriptor: BackendProcessDescriptor) -> Self {
         Self {
             backend_idx,
-            endpoint,
-            start_epoch,
+            descriptor,
         }
     }
 
@@ -267,14 +266,37 @@ impl LiveBackendTarget {
         self.backend_idx
     }
 
-    pub fn endpoint(&self) -> &RuntimeEndpoint {
-        &self.endpoint
+    pub fn descriptor(&self) -> &BackendProcessDescriptor {
+        &self.descriptor
     }
 
-    pub const fn start_epoch(&self) -> u64 {
-        self.start_epoch
+    pub fn process_id(&self) -> Result<BackendProcessId, novarocks_proto::ProtocolError> {
+        self.descriptor.process_id()
+    }
+
+    pub fn endpoint(&self) -> Result<SocketAddr, novarocks_proto::ProtocolError> {
+        let endpoint = self.descriptor.endpoint()?;
+        let address = endpoint.host().parse().map_err(|error| {
+            novarocks_proto::ProtocolError::new(
+                novarocks_proto::FieldPath::root("backend_process_descriptor")
+                    .field("endpoint")
+                    .field("host"),
+                novarocks_proto::ProtocolErrorKind::InvalidValue,
+                format!("backend endpoint must be an IP address for native transport: {error}"),
+            )
+        })?;
+        Ok(SocketAddr::new(address, endpoint.port()))
     }
 }
+
+impl PartialEq for LiveBackendTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.backend_idx == other.backend_idx
+            && self.descriptor.as_proto() == other.descriptor.as_proto()
+    }
+}
+
+impl Eq for LiveBackendTarget {}
 
 /// An immutable, versioned view of the backend targets available when a
 /// request was admitted. The owner is responsible for advancing `revision`
@@ -340,7 +362,7 @@ impl BackendTopologySnapshot {
 pub trait BackendQueryEventSink: Send + Sync + 'static {
     fn on_backend_event(&self, event: BackendQueryEvent);
 
-    fn backend_has_active_queries(&self, backend_idx: usize) -> bool;
+    fn backend_has_active_queries(&self, process_id: BackendProcessId) -> bool;
 
     fn replace_live_backends(&self, revision: u64, backends: Vec<LiveBackendTarget>);
 }
@@ -360,7 +382,7 @@ pub(crate) struct NoopBackendQueryEventSink;
 impl BackendQueryEventSink for NoopBackendQueryEventSink {
     fn on_backend_event(&self, _event: BackendQueryEvent) {}
 
-    fn backend_has_active_queries(&self, _backend_idx: usize) -> bool {
+    fn backend_has_active_queries(&self, _process_id: BackendProcessId) -> bool {
         false
     }
 
@@ -412,14 +434,6 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
 
     fn record_successful_stage(&self, _backend_idx: usize, _fragment_count: usize) {}
 
-    fn add_backend(&self, _endpoint: RuntimeEndpoint) -> Result<(), String> {
-        Err("backend topology port is not installed".to_string())
-    }
-
-    fn drop_backend(&self, _endpoint: RuntimeEndpoint, _force: bool) -> Result<(), String> {
-        Err("backend topology port is not installed".to_string())
-    }
-
     fn show_backends(&self) -> Result<crate::runtime::query_result::QueryResult, String> {
         Err("backend topology port is not installed".to_string())
     }
@@ -427,10 +441,25 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
     use super::{
         BackendTopologyError, BackendTopologySnapshot, CoordinatorReportEndpoint, LiveBackendTarget,
     };
-    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+    use novarocks_proto::lifecycle::QueryControlEndpoint;
+    use novarocks_proto::membership::BackendProcessDescriptor;
+    use novarocks_types::BackendProcessId;
+
+    fn descriptor(endpoint: SocketAddr) -> BackendProcessDescriptor {
+        BackendProcessDescriptor::new(
+            BackendProcessId::new_v7(),
+            QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port())
+                .expect("valid endpoint"),
+            "test-deployment",
+            "test-build",
+        )
+        .expect("valid descriptor")
+    }
 
     #[test]
     fn coordinator_report_endpoint_accepts_advertised_dns_hostnames() {
@@ -440,12 +469,12 @@ mod tests {
 
     #[test]
     fn topology_snapshot_sorts_targets_by_backend_id() {
-        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9030").expect("endpoint");
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9030);
         let snapshot = BackendTopologySnapshot::try_new(
             7,
             vec![
-                LiveBackendTarget::new(9, endpoint.clone(), 1),
-                LiveBackendTarget::new(2, endpoint, 3),
+                LiveBackendTarget::new(9, descriptor(endpoint)),
+                LiveBackendTarget::new(2, descriptor(endpoint)),
             ],
         )
         .expect("distinct targets form a snapshot");
@@ -463,13 +492,13 @@ mod tests {
 
     #[test]
     fn topology_snapshot_rejects_duplicate_backend_ids() {
-        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9030").expect("endpoint");
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9030);
         assert_eq!(
             BackendTopologySnapshot::try_new(
                 7,
                 vec![
-                    LiveBackendTarget::new(2, endpoint.clone(), 1),
-                    LiveBackendTarget::new(2, endpoint, 2),
+                    LiveBackendTarget::new(2, descriptor(endpoint)),
+                    LiveBackendTarget::new(2, descriptor(endpoint)),
                 ],
             ),
             Err(BackendTopologyError::DuplicateBackendId { backend_idx: 2 })

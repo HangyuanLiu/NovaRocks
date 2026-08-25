@@ -31,8 +31,8 @@ use novarocks_proto::lifecycle::{
     RuntimeFilterContribution, StageDigest, StageDigestVersion, StageFragment,
 };
 use novarocks_proto_models::{common, filter, novarocks as proto_novarocks, plan};
-use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
+use novarocks_types::{BackendProcessId, QueryId};
 use prost::Message;
 
 use super::entry::QueryLifecyclePhase;
@@ -52,9 +52,15 @@ use crate::runtime_filter::participant::{
 };
 use novarocks_failpoint::QueryLifecycleFaultKind;
 
-const LOCAL_BACKEND_ID: u64 = 7;
-const LOCAL_START_EPOCH: u64 = 11;
 const ATTEMPT_1: u64 = 1;
+
+fn local_process_id() -> BackendProcessId {
+    BackendProcessId::try_from_bytes([
+        0x01, 0x9a, 0x00, 0x00, 0x00, 0x00, 0x70, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x07,
+    ])
+    .expect("fixed test process id is UUIDv7")
+}
 
 type NegativeAttestationReason = proto_novarocks::NegativeAttestationReason;
 
@@ -446,8 +452,7 @@ fn terminal_fallback_conflict_releases_bounded_delivery_record() {
     config.terminal_ack_timeout = Duration::from_millis(1);
     config.terminal_drain_timeout = Duration::from_millis(1);
     let registry = QueryLifecycleRegistry::new_with_clock_metrics_and_terminal_fallback(
-        LOCAL_BACKEND_ID,
-        LOCAL_START_EPOCH,
+        local_process_id(),
         Arc::new(runtime),
         config,
         Arc::clone(&clock) as Arc<dyn MonotonicClock>,
@@ -506,8 +511,7 @@ fn terminal_fallback_gone_releases_bounded_delivery_record() {
     config.terminal_ack_timeout = Duration::from_millis(1);
     config.terminal_drain_timeout = Duration::from_millis(1);
     let registry = QueryLifecycleRegistry::new_with_clock_metrics_and_terminal_fallback(
-        LOCAL_BACKEND_ID,
-        LOCAL_START_EPOCH,
+        local_process_id(),
         Arc::new(runtime),
         config,
         Arc::clone(&clock) as Arc<dyn MonotonicClock>,
@@ -573,8 +577,7 @@ fn registry_with_config(
     config: QueryLifecycleRegistryConfig,
 ) -> Arc<QueryLifecycleRegistry> {
     QueryLifecycleRegistry::new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
-        LOCAL_BACKEND_ID,
-        LOCAL_START_EPOCH,
+        local_process_id(),
         Arc::new(runtime.clone()),
         config,
         Arc::new(ManualClock::default()),
@@ -590,8 +593,7 @@ fn registry_with_clock(
     clock: Arc<ManualClock>,
 ) -> Arc<QueryLifecycleRegistry> {
     QueryLifecycleRegistry::new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
-        LOCAL_BACKEND_ID,
-        LOCAL_START_EPOCH,
+        local_process_id(),
         Arc::new(runtime.clone()),
         registry_config(max_active_entries),
         clock,
@@ -602,31 +604,23 @@ fn registry_with_clock(
 }
 
 #[test]
-fn query_control_attachment_requires_backend_identity_binding() {
+fn init_requires_exact_backend_process_identity() {
     let runtime = RecordingLocalRuntime::default();
-    let registry = QueryLifecycleRegistry::new_unbound(
-        LOCAL_START_EPOCH,
+    let registry = QueryLifecycleRegistry::new_with_process_id(
+        local_process_id(),
         Arc::new(runtime),
         registry_config(8),
     );
-    let request = init_request_fixture(700, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(700, ATTEMPT_1, 10_000);
+    let mismatched =
+        init_request_fixture_for_process(701, ATTEMPT_1, BackendProcessId::new_v7(), 10_000);
 
     assert_eq!(
         registry
-            .init_query(request.clone())
+            .init_query(mismatched)
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::QueryInitRejectedStaleBackend
-    );
-    registry
-        .bind_backend_identity(LOCAL_BACKEND_ID)
-        .expect("first FE-assigned identity binds");
-    assert_eq!(
-        registry
-            .bind_backend_identity(LOCAL_BACKEND_ID + 1)
-            .expect_err("backend identity takeover must fail")
-            .code(),
-        QueryLifecycleErrorCode::Conflict
+        QueryInitOutcome::QueryInitRejectedBackendProcessMismatch
     );
     assert_eq!(
         registry
@@ -643,8 +637,8 @@ fn attach_reserves_p0_before_control_ready_and_releases_on_terminal_cleanup() {
     let mut config = registry_config(8);
     config.terminal_retained_capacity = 1;
     let registry = registry_with_config(runtime, config);
-    let first = init_request_fixture(9_701, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
-    let second = init_request_fixture(9_702, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let first = init_request_fixture(9_701, ATTEMPT_1, 10_000);
+    let second = init_request_fixture(9_702, ATTEMPT_1, 10_000);
     assert_eq!(
         registry
             .init_query(first.clone())
@@ -711,7 +705,7 @@ fn injected_p0_faults_reject_before_control_ready_and_leave_entry_retryable() {
         ),
     ] {
         let registry = registry_with(RecordingLocalRuntime::default(), 8);
-        let request = init_request_fixture(query_low, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+        let request = init_request_fixture(query_low, ATTEMPT_1, 10_000);
         let execution_id = request.manifest().execution_id();
         assert_eq!(
             registry
@@ -750,6 +744,23 @@ fn injected_p0_faults_reject_before_control_ready_and_leave_entry_retryable() {
 }
 
 #[test]
+fn draining_registry_rejects_new_init_without_installing_runtime_filter() {
+    let runtime = RecordingLocalRuntime::default();
+    let registry = registry_with(runtime.clone(), 8);
+    registry.begin_drain();
+
+    assert!(registry.is_draining());
+    assert_eq!(
+        registry
+            .init_query(init_request_fixture(120, ATTEMPT_1, LOCAL_START_EPOCH, 10_000))
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
+        QueryInitOutcome::QueryInitRejectedBackendDraining
+    );
+    assert_eq!(runtime.runtime_filter_install_calls(), 0);
+}
+
+#[test]
 fn fresh_unbound_registry_reports_no_restoration_relevant_state_after_binding() {
     let registry = QueryLifecycleRegistry::new_unbound(
         LOCAL_START_EPOCH,
@@ -780,13 +791,6 @@ fn restoration_status_counts_all_retained_execution_indexes_without_clearing_the
     let lifecycle_tombstone = init_request_fixture(121, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let pre_init_tombstone = init_request_fixture(122, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
 
-    assert_eq!(
-        registry
-            .init_query(active.clone())
-            .outcome()
-            .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::QueryInitApplied
-    );
     assert_eq!(
         registry
             .init_query(lifecycle_tombstone.clone())
@@ -877,7 +881,20 @@ fn runtime_filter_contribution(participant_id: u32) -> RuntimeFilterContribution
 fn init_request_fixture(
     query_low: i64,
     attempt: u64,
-    start_epoch: u64,
+    query_deadline_unix_ms: u64,
+) -> QueryInitRequest {
+    init_request_fixture_for_process(
+        query_low,
+        attempt,
+        local_process_id(),
+        query_deadline_unix_ms,
+    )
+}
+
+fn init_request_fixture_for_process(
+    query_low: i64,
+    attempt: u64,
+    process_id: BackendProcessId,
     query_deadline_unix_ms: u64,
 ) -> QueryInitRequest {
     let execution_id = execution_id(query_low, attempt);
@@ -885,9 +902,8 @@ fn init_request_fixture(
     let manifest = ParticipantManifest::new(
         execution_id,
         ParticipantBackendIdentity::new(
-            LOCAL_BACKEND_ID,
+            process_id,
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
-            start_epoch,
         )
         .expect("valid backend identity"),
         [ParticipantRole::RuntimeFilterService],
@@ -908,9 +924,8 @@ fn fragment_init_request_fixture(query_low: i64, expected: &[UniqueId]) -> Query
     let manifest = ParticipantManifest::new(
         execution_id,
         ParticipantBackendIdentity::new(
-            LOCAL_BACKEND_ID,
+            local_process_id(),
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
-            LOCAL_START_EPOCH,
         )
         .expect("valid backend identity"),
         [ParticipantRole::FragmentExecutor],
@@ -934,9 +949,8 @@ fn fragment_runtime_filter_init_request_fixture(
     let manifest = ParticipantManifest::new(
         execution_id,
         ParticipantBackendIdentity::new(
-            LOCAL_BACKEND_ID,
+            local_process_id(),
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
-            LOCAL_START_EPOCH,
         )
         .expect("valid backend identity"),
         [
@@ -1198,7 +1212,7 @@ fn stage_requires_matching_manifest_exact_set_and_control_attachment() {
 #[test]
 fn service_only_empty_stage_starts_and_abort_prevents_late_start() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
-    let request = init_request_fixture(1_803, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(1_803, ATTEMPT_1, 10_000);
     assert_eq!(
         registry
             .init_query(request.clone())
@@ -1326,7 +1340,7 @@ fn stage_builder_limit_is_held_until_commit_or_drop() {
 fn query_lifecycle_registry_same_digest_init_is_idempotent_and_installs_once() {
     let runtime = RecordingLocalRuntime::default();
     let registry = registry_with(runtime.clone(), 8);
-    let request = init_request_fixture(1, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(1, ATTEMPT_1, 10_000);
 
     assert_eq!(
         registry
@@ -1348,8 +1362,8 @@ fn query_lifecycle_registry_same_digest_init_is_idempotent_and_installs_once() {
 #[test]
 fn query_lifecycle_abort_digest_mismatch_keeps_live_entry_attachable() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
-    let request = init_request_fixture(101, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
-    let different = init_request_fixture(102, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(101, ATTEMPT_1, 10_000);
+    let different = init_request_fixture(102, ATTEMPT_1, 10_000);
     assert_eq!(
         registry
             .init_query(request.clone())
@@ -1396,7 +1410,7 @@ fn query_lifecycle_abort_digest_mismatch_keeps_live_entry_attachable() {
 #[test]
 fn query_lifecycle_terminal_event_survives_saturated_heartbeat_queue() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
-    let request = init_request_fixture(103, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(103, ATTEMPT_1, 10_000);
     assert_eq!(
         registry
             .init_query(request.clone())
@@ -1488,7 +1502,7 @@ fn query_lifecycle_observations_coalesce_without_consuming_correctness_capacity(
 #[test]
 fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
-    let request = init_request_fixture(104, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(104, ATTEMPT_1, 10_000);
     assert_eq!(
         registry
             .init_query(request.clone())
@@ -1564,24 +1578,14 @@ fn query_lifecycle_registry_different_digest_conflicts() {
 
     assert_eq!(
         registry
-            .init_query(init_request_fixture(
-                2,
-                ATTEMPT_1,
-                LOCAL_START_EPOCH,
-                10_000,
-            ))
+            .init_query(init_request_fixture(2, ATTEMPT_1, 10_000,))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::QueryInitApplied
     );
     assert_eq!(
         registry
-            .init_query(init_request_fixture(
-                2,
-                ATTEMPT_1,
-                LOCAL_START_EPOCH,
-                20_000,
-            ))
+            .init_query(init_request_fixture(2, ATTEMPT_1, 20_000,))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::QueryInitRejectedConflict
@@ -1596,24 +1600,14 @@ fn query_lifecycle_registry_capacity_rejects_without_install() {
 
     assert_eq!(
         registry
-            .init_query(init_request_fixture(
-                3,
-                ATTEMPT_1,
-                LOCAL_START_EPOCH,
-                10_000,
-            ))
+            .init_query(init_request_fixture(3, ATTEMPT_1, 10_000,))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::QueryInitApplied
     );
     assert_eq!(
         registry
-            .init_query(init_request_fixture(
-                4,
-                ATTEMPT_1,
-                LOCAL_START_EPOCH,
-                10_000,
-            ))
+            .init_query(init_request_fixture(4, ATTEMPT_1, 10_000,))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::QueryInitRejectedCapacity
@@ -1622,45 +1616,40 @@ fn query_lifecycle_registry_capacity_rejects_without_install() {
 }
 
 #[test]
-fn query_lifecycle_registry_backend_epoch_mismatch_rejects() {
+fn query_lifecycle_registry_backend_process_mismatch_rejects() {
     let runtime = RecordingLocalRuntime::default();
     let registry = registry_with(runtime.clone(), 8);
 
     assert_eq!(
         registry
-            .init_query(init_request_fixture(
+            .init_query(init_request_fixture_for_process(
                 5,
                 ATTEMPT_1,
-                LOCAL_START_EPOCH + 1,
+                BackendProcessId::new_v7(),
                 10_000,
             ))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::QueryInitRejectedStaleBackend
+        QueryInitOutcome::QueryInitRejectedBackendProcessMismatch
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 0);
 }
 
 #[test]
-fn query_lifecycle_registry_unbound_application_identity_rejects_init() {
+fn query_lifecycle_registry_generated_process_identity_rejects_mismatch() {
     let runtime = RecordingLocalRuntime::default();
-    let registry = QueryLifecycleRegistry::new_unbound(
-        LOCAL_START_EPOCH,
+    let registry = QueryLifecycleRegistry::new_with_process_id(
+        BackendProcessId::new_v7(),
         Arc::new(runtime.clone()),
         registry_config(8),
     );
 
     assert_eq!(
         registry
-            .init_query(init_request_fixture(
-                51,
-                ATTEMPT_1,
-                LOCAL_START_EPOCH,
-                10_000,
-            ))
+            .init_query(init_request_fixture(51, ATTEMPT_1, 10_000,))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::QueryInitRejectedStaleBackend
+        QueryInitOutcome::QueryInitRejectedBackendProcessMismatch
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 0);
 }
@@ -1670,7 +1659,7 @@ fn query_lifecycle_init_abort_race_never_publishes_initialized_and_rolls_back_on
     let runtime = RecordingLocalRuntime::default();
     runtime.block_install();
     let registry = registry_with(runtime.clone(), 8);
-    let request = init_request_fixture(6, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(6, ATTEMPT_1, 10_000);
     let execution_id = request.manifest().execution_id();
     let digest = request
         .manifest()
@@ -1719,8 +1708,7 @@ fn query_lifecycle_initializing_to_terminating_publishes_metrics_immediately() {
     let metrics = Arc::new(RecordingMetricsSink::default());
     let registry =
         QueryLifecycleRegistry::new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
-            LOCAL_BACKEND_ID,
-            LOCAL_START_EPOCH,
+            local_process_id(),
             Arc::new(runtime.clone()),
             registry_config(8),
             Arc::new(ManualClock::default()),
@@ -1728,7 +1716,7 @@ fn query_lifecycle_initializing_to_terminating_publishes_metrics_immediately() {
             Arc::new(RejectedTerminalFallback),
             Arc::new(runtime.clone()),
         );
-    let request = init_request_fixture(7, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(7, ATTEMPT_1, 10_000);
     let execution_id = request.manifest().execution_id();
     let digest = request
         .manifest()
@@ -1817,7 +1805,7 @@ fn query_lifecycle_admission_rejects_outside_set_and_service_only_participant() 
         QueryLifecycleErrorCode::InvalidManifest
     );
 
-    let service_request = init_request_fixture(73, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let service_request = init_request_fixture(73, ATTEMPT_1, 10_000);
     let service_execution = service_request.manifest().execution_id();
     assert_eq!(
         registry
@@ -2301,8 +2289,7 @@ fn injected_terminal_stream_drops_use_unary_fallback_without_losing_outcomes() {
         config.terminal_ack_timeout = Duration::from_millis(1);
         let fallback = Arc::new(AcceptedTerminalFallback::default());
         let registry = QueryLifecycleRegistry::new_with_clock_metrics_and_terminal_fallback(
-            LOCAL_BACKEND_ID,
-            LOCAL_START_EPOCH,
+            local_process_id(),
             Arc::new(runtime),
             config,
             Arc::new(ManualClock::default()),
@@ -2375,8 +2362,7 @@ fn failure_drain_sweep_does_not_close_runtime_filter_before_terminal_capture() {
     let clock = Arc::new(ManualClock::default());
     let registry =
         QueryLifecycleRegistry::new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
-            LOCAL_BACKEND_ID,
-            LOCAL_START_EPOCH,
+            local_process_id(),
             Arc::new(runtime.clone()),
             config,
             Arc::clone(&clock) as Arc<dyn MonotonicClock>,
@@ -2507,8 +2493,7 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
     config.terminal_retention = Duration::from_millis(1);
     let registry =
         QueryLifecycleRegistry::new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
-            LOCAL_BACKEND_ID,
-            LOCAL_START_EPOCH,
+            local_process_id(),
             Arc::new(runtime.clone()),
             config,
             Arc::clone(&clock) as Arc<dyn MonotonicClock>,
@@ -2680,7 +2665,7 @@ fn query_lifecycle_registry_rejects_fragment_executor_without_exact_set() {
 #[test]
 fn query_lifecycle_attach_distinguishes_duplicate_active_from_terminated() {
     let registry = registry_with(RecordingLocalRuntime::default(), 8);
-    let request = init_request_fixture(77, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(77, ATTEMPT_1, 10_000);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
         registry
@@ -2731,13 +2716,12 @@ fn query_lifecycle_tombstone_capacity_evicts_only_oldest_tombstone() {
     let mut config = registry_config(8);
     config.tombstone_capacity = 2;
     let registry = QueryLifecycleRegistry::new_with_clock(
-        LOCAL_BACKEND_ID,
-        LOCAL_START_EPOCH,
+        local_process_id(),
         Arc::new(runtime),
         config,
         Arc::new(ManualClock::default()),
     );
-    let active = init_request_fixture(80, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let active = init_request_fixture(80, ATTEMPT_1, 10_000);
     assert_eq!(
         registry
             .init_query(active.clone())
@@ -2747,7 +2731,7 @@ fn query_lifecycle_tombstone_capacity_evicts_only_oldest_tombstone() {
     );
     let mut terminated = Vec::new();
     for query_low in [81, 82, 83] {
-        let request = init_request_fixture(query_low, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+        let request = init_request_fixture(query_low, ATTEMPT_1, 10_000);
         let execution_id = request.manifest().execution_id();
         assert_eq!(
             registry
@@ -2788,8 +2772,7 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
     config.terminal_retention = Duration::from_millis(1);
     let clock = Arc::new(ManualClock::default());
     let registry = QueryLifecycleRegistry::new_with_clock(
-        LOCAL_BACKEND_ID,
-        LOCAL_START_EPOCH,
+        local_process_id(),
         Arc::new(runtime.clone()),
         config,
         Arc::clone(&clock) as Arc<dyn MonotonicClock>,
@@ -2828,7 +2811,7 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
     clock.advance(Duration::from_millis(2));
     registry.sweep_expired(clock.now());
 
-    let second = init_request_fixture(812, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let second = init_request_fixture(812, ATTEMPT_1, 10_000);
     let second_execution = second.manifest().execution_id();
     assert_eq!(
         registry
@@ -2897,8 +2880,7 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
     config.terminal_retention = Duration::from_millis(1);
     let clock = Arc::new(ManualClock::default());
     let registry = QueryLifecycleRegistry::new_with_clock(
-        LOCAL_BACKEND_ID,
-        LOCAL_START_EPOCH,
+        local_process_id(),
         Arc::new(runtime),
         config,
         Arc::clone(&clock) as Arc<dyn MonotonicClock>,
@@ -2937,7 +2919,7 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
     clock.advance(Duration::from_millis(2));
     registry.sweep_expired(clock.now());
 
-    let eviction = init_request_fixture(815, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let eviction = init_request_fixture(815, ATTEMPT_1, 10_000);
     let eviction_execution = eviction.manifest().execution_id();
     assert_eq!(
         registry
@@ -3012,7 +2994,7 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
 #[test]
 fn query_lifecycle_tombstone_releases_active_capacity() {
     let registry = registry_with(RecordingLocalRuntime::default(), 1);
-    let first = init_request_fixture(84, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let first = init_request_fixture(84, ATTEMPT_1, 10_000);
     assert_eq!(
         registry
             .init_query(first.clone())
@@ -3037,12 +3019,7 @@ fn query_lifecycle_tombstone_releases_active_capacity() {
 
     assert_eq!(
         registry
-            .init_query(init_request_fixture(
-                85,
-                ATTEMPT_1,
-                LOCAL_START_EPOCH,
-                10_000,
-            ))
+            .init_query(init_request_fixture(85, ATTEMPT_1, 10_000,))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
         QueryInitOutcome::QueryInitApplied
@@ -3055,13 +3032,12 @@ fn query_lifecycle_tombstone_retention_reclaims_expired_tombstone_incrementally(
     let mut config = registry_config(8);
     config.tombstone_retention = Duration::from_millis(10);
     let registry = QueryLifecycleRegistry::new_with_clock(
-        LOCAL_BACKEND_ID,
-        LOCAL_START_EPOCH,
+        local_process_id(),
         Arc::new(RecordingLocalRuntime::default()),
         config,
         Arc::clone(&clock) as Arc<dyn MonotonicClock>,
     );
-    let terminated = init_request_fixture(86, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let terminated = init_request_fixture(86, ATTEMPT_1, 10_000);
     let terminated_id = terminated.manifest().execution_id();
     assert_eq!(
         registry
@@ -3105,8 +3081,7 @@ fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
     config.terminal_drain_timeout = Duration::from_millis(1);
     config.terminal_retention = Duration::from_millis(1);
     let registry = QueryLifecycleRegistry::new_with_clock(
-        LOCAL_BACKEND_ID,
-        LOCAL_START_EPOCH,
+        local_process_id(),
         Arc::new(RecordingLocalRuntime::default()),
         config,
         Arc::clone(&clock) as Arc<dyn MonotonicClock>,
@@ -3229,7 +3204,7 @@ fn query_lifecycle_pre_start_timeout_is_disarmed_by_first_accept_and_service_con
         .commit()
         .expect("fragment admission commits");
 
-    let service_request = init_request_fixture(92, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let service_request = init_request_fixture(92, ATTEMPT_1, 10_000);
     let service_execution = service_request.manifest().execution_id();
     assert_eq!(
         registry
@@ -3347,7 +3322,7 @@ fn query_lifecycle_registry_metrics_follow_state_rejection_and_termination() {
 fn query_lifecycle_registry_termination_is_first_wins_and_runs_local_cleanup_once() {
     let runtime = RecordingLocalRuntime::default();
     let registry = registry_with(runtime.clone(), 8);
-    let request = init_request_fixture(94, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(94, ATTEMPT_1, 10_000);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
         registry
@@ -3394,7 +3369,7 @@ fn query_lifecycle_registry_same_digest_concurrent_init_is_single_flight() {
     let runtime = RecordingLocalRuntime::default();
     runtime.block_install();
     let registry = registry_with(runtime.clone(), 8);
-    let request = init_request_fixture(95, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(95, ATTEMPT_1, 10_000);
 
     let first_registry = Arc::clone(&registry);
     let first_request = request.clone();
@@ -3430,7 +3405,7 @@ fn query_lifecycle_registry_runtime_filter_install_failure_rolls_back_workspace(
     let runtime = RecordingLocalRuntime::default();
     runtime.fail_install();
     let registry = registry_with(runtime.clone(), 1);
-    let request = init_request_fixture(96, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(96, ATTEMPT_1, 10_000);
     let execution_id = request.manifest().execution_id();
 
     assert_eq!(
@@ -3460,7 +3435,7 @@ fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_ret
     let runtime = RecordingLocalRuntime::default();
     let clock = Arc::new(ManualClock::default());
     let registry = registry_with_clock(runtime.clone(), 1, Arc::clone(&clock));
-    let request = init_request_fixture(961, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(961, ATTEMPT_1, 10_000);
     let execution_id = request.manifest().execution_id();
     assert_eq!(
         registry
@@ -3524,7 +3499,7 @@ fn query_lifecycle_install_failure_racing_abort_preserves_first_reason_without_p
     runtime.block_install();
     runtime.fail_install();
     let registry = registry_with(runtime.clone(), 8);
-    let request = init_request_fixture(97, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(97, ATTEMPT_1, 10_000);
     let execution_id = request.manifest().execution_id();
     let digest = request
         .manifest()
@@ -3580,7 +3555,7 @@ fn query_lifecycle_install_failure_racing_abort_preserves_first_reason_without_p
 fn query_lifecycle_registry_abort_before_init_leaves_fail_closed_tombstone() {
     let runtime = RecordingLocalRuntime::default();
     let registry = registry_with(runtime.clone(), 8);
-    let request = init_request_fixture(98, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
+    let request = init_request_fixture(98, ATTEMPT_1, 10_000);
     let execution_id = request.manifest().execution_id();
     registry
         .abort_query(

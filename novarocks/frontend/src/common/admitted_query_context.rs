@@ -315,10 +315,13 @@ impl<'a> QueryPreparationContext<'a> {
 
 #[cfg(test)]
 mod tests {
+    use novarocks_proto::lifecycle::QueryControlEndpoint;
+    use novarocks_proto::membership::BackendProcessDescriptor;
+    use novarocks_types::BackendProcessId;
+
     use super::*;
     use crate::common::backend_topology::LiveBackendTarget;
     use crate::common::query_cancellation::QueryCancellationSource;
-    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 
     #[test]
     fn lake_publication_policy_requires_a_strict_gc_age_and_clamps_deadlines() {
@@ -360,8 +363,13 @@ mod tests {
             9,
             vec![LiveBackendTarget::new(
                 7,
-                RuntimeEndpoint::parse("127.0.0.1:9030").expect("endpoint"),
-                2,
+                BackendProcessDescriptor::new(
+                    BackendProcessId::new_v7(),
+                    QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid loopback endpoint"),
+                    "test-deployment",
+                    "test-build",
+                )
+                .expect("valid test descriptor"),
             )],
         )
         .expect("valid snapshot");

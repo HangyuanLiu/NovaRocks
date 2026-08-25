@@ -1244,6 +1244,9 @@ fn test_request_context_with_role(
     };
     use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
     use crate::common::query_cancellation::QueryCancellationSource;
+    use novarocks_proto::lifecycle::QueryControlEndpoint;
+    use novarocks_proto::membership::BackendProcessDescriptor;
+    use novarocks_types::BackendProcessId;
 
     let cancellation = QueryCancellationSource::new();
     RequestContext::new(
@@ -1261,8 +1264,14 @@ fn test_request_context_with_role(
                 0,
                 vec![LiveBackendTarget::new(
                     0,
-                    "127.0.0.1:9030".parse().expect("loopback test backend"),
-                    1,
+                    BackendProcessDescriptor::new(
+                        BackendProcessId::new_v7(),
+                        QueryControlEndpoint::new("127.0.0.1", 9030)
+                            .expect("valid loopback endpoint"),
+                        "test-deployment",
+                        "test-build",
+                    )
+                    .expect("valid test descriptor"),
                 )],
             )
             .expect("non-empty test topology"),

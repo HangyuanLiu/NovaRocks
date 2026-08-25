@@ -74,6 +74,9 @@ service NovaRocksGrpc {
   // binding generation. Existing query leases may drain.
   rpc RetireConnectorExecutionBinding(RetireConnectorExecutionBindingRequest)
       returns (RetireConnectorExecutionBindingResponse);
+  // Backend registration lease. The FE verifies the claimed endpoint through
+  // the separate FE-pull Heartbeat path before the backend is eligible.
+  rpc AnnounceBackend(AnnounceBackendRequest) returns (AnnounceBackendResponse);
   // FE-pull cluster heartbeat (unary). Consumer: src/runtime/heartbeat_mgr.rs.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
 
@@ -96,10 +99,55 @@ message QueryControlEndpoint {
   uint32 port = 2;
 }
 
-message ParticipantBackendIdentity {
-  uint64 backend_id = 1;
+message BackendProcessId {
+  bytes value = 1;  // exactly 16 non-nil UUID-v7 bytes
+}
+
+enum BackendReportedState {
+  BACKEND_REPORTED_STATE_UNSPECIFIED = 0;
+  BACKEND_REPORTED_STATE_RUNNING = 1;
+  BACKEND_REPORTED_STATE_DRAINING = 2;
+}
+
+message BackendProcessDescriptor {
+  BackendProcessId process_id = 1;
   QueryControlEndpoint endpoint = 2;
-  uint64 start_epoch = 3;
+  string deployment_id = 3;
+  string build_identity = 4;
+}
+
+message AnnounceBackendRequest {
+  BackendProcessDescriptor descriptor = 1;
+  BackendReportedState reported_state = 2;
+}
+
+message BackendAnnounceLease {
+  uint64 lease_ttl_ms = 1;
+}
+
+enum BackendAnnounceRejectionReason {
+  BACKEND_ANNOUNCE_REJECTION_REASON_UNSPECIFIED = 0;
+  BACKEND_ANNOUNCE_REJECTION_DESCRIPTOR_CONFLICT = 1;
+  BACKEND_ANNOUNCE_REJECTION_DEPLOYMENT_MISMATCH = 2;
+}
+
+message BackendAnnounceRejected {
+  BackendAnnounceRejectionReason reason = 1;
+  string safe_detail = 2;  // at most 512 UTF-8 bytes
+}
+
+message AnnounceBackendResponse {
+  oneof outcome {
+    BackendAnnounceLease accepted = 1;
+    BackendAnnounceRejected rejected = 2;
+  }
+}
+
+message ParticipantBackendIdentity {
+  reserved 1, 3;
+  reserved "backend_id", "start_epoch";
+  QueryControlEndpoint endpoint = 2;
+  BackendProcessId process_id = 4;
 }
 
 message ExchangeRouteManifest {
@@ -140,6 +188,8 @@ enum QueryInitOutcome {
   QUERY_INIT_REJECTED_CAPACITY = 5;
   QUERY_INIT_REJECTED_INVALID_MANIFEST = 6;
   QUERY_INIT_REJECTED_TERMINATED = 7;
+  QUERY_INIT_REJECTED_BACKEND_DRAINING = 8;
+  QUERY_INIT_REJECTED_BACKEND_PROCESS_MISMATCH = 9;
 }
 
 enum QueryTerminationReason {
@@ -848,16 +898,18 @@ message RetireConnectorExecutionBindingInternal {}
 
 // FE-pull heartbeat request. Consumer: src/runtime/heartbeat_mgr.rs.
 message HeartbeatRequest {
-  uint32 assigned_be_id = 1;  // id the FE assigns to this BE
-  int64 fe_epoch = 2;         // FE epoch for split-brain detection
+  reserved 1, 2;
+  reserved "assigned_be_id", "fe_epoch";
+  BackendProcessId expected_process_id = 3;
 }
 
 // BE heartbeat state returned to the FE poller.
 message HeartbeatResponse {
-  uint64 start_epoch = 1;  // BE process start epoch (restart detection)
-  string version = 2;      // Immutable Native build identity for FE/BE admission.
+  reserved 1, 2, 4;
+  reserved "start_epoch", "version", "status_code";
   uint32 num_cores = 3;    // available cores for scheduling
-  int32 status_code = 4;   // 0 == healthy
+  BackendProcessDescriptor descriptor = 5;
+  BackendReportedState reported_state = 6;
 }
 
 // Native recursive runtime profile. Replaces the flat thrift

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::common::backend_topology::{
     BackendQueryEvent, BackendQueryEventSink, LiveBackendTarget,
 };
-use novarocks_types::QueryId;
+use novarocks_types::{BackendProcessId, QueryId};
 
 use super::query_registry::FrontendQueryRegistry;
 
@@ -36,21 +36,19 @@ impl BackendQueryActivity {
         Self { registry }
     }
 
-    pub fn backend_lost(&self, backend_idx: usize) -> Vec<QueryId> {
+    pub fn backend_lost(&self, process_id: BackendProcessId) -> Vec<QueryId> {
         self.registry
-            .backend_failed(backend_idx, format!("backend {backend_idx} lost"))
+            .backend_failed(process_id, format!("backend process {process_id} lost"))
     }
 
     pub fn backend_restarted(
         &self,
-        backend_idx: usize,
-        old_epoch: u64,
-        new_epoch: u64,
+        old_process_id: BackendProcessId,
+        new_process_id: BackendProcessId,
     ) -> Vec<QueryId> {
         self.registry.backend_restarted(
-            backend_idx,
-            old_epoch,
-            format!("backend {backend_idx} restarted (epoch {old_epoch} -> {new_epoch})"),
+            old_process_id,
+            format!("backend process restarted ({old_process_id} -> {new_process_id})"),
         )
     }
 }
@@ -59,23 +57,22 @@ impl BackendQueryEventSink for BackendQueryActivity {
     fn on_backend_event(&self, event: BackendQueryEvent) {
         match event {
             BackendQueryEvent::Unavailable {
-                backend_idx,
-                reason,
+                process_id, reason, ..
             } => {
-                self.registry.backend_failed(backend_idx, reason);
+                self.registry.backend_failed(process_id, reason);
             }
             BackendQueryEvent::Restarted {
-                backend_idx,
-                old_epoch,
-                new_epoch,
+                old_process_id,
+                new_process_id,
+                ..
             } => {
-                self.backend_restarted(backend_idx, old_epoch, new_epoch);
+                self.backend_restarted(old_process_id, new_process_id);
             }
         }
     }
 
-    fn backend_has_active_queries(&self, backend_idx: usize) -> bool {
-        self.registry.backend_has_active_queries(backend_idx)
+    fn backend_has_active_queries(&self, process_id: BackendProcessId) -> bool {
+        self.registry.backend_has_active_queries(process_id)
     }
 
     fn replace_live_backends(&self, revision: u64, backends: Vec<LiveBackendTarget>) {

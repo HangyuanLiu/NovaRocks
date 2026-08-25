@@ -17,14 +17,33 @@
 
 use crate::{
     ParseError,
-    ast::{BackendStatement, ShowBackends, Statement},
+    ast::{ShowBackends, Statement},
     token::Keyword,
 };
 
 use super::StatementParser;
 
 /// `show-backends ::= SHOW BACKENDS`
-pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseError> {
+pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<Statement>, ParseError> {
+    if !parser.current_is_word("SHOW") {
+        return Ok(None);
+    }
+    if !parser.peek_word(1, "BACKENDS") {
+        if [
+            "ANALYZE",
+            "TABLE",
+            "CREATE",
+            "BASIC",
+            "HISTOGRAM",
+            "ALTER",
+            "MATERIALIZED",
+        ]
+        .iter()
+        .any(|word| parser.peek_word(1, word))
+        {
+            return Ok(None);
+        }
+    }
     let start = parser.current_span().start();
     parser.advance(); // SHOW
     skip_trivia(parser);
@@ -33,11 +52,9 @@ pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Statement, P
     }
     let end = parser.current_span().end();
     parser.advance();
-    Ok(Statement::Backend(BackendStatement::ShowBackends(
-        ShowBackends {
-            span: crate::Span::new(start, end),
-        },
-    )))
+    Ok(Some(Statement::ShowBackends(ShowBackends {
+        span: crate::Span::new(start, end),
+    })))
 }
 
 fn skip_trivia(parser: &mut StatementParser<'_, '_>) {
