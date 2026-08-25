@@ -171,7 +171,14 @@ where
         .take(COMMIT_RETRY_MAX_ATTEMPTS)
     {
         if let Some(before_attempt) = before_attempt {
-            before_attempt(&current).map_err(|detail| FencedSubmitError::Failed { detail })?;
+            // The guard runs entirely against the locally loaded base before
+            // an action is staged or a catalog request is sent. Its failure is
+            // therefore a definite non-publication (for ADD FILES this is the
+            // refreshed-base duplicate-file check), not a response-unknown
+            // commit failure.
+            before_attempt(&current).map_err(|detail| FencedSubmitError::Failed {
+                detail: format!("catalog commit conflict: {detail}"),
+            })?;
         }
         let staged = Arc::clone(&action)
             .commit(&current)

@@ -46,6 +46,13 @@ FROM VALUES
   ('alpha', CAST(11 AS BIGINT)),
   ('beta', CAST(22 AS BIGINT))
 AS source(old_note, old_id);
+
+INSERT OVERWRITE DIRECTORY 's3a://warehouse/c2-add-files-no-mapping-${uuid0}'
+USING parquet
+SELECT old_note, old_id
+FROM VALUES
+  ('gamma', CAST(33 AS BIGINT))
+AS source(old_note, old_id);
 SPARK_SQL
 "${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-sql.sh" "$tmp_sql"
 printf 'SPARK_SQL_OK\n'
@@ -64,10 +71,10 @@ FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_${uuid0
 ORDER BY new_id;
 
 -- query 4
--- The frontend-owned source scope is permanently TableOwned after the first
--- successful registration, so a second statement is rejected before it can
--- re-enter provider listing/commit.
--- @expect_error=source scope is owned by operation
+-- A second statement reaches the refreshed target base and is rejected by the
+-- lake-side duplicate-file validation; no frontend source-scope ledger is a
+-- correctness authority.
+-- @expect_error=source already exists in the target table
 ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_${uuid0}
   ADD FILES FROM 's3://warehouse/c2-add-files-${uuid0}';
 
@@ -91,7 +98,7 @@ CREATE TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files
 -- query 8
 -- @expect_error=schema.name-mapping.default
 ALTER TABLE iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.c2_add_files_no_mapping_${uuid0}
-  ADD FILES FROM 's3://warehouse/c2-add-files-${uuid0}';
+  ADD FILES FROM 's3://warehouse/c2-add-files-no-mapping-${uuid0}';
 
 -- query 9
 -- @skip_result_check=true

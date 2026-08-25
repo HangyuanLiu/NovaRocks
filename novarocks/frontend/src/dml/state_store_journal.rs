@@ -34,17 +34,16 @@ use uuid::Uuid;
 use crate::dml::error::DmlError;
 use crate::dml::journal::{DmlIntentAdmissionValidator, DmlMutationAuthority, OperationJournal};
 use crate::dml::model::{
-    AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesDispatchCertainty,
-    AddFilesLifecyclePhase, AddFilesLifecycleRecord, AddFilesMutationRequest, AddFilesSourceAction,
-    CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
-    ConnectorWriteFinalizationRecord, ConnectorWriteLifecycleRecord, CreatePreparingRequest,
-    CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord,
-    DML_COORDINATION_RESOURCE_CODEC_VERSION, DML_CTAS_FACT_ENCODED_LIMIT,
-    DML_CTAS_TOTAL_FACT_ENCODED_LIMIT, DML_EXTERNAL_FACT_ENCODED_LIMIT,
-    DML_FOREGROUND_RECOVERY_VISIBILITY_MS, DML_OPERATION_SCHEMA_VERSION,
-    DML_RECOVERY_DUE_SCHEMA_VERSION, DML_RECOVERY_PAGE_SIZE, DML_RECOVERY_SHARD_COUNT,
-    DML_UNFINISHED_SCHEMA_VERSION, DmlCoordinationClaimRequest, DmlCtasRecoveryMutationRequest,
-    DmlCtasRecoveryRecord, DmlDirectMutationFenceMutationRequest,
+    AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesLifecyclePhase, AddFilesLifecycleRecord,
+    AddFilesMutationRequest, AddFilesSourceAction, CTAS_CREATE_POLICY_FAIL_IF_EXISTS,
+    CTAS_CREATE_POLICY_NO_OP_IF_EXISTS, ConnectorWriteFinalizationRecord,
+    ConnectorWriteLifecycleRecord, CreatePreparingRequest, CreateStatementOperationRequest,
+    CtasSagaPhase, CtasSagaRecord, DML_COORDINATION_RESOURCE_CODEC_VERSION,
+    DML_CTAS_FACT_ENCODED_LIMIT, DML_CTAS_TOTAL_FACT_ENCODED_LIMIT,
+    DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_FOREGROUND_RECOVERY_VISIBILITY_MS,
+    DML_OPERATION_SCHEMA_VERSION, DML_RECOVERY_DUE_SCHEMA_VERSION, DML_RECOVERY_PAGE_SIZE,
+    DML_RECOVERY_SHARD_COUNT, DML_UNFINISHED_SCHEMA_VERSION, DmlCoordinationClaimRequest,
+    DmlCtasRecoveryMutationRequest, DmlCtasRecoveryRecord, DmlDirectMutationFenceMutationRequest,
     DmlDirectMutationFenceReceiptRecord, DmlExternalFenceMutationRequest,
     DmlExternalFenceReceiptRecord, DmlHistoricalDataMutationRecoveryMutationRequest,
     DmlHistoricalDataMutationRecoveryRecord, DmlHistoricalWriteRecoveryMutationRequest,
@@ -3919,29 +3918,11 @@ fn validate_add_files_record(record: &AddFilesLifecycleRecord) -> Result<(), Dml
             "ADD FILES dispatched lifecycle phase requires an exact connector owner",
         ));
     }
-    if matches!(
-        record.phase,
-        AddFilesLifecyclePhase::CommitUnknown | AddFilesLifecyclePhase::Reconciling
-    ) && record.source_ownership != SourceScopeOwnership::Frozen
-    {
-        return Err(DmlError::journal_corruption(
-            "ADD FILES unknown lifecycle must keep its source scope frozen",
-        ));
-    }
-    if record.phase == AddFilesLifecyclePhase::Committed
-        && record.source_ownership != SourceScopeOwnership::TableOwned
-    {
-        return Err(DmlError::journal_corruption(
-            "ADD FILES committed lifecycle must transfer source ownership to the table",
-        ));
-    }
-    if record.dispatch_certainty == AddFilesDispatchCertainty::PossiblyDispatched
-        && record.source_ownership == SourceScopeOwnership::Unclaimed
-    {
-        return Err(DmlError::journal_corruption(
-            "possibly dispatched ADD FILES operation cannot release its source scope",
-        ));
-    }
+    // `source_ownership` is retained only to decode historical records. The
+    // source GC domain is an immutable plan fact, while refreshed-base
+    // duplicate validation in the catalog commit is the sole correctness
+    // authority for ownership transfer. A local ledger state must therefore
+    // never classify an otherwise valid publication as corrupt.
     Ok(())
 }
 
