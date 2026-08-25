@@ -480,6 +480,24 @@ pub enum StandardCtasPublishOutcome {
     },
 }
 
+/// The standard staged-create path never carries a takeover fence. Keeping a
+/// separate outcome type prevents the retired authority carrier from leaking
+/// back into the crash-only CTAS frontier while legacy code is being removed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StandardCtasWriteOutcome {
+    Completed {
+        completion: ConnectorWriteOperationCompletion,
+        execution_identity: [u8; 32],
+    },
+    KnownUncommitted {
+        failure: CtasFailure,
+    },
+    CommitUnknown {
+        failure: CtasFailure,
+        evidence: ExternalMutationEvidence,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CtasWriteOutcome {
     Completed {
@@ -555,8 +573,11 @@ pub trait CtasEngine: Send + Sync {
         Err(standard_ctas_unsupported())
     }
 
-    fn execute_standard_ctas_write(&self, _prepared: &dyn CtasPreparedWrite) -> CtasWriteOutcome {
-        CtasWriteOutcome::KnownUncommitted {
+    fn execute_standard_ctas_write(
+        &self,
+        _prepared: &dyn CtasPreparedWrite,
+    ) -> StandardCtasWriteOutcome {
+        StandardCtasWriteOutcome::KnownUncommitted {
             failure: standard_ctas_unsupported(),
         }
     }
@@ -2427,8 +2448,36 @@ impl CtasEngine for DmlExecutionKernel {
         self.bind_ctas_write_native_bundle(prepared, native_bundle)
     }
 
-    fn execute_standard_ctas_write(&self, prepared: &dyn CtasPreparedWrite) -> CtasWriteOutcome {
-        self.execute_ctas_write(prepared)
+    fn execute_standard_ctas_write(
+        &self,
+        prepared: &dyn CtasPreparedWrite,
+    ) -> StandardCtasWriteOutcome {
+        match self.execute_ctas_write(prepared) {
+            CtasWriteOutcome::Completed {
+                completion,
+                execution_identity,
+                established_fence: None,
+            } => StandardCtasWriteOutcome::Completed {
+                completion,
+                execution_identity,
+            },
+            CtasWriteOutcome::Completed {
+                established_fence: Some(_),
+                ..
+            } => StandardCtasWriteOutcome::KnownUncommitted {
+                failure: CtasFailure {
+                    kind: CtasFailureKind::Internal,
+                    message: "standard CTAS writer returned retired fence authority".to_string(),
+                    user_error: None,
+                },
+            },
+            CtasWriteOutcome::KnownUncommitted { failure } => {
+                StandardCtasWriteOutcome::KnownUncommitted { failure }
+            }
+            CtasWriteOutcome::CommitUnknown {
+                failure, evidence, ..
+            } => StandardCtasWriteOutcome::CommitUnknown { failure, evidence },
+        }
     }
 
     fn prepare_standard_publish_ctas(

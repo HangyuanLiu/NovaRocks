@@ -28,6 +28,7 @@ use crate::query_execution::dml::ctas::{
     CtasTargetPreflightOutcome, CtasWriteOutcome, PrepareCtasSourceRequest, PreparedCtasSource,
     PreparedCtasTarget, PreparedCtasWrite, PreparedStandardCtasTarget, PreparedStandardCtasWrite,
     StandardCtasPublishOutcome, StandardCtasStageOutcome, StandardCtasTargetFacts,
+    StandardCtasWriteOutcome,
 };
 use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
@@ -388,24 +389,10 @@ fn execute_standard_foreground_write(
     )?;
     active.check_before_dispatch()?;
     match engine.execute_standard_ctas_write(prepared.handle.as_ref()) {
-        CtasWriteOutcome::Completed {
+        StandardCtasWriteOutcome::Completed {
             completion,
             execution_identity,
-            established_fence,
         } => {
-            if established_fence.is_some() {
-                return finish_standard_known_uncommitted(
-                    active,
-                    CtasSagaPhase::Failed,
-                    FactSlot::Write,
-                    CtasFailure {
-                        kind: CtasFailureKind::Internal,
-                        message: "standard CTAS writer returned legacy fence authority".to_string(),
-                        user_error: None,
-                    },
-                    None,
-                );
-            }
             validate_standard_completion(
                 &active.stored,
                 &source,
@@ -433,42 +420,23 @@ fn execute_standard_foreground_write(
             )?;
             execute_standard_publish(engine, active, target, publication_id, completion)
         }
-        CtasWriteOutcome::KnownUncommitted { failure } => finish_standard_known_uncommitted(
-            active,
-            CtasSagaPhase::Failed,
-            FactSlot::Write,
-            failure,
-            None,
-        ),
-        CtasWriteOutcome::CommitUnknown {
-            failure,
-            evidence,
-            established_fence,
-        } => {
-            if established_fence.is_some() {
-                return finish_standard_unknown(
-                    active,
-                    CtasSagaPhase::WriteUnknown,
-                    FactSlot::Write,
-                    CtasFailure {
-                        kind: CtasFailureKind::Internal,
-                        message: "standard CTAS writer outcome included legacy fence authority"
-                            .to_string(),
-                        user_error: None,
-                    },
-                    evidence,
-                    "CTAS writer",
-                );
-            }
-            finish_standard_unknown(
+        StandardCtasWriteOutcome::KnownUncommitted { failure } => {
+            finish_standard_known_uncommitted(
                 active,
-                CtasSagaPhase::WriteUnknown,
+                CtasSagaPhase::Failed,
                 FactSlot::Write,
                 failure,
-                evidence,
-                "CTAS writer",
+                None,
             )
         }
+        StandardCtasWriteOutcome::CommitUnknown { failure, evidence } => finish_standard_unknown(
+            active,
+            CtasSagaPhase::WriteUnknown,
+            FactSlot::Write,
+            failure,
+            evidence,
+            "CTAS writer",
+        ),
     }
 }
 
