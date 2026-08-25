@@ -1348,6 +1348,9 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         let query_id = self.query_ids.next_query_id()?;
         let (first_request, first_completion, mut round_factory) = operation.into_parts();
         let first_revision = first_request.topology().revision();
+        let retry_deadline = first_request
+            .deadline()
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
         let first_execution_id = execution_id_for_round(query_id, 1)?;
         match self.execute_round(query_id, first_execution_id, first_request) {
             Ok(outcome) => first_completion.complete(outcome).map_err(failed),
@@ -1362,12 +1365,15 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                     return Err(first_error);
                 };
                 factory.permit_pre_ready_retry()?;
-                let fresh_topology = self.backend_topology.snapshot().map_err(|error| {
-                    DistributedQueryError::new(DistributedQueryErrorKind::Failed, error.to_string())
-                })?;
-                if fresh_topology.revision() <= first_revision {
-                    return Err(first_error);
-                }
+                let fresh_topology = self
+                    .backend_topology
+                    .wait_for_eligible_after(first_revision, retry_deadline)
+                    .map_err(|error| {
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::Failed,
+                            error.to_string(),
+                        )
+                    })?;
                 let replacement = factory.replan(fresh_topology)?;
                 let (replacement_request, replacement_completion, replacement_factory) =
                     replacement.into_parts();

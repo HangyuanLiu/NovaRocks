@@ -20,6 +20,7 @@
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::membership::{BackendProcessDescriptor, BackendReportedState};
@@ -36,6 +37,15 @@ pub trait BackendTopologyPort: Send + Sync + 'static {
         &self,
         expected: &BackendTopologySnapshot,
     ) -> Result<(), BackendTopologyValidationError>;
+
+    /// Wait for a newer non-empty eligible snapshot without extending the
+    /// statement's original deadline. This is used only between a fully
+    /// aborted pre-ready round and its one permitted replacement round.
+    fn wait_for_eligible_after(
+        &self,
+        revision: u64,
+        deadline: Instant,
+    ) -> Result<BackendTopologySnapshot, BackendTopologyError>;
 
     /// Records one successfully acknowledged Stage batch.  `fragment_count`
     /// remains separate from the batch boundary so service-only participants
@@ -430,6 +440,16 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
                 },
             )
         }
+    }
+
+    fn wait_for_eligible_after(
+        &self,
+        _revision: u64,
+        _deadline: Instant,
+    ) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+        Err(BackendTopologyError::Unavailable {
+            message: "backend topology port is not installed".to_string(),
+        })
     }
 
     fn record_successful_stage(&self, _backend_idx: usize, _fragment_count: usize) {}

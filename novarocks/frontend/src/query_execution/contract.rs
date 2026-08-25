@@ -945,7 +945,13 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         &self,
         operation: crate::query_execution::completion::PreparedDistributedQuery,
     ) -> Result<crate::runtime::statement_result::StatementResult, DistributedQueryError> {
-        let (request, completion, _round_factory) = operation.into_parts();
+        let (request, completion, round_factory) = operation.into_parts();
+        if round_factory.is_some() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "injected coordinator does not implement statement-level pre-ready replan",
+            ));
+        }
         let outcome = self.execute(request)?;
         completion
             .complete(outcome)

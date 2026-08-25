@@ -998,6 +998,38 @@ impl FrontendQuerySession {
                 ));
             }
         };
+        let topology = if topology.targets().is_empty()
+            && matches!(
+                parsed_statement,
+                ParsedStatement::Query(_)
+                    | ParsedStatement::ExplainQuery(_)
+                    | ParsedStatement::Dml(_)
+            ) {
+            let wait_deadline =
+                deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
+            let wait_after_revision = topology.revision();
+            let topology_service = Arc::clone(&self.service.topology);
+            match task::spawn_blocking(move || {
+                topology_service.wait_for_eligible_after(wait_after_revision, wait_deadline)
+            })
+            .await
+            {
+                Ok(Ok(snapshot)) => snapshot,
+                Ok(Err(error)) => {
+                    let _ = active.finish();
+                    return Err(QueryServiceError::new(
+                        QueryServiceErrorKind::Internal,
+                        error.to_string(),
+                    ));
+                }
+                Err(error) => {
+                    let _ = active.finish();
+                    return Err(internal_error(error.to_string()));
+                }
+            }
+        } else {
+            topology
+        };
         let mut optimizer_settings = state.optimizer_settings;
         // A session `SET` wins; otherwise admission freezes the process budget so
         // SQL costing never consults a process-global configuration.

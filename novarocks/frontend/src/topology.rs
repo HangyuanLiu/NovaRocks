@@ -170,6 +170,7 @@ pub(crate) struct ClusterBackendService {
     heartbeat_round: Mutex<()>,
     heartbeat_signal: Mutex<HeartbeatSignal>,
     heartbeat_wake: Condvar,
+    topology_wake: Condvar,
     #[cfg(test)]
     _test_runtime_owner: Option<Arc<tokio::runtime::Runtime>>,
 }
@@ -217,6 +218,7 @@ impl ClusterBackendService {
                 stopping: false,
             }),
             heartbeat_wake: Condvar::new(),
+            topology_wake: Condvar::new(),
             #[cfg(test)]
             _test_runtime_owner: None,
         }
@@ -618,6 +620,7 @@ impl ClusterBackendService {
         if let Some(events) = self.query_events.lock().unwrap().as_ref() {
             events.replace_live_backends(revision, live);
         }
+        self.topology_wake.notify_all();
     }
 
     fn refresh_expired_announce_leases(&self, now: std::time::Instant) -> bool {
@@ -684,6 +687,42 @@ impl BackendTopologyPort for ClusterBackendService {
             );
         }
         Ok(())
+    }
+    fn wait_for_eligible_after(
+        &self,
+        revision: u64,
+        deadline: std::time::Instant,
+    ) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| BackendTopologyError::Unavailable {
+                message: "lock frontend topology failed".to_string(),
+            })?;
+        loop {
+            if let Some(message) = &state.terminal_error {
+                return Err(BackendTopologyError::Unavailable {
+                    message: message.clone(),
+                });
+            }
+            let snapshot = BackendTopologySnapshot::try_new(state.revision, live_targets(&state))?;
+            if snapshot.revision() > revision && !snapshot.targets().is_empty() {
+                return Ok(snapshot);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(BackendTopologyError::Unavailable {
+                    message: format!(
+                        "timed out waiting for an eligible backend topology revision after {revision}"
+                    ),
+                });
+            }
+            let (next, _) = self
+                .topology_wake
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .expect("frontend topology wait lock");
+            state = next;
+        }
     }
     fn record_successful_stage(&self, backend_idx: usize, fragment_count: usize) {
         let mut state = self.state.lock().unwrap();
@@ -938,6 +977,36 @@ mod tests {
         assert!(service.snapshot().unwrap().targets().is_empty());
         verify(&service, &descriptor);
         assert_eq!(service.snapshot().unwrap().targets().len(), 1);
+    }
+
+    #[test]
+    fn wait_for_eligible_after_requires_a_new_verified_revision() {
+        let service = Arc::new(ClusterBackendService::new_transient_for_test(1));
+        let revision = service.snapshot().expect("initial snapshot").revision();
+        let waiter = {
+            let service = Arc::clone(&service);
+            std::thread::spawn(move || {
+                service.wait_for_eligible_after(
+                    revision,
+                    std::time::Instant::now() + std::time::Duration::from_secs(1),
+                )
+            })
+        };
+        let descriptor = descriptor("127.0.0.1:9070".parse().unwrap());
+        service
+            .record_announce(descriptor.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &descriptor);
+
+        let snapshot = waiter
+            .join()
+            .expect("topology waiter must not panic")
+            .expect("new verified backend must wake waiter");
+        assert!(snapshot.revision() > revision);
+        assert_eq!(
+            snapshot.targets()[0].process_id().unwrap(),
+            descriptor.process_id().unwrap()
+        );
     }
     #[test]
     fn replacement_is_pending_until_pull_and_is_the_only_restart_event() {
