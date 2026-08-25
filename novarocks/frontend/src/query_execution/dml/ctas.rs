@@ -2110,6 +2110,41 @@ fn write_commit_unknown(
     }
 }
 
+fn standard_write_commit_unknown(
+    prepared: &CorePreparedCtasWrite,
+    session: &crate::query_execution::write_operation::ConnectorWriteOperationSession,
+    message: impl Into<String>,
+) -> StandardCtasWriteOutcome {
+    let mut failure_message = message.into();
+    let evidence = {
+        let mut stored = prepared
+            .write_unknown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stored.is_none() {
+            let evidence = write_staging_evidence(session);
+            if let Err(error) = prepared.target.mark_write_unknown() {
+                failure_message.push_str(&format!(
+                    "; standard CTAS target rejected write-unknown transition: {error}"
+                ));
+            }
+            *stored = Some(evidence);
+        }
+        stored
+            .as_ref()
+            .expect("CTAS evidence was installed")
+            .clone()
+    };
+    StandardCtasWriteOutcome::CommitUnknown {
+        failure: CtasFailure {
+            kind: CtasFailureKind::Unavailable,
+            message: failure_message,
+            user_error: None,
+        },
+        evidence,
+    }
+}
+
 impl CtasEngine for DmlExecutionKernel {
     fn preflight_standard_ctas_target(
         &self,
@@ -2511,31 +2546,98 @@ impl CtasEngine for DmlExecutionKernel {
         &self,
         prepared: &dyn CtasPreparedWrite,
     ) -> StandardCtasWriteOutcome {
-        match self.execute_ctas_write(prepared) {
-            CtasWriteOutcome::Completed {
-                completion,
-                execution_identity,
-                established_fence: None,
-            } => StandardCtasWriteOutcome::Completed {
-                completion,
-                execution_identity,
+        let prepared = match downcast_write(prepared) {
+            Ok(prepared) => prepared,
+            Err(failure) => return StandardCtasWriteOutcome::KnownUncommitted { failure },
+        };
+        let result = prepared
+            .gate
+            .execute_once(prepared.execution_identity, |_, execution| {
+                let request = prepared
+                    .prepared
+                    .lock()
+                    .map_err(|error| format!("CTAS prepared write lock: {error}"))?
+                    .take()
+                    .ok_or_else(|| "CTAS prepared write was already consumed".to_string())?;
+                let cohort_id = request.write_cohort_id();
+                let session = prepared
+                    .state
+                    .query_execution()
+                    .begin_write_operation(request.registration(), request.lease())
+                    .map_err(|error| error.to_string())?;
+                *prepared
+                    .write_session
+                    .lock()
+                    .map_err(|error| format!("CTAS write session lock: {error}"))? =
+                    Some(session.clone());
+                let registration =
+                    crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
+                        session.clone(),
+                        cohort_id,
+                    )
+                    .map_err(|error| error.to_string())?;
+                let request = request
+                    .into_request(&execution, registration)
+                    .map_err(|error| error.to_string())?;
+                let outcome = match prepared.state.query_execution().execute(request) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return Ok(standard_write_commit_unknown(
+                            prepared,
+                            &session,
+                            format!("CTAS writer dispatch outcome is unknown: {error}"),
+                        ));
+                    }
+                };
+                let write = match outcome.into_write() {
+                    Ok(write) => write,
+                    Err(error) => {
+                        return Ok(standard_write_commit_unknown(
+                            prepared,
+                            &session,
+                            format!("CTAS writer terminal outcome is unknown: {error}"),
+                        ));
+                    }
+                };
+                let (_, _, _, completion) = write.into_parts_with_connector();
+                let Some(completion) = completion else {
+                    return Ok(standard_write_commit_unknown(
+                        prepared,
+                        &session,
+                        "CTAS writer returned no complete generic completion",
+                    ));
+                };
+                let sealed = match completion.sealed_operation_completion() {
+                    Ok(sealed) => sealed,
+                    Err(error) => {
+                        return Ok(standard_write_commit_unknown(
+                            prepared,
+                            &session,
+                            format!("CTAS writer aggregate is incomplete: {error}"),
+                        ));
+                    }
+                };
+                if let Err(error) = prepared.target.bind_write(sealed.clone()) {
+                    return Ok(standard_write_commit_unknown(
+                        prepared,
+                        &session,
+                        format!("CTAS target write binding outcome is unknown: {error}"),
+                    ));
+                }
+                *prepared
+                    .completion
+                    .lock()
+                    .map_err(|error| format!("CTAS completion lock: {error}"))? = Some(completion);
+                Ok(StandardCtasWriteOutcome::Completed {
+                    completion: sealed,
+                    execution_identity: prepared.execution_identity,
+                })
+            });
+        match result {
+            Ok(outcome) => outcome,
+            Err(message) => StandardCtasWriteOutcome::KnownUncommitted {
+                failure: internal_failure(message),
             },
-            CtasWriteOutcome::Completed {
-                established_fence: Some(_),
-                ..
-            } => StandardCtasWriteOutcome::KnownUncommitted {
-                failure: CtasFailure {
-                    kind: CtasFailureKind::Internal,
-                    message: "standard CTAS writer returned retired fence authority".to_string(),
-                    user_error: None,
-                },
-            },
-            CtasWriteOutcome::KnownUncommitted { failure } => {
-                StandardCtasWriteOutcome::KnownUncommitted { failure }
-            }
-            CtasWriteOutcome::CommitUnknown {
-                failure, evidence, ..
-            } => StandardCtasWriteOutcome::CommitUnknown { failure, evidence },
         }
     }
 
