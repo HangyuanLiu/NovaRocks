@@ -786,13 +786,12 @@ mod tests {
         CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorExecutionBindingKey,
         ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
         ConnectorExecutionProviderKind, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorProviderId,
-        ConnectorRequestContext, ConnectorStagedReport, ConnectorStagedReportSummary,
-        ConnectorTableHandle, ConnectorWriteBaseVersion, ConnectorWriteControl,
-        ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-        ConnectorWriteIntent, ConnectorWritePlan, ConnectorWritePlanningRequest,
-        ConnectorWritePreparation, ConnectorWriterHandle, ConnectorWriterIdentity,
-        ConnectorWriterTerminalState, ExternalMutationFinalization,
+        ConnectorProviderId, ConnectorRequestContext, ConnectorStagedReport,
+        ConnectorStagedReportSummary, ConnectorTableHandle, ConnectorWriteBaseVersion,
+        ConnectorWriteControl, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+        ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWritePlan,
+        ConnectorWritePlanningRequest, ConnectorWritePreparation, ConnectorWriterHandle,
+        ConnectorWriterIdentity, ConnectorWriterTerminalState, ExternalMutationFinalization,
     };
 
     use super::*;
