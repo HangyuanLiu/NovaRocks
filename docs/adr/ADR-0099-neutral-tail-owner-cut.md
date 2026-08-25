@@ -2,9 +2,9 @@
 id: ADR-0099
 title: "Neutral tail owner cut"
 domain: [crate-boundary]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0108
 date: 2026-08-19
 provenance:
   - "implementation: neutral-tail owner cut; PR number pending"

@@ -58,6 +58,7 @@ where
     Backend: Future<Output = anyhow::Result<()>>,
     Shutdown: Future<Output = ()>,
 {
+    // Design: ADR-0108 (docs/adr/ADR-0108-native-role-launch-and-management-surfaces.md)
     tokio::pin!(frontend);
     tokio::pin!(backend);
     let primary = tokio::select! {

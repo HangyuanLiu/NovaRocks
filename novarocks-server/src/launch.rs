@@ -171,6 +171,7 @@ pub enum ResolvedServerLaunch {
 }
 
 pub fn resolve_server_launch(args: StandaloneLaunchArgs) -> Result<ResolvedServerLaunch> {
+    // Design: ADR-0108 (docs/adr/ADR-0108-native-role-launch-and-management-surfaces.md)
     match args.mode {
         ServerLaunchMode::Fe => Ok(ResolvedServerLaunch::Fe(load_role_config(
             ServerLaunchMode::Fe,

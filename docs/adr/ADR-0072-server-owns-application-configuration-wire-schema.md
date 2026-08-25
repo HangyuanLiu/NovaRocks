@@ -2,9 +2,9 @@
 id: ADR-0072
 title: "Server owns the application configuration wire schema and projects resolved domain inputs"
 domain: [configuration]
-status: active
+status: superseded
 supersedes: [ADR-0059]
-superseded-by: null
+superseded-by: ADR-0108
 date: 2026-08-14
 provenance:
   - "discussion: 2026-08-14 application configuration wire and resolved-value ownership after Core engine retirement"
