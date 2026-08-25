@@ -26,9 +26,7 @@ use crate::PROVIDER_ID;
 use crate::catalog_config::parse_catalog_configuration_with_object_store_binding;
 use crate::catalog_control::IcebergCatalogControlState;
 use crate::catalog_control::cleanup_maintenance::IcebergCleanupMaintenanceAdapter;
-use crate::catalog_control::ctas_fenced_publication::IcebergCtasFencedPublication;
 use crate::catalog_control::data_mutation::IcebergDataMutationAdapter;
-use crate::catalog_control::historical_ctas_recovery::IcebergHistoricalCtasRecovery;
 use crate::catalog_control::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use crate::catalog_control::staged_create::IcebergStagedCreateAdapter;
 use crate::commit::IcebergWriteControl;
@@ -189,21 +187,6 @@ impl ConnectorControlFactory for IcebergControlFactory {
         } else {
             None
         };
-        let ctas_staged_publication = if unpublished.runtime.has_ctas_fenced_publication() {
-            Some(Arc::new(IcebergCtasFencedPublication::try_new(
-                Arc::clone(&provider),
-                Arc::clone(&write_control),
-            )?))
-        } else {
-            None
-        };
-        let historical_ctas_recovery = if unpublished.runtime.has_ctas_fenced_publication() {
-            Some(Arc::new(IcebergHistoricalCtasRecovery::try_new(
-                Arc::clone(&provider),
-            )?))
-        } else {
-            None
-        };
         // One owner implements both MV control facets: fencing and attempt
         // discovery share the provider, the stable resource vocabulary, and the
         // same freshness requirement.
@@ -224,16 +207,6 @@ impl ConnectorControlFactory for IcebergControlFactory {
                 staged_create.map(|capability| capability as Arc<dyn novarocks_spi::connector::ConnectorStagedCreate>),
                 Some(write_control),
                 Some(provider.clone()),
-            )?
-            .try_with_ctas_staged_publication(ctas_staged_publication.map(|capability| {
-                capability
-                    as Arc<dyn novarocks_spi::connector::ConnectorCtasStagedPublication>
-            }))?
-            .try_with_historical_ctas_staged_publication_recovery(
-                historical_ctas_recovery.map(|capability| {
-                    capability
-                        as Arc<dyn novarocks_spi::connector::ConnectorHistoricalCtasStagedPublicationRecovery>
-                }),
             )?
             .try_with_staged_publication_recovery(Some(provider.clone()))?
             .try_with_historical_maintenance_recovery(Some(Arc::new(
@@ -708,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn rest_factory_installs_fenced_ctas_only_for_exact_server_advertisement() {
+    fn rest_factory_does_not_install_retired_fenced_ctas_capabilities() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let binding = crate::access_binding::IcebergReadBinding::new(
             None,
@@ -730,12 +703,12 @@ mod tests {
             .expect("advertised REST control");
         server.join().expect("config server");
 
-        assert!(creation.binding().ctas_staged_publication().is_some());
+        assert!(creation.binding().ctas_staged_publication().is_none());
         assert!(
             creation
                 .binding()
                 .historical_ctas_staged_publication_recovery()
-                .is_some()
+                .is_none()
         );
     }
 
