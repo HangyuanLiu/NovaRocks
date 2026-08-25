@@ -123,6 +123,44 @@ static BACKEND_TOPOLOGY_REVISION: Lazy<IntGauge> = Lazy::new(|| {
     ))
     .expect("register novarocks_backend_topology_revision")
 });
+
+static PRE_READY_REPLAN_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+        "novarocks_pre_ready_replan_total",
+        "Total pre-ControlReady whole-round replans by typed topology reason.",
+        ),
+        &["reason"]
+    )
+    .expect("register novarocks_pre_ready_replan_total")
+});
+
+static PRE_READY_EFFECT_GATE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+        "novarocks_pre_ready_effect_gate_total",
+        "Total pre-ControlReady effect-gate decisions.",
+        ),
+        &["outcome"]
+    )
+    .expect("register novarocks_pre_ready_effect_gate_total")
+});
+
+static WAITING_FOR_BACKEND_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    Histogram::with_opts(HistogramOpts::new(
+        "novarocks_waiting_for_backend_seconds",
+        "Time spent waiting for a newer eligible backend topology revision.",
+    ))
+    .expect("register novarocks_waiting_for_backend_seconds")
+});
+
+static PRE_READY_REPLAN_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    Histogram::with_opts(HistogramOpts::new(
+        "novarocks_pre_ready_replan_seconds",
+        "Time spent rebuilding one replacement distributed round.",
+    ))
+    .expect("register novarocks_pre_ready_replan_seconds")
+});
 static FRONTEND_QUERY_LIFECYCLE_ATTEMPTS: Lazy<IntGauge> = Lazy::new(|| {
     IntGauge::with_opts(Opts::new(
         "novarocks_frontend_query_lifecycle_active_attempts",
@@ -200,6 +238,10 @@ impl FrontendMetricsRegistry {
             Box::new(BACKEND_ENDPOINT_OWNERSHIP.clone()),
             Box::new(BACKEND_ELIGIBLE.clone()),
             Box::new(BACKEND_TOPOLOGY_REVISION.clone()),
+            Box::new(PRE_READY_REPLAN_TOTAL.clone()),
+            Box::new(PRE_READY_EFFECT_GATE_TOTAL.clone()),
+            Box::new(WAITING_FOR_BACKEND_SECONDS.clone()),
+            Box::new(PRE_READY_REPLAN_SECONDS.clone()),
             Box::new(FRONTEND_QUERY_LIFECYCLE_ATTEMPTS.clone()),
             Box::new(FRONTEND_QUERY_LIFECYCLE_INIT.clone()),
             Box::new(FRONTEND_QUERY_LIFECYCLE_CONTROL.clone()),
@@ -234,6 +276,24 @@ pub(crate) fn observe_native_trust_transport_rejection(listener: &'static str) {
     NATIVE_TRUST_TRANSPORT_REJECTIONS
         .with_label_values(&[listener])
         .inc();
+}
+
+pub(crate) fn record_pre_ready_replan(reason: &'static str) {
+    PRE_READY_REPLAN_TOTAL.with_label_values(&[reason]).inc();
+}
+
+pub(crate) fn record_pre_ready_effect_gate(outcome: &'static str) {
+    PRE_READY_EFFECT_GATE_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+pub(crate) fn observe_waiting_for_backend(duration: Duration) {
+    WAITING_FOR_BACKEND_SECONDS.observe(duration.as_secs_f64());
+}
+
+pub(crate) fn observe_pre_ready_replan(duration: Duration) {
+    PRE_READY_REPLAN_SECONDS.observe(duration.as_secs_f64());
 }
 /// Publishes already-counted backend registry facts as neutral scalars.
 ///
@@ -458,6 +518,14 @@ fn refresh_frontend_gauges() {
     Lazy::force(&BACKEND_ENDPOINT_OWNERSHIP);
     Lazy::force(&BACKEND_ELIGIBLE);
     Lazy::force(&BACKEND_TOPOLOGY_REVISION);
+    Lazy::force(&PRE_READY_REPLAN_TOTAL);
+    Lazy::force(&PRE_READY_EFFECT_GATE_TOTAL);
+    Lazy::force(&WAITING_FOR_BACKEND_SECONDS);
+    Lazy::force(&PRE_READY_REPLAN_SECONDS);
+    Lazy::force(&PRE_READY_REPLAN_TOTAL);
+    Lazy::force(&PRE_READY_EFFECT_GATE_TOTAL);
+    Lazy::force(&WAITING_FOR_BACKEND_SECONDS);
+    Lazy::force(&PRE_READY_REPLAN_SECONDS);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_ATTEMPTS);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_INIT);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_CONTROL);
@@ -477,6 +545,22 @@ fn ensure_frontend_metric_label_families() {
     }
     for state in ["owned", "unowned", "unknown"] {
         let _ = BACKEND_ENDPOINT_OWNERSHIP.get_metric_with_label_values(&[state]);
+    }
+    for reason in ["topology_changed", "topology_ineligible", "replacement_ready"] {
+        let _ = PRE_READY_REPLAN_TOTAL.get_metric_with_label_values(&[reason]);
+    }
+    for outcome in ["allowed", "rejected"] {
+        let _ = PRE_READY_EFFECT_GATE_TOTAL.get_metric_with_label_values(&[outcome]);
+    }
+    for reason in [
+        "backend_draining",
+        "backend_process_mismatch",
+        "backend_not_eligible",
+    ] {
+        let _ = PRE_READY_REPLAN_TOTAL.get_metric_with_label_values(&[reason]);
+    }
+    for outcome in ["permitted", "rejected"] {
+        let _ = PRE_READY_EFFECT_GATE_TOTAL.get_metric_with_label_values(&[outcome]);
     }
     for outcome in [
         "applied",
@@ -531,6 +615,10 @@ mod tests {
         assert!(body.contains("novarocks_heartbeat_rtt_seconds"));
         assert!(body.contains("novarocks_backend_registry_entries"));
         assert!(body.contains("novarocks_backend_eligible"));
+        assert!(body.contains("novarocks_pre_ready_replan_total"));
+        assert!(body.contains("novarocks_pre_ready_effect_gate_total"));
+        assert!(body.contains("novarocks_waiting_for_backend_seconds"));
+        assert!(body.contains("novarocks_pre_ready_replan_seconds"));
     }
 
     #[test]

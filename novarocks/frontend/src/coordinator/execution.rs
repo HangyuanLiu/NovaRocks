@@ -63,6 +63,10 @@ use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use crate::connector::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
 };
+use crate::metrics::{
+    observe_pre_ready_replan, observe_waiting_for_backend, record_pre_ready_effect_gate,
+    record_pre_ready_replan,
+};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
@@ -1394,17 +1398,33 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                 let Some(factory) = round_factory.as_deref_mut() else {
                     return Err(first_error);
                 };
-                factory.permit_pre_ready_retry()?;
+                let reason = pre_ready_topology_reason(
+                    first_error
+                        .pre_ready_topology_outcome()
+                        .expect("pre-ready topology outcome checked above"),
+                );
+                if let Err(error) = factory.permit_pre_ready_retry() {
+                    record_pre_ready_effect_gate("rejected");
+                    return Err(error);
+                }
+                record_pre_ready_effect_gate("permitted");
+                record_pre_ready_replan(reason);
+                let waiting_started_at = Instant::now();
                 let fresh_topology = self
                     .backend_topology
                     .wait_for_eligible_after(first_revision, retry_deadline)
                     .map_err(|error| {
+                        observe_waiting_for_backend(waiting_started_at.elapsed());
                         DistributedQueryError::new(
                             DistributedQueryErrorKind::Failed,
                             error.to_string(),
                         )
                     })?;
-                let replacement = factory.replan(fresh_topology)?;
+                observe_waiting_for_backend(waiting_started_at.elapsed());
+                let replan_started_at = Instant::now();
+                let replacement = factory.replan(fresh_topology);
+                observe_pre_ready_replan(replan_started_at.elapsed());
+                let replacement = replacement?;
                 let (replacement_request, replacement_completion, replacement_factory) =
                     replacement.into_parts();
                 if replacement_factory.is_some() {
@@ -1423,6 +1443,14 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                 .and_then(|outcome| replacement_completion.complete(outcome).map_err(failed))
             }
         }
+    }
+}
+
+fn pre_ready_topology_reason(outcome: PreReadyTopologyOutcome) -> &'static str {
+    match outcome {
+        PreReadyTopologyOutcome::BackendDraining { .. } => "backend_draining",
+        PreReadyTopologyOutcome::BackendProcessMismatch { .. } => "backend_process_mismatch",
+        PreReadyTopologyOutcome::BackendNotEligible { .. } => "backend_not_eligible",
     }
 }
 
