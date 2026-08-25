@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use crate::connector::{ConnectorRegistry, binding_decode::AdmittedConnectorExecutionDeclaration};
+use crate::connector::ConnectorRegistry;
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use crate::runtime::sink_commit::{BackendSinkCommitPort, ConfiguredBackendSinkCommitPort};
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
@@ -37,6 +37,7 @@ use novarocks_execution::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
 use novarocks_execution::runtime::profile::Profiler;
+use novarocks_proto::connector::AdmittedConnectorExecutionDeclaration;
 use novarocks_proto::lifecycle::{QueryExecutionId, StageFragment};
 use novarocks_spi::connector::{ConnectorExecutionBindingKey, WriteCommitEvidenceLimits};
 use tracing::error;
@@ -805,12 +806,12 @@ mod tests {
     use novarocks_execution::runtime::fragment::{
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
     };
-    use novarocks_proto as proto;
     use novarocks_proto::lifecycle::{AttemptId as ProtocolAttemptId, QueryExecutionId};
     use novarocks_proto::lifecycle::{
         ParticipantBackendIdentity, ParticipantManifest, ParticipantRole, QueryControlAttach,
         QueryControlEndpoint, QueryInitOutcome, QueryInitRequest, QueryOptions, StageFragment,
     };
+    use novarocks_proto_models as proto;
     use novarocks_types::QueryId as ExecutionQueryId;
     use novarocks_types::QueryId;
     use novarocks_types::UniqueId;
@@ -1003,7 +1004,7 @@ mod tests {
                 .init_query(init.clone())
                 .outcome()
                 .expect("valid init acknowledgement"),
-            QueryInitOutcome::Applied
+            QueryInitOutcome::QueryInitApplied
         );
         let mut attachment = service
             .lifecycle
@@ -1019,7 +1020,7 @@ mod tests {
                 .expect("ControlReady")
                 .as_proto()
                 .event,
-            Some(novarocks_proto::novarocks::query_control_response::Event::ControlReady(_))
+            Some(novarocks_proto_models::novarocks::query_control_response::Event::ControlReady(_))
         ));
         attachment
     }

@@ -50,7 +50,8 @@ pub use field_render::{
 };
 pub use field_render_schema::FieldRenderSchema;
 pub use identity::{
-    LocalQuerySequence, QueryId, QueryIdAttribution, QueryProcessNamespace, UniqueId, format_uuid,
+    AttemptId, ExecutionIdentityError, LocalQuerySequence, QueryExecutionId, QueryId,
+    QueryIdAttribution, QueryProcessNamespace, UniqueId, format_uuid,
 };
 pub use network::{AdvertiseEndpoint, format_host_for_url};
 pub use primitive::PrimitiveType;

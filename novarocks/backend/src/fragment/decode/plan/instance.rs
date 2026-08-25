@@ -22,7 +22,7 @@ use novarocks_proto::FieldPath;
 use novarocks_proto::lifecycle::ScanRangeParams;
 use novarocks_types::UniqueId;
 
-use novarocks_proto::novarocks as native_proto;
+use novarocks_proto_models::novarocks as native_proto;
 
 use super::error::NativeFragmentDecodeError;
 
@@ -137,7 +137,7 @@ pub(super) fn decode_scan_range_params_at(
     dead_code,
     reason = "Retained for target-specific native integration and regression coverage."
 )]
-fn unique_id(src: &novarocks_proto::common::UniqueId) -> UniqueId {
+fn unique_id(src: &novarocks_proto_models::common::UniqueId) -> UniqueId {
     UniqueId::new(src.hi, src.lo)
 }
 
@@ -146,7 +146,7 @@ mod tests {
     use super::decode_destinations;
     use crate::fragment::decode::query_options::decode_query_options;
     use novarocks_proto::ProtocolErrorKind;
-    use novarocks_proto::novarocks as native_proto;
+    use novarocks_proto_models::novarocks as native_proto;
 
     #[test]
     fn query_options_decode_is_owned_by_native_protocol() {

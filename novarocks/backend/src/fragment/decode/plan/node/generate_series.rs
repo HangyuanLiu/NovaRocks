@@ -31,7 +31,7 @@ use novarocks_execution::exec::node::table_function::{TableFunctionNode, TableFu
 use novarocks_execution::exec::node::values::ValuesNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_proto::FieldPath;
-use novarocks_proto::{common as proto_common, expr, plan};
+use novarocks_proto_models::{common as proto_common, expr, plan};
 use novarocks_types::SlotId;
 
 pub(super) fn lower_generate_series_node(

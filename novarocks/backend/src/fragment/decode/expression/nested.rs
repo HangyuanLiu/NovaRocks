@@ -22,7 +22,7 @@ use arrow::datatypes::DataType;
 use super::{decode_expr_at, decode_expr_type_at};
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_proto::FieldPath;
-use novarocks_proto::expr;
+use novarocks_proto_models::expr;
 
 use super::NativeExpressionInputLayout;
 
@@ -60,7 +60,7 @@ pub(super) fn is_encoded_variant_payload_source(data_type: &DataType) -> bool {
 mod tests {
     use super::super::tests::{lower_err_with_slots, scalar_expr, string_lit};
     use arrow::datatypes::DataType;
-    use novarocks_proto::expr;
+    use novarocks_proto_models::expr;
 
     #[test]
     fn nested_requires_outer_and_inner_type_match() {

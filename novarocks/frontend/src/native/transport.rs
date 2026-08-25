@@ -21,25 +21,24 @@ use crate::query_execution::connector_binding::{
     ConnectorBindingDispatchError, ConnectorBindingRetirementError,
 };
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
-use novarocks_proto::common::UniqueId as ProtoUniqueId;
+use novarocks_proto::connector::{
+    encode_connector_execution_binding_key, encode_connector_execution_declaration,
+};
 use novarocks_proto::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
     QueryInitRequest, QueryStageAck, QueryStageRequest, QueryStartAck, QueryStartRequest,
     QueryTerminationAck, QueryTerminationReason,
 };
-use novarocks_proto::novarocks::{
-    ConnectorExecutionBindingDeclaration, EnsureConnectorExecutionBindingRequest,
-    FetchResultRequest, IcebergExecutionBindingDeclaration,
-    QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
-    StarRocksExecutionBindingDeclaration,
-    connector_execution_binding_declaration::Provider as ConnectorExecutionBindingProvider,
-    fetch_result_response::Status as FetchStatus,
-};
 use novarocks_proto::provider::{
     EnsureConnectorExecutionBindingOutcome, EnsureConnectorExecutionBindingResult,
     RetireConnectorExecutionBindingOutcome, RetireConnectorExecutionBindingResult,
 };
-use novarocks_spi::connector::ConnectorExecutionDeclarationProvider;
+use novarocks_proto_models::common::UniqueId as ProtoUniqueId;
+use novarocks_proto_models::novarocks::{
+    EnsureConnectorExecutionBindingRequest, FetchResultRequest,
+    QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
+    fetch_result_response::Status as FetchStatus,
+};
 use novarocks_types::{UniqueId, format_host_for_url};
 
 use super::data_runtime::FrontendDataRuntime;
@@ -51,37 +50,6 @@ use super::query_lifecycle::{
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const QUERY_CONTROL_CHANNEL_CAPACITY: usize = 32;
-
-/// Encodes a validated SPI declaration at the FE-owned Protocol boundary.
-///
-// Design: ADR-0105 (docs/adr/ADR-0105-wire-authority-and-domain-carrier-separation.md)
-/// This is deliberately the only frontend mapping from the transport-neutral
-/// declaration into the generated wire DTO. The declaration's closed variant
-/// selects the wire oneof; canonical digesting remains Protocol-owned and is
-/// performed by the BE over this generated DTO.
-#[doc(hidden)]
-pub fn encode_connector_execution_declaration(
-    declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
-) -> ConnectorExecutionBindingDeclaration {
-    let binding_key = declaration.binding_key();
-    let provider = match declaration.provider() {
-        ConnectorExecutionDeclarationProvider::Iceberg { access_binding } => {
-            ConnectorExecutionBindingProvider::Iceberg(IcebergExecutionBindingDeclaration {
-                access_binding: access_binding.to_string(),
-            })
-        }
-        ConnectorExecutionDeclarationProvider::StarRocks { local_binding } => {
-            ConnectorExecutionBindingProvider::Starrocks(StarRocksExecutionBindingDeclaration {
-                local_binding: local_binding.to_string(),
-            })
-        }
-    };
-    ConnectorExecutionBindingDeclaration {
-        instance_id: binding_key.instance_id.as_str().to_string(),
-        incarnation: binding_key.incarnation.to_bytes().to_vec(),
-        provider: Some(provider),
-    }
-}
 
 #[derive(Clone)]
 struct Client {
@@ -340,9 +308,10 @@ impl ConnectorBindingDispatcher for ConnectorBindingControl {
         key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
     ) -> Result<(), ConnectorBindingRetirementError> {
         let client = self.endpoints.iter().find_map(|(id, configured)| (*configured == endpoint).then(|| self.clients.get(id))).flatten().ok_or_else(|| ConnectorBindingRetirementError::Transport(format!("connector retirement endpoint {endpoint} is absent from configured backend snapshot")))?;
+        let (instance_id, incarnation) = encode_connector_execution_binding_key(key);
         let request = RetireConnectorExecutionBindingRequest {
-            instance_id: key.instance_id.as_str().to_string(),
-            incarnation: key.incarnation.to_bytes().to_vec(),
+            instance_id,
+            incarnation,
         };
         let response = client
             .data_runtime
@@ -379,10 +348,12 @@ pub(crate) fn heartbeat(
         let client = Client::new(endpoint, data_runtime.clone())?;
         data_runtime.block_on(async {
             let mut grpc = client.grpc().await?;
-            grpc.heartbeat(Request::new(novarocks_proto::novarocks::HeartbeatRequest {
-                assigned_be_id: be_id,
-                fe_epoch: 0,
-            }))
+            grpc.heartbeat(Request::new(
+                novarocks_proto_models::novarocks::HeartbeatRequest {
+                    assigned_be_id: be_id,
+                    fe_epoch: 0,
+                },
+            ))
             .await
             .map(|value| value.into_inner())
             .map_err(|error| format!("heartbeat rpc failed: {error}"))
@@ -506,9 +477,9 @@ impl QueryLifecycleTransport for LifecycleTransport {
         timeout: Duration,
     ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
         let (tx, rx) = mpsc::channel(QUERY_CONTROL_CHANNEL_CAPACITY);
-        tx.try_send(novarocks_proto::novarocks::QueryControlRequest {
+        tx.try_send(novarocks_proto_models::novarocks::QueryControlRequest {
             command: Some(
-                novarocks_proto::novarocks::query_control_request::Command::Attach(
+                novarocks_proto_models::novarocks::query_control_request::Command::Attach(
                     attach.as_proto().clone(),
                 ),
             ),
@@ -685,7 +656,7 @@ struct ControlSession {
     data_runtime: FrontendDataRuntime,
 }
 struct ControlCommands {
-    sender: Option<mpsc::Sender<novarocks_proto::novarocks::QueryControlRequest>>,
+    sender: Option<mpsc::Sender<novarocks_proto_models::novarocks::QueryControlRequest>>,
     pending: VecDeque<Pending>,
     /// The single terminal reason already accepted on this stream.  A later
     /// coordinator Abort cannot change a completed Finalize, but the BE may
@@ -734,19 +705,22 @@ impl QueryControlSession for ControlSession {
                 }
             })?;
         match command.as_proto().command.as_ref() {
-            Some(novarocks_proto::novarocks::query_control_request::Command::Heartbeat(
+            Some(novarocks_proto_models::novarocks::query_control_request::Command::Heartbeat(
                 heartbeat,
             )) => state
                 .pending
                 .push_back(Pending::Heartbeat(heartbeat.sequence)),
-            Some(novarocks_proto::novarocks::query_control_request::Command::Abort(_)) => {
+            Some(novarocks_proto_models::novarocks::query_control_request::Command::Abort(_)) => {
                 state.pending.push_back(Pending::Abort)
             }
-            Some(novarocks_proto::novarocks::query_control_request::Command::Finalize(_)) => {
-                state.pending.push_back(Pending::Finalize)
-            }
-            Some(novarocks_proto::novarocks::query_control_request::Command::TerminalAck(_)) => {}
-            Some(novarocks_proto::novarocks::query_control_request::Command::Attach(_)) | None => {
+            Some(novarocks_proto_models::novarocks::query_control_request::Command::Finalize(
+                _,
+            )) => state.pending.push_back(Pending::Finalize),
+            Some(
+                novarocks_proto_models::novarocks::query_control_request::Command::TerminalAck(_),
+            ) => {}
+            Some(novarocks_proto_models::novarocks::query_control_request::Command::Attach(_))
+            | None => {
                 return Err(invalid(
                     "validated query control command has an invalid variant",
                 ));
@@ -785,7 +759,7 @@ impl Drop for ControlSession {
     }
 }
 async fn bridge(
-    mut stream: tonic::Streaming<novarocks_proto::novarocks::QueryControlResponse>,
+    mut stream: tonic::Streaming<novarocks_proto_models::novarocks::QueryControlResponse>,
     events: mpsc::Sender<Result<QueryControlEvent, QueryLifecycleTransportError>>,
     commands: Arc<Mutex<ControlCommands>>,
 ) {
@@ -826,25 +800,27 @@ fn validate_control_event(
         .lock()
         .map_err(|_| unavailable("query control command lock poisoned"))?;
     match event.as_proto().event.as_ref() {
-        Some(novarocks_proto::novarocks::query_control_response::Event::HeartbeatAck(ack)) => {
-            match commands.pending.front().copied() {
-                Some(Pending::Heartbeat(expected)) if expected == ack.sequence => {
-                    commands.pending.pop_front();
-                    Ok(())
-                }
-                Some(other) => Err(invalid(format!(
-                    "unexpected heartbeat acknowledgement {} for {other:?}",
-                    ack.sequence
-                ))),
-                None => Err(invalid(format!(
-                    "received unsolicited heartbeat sequence {}",
-                    ack.sequence
-                ))),
+        Some(novarocks_proto_models::novarocks::query_control_response::Event::HeartbeatAck(
+            ack,
+        )) => match commands.pending.front().copied() {
+            Some(Pending::Heartbeat(expected)) if expected == ack.sequence => {
+                commands.pending.pop_front();
+                Ok(())
             }
-        }
-        Some(novarocks_proto::novarocks::query_control_response::Event::TerminationAccepted(
-            accepted,
-        )) => {
+            Some(other) => Err(invalid(format!(
+                "unexpected heartbeat acknowledgement {} for {other:?}",
+                ack.sequence
+            ))),
+            None => Err(invalid(format!(
+                "received unsolicited heartbeat sequence {}",
+                ack.sequence
+            ))),
+        },
+        Some(
+            novarocks_proto_models::novarocks::query_control_response::Event::TerminationAccepted(
+                accepted,
+            ),
+        ) => {
             let reason = QueryTerminationReason::try_from(accepted.reason).map_err(|_| {
                 invalid(format!(
                     "unknown query termination reason {}",
@@ -1002,51 +978,5 @@ fn stream_status_error(status: tonic::Status) -> QueryLifecycleTransportError {
             status.code(),
             status.message()
         )),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use novarocks_proto::novarocks::{
-        IcebergExecutionBindingDeclaration, StarRocksExecutionBindingDeclaration,
-        connector_execution_binding_declaration::Provider,
-    };
-    use novarocks_spi::connector::ConnectorExecutionDeclaration;
-
-    use super::encode_connector_execution_declaration;
-
-    #[test]
-    fn encodes_iceberg_declaration_from_the_closed_spi_variant() {
-        let declaration =
-            ConnectorExecutionDeclaration::iceberg("catalog", [7; 16], "warehouse-binding")
-                .unwrap();
-
-        assert_eq!(
-            encode_connector_execution_declaration(&declaration),
-            novarocks_proto::novarocks::ConnectorExecutionBindingDeclaration {
-                instance_id: "catalog".to_string(),
-                incarnation: vec![7; 16],
-                provider: Some(Provider::Iceberg(IcebergExecutionBindingDeclaration {
-                    access_binding: "warehouse-binding".to_string(),
-                })),
-            }
-        );
-    }
-
-    #[test]
-    fn encodes_starrocks_declaration_from_the_closed_spi_variant() {
-        let declaration =
-            ConnectorExecutionDeclaration::starrocks("catalog", [9; 16], "local-binding").unwrap();
-
-        assert_eq!(
-            encode_connector_execution_declaration(&declaration),
-            novarocks_proto::novarocks::ConnectorExecutionBindingDeclaration {
-                instance_id: "catalog".to_string(),
-                incarnation: vec![9; 16],
-                provider: Some(Provider::Starrocks(StarRocksExecutionBindingDeclaration {
-                    local_binding: "local-binding".to_string(),
-                })),
-            }
-        );
     }
 }

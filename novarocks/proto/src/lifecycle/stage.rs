@@ -9,10 +9,12 @@ use sha2::{Digest, Sha256};
 
 use novarocks_types::UniqueId;
 
-use crate::{canonical, novarocks, plan};
+use crate::{FieldPath, ProtocolError, ProtocolErrorKind, canonical};
+use novarocks_proto_models::{novarocks, plan};
 
 use super::{
-    error::ContractError, identity::QueryExecutionId, manifest::ParticipantManifestDigest,
+    identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id},
+    manifest::ParticipantManifestDigest,
 };
 
 pub const DEFAULT_STAGE_MAX_ENCODED_BYTES: usize = 48 * 1024 * 1024;
@@ -29,12 +31,14 @@ impl StageDigestVersion {
         self.0
     }
 
-    pub fn try_from_wire(value: u32) -> Result<Self, ContractError> {
+    pub fn try_from_wire(value: u32) -> Result<Self, ProtocolError> {
         match value {
             1 => Ok(Self::V1),
-            _ => Err(ContractError::version_mismatch(format!(
-                "unsupported stage digest version {value}"
-            ))),
+            _ => Err(ProtocolError::new(
+                FieldPath::root("stage_digest_version"),
+                ProtocolErrorKind::VersionMismatch,
+                format!("unsupported stage digest version {value}"),
+            )),
         }
     }
 }
@@ -48,10 +52,14 @@ impl StageDigest {
         Self(bytes)
     }
 
-    pub fn try_from_slice(bytes: &[u8]) -> Result<Self, ContractError> {
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| ContractError::invalid_value("stage digest must be 32 bytes"))?;
+    pub fn try_from_slice(bytes: &[u8]) -> Result<Self, ProtocolError> {
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+            ProtocolError::new(
+                FieldPath::root("stage_digest"),
+                ProtocolErrorKind::InvalidValue,
+                "stage digest must be 32 bytes",
+            )
+        })?;
         Ok(Self(bytes))
     }
 
@@ -67,12 +75,14 @@ impl StageDigest {
         execution_id: QueryExecutionId,
         init_digest: ParticipantManifestDigest,
         fragments: &[StageFragment],
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         let mut ordered = fragments.iter().collect::<Vec<_>>();
         ordered.sort_by_key(|fragment| fragment.fragment_instance_id());
         for pair in ordered.windows(2) {
             if pair[0].fragment_instance_id() == pair[1].fragment_instance_id() {
-                return Err(ContractError::invalid_value(
+                return Err(ProtocolError::new(
+                    FieldPath::root("stage_fragments"),
+                    ProtocolErrorKind::InvalidValue,
                     "stage digest requires unique fragment instance ids",
                 ));
             }
@@ -108,11 +118,13 @@ fn hash_stage_message<M: Message>(
     hasher: &mut Sha256,
     message_name: &str,
     message: &M,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     canonical::hash_message(hasher, message_name, message).map_err(|error| {
-        ContractError::invalid_value(format!(
-            "cannot canonicalize {message_name} for Stage digest: {error}"
-        ))
+        ProtocolError::new(
+            FieldPath::root("stage_fragments"),
+            ProtocolErrorKind::InvalidValue,
+            format!("cannot canonicalize {message_name} for Stage digest: {error}"),
+        )
     })
 }
 
@@ -127,19 +139,25 @@ impl StageFragment {
     pub fn new(
         plan: plan::PlanFragment,
         instance_params: novarocks::InstanceParams,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::StageFragment {
             plan: Some(plan),
             instance_params: Some(instance_params),
         })
     }
 
-    pub fn parse(wire: novarocks::StageFragment) -> Result<Self, ContractError> {
+    pub fn parse(wire: novarocks::StageFragment) -> Result<Self, ProtocolError> {
         let instance_params = wire.instance_params.as_ref().ok_or_else(|| {
-            ContractError::invalid_value("stage fragment instance params are required")
+            ProtocolError::new(
+                FieldPath::root("stage_fragment").field("instance_params"),
+                ProtocolErrorKind::InvalidValue,
+                "stage fragment instance params are required",
+            )
         })?;
         if wire.plan.is_none() {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_fragment").field("plan"),
+                ProtocolErrorKind::InvalidValue,
                 "stage fragment plan is required",
             ));
         }
@@ -190,11 +208,11 @@ impl QueryStageRequest {
         digest_version: StageDigestVersion,
         digest: StageDigest,
         mut fragments: Vec<StageFragment>,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         fragments.sort_by_key(StageFragment::fragment_instance_id);
         validate_stage_fragment_ids(&fragments)?;
         Self::parse(novarocks::StageFragmentsRequest {
-            execution_id: Some(execution_id.to_proto()),
+            execution_id: Some(encode_query_execution_id(execution_id)),
             init_digest: init_digest.as_bytes().to_vec(),
             stage_digest_version: digest_version.get(),
             stage_digest: digest.as_bytes().to_vec(),
@@ -205,17 +223,25 @@ impl QueryStageRequest {
         })
     }
 
-    pub fn parse(wire: novarocks::StageFragmentsRequest) -> Result<Self, ContractError> {
+    pub fn parse(wire: novarocks::StageFragmentsRequest) -> Result<Self, ProtocolError> {
         if wire.fragments.len() > DEFAULT_STAGE_MAX_FRAGMENTS {
-            return Err(ContractError::capacity(format!(
-                "stage request contains {} fragments; limit is {DEFAULT_STAGE_MAX_FRAGMENTS}",
-                wire.fragments.len()
-            )));
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_fragments_request").field("fragments"),
+                ProtocolErrorKind::Capacity,
+                format!(
+                    "stage request contains {} fragments; limit is {DEFAULT_STAGE_MAX_FRAGMENTS}",
+                    wire.fragments.len()
+                ),
+            ));
         }
         if wire.encoded_len() > DEFAULT_STAGE_MAX_ENCODED_BYTES {
-            return Err(ContractError::capacity(format!(
-                "stage request encoded bytes exceed {DEFAULT_STAGE_MAX_ENCODED_BYTES} byte limit"
-            )));
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_fragments_request"),
+                ProtocolErrorKind::Capacity,
+                format!(
+                    "stage request encoded bytes exceed {DEFAULT_STAGE_MAX_ENCODED_BYTES} byte limit"
+                ),
+            ));
         }
 
         let execution_id = required_execution_id(wire.execution_id.as_ref())?;
@@ -234,7 +260,9 @@ impl QueryStageRequest {
         // versioned without leaving an unchecked fallback for future values.
         let recomputed = StageDigest::compute_v1(execution_id, init_digest, &fragments)?;
         if recomputed != digest {
-            return Err(ContractError::digest_mismatch(
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_fragments_request").field("stage_digest"),
+                ProtocolErrorKind::DigestMismatch,
                 "stage digest does not match decoded stage fragment batch",
             ));
         }
@@ -313,9 +341,9 @@ impl QueryStageAck {
         digest: StageDigest,
         outcome: QueryStageOutcome,
         detail: impl Into<String>,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::StageFragmentsResponse {
-            execution_id: Some(execution_id.to_proto()),
+            execution_id: Some(encode_query_execution_id(execution_id)),
             stage_digest_version: digest_version.get(),
             stage_digest: digest.as_bytes().to_vec(),
             outcome: encode_stage_outcome(outcome),
@@ -323,7 +351,7 @@ impl QueryStageAck {
         })
     }
 
-    pub fn parse(wire: novarocks::StageFragmentsResponse) -> Result<Self, ContractError> {
+    pub fn parse(wire: novarocks::StageFragmentsResponse) -> Result<Self, ProtocolError> {
         let _ = required_execution_id(wire.execution_id.as_ref())?;
         let _ = StageDigestVersion::try_from_wire(wire.stage_digest_version)?;
         let _ = StageDigest::try_from_slice(&wire.stage_digest)?;
@@ -377,15 +405,15 @@ impl QueryStartRequest {
         execution_id: QueryExecutionId,
         digest_version: StageDigestVersion,
         digest: StageDigest,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::StartPreparedQueryRequest {
-            execution_id: Some(execution_id.to_proto()),
+            execution_id: Some(encode_query_execution_id(execution_id)),
             stage_digest_version: digest_version.get(),
             stage_digest: digest.as_bytes().to_vec(),
         })
     }
 
-    pub fn parse(wire: novarocks::StartPreparedQueryRequest) -> Result<Self, ContractError> {
+    pub fn parse(wire: novarocks::StartPreparedQueryRequest) -> Result<Self, ProtocolError> {
         let _ = required_execution_id(wire.execution_id.as_ref())?;
         let _ = StageDigestVersion::try_from_wire(wire.stage_digest_version)?;
         let _ = StageDigest::try_from_slice(&wire.stage_digest)?;
@@ -446,9 +474,9 @@ impl QueryStartAck {
         digest: StageDigest,
         outcome: QueryStartOutcome,
         detail: impl Into<String>,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::StartPreparedQueryResponse {
-            execution_id: Some(execution_id.to_proto()),
+            execution_id: Some(encode_query_execution_id(execution_id)),
             stage_digest_version: digest_version.get(),
             stage_digest: digest.as_bytes().to_vec(),
             outcome: encode_start_outcome(outcome),
@@ -456,7 +484,7 @@ impl QueryStartAck {
         })
     }
 
-    pub fn parse(wire: novarocks::StartPreparedQueryResponse) -> Result<Self, ContractError> {
+    pub fn parse(wire: novarocks::StartPreparedQueryResponse) -> Result<Self, ProtocolError> {
         let _ = required_execution_id(wire.execution_id.as_ref())?;
         let _ = StageDigestVersion::try_from_wire(wire.stage_digest_version)?;
         let _ = StageDigest::try_from_slice(&wire.stage_digest)?;
@@ -499,25 +527,38 @@ impl QueryStartAck {
 
 fn required_execution_id(
     execution_id: Option<&novarocks::QueryExecutionId>,
-) -> Result<QueryExecutionId, ContractError> {
-    let execution_id = execution_id
-        .ok_or_else(|| ContractError::invalid_value("query execution id is required"))?;
-    QueryExecutionId::try_from_proto(execution_id)
+) -> Result<QueryExecutionId, ProtocolError> {
+    let execution_id = execution_id.ok_or_else(|| {
+        ProtocolError::new(
+            FieldPath::root("query_execution_id"),
+            ProtocolErrorKind::InvalidValue,
+            "query execution id is required",
+        )
+    })?;
+    decode_query_execution_id(execution_id)
 }
 
 fn fragment_instance_id(
     instance_params: &novarocks::InstanceParams,
-) -> Result<UniqueId, ContractError> {
+) -> Result<UniqueId, ProtocolError> {
     let fragment_instance_id = instance_params
         .fragment_instance_id
         .as_ref()
         .ok_or_else(|| {
-            ContractError::invalid_value(
+            ProtocolError::new(
+                FieldPath::root("stage_fragment")
+                    .field("instance_params")
+                    .field("fragment_instance_id"),
+                ProtocolErrorKind::InvalidValue,
                 "stage fragment instance params require fragment instance id",
             )
         })?;
     if fragment_instance_id.hi == 0 && fragment_instance_id.lo == 0 {
-        return Err(ContractError::invalid_value(
+        return Err(ProtocolError::new(
+            FieldPath::root("stage_fragment")
+                .field("instance_params")
+                .field("fragment_instance_id"),
+            ProtocolErrorKind::InvalidValue,
             "stage fragment instance id must be nonzero",
         ));
     }
@@ -527,14 +568,16 @@ fn fragment_instance_id(
     ))
 }
 
-fn validate_stage_fragment_ids(fragments: &[StageFragment]) -> Result<(), ContractError> {
+fn validate_stage_fragment_ids(fragments: &[StageFragment]) -> Result<(), ProtocolError> {
     let mut instance_ids = fragments
         .iter()
         .map(StageFragment::fragment_instance_id)
         .collect::<Vec<_>>();
     instance_ids.sort_unstable();
     if instance_ids.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(ContractError::invalid_value(
+        return Err(ProtocolError::new(
+            FieldPath::root("stage_fragments_request").field("fragments"),
+            ProtocolErrorKind::InvalidValue,
             "stage fragment instance ids must be unique",
         ));
     }
@@ -557,7 +600,7 @@ fn encode_stage_outcome(outcome: QueryStageOutcome) -> i32 {
     .into()
 }
 
-fn decode_stage_outcome(value: i32) -> Result<QueryStageOutcome, ContractError> {
+fn decode_stage_outcome(value: i32) -> Result<QueryStageOutcome, ProtocolError> {
     use novarocks::StageFragmentsOutcome as Wire;
 
     match Wire::try_from(value).ok() {
@@ -575,9 +618,11 @@ fn decode_stage_outcome(value: i32) -> Result<QueryStageOutcome, ContractError> 
         Some(Wire::StageFragmentsRejectedLocalFailure) => {
             Ok(QueryStageOutcome::RejectedLocalFailure)
         }
-        Some(Wire::Unspecified) | None => Err(ContractError::invalid_value(format!(
-            "unknown stage fragments outcome {value}"
-        ))),
+        Some(Wire::Unspecified) | None => Err(ProtocolError::new(
+            FieldPath::root("stage_fragments_response").field("outcome"),
+            ProtocolErrorKind::InvalidValue,
+            format!("unknown stage fragments outcome {value}"),
+        )),
     }
 }
 
@@ -594,7 +639,7 @@ fn encode_start_outcome(outcome: QueryStartOutcome) -> i32 {
     .into()
 }
 
-fn decode_start_outcome(value: i32) -> Result<QueryStartOutcome, ContractError> {
+fn decode_start_outcome(value: i32) -> Result<QueryStartOutcome, ProtocolError> {
     use novarocks::StartPreparedQueryOutcome as Wire;
 
     match Wire::try_from(value).ok() {
@@ -605,9 +650,11 @@ fn decode_start_outcome(value: i32) -> Result<QueryStartOutcome, ContractError> 
         Some(Wire::StartPreparedQueryRejectedTerminated) => {
             Ok(QueryStartOutcome::RejectedTerminated)
         }
-        Some(Wire::Unspecified) | None => Err(ContractError::invalid_value(format!(
-            "unknown start prepared query outcome {value}"
-        ))),
+        Some(Wire::Unspecified) | None => Err(ProtocolError::new(
+            FieldPath::root("start_prepared_query_response").field("outcome"),
+            ProtocolErrorKind::InvalidValue,
+            format!("unknown start prepared query outcome {value}"),
+        )),
     }
 }
 
@@ -618,8 +665,8 @@ mod tests {
     use novarocks_types::QueryId;
 
     use super::*;
-    use crate::common;
     use crate::lifecycle::identity::AttemptId;
+    use novarocks_proto_models::common;
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
@@ -705,7 +752,7 @@ mod tests {
     #[test]
     fn stage_request_rejects_duplicate_fragment_ids_and_unknown_digest_version() {
         let raw = novarocks::StageFragmentsRequest {
-            execution_id: Some(execution_id().to_proto()),
+            execution_id: Some(encode_query_execution_id(execution_id())),
             init_digest: init_digest().as_bytes().to_vec(),
             stage_digest_version: StageDigestVersion::V1.get(),
             stage_digest: [9; 32].to_vec(),
@@ -713,6 +760,11 @@ mod tests {
         };
         let error = QueryStageRequest::parse(raw).expect_err("duplicate ids cannot be staged");
         assert_eq!(error.detail(), "stage fragment instance ids must be unique");
+        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(
+            error.path().to_string(),
+            "stage_fragments_request.fragments"
+        );
         assert!(StageDigestVersion::try_from_wire(2).is_err());
     }
 

@@ -22,7 +22,7 @@ use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 use crate::fragment::decode::plan::layout::Layout;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_proto::FieldPath;
-use novarocks_proto::plan;
+use novarocks_proto_models::plan;
 
 pub(super) fn lower_redistribute_node(
     physical: &plan::PlanNode,

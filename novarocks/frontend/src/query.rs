@@ -1819,7 +1819,7 @@ mod tests {
     use novarocks_types::schema::ColumnDef;
 
     fn default_query_options() -> QueryOptions {
-        QueryOptions::parse(novarocks_proto::novarocks::QueryOptions::default())
+        QueryOptions::parse(novarocks_proto_models::novarocks::QueryOptions::default())
             .expect("default wire query options are valid")
     }
 

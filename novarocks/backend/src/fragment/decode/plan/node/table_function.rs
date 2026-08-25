@@ -31,7 +31,7 @@ use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_proto::FieldPath;
-use novarocks_proto::{common as proto_common, expr, plan};
+use novarocks_proto_models::{common as proto_common, expr, plan};
 use novarocks_types::SlotId;
 
 pub(super) fn lower_table_function_node(
@@ -439,7 +439,7 @@ mod tests {
     use super::*;
     use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
-    use novarocks_proto::{common, expr, plan};
+    use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {

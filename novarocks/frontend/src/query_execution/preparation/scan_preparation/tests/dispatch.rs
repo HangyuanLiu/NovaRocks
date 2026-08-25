@@ -146,13 +146,12 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
         .map(|fragment| fragment.fragment_id)
         .collect::<std::collections::BTreeSet<_>>();
     let native = crate::query_execution::native_fragment::native_fragment_attachment_for_test(
-        expected_ids
-            .iter()
-            .copied()
-            .map(|fragment_id| novarocks_proto::plan::PlanFragment {
+        expected_ids.iter().copied().map(|fragment_id| {
+            novarocks_proto_models::plan::PlanFragment {
                 fragment_id,
                 ..Default::default()
-            }),
+            }
+        }),
         &expected_ids,
         None,
     )

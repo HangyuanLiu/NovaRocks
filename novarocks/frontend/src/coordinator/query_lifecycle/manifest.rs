@@ -21,7 +21,7 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::lifecycle_plan::QueryInitPlan;
 use novarocks_proto::lifecycle::QueryExecutionId;
 use novarocks_proto::lifecycle::{ParticipantManifestDigest, ParticipantRole, QueryInitRequest};
-use novarocks_proto::novarocks as protocol_wire;
+use novarocks_proto_models::novarocks as protocol_wire;
 
 use super::QueryLifecycleTarget;
 

@@ -3,8 +3,8 @@
 //! These wrappers retain the generated messages unchanged. File-system and
 //! execution-specific interpretation remains with the Backend decoder.
 
-use super::error::ContractError;
-use crate::novarocks;
+use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_models::novarocks;
 
 /// A validated generated `ScanRangeParams` value.
 #[derive(Clone, Debug, PartialEq)]
@@ -13,12 +13,23 @@ pub struct ScanRangeParams {
 }
 
 impl ScanRangeParams {
-    pub fn parse(raw: novarocks::ScanRangeParams) -> Result<Self, ContractError> {
-        let range = raw
-            .range
-            .clone()
-            .ok_or_else(|| ContractError::invalid_value("native ScanRangeParams requires range"))?;
-        ScanRange::parse(range)?;
+    pub fn parse(raw: novarocks::ScanRangeParams) -> Result<Self, ProtocolError> {
+        let range = raw.range.clone().ok_or_else(|| {
+            ProtocolError::new(
+                FieldPath::root("scan_range_params").field("range"),
+                ProtocolErrorKind::InvalidValue,
+                "native ScanRangeParams requires range",
+            )
+        })?;
+        ScanRange::parse(range).map_err(|error| {
+            ProtocolError::new(
+                FieldPath::root("scan_range_params")
+                    .field("range")
+                    .append_segments(error.path().segments().iter().skip(1).cloned()),
+                error.kind(),
+                error.detail(),
+            )
+        })?;
         Ok(Self { raw })
     }
 
@@ -27,7 +38,7 @@ impl ScanRangeParams {
         volume_id: Option<i32>,
         empty: Option<bool>,
         has_more: Option<bool>,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::ScanRangeParams {
             range: Some(range.into_proto()),
             volume_id,
@@ -74,13 +85,15 @@ pub struct ScanRange {
 }
 
 impl ScanRange {
-    pub fn parse(raw: novarocks::ScanRange) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::ScanRange) -> Result<Self, ProtocolError> {
         match raw.kind.as_ref() {
             Some(novarocks::scan_range::Kind::File(file)) => {
                 FileScanRange::parse(file.clone())?;
             }
             None => {
-                return Err(ContractError::invalid_value(
+                return Err(ProtocolError::new(
+                    FieldPath::root("scan_range").field("kind"),
+                    ProtocolErrorKind::InvalidValue,
                     "native ScanRange requires kind",
                 ));
             }
@@ -88,7 +101,7 @@ impl ScanRange {
         Ok(Self { raw })
     }
 
-    pub fn file(file: FileScanRange) -> Result<Self, ContractError> {
+    pub fn file(file: FileScanRange) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::ScanRange {
             kind: Some(novarocks::scan_range::Kind::File(file.into_proto())),
         })
@@ -119,9 +132,11 @@ pub struct FileScanRange {
 impl FileScanRange {
     /// Validates only wire-owned shape. Backend owns the execution-specific
     /// file-format and pruning interpretation.
-    pub fn parse(raw: novarocks::FileScanRange) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::FileScanRange) -> Result<Self, ProtocolError> {
         if raw.file_format.trim().is_empty() {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::new(
+                FieldPath::root("file_scan_range").field("file_format"),
+                ProtocolErrorKind::InvalidValue,
                 "native FileScanRange requires file_format",
             ));
         }
@@ -142,7 +157,8 @@ mod tests {
     use prost::Message;
 
     use super::{FileScanRange, ScanRange, ScanRangeParams};
-    use crate::novarocks;
+    use crate::ProtocolErrorKind;
+    use novarocks_proto_models::novarocks;
 
     #[test]
     fn preserves_fixed_file_scan_range_wire_bytes() {
@@ -176,9 +192,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_range_and_file_format() {
-        assert!(ScanRangeParams::parse(novarocks::ScanRangeParams::default()).is_err());
-        assert!(ScanRange::parse(novarocks::ScanRange::default()).is_err());
-        assert!(FileScanRange::parse(novarocks::FileScanRange::default()).is_err());
+    fn rejects_missing_range_and_file_format_at_their_wire_paths() {
+        let missing_range = ScanRangeParams::parse(novarocks::ScanRangeParams::default())
+            .expect_err("range is required");
+        assert_eq!(missing_range.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(missing_range.path().to_string(), "scan_range_params.range");
+
+        let missing_kind =
+            ScanRange::parse(novarocks::ScanRange::default()).expect_err("kind is required");
+        assert_eq!(missing_kind.path().to_string(), "scan_range.kind");
+
+        let missing_format = FileScanRange::parse(novarocks::FileScanRange::default())
+            .expect_err("file format is required");
+        assert_eq!(
+            missing_format.path().to_string(),
+            "file_scan_range.file_format"
+        );
     }
 }

@@ -26,7 +26,7 @@ use super::error::NativeFragmentDecodeError;
 use super::node::DecodedNode;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_proto::FieldPath;
-use novarocks_proto::plan;
+use novarocks_proto_models::plan;
 
 pub(crate) fn lower_scan_node(
     node: &plan::DistributedNode,
@@ -111,7 +111,7 @@ mod tests {
         RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
     };
     use novarocks_proto::ProtocolErrorKind;
-    use novarocks_proto::{common, expr, novarocks as native_proto, plan};
+    use novarocks_proto_models::{common, expr, novarocks as native_proto, plan};
 
     struct TestNotCancelled;
 

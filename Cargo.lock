@@ -3087,6 +3087,7 @@ dependencies = [
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-proto",
+ "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-types",
  "novarocks-version",
@@ -3225,7 +3226,6 @@ dependencies = [
 name = "novarocks-failpoint"
 version = "0.1.0"
 dependencies = [
- "novarocks-proto",
  "novarocks-types",
 ]
 
@@ -3252,6 +3252,7 @@ dependencies = [
  "novarocks-fs",
  "novarocks-parser",
  "novarocks-proto",
+ "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",
@@ -3306,13 +3307,23 @@ dependencies = [
 name = "novarocks-proto"
 version = "0.1.0"
 dependencies = [
+ "novarocks-proto-models",
+ "novarocks-spi",
  "novarocks-types",
  "once_cell",
+ "prost 0.13.5",
+ "prost-reflect",
+ "sha2",
+]
+
+[[package]]
+name = "novarocks-proto-models"
+version = "0.1.0"
+dependencies = [
  "prost 0.13.5",
  "prost-build",
  "prost-reflect",
  "protoc-bin-vendored",
- "sha2",
 ]
 
 [[package]]

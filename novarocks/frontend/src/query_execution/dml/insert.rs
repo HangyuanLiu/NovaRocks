@@ -622,7 +622,7 @@ mod tests {
                 fragment_id: 0,
                 writer_key,
                 connector_staged_report_frames: vec![
-                    novarocks_proto::novarocks::ConnectorStagedReportFrame::default(),
+                    novarocks_proto_models::novarocks::ConnectorStagedReportFrame::default(),
                 ],
                 load_counters: BTreeMap::from([("loaded.rows".to_string(), "11".to_string())]),
                 loaded_rows: 11,

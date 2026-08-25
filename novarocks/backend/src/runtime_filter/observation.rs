@@ -67,14 +67,8 @@ pub(crate) enum RuntimeFilterObservationError {
     UnknownTransportRoute(BackendTransportEventIdentity),
     UnknownConsumer(BackendConsumerSubscriptionIdentity),
     IdentityMismatch,
-    #[allow(
-        dead_code,
-        reason = "Retained for staged backend runtime-filter domain and materialization integration."
-    )]
     ConflictingChannelTerminal {
         channel: BackendChannelIdentity,
-        observed: RuntimeFilterChannelTerminal,
-        incoming: RuntimeFilterChannelTerminal,
     },
     #[allow(
         dead_code,
@@ -91,6 +85,24 @@ pub(crate) enum RuntimeFilterObservationError {
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
     InvalidRowEffect,
+    ProducerSequenceRegression {
+        stream: BackendProducerStreamIdentity,
+    },
+    TransportAcknowledgementExceedsDelivery {
+        route: BackendTransportEventIdentity,
+    },
+    ConsumerAppliedWithoutDelivery {
+        consumer: BackendConsumerSubscriptionIdentity,
+    },
+    ConsumerAppliedVersionExceedsDelivery {
+        consumer: BackendConsumerSubscriptionIdentity,
+    },
+    ConsumerOutcomeConflict {
+        consumer: BackendConsumerSubscriptionIdentity,
+    },
+    ConsumerTerminalConflict {
+        consumer: BackendConsumerSubscriptionIdentity,
+    },
 }
 
 impl fmt::Display for RuntimeFilterObservationError {
@@ -357,6 +369,7 @@ pub(crate) struct RuntimeFilterObservationSnapshot {
     transport_routes: Vec<RuntimeFilterTransportObservation>,
     consumers: Vec<RuntimeFilterConsumerObservation>,
     anomalies: RuntimeFilterObservationAnomalies,
+    correctness_error: Option<String>,
 }
 
 impl RuntimeFilterObservationSnapshot {
@@ -383,11 +396,27 @@ impl RuntimeFilterObservationSnapshot {
     pub(crate) const fn anomalies(&self) -> &RuntimeFilterObservationAnomalies {
         &self.anomalies
     }
+
+    pub(crate) fn correctness_error(&self) -> Option<&str> {
+        self.correctness_error.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn correctness_failure_for_test(detail: impl Into<String>) -> Self {
+        Self {
+            channels: Vec::new(),
+            producer_streams: Vec::new(),
+            transport_routes: Vec::new(),
+            consumers: Vec::new(),
+            anomalies: RuntimeFilterObservationAnomalies::default(),
+            correctness_error: Some(detail.into()),
+        }
+    }
 }
 
-/// Diagnostics for facts that cannot be projected into the sealed observation
-/// manifest. They describe telemetry quality only; they never veto query
-/// execution or terminalization.
+/// Diagnostics retained alongside the sealed observation manifest. Domain
+/// violations also become first-wins correctness evidence at terminal capture;
+/// late-after-seal observations remain diagnostic only.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterObservationAnomalies {
     unattributed: RuntimeFilterUnattributedObservations,
@@ -553,10 +582,11 @@ struct ObservationState {
     transport_routes: BTreeMap<BackendTransportEventIdentity, RuntimeFilterTransportObservation>,
     consumers: BTreeMap<BackendConsumerSubscriptionIdentity, RuntimeFilterConsumerObservation>,
     anomalies: RuntimeFilterObservationAnomalies,
+    correctness_error: Option<RuntimeFilterObservationError>,
     sealed: Option<RuntimeFilterObservationSnapshot>,
 }
 
-// Design: ADR-0078 (docs/adr/ADR-0078-runtime-filter-terminal-observation-without-lifecycle-veto.md)
+// Design: ADR-0106 (docs/adr/ADR-0106-native-wire-layering-and-terminal-content-identity.md)
 pub(crate) struct RuntimeFilterObservationStore {
     state: Mutex<ObservationState>,
     saturated: AtomicU64,
@@ -658,6 +688,7 @@ impl RuntimeFilterObservationStore {
                 transport_routes,
                 consumers,
                 anomalies: RuntimeFilterObservationAnomalies::default(),
+                correctness_error: None,
                 sealed: None,
             }),
             saturated: AtomicU64::new(0),
@@ -706,6 +737,7 @@ impl RuntimeFilterObservationStore {
             },
         };
         if let Err(error) = result {
+            state.correctness_error.get_or_insert(error.clone());
             record_anomaly(&mut state, error, &self.saturated);
         }
     }
@@ -717,6 +749,7 @@ impl RuntimeFilterObservationStore {
             return;
         }
         if let Err(error) = fold_event(&mut state, event, &self.saturated) {
+            state.correctness_error.get_or_insert(error.clone());
             record_anomaly(&mut state, error, &self.saturated);
         }
     }
@@ -731,6 +764,7 @@ impl RuntimeFilterObservationStore {
             increment_field(&mut state.anomalies.late_after_seal, 1, &self.saturated);
             return;
         }
+        state.correctness_error.get_or_insert(error.clone());
         record_anomaly(&mut state, error, &self.saturated);
     }
 
@@ -902,7 +936,16 @@ fn fold_event(
             channel_mut(state, *channel)?;
         }
         BackendRuntimeFilterEvent::ContributionAccepted { stream, sequence } => {
+            let identity = *stream;
             let stream = producer_stream_mut(state, *stream)?;
+            if stream
+                .latest_accepted_sequence
+                .is_some_and(|latest| *sequence < latest)
+            {
+                return Err(RuntimeFilterObservationError::ProducerSequenceRegression {
+                    stream: identity,
+                });
+            }
             stream.latest_accepted_sequence =
                 max_option(stream.latest_accepted_sequence, *sequence);
             stream.accepted = increment(stream.accepted, 1, saturated);
@@ -938,6 +981,9 @@ fn fold_event(
                 join_channel_terminal(channel, RuntimeFilterChannelTerminal::Completed(*version))
             };
             if conflicted {
+                state.correctness_error.get_or_insert(
+                    RuntimeFilterObservationError::ConflictingChannelTerminal { channel: *channel },
+                );
                 increment_field(
                     &mut state.anomalies.conflicting_reports.channel_terminal,
                     1,
@@ -952,6 +998,9 @@ fn fold_event(
                 join_channel_terminal(channel, RuntimeFilterChannelTerminal::Unavailable(*reason))
             };
             if conflicted {
+                state.correctness_error.get_or_insert(
+                    RuntimeFilterObservationError::ConflictingChannelTerminal { channel: *channel },
+                );
                 increment_field(
                     &mut state.anomalies.conflicting_reports.channel_terminal,
                     1,
@@ -966,6 +1015,9 @@ fn fold_event(
                 join_channel_terminal(channel, RuntimeFilterChannelTerminal::Cancelled)
             };
             if conflicted {
+                state.correctness_error.get_or_insert(
+                    RuntimeFilterObservationError::ConflictingChannelTerminal { channel: *channel },
+                );
                 increment_field(
                     &mut state.anomalies.conflicting_reports.channel_terminal,
                     1,
@@ -982,7 +1034,6 @@ fn fold_event(
             let route = state.transport_routes.get_mut(identity).ok_or(
                 RuntimeFilterObservationError::UnknownTransportRoute(*identity),
             )?;
-            let total_bytes = increment(route.bytes, bytes, saturated);
             match kind {
                 BackendTransportEventKind::Sent => {
                     route.sent = increment(route.sent, 1, saturated);
@@ -993,6 +1044,28 @@ fn fold_event(
                     route.retried_bytes = increment(route.retried_bytes, bytes, saturated);
                 }
                 BackendTransportEventKind::Acked(_status) => {
+                    let delivered_count = route.sent.checked_add(route.retried).ok_or(
+                        RuntimeFilterObservationError::TransportAcknowledgementExceedsDelivery {
+                            route: *identity,
+                        },
+                    )?;
+                    let delivered_bytes = route.sent_bytes.checked_add(route.retried_bytes).ok_or(
+                        RuntimeFilterObservationError::TransportAcknowledgementExceedsDelivery {
+                            route: *identity,
+                        },
+                    )?;
+                    if route.acked >= delivered_count
+                        || route
+                            .acked_bytes
+                            .checked_add(bytes)
+                            .is_none_or(|acked| acked > delivered_bytes)
+                    {
+                        return Err(
+                            RuntimeFilterObservationError::TransportAcknowledgementExceedsDelivery {
+                                route: *identity,
+                            },
+                        );
+                    }
                     route.acked = increment(route.acked, 1, saturated);
                     route.acked_bytes = increment(route.acked_bytes, bytes, saturated);
                 }
@@ -1001,7 +1074,7 @@ fn fold_event(
                     route.failed_open_bytes = increment(route.failed_open_bytes, bytes, saturated);
                 }
             }
-            route.bytes = total_bytes;
+            route.bytes = increment(route.bytes, bytes, saturated);
         }
         BackendRuntimeFilterEvent::SubscriptionAcquired { identity, version } => {
             let conflicted = {
@@ -1011,6 +1084,11 @@ fn fold_event(
                 join_consumer_outcome(consumer, RuntimeFilterConsumerOutcome::Acquired)
             };
             if conflicted {
+                state.correctness_error.get_or_insert(
+                    RuntimeFilterObservationError::ConsumerOutcomeConflict {
+                        consumer: *identity,
+                    },
+                );
                 increment_field(
                     &mut state.anomalies.conflicting_reports.consumer_outcome,
                     1,
@@ -1024,6 +1102,11 @@ fn fold_event(
                 RuntimeFilterConsumerOutcome::TimedOut,
             );
             if conflicted {
+                state.correctness_error.get_or_insert(
+                    RuntimeFilterObservationError::ConsumerOutcomeConflict {
+                        consumer: *identity,
+                    },
+                );
                 increment_field(
                     &mut state.anomalies.conflicting_reports.consumer_outcome,
                     1,
@@ -1037,6 +1120,11 @@ fn fold_event(
                 RuntimeFilterConsumerOutcome::Unavailable(*reason),
             );
             if conflicted {
+                state.correctness_error.get_or_insert(
+                    RuntimeFilterObservationError::ConsumerOutcomeConflict {
+                        consumer: *identity,
+                    },
+                );
                 increment_field(
                     &mut state.anomalies.conflicting_reports.consumer_outcome,
                     1,
@@ -1050,6 +1138,11 @@ fn fold_event(
                 RuntimeFilterConsumerOutcome::Unsupported(*reason),
             );
             if conflicted {
+                state.correctness_error.get_or_insert(
+                    RuntimeFilterObservationError::ConsumerOutcomeConflict {
+                        consumer: *identity,
+                    },
+                );
                 increment_field(
                     &mut state.anomalies.conflicting_reports.consumer_outcome,
                     1,
@@ -1063,6 +1156,11 @@ fn fold_event(
                 RuntimeFilterConsumerOutcome::Cancelled,
             );
             if conflicted {
+                state.correctness_error.get_or_insert(
+                    RuntimeFilterObservationError::ConsumerOutcomeConflict {
+                        consumer: *identity,
+                    },
+                );
                 increment_field(
                     &mut state.anomalies.conflicting_reports.consumer_outcome,
                     1,
@@ -1086,6 +1184,11 @@ fn fold_event(
                 (outcome_conflicted, terminal_conflicted)
             };
             if outcome_conflicted {
+                state.correctness_error.get_or_insert(
+                    RuntimeFilterObservationError::ConsumerOutcomeConflict {
+                        consumer: *identity,
+                    },
+                );
                 increment_field(
                     &mut state.anomalies.conflicting_reports.consumer_outcome,
                     1,
@@ -1093,6 +1196,11 @@ fn fold_event(
                 );
             }
             if terminal_conflicted {
+                state.correctness_error.get_or_insert(
+                    RuntimeFilterObservationError::ConsumerTerminalConflict {
+                        consumer: *identity,
+                    },
+                );
                 increment_field(
                     &mut state.anomalies.conflicting_reports.consumer_terminal,
                     1,
@@ -1114,6 +1222,11 @@ fn fold_event(
                 terminal.is_some_and(|terminal| join_consumer_terminal(consumer, terminal))
             };
             if terminal_conflicted {
+                state.correctness_error.get_or_insert(
+                    RuntimeFilterObservationError::ConsumerTerminalConflict {
+                        consumer: *identity,
+                    },
+                );
                 increment_field(
                     &mut state.anomalies.conflicting_reports.consumer_terminal,
                     1,
@@ -1135,6 +1248,11 @@ fn fold_event(
                 join_consumer_terminal(consumer, *terminal)
             };
             if terminal_conflicted {
+                state.correctness_error.get_or_insert(
+                    RuntimeFilterObservationError::ConsumerTerminalConflict {
+                        consumer: *identity,
+                    },
+                );
                 increment_field(
                     &mut state.anomalies.conflicting_reports.consumer_terminal,
                     1,
@@ -1163,7 +1281,24 @@ fn fold_event(
             input_rows,
             output_rows,
         } => {
+            if output_rows > input_rows {
+                return Err(RuntimeFilterObservationError::InvalidRowEffect);
+            }
             let consumer = consumer_mut(state, *identity)?;
+            let Some(delivered) = consumer.latest_delivered_version else {
+                return Err(
+                    RuntimeFilterObservationError::ConsumerAppliedWithoutDelivery {
+                        consumer: *identity,
+                    },
+                );
+            };
+            if *logical_version > delivered {
+                return Err(
+                    RuntimeFilterObservationError::ConsumerAppliedVersionExceedsDelivery {
+                        consumer: *identity,
+                    },
+                );
+            }
             consumer.latest_applied_version =
                 max_option(consumer.latest_applied_version, *logical_version);
             let evaluations = increment(consumer.row_evaluations, 1, saturated);
@@ -1179,6 +1314,20 @@ fn fold_event(
             decision,
         } => {
             let consumer = consumer_mut(state, *identity)?;
+            let Some(delivered) = consumer.latest_delivered_version else {
+                return Err(
+                    RuntimeFilterObservationError::ConsumerAppliedWithoutDelivery {
+                        consumer: *identity,
+                    },
+                );
+            };
+            if *logical_version > delivered {
+                return Err(
+                    RuntimeFilterObservationError::ConsumerAppliedVersionExceedsDelivery {
+                        consumer: *identity,
+                    },
+                );
+            }
             consumer.latest_applied_version =
                 max_option(consumer.latest_applied_version, *logical_version);
             let evaluated = increment(consumer.scan_evaluated, 1, saturated);
@@ -1321,6 +1470,13 @@ fn snapshot(state: &ObservationState, saturated: u64) -> RuntimeFilterObservatio
         transport_routes: state.transport_routes.values().cloned().collect(),
         consumers: state.consumers.values().cloned().collect(),
         anomalies,
+        correctness_error: state
+            .correctness_error
+            .as_ref()
+            .map(ToString::to_string)
+            .or_else(|| {
+                (saturated > 0).then(|| "runtime-filter observation counter overflow".to_owned())
+            }),
     }
 }
 
@@ -1379,7 +1535,13 @@ fn record_anomaly(
         }
         RuntimeFilterObservationError::DeliveryConflict
         | RuntimeFilterObservationError::DeliveryResourceLimit
-        | RuntimeFilterObservationError::InvalidRowEffect => {
+        | RuntimeFilterObservationError::InvalidRowEffect
+        | RuntimeFilterObservationError::ProducerSequenceRegression { .. }
+        | RuntimeFilterObservationError::TransportAcknowledgementExceedsDelivery { .. }
+        | RuntimeFilterObservationError::ConsumerAppliedWithoutDelivery { .. }
+        | RuntimeFilterObservationError::ConsumerAppliedVersionExceedsDelivery { .. }
+        | RuntimeFilterObservationError::ConsumerOutcomeConflict { .. }
+        | RuntimeFilterObservationError::ConsumerTerminalConflict { .. } => {
             increment_field(&mut state.anomalies.rejected, 1, saturated);
         }
     };
@@ -1548,9 +1710,9 @@ mod tests {
     use super::*;
     use crate::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
     use crate::runtime_filter::domain::{
-        BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall,
-        BackendCoverageWitnessId, BackendMaterializationPolicy, BackendProducerInstall,
-        BackendRouteEdgeId, BackendRoutingShard,
+        BackendAcceptStatus, BackendChannelInstall, BackendChannelLifecycle,
+        BackendConsumerInstall, BackendCoverageWitnessId, BackendMaterializationPolicy,
+        BackendProducerInstall, BackendRouteEdgeId, BackendRoutingShard,
     };
     use crate::runtime_filter::test_support::BackendRuntimeFilterFixture;
 
@@ -1630,6 +1792,14 @@ mod tests {
             consumer,
             route: BackendTransportEventIdentity::new(consumer_channel, route_edge_id),
         }
+    }
+
+    fn record_delivery(
+        emitter: &RuntimeFilterObservationEmitter,
+        identity: BackendConsumerSubscriptionIdentity,
+        version: LogicalVersion,
+    ) {
+        emitter.record(BackendRuntimeFilterEvent::SubscriptionAcquired { identity, version });
     }
 
     #[test]
@@ -1766,6 +1936,7 @@ mod tests {
     fn cross_driver_effect_reordering_keeps_the_highest_observed_version() {
         let fixture = fixture();
         let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+        record_delivery(&emitter, fixture.consumer, LogicalVersion::new(2));
         for version in [LogicalVersion::new(2), LogicalVersion::FIRST] {
             emitter.record(BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
                 identity: fixture.consumer,
@@ -1788,7 +1959,7 @@ mod tests {
     }
 
     #[test]
-    fn unattributed_events_are_counted_without_poisoning_the_contribution() {
+    fn unattributed_events_preserve_diagnostics_and_poison_terminal_correctness() {
         let fixture = fixture();
         let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
         let stream = BackendProducerStreamIdentity::new(
@@ -1804,6 +1975,82 @@ mod tests {
         let captured = emitter.capture();
         assert_eq!(captured.anomalies().unattributed().producer_instance(), 1);
         assert_eq!(captured.anomalies().rejected(), 1);
+        assert!(
+            captured
+                .correctness_error()
+                .is_some_and(|detail| detail.contains("ProducerInstanceNotOpened"))
+        );
+    }
+
+    #[test]
+    fn sequence_regression_is_sticky_and_leaves_the_accepted_counter_unchanged() {
+        let fixture = fixture();
+        let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+        emitter.register_producer_instance(fixture.producer_channel, fixture.producer_instance, 1);
+        let stream = BackendProducerStreamIdentity::new(
+            fixture.producer_channel,
+            fixture.producer_instance,
+            PartitionId::new(0),
+        );
+        emitter.record(BackendRuntimeFilterEvent::ContributionAccepted {
+            stream,
+            sequence: 2,
+        });
+        emitter.record(BackendRuntimeFilterEvent::ContributionAccepted {
+            stream,
+            sequence: 1,
+        });
+
+        let captured = emitter.capture();
+        assert_eq!(captured.producer_streams()[0].accepted(), 1);
+        assert_eq!(
+            captured.producer_streams()[0].latest_accepted_sequence(),
+            Some(2)
+        );
+        assert!(
+            captured
+                .correctness_error()
+                .is_some_and(|detail| detail.contains("ProducerSequenceRegression"))
+        );
+    }
+
+    #[test]
+    fn acknowledgement_cannot_exceed_the_recorded_delivery() {
+        let fixture = fixture();
+        let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+        emitter.record(BackendRuntimeFilterEvent::TransportEnvelope {
+            identity: fixture.route,
+            kind: BackendTransportEventKind::Acked(BackendAcceptStatus::Accepted),
+            bytes: 17,
+        });
+
+        let captured = emitter.capture();
+        assert_eq!(captured.transport_routes()[0].acked(), 0);
+        assert!(
+            captured
+                .correctness_error()
+                .is_some_and(|detail| detail.contains("TransportAcknowledgementExceedsDelivery"))
+        );
+    }
+
+    #[test]
+    fn applying_a_version_without_delivery_is_sticky_and_does_not_fold_rows() {
+        let fixture = fixture();
+        let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+        emitter.record(BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
+            identity: fixture.consumer,
+            logical_version: LogicalVersion::FIRST,
+            input_rows: 4,
+            output_rows: 2,
+        });
+
+        let captured = emitter.capture();
+        assert_eq!(captured.consumers()[0].row_evaluations(), 0);
+        assert!(
+            captured
+                .correctness_error()
+                .is_some_and(|detail| detail.contains("ConsumerAppliedWithoutDelivery"))
+        );
     }
 
     #[test]
@@ -1838,6 +2085,7 @@ mod tests {
         let observer: Arc<dyn BackendRuntimeFilterEventObserver> = Arc::new(PanickingObserver);
         let emitter =
             RuntimeFilterObservationEmitter::from_install(&fixture.install, Some(observer));
+        record_delivery(&emitter, fixture.consumer, LogicalVersion::FIRST);
         emitter.record(BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
             identity: fixture.consumer,
             logical_version: LogicalVersion::FIRST,
@@ -1876,6 +2124,7 @@ mod tests {
         let emitter =
             RuntimeFilterObservationEmitter::from_install(&fixture.install, Some(observer.clone()));
         *observer.emitter.lock().unwrap() = Arc::downgrade(&emitter);
+        record_delivery(&emitter, fixture.consumer, LogicalVersion::FIRST);
         emitter.record(event);
         let captured = emitter.capture();
         let consumer = &captured.consumers()[0];
@@ -1887,6 +2136,7 @@ mod tests {
     fn concurrent_fold_and_capture_preserve_checked_totals() {
         let fixture = fixture();
         let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+        record_delivery(&emitter, fixture.consumer, LogicalVersion::FIRST);
         let mut workers = Vec::new();
         for _ in 0..4 {
             let emitter = Arc::clone(&emitter);
@@ -1927,6 +2177,10 @@ mod tests {
                 .expect("installed consumer")
                 .row_input = u64::MAX;
         }
+        store.fold(&BackendRuntimeFilterEvent::SubscriptionAcquired {
+            identity: fixture.consumer,
+            version: LogicalVersion::FIRST,
+        });
         store.fold(&BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
             identity: fixture.consumer,
             logical_version: LogicalVersion::FIRST,
@@ -1936,6 +2190,32 @@ mod tests {
         let captured = store.capture();
         assert_eq!(captured.consumers()[0].row_input(), u64::MAX);
         assert_eq!(captured.anomalies().saturated(), 1);
+        assert_eq!(
+            captured.correctness_error(),
+            Some("runtime-filter observation counter overflow")
+        );
+    }
+
+    #[test]
+    fn invalid_row_effect_is_a_first_wins_correctness_failure() {
+        let fixture = fixture();
+        let store = RuntimeFilterObservationStore::from_install(&fixture.install);
+        store.fold(&BackendRuntimeFilterEvent::SubscriptionAcquired {
+            identity: fixture.consumer,
+            version: LogicalVersion::FIRST,
+        });
+        store.fold(&BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
+            identity: fixture.consumer,
+            logical_version: LogicalVersion::FIRST,
+            input_rows: 1,
+            output_rows: 2,
+        });
+        let captured = store.seal();
+        assert_eq!(
+            captured.correctness_error(),
+            Some("invalid Backend runtime-filter observation: InvalidRowEffect")
+        );
+        assert_eq!(captured.consumers()[0].row_evaluations(), 0);
     }
 
     #[test]
@@ -1943,6 +2223,8 @@ mod tests {
         let fixture = fixture();
         let first = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
         let second = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+        record_delivery(&first, fixture.consumer, LogicalVersion::new(2));
+        record_delivery(&second, fixture.consumer, LogicalVersion::new(2));
         let events = [
             BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
                 identity: fixture.consumer,
@@ -1978,6 +2260,7 @@ mod tests {
     fn seal_freezes_the_contribution_and_marks_late_events() {
         let fixture = fixture();
         let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+        record_delivery(&emitter, fixture.consumer, LogicalVersion::FIRST);
         emitter.record(BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
             identity: fixture.consumer,
             logical_version: LogicalVersion::FIRST,

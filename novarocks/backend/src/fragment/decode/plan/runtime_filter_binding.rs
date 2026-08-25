@@ -25,7 +25,7 @@ use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter as execution;
 use novarocks_proto::{FieldPath, ProtocolErrorKind};
-use novarocks_proto::{expr, plan};
+use novarocks_proto_models::{expr, plan};
 
 /// Backend-local producer attachment target decoded from the native fragment
 /// binding table. It is translated into the corresponding neutral execution
@@ -1208,13 +1208,13 @@ mod tests {
 
     use super::*;
     use novarocks_proto::ProtocolErrorKind;
-    use novarocks_proto::expr;
+    use novarocks_proto_models::expr;
 
-    fn int64_type() -> novarocks_proto::common::TypeDesc {
-        novarocks_proto::common::TypeDesc {
-            kind: Some(novarocks_proto::common::type_desc::Kind::Scalar(
-                novarocks_proto::common::ScalarType {
-                    r#type: novarocks_proto::common::PrimitiveType::Bigint as i32,
+    fn int64_type() -> novarocks_proto_models::common::TypeDesc {
+        novarocks_proto_models::common::TypeDesc {
+            kind: Some(novarocks_proto_models::common::type_desc::Kind::Scalar(
+                novarocks_proto_models::common::ScalarType {
+                    r#type: novarocks_proto_models::common::PrimitiveType::Bigint as i32,
                     ..Default::default()
                 },
             )),

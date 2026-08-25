@@ -2,9 +2,9 @@
 id: ADR-0105
 title: "Wire authority and domain carrier separation"
 domain: [provider-spi, distributed-query-lifecycle, cluster-membership]
-status: active
+status: superseded
 supersedes: [ADR-0103]
-superseded-by: null
+superseded-by: ADR-0106
 date: 2026-08-25
 provenance:
   - "discussion: 2026-08-25 connector execution binding carrier ownership"

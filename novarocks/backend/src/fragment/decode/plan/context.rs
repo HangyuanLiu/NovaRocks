@@ -34,7 +34,7 @@ use novarocks_execution::runtime::fragment::{ExchangeInputAssignments, FragmentI
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto::FieldPath;
 use novarocks_proto::lifecycle::ScanRangeParams;
-use novarocks_proto::{common, expr};
+use novarocks_proto_models::{common, expr};
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
 use novarocks_types::QueryId;
 
@@ -298,7 +298,7 @@ impl NativePlanDecodeContext {
     pub(crate) fn with_scan_ranges(
         mut self,
         node_id: i32,
-        ranges: Vec<novarocks_proto::novarocks::ScanRangeParams>,
+        ranges: Vec<novarocks_proto_models::novarocks::ScanRangeParams>,
     ) -> Self {
         let ranges = ranges
             .iter()

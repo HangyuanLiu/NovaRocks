@@ -22,10 +22,10 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     use std::collections::{BTreeMap, HashMap};
 
     let scan_range = novarocks_proto::lifecycle::ScanRangeParams::parse(
-        novarocks_proto::novarocks::ScanRangeParams {
-            range: Some(novarocks_proto::novarocks::ScanRange {
-                kind: Some(novarocks_proto::novarocks::scan_range::Kind::File(
-                    novarocks_proto::novarocks::FileScanRange {
+        novarocks_proto_models::novarocks::ScanRangeParams {
+            range: Some(novarocks_proto_models::novarocks::ScanRange {
+                kind: Some(novarocks_proto_models::novarocks::scan_range::Kind::File(
+                    novarocks_proto_models::novarocks::FileScanRange {
                         file_format: "PARQUET".to_string(),
                         full_path: Some("s3://bucket/data.parquet".to_string()),
                         relative_path: Some("data.parquet".to_string()),
@@ -43,7 +43,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
                         )),
                         file_pruning_min_max_values: HashMap::from([(
                             0,
-                            novarocks_proto::novarocks::FilePruningMinMaxValue {
+                            novarocks_proto_models::novarocks::FilePruningMinMaxValue {
                                 value_kind: 2,
                                 has_null: false,
                                 all_null: false,
@@ -138,7 +138,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     assert_eq!(encoded_range.volume_id, Some(13));
     assert_eq!(encoded_range.empty, Some(true));
     assert_eq!(encoded_range.has_more, Some(false));
-    let novarocks_proto::novarocks::scan_range::Kind::File(file) = encoded_range
+    let novarocks_proto_models::novarocks::scan_range::Kind::File(file) = encoded_range
         .range
         .as_ref()
         .and_then(|range| range.kind.as_ref())

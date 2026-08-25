@@ -627,17 +627,18 @@ mod tests {
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
+    use novarocks_proto::lifecycle as protocol_lifecycle;
     use novarocks_proto::lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
         ParticipantRole, QueryAbortRequest, QueryControlEndpoint, QueryExecutionId,
         QueryInitRequest, QueryOptions, QueryTerminationReason,
     };
-    use novarocks_proto::novarocks::{
+    use novarocks_proto_models::novarocks as protocol;
+    use novarocks_proto_models::novarocks::{
         AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
         InitQueryRequest as ProtoInitQueryRequest, QueryControlAttach as ProtoQueryControlAttach,
         QueryControlRequest as ProtoQueryControlRequest,
     };
-    use novarocks_proto::{lifecycle as protocol_lifecycle, novarocks as protocol};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::AdvertiseEndpoint;
     use novarocks_types::QueryId;
@@ -745,7 +746,7 @@ mod tests {
                 )
                 .expect("valid backend identity"),
                 [ParticipantRole::FragmentExecutor],
-                [novarocks_proto::common::UniqueId {
+                [novarocks_proto_models::common::UniqueId {
                     hi: query_low,
                     lo: 1,
                 }],
@@ -955,7 +956,7 @@ mod tests {
                     event,
                     protocol::query_control_response::Event::TerminationAccepted(
                         protocol::QueryControlTerminationAccepted { reason }
-                    ) if reason == QueryTerminationReason::CoordinatorAbort as i32
+                    ) if reason == QueryTerminationReason::QueryTerminationCoordinatorAbort as i32
                 )
             },
         );
@@ -1020,7 +1021,7 @@ mod tests {
                     event,
                     protocol::query_control_response::Event::TerminationAccepted(
                         protocol::QueryControlTerminationAccepted { reason }
-                    ) if reason == QueryTerminationReason::CoordinatorHeartbeatTimeout as i32
+                    ) if reason == QueryTerminationReason::QueryTerminationCoordinatorHeartbeatTimeout as i32
                 )
             },
         );
@@ -1038,7 +1039,7 @@ mod tests {
             .into_inner();
         assert_eq!(
             termination.accepted_reason,
-            novarocks_proto::novarocks::QueryTerminationReason::
+            novarocks_proto_models::novarocks::QueryTerminationReason::
                 QueryTerminationCoordinatorHeartbeatTimeout as i32
         );
 
@@ -1140,7 +1141,7 @@ mod tests {
             termination
                 .accepted_reason()
                 .expect("validated termination reason"),
-            QueryTerminationReason::CoordinatorStreamLost
+            QueryTerminationReason::QueryTerminationCoordinatorStreamLost
         );
     }
 

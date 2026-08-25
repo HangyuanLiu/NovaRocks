@@ -17,14 +17,13 @@
 
 use std::time::Duration;
 
-use novarocks_proto::{
-    lifecycle::{
-        AttemptId, ContractErrorCode, ParticipantBackendIdentity, ParticipantManifest,
-        ParticipantRole, QueryControlEndpoint, QueryExecutionId, QueryInitRequest, QueryOptions,
-        RuntimeFilterContribution,
-    },
-    novarocks,
+use novarocks_proto::ProtocolErrorKind;
+use novarocks_proto::lifecycle::{
+    AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantRole,
+    QueryControlEndpoint, QueryExecutionId, QueryInitRequest, QueryOptions,
+    RuntimeFilterContribution,
 };
+use novarocks_proto_models::novarocks;
 use novarocks_types::QueryId;
 
 fn request_with_runtime_filter() -> QueryInitRequest {
@@ -92,7 +91,7 @@ fn participant_manifest_digest_rejects_mutated_runtime_filter_digest() {
     let error = QueryInitRequest::parse(wire)
         .expect_err("mutated runtime filter carrier must not retain the manifest digest");
 
-    assert_eq!(error.code(), ContractErrorCode::InvalidValue);
+    assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
     assert_eq!(
         error.detail(),
         "participant manifest digest does not match canonical projection"

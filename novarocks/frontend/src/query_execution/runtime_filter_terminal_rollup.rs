@@ -23,7 +23,7 @@
 //! facts and computes diagnostic query totals without introducing another
 //! lifecycle owner.
 
-use novarocks_proto::novarocks;
+use novarocks_proto_models::novarocks;
 
 use super::terminal_set::QueryTerminalSet;
 
@@ -378,7 +378,7 @@ mod tests {
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::terminal_set::QueryTerminalSet;
     use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
-    use novarocks_proto::{common, novarocks};
+    use novarocks_proto_models::{common, novarocks};
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
@@ -390,9 +390,9 @@ mod tests {
         channel_id: u32,
         transport_sent_count: u64,
     ) -> QueryTerminalSnapshot {
-        QueryTerminalSnapshot::seal(novarocks::QueryTerminalSnapshot {
+        QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(execution_id().into()),
+            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(execution_id())),
             backend: Some(novarocks::ParticipantBackendIdentity {
                 backend_id,
                 endpoint: Some(novarocks::QueryControlEndpoint {
@@ -479,9 +479,9 @@ mod tests {
     }
 
     fn unavailable_snapshot(backend_id: u64) -> QueryTerminalSnapshot {
-        QueryTerminalSnapshot::seal(novarocks::QueryTerminalSnapshot {
+        QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(execution_id().into()),
+            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(execution_id())),
             backend: Some(novarocks::ParticipantBackendIdentity {
                 backend_id,
                 endpoint: Some(novarocks::QueryControlEndpoint {
@@ -609,7 +609,7 @@ mod tests {
             panic!("fixture profile contribution must be available");
         };
         contribution.channels[0].published_count = u64::MAX;
-        let first = QueryTerminalSnapshot::seal(first).expect("maximum valid terminal snapshot");
+        let first = QueryTerminalSnapshot::parse(first).expect("maximum valid terminal snapshot");
         let set = QueryTerminalSet::new(vec![first, available_snapshot(2, 102, 1)])
             .expect("terminal set");
 
@@ -638,7 +638,7 @@ mod tests {
                 },
             ),
         );
-        let snapshot = QueryTerminalSnapshot::seal(snapshot).expect("empty terminal snapshot");
+        let snapshot = QueryTerminalSnapshot::parse(snapshot).expect("empty terminal snapshot");
         let set = QueryTerminalSet::new(vec![snapshot]).expect("terminal set");
 
         let rollup = set.runtime_filter_terminal_rollup();

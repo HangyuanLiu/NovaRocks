@@ -42,12 +42,12 @@ use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use crate::query_execution::lifecycle_plan::{QueryInitOptions, QueryLifecycleLease};
 use crate::query_execution::write::WriteTerminalBuilder;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
-use novarocks_proto::lifecycle::{
-    AttemptId, AttemptId as ProtocolAttemptId, QueryExecutionId,
-    QueryExecutionId as ProtocolQueryExecutionId, QueryOptions as ProtocolQueryOptions,
-};
+use novarocks_proto::lifecycle::QueryOptions as ProtocolQueryOptions;
 use novarocks_spi::connector::ConnectorWriteLease;
-use novarocks_types::{LocalQuerySequence, QueryId, QueryIdAttribution, QueryProcessNamespace};
+use novarocks_types::{
+    AttemptId, LocalQuerySequence, QueryExecutionId, QueryId, QueryIdAttribution,
+    QueryProcessNamespace,
+};
 
 use super::backend_events::BackendQueryActivity;
 use super::query_lifecycle::{
@@ -74,15 +74,14 @@ use crate::runtime_filter::compiler::{
 };
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 #[cfg(test)]
-use novarocks_proto::{
-    lifecycle::{
-        QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent,
-        QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryStageAck, QueryStageOutcome,
-        QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
-        QueryTerminationAck, QueryTerminationReason,
-    },
-    novarocks as protocol,
+use novarocks_proto::lifecycle::{
+    QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
+    QueryInitOutcome, QueryInitRequest, QueryStageAck, QueryStageOutcome, QueryStageRequest,
+    QueryStartAck, QueryStartOutcome, QueryStartRequest, QueryTerminationAck,
+    QueryTerminationReason,
 };
+#[cfg(test)]
+use novarocks_proto_models::novarocks as protocol;
 
 trait QueryIdSource: Send + Sync + 'static {
     fn next_query_id(&self) -> Result<QueryId, DistributedQueryError>;
@@ -492,7 +491,9 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
             .map_err(protocol_contract_error)?;
         let digest = request.digest().map_err(protocol_contract_error)?;
         QueryInitAck::parse(protocol::InitQueryResponse {
-            execution_id: Some(execution_id.to_proto()),
+            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+                execution_id,
+            )),
             init_digest: digest.as_bytes().to_vec(),
             outcome: QueryInitOutcome::QueryInitApplied as i32,
         })
@@ -556,12 +557,9 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         _timeout: Duration,
     ) -> Result<QueryTerminationAck, QueryLifecycleTransportError> {
         QueryTerminationAck::parse(protocol::AbortQueryResponse {
-            execution_id: Some(
-                request
-                    .execution_id()
-                    .map_err(protocol_contract_error)?
-                    .to_proto(),
-            ),
+            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+                request.execution_id().map_err(protocol_contract_error)?,
+            )),
             accepted_reason: QueryTerminationReason::QueryTerminationCoordinatorAbort as i32,
         })
         .map_err(protocol_contract_error)
@@ -569,9 +567,7 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
 }
 
 #[cfg(test)]
-fn protocol_contract_error(
-    error: novarocks_proto::lifecycle::ContractError,
-) -> QueryLifecycleTransportError {
+fn protocol_contract_error(error: novarocks_proto::ProtocolError) -> QueryLifecycleTransportError {
     QueryLifecycleTransportError::new(
         QueryLifecycleTransportErrorKind::InvalidResponse,
         error.to_string(),
@@ -1041,22 +1037,8 @@ impl FrontendDistributedQueryCoordinator {
             self.lifecycle_config,
         )
         .with_cancellation(parts.cancellation.clone());
-        let protocol_attempt =
-            ProtocolAttemptId::new(execution_id.attempt_id().get()).map_err(|error| {
-                failed(format!(
-                    "query attempt protocol projection is invalid: {error}"
-                ))
-            })?;
-        let protocol_execution_id =
-            ProtocolQueryExecutionId::new(execution_id.query_id(), protocol_attempt).map_err(
-                |error| {
-                    failed(format!(
-                        "query execution protocol projection is invalid: {error}"
-                    ))
-                },
-            )?;
         let init_options = QueryInitOptions::new(
-            protocol_execution_id,
+            execution_id,
             backend_services.live_backends,
             &parts.options,
             ProtocolQueryOptions::parse(encode_query_options(parts.options.runtime_options()))

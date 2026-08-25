@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use crate::query_execution::artifact::WriterRegistrationSet;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use novarocks_proto::lifecycle::QueryExecutionId;
-use novarocks_proto::novarocks;
+use novarocks_proto_models::novarocks;
 use novarocks_types::UniqueId;
 
 // This is deliberately a wire-level value rather than an Iceberg enum.  The
@@ -599,7 +599,7 @@ pub(crate) fn decode_connector_staged_report_frame(
 }
 
 fn connector_writer_identity_from_native(
-    writer: &novarocks_proto::plan::ConnectorWriterIdentity,
+    writer: &novarocks_proto_models::plan::ConnectorWriterIdentity,
 ) -> Result<ConnectorWriterIdentity, DistributedQueryError> {
     let operation_id = ConnectorWriteOperationId::from_bytes(connector_id_bytes(
         &writer.operation_id,
@@ -858,7 +858,7 @@ mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
     use novarocks_proto::lifecycle::{AttemptId, QueryTerminalSnapshot};
-    use novarocks_proto::{common, plan};
+    use novarocks_proto_models::{common, plan};
     use prost::Message;
 
     fn query_id() -> UniqueId {
@@ -966,9 +966,11 @@ mod tests {
     fn terminal_snapshot_with_p2(
         profile_contribution: novarocks::QueryTerminalProfileContributionTelemetry,
     ) -> QueryTerminalSnapshot {
-        QueryTerminalSnapshot::seal(novarocks::QueryTerminalSnapshot {
+        QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(execution_id().into()),
+            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+                execution_id(),
+            )),
             backend: Some(novarocks::ParticipantBackendIdentity {
                 backend_id: 31,
                 endpoint: Some(novarocks::QueryControlEndpoint {
@@ -980,7 +982,6 @@ mod tests {
             init_digest: vec![9; 32],
             fragments: vec![writer_terminal_fragment()],
             profile_contribution: Some(profile_contribution),
-            ..Default::default()
         })
         .expect("terminal snapshot")
     }

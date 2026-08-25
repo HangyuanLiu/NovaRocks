@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 use prost::Message;
 
-use novarocks_proto::{common, expr, filter, novarocks, plan};
+use novarocks_proto_models::{common, expr, filter, novarocks, plan};
 
 const FETCH_RESULT_RESPONSE_FIXTURE_HEX: &str =
     "0801120572656164791a0c4e5258312d6669787475726520092801";
@@ -379,7 +379,6 @@ fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequ
             start_epoch: 77,
         }),
         init_digest: vec![0x11; 32],
-        digest: vec![0x22; 32],
         fragments: vec![novarocks::QueryTerminalFragmentSnapshot {
             fragment_instance_id: Some(id(3, 4)),
             backend_num: 9,
@@ -440,7 +439,6 @@ fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequ
                     execution_id: snapshot.execution_id,
                     backend: snapshot.backend.clone(),
                     init_digest: snapshot.init_digest.clone(),
-                    digest: snapshot.digest.clone(),
                     fragments: vec![novarocks::TerminalizationProofFragment {
                         fragment_instance_id: Some(id(3, 4)),
                         backend_num: 9,
@@ -720,7 +718,6 @@ fn release_report_query_terminal_request_fixture_decodes() {
         77
     );
     assert_eq!(snapshot.init_digest, vec![0x11; 32]);
-    assert_eq!(snapshot.digest, vec![0x22; 32]);
     assert_eq!(snapshot.fragments.len(), 1);
     let profile_contribution = snapshot
         .profile_contribution

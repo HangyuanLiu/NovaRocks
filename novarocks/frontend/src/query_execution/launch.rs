@@ -25,10 +25,11 @@
 use std::collections::BTreeSet;
 
 use novarocks_proto::lifecycle::{
-    ContractError, ContractErrorCode, ParticipantManifestDigest, ParticipantRole, QueryExecutionId,
-    QueryStageRequest, QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
+    ParticipantManifestDigest, ParticipantRole, QueryStageRequest, QueryStartRequest, StageDigest,
+    StageDigestVersion, StageFragment,
 };
-use novarocks_types::UniqueId;
+use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_types::{QueryExecutionId, UniqueId};
 
 use crate::query_execution::contract::DistributedQueryError;
 
@@ -53,11 +54,12 @@ impl StageParticipantBinding {
         init_digest: ParticipantManifestDigest,
         roles: impl IntoIterator<Item = ParticipantRole>,
         expected_fragment_instance_ids: impl IntoIterator<Item = UniqueId>,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         let roles = roles.into_iter().collect::<BTreeSet<_>>();
         if roles.is_empty() {
-            return Err(ContractError::new(
-                ContractErrorCode::InvalidValue,
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_participant_binding").field("roles"),
+                ProtocolErrorKind::InvalidValue,
                 "stage participant must have at least one role",
             ));
         }
@@ -103,10 +105,11 @@ impl StageBatch {
         execution_id: QueryExecutionId,
         binding: StageParticipantBinding,
         fragments: Vec<StageFragment>,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         if fragments.len() > DEFAULT_STAGE_MAX_FRAGMENTS {
-            return Err(ContractError::new(
-                ContractErrorCode::Capacity,
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_batch").field("fragments"),
+                ProtocolErrorKind::Capacity,
                 format!(
                     "stage batch contains {} fragments; limit is {DEFAULT_STAGE_MAX_FRAGMENTS}",
                     fragments.len()
@@ -118,8 +121,9 @@ impl StageBatch {
             .map(StageFragment::fragment_instance_id)
             .collect::<BTreeSet<_>>();
         if actual != *binding.expected_fragment_instance_ids() {
-            return Err(ContractError::new(
-                ContractErrorCode::InvalidValue,
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_batch").field("fragments"),
+                ProtocolErrorKind::InvalidValue,
                 format!(
                     "stage batch exact fragment set differs for backend {}: expected {:?}, actual {:?}",
                     binding.target().backend_idx(),
@@ -169,9 +173,9 @@ pub trait QueryLaunchBarrier: Send + Sync + 'static {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-    use novarocks_proto::common;
     use novarocks_proto::lifecycle::AttemptId;
-    use novarocks_proto::{novarocks, plan};
+    use novarocks_proto_models::common;
+    use novarocks_proto_models::{novarocks, plan};
     use novarocks_types::QueryId;
 
     use super::*;
@@ -239,6 +243,6 @@ mod tests {
             vec![fragment(3)],
         )
         .expect_err("unbound fragment must not reach Protocol Stage");
-        assert_eq!(error.code(), ContractErrorCode::InvalidValue);
+        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
     }
 }

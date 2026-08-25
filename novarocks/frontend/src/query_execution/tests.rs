@@ -184,7 +184,7 @@ fn real_execution_artifacts() -> (
     .expect("prepare production execution artifact");
     let native_bundle =
         crate::query_execution::native_fragment::native_fragment_attachment_for_test(
-            [novarocks_proto::plan::PlanFragment {
+            [novarocks_proto_models::plan::PlanFragment {
                 fragment_id: 7,
                 ..Default::default()
             }],
@@ -207,7 +207,7 @@ fn request_owns_prepared_and_native_artifacts() {
         prepared,
         native_bundle,
         Some(
-            QueryOptions::parse(novarocks_proto::novarocks::QueryOptions {
+            QueryOptions::parse(novarocks_proto_models::novarocks::QueryOptions {
                 pipeline_dop: 3,
                 ..Default::default()
             })
@@ -267,7 +267,7 @@ fn query_control_typestate_initializes_before_native_assembly() {
     )
     .expect("valid protocol execution id");
     let wire_query_options = novarocks_proto::lifecycle::QueryOptions::parse(
-        novarocks_proto::novarocks::QueryOptions::default(),
+        novarocks_proto_models::novarocks::QueryOptions::default(),
     )
     .expect("valid protocol query options");
     let endpoint = "127.0.0.1:19031".parse().expect("valid endpoint");
@@ -329,8 +329,8 @@ fn query_control_typestate_initializes_before_native_assembly() {
             (fragment_id == key.fragment_id()).then(|| fragment.clone())
         })
         .expect("sealed root template");
-    let instance_params = novarocks_proto::novarocks::InstanceParams {
-        fragment_instance_id: Some(novarocks_proto::common::UniqueId {
+    let instance_params = novarocks_proto_models::novarocks::InstanceParams {
+        fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
             hi: key.fragment_instance_id().high(),
             lo: key.fragment_instance_id().low(),
         }),

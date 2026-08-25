@@ -22,7 +22,7 @@ use arrow::datatypes::DataType;
 use super::{decode_expr_at, decode_type, nested};
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_proto::FieldPath;
-use novarocks_proto::{common, expr};
+use novarocks_proto_models::{common, expr};
 
 use super::NativeExpressionInputLayout;
 
@@ -145,7 +145,7 @@ mod tests {
     };
     use arrow::datatypes::{DataType, TimeUnit};
     use novarocks_execution::exec::expr::ExprNode;
-    use novarocks_proto::expr;
+    use novarocks_proto_models::expr;
 
     #[test]
     fn cast_rejects_target_type_mismatch() {

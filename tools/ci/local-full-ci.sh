@@ -410,6 +410,10 @@ run_fail_fast_stage() {
 run_cargo_gates() {
   run_fail_fast_stage "generated artifact hygiene" "generated-artifact-hygiene.log" \
     tools/ci/check-generated-artifacts.sh
+  run_fail_fast_stage "native wire dependency boundary" "native-wire-dependency-boundary.log" \
+    tools/ci/check-native-wire-dependency-boundary.py
+  run_fail_fast_stage "native wire dependency boundary mutations" "native-wire-dependency-boundary-test.log" \
+    tools/ci/tests/native-wire-dependency-boundary-test.sh
   run_fail_fast_stage "legacy branding" "legacy-branding.log" \
     tools/ci/check-legacy-branding.sh
   run_fail_fast_stage "legacy branding tests" "legacy-branding-test.log" \

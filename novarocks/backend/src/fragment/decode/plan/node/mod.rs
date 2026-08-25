@@ -63,7 +63,7 @@ use novarocks_execution::exec::node::runtime_filter::{
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_proto::FieldPath;
-use novarocks_proto::plan;
+use novarocks_proto_models::plan;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DecodedNode {
@@ -547,7 +547,7 @@ fn validate_scan_domain_target(
     target: &crate::fragment::decode::plan::runtime_filter_binding::DecodedRuntimeFilterScanDomainTarget,
     path: FieldPath,
 ) -> Result<(), NativeFragmentDecodeError> {
-    use novarocks_proto::expr::expr::Kind;
+    use novarocks_proto_models::expr::expr::Kind;
 
     if !matches!(&binding.expression.kind, Some(Kind::ColumnRef(_))) {
         return Err(NativeFragmentDecodeError::inconsistent(
@@ -1067,12 +1067,12 @@ fn lower_binding_expression(
 
 fn validate_column_refs_exact(
     binding_id: u32,
-    expression: &novarocks_proto::expr::Expr,
+    expression: &novarocks_proto_models::expr::Expr,
     layout: &Layout,
     schema: &ChunkSchemaRef,
     path: FieldPath,
 ) -> Result<(), NativeFragmentDecodeError> {
-    use novarocks_proto::expr::expr::Kind;
+    use novarocks_proto_models::expr::expr::Kind;
 
     let kind = expression.kind.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(
@@ -1144,7 +1144,7 @@ fn validate_column_refs_exact(
         }
     }
 
-    let visit = |child: &novarocks_proto::expr::Expr, child_path: FieldPath| {
+    let visit = |child: &novarocks_proto_models::expr::Expr, child_path: FieldPath| {
         validate_column_refs_exact(binding_id, child, layout, schema, child_path)
     };
     let missing = |child_path: FieldPath, detail: &'static str| {
@@ -1612,7 +1612,7 @@ mod tests {
     use novarocks_execution::exec::node::assert::{AssertNumRowsMode, Assertion};
     use novarocks_execution::exec::node::set_op::SetOpKind;
     use novarocks_execution::runtime_filter as execution;
-    use novarocks_proto::{common, expr, plan};
+    use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 
     #[allow(
