@@ -282,6 +282,12 @@ impl FrontendQueryCompiler {
             execution,
             completion_intent,
         )?;
+        // Semantic admission is complete before native request construction.
+        // A future topology-only round must reuse these exact bindings or fail
+        // closed; it may never materialize a newer `Current` table here.
+        materializer
+            .query_table_bindings()
+            .seal_for_topology_replan();
         let native_bundle = encode_native_fragment_bundle(assembly.encoding().encoding_view())?;
         Ok(assembly.into_operation(native_bundle, completion)?)
     }

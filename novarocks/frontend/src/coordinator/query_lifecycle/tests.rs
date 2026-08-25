@@ -27,7 +27,7 @@ use crate::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
 };
 use crate::native::transport::new_query_lifecycle_transport;
-use crate::query_execution::contract::DistributedQueryIntent;
+use crate::query_execution::contract::{DistributedQueryIntent, PreReadyTopologyOutcome};
 use crate::query_execution::lifecycle_plan::{QueryInitBarrier, QueryInitPlan};
 use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_proto::lifecycle as protocol_lifecycle;
@@ -1824,6 +1824,43 @@ fn frontend_query_lifecycle_business_rejection_is_not_retried() {
         1
     );
     assert_eq!(barrier.metrics_snapshot().manifest_conflicts, 0);
+}
+
+#[test]
+fn frontend_query_lifecycle_draining_rejection_preserves_typed_pre_ready_evidence() {
+    let plan = query_init_plan(None);
+    let participant = plan.participant(1).expect("participant one");
+    let backend_idx = participant.backend_idx();
+    let process_id = participant
+        .backend()
+        .process_id()
+        .expect("validated participant process identity");
+    let digest = participant.digest();
+    let execution_id = plan.execution_id();
+    let (transport, _) = RecordingTransport::ready(&plan);
+    transport.state.lock().unwrap().init_results.insert(
+        1,
+        VecDeque::from([Ok(QueryInitAck::new(
+            execution_id,
+            digest,
+            QueryInitOutcome::QueryInitRejectedBackendDraining,
+        ))]),
+    );
+    let (registry, _query) = registry_for(&plan);
+    let barrier = FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, config());
+
+    let error = match barrier.initialize_all(plan) {
+        Ok(_) => panic!("draining backend must reject InitQuery before ControlReady"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.pre_ready_topology_outcome(),
+        Some(PreReadyTopologyOutcome::BackendDraining {
+            backend_idx,
+            process_id,
+        })
+    );
 }
 
 #[test]

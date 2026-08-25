@@ -47,6 +47,7 @@ use novarocks_spi::connector::{
     ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlanningRequest,
     ConnectorWritePreparation,
 };
+use novarocks_types::BackendProcessId;
 
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use novarocks_sql::plan_read::FragmentId;
@@ -813,6 +814,25 @@ pub enum DistributedQueryErrorKind {
     Failed,
 }
 
+/// Closed, pre-ControlReady topology outcomes that a statement-level round
+/// controller may consider for one bounded replan.  This is carried as typed
+/// coordinator evidence rather than reconstructed from an error string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreReadyTopologyOutcome {
+    BackendDraining {
+        backend_idx: usize,
+        process_id: BackendProcessId,
+    },
+    BackendProcessMismatch {
+        backend_idx: usize,
+        process_id: BackendProcessId,
+    },
+    BackendNotEligible {
+        backend_idx: usize,
+        process_id: BackendProcessId,
+    },
+}
+
 /// A coordinator failure that core can surface without naming a coordinator
 /// implementation or frontend state type.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -820,6 +840,7 @@ pub struct DistributedQueryError {
     kind: DistributedQueryErrorKind,
     message: String,
     connector_binding_rejection: Option<EnsureConnectorExecutionBindingRejection>,
+    pre_ready_topology_outcome: Option<PreReadyTopologyOutcome>,
 }
 
 impl DistributedQueryError {
@@ -828,6 +849,7 @@ impl DistributedQueryError {
             kind,
             message: message.into(),
             connector_binding_rejection: None,
+            pre_ready_topology_outcome: None,
         }
     }
 
@@ -852,6 +874,22 @@ impl DistributedQueryError {
                 field_path,
             ),
             connector_binding_rejection: Some(rejection),
+            pre_ready_topology_outcome: None,
+        }
+    }
+
+    /// Constructed only by the pre-ControlReady coordinator/barrier path.
+    /// Callers must never infer this disposition from transport text or a
+    /// post-ready lifecycle failure.
+    pub(crate) fn pre_ready_topology(
+        outcome: PreReadyTopologyOutcome,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: DistributedQueryErrorKind::Rejected,
+            message: message.into(),
+            connector_binding_rejection: None,
+            pre_ready_topology_outcome: Some(outcome),
         }
     }
 
@@ -865,6 +903,10 @@ impl DistributedQueryError {
 
     pub fn connector_binding_rejection(&self) -> Option<&EnsureConnectorExecutionBindingRejection> {
         self.connector_binding_rejection.as_ref()
+    }
+
+    pub(crate) const fn pre_ready_topology_outcome(&self) -> Option<PreReadyTopologyOutcome> {
+        self.pre_ready_topology_outcome
     }
 }
 
