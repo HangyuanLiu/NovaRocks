@@ -599,6 +599,14 @@ fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
             StatisticsExecutionMode::DurableJobAttempt,
             std::time::Duration::from_secs(30 * 60 + 1),
         )
+        .is_ok(),
+        "the shared LakePublicationRuntimePolicy, not this transport-neutral Core policy, owns the configured maximum"
+    );
+    assert!(
+        StatisticsExecutionPolicy::try_new(
+            StatisticsExecutionMode::DurableJobAttempt,
+            std::time::Duration::ZERO,
+        )
         .is_err()
     );
     assert!(StatisticsExecutionMode::SynchronousWait.statement_cancellation_terminates_execution());

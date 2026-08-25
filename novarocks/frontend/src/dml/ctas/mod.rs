@@ -2636,7 +2636,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_checkpoint_is_durable_before_dispatch_and_retains_cleanup() {
+    fn legacy_stage_checkpoint_is_not_a_recovery_authority() {
         let mut recovery = confirmed_recovery();
         let stage = install_staging(&mut recovery);
         validate_ctas_recovery(&recovery).unwrap();
@@ -2647,7 +2647,10 @@ mod tests {
             DmlCtasDispatchCertainty::PossiblyDispatched
         );
         assert!(checkpoint.dispatched_at_ms.is_some());
-        assert!(recovery.requires_recovery_scan());
+        assert!(
+            !recovery.requires_recovery_scan(),
+            "legacy CTAS recovery records are decode-only; GC owns retained staging"
+        );
     }
 
     #[test]
@@ -2684,7 +2687,7 @@ mod tests {
     }
 
     #[test]
-    fn fence_reply_loss_remains_recovery_due_without_stage_facts() {
+    fn legacy_fence_reply_loss_is_retained_without_recovery_scan() {
         let mut recovery = confirmed_recovery();
         let fence = recovery.catalog_fence.as_mut().unwrap();
         fence.fence_digest = None;
@@ -2693,7 +2696,10 @@ mod tests {
         fence.established_at_ms = None;
         recovery.next_action = StatementNextAction::ManualInspect;
         validate_ctas_recovery(&recovery).unwrap();
-        assert!(recovery.requires_recovery_scan());
+        assert!(
+            !recovery.requires_recovery_scan(),
+            "an obsolete fence reply-loss record cannot grant a new process mutation authority"
+        );
         assert!(recovery.staged_locator.is_none());
     }
 
