@@ -278,7 +278,7 @@ fn prepare_iceberg_distributed_write(
         source: IcebergWriteSource::CoordinatedPlan,
     };
     Ok(PreparedIcebergWrite {
-        semantic_binding,
+        semantic_binding: Arc::new(semantic_binding),
         spec,
         native_assembly: Mutex::new(None),
     })
@@ -398,7 +398,7 @@ pub(crate) fn prepare_iceberg_connector_write_with_table(
 // Core only forwards the target identity; it never builds a handle payload.
 
 pub(crate) struct PreparedIcebergWrite {
-    semantic_binding: FrozenIcebergWriteSemanticBinding,
+    semantic_binding: Arc<FrozenIcebergWriteSemanticBinding>,
     spec: IcebergWriteTransactionSpec,
     native_assembly: Mutex<Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>>,
 }
