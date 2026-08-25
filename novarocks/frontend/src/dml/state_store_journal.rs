@@ -251,10 +251,7 @@ impl StateStoreOperationJournal {
         request: CreateStatementOperationRequest,
         admission: Option<Arc<dyn DmlIntentAdmissionValidator>>,
     ) -> Result<StoredOperation, DmlError> {
-        let recovery_due_at_ms = request
-            .created_at_ms
-            .saturating_add(DML_FOREGROUND_RECOVERY_VISIBILITY_MS);
-        let operation = StoredOperation {
+        let mut operation = StoredOperation {
             schema_version: DML_OPERATION_SCHEMA_VERSION,
             operation_id: request.operation_id,
             revision: 1,
@@ -269,11 +266,17 @@ impl StateStoreOperationJournal {
             staged_artifacts: Vec::new(),
             payload: request.payload,
             coordination_provenance: None,
-            recovery_due_at_ms: Some(recovery_due_at_ms),
+            recovery_due_at_ms: None,
             created_at_ms: request.created_at_ms,
             updated_at_ms: request.created_at_ms,
             finished_at_ms: None,
         };
+        let recovery_due_at_ms = operation_requires_recovery(&operation).then_some(
+            request
+                .created_at_ms
+                .saturating_add(DML_FOREGROUND_RECOVERY_VISIBILITY_MS),
+        );
+        operation.recovery_due_at_ms = recovery_due_at_ms;
         validate_operation(&operation)?;
         // A statement operation is being created, so no side record can exist.
         validate_recovery_due_scope(&operation, None, None, None)?;
@@ -281,7 +284,9 @@ impl StateStoreOperationJournal {
         let mutation_id = operation.last_mutation_id;
         let operation_key = operation_key(operation_id)?;
         let unfinished_key = unfinished_key(operation_id)?;
-        let recovery_due_key = recovery_due_key(operation_id, recovery_due_at_ms)?;
+        let recovery_due_key = recovery_due_at_ms
+            .map(|due_at_ms| recovery_due_key(operation_id, due_at_ms))
+            .transpose()?;
         let stored = operation.clone();
         let max_value_bytes = self.store.limits().max_value_bytes;
         let result = run_side_effect_free(
@@ -303,7 +308,10 @@ impl StateStoreOperationJournal {
                     }
                     let existing_operation = transaction.get(&operation_key).await?;
                     let existing_unfinished = transaction.get(&unfinished_key).await?;
-                    let existing_due = transaction.get(&recovery_due_key).await?;
+                    let existing_due = match &recovery_due_key {
+                        Some(key) => transaction.get(key).await?,
+                        None => None,
+                    };
                     if let Some(record) = existing_operation {
                         let existing = match decode_operation(record.key, record.value) {
                             Ok(existing) => existing,
@@ -327,6 +335,20 @@ impl StateStoreOperationJournal {
                                 }
                                 if let Err(error) = validate_recovery_due_record(&existing, due) {
                                     return Ok(Err(error));
+                                }
+                            }
+                            (false, Some(index), None)
+                                if !operation_requires_recovery(&existing) =>
+                            {
+                                let indexed_id = match decode_unfinished(index.key, index.value) {
+                                    Ok(indexed_id) => indexed_id,
+                                    Err(error) => return Ok(Err(error)),
+                                };
+                                if indexed_id != stored.operation_id {
+                                    return Ok(Err(DmlError::journal_corruption(format!(
+                                        "unfinished DML operation index identity mismatch for {}",
+                                        stored.operation_id
+                                    ))));
                                 }
                             }
                             (false, _, _) => {
@@ -371,19 +393,21 @@ impl StateStoreOperationJournal {
                         Ok(value) => value,
                         Err(error) => return Ok(Err(error)),
                     };
-                    let recovery_due_value = match encode_recovery_due(&stored) {
-                        Ok(value) => value,
-                        Err(error) => return Ok(Err(error)),
-                    };
                     transaction
                         .put(operation_key, operation_value, Precondition::Absent)
                         .await?;
                     transaction
                         .put(unfinished_key, unfinished_value, Precondition::Absent)
                         .await?;
-                    transaction
-                        .put(recovery_due_key, recovery_due_value, Precondition::Absent)
-                        .await?;
+                    if let Some(recovery_due_key) = recovery_due_key {
+                        let recovery_due_value = match encode_recovery_due(&stored) {
+                            Ok(value) => value,
+                            Err(error) => return Ok(Err(error)),
+                        };
+                        transaction
+                            .put(recovery_due_key, recovery_due_value, Precondition::Absent)
+                            .await?;
+                    }
                     Ok(Ok(stored))
                 })
             },
@@ -955,12 +979,27 @@ impl StateStoreOperationJournal {
             ));
         }
         validate_coordination_provenance(&request.provenance)?;
+        let operation = self
+            .load_async(request.operation_id)
+            .await?
+            .ok_or_else(|| {
+                DmlError::journal_unavailable(format!(
+                    "DML operation {} cannot be claimed because it does not exist",
+                    request.operation_id
+                ))
+            })?;
+        // Crash-only CTAS never enters the recovery scheduler, including
+        // during the foreground lease claim that precedes its first effect.
+        // The expected-revision check below remains the authority against a
+        // concurrent state transition after this read.
+        let recovery_due_at_ms =
+            operation_requires_recovery(&operation).then_some(request.recovery_due_at_ms);
         let provenance = request.provenance.clone();
         self.mutate_operation_authorized_async(
             request.operation_id,
             request.expected_revision,
             request.mutation_id,
-            Some(request.recovery_due_at_ms),
+            recovery_due_at_ms,
             admission,
             authority,
             true,
@@ -3934,17 +3973,14 @@ fn is_sha256(value: Option<&str>) -> bool {
     reason = "Preserves the frozen DML error contract without a broad ABI migration."
 )]
 fn validate_ctas_record(record: &CtasSagaRecord) -> Result<(), DmlError> {
-    let child_ids = [
-        record.prepare_operation_id,
-        record.write_operation_id,
-        record.publish_operation_id,
-        record.abort_staging_operation_id,
-    ];
-    if child_ids.iter().any(Uuid::is_nil)
-        || child_ids.iter().copied().collect::<BTreeSet<_>>().len() != child_ids.len()
+    let publication_id = record.prepare_operation_id;
+    if publication_id.is_nil()
+        || record.write_operation_id != publication_id
+        || record.publish_operation_id != publication_id
+        || record.abort_staging_operation_id != publication_id
     {
         return Err(DmlError::journal_corruption(
-            "CTAS child operation IDs must be non-nil and pairwise distinct",
+            "CTAS lifecycle IDs must equal one non-nil statement publication ID",
         ));
     }
     if !matches!(
@@ -4070,6 +4106,13 @@ fn validate_ctas_record(record: &CtasSagaRecord) -> Result<(), DmlError> {
                     .prepare_fact
                     .as_ref()
                     .is_some_and(|fact| fact.outcome == ExternalFactOutcome::Conflict) =>
+        {
+            Ok(())
+        }
+        CtasSagaPhase::NoOp
+            if record.create_policy == CTAS_CREATE_POLICY_NO_OP_IF_EXISTS
+                && record.prepare_fact.is_none()
+                && record.publish_fact.is_none() =>
         {
             Ok(())
         }

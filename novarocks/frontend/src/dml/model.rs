@@ -2083,6 +2083,18 @@ pub struct CtasSagaRecord {
     pub next_action: StatementNextAction,
 }
 
+impl CtasSagaRecord {
+    /// A crash-only CTAS has one statement publication identity across stage,
+    /// write and publication. It deliberately has no durable recovery action:
+    /// an interrupted attempt is diagnosed manually and its owned residue is
+    /// retired only by age-based lake GC.
+    pub fn is_crash_only_publication(&self) -> bool {
+        self.prepare_operation_id == self.write_operation_id
+            && self.prepare_operation_id == self.publish_operation_id
+            && self.prepare_operation_id == self.abort_staging_operation_id
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CP-3D: catalog-fenced CTAS takeover and historical recovery.
 //
@@ -3038,6 +3050,11 @@ pub fn operation_requires_recovery_scan(
     payload: &OperationPayload,
     historical_write_recovery: Option<&DmlHistoricalWriteRecoveryRecord>,
 ) -> bool {
+    if let OperationPayload::CtasSaga(record) = payload
+        && record.is_crash_only_publication()
+    {
+        return false;
+    }
     if !state.is_finished() {
         return true;
     }

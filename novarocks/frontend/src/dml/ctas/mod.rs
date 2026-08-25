@@ -1899,7 +1899,7 @@ fn finish_catalog_unknown(
     active.mutate_statement(
         OperationState::CommitUnknown,
         OperationPayload::CtasSaga(saga),
-        Some(crate::dml::now_unix_millis()),
+        None,
     )?;
     Err(operation_error(
         DmlErrorKind::Commit,
@@ -2294,15 +2294,21 @@ fn finalize_standard_ctas_publication(
 
 fn staged_create_fact(
     outcome: ExternalFactOutcome,
-    _receipt: &novarocks_spi::connector::ConnectorStagedCreateReceipt,
+    receipt: &novarocks_spi::connector::ConnectorStagedCreateReceipt,
 ) -> DurableExternalFact {
+    let mut digest = Sha256::new();
+    digest.update(b"novarocks.staged-create-receipt-observation.v1");
+    digest.update(receipt.owner().instance_id.as_str().as_bytes());
+    digest.update(receipt.owner().incarnation.to_bytes());
+    digest.update(receipt.operation_id().to_bytes());
+    digest.update(format!("{:?}", receipt.phase()).as_bytes());
+    digest.update(format!("{:?}", receipt.effect()).as_bytes());
+    digest.update(receipt.provider_payload());
     DurableExternalFact {
         outcome,
-        // Standard staged-create receipts intentionally have no generic
-        // semantic digest: their provider payload remains opaque and is not
-        // recovery authority. The durable fact records only the known
-        // outcome; publication truth is the catalog's atomic frontier.
-        receipt: None,
+        // This bounded observation digest is diagnostic only; publication
+        // truth is the catalog's atomic staged-create frontier.
+        receipt: Some(hex::encode(digest.finalize())),
         evidence: None,
         finalization_failure: None,
         failure: None,
