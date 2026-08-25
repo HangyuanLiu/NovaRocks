@@ -165,11 +165,20 @@ impl ConnectorControlFactory for IcebergControlFactory {
             None
         };
         let unanchored_ctas_cleanup = if unpublished.runtime.rest_catalog().is_some() {
-            Some(Arc::new(IcebergUnanchoredCtasCleanupAdapter::try_new(
+            match IcebergUnanchoredCtasCleanupAdapter::try_new(
                 descriptor.clone(),
                 incarnation,
                 Arc::clone(&unpublished.runtime),
-            )?))
+            ) {
+                Ok(capability) => Some(Arc::new(capability)),
+                // This is an optional CTAS-only capability. A REST catalog
+                // without a warehouse that can safely enumerate/delete the
+                // unanchored namespace must still attach for reads and normal
+                // table operations; CTAS fails typed Unsupported before its
+                // first source or catalog-write side effect.
+                Err(error) if error.kind() == ConnectorErrorKind::Unsupported => None,
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
@@ -612,6 +621,39 @@ mod tests {
         assert!(
             creation.binding().staged_create().is_some(),
             "standard REST staged create must not depend on a private capability"
+        );
+    }
+
+    #[test]
+    fn rest_factory_without_unanchored_cleanup_still_attaches_for_non_ctas_work() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+            binding,
+            runtime.handle().clone(),
+        ));
+        let request = ConnectorControlFactoryRequest::try_new(
+            factory.provider_id().clone(),
+            ConnectorInstanceId::parse("ice").expect("instance ID"),
+            vec![
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), "http://127.0.0.1:1".to_string()),
+            ],
+        )
+        .expect("REST request");
+
+        let creation = factory
+            .create_control(request)
+            .expect("REST control without a GC-capable warehouse");
+        assert!(creation.binding().staged_create().is_some());
+        assert!(
+            creation.binding().unanchored_ctas_cleanup().is_none(),
+            "missing cleanup capability belongs to CTAS preflight, not catalog attachment"
         );
     }
 

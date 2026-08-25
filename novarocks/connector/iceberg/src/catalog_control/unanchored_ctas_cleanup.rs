@@ -329,8 +329,9 @@ impl ConnectorUnanchoredCtasCleanup for IcebergUnanchoredCtasCleanupAdapter {
         }
         // The current target must be a fresh exact lookup. A matching UUID is
         // the successful publication and pins this root. A different UUID is
-        // a later/recreated target, so it cannot make the old publication
-        // live; the deterministic root remains eligible for deletion.
+        // an ambiguous drop/recreate observation: the old staging root may be
+        // shared or otherwise still operator-relevant, so it also leaks. Only
+        // a definite NotFound target permits unanchored-root deletion.
         self.runtime
             .control_state()
             .invalidate_table(&observed.target.namespace, &observed.target.table);
@@ -338,13 +339,11 @@ impl ConnectorUnanchoredCtasCleanup for IcebergUnanchoredCtasCleanupAdapter {
             .runtime
             .load_table_classified(&observed.target.namespace, &observed.target.table)
         {
-            Ok(physical) => {
-                let expected_uuid = observed.staged_table_uuid.ok_or_else(|| {
+            Ok(_physical) => {
+                let _expected_uuid = observed.staged_table_uuid.ok_or_else(|| {
                     invalid("unanchored CTAS cleanup provenance lacks staged table UUID")
                 })?;
-                if physical.table.metadata().uuid().as_bytes() == &expected_uuid {
-                    return Ok(ConnectorCtasUnanchoredCleanupOutcome::Retained);
-                }
+                return Ok(ConnectorCtasUnanchoredCleanupOutcome::Retained);
             }
             Err((ConnectorErrorKind::NotFound, _)) => {}
             Err((kind, message)) => return Err(ConnectorError::new(kind, message)),

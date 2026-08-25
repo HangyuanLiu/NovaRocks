@@ -258,13 +258,14 @@ pub(crate) fn canonical_directory_source_scope(
 }
 
 /// Prove, before source listing or footer reads, that the user-owned source is
-/// outside every current NovaRocks cleanup root. The whole warehouse is used
-/// as the protected root in this first implementation: it is deliberately
-/// stricter than checking only the target table, and therefore also covers the
-/// CTAS and maintenance namespaces below it.
+/// outside every current NovaRocks cleanup root. Both the configured warehouse
+/// and the loaded target table location are protected: a catalog may host an
+/// existing table outside its configured warehouse, and that table's live
+/// data/maintenance roots are no less protected than the warehouse namespace.
 pub(crate) fn preflight_caller_managed_source_domain(
     source_directory: &str,
     warehouse_uri: &str,
+    target_table_location: &str,
     object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<ConnectorDataMutationAddFilesDomain, String> {
     if warehouse_uri.trim().is_empty() {
@@ -274,17 +275,33 @@ pub(crate) fn preflight_caller_managed_source_domain(
         );
     }
     let source = canonical_directory_identity(source_directory, object_store_config)?;
-    let warehouse = canonical_directory_identity(warehouse_uri, object_store_config)?;
-    if directories_overlap(&source, &warehouse) {
+    let mut protected_roots = vec![
+        canonical_directory_identity(warehouse_uri, object_store_config)?,
+        canonical_directory_identity(target_table_location, object_store_config)?,
+    ];
+    protected_roots.sort_by(|left, right| {
+        left.authority
+            .cmp(&right.authority)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    protected_roots
+        .dedup_by(|left, right| left.authority == right.authority && left.path == right.path);
+    if protected_roots
+        .iter()
+        .any(|root| directories_overlap(&source, root))
+    {
         return Err(
-            "ADD FILES source root overlaps the Iceberg warehouse or a NovaRocks cleanup namespace"
+            "ADD FILES source root overlaps the Iceberg warehouse, target table, or a NovaRocks cleanup namespace"
                 .to_string(),
         );
     }
     let mut hasher = Sha256::new();
     hasher.update(SOURCE_SCOPE_DIGEST_DOMAIN);
-    digest_bytes(&mut hasher, warehouse.authority.as_bytes());
-    digest_bytes(&mut hasher, warehouse.path.as_bytes());
+    hasher.update((protected_roots.len() as u32).to_be_bytes());
+    for root in protected_roots {
+        digest_bytes(&mut hasher, root.authority.as_bytes());
+        digest_bytes(&mut hasher, root.path.as_bytes());
+    }
     ConnectorDataMutationAddFilesDomain::try_new_caller_managed_stable(hasher.finalize().into())
         .map_err(|error| format!("build ADD FILES source domain: {error}"))
 }
@@ -989,6 +1006,7 @@ mod tests {
         let error = preflight_caller_managed_source_domain(
             &format!("file://{}", source.display()),
             &format!("file://{}", warehouse.path().display()),
+            &format!("file://{}", warehouse.path().display()),
             None,
         )
         .expect_err("warehouse-owned source must be rejected before listing");
@@ -1002,10 +1020,28 @@ mod tests {
         let domain = preflight_caller_managed_source_domain(
             &format!("file://{}", source.path().display()),
             &format!("file://{}", warehouse.path().display()),
+            &format!("file://{}", warehouse.path().display()),
             None,
         )
         .expect("caller-managed source proof");
         assert_ne!(domain.target_cleanup_root_digest(), [0; 32]);
+    }
+
+    #[test]
+    fn caller_managed_source_must_be_disjoint_from_an_external_target_table_location() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let external_target = tempfile::tempdir().expect("external target");
+        let source = external_target.path().join("data");
+        std::fs::create_dir(&source).expect("source");
+
+        let error = preflight_caller_managed_source_domain(
+            &format!("file://{}", source.display()),
+            &format!("file://{}", warehouse.path().display()),
+            &format!("file://{}", external_target.path().display()),
+            None,
+        )
+        .expect_err("target-table-owned source must be rejected before listing");
+        assert!(error.contains("target table"));
     }
 
     #[test]

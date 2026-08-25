@@ -258,6 +258,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 let domain = preflight_caller_managed_source_domain(
                     source_location,
                     &self.runtime.control_state().configuration().warehouse_uri,
+                    table.metadata().location(),
                     self.runtime.control_state().object_store_config(),
                 )
                 .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unsupported, error))?;

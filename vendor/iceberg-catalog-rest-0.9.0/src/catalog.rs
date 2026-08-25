@@ -17,11 +17,6 @@
 
 //! This module contains the iceberg REST catalog implementation.
 
-#[path = "ctas_fenced_publication.rs"]
-mod ctas_fenced_publication;
-
-pub use ctas_fenced_publication::*;
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::str::FromStr;
