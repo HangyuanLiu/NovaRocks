@@ -34,8 +34,6 @@ use crate::control_provider::IcebergControlProvider;
 use crate::control_runtime::IcebergControlRuntime;
 use crate::distributed_rewrite::IcebergDistributedRewriteControl;
 use crate::execution_declaration::IcebergInstanceDistribution;
-use crate::historical_data_mutation_recovery::IcebergHistoricalDataMutationRecovery;
-use crate::historical_write_recovery::IcebergHistoricalWriteRecovery;
 use crate::resources::IcebergControlResources;
 use novarocks_spi::connector::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
@@ -157,28 +155,6 @@ impl ConnectorControlFactory for IcebergControlFactory {
             key.clone(),
             Arc::clone(&unpublished.runtime),
         )?);
-        // Historical distributed-write recovery is a narrow capability of its
-        // own, deliberately not reachable from `write_control`: an ordinary
-        // execution path must never be able to fall back into cross-generation
-        // inspection, and this facet must never call an ordinary old-owner
-        // write method.
-        let historical_write_recovery = Arc::new(IcebergHistoricalWriteRecovery::new(
-            descriptor.clone(),
-            incarnation,
-            Arc::clone(&unpublished.runtime),
-        ));
-        // Historical direct-mutation recovery is a third, independent
-        // capability: it is not reachable from `data_mutation` and it does not
-        // share an owner with the distributed-write facet. TRUNCATE and ADD
-        // FILES are executed exactly once by one exact generation, so an
-        // ordinary path that could fall back into cross-generation inspection
-        // is exactly how a destructive mutation would be replayed.
-        let historical_data_mutation_recovery =
-            Arc::new(IcebergHistoricalDataMutationRecovery::new(
-                descriptor.clone(),
-                incarnation,
-                Arc::clone(&unpublished.runtime),
-            ));
         let staged_create = if unpublished.runtime.rest_catalog().is_some() {
             Some(Arc::new(IcebergStagedCreateAdapter::try_new(
                 Arc::clone(&provider),
@@ -217,8 +193,6 @@ impl ConnectorControlFactory for IcebergControlFactory {
             )))?
             .try_with_mv_publication_fencing(Some(mv_fencing.clone()))?
             .try_with_mv_attempt_discovery(Some(mv_fencing))?
-            .try_with_historical_write_recovery(Some(historical_write_recovery))?
-            .try_with_historical_data_mutation_recovery(Some(historical_data_mutation_recovery))?
             .try_with_view_metadata(Some(provider))?;
         ConnectorControlCreation::try_new(&request, binding, unpublished.durable_properties)
     }
@@ -644,32 +618,16 @@ mod tests {
             recovery.binding_key().incarnation,
             creation.binding().incarnation()
         );
-        let historical = creation
-            .binding()
-            .historical_write_recovery()
-            .expect("historical write recovery");
-        assert_eq!(
-            historical.binding_key().incarnation,
-            creation.binding().incarnation()
+        assert!(
+            creation.binding().historical_write_recovery().is_none(),
+            "crash-only bindings must not install historical write takeover"
         );
-        assert_eq!(
-            historical.binding_key().instance_id,
-            creation.binding().descriptor().instance_id
-        );
-        // The direct-mutation historical facet is installed independently of
-        // the ordinary data-mutation capability and of the distributed-write
-        // facet, so an ordinary path can never reach it as a fallback.
-        let historical_data_mutation = creation
-            .binding()
-            .historical_data_mutation_recovery()
-            .expect("historical data mutation recovery");
-        assert_eq!(
-            historical_data_mutation.binding_key().incarnation,
-            creation.binding().incarnation()
-        );
-        assert_eq!(
-            historical_data_mutation.binding_key().instance_id,
-            creation.binding().descriptor().instance_id
+        assert!(
+            creation
+                .binding()
+                .historical_data_mutation_recovery()
+                .is_none(),
+            "crash-only bindings must not install historical direct-mutation takeover"
         );
         let views = creation.binding().view_metadata().expect("view metadata");
         assert_eq!(views.descriptor(), creation.binding().descriptor());
