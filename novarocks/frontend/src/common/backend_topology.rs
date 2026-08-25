@@ -155,11 +155,18 @@ impl std::error::Error for BackendTopologyValidationError {}
 /// on it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BackendTopologyMetricsSnapshot {
-    pub registering: usize,
-    pub live: usize,
-    pub incompatible: usize,
-    pub lost: usize,
-    pub decommissioning: usize,
+    pub entries: usize,
+    pub announce_lease_valid: usize,
+    pub identity_verified: usize,
+    pub reported_running: usize,
+    pub reported_draining: usize,
+    pub compatibility_compatible: usize,
+    pub compatibility_incompatible: usize,
+    pub compatibility_unknown: usize,
+    pub endpoint_owned: usize,
+    pub endpoint_unowned: usize,
+    pub eligible: usize,
+    pub revision: u64,
 }
 
 /// Publishes the latest frontend-owned topology counts to the shared process
@@ -171,11 +178,18 @@ pub struct BackendTopologyMetricsSnapshot {
 /// name a type belonging to the other.
 pub fn publish_backend_topology_metrics(snapshot: BackendTopologyMetricsSnapshot) {
     crate::metrics::publish_backend_topology_metrics(
-        snapshot.registering,
-        snapshot.live,
-        snapshot.incompatible,
-        snapshot.lost,
-        snapshot.decommissioning,
+        snapshot.entries,
+        snapshot.announce_lease_valid,
+        snapshot.identity_verified,
+        snapshot.reported_running,
+        snapshot.reported_draining,
+        snapshot.compatibility_compatible,
+        snapshot.compatibility_incompatible,
+        snapshot.compatibility_unknown,
+        snapshot.endpoint_owned,
+        snapshot.endpoint_unowned,
+        snapshot.eligible,
+        snapshot.revision,
     );
 }
 

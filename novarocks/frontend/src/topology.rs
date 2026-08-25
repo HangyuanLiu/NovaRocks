@@ -861,18 +861,28 @@ fn live_targets(state: &TopologyState) -> Vec<LiveBackendTarget> {
         .collect()
 }
 fn metrics_snapshot(state: &TopologyState) -> BackendTopologyMetricsSnapshot {
-    let mut metrics = BackendTopologyMetricsSnapshot::default();
+    let mut metrics = BackendTopologyMetricsSnapshot {
+        entries: state.processes.len(),
+        revision: state.revision,
+        ..BackendTopologyMetricsSnapshot::default()
+    };
     for facts in state.processes.values() {
+        metrics.announce_lease_valid += usize::from(facts.announce_lease_valid);
+        metrics.identity_verified += usize::from(facts.exact_identity_verified);
+        match facts.reported_state {
+            BackendReportedState::Running => metrics.reported_running += 1,
+            BackendReportedState::Draining => metrics.reported_draining += 1,
+            BackendReportedState::Unspecified => {}
+        }
+        match facts.compatibility {
+            Compatibility::Compatible => metrics.compatibility_compatible += 1,
+            Compatibility::Incompatible(_) => metrics.compatibility_incompatible += 1,
+            Compatibility::Unknown => metrics.compatibility_unknown += 1,
+        }
+        metrics.endpoint_owned += usize::from(facts.endpoint_owned);
+        metrics.endpoint_unowned += usize::from(!facts.endpoint_owned);
         if facts.eligible() {
-            metrics.live += 1;
-        } else if facts.reported_state == BackendReportedState::Draining {
-            metrics.decommissioning += 1;
-        } else if !facts.exact_identity_verified {
-            metrics.registering += 1;
-        } else if !facts.compatibility.is_compatible() {
-            metrics.incompatible += 1;
-        } else {
-            metrics.lost += 1;
+            metrics.eligible += 1;
         }
     }
     metrics
