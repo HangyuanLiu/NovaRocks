@@ -28,10 +28,11 @@ use novarocks_frontend::query_execution::maintenance::OptimizeJobState;
 use novarocks_frontend::table_maintenance::coordination::{
     MaintenanceAuthorityFailure, MaintenanceFenceValidator,
 };
-use novarocks_frontend::table_maintenance::model::MaintenanceAuthorityV1;
+use novarocks_frontend::table_maintenance::model::{GcOwnedRefObservation, MaintenanceAuthorityV1};
 use novarocks_frontend::table_maintenance::model::{OptimizeJobCreate, OptimizeJobOutcome};
 use novarocks_frontend::table_maintenance::repository::{
-    OptimizeJobRepository, RepositoryErrorKind,
+    GcOwnedRefObservationDecision, GcOwnedRefObservationRepository, OptimizeJobRepository,
+    RepositoryErrorKind,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{
@@ -113,6 +114,24 @@ fn object_id() -> ConnectorTableObjectId {
     ConnectorTableObjectId::try_new(Bytes::from_static(b"test-object-id")).unwrap()
 }
 
+fn gc_owned_ref_observation(
+    table_uuid: Uuid,
+    ref_name: &str,
+    head_snapshot_id: i64,
+    provenance_version: u16,
+    provenance_digest: u8,
+) -> GcOwnedRefObservation {
+    GcOwnedRefObservation::try_new(
+        table_uuid,
+        ref_name.to_string(),
+        head_snapshot_id,
+        provenance_version,
+        [provenance_digest; 32],
+        1,
+    )
+    .expect("valid GC owned-ref observation")
+}
+
 fn create_request(
     catalog: &str,
     namespace: &str,
@@ -140,6 +159,15 @@ fn outcome(target_snapshot_id: i64) -> OptimizeJobOutcome {
 
 fn raw_key(suffix: &str) -> Key {
     Key::try_from(Bytes::from(format!("{PREFIX}{suffix}"))).expect("valid raw key")
+}
+
+fn gc_owned_ref_observation_key(table_uuid: Uuid, ref_name: &str) -> Key {
+    Key::try_from(Bytes::from(format!(
+        "novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/{}/{}",
+        table_uuid,
+        hex::encode(ref_name.as_bytes())
+    )))
+    .expect("valid GC owned-ref observation key")
 }
 
 fn active_key(target: &MaintenanceTarget) -> Key {
@@ -996,4 +1024,182 @@ async fn repository_open_fails_fast_on_unknown_job_schema_version() {
     let error = OptimizeJobRepository::open(store).await.unwrap_err();
     assert_eq!(error.kind(), RepositoryErrorKind::Corruption);
     assert!(error.to_string().contains("schema version"));
+}
+
+#[tokio::test]
+async fn gc_owned_ref_observation_requires_two_stable_observations_across_the_safety_window() {
+    let temp = TempDir::new().unwrap();
+    let store = open_sqlite(&temp.path().join("state.sqlite")).await;
+    let repository = GcOwnedRefObservationRepository::open(Arc::clone(&store))
+        .await
+        .unwrap();
+    let observation = gc_owned_ref_observation(
+        Uuid::from_u128(0x41),
+        "__novarocks_mv_refresh_candidate",
+        101,
+        1,
+        9,
+    );
+
+    assert_eq!(
+        repository
+            .observe(observation.clone(), 1_000, 500)
+            .await
+            .unwrap(),
+        GcOwnedRefObservationDecision::NotMature {
+            first_observed_at_ms: 1_000
+        }
+    );
+    drop(repository);
+    let repository = GcOwnedRefObservationRepository::open(store).await.unwrap();
+    assert_eq!(
+        repository
+            .observe(observation.clone(), 1_499, 500)
+            .await
+            .unwrap(),
+        GcOwnedRefObservationDecision::NotMature {
+            first_observed_at_ms: 1_000
+        }
+    );
+    assert_eq!(
+        repository
+            .observe(observation.clone(), 1_500, 500)
+            .await
+            .unwrap(),
+        GcOwnedRefObservationDecision::NotMature {
+            first_observed_at_ms: 1_000
+        }
+    );
+    assert_eq!(
+        repository.observe(observation, 1_501, 500).await.unwrap(),
+        GcOwnedRefObservationDecision::Mature {
+            first_observed_at_ms: 1_000
+        }
+    );
+    let same_ref_other_table = gc_owned_ref_observation(
+        Uuid::from_u128(0x43),
+        "__novarocks_mv_refresh_candidate",
+        101,
+        1,
+        9,
+    );
+    assert_eq!(
+        repository
+            .observe(same_ref_other_table, 1_500, 500)
+            .await
+            .unwrap(),
+        GcOwnedRefObservationDecision::NotMature {
+            first_observed_at_ms: 1_500
+        }
+    );
+}
+
+#[tokio::test]
+async fn gc_owned_ref_observation_replaces_every_changed_fact_and_clear_restarts_the_clock() {
+    let temp = TempDir::new().unwrap();
+    let store = open_sqlite(&temp.path().join("state.sqlite")).await;
+    let repository = GcOwnedRefObservationRepository::open(store).await.unwrap();
+    let table_uuid = Uuid::from_u128(0x42);
+    let ref_name = "__novarocks_write_fence_candidate";
+    let original = gc_owned_ref_observation(table_uuid, ref_name, 101, 1, 9);
+
+    assert_eq!(
+        repository.observe(original, 1_000, 500).await.unwrap(),
+        GcOwnedRefObservationDecision::NotMature {
+            first_observed_at_ms: 1_000
+        }
+    );
+    let changed_head = gc_owned_ref_observation(table_uuid, ref_name, 102, 1, 9);
+    assert_eq!(
+        repository
+            .observe(changed_head.clone(), 2_000, 500)
+            .await
+            .unwrap(),
+        GcOwnedRefObservationDecision::NotMature {
+            first_observed_at_ms: 2_000
+        }
+    );
+    assert_eq!(
+        repository.observe(changed_head, 2_501, 500).await.unwrap(),
+        GcOwnedRefObservationDecision::Mature {
+            first_observed_at_ms: 2_000
+        }
+    );
+    let changed_provenance = gc_owned_ref_observation(table_uuid, ref_name, 102, 2, 10);
+    assert_eq!(
+        repository
+            .observe(changed_provenance.clone(), 2_600, 500)
+            .await
+            .unwrap(),
+        GcOwnedRefObservationDecision::NotMature {
+            first_observed_at_ms: 2_600
+        }
+    );
+    assert_eq!(
+        repository
+            .observe(changed_provenance, 3_101, 500)
+            .await
+            .unwrap(),
+        GcOwnedRefObservationDecision::Mature {
+            first_observed_at_ms: 2_600
+        }
+    );
+
+    assert!(
+        repository
+            .remove(table_uuid, ref_name.to_string())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !repository
+            .remove(table_uuid, ref_name.to_string())
+            .await
+            .unwrap()
+    );
+    let recreated = gc_owned_ref_observation(table_uuid, ref_name, 101, 1, 9);
+    assert_eq!(
+        repository.observe(recreated, 3_200, 500).await.unwrap(),
+        GcOwnedRefObservationDecision::NotMature {
+            first_observed_at_ms: 3_200
+        }
+    );
+}
+
+#[tokio::test]
+async fn gc_owned_ref_observation_corruption_fails_closed_without_replacing_the_record() {
+    let temp = TempDir::new().unwrap();
+    let store = open_sqlite(&temp.path().join("state.sqlite")).await;
+    let repository = GcOwnedRefObservationRepository::open(Arc::clone(&store))
+        .await
+        .unwrap();
+    let table_uuid = Uuid::from_u128(0x44);
+    let ref_name = "__novarocks_mv_refresh_corrupt";
+    let key = gc_owned_ref_observation_key(table_uuid, ref_name);
+    write_raw(
+        store.as_ref(),
+        key.clone(),
+        Value::try_from(Bytes::from_static(b"not-canonical-json")).unwrap(),
+    )
+    .await;
+
+    let error = repository
+        .observe(
+            gc_owned_ref_observation(table_uuid, ref_name, 101, 1, 9),
+            1_000,
+            500,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), RepositoryErrorKind::Corruption);
+    assert!(raw_key_exists(store.as_ref(), &key).await);
+    assert_eq!(
+        repository
+            .remove(table_uuid, ref_name.to_string())
+            .await
+            .unwrap_err()
+            .kind(),
+        RepositoryErrorKind::Corruption
+    );
+    assert!(raw_key_exists(store.as_ref(), &key).await);
 }

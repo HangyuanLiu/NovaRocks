@@ -29,8 +29,8 @@ use novarocks_spi::connector::{
     BatchReceipt, CandidatePage, ConnectorCleanupCandidatePageRequest,
     ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest,
     ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver,
-    ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupPlan,
-    ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
+    ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
+    ConnectorCleanupPlan, ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
     ConnectorCleanupReconcileRequest, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
     ConnectorTableResolution, PreparedBatch,
@@ -106,6 +106,59 @@ impl CleanupMaintenanceSession {
             operation,
             context.clone(),
         )?;
+        Self::from_planning_request(lease, table, request, context)
+    }
+
+    /// Freeze the second cleanup plan after the frontend has durably observed
+    /// the exact owned refs that survived the age window. This route is
+    /// deliberately distinct from discovery: even an empty selection remains
+    /// an owned-ref plan and can never fall through to an object sweep.
+    pub fn plan_selected_owned_refs(
+        resolver: &dyn ConnectorCleanupMaintenanceResolver,
+        instance_id: &ConnectorInstanceId,
+        operation_id: ConnectorCleanupOperationId,
+        table: ConnectorTableIdentity,
+        older_than_ms: i64,
+        selection: ConnectorCleanupOwnedRefSelection,
+        context: ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        if &table.instance_id != instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cleanup table does not belong to requested connector instance",
+            ));
+        }
+        let lease = resolver.acquire_current_cleanup_maintenance(instance_id)?;
+        let metadata = lease.metadata().load_table(ConnectorTableRequest {
+            table: table.clone(),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            context: context.clone(),
+        })?;
+        if metadata.identity != table || metadata.table.owner() != &lease.binding_key().instance_id
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cleanup metadata returned a table handle for a different exact owner",
+            ));
+        }
+        let operation =
+            ConnectorCleanupOperation::remove_unreferenced_objects(metadata.table, older_than_ms)?;
+        let request = ConnectorCleanupPlanningRequest::try_new_selected_owned_refs(
+            operation_id,
+            lease.binding_key().clone(),
+            operation,
+            selection,
+            context.clone(),
+        )?;
+        Self::from_planning_request(lease, table, request, context)
+    }
+
+    fn from_planning_request(
+        lease: ConnectorCleanupMaintenanceLease,
+        table: ConnectorTableIdentity,
+        request: ConnectorCleanupPlanningRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
         let plan = lease.plan_cleanup(request)?;
         Ok(Self {
             lease,

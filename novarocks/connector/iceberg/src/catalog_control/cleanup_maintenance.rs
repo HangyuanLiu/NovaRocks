@@ -30,9 +30,10 @@ use novarocks_spi::connector::{
     BatchReceipt, BatchReceiptSummary, CandidatePage, ConnectorCleanupCandidate,
     ConnectorCleanupCandidatePageRequest, ConnectorCleanupExecuteRequest,
     ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance, ConnectorCleanupOperationId,
-    ConnectorCleanupPlan, ConnectorCleanupPlanSummary, ConnectorCleanupPlanningRequest,
-    ConnectorCleanupPrepareRequest, ConnectorCleanupReconcileRequest, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, PreparedBatch,
+    ConnectorCleanupOwnedRefIdentity, ConnectorCleanupOwnedRefSelection, ConnectorCleanupPlan,
+    ConnectorCleanupPlanSummary, ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
+    ConnectorCleanupReconcileRequest, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, PreparedBatch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -82,7 +83,7 @@ struct LogicalManifest {
     records: Vec<ManifestRecord>,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum CleanupPhase {
     OwnedRefRetire,
@@ -467,27 +468,45 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             &target.table,
             older_than_ms,
         );
-        let owned_ref_records = owned_ref_manifest_records(owned_refs);
-        let (phase, records) = if owned_ref_records.is_empty() {
-            let table_for_scan = table.clone();
-            let object_store = physical.object_store_config.clone();
-            let scanned = self
-                .runtime
-                .resources()
-                .catalog_runtime()
-                .block_on(async move {
-                    collect_orphan_candidates(&table_for_scan, older_than_ms, object_store.as_ref())
+        let owned_ref_records =
+            selected_owned_ref_manifest_records(owned_refs, request.owned_ref_selection());
+        let (phase, records) =
+            if cleanup_phase_for_owned_refs(request.owned_ref_selection(), owned_ref_records.len())
+                == CleanupPhase::OwnedRefRetire
+            {
+                // A second selected-ref plan is never eligible for object
+                // discovery. Missing/stale/drifted selections become an empty ref
+                // manifest and leak until a later observation, rather than
+                // destructively falling through to the object pass.
+                (CleanupPhase::OwnedRefRetire, owned_ref_records)
+            } else if owned_ref_records.is_empty() {
+                let table_for_scan = table.clone();
+                let object_store = physical.object_store_config.clone();
+                let scanned = self
+                    .runtime
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(async move {
+                        collect_orphan_candidates(
+                            &table_for_scan,
+                            older_than_ms,
+                            object_store.as_ref(),
+                        )
                         .await
-                })
-                .map_err(unavailable)?
-                .map_err(unavailable)?;
-            (
-                CleanupPhase::ObjectSweep,
-                records_from_candidates(&scanned, &table, physical.object_store_config.as_ref())?,
-            )
-        } else {
-            (CleanupPhase::OwnedRefRetire, owned_ref_records)
-        };
+                    })
+                    .map_err(unavailable)?
+                    .map_err(unavailable)?;
+                (
+                    CleanupPhase::ObjectSweep,
+                    records_from_candidates(
+                        &scanned,
+                        &table,
+                        physical.object_store_config.as_ref(),
+                    )?,
+                )
+            } else {
+                (CleanupPhase::OwnedRefRetire, owned_ref_records)
+            };
         if records.len() > MAX_RECORDS {
             return Err(exhausted("Iceberg cleanup manifest exceeds 262144 records"));
         }
@@ -632,6 +651,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         validate_context(&request.context)?;
         self.ensure_owner(request.plan.owner())?;
         let payload = self.plan_payload(&request.plan)?;
+        let table_uuid = table_uuid_from_payload(&payload)?;
         let records = self.manifest(&request.plan, &payload)?;
         let start = request.offset as usize;
         if start > records.len() {
@@ -645,8 +665,8 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             request.offset,
             records[start..end]
                 .iter()
-                .map(manifest_candidate_projection)
-                .collect(),
+                .map(|record| manifest_candidate_projection(record, table_uuid))
+                .collect::<Result<Vec<_>, _>>()?,
             end == records.len(),
         )
     }
@@ -715,9 +735,20 @@ fn records_from_candidates(
 /// Ref candidates and object candidates are deliberately never mixed in one
 /// cleanup manifest. A successful ref drop changes the table live set, so the
 /// following object pass must begin at `plan_cleanup` and reload metadata.
-fn owned_ref_manifest_records(candidates: Vec<OwnedRefCandidate>) -> Vec<ManifestRecord> {
+fn selected_owned_ref_manifest_records(
+    candidates: Vec<OwnedRefCandidate>,
+    selection: Option<&ConnectorCleanupOwnedRefSelection>,
+) -> Vec<ManifestRecord> {
     candidates
         .into_iter()
+        .filter(|candidate| {
+            selection.is_none_or(|selection| {
+                selection
+                    .identities()
+                    .binary_search_by(|identity| owned_ref_identity(candidate).cmp(identity))
+                    .is_ok()
+            })
+        })
         .enumerate()
         .map(|(ordinal, candidate)| ManifestRecord {
             ordinal: ordinal as u32,
@@ -732,8 +763,32 @@ fn owned_ref_manifest_records(candidates: Vec<OwnedRefCandidate>) -> Vec<Manifes
         .collect()
 }
 
-fn manifest_candidate_projection(record: &ManifestRecord) -> ConnectorCleanupCandidate {
-    match &record.candidate {
+fn cleanup_phase_for_owned_refs(
+    selection: Option<&ConnectorCleanupOwnedRefSelection>,
+    selected_owned_ref_count: usize,
+) -> CleanupPhase {
+    if selection.is_some() || selected_owned_ref_count > 0 {
+        CleanupPhase::OwnedRefRetire
+    } else {
+        CleanupPhase::ObjectSweep
+    }
+}
+
+fn owned_ref_identity(candidate: &OwnedRefCandidate) -> ConnectorCleanupOwnedRefIdentity {
+    ConnectorCleanupOwnedRefIdentity::try_new(
+        Arc::from(candidate.name.as_str()),
+        candidate.head_snapshot_id,
+        candidate.provenance_version,
+        candidate.provenance_digest,
+    )
+    .expect("owned ref candidate is validated before cleanup planning")
+}
+
+fn manifest_candidate_projection(
+    record: &ManifestRecord,
+    table_uuid: uuid::Uuid,
+) -> Result<ConnectorCleanupCandidate, ConnectorError> {
+    Ok(match &record.candidate {
         ManifestCandidate::Object { location, .. } => ConnectorCleanupCandidate::Object {
             location: Arc::from(location.as_str()),
         },
@@ -741,15 +796,24 @@ fn manifest_candidate_projection(record: &ManifestRecord) -> ConnectorCleanupCan
             name,
             head_snapshot_id,
             provenance_version,
+            provenance_digest_hex,
             created_at_ms,
-            ..
         } => ConnectorCleanupCandidate::OwnedRef {
+            table_uuid,
             name: Arc::from(name.as_str()),
             head_snapshot_id: *head_snapshot_id,
             provenance_version: *provenance_version,
+            provenance_digest: decode_owned_ref_provenance_digest(
+                provenance_digest_hex.as_deref(),
+            )?,
             created_at_ms: *created_at_ms,
         },
-    }
+    })
+}
+
+fn table_uuid_from_payload(payload: &PlanPayload) -> Result<uuid::Uuid, ConnectorError> {
+    uuid::Uuid::parse_str(&payload.table_uuid)
+        .map_err(|_| invalid("Iceberg cleanup plan has an invalid table UUID"))
 }
 
 fn execute_frozen_batch(
@@ -1909,13 +1973,16 @@ mod tests {
 
     #[test]
     fn ref_retirement_manifest_never_carries_object_sweep_candidates() {
-        let ref_pass = owned_ref_manifest_records(vec![OwnedRefCandidate {
-            name: "__novarocks_mv_refresh_41".to_string(),
-            head_snapshot_id: 7,
-            provenance_version: 1,
-            provenance_digest: [9; 32],
-            created_at_ms: 100,
-        }]);
+        let ref_pass = selected_owned_ref_manifest_records(
+            vec![OwnedRefCandidate {
+                name: "__novarocks_mv_refresh_41".to_string(),
+                head_snapshot_id: 7,
+                provenance_version: 1,
+                provenance_digest: [9; 32],
+                created_at_ms: 100,
+            }],
+            None,
+        );
         assert_eq!(ref_pass.len(), 1);
         assert!(matches!(
             ref_pass[0].candidate,
@@ -1935,7 +2002,7 @@ mod tests {
         // Model the next invocation after a successful exact CAS. It begins
         // with a new owned-ref discovery result; an empty result is the only
         // condition that permits this later pass to list object candidates.
-        let next_pass = owned_ref_manifest_records(Vec::new());
+        let next_pass = selected_owned_ref_manifest_records(Vec::new(), None);
         assert!(next_pass.is_empty());
         let object_pass = object_record(
             0,
@@ -1949,6 +2016,78 @@ mod tests {
             object_pass.candidate,
             ManifestCandidate::Object { .. }
         ));
+    }
+
+    #[test]
+    fn selected_owned_ref_plan_is_exact_and_never_promotes_to_object_sweep() {
+        let current = vec![
+            OwnedRefCandidate {
+                name: "__novarocks_mv_refresh_a".to_string(),
+                head_snapshot_id: 7,
+                provenance_version: 1,
+                provenance_digest: [1; 32],
+                created_at_ms: 100,
+            },
+            OwnedRefCandidate {
+                name: "__novarocks_mv_refresh_b".to_string(),
+                head_snapshot_id: 8,
+                provenance_version: 1,
+                provenance_digest: [2; 32],
+                created_at_ms: 100,
+            },
+        ];
+        let exact = ConnectorCleanupOwnedRefSelection::try_new(vec![
+            ConnectorCleanupOwnedRefIdentity::try_new(
+                Arc::from("__novarocks_mv_refresh_a"),
+                7,
+                1,
+                [1; 32],
+            )
+            .expect("exact selected ref"),
+        ])
+        .expect("canonical selection");
+        let selected = selected_owned_ref_manifest_records(current.clone(), Some(&exact));
+        assert_eq!(selected.len(), 1);
+        assert!(matches!(
+            &selected[0].candidate,
+            ManifestCandidate::OwnedRef { name, .. } if name == "__novarocks_mv_refresh_a"
+        ));
+
+        let stale = ConnectorCleanupOwnedRefSelection::try_new(vec![
+            ConnectorCleanupOwnedRefIdentity::try_new(
+                Arc::from("__novarocks_mv_refresh_a"),
+                7,
+                1,
+                [3; 32],
+            )
+            .expect("stale selected ref"),
+        ])
+        .expect("canonical stale selection");
+        assert!(selected_owned_ref_manifest_records(current.clone(), Some(&stale)).is_empty());
+        assert!(
+            selected_owned_ref_manifest_records(
+                current,
+                Some(
+                    &ConnectorCleanupOwnedRefSelection::try_new(Vec::new())
+                        .expect("empty selection")
+                ),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            cleanup_phase_for_owned_refs(Some(&exact), 1),
+            CleanupPhase::OwnedRefRetire
+        );
+        assert_eq!(
+            cleanup_phase_for_owned_refs(Some(&stale), 0),
+            CleanupPhase::OwnedRefRetire,
+            "a stale selected ref must not fall through to an object sweep"
+        );
+        assert_eq!(
+            cleanup_phase_for_owned_refs(None, 0),
+            CleanupPhase::ObjectSweep,
+            "only a fresh discovery with no owned refs may sweep objects"
+        );
     }
 
     #[test]

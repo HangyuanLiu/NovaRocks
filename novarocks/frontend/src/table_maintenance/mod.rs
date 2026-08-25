@@ -35,7 +35,8 @@ use novarocks_failpoint::{
     CleanupFaultKind, claim_configured_cleanup_fault as claim_cleanup_fault,
 };
 use novarocks_spi::connector::{
-    BatchReceipt, ConnectorCleanupOperationId, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
+    BatchReceipt, ConnectorCleanupCandidate, ConnectorCleanupOperationId,
+    ConnectorCleanupOwnedRefSelection, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
     ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanSummary,
     ConnectorMutationOperationId, ConnectorTableIdentity, ConnectorWriteOperationId,
@@ -62,13 +63,14 @@ use self::model::{
     CleanupBatchCheckpoint, CleanupOperationCreate, CleanupOperationState, CleanupPlanPayload,
     DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
     DistributedRewriteOpaquePayload, DistributedRewriteOperationCreate,
-    DistributedRewriteOperationKind, DistributedRewritePlanPayload, MaintenanceAuthorityV1,
-    MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload,
+    DistributedRewriteOperationKind, DistributedRewritePlanPayload, GcOwnedRefObservation,
+    MaintenanceAuthorityV1, MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload,
     MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationKind,
     MetadataMaintenancePlanPayload, OptimizeJobCreate,
 };
 use self::repository::{
     CleanupOperationRepository, DistributedRewriteOperationRepository,
+    GcOwnedRefObservationDecision, GcOwnedRefObservationRepository,
     MetadataMaintenanceOperationRepository, OptimizeJobRepository, RepositoryErrorKind,
     cleanup_payload_digest, distributed_rewrite_payload_digest,
     metadata_maintenance_payload_digest,
@@ -127,6 +129,7 @@ pub struct FrontendTableMaintenanceService {
     metadata_repository: Option<Arc<MetadataMaintenanceOperationRepository>>,
     distributed_rewrite_repository: Option<Arc<DistributedRewriteOperationRepository>>,
     cleanup_repository: Option<Arc<CleanupOperationRepository>>,
+    gc_owned_ref_observation_repository: Option<Arc<GcOwnedRefObservationRepository>>,
     coordination: Option<MaintenanceCoordination>,
     worker: Mutex<WorkerLifecycle>,
     runtime: Handle,
@@ -157,49 +160,60 @@ impl FrontendTableMaintenanceService {
         runtime: Handle,
         coordination: Option<MaintenanceCoordination>,
     ) -> Result<Self, String> {
-        let (repository, metadata_repository, distributed_rewrite_repository, cleanup_repository) =
-            match store {
-                Some(store) => (
-                    Some(Arc::new(
-                        OptimizeJobRepository::open(Arc::clone(&store))
-                            .await
-                            .map_err(|error| {
-                                format!("open frontend optimize job repository failed: {error}")
-                            })?,
-                    )),
-                    Some(Arc::new(
-                        MetadataMaintenanceOperationRepository::open(Arc::clone(&store))
-                            .await
-                            .map_err(|error| {
-                                format!(
-                                    "open frontend metadata maintenance repository failed: {error}"
-                                )
-                            })?,
-                    )),
-                    Some(Arc::new(
-                        DistributedRewriteOperationRepository::open(Arc::clone(&store))
-                            .await
-                            .map_err(|error| {
-                                format!(
-                                    "open frontend distributed rewrite repository failed: {error}"
-                                )
-                            })?,
-                    )),
-                    Some(Arc::new(
-                        CleanupOperationRepository::open(Arc::clone(&store))
-                            .await
-                            .map_err(|error| {
-                                format!("open frontend cleanup repository failed: {error}")
-                            })?,
-                    )),
-                ),
-                None => (None, None, None, None),
-            };
+        let (
+            repository,
+            metadata_repository,
+            distributed_rewrite_repository,
+            cleanup_repository,
+            gc_owned_ref_observation_repository,
+        ) = match store {
+            Some(store) => (
+                Some(Arc::new(
+                    OptimizeJobRepository::open(Arc::clone(&store))
+                        .await
+                        .map_err(|error| {
+                            format!("open frontend optimize job repository failed: {error}")
+                        })?,
+                )),
+                Some(Arc::new(
+                    MetadataMaintenanceOperationRepository::open(Arc::clone(&store))
+                        .await
+                        .map_err(|error| {
+                            format!("open frontend metadata maintenance repository failed: {error}")
+                        })?,
+                )),
+                Some(Arc::new(
+                    DistributedRewriteOperationRepository::open(Arc::clone(&store))
+                        .await
+                        .map_err(|error| {
+                            format!("open frontend distributed rewrite repository failed: {error}")
+                        })?,
+                )),
+                Some(Arc::new(
+                    CleanupOperationRepository::open(Arc::clone(&store))
+                        .await
+                        .map_err(|error| {
+                            format!("open frontend cleanup repository failed: {error}")
+                        })?,
+                )),
+                Some(Arc::new(
+                    GcOwnedRefObservationRepository::open(Arc::clone(&store))
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "open frontend GC owned-ref observation repository failed: {error}"
+                            )
+                        })?,
+                )),
+            ),
+            None => (None, None, None, None, None),
+        };
         Ok(Self {
             repository,
             metadata_repository,
             distributed_rewrite_repository,
             cleanup_repository,
+            gc_owned_ref_observation_repository,
             coordination,
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime,
@@ -217,7 +231,7 @@ impl FrontendTableMaintenanceService {
         self
     }
 
-    fn validate_cleanup_cutoff(&self, older_than_ms: i64) -> Result<(), String> {
+    fn cleanup_gc_timing(&self, older_than_ms: i64) -> Result<(i64, i64), String> {
         let policy = self.lake_publication_runtime_policy.ok_or_else(|| {
             "orphan cleanup is unsupported until the lake publication runtime policy is installed"
                 .to_string()
@@ -239,7 +253,69 @@ impl FrontendTableMaintenanceService {
                 "orphan cleanup cutoff {older_than_ms} is newer than the shared safe GC boundary {latest_safe_cutoff}"
             ));
         }
-        Ok(())
+        Ok((now_ms, safe_age_ms))
+    }
+
+    /// Persist the first stable observation for the bounded discovery page and
+    /// select only refs that have independently survived the same GC age
+    /// window. The provider has already proven schema ownership; this layer
+    /// adds only the restart-safe temporal proof and never deletes a ref.
+    fn observe_mature_owned_refs(
+        &self,
+        repository: &GcOwnedRefObservationRepository,
+        candidates: &[ConnectorCleanupCandidate],
+        now_ms: i64,
+        safe_gc_age_ms: i64,
+    ) -> Result<ConnectorCleanupOwnedRefSelection, String> {
+        let safe_cutoff_ms = now_ms.checked_sub(safe_gc_age_ms).ok_or_else(|| {
+            "orphan cleanup is unsupported because owned-ref safe cutoff underflows".to_string()
+        })?;
+        let mut mature = Vec::new();
+        for candidate in candidates {
+            let ConnectorCleanupCandidate::OwnedRef {
+                table_uuid,
+                name,
+                head_snapshot_id,
+                provenance_version,
+                provenance_digest,
+                created_at_ms,
+            } = candidate
+            else {
+                return Err("owned-ref discovery contained an object candidate".to_string());
+            };
+            // Require both independent clocks to strictly exceed the shared
+            // safe age. The provider cutoff is repeated here so a malformed
+            // candidate page cannot turn an old observation into a young-ref
+            // deletion capability.
+            if *created_at_ms >= safe_cutoff_ms {
+                return Err(format!(
+                    "owned-ref discovery candidate {name} is younger than the shared safe GC boundary"
+                ));
+            }
+            let observation = GcOwnedRefObservation::try_new(
+                *table_uuid,
+                name.to_string(),
+                *head_snapshot_id,
+                *provenance_version,
+                *provenance_digest,
+                now_ms,
+            )
+            .map_err(|error| format!("invalid owned-ref discovery candidate: {error}"))?;
+            if matches!(
+                self.block_on(repository.observe(observation, now_ms, safe_gc_age_ms))
+                    .map_err(|error| {
+                        format!("persist owned-ref GC observation failed: {error}")
+                    })?,
+                GcOwnedRefObservationDecision::Mature { .. }
+            ) {
+                mature.push(candidate.owned_ref_identity().ok_or_else(|| {
+                    "owned-ref discovery candidate has no exact identity".to_string()
+                })?);
+            }
+        }
+        mature.sort();
+        ConnectorCleanupOwnedRefSelection::try_new(mature)
+            .map_err(|error| format!("owned-ref GC selection is invalid: {error}"))
     }
 
     /// Executes one parser-owned maintenance statement without accepting raw
@@ -514,23 +590,68 @@ impl FrontendTableMaintenanceService {
         target: MaintenanceTarget,
         older_than_ms: i64,
     ) -> Result<MaintenanceActionOutcome, String> {
-        self.validate_cleanup_cutoff(older_than_ms)?;
+        let (now_ms, safe_gc_age_ms) = self.cleanup_gc_timing(older_than_ms)?;
         let repository = self
             .cleanup_repository
+            .as_ref()
+            .ok_or_else(|| CLEANUP_STATE_STORE_REQUIRED.to_string())?;
+        let observation_repository = self
+            .gc_owned_ref_observation_repository
             .as_ref()
             .ok_or_else(|| CLEANUP_STATE_STORE_REQUIRED.to_string())?;
         let (admission, attempt) = self.admit_and_acquire(&target)?;
         let (authority, validator) = self.attempt_authority(&attempt)?;
         let object_id = engine.capture_target_object_id(&target)?;
-        let operation_id = ConnectorCleanupOperationId::new();
-        let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
+        // Discovery is read-only. It must not become a durable cleanup
+        // operation, because a first observation grants no catalog mutation
+        // authority and a crash at this point must simply leak until the next
+        // GC pass.
+        let discovery_operation_id = ConnectorCleanupOperationId::new();
         let cancellation = self.attempt_cancellation(&attempt);
-        let session = engine.plan_cleanup_maintenance_with_attempt_context(
+        let discovery_session = engine.plan_cleanup_maintenance_with_attempt_context(
             &target,
-            operation_id,
+            discovery_operation_id,
             older_than_ms,
             &cancellation.context(),
         )?;
+        let discovery_candidates = cleanup_candidates_first_page(engine, &discovery_session)?;
+        let has_owned_refs = discovery_candidates
+            .iter()
+            .any(|candidate| matches!(candidate, ConnectorCleanupCandidate::OwnedRef { .. }));
+        let has_object_candidates = discovery_candidates
+            .iter()
+            .any(|candidate| matches!(candidate, ConnectorCleanupCandidate::Object { .. }));
+        if has_owned_refs && has_object_candidates {
+            return Err("cleanup discovery mixed owned-ref and object candidates".to_string());
+        }
+        let session = if has_owned_refs {
+            let mature_selection = self.observe_mature_owned_refs(
+                observation_repository,
+                &discovery_candidates,
+                now_ms,
+                safe_gc_age_ms,
+            )?;
+            if let Err(error) = engine.finalize_cleanup_terminal(&discovery_session) {
+                tracing::warn!(%error, ?discovery_operation_id, "orphan cleanup discovery artifact finalization failed");
+            }
+            if mature_selection.identities().is_empty() {
+                return Ok(MaintenanceActionOutcome::RemoveOrphanFiles {
+                    orphan_file_locations: Vec::new(),
+                });
+            }
+            let operation_id = ConnectorCleanupOperationId::new();
+            engine.plan_selected_owned_ref_cleanup_maintenance_with_attempt_context(
+                &target,
+                operation_id,
+                older_than_ms,
+                mature_selection,
+                &cancellation.context(),
+            )?
+        } else {
+            discovery_session
+        };
+        let operation_id = session.plan_ref().operation_id();
+        let durable_id = uuid::Uuid::from_bytes(operation_id.to_bytes());
         let plan = session.plan_ref();
         let owner = MetadataMaintenanceExactOwner {
             instance_id: plan.owner().instance_id.as_str().to_string(),
@@ -1145,6 +1266,7 @@ impl FrontendTableMaintenanceService {
             metadata_repository: None,
             distributed_rewrite_repository: Some(distributed_rewrite_repository),
             cleanup_repository: None,
+            gc_owned_ref_observation_repository: None,
             // The child never admits or acquires: it runs entirely under the
             // caller's already-held attempt.
             coordination: None,
@@ -2732,6 +2854,21 @@ fn cleanup_candidate_locations(
             .checked_add(page.candidates().len() as u64)
             .ok_or_else(|| "orphan cleanup candidate page offset overflow".to_string())?;
     }
+}
+
+/// Read one bounded discovery page. Owned refs are retired in bounded batches:
+/// if more remain, the next GC cycle rediscovers the then-current live set.
+/// This deliberately avoids accumulating an unbounded cross-page selection
+/// that could outlive a changing catalog view.
+fn cleanup_candidates_first_page(
+    engine: &dyn TableMaintenanceEngine,
+    session: &crate::connector::cleanup_maintenance::CleanupMaintenanceSession,
+) -> Result<Vec<ConnectorCleanupCandidate>, String> {
+    let page = engine.read_cleanup_candidate_page(session, 0, 1024)?;
+    if page.candidates().is_empty() && !page.complete() {
+        return Err("cleanup discovery returned a non-terminal empty candidate page".to_string());
+    }
+    Ok(page.candidates().to_vec())
 }
 
 fn cleanup_plan_from_durable(

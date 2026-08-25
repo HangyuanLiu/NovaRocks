@@ -40,8 +40,8 @@ use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
 use crate::runtime::query_result::QueryResult;
 use novarocks_spi::connector::{
-    BatchReceipt, CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupPlan,
-    ConnectorControlResolver, ConnectorDistributedRewriteAttemptCheckpoint,
+    BatchReceipt, CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
+    ConnectorCleanupPlan, ConnectorControlResolver, ConnectorDistributedRewriteAttemptCheckpoint,
     ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorMetadataMaintenancePlan,
     ConnectorMutationOperationId, ConnectorTableObjectBindingFailure,
     ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
@@ -497,6 +497,35 @@ pub trait TableMaintenanceEngine: Send + Sync {
         _attempt: &MaintenanceAttemptContext,
     ) -> Result<CleanupMaintenanceSession, String> {
         self.plan_cleanup_maintenance(target, operation_id, older_than_ms)
+    }
+
+    /// Plan the second cleanup pass after the frontend has durably selected
+    /// exact mature owned refs. An empty selection is a valid ref-only plan;
+    /// it must never become an object sweep.
+    fn plan_selected_owned_ref_cleanup_maintenance(
+        &self,
+        _target: &MaintenanceTarget,
+        _operation_id: ConnectorCleanupOperationId,
+        _older_than_ms: i64,
+        _selection: ConnectorCleanupOwnedRefSelection,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    }
+
+    fn plan_selected_owned_ref_cleanup_maintenance_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorCleanupOperationId,
+        older_than_ms: i64,
+        selection: ConnectorCleanupOwnedRefSelection,
+        _attempt: &MaintenanceAttemptContext,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        self.plan_selected_owned_ref_cleanup_maintenance(
+            target,
+            operation_id,
+            older_than_ms,
+            selection,
+        )
     }
 
     fn recover_cleanup_for_reconcile(
@@ -1155,6 +1184,43 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         .map_err(|error| format!("plan orphan cleanup operation: {error}"))
     }
 
+    fn plan_selected_owned_ref_cleanup_maintenance(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorCleanupOperationId,
+        older_than_ms: i64,
+        selection: ConnectorCleanupOwnedRefSelection,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        self.plan_selected_owned_ref_cleanup_maintenance_with_attempt_context(
+            target,
+            operation_id,
+            older_than_ms,
+            selection,
+            &MaintenanceAttemptContext::uncancelled(),
+        )
+    }
+
+    fn plan_selected_owned_ref_cleanup_maintenance_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorCleanupOperationId,
+        older_than_ms: i64,
+        selection: ConnectorCleanupOwnedRefSelection,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        let identity = Self::target_identity(target)?;
+        CleanupMaintenanceSession::plan_selected_owned_refs(
+            self.kernel.connector_control().as_ref(),
+            &identity.instance_id.clone(),
+            operation_id,
+            identity,
+            older_than_ms,
+            selection,
+            self.connector_context_for_attempt(attempt)?,
+        )
+        .map_err(|error| format!("plan selected owned-ref cleanup operation: {error}"))
+    }
+
     fn recover_cleanup_for_reconcile(
         &self,
         target: &MaintenanceTarget,
@@ -1498,6 +1564,40 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
                 target,
                 operation_id,
                 older_than_ms,
+                attempt,
+            )
+    }
+
+    fn plan_selected_owned_ref_cleanup_maintenance(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorCleanupOperationId,
+        older_than_ms: i64,
+        selection: ConnectorCleanupOwnedRefSelection,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        self.request_engine()?
+            .plan_selected_owned_ref_cleanup_maintenance(
+                target,
+                operation_id,
+                older_than_ms,
+                selection,
+            )
+    }
+
+    fn plan_selected_owned_ref_cleanup_maintenance_with_attempt_context(
+        &self,
+        target: &MaintenanceTarget,
+        operation_id: ConnectorCleanupOperationId,
+        older_than_ms: i64,
+        selection: ConnectorCleanupOwnedRefSelection,
+        attempt: &MaintenanceAttemptContext,
+    ) -> Result<CleanupMaintenanceSession, String> {
+        self.request_engine()?
+            .plan_selected_owned_ref_cleanup_maintenance_with_attempt_context(
+                target,
+                operation_id,
+                older_than_ms,
+                selection,
                 attempt,
             )
     }
