@@ -222,13 +222,13 @@ frontend 的 `ClusterBackendService` 通过 StateStore 成为唯一 membership a
 seeds，动态 ADD/DROP 的结果跨 FE 重启恢复；单 FE writer 与未来多 FE fencing/takeover 分阶段裁决。
 
 - ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
+- ADR-0107 — Backend 为何以自注册、精确 heartbeat 与 pre-ready 完整重规划取代 durable membership（active）
 
 #### 历史
 
+ - ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（superseded → ADR-0107）
 - ADR-0103 — 中央 Provider wire authority 与同构 Native build admission 为何统一由 Protocol 和 Frontend topology 拥有（superseded → ADR-0105）
 - ADR-0105 — Provider wire authority 为何与 SPI domain carrier 分离、但仍保持单一 Protocol digest（superseded → ADR-0106）
-- ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（superseded → ADR-0108）
-- ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
 
 ### catalog-attachment
 
