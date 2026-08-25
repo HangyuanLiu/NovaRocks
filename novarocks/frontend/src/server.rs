@@ -200,7 +200,7 @@ pub fn build_frontend_query_session_factory(
         Arc::new(FrontendBackgroundMaintenanceAttemptFactory {
             role,
             topology: topology.clone(),
-            runtime_policy: host.lake_publication_runtime_policy().clone(),
+            runtime_policy: host.lake_publication_runtime_policy(),
         }),
     );
     if let Err(error) = maintenance_service.start(Arc::clone(&maintenance_engine)) {
