@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex};
 
 fn test_execution(cancellation: QueryCancellationView) -> QueryExecutionContext {
     QueryExecutionContext::new(
-        novarocks_types::ClusterRole::AllInOne,
+        novarocks_types::ClusterRole::Fe,
         BackendTopologySnapshot::empty(0),
         None,
         cancellation,

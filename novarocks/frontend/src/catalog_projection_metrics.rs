@@ -16,26 +16,41 @@
 // under the License.
 
 use once_cell::sync::Lazy;
-use prometheus::{IntGauge, IntGaugeVec, register_int_gauge, register_int_gauge_vec};
+use prometheus::{IntGauge, IntGaugeVec, Opts, Registry};
 
 use crate::catalog_application::CatalogProjectionMetricsSnapshot;
 
 static FRONTEND_CATALOG_PROJECTION_CATALOGS: Lazy<IntGauge> = Lazy::new(|| {
-    register_int_gauge!(
+    IntGauge::with_opts(Opts::new(
         "novarocks_frontend_catalog_projection_catalogs",
-        "Number of catalog attachments currently projected into this Frontend runtime."
-    )
+        "Number of catalog attachments currently projected into this Frontend runtime.",
+    ))
     .expect("register novarocks_frontend_catalog_projection_catalogs")
 });
 
 static FRONTEND_CATALOG_PROJECTION_EVENTS: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "novarocks_frontend_catalog_projection_events_total",
-        "Cumulative Frontend catalog projection controller events.",
-        &["outcome"]
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_frontend_catalog_projection_events_total",
+            "Cumulative Frontend catalog projection controller events.",
+        ),
+        &["outcome"],
     )
     .expect("register novarocks_frontend_catalog_projection_events_total")
 });
+
+pub(crate) fn register_collectors(registry: &Registry) -> Result<(), String> {
+    for collector in [
+        Box::new(FRONTEND_CATALOG_PROJECTION_CATALOGS.clone())
+            as Box<dyn prometheus::core::Collector>,
+        Box::new(FRONTEND_CATALOG_PROJECTION_EVENTS.clone()),
+    ] {
+        registry.register(collector).map_err(|error| {
+            format!("register catalog projection metric collector failed: {error}")
+        })?;
+    }
+    Ok(())
+}
 
 pub(crate) fn publish(snapshot: CatalogProjectionMetricsSnapshot) {
     Lazy::force(&FRONTEND_CATALOG_PROJECTION_CATALOGS).set(snapshot.projected_catalogs as i64);

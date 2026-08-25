@@ -53,6 +53,7 @@ novarocks-spi = { path = "../spi", features = ["state-store-conformance"] }
 novarocks-sql = { path = "../sql", features = ["test-support"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3"

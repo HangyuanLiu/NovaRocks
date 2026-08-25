@@ -389,7 +389,7 @@ mod tests {
         RequestContext::admit(RequestAdmission::new(
             Some("ice".to_string()),
             "db".to_string(),
-            ClusterRole::AllInOne,
+            ClusterRole::Fe,
             BackendTopologySnapshot::empty(11),
             Some(Instant::now() + Duration::from_secs(30)),
             cancellation.view(),

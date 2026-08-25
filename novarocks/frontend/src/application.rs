@@ -1232,7 +1232,7 @@ mod tests {
         let state_store = test_state_store_input("catalog-controller-host-test");
         let registry = test_state_store_registry();
         let backend = crate::topology::ClusterBackendOpenConfig::new(
-            novarocks_types::ClusterRole::AllInOne,
+            novarocks_types::ClusterRole::Fe,
             Vec::new(),
             Duration::from_secs(1),
             1,

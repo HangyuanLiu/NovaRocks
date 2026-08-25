@@ -16,24 +16,32 @@
 // under the License.
 
 use std::net::{SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
-use axum::{Router, routing::get};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 
-/// Frontend-owned HTTP listener for metrics in a dedicated FE process.
-///
-/// The gRPC report endpoint also serves `/metrics` for compatibility. A
-/// role=fe process nevertheless owns the configured HTTP listener so the
-/// native FE/BE deployment has one stable metrics endpoint per role.
+use crate::coordinator::QueryLifecycleConvergenceReader;
+
+use super::FrontendMetricsRegistry;
+
+/// Frontend-owned management HTTP listener.
 pub(crate) struct MetricsHttpServer {
     shutdown_tx: Option<watch::Sender<bool>>,
+    failure_rx: mpsc::Receiver<String>,
     join_handle: Option<JoinHandle<()>>,
+    stop_requested: Arc<AtomicBool>,
 }
 
 impl MetricsHttpServer {
-    pub(crate) fn start(host: &str, port: u16) -> Result<Self, String> {
+    pub(crate) fn start(
+        host: &str,
+        port: u16,
+        registry: Arc<FrontendMetricsRegistry>,
+        convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
+    ) -> Result<Self, String> {
         let bind_addr = parse_metrics_bind_addr(host, port)
             .map_err(|error| format!("parse frontend metrics HTTP bind address failed: {error}"))?;
         let listener = TcpListener::bind(bind_addr).map_err(|error| {
@@ -43,47 +51,72 @@ impl MetricsHttpServer {
             format!("configure frontend metrics HTTP listener on {bind_addr} failed: {error}")
         })?;
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let thread_stop_requested = Arc::clone(&stop_requested);
         let join_handle = std::thread::spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    eprintln!("failed to build frontend metrics HTTP runtime: {error}");
-                    return;
-                }
-            };
-            runtime.block_on(async move {
-                let listener = match TokioTcpListener::from_std(listener) {
-                    Ok(listener) => listener,
-                    Err(error) => {
-                        eprintln!("failed to create frontend metrics HTTP listener: {error}");
-                        return;
-                    }
-                };
-                let app = Router::new().route("/metrics", get(super::handle_metrics));
-                if let Err(error) = axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        while !*shutdown_rx.borrow() {
-                            if shutdown_rx.changed().await.is_err() {
-                                break;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| {
+                        format!("build frontend management HTTP runtime failed: {error}")
+                    })?;
+                runtime.block_on(async move {
+                    let listener = TokioTcpListener::from_std(listener).map_err(|error| {
+                        format!("create frontend management HTTP listener failed: {error}")
+                    })?;
+                    let app =
+                        super::management::frontend_management_router(registry, convergence_reader);
+                    axum::serve(listener, app)
+                        .with_graceful_shutdown(async move {
+                            while !*shutdown_rx.borrow() {
+                                if shutdown_rx.changed().await.is_err() {
+                                    break;
+                                }
                             }
-                        }
+                        })
+                        .await
+                        .map_err(|error| {
+                            format!("frontend management HTTP server exited with error: {error}")
+                        })
+                })
+            }));
+            if thread_stop_requested.load(Ordering::Acquire) {
+                return;
+            }
+            let error = match outcome {
+                Ok(Ok(())) => "frontend management HTTP server exited unexpectedly".to_string(),
+                Ok(Err(error)) => error,
+                Err(payload) => payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| {
+                        payload
+                            .downcast_ref::<&str>()
+                            .map(|value| (*value).to_string())
                     })
-                    .await
-                {
-                    eprintln!("frontend metrics HTTP server exited with error: {error}");
-                }
-            });
+                    .unwrap_or_else(|| "frontend management HTTP server panicked".to_string()),
+            };
+            let _ = failure_tx.send(error);
         });
         Ok(Self {
             shutdown_tx: Some(shutdown_tx),
+            failure_rx,
             join_handle: Some(join_handle),
+            stop_requested,
         })
     }
 
-    pub(crate) fn stop(mut self) -> Result<(), String> {
+    pub(crate) fn poll_failure(&mut self) -> Result<Option<String>, String> {
+        match self.failure_rx.try_recv() {
+            Ok(error) => Ok(Some(error)),
+            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => Ok(None),
+        }
+    }
+
+    pub(crate) fn stop(&mut self) -> Result<(), String> {
+        self.stop_requested.store(true, Ordering::Release);
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(true);
         }
@@ -93,6 +126,12 @@ impl MetricsHttpServer {
                 .map_err(|_| "frontend metrics HTTP server thread panicked".to_string())?;
         }
         Ok(())
+    }
+}
+
+impl Drop for MetricsHttpServer {
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 

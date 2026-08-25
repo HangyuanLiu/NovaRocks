@@ -2281,7 +2281,7 @@ mod tests {
         RequestContext::admit(RequestAdmission::new(
             None,
             "db".to_string(),
-            ClusterRole::AllInOne,
+            ClusterRole::Fe,
             BackendTopologySnapshot::empty(topology_revision),
             Some(deadline),
             cancellation.view(),

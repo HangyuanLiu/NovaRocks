@@ -63,8 +63,7 @@ pub struct FrontendServerConfig {
     pub backend_open: ClusterBackendOpenConfig,
     pub report_bind_host: String,
     pub report_grpc_port: u16,
-    /// Dedicated role=fe metrics endpoint. In all-in-one composition the
-    /// Backend-owned listener serves the combined process registry instead.
+    /// Dedicated role=fe management HTTP endpoint.
     pub metrics_http_port: u16,
     pub mysql_listener: ResolvedMysqlListenerSettings,
     /// Provider-owned FE control factories composed by the server root.
@@ -403,11 +402,15 @@ async fn serve_ready_frontend_session_factory<F>(
 where
     F: Future<Output = ()> + Send,
 {
+    let metrics_registry =
+        crate::metrics::FrontendMetricsRegistry::new().map_err(FrontendApplicationError::server)?;
     let mut report_server =
         host.start_report_server_from_host(&config.report_bind_host, config.report_grpc_port)?;
-    let metrics_http_server = match crate::metrics::MetricsHttpServer::start(
+    let mut metrics_http_server = match crate::metrics::MetricsHttpServer::start(
         &config.report_bind_host,
         config.metrics_http_port,
+        metrics_registry,
+        host.lifecycle_convergence_reader(),
     ) {
         Ok(server) => server,
         Err(error) => {
@@ -449,14 +452,15 @@ where
             );
         }
     };
-    let server_result = crate::run_mysql_server_until_shutdown(
+    let server_result = run_mysql_with_listener_supervision(
         config.mysql_listener,
         session_factory,
         client_connections,
         shutdown,
+        &mut report_server,
+        &mut metrics_http_server,
     )
-    .await
-    .map_err(FrontendApplicationError::server);
+    .await;
     let stop_result = report_server
         .stop()
         .map_err(FrontendApplicationError::server);
@@ -467,6 +471,71 @@ where
         combine_server_and_shutdown(server_result, stop_result),
         metrics_stop,
     )
+}
+
+async fn run_mysql_with_listener_supervision<F>(
+    mysql_listener: ResolvedMysqlListenerSettings,
+    session_factory: Arc<dyn QuerySessionFactory>,
+    client_connections: Arc<MysqlClientConnectionRegistry>,
+    shutdown: F,
+    report_server: &mut crate::native::report_server::FrontendReportServerHandle,
+    management_server: &mut crate::metrics::MetricsHttpServer,
+) -> Result<(), FrontendApplicationError>
+where
+    F: Future<Output = ()> + Send,
+{
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mysql_shutdown = async move {
+        let mut shutdown_rx = shutdown_rx;
+        while !*shutdown_rx.borrow() {
+            if shutdown_rx.changed().await.is_err() {
+                break;
+            }
+        }
+    };
+    let mysql_server = crate::run_mysql_server_until_shutdown(
+        mysql_listener,
+        session_factory,
+        client_connections,
+        mysql_shutdown,
+    );
+    tokio::pin!(mysql_server);
+
+    tokio::select! {
+        result = &mut mysql_server => result.map_err(FrontendApplicationError::server),
+        _ = shutdown => {
+            let _ = shutdown_tx.send(true);
+            mysql_server.await.map_err(FrontendApplicationError::server)
+        }
+        error = wait_for_frontend_listener_failure(report_server, management_server) => {
+            let _ = shutdown_tx.send(true);
+            let mysql_result = mysql_server.await.map_err(FrontendApplicationError::server);
+            match mysql_result {
+                Ok(()) => Err(FrontendApplicationError::server(error)),
+                Err(mysql_error) => Err(FrontendApplicationError::server(error)
+                    .with_cleanup_context(format!("shutdown MySQL listener after Frontend listener failure: {mysql_error}"))),
+            }
+        }
+    }
+}
+
+async fn wait_for_frontend_listener_failure(
+    report_server: &mut crate::native::report_server::FrontendReportServerHandle,
+    management_server: &mut crate::metrics::MetricsHttpServer,
+) -> String {
+    loop {
+        match report_server.poll_failure() {
+            Ok(Some(error)) => return format!("frontend report listener failed: {error}"),
+            Ok(None) => {}
+            Err(error) => return format!("poll frontend report listener failed: {error}"),
+        }
+        match management_server.poll_failure() {
+            Ok(Some(error)) => return format!("frontend management listener failed: {error}"),
+            Ok(None) => {}
+            Err(error) => return format!("poll frontend management listener failed: {error}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 #[cfg(test)]
@@ -702,13 +771,13 @@ mod tests {
 
     fn frontend_backend_open_config() -> ClusterBackendOpenConfig {
         ClusterBackendOpenConfig::new(
-            novarocks_types::ClusterRole::AllInOne,
+            novarocks_types::ClusterRole::Fe,
             Vec::new(),
             Duration::from_secs(1),
             3,
             Duration::from_secs(1),
         )
-        .expect("valid all-in-one backend config")
+        .expect("valid frontend backend config")
     }
 
     /// Answers whichever catalog instance the factory request carries, so the
@@ -845,10 +914,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn frontend_report_endpoint_binds_loopback_without_core_transport_facade() {
-        let host = FrontendApplicationHost::open(
-            None,
+        let state_store = test_state_store_input("frontend-report-listener");
+        let registry = test_state_store_registry();
+        let host = FrontendApplicationHost::open_with_factories_and_state_store_registry(
+            Some(state_store),
+            &registry,
             FrontendExecutionConfig::new("127.0.0.1", 0, std::num::NonZeroUsize::new(1).unwrap()),
             frontend_backend_open_config(),
+            Vec::new(),
             tokio::runtime::Handle::current(),
         )
         .await
@@ -880,14 +953,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn sqlx2_application_frontend_services_inject_statistics_application_port() {
-        let host = FrontendApplicationHost::open(
-            None,
+        let state_store = test_state_store_input("statistics-application-port");
+        let registry = test_state_store_registry();
+        let host = FrontendApplicationHost::open_with_factories_and_state_store_registry(
+            Some(state_store),
+            &registry,
             FrontendExecutionConfig::new(
                 "127.0.0.1",
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
             ),
             frontend_backend_open_config(),
+            Vec::new(),
             tokio::runtime::Handle::current(),
         )
         .await
@@ -906,22 +983,10 @@ mod tests {
                 "statistics-binding",
             ))
             .expect("open frontend query session");
-        let error = session
+        session
             .execute_batch("SHOW ANALYZE JOBS")
             .await
-            .expect_err("a host without StateStore must reach the frontend statistics service");
-        assert!(
-            error
-                .message()
-                .contains("statistics job commands require a configured frontend StateStore"),
-            "statistics application port was not injected: {error}"
-        );
-        assert!(
-            !error
-                .message()
-                .contains("statistics application service is unavailable"),
-            "Core default statistics application port must not be used: {error}"
-        );
+            .expect("configured Frontend statistics application port handles SHOW ANALYZE JOBS");
 
         session.close();
         drop(session);

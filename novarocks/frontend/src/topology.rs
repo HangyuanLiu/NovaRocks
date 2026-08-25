@@ -556,9 +556,14 @@ impl ClusterBackendService {
                     "role=fe requires StateStore for durable cluster backend membership".to_string()
                 })?,
             )),
-            ClusterRole::AllInOne => MembershipStorage::Transient,
             ClusterRole::Be => {
                 return Err("role=be must not open ClusterBackendService".to_string());
+            }
+            ClusterRole::AllInOne => {
+                return Err(
+                    "role=all-in-one must be resolved by the Server launch supervisor before opening Frontend membership"
+                        .to_string(),
+                );
             }
         };
         let service = Arc::new(Self::new(
@@ -633,7 +638,7 @@ impl ClusterBackendService {
     #[cfg(test)]
     pub(crate) fn new_transient_for_test(timeout_retries: u32) -> Self {
         let config = ClusterBackendOpenConfig::new(
-            ClusterRole::AllInOne,
+            ClusterRole::Fe,
             Vec::new(),
             Duration::from_millis(1),
             timeout_retries.max(1),

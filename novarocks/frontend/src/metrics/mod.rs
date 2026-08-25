@@ -16,88 +16,133 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::Query;
+use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, TextEncoder,
-    register_histogram, register_int_counter, register_int_gauge, register_int_gauge_vec,
+    Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry,
+    TextEncoder,
 };
 
 mod http;
+mod management;
 pub mod query_lifecycle;
 pub(crate) use http::MetricsHttpServer;
 pub use query_lifecycle::FrontendQueryLifecycleMetricsSnapshot;
 
 static FRAGMENT_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
-    register_int_counter!(
+    IntCounter::with_opts(Opts::new(
         "novarocks_fragment_scheduled_total",
-        "Total number of plan fragment instances scheduled to backends."
-    )
+        "Total number of plan fragment instances scheduled to backends.",
+    ))
     .expect("register novarocks_fragment_scheduled_total")
 });
 
 static HEARTBEAT_RTT_SECONDS: Lazy<Histogram> = Lazy::new(|| {
-    register_histogram!(HistogramOpts::new(
+    Histogram::with_opts(HistogramOpts::new(
         "novarocks_heartbeat_rtt_seconds",
-        "Backend heartbeat round-trip time in seconds."
+        "Backend heartbeat round-trip time in seconds.",
     ))
     .expect("register novarocks_heartbeat_rtt_seconds")
 });
 
 static LIVE_BACKENDS: Lazy<IntGauge> = Lazy::new(|| {
-    register_int_gauge!(
+    IntGauge::with_opts(Opts::new(
         "novarocks_live_backends",
-        "Number of live backends in the FE registry."
-    )
+        "Number of live backends in the FE registry.",
+    ))
     .expect("register novarocks_live_backends")
 });
 
 static BACKENDS_BY_STATE: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "novarocks_backends",
-        "Number of backends by registry state.",
-        &["state"]
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_backends",
+            "Number of backends by registry state.",
+        ),
+        &["state"],
     )
     .expect("register novarocks_backends")
 });
 static FRONTEND_QUERY_LIFECYCLE_ATTEMPTS: Lazy<IntGauge> = Lazy::new(|| {
-    register_int_gauge!(
+    IntGauge::with_opts(Opts::new(
         "novarocks_frontend_query_lifecycle_active_attempts",
-        "Number of frontend-owned query lifecycle attempts."
-    )
+        "Number of frontend-owned query lifecycle attempts.",
+    ))
     .expect("register novarocks_frontend_query_lifecycle_active_attempts")
 });
 
 static FRONTEND_QUERY_LIFECYCLE_INIT: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "novarocks_frontend_query_lifecycle_init_total",
-        "Cumulative frontend query initialization outcomes.",
-        &["outcome"]
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_frontend_query_lifecycle_init_total",
+            "Cumulative frontend query initialization outcomes.",
+        ),
+        &["outcome"],
     )
     .expect("register novarocks_frontend_query_lifecycle_init_total")
 });
 
 static FRONTEND_QUERY_LIFECYCLE_CONTROL: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "novarocks_frontend_query_lifecycle_control_total",
-        "Cumulative frontend query control outcomes.",
-        &["outcome"]
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_frontend_query_lifecycle_control_total",
+            "Cumulative frontend query control outcomes.",
+        ),
+        &["outcome"],
     )
     .expect("register novarocks_frontend_query_lifecycle_control_total")
 });
 
 static FRONTEND_QUERY_LIFECYCLE_LATENCY: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "novarocks_frontend_query_lifecycle_latency_micros",
-        "Cumulative frontend query lifecycle latency and sample counts.",
-        &["phase", "measure"]
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_frontend_query_lifecycle_latency_micros",
+            "Cumulative frontend query lifecycle latency and sample counts.",
+        ),
+        &["phase", "measure"],
     )
     .expect("register novarocks_frontend_query_lifecycle_latency_micros")
 });
+
+/// Explicit collector registry owned by one Frontend management host.
+///
+/// This keeps FE's metrics surface role-local even when a process supervises
+/// both Frontend and Backend application hosts.
+pub(crate) struct FrontendMetricsRegistry {
+    registry: Registry,
+}
+
+impl FrontendMetricsRegistry {
+    pub(crate) fn new() -> Result<Arc<Self>, String> {
+        refresh_frontend_gauges();
+        let registry = Registry::new();
+        for collector in [
+            Box::new(FRAGMENT_SCHEDULED_TOTAL.clone()) as Box<dyn prometheus::core::Collector>,
+            Box::new(HEARTBEAT_RTT_SECONDS.clone()),
+            Box::new(LIVE_BACKENDS.clone()),
+            Box::new(BACKENDS_BY_STATE.clone()),
+            Box::new(FRONTEND_QUERY_LIFECYCLE_ATTEMPTS.clone()),
+            Box::new(FRONTEND_QUERY_LIFECYCLE_INIT.clone()),
+            Box::new(FRONTEND_QUERY_LIFECYCLE_CONTROL.clone()),
+            Box::new(FRONTEND_QUERY_LIFECYCLE_LATENCY.clone()),
+        ] {
+            registry
+                .register(collector)
+                .map_err(|error| format!("register frontend metric collector failed: {error}"))?;
+        }
+        crate::catalog_projection_metrics::register_collectors(&registry)?;
+        Ok(Arc::new(Self { registry }))
+    }
+
+    fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
+        self.registry.gather()
+    }
+}
 
 pub(crate) fn observe_fragments_scheduled(count: usize) {
     Lazy::force(&FRAGMENT_SCHEDULED_TOTAL).inc_by(count as u64);
@@ -201,41 +246,43 @@ pub fn publish_frontend_query_lifecycle_metrics(snapshot: FrontendQueryLifecycle
     }
 }
 
-/// Shared metrics HTTP handler for role-owned native listeners.
-pub async fn handle_metrics(Query(params): Query<HashMap<String, String>>) -> Response {
+/// Management HTTP handler for the role-owned Frontend registry.
+pub(crate) async fn handle_metrics(
+    State(registry): State<Arc<FrontendMetricsRegistry>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
     if params
         .get("type")
         .is_some_and(|value| value.eq_ignore_ascii_case("json"))
     {
-        return match render_metrics_json() {
+        return match render_metrics_json(registry.as_ref()) {
             Ok(body) => ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
             Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
         };
     }
 
-    match render_metrics() {
+    match render_metrics(registry.as_ref()) {
         Ok(body) => ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
 }
 
-/// Renders the process metrics in Prometheus text format for any listener
-/// host. The caller owns HTTP route composition.
-pub fn render_metrics() -> Result<String, String> {
+/// Renders only the collectors explicitly registered by the Frontend host.
+pub(crate) fn render_metrics(registry: &FrontendMetricsRegistry) -> Result<String, String> {
     refresh_frontend_gauges();
     let encoder = TextEncoder::new();
     let mut buf = Vec::new();
     encoder
-        .encode(&prometheus::gather(), &mut buf)
+        .encode(&registry.gather(), &mut buf)
         .map_err(|e| format!("encode prometheus metrics failed: {e}"))?;
     String::from_utf8(buf).map_err(|e| format!("prometheus metrics were not utf-8: {e}"))
 }
 
-/// Renders the process metrics in the existing JSON form for listener hosts.
-pub fn render_metrics_json() -> Result<String, String> {
+/// Renders the Frontend registry in the existing JSON form.
+pub(crate) fn render_metrics_json(registry: &FrontendMetricsRegistry) -> Result<String, String> {
     refresh_frontend_gauges();
     let mut rows = Vec::new();
-    for family in prometheus::gather() {
+    for family in registry.gather() {
         for metric in family.get_metric() {
             let mut tags = serde_json::Map::new();
             tags.insert(
@@ -345,12 +392,17 @@ fn ensure_frontend_metric_label_families() {
 mod tests {
     use super::*;
 
+    fn frontend_registry() -> Arc<FrontendMetricsRegistry> {
+        FrontendMetricsRegistry::new().expect("create frontend metrics registry")
+    }
+
     #[test]
     fn rendered_metrics_include_cluster_core_names() {
         observe_fragments_scheduled(1);
         observe_backend_heartbeat_rtt(Duration::from_millis(5));
 
-        let body = render_metrics().expect("render metrics");
+        let registry = frontend_registry();
+        let body = render_metrics(registry.as_ref()).expect("render metrics");
         assert!(body.contains("novarocks_fragment_scheduled_total"));
         assert!(body.contains("novarocks_heartbeat_rtt_seconds"));
         assert!(body.contains("novarocks_live_backends"));
@@ -361,8 +413,9 @@ mod tests {
     fn backend_topology_gauges_preserve_the_last_nonzero_frontend_snapshot() {
         publish_backend_topology_metrics(1, 2, 3, 4, 5);
 
-        let first = render_metrics().expect("render first metrics snapshot");
-        let second = render_metrics().expect("render second metrics snapshot");
+        let registry = frontend_registry();
+        let first = render_metrics(registry.as_ref()).expect("render first metrics snapshot");
+        let second = render_metrics(registry.as_ref()).expect("render second metrics snapshot");
 
         for body in [&first, &second] {
             assert!(body.contains("novarocks_live_backends 2"), "{body}");
@@ -392,7 +445,8 @@ mod tests {
     #[test]
     fn rendered_json_metrics_are_fe_metrics_compatible_array() {
         observe_fragments_scheduled(1);
-        let body = render_metrics_json().expect("render json metrics");
+        let registry = frontend_registry();
+        let body = render_metrics_json(registry.as_ref()).expect("render json metrics");
         let value: serde_json::Value = serde_json::from_str(&body).expect("parse json metrics");
         let rows = value.as_array().expect("json metrics array");
         assert!(rows.iter().any(|row| {
@@ -430,7 +484,9 @@ mod tests {
             terminal_finalize_failures: 23,
         });
 
-        let body = render_metrics().expect("render frontend query lifecycle metrics");
+        let registry = frontend_registry();
+        let body =
+            render_metrics(registry.as_ref()).expect("render frontend query lifecycle metrics");
         assert!(
             body.contains("novarocks_frontend_query_lifecycle_active_attempts 2"),
             "{body}"
@@ -482,6 +538,25 @@ mod tests {
                 "novarocks_frontend_query_lifecycle_control_total{outcome=\"backend_epoch_mismatch\"} 17"
             ),
             "{body}"
+        );
+    }
+
+    #[test]
+    fn frontend_registry_excludes_foreign_process_collectors() {
+        let foreign = prometheus::IntGauge::new(
+            "novarocks_backend_foreign_registry_test_gauge",
+            "Foreign collector used to prove Frontend registry isolation.",
+        )
+        .expect("create foreign collector");
+        prometheus::default_registry()
+            .register(Box::new(foreign))
+            .expect("register foreign process collector");
+
+        let registry = frontend_registry();
+        let body = render_metrics(registry.as_ref()).expect("render frontend metrics");
+        assert!(
+            !body.contains("novarocks_backend_foreign_registry_test_gauge"),
+            "Frontend endpoint must not gather process-global collector families: {body}"
         );
     }
 }

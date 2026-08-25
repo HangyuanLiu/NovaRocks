@@ -33,7 +33,9 @@ fn require_backend_management_role(statement: &str, role: ClusterRole) -> Result
         ClusterRole::Be => Err(format!(
             "{statement} is not available in role=be; backend management is owned by StarRocks FE"
         )),
-        ClusterRole::AllInOne => Err(format!("{statement} requires role=fe")),
+        ClusterRole::AllInOne => Err(format!(
+            "{statement} requires role=fe; role=all-in-one is a Server launch mode"
+        )),
     }
 }
 

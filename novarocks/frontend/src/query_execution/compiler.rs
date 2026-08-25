@@ -1249,7 +1249,7 @@ fn test_request_context(
     test_request_context_with_role(
         current_catalog,
         current_database,
-        novarocks_types::ClusterRole::AllInOne,
+        novarocks_types::ClusterRole::Fe,
     )
 }
 
@@ -1343,7 +1343,9 @@ fn require_backend_management_role(
         novarocks_types::ClusterRole::Be => Err(format!(
             "{statement} is not available in role=be; backend management is owned by StarRocks FE"
         )),
-        novarocks_types::ClusterRole::AllInOne => Err(format!("{statement} requires role=fe")),
+        novarocks_types::ClusterRole::AllInOne => Err(format!(
+            "{statement} requires role=fe; role=all-in-one is a Server launch mode"
+        )),
     }
 }
 
