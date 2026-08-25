@@ -40,7 +40,6 @@ pub struct IcebergControlRuntime {
     catalog: Arc<dyn crate::iceberg::Catalog>,
     hadoop_catalog: Option<Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>>,
     rest_catalog: Option<Arc<crate::iceberg_catalog_rest::RestCatalog>>,
-    ctas_fenced_publication: bool,
     write_activations: Arc<crate::write_activation::IcebergWriteActivationReservations>,
 }
 
@@ -62,30 +61,12 @@ impl IcebergControlRuntime {
             )?
             .map_err(|error| format!("build Iceberg control-generation catalog: {error}"))?;
         let rest_catalog = catalog.rest().cloned();
-        let ctas_fenced_publication = match rest_catalog.as_ref() {
-            Some(rest_catalog) => {
-                let rest_catalog = Arc::clone(rest_catalog);
-                resources
-                    .catalog_runtime()
-                    .block_on(async move {
-                        rest_catalog
-                            .ctas_fenced_publication()
-                            .await
-                            .map(|capability| capability.is_some())
-                    })?
-                    .map_err(|error| {
-                        format!("read Iceberg CTAS fenced-publication capability: {error}")
-                    })?
-            }
-            None => false,
-        };
         Ok(Self {
             control_state,
             resources,
             catalog: Arc::clone(catalog.generic()),
             hadoop_catalog: catalog.hadoop().cloned(),
             rest_catalog,
-            ctas_fenced_publication,
             write_activations: Arc::new(
                 crate::write_activation::IcebergWriteActivationReservations::default(),
             ),
@@ -108,10 +89,6 @@ impl IcebergControlRuntime {
         &self,
     ) -> Option<&Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>> {
         self.hadoop_catalog.as_ref()
-    }
-
-    pub(crate) const fn has_ctas_fenced_publication(&self) -> bool {
-        self.ctas_fenced_publication
     }
 
     pub(crate) fn resources(&self) -> &IcebergControlResources {
@@ -283,7 +260,6 @@ impl std::fmt::Debug for IcebergControlRuntime {
             .field("catalog", &"<provider catalog client>")
             .field("hadoop_catalog", &self.hadoop_catalog.is_some())
             .field("rest_catalog", &self.rest_catalog.is_some())
-            .field("ctas_fenced_publication", &self.ctas_fenced_publication)
             .finish()
     }
 }

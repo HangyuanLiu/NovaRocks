@@ -223,7 +223,7 @@ impl IcebergControlProvider {
     ) -> Result<ConnectorTableHandle, ConnectorError> {
         self.validate_context(context)?;
         let table_metadata = table.metadata();
-        let data_prefix = crate::catalog_control::staged_create::fenced_staging_data_prefix(
+        let data_prefix = crate::catalog_control::staged_create::staged_write_data_prefix(
             table_metadata.location(),
             staging_operation,
         );

@@ -612,17 +612,6 @@ mod tests {
             creation.binding().staged_create().is_none(),
             "Hadoop generations must not expose REST-only staged create"
         );
-        assert!(
-            creation.binding().ctas_staged_publication().is_none(),
-            "Hadoop generations must not expose catalog-native fenced CTAS"
-        );
-        assert!(
-            creation
-                .binding()
-                .historical_ctas_staged_publication_recovery()
-                .is_none(),
-            "Hadoop generations must not expose historical fenced CTAS"
-        );
         let recovery = creation
             .binding()
             .staged_publication_recovery()
@@ -663,13 +652,6 @@ mod tests {
             .expect("advertised REST control");
         server.join().expect("config server");
 
-        assert!(creation.binding().ctas_staged_publication().is_none());
-        assert!(
-            creation
-                .binding()
-                .historical_ctas_staged_publication_recovery()
-                .is_none()
-        );
     }
 
     #[test]
@@ -700,13 +682,6 @@ mod tests {
             .expect("vanilla REST control");
         server.join().expect("config server");
 
-        assert!(creation.binding().ctas_staged_publication().is_none());
-        assert!(
-            creation
-                .binding()
-                .historical_ctas_staged_publication_recovery()
-                .is_none()
-        );
     }
 
     #[test]
@@ -741,12 +716,5 @@ mod tests {
         .expect("Hive factory request");
 
         let creation = factory.create_control(request).expect("Hive control");
-        assert!(creation.binding().ctas_staged_publication().is_none());
-        assert!(
-            creation
-                .binding()
-                .historical_ctas_staged_publication_recovery()
-                .is_none()
-        );
     }
 }

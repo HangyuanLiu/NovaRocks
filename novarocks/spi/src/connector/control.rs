@@ -20,12 +20,11 @@ use std::sync::{Arc, Mutex};
 use super::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
     ConnectorCleanupMaintenance, ConnectorCleanupMaintenanceResolver,
-    ConnectorCtasStagedPublication, ConnectorCtasStagedPublicationLease, ConnectorDataMutation,
-    ConnectorDataMutationResolver, ConnectorDistributedRewrite,
+    ConnectorDataMutation, ConnectorDataMutationResolver, ConnectorDistributedRewrite,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorHistoricalCtasStagedPublicationRecovery, ConnectorHistoricalMaintenanceRecovery,
-    ConnectorHistoricalMaintenanceResolver, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorHistoricalMaintenanceRecovery, ConnectorHistoricalMaintenanceResolver,
+    ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorMetadataMaintenance,
     ConnectorMetadataMaintenanceResolver, ConnectorMvAttemptDiscovery,
     ConnectorMvPublicationFencing, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
@@ -237,15 +236,12 @@ pub struct ConnectorControlBinding {
     cleanup_maintenance: Option<Arc<dyn ConnectorCleanupMaintenance>>,
     staged_create: Option<Arc<dyn ConnectorStagedCreate>>,
     unanchored_ctas_cleanup: Option<Arc<dyn ConnectorUnanchoredCtasCleanup>>,
-    ctas_staged_publication: Option<Arc<dyn ConnectorCtasStagedPublication>>,
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
     staged_publication_recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
     historical_maintenance_recovery: Option<Arc<dyn ConnectorHistoricalMaintenanceRecovery>>,
     mv_publication_fencing: Option<Arc<dyn ConnectorMvPublicationFencing>>,
     mv_attempt_discovery: Option<Arc<dyn ConnectorMvAttemptDiscovery>>,
-    historical_ctas_staged_publication_recovery:
-        Option<Arc<dyn ConnectorHistoricalCtasStagedPublicationRecovery>>,
     view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
 }
 
@@ -428,14 +424,12 @@ impl ConnectorControlBinding {
             cleanup_maintenance: None,
             staged_create: None,
             unanchored_ctas_cleanup: None,
-            ctas_staged_publication: None,
             write,
             statistics,
             staged_publication_recovery: None,
             historical_maintenance_recovery: None,
             mv_publication_fencing: None,
             mv_attempt_discovery: None,
-            historical_ctas_staged_publication_recovery: None,
             view_metadata: None,
         })
     }
@@ -673,10 +667,6 @@ impl ConnectorControlBinding {
         self.unanchored_ctas_cleanup.as_ref()
     }
 
-    pub fn ctas_staged_publication(&self) -> Option<&Arc<dyn ConnectorCtasStagedPublication>> {
-        self.ctas_staged_publication.as_ref()
-    }
-
     pub fn write(&self) -> Option<&Arc<dyn ConnectorWriteControl>> {
         self.write.as_ref()
     }
@@ -746,24 +736,6 @@ impl ConnectorControlBinding {
             ));
         }
         self.unanchored_ctas_cleanup = capability;
-        Ok(self)
-    }
-
-    /// Installs catalog-native fenced CTAS publication for this exact control
-    /// generation. Presence is the capability preflight; unsupported catalogs
-    /// leave this slot empty and may not use the unfenced staged-create path.
-    pub fn try_with_ctas_staged_publication(
-        mut self,
-        capability: Option<Arc<dyn ConnectorCtasStagedPublication>>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(capability) = &capability {
-            super::ctas_staged_publication::validate_ctas_staged_publication_owner(
-                &self.descriptor,
-                self.incarnation,
-                capability.as_ref(),
-            )?;
-        }
-        self.ctas_staged_publication = capability;
         Ok(self)
     }
 
@@ -849,30 +821,6 @@ impl ConnectorControlBinding {
 
     pub fn mv_attempt_discovery(&self) -> Option<&Arc<dyn ConnectorMvAttemptDiscovery>> {
         self.mv_attempt_discovery.as_ref()
-    }
-
-    /// Installs current-generation catalog inspection for a historical CTAS.
-    /// This slot is independent from both ordinary staged-create and ordinary
-    /// fenced CTAS publication, preventing a cross-generation fallback.
-    pub fn try_with_historical_ctas_staged_publication_recovery(
-        mut self,
-        recovery: Option<Arc<dyn ConnectorHistoricalCtasStagedPublicationRecovery>>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(recovery) = &recovery {
-            super::ctas_staged_publication::validate_historical_ctas_staged_publication_owner(
-                &self.descriptor,
-                self.incarnation,
-                recovery.as_ref(),
-            )?;
-        }
-        self.historical_ctas_staged_publication_recovery = recovery;
-        Ok(self)
-    }
-
-    pub fn historical_ctas_staged_publication_recovery(
-        &self,
-    ) -> Option<&Arc<dyn ConnectorHistoricalCtasStagedPublicationRecovery>> {
-        self.historical_ctas_staged_publication_recovery.as_ref()
     }
 
     pub fn execution_declaration(
@@ -1075,26 +1023,6 @@ impl ConnectorControlPlanningLease {
         })
     }
 
-    /// Derive the exact-generation fenced CTAS publication lease. This is the
-    /// mandatory CTAS capability preflight and must run before source work.
-    pub fn derive_ctas_staged_publication_lease(
-        &self,
-    ) -> Result<ConnectorCtasStagedPublicationLease, ConnectorError> {
-        let capability = self.binding.ctas_staged_publication().cloned().ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "connector control generation has no catalog-native fenced CTAS staged-publication capability",
-            )
-        })?;
-        let owner = ConnectorExecutionBindingKey {
-            instance_id: self.binding.descriptor().instance_id.clone(),
-            incarnation: self.binding.incarnation(),
-        };
-        let retained_planning_lease = self.clone();
-        ConnectorCtasStagedPublicationLease::new(owner, capability, move || {
-            drop(retained_planning_lease)
-        })
-    }
 }
 
 impl Drop for PlanningLeaseRelease {
