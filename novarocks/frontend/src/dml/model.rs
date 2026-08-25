@@ -3052,6 +3052,21 @@ pub fn operation_requires_recovery_scan(
     if matches!(payload, OperationPayload::CtasSaga(_)) {
         return false;
     }
+    if matches!(
+        payload,
+        OperationPayload::TruncateLifecycle(record)
+            if record.next_action == StatementNextAction::ManualInspect
+    ) || matches!(
+        payload,
+        OperationPayload::AddFilesLifecycle(record)
+            if record.next_action == StatementNextAction::ManualInspect
+    ) {
+        // A crash-only direct-mutation unknown is terminal from the recovery
+        // controller's perspective even when its publication result remains
+        // unknown to the user. Manual inspection and age-gated GC own the
+        // retained evidence; no process may re-drive the old attempt.
+        return false;
+    }
     if !state.is_finished() {
         return true;
     }
@@ -3063,12 +3078,10 @@ pub fn operation_requires_recovery_scan(
     match payload {
         OperationPayload::ConnectorWriteLifecycle(_) => false,
         OperationPayload::CtasSaga(record) => record.next_action != StatementNextAction::None,
-        OperationPayload::TruncateLifecycle(record) => {
-            record.next_action != StatementNextAction::None
-        }
-        OperationPayload::AddFilesLifecycle(record) => {
-            record.next_action != StatementNextAction::None
-        }
+        // LNP-1 has no in-process recovery authority after a direct mutation
+        // reaches a terminal result. `ManualInspect` is diagnostic guidance,
+        // not a license to re-drive the old catalog attempt.
+        OperationPayload::TruncateLifecycle(_) | OperationPayload::AddFilesLifecycle(_) => false,
     }
 }
 
@@ -3403,5 +3416,36 @@ mod tests {
             );
             assert!(validate_operation_transition(from, to).is_err());
         }
+    }
+
+    #[test]
+    fn manual_direct_mutation_unknown_never_schedules_recovery() {
+        let payload = OperationPayload::TruncateLifecycle(TruncateLifecycleRecord {
+            phase: TruncateLifecyclePhase::CommitUnknown,
+            connector_operation_id: Uuid::now_v7(),
+            provider_id: Some("iceberg".to_string()),
+            connector_instance_id: Some("rest".to_string()),
+            connector_incarnation: Some("01".repeat(16)),
+            target_ref: "main".to_string(),
+            request_digest: None,
+            plan_digest: None,
+            state_digest: None,
+            plan_summary: None,
+            outcome: None,
+            next_action: StatementNextAction::ManualInspect,
+        });
+        assert!(
+            !operation_requires_recovery_scan(OperationState::CommitUnknown, &payload, None),
+            "manual inspection must not make a fresh process recover an old direct mutation"
+        );
+        assert!(
+            !operation_requires_recovery_scan_with_direct_mutation(
+                OperationState::CommitUnknown,
+                &payload,
+                None,
+                None,
+            ),
+            "the direct-mutation variant must preserve the same crash-only boundary"
+        );
     }
 }
