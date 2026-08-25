@@ -473,6 +473,7 @@ mod tests {
     use crate::{
         MYSQL_MAX_KEY_BYTES, MYSQL_STATE_STORE_PROVIDER_ID, MySqlClientConfig, MySqlTlsMode,
     };
+    use novarocks_secret::SecretValue;
 
     #[cfg(feature = "state-store-test-hooks")]
     struct FailOncePool {
@@ -815,7 +816,7 @@ mod tests {
                 host: "mysql.internal.example".to_owned(),
                 port: 3306,
                 username: "novarocks_state_store".to_owned(),
-                password_env: "NOVAROCKS_SPI2_MYSQL_BIND_TEST_PASSWORD".to_owned(),
+                password: SecretValue::new("bind-test-password"),
                 tls_mode: MySqlTlsMode::Required,
                 tls_ca_path: None,
                 tls_cert_path: None,

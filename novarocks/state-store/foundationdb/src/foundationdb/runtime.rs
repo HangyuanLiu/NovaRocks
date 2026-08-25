@@ -717,10 +717,11 @@ fn start_foundationdb_network(
         network = network
             .set_option(NetworkOption::DisableMultiVersionClientApi)
             .map_err(|_| ())?;
-        if let Some(password_env) = config.tls_password_env.as_deref() {
-            let password = std::env::var(password_env).map_err(|_| ())?;
+        if let Some(password) = config.tls_password.as_ref() {
             network = network
-                .set_option(NetworkOption::TLSPassword(password))
+                .set_option(NetworkOption::TLSPassword(
+                    password.expose_secret().to_owned(),
+                ))
                 .map_err(|_| ())?;
         }
         if let Some(path) = config.tls_key_path.as_deref() {
@@ -1025,7 +1026,7 @@ mod tests {
             tls_key_path: None,
             tls_ca_path: None,
             tls_verify_peers: None,
-            tls_password_env: None,
+            tls_password: None,
         });
         let repeated = match repeated {
             Ok(_) => panic!("poisoned process runtime must reject later boot"),

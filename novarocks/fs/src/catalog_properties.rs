@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ObjectStoreConfig;
+use crate::{ObjectStoreConfig, SecretValue};
 
 /// AWS S3 properties that affect an [`ObjectStoreConfig`].
 ///
@@ -113,9 +113,10 @@ pub fn object_store_config_from_aws_s3_catalog_properties(
 
     Ok(Some(ObjectStoreConfig {
         endpoint: endpoint.to_string(),
-        access_key_id: access_key_id.to_string(),
-        access_key_secret: access_key_secret.to_string(),
-        session_token: first_nonempty_property(&properties, SESSION_TOKEN_KEYS).map(str::to_string),
+        access_key_id: SecretValue::new(access_key_id),
+        access_key_secret: SecretValue::new(access_key_secret),
+        session_token: first_nonempty_property(&properties, SESSION_TOKEN_KEYS)
+            .map(SecretValue::new),
         enable_path_style_access,
         region: first_nonempty_property(&properties, REGION_KEYS).map(str::to_string),
         retry_max_times: first_nonempty_property(&properties, RETRY_MAX_TIMES_KEYS)
@@ -186,6 +187,7 @@ mod tests {
         normalize_aws_s3_catalog_properties, object_store_config_from_aws_s3_catalog_properties,
         object_store_config_from_aws_s3_catalog_property_pairs,
     };
+    use crate::SecretValue;
     use std::collections::BTreeMap;
 
     fn properties(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -231,9 +233,15 @@ mod tests {
         .expect("complete credentials");
 
         assert_eq!(config.endpoint, "http://localhost:9000/");
-        assert_eq!(config.access_key_id, "ak");
-        assert_eq!(config.access_key_secret, "sk");
-        assert_eq!(config.session_token.as_deref(), Some("token"));
+        assert_eq!(config.access_key_id.expose_secret(), "ak");
+        assert_eq!(config.access_key_secret.expose_secret(), "sk");
+        assert_eq!(
+            config
+                .session_token
+                .as_ref()
+                .map(SecretValue::expose_secret),
+            Some("token")
+        );
         assert_eq!(config.region.as_deref(), Some("us-east-1"));
         assert_eq!(config.enable_path_style_access, Some(true));
         assert_eq!(config.retry_max_times, Some(9));

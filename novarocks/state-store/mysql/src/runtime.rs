@@ -47,6 +47,8 @@ use crate::MYSQL_MAX_KEY_BYTES;
 use crate::MySqlClientConfig;
 #[cfg(all(test, feature = "state-store-test-hooks"))]
 use crate::MySqlTlsMode;
+#[cfg(all(test, feature = "state-store-test-hooks"))]
+use novarocks_secret::SecretValue;
 
 const RUNTIME_PID_ERROR: &str = "state store runtime belongs to a different process";
 
@@ -750,15 +752,11 @@ impl MysqlRuntimeShared {
 
 #[cfg(all(test, feature = "state-store-test-hooks"))]
 pub(super) fn test_mysql_runtime_with_pool(pool: Arc<dyn PoolLifecycle>) -> MysqlRuntime {
-    const PASSWORD_ENV: &str = "NOVAROCKS_SS3_DISCONNECT_TEST_PASSWORD";
-    unsafe {
-        std::env::set_var(PASSWORD_ENV, "test-secret");
-    }
     let client = ResolvedMysqlClient::resolve(MySqlClientConfig {
         host: "localhost".to_owned(),
         port: 3306,
         username: "runtime-test".to_owned(),
-        password_env: PASSWORD_ENV.to_owned(),
+        password: SecretValue::new("test-secret"),
         tls_mode: MySqlTlsMode::Disabled,
         tls_ca_path: None,
         tls_cert_path: None,

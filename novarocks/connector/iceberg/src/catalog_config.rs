@@ -445,8 +445,8 @@ mod tests {
     fn object_store_binding() -> ObjectStoreConfig {
         ObjectStoreConfig {
             endpoint: "http://127.0.0.1:9000".to_string(),
-            access_key_id: "admin".to_string(),
-            access_key_secret: "admin123".to_string(),
+            access_key_id: novarocks_fs::SecretValue::new("admin"),
+            access_key_secret: novarocks_fs::SecretValue::new("admin123"),
             session_token: None,
             enable_path_style_access: Some(true),
             region: None,

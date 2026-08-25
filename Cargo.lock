@@ -3286,6 +3286,7 @@ dependencies = [
  "bytes",
  "crc32c",
  "libc",
+ "novarocks-secret",
  "opendal",
  "orc-rust",
  "parquet",
@@ -3327,6 +3328,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-secret"
+version = "0.1.0"
+
+[[package]]
 name = "novarocks-server"
 version = "0.1.0"
 dependencies = [
@@ -3343,6 +3348,7 @@ dependencies = [
  "novarocks-failpoint",
  "novarocks-frontend",
  "novarocks-fs",
+ "novarocks-secret",
  "novarocks-spi",
  "novarocks-state-store-foundationdb",
  "novarocks-state-store-mysql",
@@ -3403,6 +3409,7 @@ dependencies = [
  "foundationdb",
  "futures",
  "hex",
+ "novarocks-secret",
  "novarocks-spi",
  "serde",
  "serde_json",
@@ -3423,6 +3430,7 @@ dependencies = [
  "futures",
  "hex",
  "mysql_async",
+ "novarocks-secret",
  "novarocks-spi",
  "rustls",
  "serde",

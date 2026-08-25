@@ -482,8 +482,8 @@ mod tests {
     fn test_object_store_config() -> novarocks_fs::ObjectStoreConfig {
         novarocks_fs::ObjectStoreConfig {
             endpoint: "http://localhost:9000".to_string(),
-            access_key_id: "ak".to_string(),
-            access_key_secret: "sk".to_string(),
+            access_key_id: novarocks_fs::SecretValue::new("ak"),
+            access_key_secret: novarocks_fs::SecretValue::new("sk"),
             session_token: None,
             enable_path_style_access: Some(true),
             region: Some("us-east-1".to_string()),

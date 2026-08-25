@@ -14,10 +14,12 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use crate::SecretValue;
 use crate::access::ObjectStoreConfig;
 use crate::object_store_settings::ObjectStoreRetrySettings;
 use std::borrow::Borrow;
 use std::collections::BTreeMap;
+use std::fmt::{Debug, Formatter};
 
 pub const AWS_S3_ENDPOINT_KEYS: &[&str] = &["aws.s3.endpoint", "aws.s3.endpoint_url"];
 pub const AWS_S3_ACCESS_KEY_ID_KEYS: &[&str] = &["aws.s3.accessKeyId", "aws.s3.access_key"];
@@ -56,12 +58,12 @@ impl ObjectStoreCredentialsSource {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ObjectStoreCredentials {
     pub endpoint: String,
-    pub access_key_id: String,
-    pub access_key_secret: String,
-    pub session_token: Option<String>,
+    pub access_key_id: SecretValue,
+    pub access_key_secret: SecretValue,
+    pub session_token: Option<SecretValue>,
     pub enable_path_style_access: Option<bool>,
     pub region: Option<String>,
     pub retry_max_times: Option<usize>,
@@ -69,6 +71,28 @@ pub struct ObjectStoreCredentials {
     pub retry_max_delay_ms: Option<u64>,
     pub timeout_ms: Option<u64>,
     pub io_timeout_ms: Option<u64>,
+}
+
+impl Debug for ObjectStoreCredentials {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectStoreCredentials")
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &"<redacted>")
+            .field("access_key_secret", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("enable_path_style_access", &self.enable_path_style_access)
+            .field("region", &self.region)
+            .field("retry_max_times", &self.retry_max_times)
+            .field("retry_min_delay_ms", &self.retry_min_delay_ms)
+            .field("retry_max_delay_ms", &self.retry_max_delay_ms)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("io_timeout_ms", &self.io_timeout_ms)
+            .finish()
+    }
 }
 
 impl ObjectStoreCredentials {
@@ -104,9 +128,9 @@ impl ObjectStoreCredentials {
 
         Ok(Self {
             endpoint,
-            access_key_id,
-            access_key_secret,
-            session_token,
+            access_key_id: SecretValue::new(access_key_id),
+            access_key_secret: SecretValue::new(access_key_secret),
+            session_token: session_token.map(SecretValue::new),
             enable_path_style_access,
             region,
             retry_max_times: retry_settings.retry_max_times,
@@ -156,9 +180,9 @@ impl ObjectStoreCredentials {
 
         Ok(Self {
             endpoint,
-            access_key_id,
-            access_key_secret,
-            session_token,
+            access_key_id: SecretValue::new(access_key_id),
+            access_key_secret: SecretValue::new(access_key_secret),
+            session_token: session_token.map(SecretValue::new),
             enable_path_style_access,
             region,
             retry_max_times: None,
@@ -194,14 +218,15 @@ impl ObjectStoreCredentials {
     pub fn from_parts(
         source: ObjectStoreCredentialsSource,
         endpoint: &str,
-        access_key_id: &str,
-        access_key_secret: &str,
+        access_key_id: SecretValue,
+        access_key_secret: SecretValue,
         region: Option<&str>,
         enable_path_style_access: Option<bool>,
     ) -> Result<Self, String> {
         let endpoint = required_part(source, endpoint, "aws.s3.endpoint")?;
-        let access_key_id = required_part(source, access_key_id, "aws.s3.access_key")?;
-        let access_key_secret = required_part(source, access_key_secret, "aws.s3.secret_key")?;
+        let access_key_id = required_secret_part(source, access_key_id, "aws.s3.access_key")?;
+        let access_key_secret =
+            required_secret_part(source, access_key_secret, "aws.s3.secret_key")?;
         let region = region
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -263,6 +288,18 @@ fn required_part(
         return Err(missing_required_error(source, error_key));
     }
     Ok(trimmed.to_string())
+}
+
+fn required_secret_part(
+    source: ObjectStoreCredentialsSource,
+    value: SecretValue,
+    error_key: &str,
+) -> Result<SecretValue, String> {
+    if value.is_empty() {
+        Err(missing_required_error(source, error_key))
+    } else {
+        Ok(value)
+    }
 }
 
 fn missing_required_error(source: ObjectStoreCredentialsSource, key: &str) -> String {
@@ -384,8 +421,8 @@ mod tests {
         .expect("parse credentials");
 
         assert_eq!(credentials.endpoint, "http://localhost:9000/");
-        assert_eq!(credentials.access_key_id, "ak");
-        assert_eq!(credentials.access_key_secret, "sk");
+        assert_eq!(credentials.access_key_id.expose_secret(), "ak");
+        assert_eq!(credentials.access_key_secret.expose_secret(), "sk");
         assert_eq!(credentials.region.as_deref(), Some("us-east-1"));
         assert_eq!(credentials.enable_path_style_access, Some(true));
     }
@@ -406,8 +443,8 @@ mod tests {
         .expect("parse s3a properties");
 
         assert_eq!(credentials.endpoint, "http://localhost:9000");
-        assert_eq!(credentials.access_key_id, "ak");
-        assert_eq!(credentials.access_key_secret, "sk");
+        assert_eq!(credentials.access_key_id.expose_secret(), "ak");
+        assert_eq!(credentials.access_key_secret.expose_secret(), "sk");
         assert_eq!(credentials.region.as_deref(), Some("us-east-1"));
         assert_eq!(credentials.enable_path_style_access, Some(true));
     }
@@ -565,7 +602,13 @@ mod tests {
         )
         .expect("parse credentials");
 
-        assert_eq!(credentials.session_token.as_deref(), Some("token"));
+        assert_eq!(
+            credentials
+                .session_token
+                .as_ref()
+                .map(SecretValue::expose_secret),
+            Some("token")
+        );
         assert_eq!(credentials.retry_max_times, Some(7));
         assert_eq!(credentials.retry_min_delay_ms, Some(11));
         assert_eq!(credentials.retry_max_delay_ms, Some(99));
@@ -588,7 +631,27 @@ mod tests {
         let cfg = credentials.to_object_store_config();
 
         assert_eq!(cfg.endpoint, "http://localhost:9000");
-        assert_eq!(cfg.access_key_id, "ak");
-        assert_eq!(cfg.access_key_secret, "sk");
+        assert_eq!(cfg.access_key_id.expose_secret(), "ak");
+        assert_eq!(cfg.access_key_secret.expose_secret(), "sk");
+    }
+
+    #[test]
+    fn debug_redacts_secret_canary() {
+        let credentials = ObjectStoreCredentials::from_aws_s3_properties(
+            ObjectStoreCredentialsSource::AwsS3Properties,
+            &props(&[
+                ("aws.s3.endpoint", "http://localhost:9000"),
+                ("aws.s3.access_key", "nwt-1-access-canary"),
+                ("aws.s3.secret_key", "nwt-1-secret-canary"),
+                ("aws.s3.session_token", "nwt-1-token-canary"),
+            ]),
+        )
+        .expect("parse credentials");
+
+        let debug = format!("{credentials:?}");
+        assert!(!debug.contains("nwt-1-access-canary"));
+        assert!(!debug.contains("nwt-1-secret-canary"));
+        assert!(!debug.contains("nwt-1-token-canary"));
+        assert!(debug.contains("<redacted>"));
     }
 }

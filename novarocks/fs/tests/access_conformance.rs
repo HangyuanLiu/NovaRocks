@@ -17,7 +17,7 @@
 
 use novarocks_fs::{
     FileCancellation, FileErrorKind, FileIdentity, FileReadRange, FsAccessResolver, FsLocation,
-    FsScheme, ObjectStoreConfig,
+    FsScheme, ObjectStoreConfig, SecretValue,
 };
 
 #[test]
@@ -129,9 +129,9 @@ fn bounded_range_rejects_zero_and_overflow() {
 fn object_store_debug_redacts_secrets() {
     let config = ObjectStoreConfig {
         endpoint: "http://localhost:9000".to_string(),
-        access_key_id: "visible-key".to_string(),
-        access_key_secret: "visible-secret".to_string(),
-        session_token: Some("visible-token".to_string()),
+        access_key_id: SecretValue::new("nwt-1-access-canary"),
+        access_key_secret: SecretValue::new("nwt-1-secret-canary"),
+        session_token: Some(SecretValue::new("nwt-1-token-canary")),
         enable_path_style_access: Some(true),
         region: Some("us-east-1".to_string()),
         retry_max_times: None,
@@ -141,10 +141,35 @@ fn object_store_debug_redacts_secrets() {
         io_timeout_ms: None,
     };
     let debug = format!("{config:?}");
-    assert!(!debug.contains("visible-key"));
-    assert!(!debug.contains("visible-secret"));
-    assert!(!debug.contains("visible-token"));
+    assert!(!debug.contains("nwt-1-access-canary"));
+    assert!(!debug.contains("nwt-1-secret-canary"));
+    assert!(!debug.contains("nwt-1-token-canary"));
     assert!(debug.contains("<redacted>"));
+}
+
+#[test]
+fn object_store_configuration_error_redacts_secrets() {
+    let config = ObjectStoreConfig {
+        endpoint: String::new(),
+        access_key_id: SecretValue::new("nwt-1-access-canary"),
+        access_key_secret: SecretValue::new("nwt-1-secret-canary"),
+        session_token: Some(SecretValue::new("nwt-1-token-canary")),
+        enable_path_style_access: Some(true),
+        region: Some("us-east-1".to_string()),
+        retry_max_times: None,
+        retry_min_delay_ms: None,
+        retry_max_delay_ms: None,
+        timeout_ms: None,
+        io_timeout_ms: None,
+    };
+
+    let error = FsAccessResolver::new()
+        .resolve_location("s3://bucket/data.parquet", Some(&config))
+        .expect_err("empty endpoint must fail");
+    let diagnostic = format!("{error:?}: {error}");
+    assert!(!diagnostic.contains("nwt-1-access-canary"));
+    assert!(!diagnostic.contains("nwt-1-secret-canary"));
+    assert!(!diagnostic.contains("nwt-1-token-canary"));
 }
 
 #[test]

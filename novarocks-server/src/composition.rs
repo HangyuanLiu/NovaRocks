@@ -747,7 +747,7 @@ pub fn state_store_provider_registry(
                         host: client.host.clone(),
                         port: client.port,
                         username: client.username.clone(),
-                        password_env: client.password_env.clone(),
+                        password: client.password.clone(),
                         tls_mode: match client.tls_mode {
                             MySqlTlsMode::Disabled => novarocks_state_store_mysql::MySqlTlsMode::Disabled,
                             MySqlTlsMode::Required => novarocks_state_store_mysql::MySqlTlsMode::Required,
@@ -804,7 +804,7 @@ pub fn state_store_provider_registry(
                     tls_key_path: client.tls_key_path.clone(),
                     tls_ca_path: client.tls_ca_path.clone(),
                     tls_verify_peers: client.tls_verify_peers.clone(),
-                    tls_password_env: client.tls_password_env.clone(),
+                    tls_password: client.tls_password.clone(),
                 };
                 registry.register(StateStoreProviderRegistration::new(descriptor, move |_| {
                     novarocks_state_store_foundationdb::foundationdb_provider_factory(

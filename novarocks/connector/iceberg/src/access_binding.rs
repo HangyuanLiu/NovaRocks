@@ -244,8 +244,8 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().expect("build Tokio runtime");
         let config = novarocks_fs::ObjectStoreConfig {
             endpoint: "http://minio:9000".to_string(),
-            access_key_id: "test".to_string(),
-            access_key_secret: "test".to_string(),
+            access_key_id: novarocks_fs::SecretValue::new("test"),
+            access_key_secret: novarocks_fs::SecretValue::new("test"),
             session_token: None,
             enable_path_style_access: Some(true),
             region: None,

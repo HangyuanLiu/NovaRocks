@@ -20,6 +20,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use novarocks_secret::SecretValue;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,7 +42,7 @@ pub struct FoundationDbClientConfig {
     pub tls_key_path: Option<PathBuf>,
     pub tls_ca_path: Option<PathBuf>,
     pub tls_verify_peers: Option<String>,
-    pub tls_password_env: Option<String>,
+    pub tls_password: Option<SecretValue>,
 }
 
 impl FoundationDbClientConfig {
@@ -56,7 +57,7 @@ impl FoundationDbClientConfig {
             || self.tls_key_path.is_some()
             || self.tls_ca_path.is_some()
             || self.tls_verify_peers.is_some()
-            || self.tls_password_env.is_some();
+            || self.tls_password.is_some();
         if tls_configured
             && (self.tls_cert_path.is_none()
                 || self.tls_key_path.is_none()
@@ -84,16 +85,12 @@ impl FoundationDbClientConfig {
         {
             bail!("InvalidStateStoreConfig: tls_verify_peers must not be empty");
         }
-        if let Some(variable) = self.tls_password_env.as_deref() {
-            if variable.trim().is_empty() {
-                bail!("InvalidStateStoreConfig: tls_password_env must not be empty");
-            }
-            let value = std::env::var_os(variable).ok_or_else(|| {
-                anyhow::anyhow!("InvalidStateStoreConfig: tls_password_env variable is not defined")
-            })?;
-            if value.is_empty() {
-                bail!("InvalidStateStoreConfig: tls_password_env variable must not be empty");
-            }
+        if self
+            .tls_password
+            .as_ref()
+            .is_some_and(SecretValue::is_empty)
+        {
+            bail!("InvalidStateStoreConfig: tls_password must not be empty");
         }
 
         Ok(())
@@ -115,11 +112,79 @@ impl fmt::Debug for FoundationDbClientConfig {
                 "tls_verify_peers_configured",
                 &self.tls_verify_peers.is_some(),
             )
-            .field(
-                "tls_password_env_configured",
-                &self.tls_password_env.is_some(),
-            )
+            .field("tls_password_configured", &self.tls_password.is_some())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FoundationDbClientConfig;
+    use novarocks_secret::SecretValue;
+    use tempfile::TempDir;
+
+    fn configured_tls_client(password: Option<SecretValue>) -> (FoundationDbClientConfig, TempDir) {
+        let tls = TempDir::new().expect("TLS config temp dir");
+        let cert = tls.path().join("client.crt");
+        let key = tls.path().join("client.key");
+        let ca = tls.path().join("ca.crt");
+        std::fs::write(&cert, b"cert").expect("write cert fixture");
+        std::fs::write(&key, b"key").expect("write key fixture");
+        std::fs::write(&ca, b"ca").expect("write CA fixture");
+
+        (
+            FoundationDbClientConfig {
+                disable_multi_version_client: true,
+                tls_cert_path: Some(cert),
+                tls_key_path: Some(key),
+                tls_ca_path: Some(ca),
+                tls_verify_peers: Some("Check.Valid=1".to_owned()),
+                tls_password: password,
+            },
+            tls,
+        )
+    }
+
+    #[test]
+    fn direct_empty_tls_password_fails_closed_without_disclosing_it() {
+        let (config, _tls) = configured_tls_client(Some(SecretValue::new("")));
+
+        let error = config.validate().expect_err("empty TLS password must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "InvalidStateStoreConfig: tls_password must not be empty"
+        );
+    }
+
+    #[test]
+    fn client_config_debug_redacts_direct_tls_password() {
+        let canary = "nwt-1-fdb-tls-password-canary";
+        let (config, _tls) = configured_tls_client(Some(SecretValue::new(canary)));
+
+        let debug = format!("{config:?}");
+
+        assert!(debug.contains("tls_password_configured: true"));
+        assert!(!debug.contains(canary));
+    }
+
+    #[test]
+    fn invalid_tls_configuration_error_redacts_direct_tls_password() {
+        let canary = "nwt-1-fdb-tls-password-canary";
+        let config = FoundationDbClientConfig {
+            disable_multi_version_client: true,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_ca_path: None,
+            tls_verify_peers: None,
+            tls_password: Some(SecretValue::new(canary)),
+        };
+
+        let error = config
+            .validate()
+            .expect_err("incomplete TLS configuration must fail");
+
+        assert!(!error.to_string().contains(canary));
     }
 }
 

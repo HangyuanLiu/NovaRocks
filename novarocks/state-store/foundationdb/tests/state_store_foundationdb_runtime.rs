@@ -38,7 +38,7 @@ fn client_config() -> FoundationDbClientConfig {
         tls_key_path: None,
         tls_ca_path: None,
         tls_verify_peers: None,
-        tls_password_env: None,
+        tls_password: None,
     }
 }
 
@@ -92,7 +92,7 @@ async fn foundationdb_runtime_lifecycle() {
         tls_key_path: Some(key),
         tls_ca_path: Some(ca),
         tls_verify_peers: Some("Check.Valid=1".to_owned()),
-        tls_password_env: None,
+        tls_password: None,
     }) {
         Ok(_) => panic!("a different process-global client config must fail closed"),
         Err(error) => error,

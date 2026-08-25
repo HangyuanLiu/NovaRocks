@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use novarocks_secret::SecretValue;
 #[cfg(feature = "state-store-test-hooks")]
 use novarocks_spi::state_store::ContinuationToken;
 use novarocks_spi::state_store::{
@@ -110,6 +111,8 @@ impl Drop for TestDatabase {
 }
 
 fn fixture_client_config() -> MySqlClientConfig {
+    let password_env =
+        std::env::var("NOVAROCKS_MYSQL_PASSWORD_ENV").expect("fixture password env name");
     MySqlClientConfig {
         host: std::env::var("NOVAROCKS_MYSQL_HOST").expect("fixture host"),
         port: std::env::var("NOVAROCKS_MYSQL_PORT")
@@ -117,8 +120,7 @@ fn fixture_client_config() -> MySqlClientConfig {
             .parse()
             .expect("numeric fixture port"),
         username: std::env::var("NOVAROCKS_MYSQL_USERNAME").expect("fixture username"),
-        password_env: std::env::var("NOVAROCKS_MYSQL_PASSWORD_ENV")
-            .expect("fixture password environment name"),
+        password: SecretValue::new(std::env::var(password_env).expect("fixture password value")),
         tls_mode: MySqlTlsMode::Disabled,
         tls_ca_path: None,
         tls_cert_path: None,

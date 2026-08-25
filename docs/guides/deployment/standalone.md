@@ -75,8 +75,8 @@ user = "root"
 
 [connector.object_store]
 endpoint = "http://127.0.0.1:9000"
-access_key_id = "admin"
-access_key_secret = "admin123"
+access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"
+access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
 enable_path_style_access = true
 ```
 
@@ -88,6 +88,7 @@ enable_path_style_access = true
 - `[state_store]` 是 FE durable control-plane state 的唯一持久化入口；不要配置第二套 metadata store。
 - native 持久表必须属于显式创建的 external Iceberg catalog；NovaRocks 不创建内部 StarRocks 类型表。
 - `[connector.object_store]` 为 connector execution 提供进程本地对象存储凭据；它本身不创建 catalog 或内表。
+- `password`、`tls_password`、`access_key_id` 与 `access_key_secret` 可使用 literal 或 exact `${ENV:VAR}`；Server 只在启动加载时解析一次，变更后必须重启相关进程。Provider 不读取环境变量。
 
 ## 启动服务
 

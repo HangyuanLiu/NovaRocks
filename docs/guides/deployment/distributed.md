@@ -91,8 +91,8 @@ advertise_host = "10.0.0.11"
 
 [connector.object_store]
 endpoint = "http://10.0.0.20:9000"
-access_key_id = "admin"
-access_key_secret = "admin123"
+access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"
+access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
 enable_path_style_access = true
 ```
 
@@ -116,6 +116,10 @@ BE 本地启动配置。所有参与同一集群的 BE 必须使用同一组值�
 只携带文件、split 和 catalog 标识，不会携带 endpoint 或凭据。运行期通过 SQL
 创建但只存在于 FE 内存中的 catalog 配置不能作为 distributed native read 的
 凭据来源。
+
+Secret-bearing startup scalars accept literals or only exact `${ENV:VAR}` references. Every
+FE and BE resolves its own startup snapshot once; changing a secret requires restarting the
+affected process. Credentials never enter native fragments or FE-to-BE transport.
 
 ## 配置 FE 节点
 
@@ -142,8 +146,8 @@ user = "root"
 
 [connector.object_store]
 endpoint = "http://10.0.0.20:9000"
-access_key_id = "admin"
-access_key_secret = "admin123"
+access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"
+access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
 enable_path_style_access = true
 
 [cluster]

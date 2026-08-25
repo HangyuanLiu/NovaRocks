@@ -26,7 +26,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use novarocks_fs::{ObjectStoreConfig, parse_object_store_path_parse_only};
+use novarocks_fs::{ObjectStoreConfig, SecretValue, parse_object_store_path_parse_only};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorRequestContext, ConnectorSplitPlanningRequest,
 };
@@ -567,7 +567,7 @@ fn parse_object_store_config(
             if access_key.is_empty() || secret_key.is_empty() {
                 return Err(unavailable("StarOS S3 simple credential is unavailable"));
             }
-            (access_key.to_string(), secret_key.to_string())
+            (SecretValue::new(access_key), SecretValue::new(secret_key))
         }
         Some(wire::aws_credential_info::Credential::DefaultCredential(_))
         | Some(wire::aws_credential_info::Credential::ProfileCredential(_))
@@ -895,8 +895,8 @@ mod tests {
         assert_eq!(config.endpoint, "http://object-store:9000");
         assert_eq!(config.region.as_deref(), Some("us-east-1"));
         assert_eq!(config.enable_path_style_access, Some(true));
-        assert_eq!(config.access_key_id, "ACCESS_KEY");
-        assert_eq!(config.access_key_secret, "SECRET_KEY");
+        assert_eq!(config.access_key_id.expose_secret(), "ACCESS_KEY");
+        assert_eq!(config.access_key_secret.expose_secret(), "SECRET_KEY");
         let debug = format!("{config:?}");
         assert!(!debug.contains("ACCESS_KEY"));
         assert!(!debug.contains("SECRET_KEY"));
