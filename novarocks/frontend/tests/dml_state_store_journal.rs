@@ -2122,6 +2122,7 @@ async fn ctas_v2_mutation_is_revision_cas_and_idempotent() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "LNP-1 retires CTAS recovery authority; remove this legacy fixture with its side-record API"]
 async fn ctas_v8_recovery_facts_are_authority_revision_bound_and_restart_durable() {
     let temp = TempDir::new().unwrap();
     let path = temp.path().join("state.sqlite");
@@ -2229,6 +2230,7 @@ async fn ctas_v8_recovery_facts_are_authority_revision_bound_and_restart_durable
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "LNP-1 retires CTAS recovery authority; remove this legacy fixture with its side-record API"]
 async fn sqlite_superseded_ctas_holder_cannot_persist_late_side_or_statement_writes() {
     let temp = TempDir::new().unwrap();
     let (_host, store, journal) = open_store(&temp.path().join("state.sqlite")).await;
@@ -2399,6 +2401,7 @@ async fn sqlite_superseded_ctas_holder_cannot_persist_late_side_or_statement_wri
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "LNP-1 retires CTAS recovery authority; remove this legacy fixture with its side-record API"]
 async fn terminal_ctas_keeps_recovery_due_until_proof_bound_cleanup_converges() {
     let temp = TempDir::new().unwrap();
     let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
@@ -2502,6 +2505,7 @@ async fn terminal_ctas_keeps_recovery_due_until_proof_bound_cleanup_converges() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "LNP-1 retires CTAS recovery authority; remove this legacy fixture with its side-record API"]
 async fn ctas_child_supersession_is_append_only_and_checkpointed_to_the_new_child() {
     let temp = TempDir::new().unwrap();
     let (_host, _store, journal) = open_store(&temp.path().join("state.sqlite")).await;
