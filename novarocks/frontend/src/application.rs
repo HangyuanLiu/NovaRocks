@@ -33,9 +33,7 @@ use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogControll
 use crate::common::admitted_query_context::LakePublicationRuntimePolicy;
 use crate::connector::ConnectorControlHost;
 use crate::coordination::FrontendCoordinationRuntime;
-use crate::coordinator::{
-    BackendQueryActivity, FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader,
-};
+use crate::coordinator::{FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader};
 use crate::dml::DmlService;
 use crate::mv::maintenance::MaintenanceCoordinatorConfig;
 use crate::mv::scheduler::FrontendMvSchedulerConfig;
@@ -837,19 +835,6 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub fn backend_query_activity(&self) -> BackendQueryActivity {
-        self.coordinator
-            .as_ref()
-            .expect("frontend coordinator is installed before host open returns")
-            .backend_query_activity()
-    }
-
-    pub fn backend_query_event_sink(
-        &self,
-    ) -> Arc<dyn crate::common::backend_topology::BackendQueryEventSink> {
-        Arc::new(self.backend_query_activity())
-    }
-
     pub fn coordinator_report_endpoint_sink(
         &self,
     ) -> Arc<dyn crate::common::backend_topology::CoordinatorReportEndpointSink> {
@@ -905,8 +890,6 @@ impl FrontendApplicationHost {
             )
             .map_err(FrontendApplicationError::server)?,
         );
-        self.topology()
-            .attach_query_events(Arc::new(coordinator.backend_query_activity()));
         self.query_execution = Some(QueryExecutionService::new(coordinator.clone()));
         self.coordinator = Some(coordinator);
         Ok(())
@@ -954,9 +937,6 @@ impl FrontendApplicationHost {
             .as_ref()
             .map(|topology| topology.stop_heartbeat_manager())
             .transpose();
-        if let Some(topology) = self.topology.as_ref() {
-            topology.detach_query_events();
-        }
         self.topology.take();
         primary_error = heartbeat_result.err();
         if let Some(statistics_worker_error) = statistics_worker_error {

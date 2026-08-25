@@ -246,18 +246,6 @@ impl CoordinatorReportEndpoint {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum BackendQueryEvent {
-    Unavailable {
-        process_id: BackendProcessId,
-        reason: String,
-    },
-    Restarted {
-        old_process_id: BackendProcessId,
-        new_process_id: BackendProcessId,
-    },
-}
-
 #[derive(Clone, Debug)]
 pub struct LiveBackendTarget {
     backend_idx: usize,
@@ -365,38 +353,8 @@ impl BackendTopologySnapshot {
     }
 }
 
-/// Frontend-owned query activity consumed by the core backend registry.
-///
-/// The sink owns query-wide failure and exact remote cancellation. Core only
-/// forwards lifecycle facts and never performs BE-local query cleanup.
-pub trait BackendQueryEventSink: Send + Sync + 'static {
-    fn on_backend_event(&self, event: BackendQueryEvent);
-
-    fn backend_has_active_queries(&self, process_id: BackendProcessId) -> bool;
-
-    fn replace_live_backends(&self, revision: u64, backends: Vec<LiveBackendTarget>);
-}
-
 pub trait CoordinatorReportEndpointSink: Send + Sync + 'static {
     fn set_bound_port(&self, port: u16);
-}
-
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific frontend integration and regression coverage."
-)]
-pub(crate) struct NoopBackendQueryEventSink;
-
-#[cfg(test)]
-impl BackendQueryEventSink for NoopBackendQueryEventSink {
-    fn on_backend_event(&self, _event: BackendQueryEvent) {}
-
-    fn backend_has_active_queries(&self, _process_id: BackendProcessId) -> bool {
-        false
-    }
-
-    fn replace_live_backends(&self, _revision: u64, _backends: Vec<LiveBackendTarget>) {}
 }
 
 #[cfg(test)]

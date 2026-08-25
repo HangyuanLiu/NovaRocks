@@ -50,7 +50,6 @@ use novarocks_types::{
     QueryProcessNamespace,
 };
 
-use super::backend_events::BackendQueryActivity;
 use super::query_lifecycle::{
     FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig, QueryLifecycleTransport,
 };
@@ -883,10 +882,6 @@ impl FrontendDistributedQueryCoordinator {
 
     pub(crate) fn convergence_reader(&self) -> Arc<dyn QueryLifecycleConvergenceReader> {
         Arc::clone(&self.registry) as Arc<dyn QueryLifecycleConvergenceReader>
-    }
-
-    pub fn backend_query_activity(&self) -> BackendQueryActivity {
-        BackendQueryActivity::new(Arc::clone(&self.registry))
     }
 
     pub fn report_endpoint_sink(

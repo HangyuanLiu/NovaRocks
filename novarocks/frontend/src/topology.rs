@@ -37,9 +37,9 @@ use novarocks_version::native_build_identity;
 use tokio::runtime::Handle;
 
 use crate::common::backend_topology::{
-    BackendQueryEvent, BackendQueryEventSink, BackendTopologyError, BackendTopologyMetricsSnapshot,
-    BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome,
-    LiveBackendTarget, publish_backend_topology_metrics,
+    BackendTopologyError, BackendTopologyMetricsSnapshot, BackendTopologyPort,
+    BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome, LiveBackendTarget,
+    publish_backend_topology_metrics,
 };
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::heartbeat as native_heartbeat;
@@ -164,7 +164,6 @@ pub(crate) struct ClusterBackendService {
     state: Mutex<TopologyState>,
     heartbeat_interval: Duration,
     announce_lease_ttl: Duration,
-    query_events: Mutex<Option<Arc<dyn BackendQueryEventSink>>>,
     heartbeat_probe: Arc<HeartbeatProbe>,
     heartbeat_thread: Mutex<Option<JoinHandle<()>>>,
     heartbeat_round: Mutex<()>,
@@ -209,7 +208,6 @@ impl ClusterBackendService {
             }),
             heartbeat_interval: config.heartbeat_interval(),
             announce_lease_ttl: config.announce_lease_ttl(),
-            query_events: Mutex::new(None),
             heartbeat_probe: Arc::new(probe),
             heartbeat_thread: Mutex::new(None),
             heartbeat_round: Mutex::new(()),
@@ -279,17 +277,6 @@ impl ClusterBackendService {
         }
         drop(state);
         service
-    }
-
-    pub(crate) fn attach_query_events(&self, events: Arc<dyn BackendQueryEventSink>) {
-        *self.query_events.lock().unwrap() = Some(events);
-        self.publish_snapshot();
-    }
-    pub(crate) fn detach_query_events(&self) {
-        self.query_events
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
     }
 
     /// Announce establishes a lease and a pending candidate, never eligibility.
@@ -566,12 +553,6 @@ impl ClusterBackendService {
         }
         let changed = advance_if_eligible_changed(&mut state, before).unwrap_or(false);
         drop(state);
-        if let Some(old_process_id) = old_owner.filter(|old| *old != process_id) {
-            self.dispatch_event(BackendQueryEvent::Restarted {
-                old_process_id,
-                new_process_id: process_id,
-            });
-        }
         if changed {
             self.publish_snapshot();
         }
@@ -608,18 +589,11 @@ impl ClusterBackendService {
     }
 
     fn publish_snapshot(&self) {
-        let (revision, live, metrics) = {
+        let metrics = {
             let state = self.state.lock().unwrap();
-            (
-                state.revision,
-                live_targets(&state),
-                metrics_snapshot(&state),
-            )
+            metrics_snapshot(&state)
         };
         publish_backend_topology_metrics(metrics);
-        if let Some(events) = self.query_events.lock().unwrap().as_ref() {
-            events.replace_live_backends(revision, live);
-        }
         self.topology_wake.notify_all();
     }
 
@@ -639,11 +613,6 @@ impl ClusterBackendService {
         changed
     }
 
-    fn dispatch_event(&self, event: BackendQueryEvent) {
-        if let Some(events) = self.query_events.lock().unwrap().as_ref() {
-            events.on_backend_event(event);
-        }
-    }
     fn snapshot_inner(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
         let state = self
             .state
@@ -929,26 +898,13 @@ fn advance_if_eligible_changed(
 #[cfg(test)]
 mod tests {
     use super::ClusterBackendService;
-    use crate::common::backend_topology::{
-        BackendQueryEvent, BackendQueryEventSink, BackendTopologyPort, LiveBackendTarget,
-    };
+    use crate::common::backend_topology::BackendTopologyPort;
     use novarocks_proto::lifecycle::QueryControlEndpoint;
     use novarocks_proto::membership::{BackendProcessDescriptor, BackendReportedState};
     use novarocks_types::BackendProcessId;
     use novarocks_version::native_build_identity;
     use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
-    #[derive(Default)]
-    struct Events(Mutex<Vec<BackendQueryEvent>>);
-    impl BackendQueryEventSink for Events {
-        fn on_backend_event(&self, event: BackendQueryEvent) {
-            self.0.lock().unwrap().push(event);
-        }
-        fn backend_has_active_queries(&self, _: BackendProcessId) -> bool {
-            false
-        }
-        fn replace_live_backends(&self, _: u64, _: Vec<LiveBackendTarget>) {}
-    }
+    use std::sync::Arc;
     fn descriptor(endpoint: SocketAddr) -> BackendProcessDescriptor {
         BackendProcessDescriptor::new(
             BackendProcessId::new_v7(),
@@ -1009,7 +965,7 @@ mod tests {
         );
     }
     #[test]
-    fn replacement_is_pending_until_pull_and_is_the_only_restart_event() {
+    fn replacement_is_pending_until_exact_pull_transfers_eligibility() {
         let service = ClusterBackendService::new_transient_for_test(1);
         let endpoint = "127.0.0.1:9070".parse().unwrap();
         let old = descriptor(endpoint);
@@ -1017,8 +973,6 @@ mod tests {
             .record_announce(old.clone(), BackendReportedState::Running)
             .unwrap();
         verify(&service, &old);
-        let events = Arc::new(Events::default());
-        service.attach_query_events(events.clone());
         let new = descriptor(endpoint);
         service
             .record_announce(new.clone(), BackendReportedState::Running)
@@ -1036,9 +990,6 @@ mod tests {
                 .unwrap(),
             new.process_id().unwrap()
         );
-        assert!(
-            matches!(events.0.lock().unwrap().as_slice(), [BackendQueryEvent::Restarted { old_process_id, new_process_id, .. }] if *old_process_id == old.process_id().unwrap() && *new_process_id == new.process_id().unwrap())
-        );
     }
     #[test]
     fn heartbeat_loss_never_sends_unavailable() {
@@ -1048,11 +999,8 @@ mod tests {
             .record_announce(descriptor.clone(), BackendReportedState::Running)
             .unwrap();
         verify(&service, &descriptor);
-        let events = Arc::new(Events::default());
-        service.attach_query_events(events.clone());
         assert!(service.record_heartbeat_failure(descriptor.process_id().unwrap()));
         assert!(service.snapshot().unwrap().targets().is_empty());
-        assert!(events.0.lock().unwrap().is_empty());
     }
 
     #[test]

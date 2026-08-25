@@ -573,44 +573,6 @@ impl FrontendQueryRegistry {
         affected
     }
 
-    pub(crate) fn backend_restarted(
-        &self,
-        old_process_id: BackendProcessId,
-        message: String,
-    ) -> Vec<QueryId> {
-        let (affected, cancellations) = {
-            let mut active = self.active.lock().expect("frontend query registry lock");
-            let mut affected = Vec::new();
-            let mut cancellations = Vec::new();
-            for (&(high, low), query) in active.iter_mut() {
-                if !query.scheduled_backends.contains(&old_process_id) {
-                    continue;
-                }
-                if query.first_failure.is_none() {
-                    query.record_failure(message.clone());
-                    affected.push(QueryId::new(high, low));
-                } else {
-                    query.record_failure(message.clone());
-                }
-                cancellations.push(request_cancellation(query));
-            }
-            (affected, cancellations)
-        };
-
-        for cancellation in cancellations {
-            dispatch_cancellation(Some(cancellation));
-        }
-        affected
-    }
-
-    pub(crate) fn backend_has_active_queries(&self, process_id: BackendProcessId) -> bool {
-        self.active
-            .lock()
-            .expect("frontend query registry lock")
-            .values()
-            .any(|query| query.scheduled_backends.contains(&process_id))
-    }
-
     fn unregister(&self, key: QueryKey) {
         self.active
             .lock()
