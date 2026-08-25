@@ -39,7 +39,9 @@ use crate::query_execution::write_transaction::{
 };
 use novarocks_parser::ast::{Query, Statement};
 use novarocks_spi::connector::{
-    ConnectorTableHandle, ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest,
+    ConnectorPreReadyWritePlanningRequest, ConnectorTableHandle, ConnectorWriteActivationIntent,
+    ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteCohortId, ConnectorWriteFieldRequest,
     ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteLease,
     ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWritePreparationOutcome,
     ConnectorWritePreparationRequest,
@@ -258,7 +260,8 @@ fn prepare_iceberg_distributed_write(
         table_bindings,
         execution,
         connector_context: connector_context.clone(),
-        connector_write,
+        connector_write: connector_write.template,
+        pre_ready_planning_request: connector_write.pre_ready_planning_request,
     };
     let spec = IcebergWriteTransactionSpec {
         is_overwrite: overwrite_mode.is_overwrite(),
@@ -287,14 +290,40 @@ fn register_insert_connector_write(
     operation_id: ConnectorWriteOperationId,
     context: novarocks_spi::connector::ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
-) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
-    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
+) -> Result<PreparedInsertConnectorWriteBinding, String> {
+    let activation = ConnectorWriteActivationRequest {
         operation_id,
-        preparation,
-        context,
-        exact_lease.clone(),
-    )
-    .map_err(|error| format!("activate exact Iceberg write generation: {error}"))
+        source: ConnectorWriteActivationSource::Prepared(preparation),
+        intent: ConnectorWriteActivationIntent::Ordinary,
+        context: context.clone(),
+    };
+    let pre_ready_planning_request = ConnectorPreReadyWritePlanningRequest::new(activation.clone());
+    let activated = exact_lease
+        .activate_write(activation)
+        .map_err(|error| format!("activate exact Iceberg write generation: {error}"))?;
+    let cohort = activated
+        .cohort(ConnectorWriteCohortId::primary(operation_id))
+        .ok_or_else(|| "exact Iceberg write activation omitted its primary cohort".to_string())?;
+    let template =
+        crate::query_execution::contract::ConnectorWritePlanningTemplate::from_activated_cohort(
+            cohort,
+            context,
+            exact_lease.clone(),
+        )
+        .map_err(|error| format!("seal exact Iceberg write planning template: {error}"))?;
+    Ok(PreparedInsertConnectorWriteBinding {
+        template,
+        pre_ready_planning_request,
+    })
+}
+
+/// Exact activation facts retained with the first-admission INSERT semantic
+/// binding. The provider proof is intentionally requested only if a later
+/// pre-ready topology failure reaches the replan gate: lack of a proof must
+/// not reject the ordinary first round.
+struct PreparedInsertConnectorWriteBinding {
+    template: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    pre_ready_planning_request: ConnectorPreReadyWritePlanningRequest,
 }
 
 /// Request a sealed preparation from the write-control generation retained by
@@ -492,6 +521,28 @@ impl PreparedIcebergWrite {
             ));
         }
         let execution = self.semantic_binding.execution_for_topology(topology)?;
+        let pre_ready_planning_proof = self
+            .semantic_binding
+            .connector_write
+            .lease()
+            .certify_pre_ready_write_planning(
+                self.semantic_binding.pre_ready_planning_request.clone(),
+            )
+            .map_err(|error| {
+                crate::dml::error::DmlExecutionError::from(format!(
+                    "Iceberg write topology replan has no effect-free planning proof: {error}"
+                ))
+            })?;
+        pre_ready_planning_proof
+            .validates(
+                self.semantic_binding.connector_write.lease().binding_key(),
+                &self.semantic_binding.pre_ready_planning_request,
+            )
+            .map_err(|error| {
+                crate::dml::error::DmlExecutionError::from(format!(
+                    "Iceberg write topology replan lost its effect-free planning proof: {error}"
+                ))
+            })?;
         self.prepare_native_assembly_for_execution(Some(&execution))
     }
 
@@ -579,6 +630,7 @@ struct FrozenIcebergWriteSemanticBinding {
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    pre_ready_planning_request: ConnectorPreReadyWritePlanningRequest,
 }
 
 impl FrozenIcebergWriteSemanticBinding {
