@@ -49,7 +49,6 @@ use super::service::{
 use super::truncate::TruncateCommit;
 use super::update_cow::CowUpdateCommit;
 use super::update_cow::CowUpdateRewriteSet;
-use crate::commit::write_fence::IcebergFenceAssertion;
 use crate::commit::{CommitOpKind, CommitOutcome};
 
 pub type CleanupPathMapper = Arc<dyn Fn(&str) -> String + Send + Sync>;
@@ -70,10 +69,6 @@ pub struct RunInput {
     /// Provider-assigned partition-spec updates that must share the exact
     /// external commit with one managed overwrite snapshot on `main`.
     pub atomic_partition_replacement: Option<AtomicPartitionReplacement>,
-    /// External write fence this commit must assert atomically, or `None` for
-    /// an unfenced commit family. The caller decides: this dispatcher never
-    /// derives a fence from the op kind.
-    pub fence: Option<IcebergFenceAssertion>,
 }
 
 pub(crate) struct AtomicPartitionReplacement {
@@ -113,23 +108,7 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
         target_ref,
         snapshot_properties,
         atomic_partition_replacement,
-        fence,
     } = input;
-
-    // Fail closed rather than silently dropping a fence.
-    //
-    // These two families still submit through `Transaction::commit`, which
-    // cannot carry an extra requirement. If a caller ever starts fencing them
-    // — TRUNCATE is a later phase, and rewrite is maintenance — accepting the
-    // fence here would produce a commit that *looks* fenced to the coordinator
-    // while asserting nothing at the catalog. That is strictly worse than no
-    // fence at all, because the coordinator would trust it.
-    if fence.is_some() && matches!(collector.op_kind, CommitOpKind::RewriteDataFiles) {
-        return Err(CommitServiceError::invalid_input(format!(
-            "commit op kind {:?} cannot assert an external write fence yet; refusing to drop it",
-            collector.op_kind
-        )));
-    }
 
     if let Some(replacement) = atomic_partition_replacement {
         if collector.op_kind != CommitOpKind::Overwrite || target_ref != "main" {
@@ -149,7 +128,6 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
             abort_handle: collector.abort_log.clone(),
             target_ref: &target_ref,
             snapshot_properties: &snapshot_properties,
-            fence: fence.as_ref(),
         };
         let result = run_atomic_partition_replacement(ctx, replacement).await;
         return match result {
@@ -206,7 +184,6 @@ pub async fn run_iceberg_commit(input: RunInput) -> Result<CommitOutcome, Commit
         abort_handle: collector.abort_log.clone(),
         target_ref: &target_ref,
         snapshot_properties: &snapshot_properties,
-        fence: fence.as_ref(),
     };
 
     match action.commit(ctx).await {
@@ -227,15 +204,9 @@ async fn run_atomic_partition_replacement(
     ctx: CommitCtx<'_>,
     replacement: AtomicPartitionReplacement,
 ) -> Result<CommitOutcome, String> {
-    // The atomic repartition path assembles its own `TableCommit` instead of
-    // going through `submit_fenced_action`, because the partition-spec updates
-    // must precede the snapshot updates in one commit. Capture the fence
-    // requirements before `ctx` is consumed so a supplied fence is asserted
-    // here too — an unfenced repartition would silently escape the fence.
-    let fence_requirements = ctx
-        .fence
-        .map(IcebergFenceAssertion::requirements)
-        .unwrap_or_default();
+    // The atomic repartition path assembles its own `TableCommit` because the
+    // partition-spec updates must precede the snapshot updates in one commit.
+    // The staged action retains the exact target-ref requirement for its base.
     let mut staged = super::overwrite::build_staged_overwrite_action(ctx).await?;
     let snapshot_updates = staged.action.take_updates();
     if snapshot_updates.len() != 2
@@ -249,8 +220,7 @@ async fn run_atomic_partition_replacement(
     }
     let mut updates = replacement.updates;
     updates.extend(snapshot_updates);
-    let mut requirements = staged.action.take_requirements();
-    requirements.extend(fence_requirements);
+    let requirements = staged.action.take_requirements();
     let commit = TableCommit::builder()
         .ident(staged.table_ident.clone())
         .requirements(requirements)

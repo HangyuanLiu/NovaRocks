@@ -888,7 +888,6 @@ mod tests {
                 abort_handle,
                 target_ref: "main",
                 snapshot_properties: &snapshot_properties,
-                fence: None,
             })
             .await
             .expect("empty overwrite must succeed as a no-op");
@@ -947,7 +946,6 @@ mod tests {
             abort_handle: marker_abort,
             target_ref: "main",
             snapshot_properties: &marker_properties,
-            fence: None,
         })
         .await
         .expect("publish the marker snapshot");
@@ -980,7 +978,6 @@ mod tests {
                 abort_handle,
                 target_ref: "main",
                 snapshot_properties: &snapshot_properties,
-                fence: None,
             })
             .await
             .expect("empty overwrite over a populated base must succeed");

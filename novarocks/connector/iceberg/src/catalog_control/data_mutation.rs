@@ -545,11 +545,6 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     target_ref,
                     snapshot_properties,
                     atomic_partition_replacement: None,
-                    // A fenced direct mutation asserts its marker in the same
-                    // atomic catalog update as the write; an exempt one carries
-                    // no assertion and `run` refuses any op kind that could not
-                    // assert it anyway.
-                    fence: fence_assertion.clone(),
                 })
                 .await
             })
