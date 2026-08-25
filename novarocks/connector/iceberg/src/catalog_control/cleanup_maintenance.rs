@@ -136,6 +136,8 @@ enum ManifestCandidate {
         name: String,
         head_snapshot_id: i64,
         provenance_version: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance_digest_hex: Option<String>,
         created_at_ms: i64,
     },
 }
@@ -465,7 +467,8 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             &target.table,
             older_than_ms,
         );
-        let (phase, records) = if owned_refs.is_empty() {
+        let owned_ref_records = owned_ref_manifest_records(owned_refs);
+        let (phase, records) = if owned_ref_records.is_empty() {
             let table_for_scan = table.clone();
             let object_store = physical.object_store_config.clone();
             let scanned = self
@@ -483,22 +486,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
                 records_from_candidates(&scanned, &table, physical.object_store_config.as_ref())?,
             )
         } else {
-            (
-                CleanupPhase::OwnedRefRetire,
-                owned_refs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(ordinal, candidate)| ManifestRecord {
-                        ordinal: ordinal as u32,
-                        candidate: ManifestCandidate::OwnedRef {
-                            name: candidate.name,
-                            head_snapshot_id: candidate.head_snapshot_id,
-                            provenance_version: candidate.provenance_version,
-                            created_at_ms: candidate.created_at_ms,
-                        },
-                    })
-                    .collect(),
-            )
+            (CleanupPhase::OwnedRefRetire, owned_ref_records)
         };
         if records.len() > MAX_RECORDS {
             return Err(exhausted("Iceberg cleanup manifest exceeds 262144 records"));
@@ -724,6 +712,26 @@ fn records_from_candidates(
         .collect()
 }
 
+/// Ref candidates and object candidates are deliberately never mixed in one
+/// cleanup manifest. A successful ref drop changes the table live set, so the
+/// following object pass must begin at `plan_cleanup` and reload metadata.
+fn owned_ref_manifest_records(candidates: Vec<OwnedRefCandidate>) -> Vec<ManifestRecord> {
+    candidates
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, candidate)| ManifestRecord {
+            ordinal: ordinal as u32,
+            candidate: ManifestCandidate::OwnedRef {
+                name: candidate.name,
+                head_snapshot_id: candidate.head_snapshot_id,
+                provenance_version: candidate.provenance_version,
+                provenance_digest_hex: Some(hex_encode(candidate.provenance_digest)),
+                created_at_ms: candidate.created_at_ms,
+            },
+        })
+        .collect()
+}
+
 fn manifest_candidate_projection(record: &ManifestRecord) -> ConnectorCleanupCandidate {
     match &record.candidate {
         ManifestCandidate::Object { location, .. } => ConnectorCleanupCandidate::Object {
@@ -734,6 +742,7 @@ fn manifest_candidate_projection(record: &ManifestRecord) -> ConnectorCleanupCan
             head_snapshot_id,
             provenance_version,
             created_at_ms,
+            ..
         } => ConnectorCleanupCandidate::OwnedRef {
             name: Arc::from(name.as_str()),
             head_snapshot_id: *head_snapshot_id,
@@ -756,6 +765,7 @@ fn execute_frozen_batch(
                 name,
                 head_snapshot_id,
                 provenance_version,
+                provenance_digest_hex,
                 created_at_ms,
                 ..
             } => execute_owned_ref(
@@ -765,6 +775,7 @@ fn execute_frozen_batch(
                 name,
                 *head_snapshot_id,
                 *provenance_version,
+                provenance_digest_hex.as_deref(),
                 *created_at_ms,
             ),
             ManifestCandidate::Object { location, identity } => {
@@ -832,6 +843,7 @@ fn reconcile_frozen_batch(
                 name,
                 head_snapshot_id,
                 provenance_version,
+                provenance_digest_hex,
                 created_at_ms,
                 ..
             } => reconcile_owned_ref(
@@ -841,6 +853,7 @@ fn reconcile_frozen_batch(
                 name,
                 *head_snapshot_id,
                 *provenance_version,
+                provenance_digest_hex.as_deref(),
                 *created_at_ms,
             ),
             ManifestCandidate::Object { location, identity } => {
@@ -884,6 +897,7 @@ fn execute_owned_ref(
     name: &str,
     expected_head_snapshot_id: i64,
     provenance_version: u16,
+    provenance_digest_hex: Option<&str>,
     created_at_ms: i64,
 ) -> Result<ReceiptRecord, ConnectorError> {
     runtime
@@ -896,6 +910,7 @@ fn execute_owned_ref(
         name: name.to_string(),
         head_snapshot_id: expected_head_snapshot_id,
         provenance_version,
+        provenance_digest: decode_owned_ref_provenance_digest(provenance_digest_hex)?,
         created_at_ms,
     };
     if physical.table.metadata().uuid().to_string() != payload.table_uuid
@@ -948,6 +963,7 @@ fn reconcile_owned_ref(
     name: &str,
     expected_head_snapshot_id: i64,
     provenance_version: u16,
+    provenance_digest_hex: Option<&str>,
     created_at_ms: i64,
 ) -> Result<ReceiptRecord, ConnectorError> {
     runtime
@@ -968,6 +984,7 @@ fn reconcile_owned_ref(
         name: name.to_string(),
         head_snapshot_id: expected_head_snapshot_id,
         provenance_version,
+        provenance_digest: decode_owned_ref_provenance_digest(provenance_digest_hex)?,
         created_at_ms,
     };
     match metadata.refs().get(name) {
@@ -1390,6 +1407,15 @@ fn decode_digest(value: &str) -> Result<[u8; 32], ConnectorError> {
         .ok_or_else(|| corrupt("Iceberg cleanup digest is not hex"))?
         .try_into()
         .map_err(|_| corrupt("Iceberg cleanup digest has an invalid length"))
+}
+
+fn decode_owned_ref_provenance_digest(value: Option<&str>) -> Result<[u8; 32], ConnectorError> {
+    let value = value.ok_or_else(|| {
+        corrupt(
+            "Iceberg cleanup owned ref lacks the frozen provenance proof required for retirement",
+        )
+    })?;
+    decode_digest(value)
 }
 
 fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
@@ -1879,6 +1905,50 @@ mod tests {
                 .already_absent(),
             MAX_BATCH_OBJECTS as u32
         );
+    }
+
+    #[test]
+    fn ref_retirement_manifest_never_carries_object_sweep_candidates() {
+        let ref_pass = owned_ref_manifest_records(vec![OwnedRefCandidate {
+            name: "__novarocks_mv_refresh_41".to_string(),
+            head_snapshot_id: 7,
+            provenance_version: 1,
+            provenance_digest: [9; 32],
+            created_at_ms: 100,
+        }]);
+        assert_eq!(ref_pass.len(), 1);
+        assert!(matches!(
+            ref_pass[0].candidate,
+            ManifestCandidate::OwnedRef { .. }
+        ));
+        let frozen = canonical(&ref_pass).expect("encode ref pass");
+        let decoded: Vec<ManifestRecord> =
+            decode_canonical(&frozen, "ref pass").expect("decode ref pass");
+        assert!(matches!(
+            &decoded[0].candidate,
+            ManifestCandidate::OwnedRef {
+                provenance_digest_hex: Some(digest),
+                ..
+            } if digest == &hex_encode([9; 32])
+        ));
+
+        // Model the next invocation after a successful exact CAS. It begins
+        // with a new owned-ref discovery result; an empty result is the only
+        // condition that permits this later pass to list object candidates.
+        let next_pass = owned_ref_manifest_records(Vec::new());
+        assert!(next_pass.is_empty());
+        let object_pass = object_record(
+            0,
+            "file:///tmp/fresh-object.parquet",
+            ObjectIdentity::SizeMtime {
+                size: 1,
+                mtime_ms: 1,
+            },
+        );
+        assert!(matches!(
+            object_pass.candidate,
+            ManifestCandidate::Object { .. }
+        ));
     }
 
     #[test]
