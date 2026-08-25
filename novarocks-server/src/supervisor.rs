@@ -102,6 +102,12 @@ mod tests {
 
     use super::supervise_all_in_one;
 
+    async fn wait_for_stop(mut receiver: tokio::sync::watch::Receiver<bool>) {
+        while !*receiver.borrow() {
+            receiver.changed().await.expect("supervisor owns sender");
+        }
+    }
+
     #[test]
     fn frontend_failure_stops_backend_before_returning() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -132,6 +138,96 @@ mod tests {
             stopped_rx
                 .await
                 .expect("backend must observe stop before return");
+        });
+    }
+
+    #[test]
+    fn backend_failure_stops_frontend_before_returning() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+            let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+            let result = supervise_all_in_one(
+                async move {
+                    while !*stop_rx.borrow() {
+                        stop_rx.changed().await.expect("supervisor owns sender");
+                    }
+                    stopped_tx.send(()).expect("record frontend stop");
+                    Ok(())
+                },
+                async { Err(anyhow::anyhow!("backend listener failed")) },
+                stop_tx,
+                future::pending(),
+            )
+            .await;
+
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("backend listener failed")
+            );
+            stopped_rx
+                .await
+                .expect("frontend must observe stop before return");
+        });
+    }
+
+    #[test]
+    fn shutdown_waits_for_both_roles() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+            let frontend_stop_rx = stop_rx.clone();
+            let (frontend_stopped_tx, frontend_stopped_rx) = tokio::sync::oneshot::channel();
+            let (backend_stopped_tx, backend_stopped_rx) = tokio::sync::oneshot::channel();
+            let result = supervise_all_in_one(
+                async move {
+                    wait_for_stop(frontend_stop_rx).await;
+                    frontend_stopped_tx.send(()).expect("record frontend stop");
+                    Ok(())
+                },
+                async move {
+                    wait_for_stop(stop_rx).await;
+                    backend_stopped_tx.send(()).expect("record backend stop");
+                    Ok(())
+                },
+                stop_tx,
+                async {},
+            )
+            .await;
+
+            assert!(result.is_ok(), "{result:?}");
+            frontend_stopped_rx.await.expect("frontend stopped");
+            backend_stopped_rx.await.expect("backend stopped");
+        });
+    }
+
+    #[test]
+    fn primary_failure_keeps_cleanup_failure_as_diagnostic() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        runtime.block_on(async {
+            let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+            let error = supervise_all_in_one(
+                async { Err(anyhow::anyhow!("frontend failed first")) },
+                async move {
+                    while !*stop_rx.borrow() {
+                        stop_rx.changed().await.expect("supervisor owns sender");
+                    }
+                    Err(anyhow::anyhow!("backend cleanup failed"))
+                },
+                stop_tx,
+                future::pending(),
+            )
+            .await
+            .expect_err("primary failure must be returned");
+            let diagnostic = error.to_string();
+            assert!(diagnostic.contains("frontend failed first"), "{diagnostic}");
+            assert!(
+                diagnostic.contains("backend cleanup failed"),
+                "{diagnostic}"
+            );
         });
     }
 }
