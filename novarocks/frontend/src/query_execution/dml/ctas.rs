@@ -542,7 +542,6 @@ pub trait CtasEngine: Send + Sync {
     ) -> Result<StandardCtasPublishOutcome, CtasFailure> {
         Err(standard_ctas_unsupported())
     }
-
 }
 
 /// Core-private guard embedded in concrete prepared source/write handles.
@@ -824,7 +823,9 @@ impl CoreStandardCtasTargetSession {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Err(internal_failure("standard CTAS publish has already been prepared"));
+            return Err(internal_failure(
+                "standard CTAS publish has already been prepared",
+            ));
         }
         Ok(ConnectorStagedCreatePublishRequest {
             operation_id: novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
@@ -1945,5 +1946,4 @@ impl CtasEngine for DmlExecutionKernel {
             }
         }
     }
-
 }
