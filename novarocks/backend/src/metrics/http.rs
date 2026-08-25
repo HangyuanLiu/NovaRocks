@@ -17,36 +17,66 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
-use axum::extract::Query;
+use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::get};
 use once_cell::sync::Lazy;
-use prometheus::{Encoder, IntGaugeVec, TextEncoder, register_int_gauge_vec};
+use prometheus::{Encoder, IntGaugeVec, Opts, Registry, TextEncoder};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 
-/// Dedicated HTTP listener for process metrics.  Native execution continues to
-/// expose `/metrics` on its gRPC/HTTP endpoint for compatibility, while
-/// backend deployments use this listener at the configured HTTP port.
+/// Explicitly-owned Backend metric registry.  It is intentionally separate
+/// from Prometheus' process-global registry so an all-in-one process cannot
+/// leak a foreign role's metric families through the BE management endpoint.
+pub(crate) struct BackendMetricsRegistry {
+    registry: Registry,
+}
+
+impl BackendMetricsRegistry {
+    pub(crate) fn new() -> Result<Self, String> {
+        let registry = Registry::new();
+        for collector in [
+            Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_ENTRIES).clone())
+                as Box<dyn prometheus::core::Collector>,
+            Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_REJECTIONS).clone()),
+            Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINATIONS).clone()),
+            Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINAL).clone()),
+            Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone()),
+        ] {
+            registry
+                .register(collector)
+                .map_err(|error| format!("register backend metrics collector: {error}"))?;
+        }
+        novarocks_execution::runtime::fragment::io::exchange_metrics::register_exchange_metrics(
+            &registry,
+        )?;
+        Ok(Self { registry })
+    }
+
+    fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
+        self.registry.gather()
+    }
+}
+
+/// Dedicated HTTP listener for Backend management metrics.
 pub struct MetricsHttpServer {
     shutdown_tx: Option<watch::Sender<bool>>,
+    failure_rx: mpsc::Receiver<String>,
     join_handle: Option<JoinHandle<()>>,
+    stop_requested: Arc<AtomicBool>,
 }
 
 impl MetricsHttpServer {
-    /// Use this when the caller intentionally shares `/metrics` with a
-    /// gRPC/HTTP listener on the same configured port.
-    pub const fn shared_with_grpc() -> Self {
-        Self {
-            shutdown_tx: None,
-            join_handle: None,
-        }
-    }
-
-    pub fn start(host: &str, port: u16) -> Result<Self, String> {
+    pub fn start(
+        host: &str,
+        port: u16,
+        metrics: Arc<BackendMetricsRegistry>,
+    ) -> Result<Self, String> {
         let bind_addr = parse_metrics_bind_addr(host, port)
             .map_err(|error| format!("parse metrics HTTP bind address failed: {error}"))?;
         let listener = TcpListener::bind(bind_addr).map_err(|error| {
@@ -56,47 +86,76 @@ impl MetricsHttpServer {
             format!("configure metrics HTTP listener on {bind_addr} failed: {error}")
         })?;
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let join_handle = std::thread::spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    eprintln!("failed to build metrics HTTP runtime: {error}");
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let thread_stop_requested = Arc::clone(&stop_requested);
+        let join_handle = std::thread::Builder::new()
+            .name("backend-management-http".to_string())
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| {
+                            format!("build backend management HTTP runtime: {error}")
+                        })?;
+                    runtime.block_on(async move {
+                        let listener = TokioTcpListener::from_std(listener).map_err(|error| {
+                            format!("create Tokio backend management HTTP listener: {error}")
+                        })?;
+                        let app = Router::new()
+                            .route("/metrics", get(handle_metrics))
+                            .with_state(metrics);
+                        axum::serve(listener, app)
+                            .with_graceful_shutdown(async move {
+                                while !*shutdown_rx.borrow() {
+                                    if shutdown_rx.changed().await.is_err() {
+                                        break;
+                                    }
+                                }
+                            })
+                            .await
+                            .map_err(|error| {
+                                format!("backend management HTTP serve future failed: {error}")
+                            })
+                    })
+                }));
+                if thread_stop_requested.load(Ordering::Acquire) {
                     return;
                 }
-            };
-            runtime.block_on(async move {
-                let listener = match TokioTcpListener::from_std(listener) {
-                    Ok(listener) => listener,
-                    Err(error) => {
-                        eprintln!("failed to create metrics HTTP listener: {error}");
-                        return;
-                    }
+                let error = match outcome {
+                    Ok(Ok(())) => "backend management HTTP server exited unexpectedly".to_string(),
+                    Ok(Err(error)) => error,
+                    Err(payload) => payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| {
+                            payload
+                                .downcast_ref::<&str>()
+                                .map(|value| (*value).to_string())
+                        })
+                        .unwrap_or_else(|| "backend management HTTP server panicked".to_string()),
                 };
-                let app = Router::new().route("/metrics", get(handle_metrics));
-                if let Err(error) = axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        while !*shutdown_rx.borrow() {
-                            if shutdown_rx.changed().await.is_err() {
-                                break;
-                            }
-                        }
-                    })
-                    .await
-                {
-                    eprintln!("metrics HTTP server exited with error: {error}");
-                }
-            });
-        });
+                let _ = failure_tx.send(error);
+            })
+            .map_err(|error| format!("spawn backend management HTTP server: {error}"))?;
         Ok(Self {
             shutdown_tx: Some(shutdown_tx),
+            failure_rx,
             join_handle: Some(join_handle),
+            stop_requested,
         })
     }
 
+    pub fn poll_failure(&mut self) -> Result<Option<String>, String> {
+        match self.failure_rx.try_recv() {
+            Ok(error) => Ok(Some(error)),
+            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => Ok(None),
+        }
+    }
+
     pub fn stop(mut self) -> Result<(), String> {
+        self.stop_requested.store(true, Ordering::Release);
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(true);
         }
@@ -110,48 +169,58 @@ impl MetricsHttpServer {
 }
 
 static BACKEND_QUERY_LIFECYCLE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "novarocks_backend_query_lifecycle_entries",
-        "Number of backend query lifecycle entries by state.",
-        &["state"]
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_backend_query_lifecycle_entries",
+            "Number of backend query lifecycle entries by state.",
+        ),
+        &["state"],
     )
-    .expect("register novarocks_backend_query_lifecycle_entries")
+    .expect("construct novarocks_backend_query_lifecycle_entries")
 });
 
 static BACKEND_QUERY_LIFECYCLE_REJECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "novarocks_backend_query_lifecycle_rejections",
-        "Cumulative backend query lifecycle rejections by reason.",
-        &["reason"]
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_backend_query_lifecycle_rejections",
+            "Cumulative backend query lifecycle rejections by reason.",
+        ),
+        &["reason"],
     )
-    .expect("register novarocks_backend_query_lifecycle_rejections")
+    .expect("construct novarocks_backend_query_lifecycle_rejections")
 });
 
 static BACKEND_QUERY_LIFECYCLE_TERMINATIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "novarocks_backend_query_lifecycle_terminations",
-        "Cumulative backend query lifecycle terminations by reason.",
-        &["reason"]
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_backend_query_lifecycle_terminations",
+            "Cumulative backend query lifecycle terminations by reason.",
+        ),
+        &["reason"],
     )
-    .expect("register novarocks_backend_query_lifecycle_terminations")
+    .expect("construct novarocks_backend_query_lifecycle_terminations")
 });
 
 static BACKEND_QUERY_LIFECYCLE_TERMINAL: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "novarocks_backend_query_lifecycle_terminal_total",
-        "Cumulative backend query terminal lifecycle outcomes.",
-        &["outcome"]
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_backend_query_lifecycle_terminal_total",
+            "Cumulative backend query terminal lifecycle outcomes.",
+        ),
+        &["outcome"],
     )
-    .expect("register novarocks_backend_query_lifecycle_terminal_total")
+    .expect("construct novarocks_backend_query_lifecycle_terminal_total")
 });
 
 static BACKEND_QUERY_EXECUTION_RESOURCES: Lazy<IntGaugeVec> = Lazy::new(|| {
-    register_int_gauge_vec!(
-        "novarocks_backend_query_execution_resources",
-        "Backend execution resources as reported by their owning component.",
-        &["resource"]
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_backend_query_execution_resources",
+            "Backend execution resources as reported by their owning component.",
+        ),
+        &["resource"],
     )
-    .expect("register novarocks_backend_query_execution_resources")
+    .expect("construct novarocks_backend_query_execution_resources")
 });
 
 fn parse_metrics_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
@@ -255,41 +324,42 @@ pub fn publish_backend_query_lifecycle_terminal_limits(capacity: usize, max_byte
         .set(max_bytes as i64);
 }
 
-/// Shared metrics HTTP handler for role-owned native listeners.
-pub async fn handle_metrics(Query(params): Query<HashMap<String, String>>) -> Response {
+async fn handle_metrics(
+    State(metrics): State<Arc<BackendMetricsRegistry>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
     if params
         .get("type")
         .is_some_and(|value| value.eq_ignore_ascii_case("json"))
     {
-        return match render_metrics_json() {
+        return match render_metrics_json(&metrics) {
             Ok(body) => ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
             Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
         };
     }
 
-    match render_metrics() {
+    match render_metrics(&metrics) {
         Ok(body) => ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
 }
 
-/// Renders the process metrics in Prometheus text format for any listener
-/// host. The caller owns HTTP route composition.
-pub fn render_metrics() -> Result<String, String> {
+/// Renders only the metric families registered by this Backend role.
+pub(crate) fn render_metrics(metrics: &BackendMetricsRegistry) -> Result<String, String> {
     refresh_backend_gauges();
     let encoder = TextEncoder::new();
     let mut buf = Vec::new();
     encoder
-        .encode(&prometheus::gather(), &mut buf)
+        .encode(&metrics.gather(), &mut buf)
         .map_err(|e| format!("encode prometheus metrics failed: {e}"))?;
     String::from_utf8(buf).map_err(|e| format!("prometheus metrics were not utf-8: {e}"))
 }
 
-/// Renders the process metrics in the existing JSON form for listener hosts.
-pub fn render_metrics_json() -> Result<String, String> {
+/// Renders only the role-owned metrics in the existing JSON form.
+pub(crate) fn render_metrics_json(metrics: &BackendMetricsRegistry) -> Result<String, String> {
     refresh_backend_gauges();
     let mut rows = Vec::new();
-    for family in prometheus::gather() {
+    for family in metrics.gather() {
         for metric in family.get_metric() {
             let mut tags = serde_json::Map::new();
             tags.insert(
@@ -345,7 +415,6 @@ pub fn render_metrics_json() -> Result<String, String> {
 }
 
 fn refresh_backend_gauges() {
-    novarocks_execution::runtime::fragment::io::exchange_metrics::ensure_exchange_metrics_registered();
     Lazy::force(&BACKEND_QUERY_LIFECYCLE_ENTRIES);
     Lazy::force(&BACKEND_QUERY_LIFECYCLE_REJECTIONS);
     Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINATIONS);
@@ -402,6 +471,8 @@ fn ensure_backend_metric_label_families() {
 }
 #[cfg(test)]
 mod tests {
+    use prometheus::{IntGauge, Opts, Registry};
+
     use super::*;
 
     #[test]
@@ -420,5 +491,24 @@ mod tests {
             parse_metrics_bind_addr("[::]", 9070).expect("parse bracketed IPv6"),
             "[::]:9070".parse::<SocketAddr>().expect("IPv6 wildcard")
         );
+    }
+
+    #[test]
+    fn role_registry_excludes_foreign_registry_families() {
+        let foreign = Registry::new();
+        let foreign_metric = IntGauge::with_opts(Opts::new(
+            "novarocks_frontend_only_fixture",
+            "A foreign role metric for isolation coverage.",
+        ))
+        .expect("construct foreign collector");
+        foreign
+            .register(Box::new(foreign_metric))
+            .expect("register foreign collector");
+
+        let backend = BackendMetricsRegistry::new().expect("construct Backend registry");
+        let rendered = render_metrics(&backend).expect("render Backend metrics");
+        assert!(rendered.contains("novarocks_backend_query_lifecycle_entries"));
+        assert!(rendered.contains("novarocks_exchange_shuffle_bytes_total"));
+        assert!(!rendered.contains("novarocks_frontend_only_fixture"));
     }
 }

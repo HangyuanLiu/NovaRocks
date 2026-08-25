@@ -19,6 +19,6 @@ mod http;
 pub(crate) mod query_lifecycle;
 
 pub(crate) use http::{
-    MetricsHttpServer, handle_metrics, publish_backend_query_execution_resource,
+    BackendMetricsRegistry, MetricsHttpServer, publish_backend_query_execution_resource,
     publish_backend_query_lifecycle_metrics, publish_backend_query_lifecycle_terminal_limits,
 };
