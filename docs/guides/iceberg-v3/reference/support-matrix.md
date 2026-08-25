@@ -229,6 +229,7 @@ under the License.
 | INSERT OVERWRITE 动态分区（`OVERWRITE PARTITIONS`） | ❌ | |
 | CTAS（写 Iceberg） | ❌ | |
 | CTAS 默认 V3 row-lineage | ❌ | |
+| Lake publication unknown 人工核对 | ✅ | 见 [lake-publication](../lake-publication.md)：marker、target UUID、ancestry 三项同时为正才是 Published |
 | TRUNCATE TABLE | ❌ | |
 | CDC sink（Flink-style 持续写入） | ❌ | |
 

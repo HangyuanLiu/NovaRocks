@@ -87,24 +87,14 @@ asynchronous `ALTER TABLE ... OPTIMIZE` jobs there, so terminal job history
 survives a server restart that reuses the runtime entry. Purging the runtime
 entry also removes this local durability fixture.
 
-For CP-3D protocol and native-cluster acceptance only, set
-`NOVA_ENV_FENCED_CATALOG=true` before running `up.sh --prepare-only` (or in a
-dedicated environment file). The generated SQL runner config then starts the
-test-only `fenced-catalog-fixture` in-process, redirects only the runner's
-`iceberg_rest_uri` through it, and preserves its SQLite authority at
-`runtime/<env-id>/fenced-catalog.sqlite`. The proxy forwards every standard
-REST request unchanged, adds `fenced-staged-publication=1` to `/v1/config`,
-and owns the five CP-3D extension endpoints. It is not a production catalog
-adapter and is disabled for ordinary REST, Spark, and compatibility suites.
-For retained Iceberg staging cleanup, the fixture derives and durably seals
-`<table-location>/data/_staging/<stage-action-id>/` from the standard staged
-table response before any publish terminal. Tagged publish payloads may add
-bounded exact object locations; cleanup uses the existing `AWS_S3_ENDPOINT`,
-`AWS_S3_ACCESS_KEY_ID`, and `AWS_S3_SECRET_ACCESS_KEY` environment with
-path-style S3 addressing. Credentials are never accepted in provider payloads.
-The runner additionally requires the selected suite to be explicitly listed
-in `fenced_catalog.suites`; generated config allows only the dedicated
-`ctas-takeover` acceptance suite and fails closed for every other suite.
+For `lake-publication` native-cluster acceptance, the SQL runner starts its
+test-only transparent publication proxy automatically. It redirects only that
+suite's `iceberg_rest_uri` and forwards all ordinary Iceberg REST requests to
+the configured Catalog. The proxy has no SQLite state, no private Catalog
+extension, and no publication authority: it can only consume one bounded fault
+token at a standard REST stage-create or table-commit boundary. The suite is
+explicit-only, requires `--cluster-mode cross-process --cluster-size 3 -j 1`,
+and cannot be selected together with an ordinary SQL suite.
 
 Use the generated configs:
 

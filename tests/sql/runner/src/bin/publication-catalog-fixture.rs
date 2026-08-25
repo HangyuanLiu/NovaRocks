@@ -15,24 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[path = "../fenced_catalog.rs"]
-mod fenced_catalog;
+#[path = "../publication_catalog.rs"]
+mod publication_catalog;
 
 use anyhow::Result;
 use clap::Parser;
-use fenced_catalog::{FixtureConfig, serve};
+use publication_catalog::{FixtureConfig, serve};
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "Test-only fence-aware Iceberg REST proxy")]
+#[command(about = "Test-only transparent Iceberg REST publication proxy")]
 struct Args {
     #[arg(long)]
     listen: SocketAddr,
     #[arg(long)]
     downstream: String,
-    #[arg(long)]
-    sqlite: PathBuf,
 }
 
 #[tokio::main]
@@ -41,7 +38,6 @@ async fn main() -> Result<()> {
     serve(FixtureConfig {
         listen: args.listen,
         downstream: args.downstream,
-        sqlite_path: args.sqlite,
     })
     .await
 }
