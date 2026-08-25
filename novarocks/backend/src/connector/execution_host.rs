@@ -17,25 +17,36 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use novarocks_protocol::lifecycle::QueryExecutionId;
+use novarocks_protocol::provider::{
+    EnsureConnectorExecutionBindingRejection, EnsureConnectorExecutionBindingRejectionReason,
+    EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingOutcome,
+    RetireConnectorExecutionBindingResult,
+};
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorExecutionInstaller, ConnectorExecutionResolver,
-    ConnectorProviderId, ConnectorRequestContext,
+    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
+    ConnectorExecutionProviderKind, ConnectorExecutionResolver, ConnectorRequestContext,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
-/// Process-scoped owner of BE-only connector execution bindings. It is not a
-/// catalog registry: installers are startup composed, declarations are opaque,
-/// and fragments can only resolve generations leased to their query.
-#[derive(Clone, Default)]
+use super::binding_decode::AdmittedConnectorExecutionDeclaration;
+
+const CONNECTOR_BINDING_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+// Design: ADR-0104 (docs/adr/ADR-0104-typed-connector-execution-binding-declaration.md)
+/// Process-scoped owner of BE-only execution bindings. Its built-in installer
+/// set is sealed before readiness, and fragments resolve only query-leased
+/// exact generations.
+#[derive(Clone)]
 pub struct ConnectorExecutionHost {
     state: Arc<Mutex<ExecutionHostState>>,
 }
 
-#[derive(Default)]
 struct ExecutionHostState {
-    installers: BTreeMap<ConnectorProviderId, Arc<dyn ConnectorExecutionInstaller>>,
+    installers: BTreeMap<ConnectorExecutionProviderKind, Arc<dyn ConnectorExecutionInstaller>>,
     bindings: BTreeMap<ConnectorExecutionBindingKey, Arc<BindingCell>>,
     retiring: BTreeSet<ConnectorExecutionBindingKey>,
     query_leases: BTreeMap<QueryExecutionId, BTreeSet<ConnectorExecutionBindingKey>>,
@@ -47,32 +58,213 @@ struct BindingCell {
     changed: Condvar,
 }
 
+#[derive(Clone)]
+enum Completion {
+    Ready(Arc<ConnectorExecutionBinding>),
+    Failed(EnsureConnectorExecutionBindingRejection),
+}
+
 enum BindingCellState {
-    Empty,
-    Installing,
+    Installing {
+        digest: [u8; 32],
+        epoch: u64,
+        completions: BTreeMap<u64, Completion>,
+    },
     Ready {
         digest: [u8; 32],
         binding: Arc<ConnectorExecutionBinding>,
+        completions: BTreeMap<u64, Completion>,
+    },
+    RetryableFailed {
+        digest: [u8; 32],
+        epoch: u64,
+        completions: BTreeMap<u64, Completion>,
+    },
+    TerminalFailed {
+        digest: [u8; 32],
+        rejection: EnsureConnectorExecutionBindingRejection,
+        completions: BTreeMap<u64, Completion>,
     },
 }
 
-impl Default for BindingCell {
-    fn default() -> Self {
+enum CellAction {
+    Install(u64),
+    Complete(Completion),
+}
+
+impl BindingCell {
+    fn installing(digest: [u8; 32]) -> Self {
         Self {
-            state: Mutex::new(BindingCellState::Empty),
+            state: Mutex::new(BindingCellState::Installing {
+                digest,
+                epoch: 1,
+                completions: BTreeMap::new(),
+            }),
             changed: Condvar::new(),
         }
+    }
+
+    fn acquire(&self, digest: [u8; 32]) -> Result<CellAction, ConnectorError> {
+        let mut state = self.state.lock().map_err(cell_lock_error)?;
+        loop {
+            if digest_for(&state) != digest {
+                return Ok(CellAction::Complete(Completion::Failed(
+                    conflict_rejection(),
+                )));
+            }
+            match &mut *state {
+                BindingCellState::Installing { epoch, .. } => {
+                    let observed_epoch = *epoch;
+                    state = self.changed.wait(state).map_err(cell_lock_error)?;
+                    if let Some(completion) = completions_for(&state).get(&observed_epoch) {
+                        return Ok(CellAction::Complete(completion.clone()));
+                    }
+                }
+                BindingCellState::Ready { binding, .. } => {
+                    return Ok(CellAction::Complete(Completion::Ready(Arc::clone(binding))));
+                }
+                BindingCellState::TerminalFailed { rejection, .. } => {
+                    return Ok(CellAction::Complete(Completion::Failed(rejection.clone())));
+                }
+                BindingCellState::RetryableFailed {
+                    epoch, completions, ..
+                } => {
+                    let next_epoch = epoch.saturating_add(1);
+                    let retained = std::mem::take(completions);
+                    *state = BindingCellState::Installing {
+                        digest,
+                        epoch: next_epoch,
+                        completions: retained,
+                    };
+                    return Ok(CellAction::Install(next_epoch));
+                }
+            }
+        }
+    }
+
+    fn complete(
+        &self,
+        expected_digest: [u8; 32],
+        expected_epoch: u64,
+        completion: Completion,
+    ) -> Result<(), ConnectorError> {
+        let mut state = self.state.lock().map_err(cell_lock_error)?;
+        let BindingCellState::Installing {
+            digest,
+            epoch,
+            completions,
+        } = &mut *state
+        else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "connector execution installation completed after its cell changed state",
+            ));
+        };
+        if *digest != expected_digest || *epoch != expected_epoch {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "connector execution installation completed for a stale epoch",
+            ));
+        }
+        completions.insert(expected_epoch, completion.clone());
+        let retained = std::mem::take(completions);
+        *state = match completion {
+            Completion::Ready(binding) => BindingCellState::Ready {
+                digest: expected_digest,
+                binding,
+                completions: retained,
+            },
+            Completion::Failed(rejection) if rejection.retryable_before_progress() => {
+                BindingCellState::RetryableFailed {
+                    digest: expected_digest,
+                    epoch: expected_epoch,
+                    completions: retained,
+                }
+            }
+            Completion::Failed(rejection) => BindingCellState::TerminalFailed {
+                digest: expected_digest,
+                rejection,
+                completions: retained,
+            },
+        };
+        self.changed.notify_all();
+        Ok(())
+    }
+}
+
+fn completions_for(state: &BindingCellState) -> &BTreeMap<u64, Completion> {
+    match state {
+        BindingCellState::Installing { completions, .. }
+        | BindingCellState::Ready { completions, .. }
+        | BindingCellState::RetryableFailed { completions, .. }
+        | BindingCellState::TerminalFailed { completions, .. } => completions,
+    }
+}
+
+fn digest_for(state: &BindingCellState) -> [u8; 32] {
+    match state {
+        BindingCellState::Installing { digest, .. }
+        | BindingCellState::Ready { digest, .. }
+        | BindingCellState::RetryableFailed { digest, .. }
+        | BindingCellState::TerminalFailed { digest, .. } => *digest,
     }
 }
 
 impl ConnectorExecutionHost {
+    /// Validates and seals exactly the built-in installer set before the BE is
+    /// ready. There is intentionally no runtime registration operation.
+    pub fn try_new(
+        installers: impl IntoIterator<Item = Arc<dyn ConnectorExecutionInstaller>>,
+    ) -> Result<Self, ConnectorError> {
+        let mut sealed_installers = BTreeMap::new();
+        for installer in installers {
+            let kind = installer.provider_kind();
+            if sealed_installers.insert(kind, installer).is_some() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("startup installer set contains duplicate {kind:?} installer"),
+                ));
+            }
+        }
+        for kind in ConnectorExecutionProviderKind::ALL {
+            if !sealed_installers.contains_key(&kind) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("startup installer set is missing {kind:?} installer"),
+                ));
+            }
+        }
+        Ok(Self {
+            state: Arc::new(Mutex::new(ExecutionHostState {
+                installers: sealed_installers,
+                bindings: BTreeMap::new(),
+                retiring: BTreeSet::new(),
+                query_leases: BTreeMap::new(),
+                shutting_down: false,
+            })),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_tests() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ExecutionHostState {
+                installers: BTreeMap::new(),
+                bindings: BTreeMap::new(),
+                retiring: BTreeSet::new(),
+                query_leases: BTreeMap::new(),
+                shutting_down: false,
+            })),
+        }
+    }
+
     pub fn publish_resource_snapshot(&self) {
-        let (query_leases, binding_leases) = {
-            let state = self.state.lock().expect("connector execution host lock");
-            (
+        let (query_leases, binding_leases) = match self.state.lock() {
+            Ok(state) => (
                 state.query_leases.len(),
                 state.query_leases.values().map(BTreeSet::len).sum(),
-            )
+            ),
+            Err(_) => return,
         };
         crate::metrics::publish_backend_query_execution_resource(
             "connector_query_leases",
@@ -84,92 +276,134 @@ impl ConnectorExecutionHost {
         );
     }
 
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn register_installer(
-        &self,
-        installer: Arc<dyn ConnectorExecutionInstaller>,
-    ) -> Result<(), ConnectorError> {
-        let mut state = self.lock_state()?;
-        if state.shutting_down {
-            return Err(unavailable("connector execution host is shutting down"));
-        }
-        let provider_id = installer.provider_id().clone();
-        if state.installers.contains_key(&provider_id) {
-            return Err(invalid(format!(
-                "connector execution installer `{}` is already registered",
-                provider_id.as_str()
-            )));
-        }
-        state.installers.insert(provider_id, installer);
-        Ok(())
-    }
-
-    /// Ensures a binding is installed and leases its exact generation to the
-    /// supplied query. Installation happens outside the host lock; concurrent
-    /// ensures for the same key share one per-key cell.
+    /// Ensures a binding and leases its exact generation to the supplied query.
+    /// A same-key wave has one activation owner; waiters see that owner's result
+    /// before a later retry can begin.
     pub fn ensure(
         &self,
         query: QueryExecutionId,
-        declaration: &ConnectorExecutionDeclaration,
-        context: &ConnectorRequestContext,
-    ) -> Result<(), ConnectorError> {
-        let key = declaration.binding_key();
-        let (installer, cell) = {
-            let mut state = self.lock_state()?;
-            ensure_admissible(&state, query, &key)?;
-            let installer = state
-                .installers
-                .get(&declaration.descriptor().provider_id)
-                .cloned()
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "no startup installer is registered for connector provider `{}`",
-                        declaration.descriptor().provider_id.as_str()
-                    ))
-                })?;
-            let cell = state
-                .bindings
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(BindingCell::default()))
-                .clone();
-            (installer, cell)
+        admitted: &AdmittedConnectorExecutionDeclaration,
+    ) -> EnsureConnectorExecutionBindingResult {
+        let declaration = admitted.declaration();
+        let key = declaration.binding_key().clone();
+        let digest = admitted.digest();
+        let (installer, cell, first_activation) = match self.state.lock() {
+            Ok(mut state) => {
+                if let Err(rejection) = ensure_admissible(&state, query, &key) {
+                    return rejected(rejection);
+                }
+                let Some(installer) = state.installers.get(&declaration.provider_kind()).cloned()
+                else {
+                    return rejected(host_unavailable(
+                        "connector execution provider is not installed",
+                    ));
+                };
+                let (cell, first_activation) = match state.bindings.get(&key) {
+                    Some(cell) => (Arc::clone(cell), false),
+                    None => {
+                        let cell = Arc::new(BindingCell::installing(digest));
+                        state.bindings.insert(key.clone(), Arc::clone(&cell));
+                        (cell, true)
+                    }
+                };
+                (installer, cell, first_activation)
+            }
+            Err(_) => return rejected(host_unavailable("connector execution host is unavailable")),
+        };
+        let action = if first_activation {
+            CellAction::Install(1)
+        } else {
+            match cell.acquire(digest) {
+                Ok(action) => action,
+                Err(error) => return rejected(internal_failure(&error)),
+            }
         };
 
-        let binding = cell.ensure(installer.as_ref(), declaration, context)?;
-        if binding.provider_id() != &declaration.descriptor().provider_id || binding.key() != &key {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "connector execution installer returned a mismatched binding",
-            ));
-        }
+        let completion = match action {
+            CellAction::Complete(completion) => completion,
+            CellAction::Install(epoch) => {
+                let completion = self.activate(installer.as_ref(), declaration, &key);
+                if let Err(error) = cell.complete(digest, epoch, completion.clone()) {
+                    return rejected(internal_failure(&error));
+                }
+                completion
+            }
+        };
 
-        let mut state = self.lock_state()?;
-        ensure_admissible(&state, query, &key)?;
-        state.query_leases.entry(query).or_default().insert(key);
-        drop(state);
-        self.publish_resource_snapshot();
-        Ok(())
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return rejected(host_unavailable("connector execution host is unavailable")),
+        };
+        if let Err(rejection) = ensure_admissible(&state, query, &key) {
+            return rejected(rejection);
+        }
+        match completion {
+            Completion::Ready(_) => {
+                state.query_leases.entry(query).or_default().insert(key);
+                drop(state);
+                self.publish_resource_snapshot();
+                EnsureConnectorExecutionBindingResult::ensured()
+            }
+            Completion::Failed(rejection) => rejected(rejection),
+        }
     }
 
-    pub fn retire(&self, key: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
-        let mut state = self.lock_state()?;
-        if state.shutting_down {
-            return Err(unavailable("connector execution host is shutting down"));
+    fn activate(
+        &self,
+        installer: &dyn ConnectorExecutionInstaller,
+        declaration: &ConnectorExecutionDeclaration,
+        key: &ConnectorExecutionBindingKey,
+    ) -> Completion {
+        let deadline = Instant::now() + CONNECTOR_BINDING_ACTIVATION_TIMEOUT;
+        if Instant::now() >= deadline {
+            return Completion::Failed(deadline_exceeded());
         }
-        if !state.bindings.contains_key(key) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::NotFound,
-                format!(
-                    "connector execution binding `{}` is not installed",
-                    key.instance_id.as_str()
-                ),
-            ));
+        let context = match ConnectorRequestContext::try_new(
+            deadline,
+            Arc::new(HostActivationCancellation),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        ) {
+            Ok(context) => context,
+            Err(error) => return Completion::Failed(internal_failure(&error)),
+        };
+        let installed = installer.install(declaration, &context);
+        if Instant::now() >= deadline {
+            return Completion::Failed(deadline_exceeded());
+        }
+        match installed {
+            Ok(binding)
+                if binding.key() == key
+                    && binding.provider_id().as_str() == declaration.provider_id() =>
+            {
+                Completion::Ready(Arc::new(binding))
+            }
+            Ok(_) => Completion::Failed(internal_text(
+                "connector execution installer returned a mismatched binding",
+            )),
+            Err(error) => Completion::Failed(rejection_from_install_error(&error)),
+        }
+    }
+
+    pub fn retire(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+    ) -> RetireConnectorExecutionBindingResult {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                return RetireConnectorExecutionBindingResult::new(
+                    RetireConnectorExecutionBindingOutcome::Internal,
+                );
+            }
+        };
+        if state.shutting_down {
+            return RetireConnectorExecutionBindingResult::new(
+                RetireConnectorExecutionBindingOutcome::Unavailable,
+            );
         }
         state.retiring.insert(key.clone());
-        Ok(())
+        RetireConnectorExecutionBindingResult::new(RetireConnectorExecutionBindingOutcome::Accepted)
     }
 
     pub fn resolver_for(&self, query: QueryExecutionId) -> ConnectorExecutionQueryResolver {
@@ -179,9 +413,6 @@ impl ConnectorExecutionHost {
         }
     }
 
-    /// Returns a query-lifecycle cleanup lease. The lifecycle is responsible
-    /// for closing it on Finalize, Abort, deadline, KILL QUERY, and shutdown;
-    /// Drop is only the safety net for failed setup.
     pub fn query_lease(&self, query: QueryExecutionId) -> ConnectorExecutionLease {
         ConnectorExecutionLease {
             host: Arc::downgrade(&self.state),
@@ -193,88 +424,23 @@ impl ConnectorExecutionHost {
         release_query(&self.state, query)
     }
 
+    /// Shutdown clears query leases only. Cells and retiring keys remain until
+    /// the process-scoped Host itself drops.
     pub fn shutdown(&self) -> Result<(), ConnectorError> {
-        let mut state = self.lock_state()?;
+        let mut state = self.state.lock().map_err(host_lock_error)?;
         state.shutting_down = true;
         state.query_leases.clear();
         drop(state);
         self.publish_resource_snapshot();
         Ok(())
     }
-
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, ExecutionHostState>, ConnectorError> {
-        self.state.lock().map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "connector execution host lock poisoned",
-            )
-        })
-    }
 }
 
-impl BindingCell {
-    fn ensure(
-        &self,
-        installer: &dyn ConnectorExecutionInstaller,
-        declaration: &ConnectorExecutionDeclaration,
-        context: &ConnectorRequestContext,
-    ) -> Result<Arc<ConnectorExecutionBinding>, ConnectorError> {
-        let digest = declaration.digest();
-        let mut state = self.state.lock().map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "connector execution install cell lock poisoned",
-            )
-        })?;
-        loop {
-            match &*state {
-                BindingCellState::Ready {
-                    digest: existing,
-                    binding,
-                } if *existing == digest => return Ok(Arc::clone(binding)),
-                BindingCellState::Ready { .. } => {
-                    return Err(invalid(
-                        "connector execution binding received a conflicting declaration",
-                    ));
-                }
-                BindingCellState::Installing => {
-                    state = self.changed.wait(state).map_err(|_| {
-                        ConnectorError::new(
-                            ConnectorErrorKind::Internal,
-                            "connector execution install cell lock poisoned",
-                        )
-                    })?;
-                }
-                BindingCellState::Empty => {
-                    *state = BindingCellState::Installing;
-                    break;
-                }
-            }
-        }
-        drop(state);
+struct HostActivationCancellation;
 
-        let installed = installer.install(declaration, context).map(Arc::new);
-        let mut state = self.state.lock().map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "connector execution install cell lock poisoned",
-            )
-        })?;
-        match installed {
-            Ok(binding) => {
-                *state = BindingCellState::Ready {
-                    digest,
-                    binding: Arc::clone(&binding),
-                };
-                self.changed.notify_all();
-                Ok(binding)
-            }
-            Err(error) => {
-                *state = BindingCellState::Empty;
-                self.changed.notify_all();
-                Err(error)
-            }
-        }
+impl ConnectorCancellation for HostActivationCancellation {
+    fn is_cancelled(&self) -> bool {
+        false
     }
 }
 
@@ -282,17 +448,17 @@ fn ensure_admissible(
     state: &ExecutionHostState,
     query: QueryExecutionId,
     key: &ConnectorExecutionBindingKey,
-) -> Result<(), ConnectorError> {
+) -> Result<(), EnsureConnectorExecutionBindingRejection> {
     if state.shutting_down {
-        return Err(unavailable("connector execution host is shutting down"));
+        return Err(host_unavailable(
+            "connector execution host is shutting down",
+        ));
     }
     if state.retiring.contains(key) {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Unavailable,
-            format!(
-                "connector execution binding `{}` is draining",
-                key.instance_id.as_str()
-            ),
+        return Err(rejection(
+            EnsureConnectorExecutionBindingRejectionReason::Retiring,
+            false,
+            "connector execution binding is retiring",
         ));
     }
     if state.query_leases.get(&query).is_some_and(|keys| {
@@ -300,11 +466,112 @@ fn ensure_admissible(
             existing.instance_id == key.instance_id && existing.incarnation != key.incarnation
         })
     }) {
-        return Err(invalid(
+        return Err(rejection(
+            EnsureConnectorExecutionBindingRejectionReason::QueryIncarnationConflict,
+            false,
             "one query cannot lease multiple connector incarnations for the same instance",
         ));
     }
     Ok(())
+}
+
+fn rejection_from_install_error(
+    error: &ConnectorError,
+) -> EnsureConnectorExecutionBindingRejection {
+    match error.kind() {
+        ConnectorErrorKind::InvalidRequest
+        | ConnectorErrorKind::NotFound
+        | ConnectorErrorKind::PermissionDenied
+        | ConnectorErrorKind::Unsupported
+        | ConnectorErrorKind::CorruptData => rejection(
+            EnsureConnectorExecutionBindingRejectionReason::InvalidDeclaration,
+            false,
+            error.message(),
+        ),
+        ConnectorErrorKind::Unavailable => rejection(
+            EnsureConnectorExecutionBindingRejectionReason::ActivationUnavailable,
+            error.retryable_before_progress(),
+            error.message(),
+        ),
+        ConnectorErrorKind::DeadlineExceeded => deadline_exceeded(),
+        ConnectorErrorKind::ResourceExhausted => rejection(
+            EnsureConnectorExecutionBindingRejectionReason::ResourceExhausted,
+            error.retryable_before_progress(),
+            error.message(),
+        ),
+        ConnectorErrorKind::Cancelled => {
+            internal_text("connector execution activation was cancelled")
+        }
+        ConnectorErrorKind::Internal => rejection(
+            EnsureConnectorExecutionBindingRejectionReason::InternalFailure,
+            error.retryable_before_progress(),
+            error.message(),
+        ),
+    }
+}
+
+fn conflict_rejection() -> EnsureConnectorExecutionBindingRejection {
+    rejection(
+        EnsureConnectorExecutionBindingRejectionReason::ConflictingDeclaration,
+        false,
+        "connector execution binding received a conflicting declaration",
+    )
+}
+
+fn host_unavailable(detail: &str) -> EnsureConnectorExecutionBindingRejection {
+    rejection(
+        EnsureConnectorExecutionBindingRejectionReason::HostUnavailable,
+        false,
+        detail,
+    )
+}
+
+fn deadline_exceeded() -> EnsureConnectorExecutionBindingRejection {
+    rejection(
+        EnsureConnectorExecutionBindingRejectionReason::DeadlineExceeded,
+        true,
+        "connector execution activation deadline exceeded",
+    )
+}
+
+fn internal_failure(error: &ConnectorError) -> EnsureConnectorExecutionBindingRejection {
+    internal_text(error.message())
+}
+
+fn internal_text(detail: &str) -> EnsureConnectorExecutionBindingRejection {
+    rejection(
+        EnsureConnectorExecutionBindingRejectionReason::InternalFailure,
+        false,
+        detail,
+    )
+}
+
+fn rejection(
+    reason: EnsureConnectorExecutionBindingRejectionReason,
+    retryable_before_progress: bool,
+    detail: &str,
+) -> EnsureConnectorExecutionBindingRejection {
+    EnsureConnectorExecutionBindingRejection::try_new(
+        reason,
+        retryable_before_progress,
+        truncate_safe_detail(detail),
+        None,
+    )
+    .expect("host rejection reason matrix and safe detail bounds are fixed")
+}
+
+fn truncate_safe_detail(value: &str) -> String {
+    let mut end = value.len().min(512);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn rejected(
+    rejection: EnsureConnectorExecutionBindingRejection,
+) -> EnsureConnectorExecutionBindingResult {
+    EnsureConnectorExecutionBindingResult::rejected(rejection)
 }
 
 fn resolve_for_query(
@@ -313,12 +580,7 @@ fn resolve_for_query(
     key: &ConnectorExecutionBindingKey,
 ) -> Result<Arc<ConnectorExecutionBinding>, ConnectorError> {
     let cell = {
-        let state = state.lock().map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "connector execution host lock poisoned",
-            )
-        })?;
+        let state = state.lock().map_err(host_lock_error)?;
         if !state
             .query_leases
             .get(&query)
@@ -336,15 +598,12 @@ fn resolve_for_query(
             )
         })?
     };
-    let state = cell.state.lock().map_err(|_| {
-        ConnectorError::new(
-            ConnectorErrorKind::Internal,
-            "connector execution install cell lock poisoned",
-        )
-    })?;
+    let state = cell.state.lock().map_err(cell_lock_error)?;
     match &*state {
         BindingCellState::Ready { binding, .. } => Ok(Arc::clone(binding)),
-        BindingCellState::Empty | BindingCellState::Installing => Err(ConnectorError::new(
+        BindingCellState::Installing { .. }
+        | BindingCellState::RetryableFailed { .. }
+        | BindingCellState::TerminalFailed { .. } => Err(ConnectorError::new(
             ConnectorErrorKind::Unavailable,
             "connector execution binding is not ready",
         )),
@@ -355,12 +614,7 @@ fn release_query(
     state: &Arc<Mutex<ExecutionHostState>>,
     query: QueryExecutionId,
 ) -> Result<(), ConnectorError> {
-    let mut guard = state.lock().map_err(|_| {
-        ConnectorError::new(
-            ConnectorErrorKind::Internal,
-            "connector execution host lock poisoned",
-        )
-    })?;
+    let mut guard = state.lock().map_err(host_lock_error)?;
     guard.query_leases.remove(&query);
     let (query_leases, binding_leases) = (
         guard.query_leases.len(),
@@ -382,12 +636,18 @@ fn release_query(
     Ok(())
 }
 
-fn invalid(message: impl Into<String>) -> ConnectorError {
-    ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
+fn host_lock_error<T>(_error: std::sync::PoisonError<T>) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Internal,
+        "connector execution host lock poisoned",
+    )
 }
 
-fn unavailable(message: impl Into<String>) -> ConnectorError {
-    ConnectorError::new(ConnectorErrorKind::Unavailable, message)
+fn cell_lock_error<T>(_error: std::sync::PoisonError<T>) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Internal,
+        "connector execution install cell lock poisoned",
+    )
 }
 
 /// Resolver passed to one native fragment/query decode context.
@@ -443,28 +703,19 @@ impl Drop for ConnectorExecutionLease {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
 
     use bytes::Bytes;
     use novarocks_protocol::lifecycle::AttemptId;
+    use novarocks_protocol::provider::EnsureConnectorExecutionBindingOutcome;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
-        ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
-        ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
-        ConnectorReadExecution, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason,
+        ConnectorExecutionBindingKey, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
+        ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
+        ConnectorPreparedScanUnitSet, ConnectorProviderId, ConnectorReadExecution,
+        ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason,
     };
     use novarocks_types::QueryId;
 
     use super::*;
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     struct TestRead {
         key: ConnectorExecutionBindingKey,
@@ -474,7 +725,6 @@ mod tests {
         fn binding_key(&self) -> &ConnectorExecutionBindingKey {
             &self.key
         }
-
         fn prepare_split(
             &self,
             split: &novarocks_spi::connector::ConnectorSplit,
@@ -494,7 +744,6 @@ mod tests {
                 &request,
             )
         }
-
         fn open_unit_reader(
             &self,
             _unit: &ConnectorPreparedScanUnit,
@@ -509,30 +758,26 @@ mod tests {
     }
 
     struct TestInstaller {
+        provider_kind: ConnectorExecutionProviderKind,
         provider_id: ConnectorProviderId,
         installs: Arc<AtomicUsize>,
-        fail: bool,
+        error: Option<ConnectorError>,
     }
 
     impl ConnectorExecutionInstaller for TestInstaller {
-        fn provider_id(&self) -> &ConnectorProviderId {
-            &self.provider_id
+        fn provider_kind(&self) -> ConnectorExecutionProviderKind {
+            self.provider_kind
         }
-
         fn install(
             &self,
             declaration: &ConnectorExecutionDeclaration,
             _context: &ConnectorRequestContext,
         ) -> Result<ConnectorExecutionBinding, ConnectorError> {
             self.installs.fetch_add(1, Ordering::SeqCst);
-            if self.fail {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::Unavailable,
-                    "test installer failed to install binding",
-                ));
+            if let Some(error) = &self.error {
+                return Err(error.clone());
             }
-            std::thread::sleep(Duration::from_millis(10));
-            let key = declaration.binding_key();
+            let key = ConnectorExecutionBindingKey::from(declaration);
             ConnectorExecutionBinding::try_new(
                 self.provider_id.clone(),
                 key.clone(),
@@ -541,159 +786,168 @@ mod tests {
         }
     }
 
-    fn descriptor() -> ConnectorInstanceDescriptor {
-        ConnectorInstanceDescriptor {
-            provider_id: ConnectorProviderId::parse("fixture").expect("provider ID"),
-            instance_id: ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
-        }
+    fn installer(
+        provider_kind: ConnectorExecutionProviderKind,
+        installs: Arc<AtomicUsize>,
+        error: Option<ConnectorError>,
+    ) -> Arc<dyn ConnectorExecutionInstaller> {
+        Arc::new(TestInstaller {
+            provider_kind,
+            provider_id: ConnectorProviderId::parse(provider_kind.provider_id())
+                .expect("provider ID"),
+            installs,
+            error,
+        })
     }
 
-    fn declaration(incarnation: u8) -> ConnectorExecutionDeclaration {
-        ConnectorExecutionDeclaration::try_new(
-            descriptor(),
-            ConnectorInstanceIncarnation::from_bytes([incarnation; 16]),
-            Bytes::from_static(b"binding=default"),
-        )
-        .expect("declaration")
+    fn host(installs: Arc<AtomicUsize>, error: Option<ConnectorError>) -> ConnectorExecutionHost {
+        ConnectorExecutionHost::try_new([
+            installer(ConnectorExecutionProviderKind::Iceberg, installs, error),
+            installer(
+                ConnectorExecutionProviderKind::StarRocks,
+                Arc::new(AtomicUsize::new(0)),
+                None,
+            ),
+        ])
+        .expect("complete installer set")
     }
 
-    fn context() -> ConnectorRequestContext {
-        ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
-            1024,
-            4096,
-        )
-        .expect("context")
+    fn declaration(incarnation: u8, binding: &str) -> ConnectorExecutionDeclaration {
+        ConnectorExecutionDeclaration::iceberg("catalog.analytics", [incarnation; 16], binding)
+            .expect("declaration")
     }
-
+    fn admitted(
+        declaration: ConnectorExecutionDeclaration,
+    ) -> AdmittedConnectorExecutionDeclaration {
+        let mut digest = [0; 32];
+        digest[0] = declaration.binding_key().incarnation.to_bytes()[0];
+        digest[1] = declaration
+            .iceberg_access_binding()
+            .unwrap_or_default()
+            .bytes()
+            .fold(0, u8::wrapping_add);
+        super::super::binding_decode::admitted_for_tests(declaration, digest)
+    }
     fn query(value: i64) -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(1, value), AttemptId::new(1).expect("attempt"))
             .expect("query")
     }
-
-    fn host(installs: Arc<AtomicUsize>) -> Arc<ConnectorExecutionHost> {
-        let host = Arc::new(ConnectorExecutionHost::new());
-        host.register_installer(Arc::new(TestInstaller {
-            provider_id: descriptor().provider_id,
-            installs,
-            fail: false,
-        }))
-        .expect("installer");
-        host
+    fn rejection(
+        result: EnsureConnectorExecutionBindingResult,
+    ) -> EnsureConnectorExecutionBindingRejection {
+        match result.outcome() {
+            EnsureConnectorExecutionBindingOutcome::Rejected(rejection) => rejection.clone(),
+            EnsureConnectorExecutionBindingOutcome::Ensured => panic!("expected rejection"),
+        }
     }
 
     #[test]
-    fn concurrent_ensure_constructs_one_binding_and_leases_each_query() {
+    fn sealed_set_rejects_missing_and_duplicate_installers() {
         let installs = Arc::new(AtomicUsize::new(0));
-        let host = host(Arc::clone(&installs));
-        let declaration = declaration(7);
-        let mut joins = Vec::new();
-        for value in 1..=4 {
-            let host = Arc::clone(&host);
-            let declaration = declaration.clone();
-            joins.push(std::thread::spawn(move || {
-                host.ensure(query(value), &declaration, &context())
-            }));
-        }
-        for join in joins {
-            join.join().expect("thread").expect("ensure");
-        }
+        assert!(
+            ConnectorExecutionHost::try_new([installer(
+                ConnectorExecutionProviderKind::Iceberg,
+                Arc::clone(&installs),
+                None,
+            )])
+            .is_err()
+        );
+        assert!(
+            ConnectorExecutionHost::try_new([
+                installer(
+                    ConnectorExecutionProviderKind::Iceberg,
+                    Arc::clone(&installs),
+                    None
+                ),
+                installer(ConnectorExecutionProviderKind::Iceberg, installs, None),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn digest_lock_and_terminal_replay_are_stable() {
+        let installs = Arc::new(AtomicUsize::new(0));
+        let execution_host = host(Arc::clone(&installs), None);
+        let first_declaration = declaration(7, "default");
+        assert!(matches!(
+            execution_host
+                .ensure(query(1), &admitted(first_declaration.clone()))
+                .outcome(),
+            EnsureConnectorExecutionBindingOutcome::Ensured
+        ));
+        assert!(matches!(
+            execution_host
+                .ensure(query(2), &admitted(first_declaration.clone()))
+                .outcome(),
+            EnsureConnectorExecutionBindingOutcome::Ensured
+        ));
         assert_eq!(installs.load(Ordering::SeqCst), 1);
-        assert!(
-            host.resolver_for(query(1))
-                .resolve(&declaration.binding_key())
-                .is_ok()
+        assert_eq!(
+            rejection(execution_host.ensure(query(3), &admitted(declaration(7, "other")))).reason(),
+            EnsureConnectorExecutionBindingRejectionReason::ConflictingDeclaration,
         );
+
+        let installs = Arc::new(AtomicUsize::new(0));
+        let terminal_host = host(
+            Arc::clone(&installs),
+            Some(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "bad",
+            )),
+        );
+        let terminal_declaration = declaration(8, "default");
+        assert_eq!(
+            rejection(terminal_host.ensure(query(4), &admitted(terminal_declaration.clone())))
+                .reason(),
+            EnsureConnectorExecutionBindingRejectionReason::InvalidDeclaration
+        );
+        assert_eq!(
+            rejection(terminal_host.ensure(query(5), &admitted(terminal_declaration.clone())))
+                .reason(),
+            EnsureConnectorExecutionBindingRejectionReason::InvalidDeclaration
+        );
+        assert_eq!(installs.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn draining_generation_rejects_new_leases_but_old_query_can_resolve() {
-        let host = host(Arc::new(AtomicUsize::new(0)));
-        let old = declaration(7);
-        let new = declaration(8);
-        let first = query(1);
-        let second = query(2);
-        host.ensure(first, &old, &context()).expect("old ensure");
-        host.retire(&old.binding_key()).expect("retire old");
-
-        assert!(host.resolver_for(first).resolve(&old.binding_key()).is_ok());
-        assert_eq!(
-            host.ensure(second, &old, &context())
-                .expect_err("draining generation must reject new query")
-                .kind(),
-            ConnectorErrorKind::Unavailable
+    fn retryable_failure_retries_and_retirement_keeps_old_lease() {
+        let installs = Arc::new(AtomicUsize::new(0));
+        let retry_host = host(
+            Arc::clone(&installs),
+            Some(
+                ConnectorError::new(ConnectorErrorKind::Unavailable, "temporary")
+                    .with_retryable_before_progress(),
+            ),
         );
-        host.ensure(second, &new, &context()).expect("new ensure");
-        assert!(
-            host.resolver_for(second)
-                .resolve(&new.binding_key())
-                .is_ok()
-        );
+        let declaration = declaration(7, "default");
+        for value in [1, 2] {
+            let error = rejection(retry_host.ensure(query(value), &admitted(declaration.clone())));
+            assert_eq!(
+                error.reason(),
+                EnsureConnectorExecutionBindingRejectionReason::ActivationUnavailable
+            );
+            assert!(error.retryable_before_progress());
+        }
+        assert_eq!(installs.load(Ordering::SeqCst), 2);
+
+        let ready_host = host(Arc::new(AtomicUsize::new(0)), None);
+        let first = query(3);
+        assert!(matches!(
+            ready_host
+                .ensure(first, &admitted(declaration.clone()))
+                .outcome(),
+            EnsureConnectorExecutionBindingOutcome::Ensured
+        ));
+        let key = ConnectorExecutionBindingKey::from(&declaration);
         assert_eq!(
-            host.ensure(second, &old, &context())
-                .expect_err("one query cannot mix incarnations")
-                .kind(),
-            ConnectorErrorKind::Unavailable
+            ready_host.retire(&key).outcome(),
+            RetireConnectorExecutionBindingOutcome::Accepted
         );
-
-        host.release_query(first).expect("release old query");
-        let released = host.resolver_for(first).resolve(&old.binding_key());
+        assert!(ready_host.resolver_for(first).resolve(&key).is_ok());
         assert_eq!(
-            released
-                .err()
-                .expect("released query cannot resolve")
-                .kind(),
-            ConnectorErrorKind::NotFound
-        );
-    }
-
-    #[test]
-    fn duplicate_startup_installers_are_rejected_before_execution() {
-        let host = ConnectorExecutionHost::new();
-        let provider_id = descriptor().provider_id;
-        host.register_installer(Arc::new(TestInstaller {
-            provider_id: provider_id.clone(),
-            installs: Arc::new(AtomicUsize::new(0)),
-            fail: false,
-        }))
-        .expect("first startup installer");
-
-        let error = host
-            .register_installer(Arc::new(TestInstaller {
-                provider_id,
-                installs: Arc::new(AtomicUsize::new(0)),
-                fail: false,
-            }))
-            .expect_err("duplicate startup installer must fail fast");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-    }
-
-    #[test]
-    fn unknown_provider_and_installer_failure_are_explicit() {
-        let query = query(11);
-        let declaration = declaration(9);
-        let context = context();
-        let host = ConnectorExecutionHost::new();
-        assert_eq!(
-            host.ensure(query, &declaration, &context)
-                .expect_err("unknown provider must be rejected")
-                .kind(),
-            ConnectorErrorKind::InvalidRequest
-        );
-
-        let host = ConnectorExecutionHost::new();
-        host.register_installer(Arc::new(TestInstaller {
-            provider_id: declaration.descriptor().provider_id.clone(),
-            installs: Arc::new(AtomicUsize::new(0)),
-            fail: true,
-        }))
-        .expect("failing startup installer registration");
-        assert_eq!(
-            host.ensure(query, &declaration, &context)
-                .expect_err("installer failure must not be swallowed")
-                .kind(),
-            ConnectorErrorKind::Unavailable
+            rejection(ready_host.ensure(query(4), &admitted(declaration))).reason(),
+            EnsureConnectorExecutionBindingRejectionReason::Retiring
         );
     }
 }

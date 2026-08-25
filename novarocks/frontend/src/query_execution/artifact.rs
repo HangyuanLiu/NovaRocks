@@ -1994,15 +1994,15 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId,
-        ConnectorRequestContext, ConnectorSplit, ConnectorTableHandle, ConnectorWriteAbortOutcome,
-        ConnectorWriteAbortRequest, ConnectorWriteBaseVersion, ConnectorWriteCohortId,
-        ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteExecutionId,
-        ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-        ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlan,
-        ConnectorWritePlanningRequest, ConnectorWritePreparation, ConnectorWriteReceipt,
-        ConnectorWriteReconcileRequest, ConnectorWriterHandle,
+        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorRequestContext, ConnectorSplit,
+        ConnectorTableHandle, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
+        ConnectorWriteBaseVersion, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
+        ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteFieldBinding,
+        ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteLease,
+        ConnectorWriteOperationId, ConnectorWritePlan, ConnectorWritePlanningRequest,
+        ConnectorWritePreparation, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
+        ConnectorWriterHandle,
     };
 
     use super::{
@@ -2207,14 +2207,14 @@ mod tests {
             &self,
             _context: &ConnectorRequestContext,
         ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-            ConnectorExecutionDeclaration::try_new(
-                ConnectorInstanceDescriptor {
-                    provider_id: ConnectorProviderId::parse("test").expect("valid provider ID"),
-                    instance_id: self.key.instance_id.clone(),
-                },
-                self.key.incarnation,
-                Bytes::from_static(b"test-write-binding"),
+            ConnectorExecutionDeclaration::iceberg(
+                self.key.instance_id.as_str(),
+                self.key.incarnation.to_bytes(),
+                "test-write-binding",
             )
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })
         }
     }
 
@@ -2343,6 +2343,7 @@ mod tests {
         let lease = ConnectorWriteLease::new_with_execution_distribution(
             owner.clone(),
             control,
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),
             Arc::new(TestWriteDistribution { key: owner.clone() }),
             || {},
         )

@@ -56,24 +56,24 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorBeginScanRequest, ConnectorChangeWindowAdmission,
     ConnectorControlBinding, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorNamespaceRequest, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorProviderId, ConnectorReadPurpose,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorExecutionProviderKind,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
+    ConnectorReadPurpose, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableHandle,
     ConnectorTableMetadata, ConnectorTableRequest,
-    MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES,
 };
 use serde::{Deserialize, Serialize};
 
 /// Neutral provider identity for the fixture. It intentionally names no real
 /// provider so a Core assertion can never accidentally depend on one.
-const FIXTURE_PROVIDER_ID: &str = "fixture";
+// The fixture emits the closed Iceberg declaration variant, so its descriptor
+// must carry the same derived provider identity.
+const FIXTURE_PROVIDER_ID: &str = "iceberg";
 const FIXTURE_SPLIT_PAYLOAD_V1: u16 = 1;
-const FIXTURE_DECLARATION_V1: u16 = 1;
 /// Wildcard key in a table -> files map: it answers for every table name that
 /// has no explicit entry.
 const FIXTURE_ANY_TABLE: &str = "*";
@@ -252,11 +252,6 @@ struct PhysicalPredicate {
     column: String,
     op: String,
     literal: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct DeclarationPayload {
-    version: u16,
 }
 
 fn encode_payload(
@@ -730,17 +725,12 @@ impl ConnectorExecutionDistribution for FixtureDistribution {
                 "read fixture observed caller cancellation",
             ));
         }
-        ConnectorExecutionDeclaration::try_new(
-            self.descriptor.clone(),
-            self.incarnation,
-            encode_payload(
-                &DeclarationPayload {
-                    version: FIXTURE_DECLARATION_V1,
-                },
-                "execution declaration",
-                MAX_CONNECTOR_INSTANCE_DECLARATION_PAYLOAD_BYTES,
-            )?,
+        ConnectorExecutionDeclaration::iceberg(
+            self.descriptor.instance_id.as_str(),
+            self.incarnation.to_bytes(),
+            "fixture",
         )
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string()))
     }
 }
 
@@ -1451,10 +1441,10 @@ mod tests {
             .expect("fixture execution declaration");
 
         assert_eq!(
-            declaration.descriptor().provider_id.as_str(),
-            FIXTURE_PROVIDER_ID
+            declaration.provider_kind(),
+            ConnectorExecutionProviderKind::Iceberg
         );
-        assert_eq!(declaration.descriptor().instance_id.as_str(), CATALOG);
+        assert_eq!(declaration.binding_key().instance_id(), CATALOG);
     }
 
     #[test]

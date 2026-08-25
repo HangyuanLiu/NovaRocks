@@ -42,6 +42,7 @@ impl ConnectorProviderId {
 pub struct ConnectorInstanceId(Arc<str>);
 
 impl ConnectorInstanceId {
+    /// Catalog admission preserves the existing case-insensitive SQL behavior.
     pub fn parse(value: &str) -> Result<Self, ConnectorError> {
         if !value.is_ascii() {
             return Err(invalid_id("connector instance ID"));
@@ -53,8 +54,40 @@ impl ConnectorInstanceId {
         Ok(Self(Arc::from(normalized)))
     }
 
+    /// Native wire ingress accepts only the already-canonical form.  This
+    /// deliberately shares the catalog grammar while refusing normalization at
+    /// the process boundary.
+    pub fn try_from_canonical(value: &str) -> Result<Self, ConnectorError> {
+        if !value.is_ascii() || !is_instance_id(value) {
+            return Err(invalid_id("canonical connector instance ID"));
+        }
+        Ok(Self(Arc::from(value)))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectorInstanceId;
+
+    #[test]
+    fn catalog_admission_normalizes_but_wire_ingress_requires_canonical_form() {
+        assert_eq!(
+            ConnectorInstanceId::parse("MyCatalog.Analytics")
+                .unwrap()
+                .as_str(),
+            "mycatalog.analytics"
+        );
+        assert!(ConnectorInstanceId::try_from_canonical("MyCatalog.Analytics").is_err());
+        assert_eq!(
+            ConnectorInstanceId::try_from_canonical("mycatalog.analytics")
+                .unwrap()
+                .as_str(),
+            "mycatalog.analytics"
+        );
     }
 }
 

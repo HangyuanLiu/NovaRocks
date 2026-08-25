@@ -2,9 +2,9 @@
 id: ADR-0103
 title: "Central provider wire authority and homogeneous native build admission"
 domain: [provider-spi, distributed-query-lifecycle, cluster-membership]
-status: active
+status: superseded
 supersedes: [ADR-0047]
-superseded-by: null
+superseded-by: ADR-0105
 date: 2026-08-24
 provenance:
   - "discussion: 2026-08-21 central provider wire authority and homogeneous native build admission"

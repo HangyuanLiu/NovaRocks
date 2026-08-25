@@ -656,11 +656,12 @@ impl ConnectorExecutionDistribution for FakeProvider {
         &self,
         _context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-        ConnectorExecutionDeclaration::try_new(
-            self.descriptor.clone(),
-            self.binding_key.incarnation,
-            Bytes::from_static(b"binding=fake"),
+        ConnectorExecutionDeclaration::iceberg(
+            self.descriptor.instance_id.as_str(),
+            self.binding_key.incarnation.to_bytes(),
+            "fake",
         )
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string()))
     }
 }
 

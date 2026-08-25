@@ -130,9 +130,9 @@ fn delta_scan_uses_opaque_connector_read() {
         .connector_read(0, 10)
         .expect("delta connector read");
     assert_eq!(
-        planned.declaration.descriptor().provider_id.as_str(),
-        "fixture",
-        "the planned read must carry the declaring connector's own provider identity"
+        planned.declaration.provider_kind(),
+        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg,
+        "the planned read must carry the typed connector declaration"
     );
     assert_eq!(planned.splits.len(), 1);
     assert_eq!(planned.splits[0].split_id(), "fixture-0");
@@ -152,11 +152,11 @@ fn explicit_files_plan_opaque_connector_splits() {
     assert!(ranges.is_empty());
     let planned = bindings.connector_read(0, 10).expect("connector read");
     assert_eq!(
-        planned.declaration.descriptor().provider_id.as_str(),
-        "fixture"
+        planned.declaration.provider_kind(),
+        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
     );
     assert_eq!(
-        planned.declaration.descriptor().instance_id.as_str(),
+        planned.declaration.binding_key().instance_id(),
         "test_catalog"
     );
     assert_eq!(planned.splits.len(), 1);

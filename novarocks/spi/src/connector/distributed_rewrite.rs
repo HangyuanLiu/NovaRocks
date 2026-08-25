@@ -670,7 +670,7 @@ impl ConnectorDistributedRewriteLease {
     pub fn planning(&self) -> &Arc<dyn ConnectorScanPlanning> {
         &self.planning
     }
-    /// Produce the opaque BE installer declaration from the same exact
+    /// Produce the typed BE installer declaration from the same exact
     /// generation that froze this rewrite.  This prevents a later active
     /// incarnation from silently serving a staged operation.
     pub fn execution_declaration(
@@ -678,8 +678,10 @@ impl ConnectorDistributedRewriteLease {
         context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
         let declaration = self.distribution.declaration(context)?;
-        if declaration.descriptor() != &self.descriptor
-            || declaration.incarnation() != self.key.incarnation
+        let key = declaration.binding_key();
+        if declaration.provider_id() != self.descriptor.provider_id.as_str()
+            || key.instance_id != self.descriptor.instance_id
+            || key.incarnation != self.key.incarnation
         {
             return Err(invalid(
                 "distributed rewrite execution declaration does not match lease generation",
@@ -788,6 +790,7 @@ impl ConnectorDistributedRewriteLease {
         ConnectorWriteLease::new_with_execution_distribution(
             self.key.clone(),
             self.write.clone(),
+            self.descriptor.provider_id.clone(),
             self.distribution.clone(),
             move || drop(retained),
         )

@@ -4,7 +4,7 @@
 //! lifecycle contract derived from the canonical repository-level IDL.
 //! Transport, role-local state machines, and FE/BE execution conversion remain
 //! outside this package.
-// Design: ADR-0103 (docs/adr/ADR-0103-central-provider-wire-and-homogeneous-native-build-admission.md)
+// Design: ADR-0105 (docs/adr/ADR-0105-wire-authority-and-domain-carrier-separation.md)
 
 pub const SCHEMA_LEDGER_VERSION: u32 = 1;
 
@@ -18,6 +18,9 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 
 /// Canonical descriptor-driven projection and digest utilities.
 pub mod canonical;
+
+/// Validated connector execution-binding declaration and result values.
+pub mod provider;
 
 /// Validated neutral values used by the native query lifecycle.
 pub mod lifecycle;

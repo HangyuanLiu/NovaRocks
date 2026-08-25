@@ -175,7 +175,7 @@ impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
         _backend_idx: usize,
         _endpoint: SocketAddr,
         _declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::query_execution::connector_binding::ConnectorBindingDispatchError> {
         Ok(())
     }
 
@@ -183,7 +183,8 @@ impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
         &self,
         _endpoint: SocketAddr,
         _key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::query_execution::connector_binding::ConnectorBindingRetirementError>
+    {
         Ok(())
     }
 }
@@ -250,7 +251,10 @@ impl ConnectorBindingInstallObserver for FrontendConnectorBindingInstallObserver
         declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
     ) -> Result<(), String> {
         self.control
-            .record_installed_backend(&declaration.binding_key(), endpoint.to_string())
+            .record_installed_backend(
+                &novarocks_spi::connector::ConnectorExecutionBindingKey::from(declaration),
+                endpoint.to_string(),
+            )
             .map_err(|error| error.to_string())
     }
 }

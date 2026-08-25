@@ -15,105 +15,285 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use bytes::Bytes;
-use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorRequestContext,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-};
-
 use novarocks_protocol::lifecycle::QueryExecutionId;
 use novarocks_protocol::novarocks::{
     EnsureConnectorExecutionBindingRequest, RetireConnectorExecutionBindingRequest,
 };
+use novarocks_protocol::provider::{
+    EnsureConnectorExecutionBindingRejection, EnsureConnectorExecutionBindingRejectionReason,
+    EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingOutcome,
+    RetireConnectorExecutionBindingResult, connector_execution_binding_declaration_digest,
+};
+use novarocks_spi::connector::{
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceId,
+    ConnectorInstanceIncarnation,
+};
 
 use crate::fragment::decode::request::decode_native_query_execution_id;
 
-const CONNECTOR_BINDING_CONTEXT_TIMEOUT: Duration = Duration::from_secs(30);
+// Design: ADR-0105 (docs/adr/ADR-0105-wire-authority-and-domain-carrier-separation.md)
+/// Backend-local result of wire validation. The digest is deliberately made
+/// from the original generated DTO only after it has been translated into the
+/// SPI domain declaration; the execution Host never recomputes a wire identity.
+#[derive(Clone, Debug)]
+pub struct AdmittedConnectorExecutionDeclaration {
+    digest: [u8; 32],
+    declaration: ConnectorExecutionDeclaration,
+}
+
+impl AdmittedConnectorExecutionDeclaration {
+    #[doc(hidden)]
+    pub fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    #[doc(hidden)]
+    pub fn declaration(&self) -> &ConnectorExecutionDeclaration {
+        &self.declaration
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn admitted_for_tests(
+    declaration: ConnectorExecutionDeclaration,
+    digest: [u8; 32],
+) -> AdmittedConnectorExecutionDeclaration {
+    AdmittedConnectorExecutionDeclaration {
+        digest,
+        declaration,
+    }
+}
 
 pub(crate) fn decode_ensure_request(
     request: EnsureConnectorExecutionBindingRequest,
-) -> Result<(QueryExecutionId, ConnectorExecutionDeclaration), ConnectorError> {
+) -> Result<
+    (QueryExecutionId, AdmittedConnectorExecutionDeclaration),
+    EnsureConnectorExecutionBindingResult,
+> {
     let execution_id = request.execution_id.as_ref().ok_or_else(|| {
-        ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "connector execution binding request is missing execution_id",
-        )
+        invalid_declaration("connector execution binding request is missing execution_id")
     })?;
-    let execution_id = decode_native_query_execution_id(execution_id).map_err(|error| {
-        ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+    let execution_id = decode_native_query_execution_id(execution_id)
+        .map_err(|error| invalid_declaration(&error.to_string()))?;
+    let declaration = request.declaration.ok_or_else(|| {
+        invalid_declaration("connector execution binding request is missing declaration")
     })?;
-    let provider_id = ConnectorProviderId::parse(&request.provider_id)?;
-    let instance_id = ConnectorInstanceId::parse(&request.instance_id)?;
-    let incarnation = decode_incarnation(&request.incarnation)?;
-    let declaration = ConnectorExecutionDeclaration::try_new(
-        ConnectorInstanceDescriptor {
-            provider_id,
-            instance_id,
-        },
-        incarnation,
-        Bytes::from(request.declaration_payload),
-    )?;
+    let declaration = decode_connector_execution_declaration(declaration)
+        .map_err(|detail| invalid_declaration(&detail))?;
     Ok((execution_id, declaration))
+}
+
+/// Decodes a generated native DTO using the production BE admission path.
+///
+/// It is public only for the end-to-end carrier-contract test; callers must
+/// pass the resulting admitted pair directly to the BE Host.
+#[doc(hidden)]
+pub fn decode_connector_execution_declaration(
+    raw: novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration,
+) -> Result<AdmittedConnectorExecutionDeclaration, String> {
+    let incarnation: [u8; 16] = raw
+        .incarnation
+        .as_slice()
+        .try_into()
+        .map_err(|_| "connector execution declaration has invalid incarnation".to_string())?;
+    let declaration = match raw.provider.as_ref() {
+        Some(
+            novarocks_protocol::novarocks::connector_execution_binding_declaration::Provider::Iceberg(
+                provider,
+            ),
+        ) => ConnectorExecutionDeclaration::iceberg(
+            &raw.instance_id,
+            incarnation,
+            &provider.access_binding,
+        ),
+        Some(
+            novarocks_protocol::novarocks::connector_execution_binding_declaration::Provider::Starrocks(
+                provider,
+            ),
+        ) => ConnectorExecutionDeclaration::starrocks(
+            &raw.instance_id,
+            incarnation,
+            &provider.local_binding,
+        ),
+        None => return Err("connector execution declaration has no provider".to_string()),
+    }
+    .map_err(|_| "connector execution declaration is invalid".to_string())?;
+    let digest = connector_execution_binding_declaration_digest(&raw)
+        .map_err(|_| "cannot canonicalize connector execution declaration".to_string())?;
+    Ok(AdmittedConnectorExecutionDeclaration {
+        digest,
+        declaration,
+    })
 }
 
 pub(crate) fn decode_retire_request(
     request: RetireConnectorExecutionBindingRequest,
-) -> Result<ConnectorExecutionBindingKey, ConnectorError> {
+) -> Result<ConnectorExecutionBindingKey, RetireConnectorExecutionBindingResult> {
+    let incarnation: [u8; 16] = request.incarnation.as_slice().try_into().map_err(|_| {
+        RetireConnectorExecutionBindingResult::new(
+            RetireConnectorExecutionBindingOutcome::InvalidKey,
+        )
+    })?;
     Ok(ConnectorExecutionBindingKey {
-        instance_id: ConnectorInstanceId::parse(&request.instance_id)?,
-        incarnation: decode_incarnation(&request.incarnation)?,
+        instance_id: ConnectorInstanceId::try_from_canonical(&request.instance_id).map_err(
+            |_| {
+                RetireConnectorExecutionBindingResult::new(
+                    RetireConnectorExecutionBindingOutcome::InvalidKey,
+                )
+            },
+        )?,
+        incarnation: ConnectorInstanceIncarnation::from_bytes(incarnation),
     })
 }
 
-pub(crate) fn install_request_context() -> Result<ConnectorRequestContext, ConnectorError> {
-    ConnectorRequestContext::try_new(
-        Instant::now() + CONNECTOR_BINDING_CONTEXT_TIMEOUT,
-        Arc::new(NotCancelled),
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    )
-}
-
-fn decode_incarnation(bytes: &[u8]) -> Result<ConnectorInstanceIncarnation, ConnectorError> {
-    let bytes: [u8; 16] = bytes.try_into().map_err(|_| {
-        ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "connector instance incarnation must contain exactly 16 bytes",
-        )
-    })?;
-    Ok(ConnectorInstanceIncarnation::from_bytes(bytes))
-}
-
-struct NotCancelled;
-
-impl ConnectorCancellation for NotCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
+fn invalid_declaration(detail: &str) -> EnsureConnectorExecutionBindingResult {
+    let mut end = detail.len().min(512);
+    while end > 0 && !detail.is_char_boundary(end) {
+        end -= 1;
     }
+    let rejection = EnsureConnectorExecutionBindingRejection::try_new(
+        EnsureConnectorExecutionBindingRejectionReason::InvalidDeclaration,
+        false,
+        detail[..end].to_string(),
+        None,
+    )
+    .expect("fixed invalid declaration outcome is Protocol-valid");
+    EnsureConnectorExecutionBindingResult::rejected(rejection)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn iceberg_declaration(
+        instance_id: impl Into<String>,
+        incarnation: Vec<u8>,
+        access_binding: impl Into<String>,
+    ) -> novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+        novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+            instance_id: instance_id.into(),
+            incarnation,
+            provider: Some(
+                novarocks_protocol::novarocks::connector_execution_binding_declaration::Provider::Iceberg(
+                    novarocks_protocol::novarocks::IcebergExecutionBindingDeclaration {
+                        access_binding: access_binding.into(),
+                    },
+                ),
+            ),
+        }
+    }
+
     #[test]
-    fn ensure_request_rejects_invalid_incarnation_length() {
-        let error = decode_ensure_request(EnsureConnectorExecutionBindingRequest {
+    fn ensure_request_rejects_missing_typed_declaration() {
+        let result = decode_ensure_request(EnsureConnectorExecutionBindingRequest {
             execution_id: Some(novarocks_protocol::novarocks::QueryExecutionId {
                 query_id: Some(novarocks_protocol::common::UniqueId { hi: 7, lo: 9 }),
                 attempt_id: 1,
             }),
-            provider_id: "iceberg".to_string(),
-            instance_id: "catalog.analytics".to_string(),
-            incarnation: vec![7; 15],
-            declaration_payload: Vec::new(),
+            declaration: None,
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn wire_declaration_rejects_noncanonical_instance_id() {
+        let result = decode_connector_execution_declaration(iceberg_declaration(
+            "MyCatalog",
+            vec![7; 16],
+            "local",
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn admitted_digest_is_calculated_from_the_successfully_validated_raw_dto() {
+        let raw = iceberg_declaration("catalog", vec![7; 16], "local");
+        let expected = connector_execution_binding_declaration_digest(&raw)
+            .expect("test declaration canonicalizes");
+
+        let admitted =
+            decode_connector_execution_declaration(raw).expect("valid raw declaration is admitted");
+
+        assert_eq!(admitted.digest(), expected);
+    }
+
+    #[test]
+    fn wire_declaration_rejects_invalid_incarnation_length() {
+        let result = decode_connector_execution_declaration(iceberg_declaration(
+            "catalog",
+            vec![7; 15],
+            "local",
+        ));
+
+        assert_eq!(
+            result.unwrap_err(),
+            "connector execution declaration has invalid incarnation"
+        );
+    }
+
+    #[test]
+    fn wire_declaration_rejects_missing_provider_oneof() {
+        let result = decode_connector_execution_declaration(
+            novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+                instance_id: "catalog".to_string(),
+                incarnation: vec![7; 16],
+                provider: None,
+            },
+        );
+
+        assert_eq!(
+            result.unwrap_err(),
+            "connector execution declaration has no provider"
+        );
+    }
+
+    #[test]
+    fn wire_declaration_rejects_oversized_provider_binding() {
+        let result = decode_connector_execution_declaration(iceberg_declaration(
+            "catalog",
+            vec![7; 16],
+            "x".repeat(257),
+        ));
+
+        assert_eq!(
+            result.unwrap_err(),
+            "connector execution declaration is invalid"
+        );
+    }
+
+    #[test]
+    fn ensure_request_preserves_safe_declaration_failure_detail() {
+        let result = decode_ensure_request(EnsureConnectorExecutionBindingRequest {
+            execution_id: Some(novarocks_protocol::novarocks::QueryExecutionId {
+                query_id: Some(novarocks_protocol::common::UniqueId { hi: 7, lo: 9 }),
+                attempt_id: 1,
+            }),
+            declaration: Some(
+                novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+                    instance_id: "catalog".to_string(),
+                    incarnation: vec![7; 16],
+                    provider: None,
+                },
+            ),
         })
-        .expect_err("short incarnation must be rejected");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        .expect_err("missing provider must reject admission");
+
+        match result.outcome() {
+            novarocks_protocol::provider::EnsureConnectorExecutionBindingOutcome::Rejected(
+                rejection,
+            ) => {
+                assert_eq!(
+                    rejection.reason(),
+                    EnsureConnectorExecutionBindingRejectionReason::InvalidDeclaration
+                );
+                assert_eq!(
+                    rejection.safe_detail(),
+                    "connector execution declaration has no provider"
+                );
+            }
+            novarocks_protocol::provider::EnsureConnectorExecutionBindingOutcome::Ensured => {
+                panic!("missing provider must not be ensured")
+            }
+        }
     }
 }

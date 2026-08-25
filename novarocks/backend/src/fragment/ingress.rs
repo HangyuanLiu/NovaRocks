@@ -20,11 +20,14 @@
 use std::fmt;
 
 use novarocks_protocol::lifecycle::QueryExecutionId;
-use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorRequestContext,
+use novarocks_protocol::provider::{
+    EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingResult,
 };
+use novarocks_spi::connector::ConnectorExecutionBindingKey;
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
+
+use crate::connector::binding_decode::AdmittedConnectorExecutionDeclaration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(
@@ -91,13 +94,12 @@ pub(crate) trait NativeFragmentIngress: Send + Sync + 'static {
     fn ensure_connector_execution_binding(
         &self,
         execution_id: QueryExecutionId,
-        declaration: ConnectorExecutionDeclaration,
-        context: ConnectorRequestContext,
-    ) -> Result<(), NativeFragmentIngressError>;
+        declaration: AdmittedConnectorExecutionDeclaration,
+    ) -> EnsureConnectorExecutionBindingResult;
     fn retire_connector_execution_binding(
         &self,
         key: ConnectorExecutionBindingKey,
-    ) -> Result<(), NativeFragmentIngressError>;
+    ) -> RetireConnectorExecutionBindingResult;
     fn cancel(
         &self,
         request: NativeFragmentCancelRequest,

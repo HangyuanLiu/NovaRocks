@@ -54,8 +54,8 @@ pub trait ConnectorScanPlanning: Send + Sync {
     ) -> Result<ConnectorSplitPlanningResult, ConnectorError>;
 }
 
-/// FE-only capability that turns a logical control binding into the bounded,
-/// opaque declaration accepted by a BE execution installer.
+/// FE-only capability that turns a logical control binding into the typed
+/// Protocol declaration accepted by a BE execution installer.
 pub trait ConnectorExecutionDistribution: Send + Sync {
     fn declaration(
         &self,
@@ -912,8 +912,10 @@ impl ConnectorControlBinding {
         context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
         let declaration = self.distribution.declaration(context)?;
-        if declaration.descriptor() != &self.descriptor
-            || declaration.incarnation() != self.incarnation
+        let key = declaration.binding_key();
+        if declaration.provider_id() != self.descriptor.provider_id.as_str()
+            || key.instance_id != self.descriptor.instance_id
+            || key.incarnation != self.incarnation
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -1004,11 +1006,16 @@ impl ConnectorControlPlanningLease {
             )
         })?;
         let distribution = self.binding.execution_distribution().clone();
+        let provider_id = self.binding.descriptor().provider_id.clone();
         let key = write.binding_key().clone();
         let retained_planning_lease = self.clone();
-        ConnectorWriteLease::new_with_execution_distribution(key, write, distribution, move || {
-            drop(retained_planning_lease)
-        })
+        ConnectorWriteLease::new_with_execution_distribution(
+            key,
+            write,
+            provider_id,
+            distribution,
+            move || drop(retained_planning_lease),
+        )
         .map(|lease| lease.with_metadata(Arc::clone(&self.binding.metadata)))
     }
 

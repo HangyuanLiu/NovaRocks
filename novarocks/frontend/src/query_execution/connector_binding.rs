@@ -35,6 +35,9 @@ use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
 use novarocks_protocol::lifecycle::QueryExecutionId;
+use novarocks_protocol::provider::{
+    EnsureConnectorExecutionBindingRejection, RetireConnectorExecutionBindingOutcome,
+};
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
@@ -43,6 +46,54 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
 }
+
+/// Typed transport failures at the FE-to-BE binding boundary.  In
+/// particular, an acknowledged BE rejection retains the Protocol-owned
+/// reason and retry contract; it is never reconstructed from message text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorBindingDispatchError {
+    Rejected(EnsureConnectorExecutionBindingRejection),
+    Transport(String),
+}
+
+impl std::fmt::Display for ConnectorBindingDispatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(rejection) => write!(
+                formatter,
+                "connector execution binding rejected: reason={:?} retryable_before_progress={} detail={}",
+                rejection.reason(),
+                rejection.retryable_before_progress(),
+                rejection.safe_detail(),
+            ),
+            Self::Transport(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for ConnectorBindingDispatchError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorBindingRetirementError {
+    Outcome(RetireConnectorExecutionBindingOutcome),
+    Transport(String),
+}
+
+impl std::fmt::Display for ConnectorBindingRetirementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Outcome(outcome) => {
+                write!(
+                    formatter,
+                    "connector execution binding retirement returned {outcome:?}"
+                )
+            }
+            Self::Transport(error) => formatter.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for ConnectorBindingRetirementError {}
 
 /// One BE's deduplicated connector declarations.  This is intentionally a
 /// control-plane DTO: no scan handle, split, credential, or client is present.
@@ -98,7 +149,7 @@ pub trait ConnectorBindingDispatcher: Send + Sync + 'static {
         backend_idx: usize,
         endpoint: SocketAddr,
         declaration: &ConnectorExecutionDeclaration,
-    ) -> Result<(), String>;
+    ) -> Result<(), ConnectorBindingDispatchError>;
 
     /// Best-effort process binding retirement. Query lease release remains
     /// solely owned by the established query terminal lifecycle.
@@ -106,7 +157,7 @@ pub trait ConnectorBindingDispatcher: Send + Sync + 'static {
         &self,
         endpoint: SocketAddr,
         key: &ConnectorExecutionBindingKey,
-    ) -> Result<(), String>;
+    ) -> Result<(), ConnectorBindingRetirementError>;
 }
 
 /// Frontend-local observer for successful ensure acknowledgements.  It is
@@ -194,7 +245,7 @@ pub(crate) fn compile_install_plan(
                             "scheduled connector split has no prepared read for fragment {fragment_id} node {node_id}"
                         ))
                     })?;
-                let instance_id = read.declaration.descriptor().instance_id.clone();
+                let instance_id = read.declaration.binding_key().instance_id.clone();
                 match entry.1.get(&instance_id) {
                     Some(existing) if existing != &read.declaration => {
                         return Err(contract_error(format!(
@@ -214,7 +265,7 @@ pub(crate) fn compile_install_plan(
 
     for attachment in connector_write_plans.values() {
         let declaration = attachment.execution_declaration();
-        let instance_id = declaration.descriptor().instance_id.clone();
+        let instance_id = declaration.binding_key().instance_id.clone();
         for writer in attachment.manifest().writers() {
             let fragment_id = u32::try_from(writer.fragment_id()).map_err(|_| {
                 contract_error("connector writer manifest contains a negative fragment ID")
@@ -345,20 +396,31 @@ impl ConnectorBindingInstallBarrier for DispatchingConnectorBindingBarrier {
                         backend.endpoint(),
                         declaration,
                     )
-                    .map_err(|error| {
-                        failed(format!(
+                    .map_err(|error| match error {
+                        ConnectorBindingDispatchError::Rejected(rejection) => {
+                            DistributedQueryError::connector_binding_rejected(
+                                format!(
+                                    "connector instance '{}' installation on BE[{}] ({})",
+                                    declaration.binding_key().instance_id(),
+                                    backend.backend_idx(),
+                                    backend.endpoint()
+                                ),
+                                rejection,
+                            )
+                        }
+                        ConnectorBindingDispatchError::Transport(error) => failed(format!(
                             "connector instance '{}' installation on BE[{}] ({}) failed: {error}",
-                            declaration.descriptor().instance_id.as_str(),
+                            declaration.binding_key().instance_id(),
                             backend.backend_idx(),
                             backend.endpoint()
-                        ))
+                        )),
                     })?;
                 self.observer
                     .installed(backend.endpoint(), declaration)
                     .map_err(|error| {
                         failed(format!(
                             "connector instance '{}' installation acknowledgement could not be recorded for BE[{}] ({}): {error}",
-                            declaration.descriptor().instance_id.as_str(),
+                            declaration.binding_key().instance_id(),
                             backend.backend_idx(),
                             backend.endpoint()
                         ))
@@ -374,29 +436,21 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::query_execution::contract::QueryId;
-    use bytes::Bytes;
     use novarocks_protocol::lifecycle::{AttemptId, QueryExecutionId};
-    use novarocks_spi::connector::{
-        ConnectorInstanceDescriptor, ConnectorInstanceIncarnation, ConnectorProviderId,
-    };
 
     use super::*;
 
     fn declaration(instance_id: &str) -> ConnectorExecutionDeclaration {
-        ConnectorExecutionDeclaration::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
-                instance_id: ConnectorInstanceId::parse(instance_id).unwrap(),
-            },
-            ConnectorInstanceIncarnation::from_bytes([7; 16]),
-            Bytes::from_static(b"binding=default"),
-        )
-        .unwrap()
+        ConnectorExecutionDeclaration::iceberg(instance_id, [7; 16], "binding=default").unwrap()
     }
 
     struct RecordingDispatcher {
         installs: Mutex<Vec<(usize, SocketAddr, String)>>,
         fail_on: Option<usize>,
+    }
+
+    struct RejectingDispatcher {
+        rejection: EnsureConnectorExecutionBindingRejection,
     }
 
     impl ConnectorBindingDispatcher for RecordingDispatcher {
@@ -406,15 +460,17 @@ mod tests {
             backend_idx: usize,
             endpoint: SocketAddr,
             declaration: &ConnectorExecutionDeclaration,
-        ) -> Result<(), String> {
+        ) -> Result<(), ConnectorBindingDispatchError> {
             let mut installs = self.installs.lock().unwrap();
             if self.fail_on == Some(installs.len()) {
-                return Err("injected install failure".to_string());
+                return Err(ConnectorBindingDispatchError::Transport(
+                    "injected install failure".to_string(),
+                ));
             }
             installs.push((
                 backend_idx,
                 endpoint,
-                declaration.descriptor().instance_id.as_str().to_string(),
+                declaration.binding_key().instance_id().to_string(),
             ));
             Ok(())
         }
@@ -423,7 +479,29 @@ mod tests {
             &self,
             _endpoint: SocketAddr,
             _key: &ConnectorExecutionBindingKey,
-        ) -> Result<(), String> {
+        ) -> Result<(), ConnectorBindingRetirementError> {
+            Ok(())
+        }
+    }
+
+    impl ConnectorBindingDispatcher for RejectingDispatcher {
+        fn install(
+            &self,
+            _execution_id: QueryExecutionId,
+            _backend_idx: usize,
+            _endpoint: SocketAddr,
+            _declaration: &ConnectorExecutionDeclaration,
+        ) -> Result<(), ConnectorBindingDispatchError> {
+            Err(ConnectorBindingDispatchError::Rejected(
+                self.rejection.clone(),
+            ))
+        }
+
+        fn retire(
+            &self,
+            _endpoint: SocketAddr,
+            _key: &ConnectorExecutionBindingKey,
+        ) -> Result<(), ConnectorBindingRetirementError> {
             Ok(())
         }
     }
@@ -477,6 +555,39 @@ mod tests {
             .expect_err("second install fails");
         assert_eq!(error.kind(), DistributedQueryErrorKind::Failed);
         assert_eq!(dispatcher.installs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dispatch_barrier_preserves_the_typed_be_rejection_without_retrying() {
+        use novarocks_protocol::provider::{
+            EnsureConnectorExecutionBindingRejection,
+            EnsureConnectorExecutionBindingRejectionReason,
+        };
+
+        let rejection = EnsureConnectorExecutionBindingRejection::try_new(
+            EnsureConnectorExecutionBindingRejectionReason::ActivationUnavailable,
+            true,
+            "local binding is unavailable",
+            Some("declaration.iceberg.access_binding".to_string()),
+        )
+        .expect("valid rejection");
+        let barrier = DispatchingConnectorBindingBarrier::new(Arc::new(RejectingDispatcher {
+            rejection: rejection.clone(),
+        }));
+        let plan = ConnectorBindingInstallPlan {
+            backends: vec![ConnectorBindingBackendInstallPlan {
+                backend_idx: 3,
+                endpoint: "127.0.0.1:19033".parse().unwrap(),
+                declarations: vec![declaration("catalog.one")],
+            }],
+        };
+
+        let error = barrier
+            .install_all(execution_id(), plan)
+            .expect_err("typed rejection stops the barrier");
+        assert_eq!(error.kind(), DistributedQueryErrorKind::Rejected);
+        assert_eq!(error.connector_binding_rejection(), Some(&rejection));
+        assert!(error.message().contains("retryable_before_progress=true"));
     }
 
     fn execution_id() -> QueryExecutionId {

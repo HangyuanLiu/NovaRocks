@@ -473,14 +473,12 @@ impl ConnectorExecutionDistribution for InsertTestControl {
         &self,
         _context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-        ConnectorExecutionDeclaration::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
-                instance_id: self.instance_id.clone(),
-            },
-            self.incarnation,
-            Bytes::from_static(b"insert-service-test"),
+        ConnectorExecutionDeclaration::iceberg(
+            self.instance_id.as_str(),
+            self.incarnation.to_bytes(),
+            "insert-service-test",
         )
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string()))
     }
 }
 

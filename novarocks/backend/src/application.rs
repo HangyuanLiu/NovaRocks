@@ -239,7 +239,7 @@ fn compose_backend_application_services(
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
         BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
     );
-    let execution_host = Arc::new(crate::ConnectorExecutionHost::new());
+    let execution_host = seal_connector_execution_host(execution_installers)?;
     let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(
         Arc::clone(&controls),
         Arc::clone(&execution_host),
@@ -251,16 +251,6 @@ fn compose_backend_application_services(
         query_lifecycle_config,
     );
     let connector_registry = Arc::new(ConnectorRegistry::new());
-    for installer in execution_installers {
-        execution_host
-            .register_installer(Arc::clone(installer))
-            .map_err(|error| {
-                BackendApplicationError::new(
-                    BackendApplicationErrorKind::Configuration,
-                    format!("register connector execution installer: {error}"),
-                )
-            })?;
-    }
     let native_fragment_service = Arc::new(
         NativeFragmentService::new_with_controls(
             grpc_exchange_transmitter(data_runtime.clone()),
@@ -292,6 +282,25 @@ fn compose_backend_application_services(
         exchange_receiver_port,
         query_lifecycle_ingress,
     })
+}
+
+fn seal_connector_execution_host(
+    execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
+) -> Result<Arc<crate::ConnectorExecutionHost>, BackendApplicationError> {
+    #[cfg(test)]
+    if execution_installers.is_empty() {
+        // Application tests exercise lifecycle wiring without a provider
+        // composition root. Production startup never takes this branch.
+        return Ok(Arc::new(crate::ConnectorExecutionHost::empty_for_tests()));
+    }
+    crate::ConnectorExecutionHost::try_new(execution_installers.iter().cloned())
+        .map(Arc::new)
+        .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("seal connector execution installer set: {error}"),
+            )
+        })
 }
 
 impl BackendApplicationHost {

@@ -34,6 +34,7 @@ use novarocks_spi::connector::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::STARROCKS_PROVIDER_ID;
 use crate::codec::{
     Base64Bytes, CODEC_VERSION, decode_schema_ipc, decode_v1, encode_schema_ipc, encode_v1,
     freeze_digest, schema_digest,
@@ -45,7 +46,6 @@ use crate::domain::{
     StarRocksSplitPlanningInput, StarRocksStrategySplit, StarRocksStrategySplitPayload, invalid,
     select_read_strategy,
 };
-use crate::{STARROCKS_CONTRACT_VERSION, STARROCKS_PROVIDER_ID};
 
 pub trait StarRocksMetadataSource: Send + Sync {
     fn namespace_exists(
@@ -144,14 +144,6 @@ struct Provider {
     metadata: Arc<dyn StarRocksMetadataSource>,
     rpc_planner: Arc<dyn StarRocksRpcSplitPlanner>,
     direct_planner: Arc<dyn StarRocksDirectSplitPlanner>,
-}
-
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct DeclarationPayload {
-    pub(crate) version: u16,
-    pub(crate) contract_version: u16,
-    pub(crate) local_binding: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -648,33 +640,18 @@ impl ConnectorExecutionDistribution for Provider {
         context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
         self.active(context)?;
-        ConnectorExecutionDeclaration::try_new(
-            self.descriptor.clone(),
-            self.incarnation,
-            encode_v1(
-                &DeclarationPayload {
-                    version: CODEC_VERSION,
-                    contract_version: STARROCKS_CONTRACT_VERSION,
-                    local_binding: self.config.local_binding.as_str().to_string(),
-                },
-                "execution declaration",
-                context.max_handle_payload_bytes(),
-            )?,
+        ConnectorExecutionDeclaration::starrocks(
+            self.descriptor.instance_id.as_str(),
+            self.incarnation.to_bytes(),
+            self.config.local_binding.as_str(),
         )
+        .map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!("build StarRocks execution declaration: {error}"),
+            )
+        })
     }
-}
-
-pub(crate) fn decode_declaration(bytes: &Bytes) -> Result<DeclarationPayload, ConnectorError> {
-    let declaration: DeclarationPayload = decode_v1(bytes, "execution declaration")?;
-    if declaration.version != CODEC_VERSION
-        || declaration.contract_version != STARROCKS_CONTRACT_VERSION
-    {
-        return Err(unsupported_version(
-            "execution declaration",
-            declaration.version,
-        ));
-    }
-    Ok(declaration)
 }
 
 pub(crate) fn decode_split(bytes: &Bytes) -> Result<SplitPayload, ConnectorError> {
@@ -821,8 +798,8 @@ fn unsupported_version(subject: &str, version: u16) -> ConnectorError {
 mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use novarocks_spi::connector::{
-        ConnectorBatchBudget, ConnectorCancellation, ConnectorReadSelector,
-        ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
+        ConnectorBatchBudget, ConnectorCancellation, ConnectorExecutionProviderKind,
+        ConnectorReadSelector, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
         ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
     };
     use std::num::NonZeroUsize;
@@ -966,6 +943,25 @@ mod tests {
             direct_calls,
         )
     }
+
+    #[test]
+    fn execution_declaration_is_the_typed_starrocks_local_binding() {
+        let (binding, _, _) = binding(
+            crate::StarRocksReadPolicy::Auto,
+            crate::StarRocksTopology::SharedData,
+            true,
+        );
+        let declaration = binding
+            .execution_declaration(&context())
+            .expect("typed declaration");
+
+        assert_eq!(
+            declaration.provider_kind(),
+            ConnectorExecutionProviderKind::StarRocks
+        );
+        assert_eq!(declaration.starrocks_local_binding(), Some("default"));
+    }
+
     #[test]
     fn auto_selects_one_frozen_strategy_and_never_calls_the_other_planner() {
         let (binding, rpc, direct) = binding(

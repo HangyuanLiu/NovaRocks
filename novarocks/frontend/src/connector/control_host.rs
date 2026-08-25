@@ -754,7 +754,7 @@ impl ConnectorControlHost {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorWriteLease, ConnectorError> {
-        let (write, distribution, key) = {
+        let (write, provider_id, distribution, key) = {
             let mut state = self.lock_state()?;
             let key = state.active.get(instance_id).cloned().ok_or_else(|| {
                 ConnectorError::new(
@@ -783,15 +783,17 @@ impl ConnectorControlHost {
                     "connector control generation has no distributed write capability",
                 )
             })?;
+            let provider_id = generation.binding.descriptor().provider_id.clone();
             let distribution = generation.binding.execution_distribution().clone();
             generation.write_leases = generation.write_leases.saturating_add(1);
-            (write, distribution, key)
+            (write, provider_id, distribution, key)
         };
         let state = Arc::downgrade(&self.state);
         let retirement_sink = Arc::downgrade(&self.retirement_sink);
         ConnectorWriteLease::new_with_execution_distribution(
             key.clone(),
             write,
+            provider_id,
             distribution,
             move || release_lease(&state, &retirement_sink, key, LeaseKind::Write),
         )
@@ -1538,14 +1540,14 @@ pub(crate) mod tests {
             &self,
             _context: &novarocks_spi::connector::ConnectorRequestContext,
         ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-            ConnectorExecutionDeclaration::try_new(
-                ConnectorInstanceDescriptor {
-                    provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
-                    instance_id: self.instance_id.clone(),
-                },
-                self.incarnation,
-                Bytes::from_static(b"binding=default"),
+            ConnectorExecutionDeclaration::iceberg(
+                self.instance_id.as_str(),
+                self.incarnation.to_bytes(),
+                "default",
             )
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
+            })
         }
     }
 
@@ -1694,7 +1696,10 @@ pub(crate) mod tests {
             .binding()
             .execution_declaration(&starrocks_context())
             .expect("declaration");
-        assert_eq!(declaration.binding_key().incarnation, first_incarnation);
+        assert_eq!(
+            declaration.binding_key().incarnation(),
+            first_incarnation.to_bytes()
+        );
 
         host.retire_current(&instance)
             .expect("retire first generation");
@@ -1717,10 +1722,10 @@ pub(crate) mod tests {
         let host = ConnectorControlHost::new();
         let binding = starrocks_binding();
         let instance = binding.descriptor().instance_id.clone();
-        let key = binding
+        let declaration = binding
             .execution_declaration(&starrocks_context())
-            .expect("declaration")
-            .binding_key();
+            .expect("declaration");
+        let key = declaration.binding_key().clone();
         host.register(binding).expect("register RPC generation");
         let lease = host
             .acquire_current(&instance)
@@ -1731,13 +1736,16 @@ pub(crate) mod tests {
                 .execution_declaration(&starrocks_context())
                 .expect("lease declaration")
                 .binding_key(),
-            key
+            &key
         );
 
         host.retire_current(&instance)
             .expect("retire RPC generation");
         assert!(host.acquire_current(&instance).is_err());
-        assert_eq!(lease.binding().incarnation(), key.incarnation);
+        assert_eq!(
+            lease.binding().incarnation(),
+            ConnectorInstanceIncarnation::from_bytes(key.incarnation())
+        );
         drop(lease);
         assert_eq!(host.take_ready_retires().expect("ready retire").len(), 1);
     }

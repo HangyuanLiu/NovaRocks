@@ -392,7 +392,9 @@ impl ScanExecutionBindings {
                 "duplicate connector read fragment_id={fragment_id} node_id={node_id}"
             ));
         }
-        if read.scan.handle().owner() != &read.declaration.descriptor().instance_id {
+        let declaration_key =
+            novarocks_spi::connector::ConnectorExecutionBindingKey::from(&read.declaration);
+        if read.scan.handle().owner() != &declaration_key.instance_id {
             return Err(format!(
                 "connector read fragment_id={fragment_id} node_id={node_id} has a scan handle owned by another instance"
             ));
@@ -417,7 +419,7 @@ impl ScanExecutionBindings {
         if read
             .splits
             .iter()
-            .any(|split| split.owner() != &read.declaration.descriptor().instance_id)
+            .any(|split| split.owner() != &declaration_key.instance_id)
         {
             return Err(format!(
                 "connector read fragment_id={fragment_id} node_id={node_id} has a split owned by another instance"

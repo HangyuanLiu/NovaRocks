@@ -487,11 +487,10 @@ fn encode_scan_source(
             kind: Some(Kind::ConnectorRead(plan::ConnectorReadSource {
                 instance_id: planned
                     .declaration()
-                    .descriptor()
-                    .instance_id
-                    .as_str()
+                    .binding_key()
+                    .instance_id()
                     .to_string(),
-                instance_incarnation: planned.declaration().incarnation().to_bytes().to_vec(),
+                instance_incarnation: planned.declaration().binding_key().incarnation().to_vec(),
                 scan_payload: planned.scan().handle().payload().to_vec(),
                 splits: Vec::new(),
                 max_batch_rows: u64::try_from(planned.batch().max_rows.get())

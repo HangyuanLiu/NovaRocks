@@ -21,8 +21,8 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorOpenReaderRequest,
+    ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+    ConnectorExecutionDeclaration, ConnectorExecutionProviderKind, ConnectorOpenReaderRequest,
     ConnectorProviderId, ConnectorRequestContext, ConnectorScanUnitDomainFacts,
     ConnectorScanUnitFactsSummary, ConnectorSplit, ConnectorWriteExecution,
 };
@@ -32,13 +32,6 @@ use super::{
 /// the native carrier: providers must fail preparation rather than truncate a
 /// sealed membership.
 pub const MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT: usize = 4096;
-
-/// Immutable identity shared across FE control and BE execution processes.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConnectorExecutionBindingKey {
-    pub instance_id: ConnectorInstanceId,
-    pub incarnation: ConnectorInstanceIncarnation,
-}
 
 /// Provider-private bytes for one leaf of a prepared local scan set.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -506,11 +499,11 @@ impl ConnectorExecutionBinding {
     }
 }
 
-/// Startup-composed provider factory. Implementations use only local process
-/// bindings for credentials and clients; declaration payloads are opaque,
-/// bounded facts from the control plane.
+/// Startup-composed provider factory. Implementations receive a validated,
+/// credential-free domain declaration and use only local process bindings for
+/// credentials and clients.
 pub trait ConnectorExecutionInstaller: Send + Sync {
-    fn provider_id(&self) -> &ConnectorProviderId;
+    fn provider_kind(&self) -> ConnectorExecutionProviderKind;
 
     fn install(
         &self,
