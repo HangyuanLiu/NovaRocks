@@ -25,8 +25,8 @@ use std::time::Instant;
 
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
-    ConnectorExecutionDistribution, ConnectorExecutionProviderKind, ConnectorInstanceDescriptor,
-    ConnectorInstanceIncarnation, ConnectorRequestContext,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
+    ConnectorRequestContext,
 };
 
 const DEFAULT_ACCESS_BINDING: &str = "default";
@@ -66,10 +66,6 @@ impl IcebergInstanceDistribution {
 }
 
 impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
-    fn provider_kind(&self) -> ConnectorExecutionProviderKind {
-        ConnectorExecutionProviderKind::Iceberg
-    }
-
     fn declaration(
         &self,
         context: &ConnectorRequestContext,

@@ -754,7 +754,7 @@ impl ConnectorControlHost {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorWriteLease, ConnectorError> {
-        let (write, distribution, key) = {
+        let (write, provider_id, distribution, key) = {
             let mut state = self.lock_state()?;
             let key = state.active.get(instance_id).cloned().ok_or_else(|| {
                 ConnectorError::new(
@@ -783,15 +783,17 @@ impl ConnectorControlHost {
                     "connector control generation has no distributed write capability",
                 )
             })?;
+            let provider_id = generation.binding.descriptor().provider_id.clone();
             let distribution = generation.binding.execution_distribution().clone();
             generation.write_leases = generation.write_leases.saturating_add(1);
-            (write, distribution, key)
+            (write, provider_id, distribution, key)
         };
         let state = Arc::downgrade(&self.state);
         let retirement_sink = Arc::downgrade(&self.retirement_sink);
         ConnectorWriteLease::new_with_execution_distribution(
             key.clone(),
             write,
+            provider_id,
             distribution,
             move || release_lease(&state, &retirement_sink, key, LeaseKind::Write),
         )
@@ -1534,10 +1536,6 @@ pub(crate) mod tests {
     }
 
     impl ConnectorExecutionDistribution for TestControl {
-        fn provider_kind(&self) -> novarocks_spi::connector::ConnectorExecutionProviderKind {
-            novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
-        }
-
         fn declaration(
             &self,
             _context: &novarocks_spi::connector::ConnectorRequestContext,

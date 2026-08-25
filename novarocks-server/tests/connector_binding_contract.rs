@@ -17,11 +17,10 @@
 
 use novarocks_backend::connector::binding_decode::decode_connector_execution_declaration;
 use novarocks_frontend::encode_connector_execution_declaration;
-use novarocks_protocol::provider::connector_execution_binding_declaration_digest;
 use novarocks_spi::connector::ConnectorExecutionDeclaration;
 
 #[test]
-fn production_adapters_preserve_closed_domain_declarations_and_wire_digest() {
+fn production_adapters_preserve_closed_domain_declarations_and_admitted_digest() {
     let declarations = [
         ConnectorExecutionDeclaration::iceberg("catalog.analytics", [7; 16], "iceberg-local")
             .expect("canonical Iceberg declaration"),
@@ -35,30 +34,34 @@ fn production_adapters_preserve_closed_domain_declarations_and_wire_digest() {
             encoded,
             encode_connector_execution_declaration(&declaration)
         );
-        let digest = connector_execution_binding_declaration_digest(&encoded)
-            .expect("generated declaration canonicalizes");
         let admitted = decode_connector_execution_declaration(encoded)
             .expect("BE accepts the real FE adapter output");
+        let admitted_again = decode_connector_execution_declaration(
+            encode_connector_execution_declaration(&declaration),
+        )
+        .expect("BE accepts a repeated real FE adapter output");
         assert_eq!(admitted.declaration(), &declaration);
-        assert_eq!(admitted.digest(), digest);
+        assert_eq!(admitted.digest(), admitted_again.digest());
     }
 }
 
 #[test]
-fn canonical_wire_digest_distinguishes_provider_binding_and_generation() {
+fn admitted_digest_distinguishes_provider_binding_and_generation() {
     let first =
         ConnectorExecutionDeclaration::iceberg("catalog", [7; 16], "first").expect("declaration");
+    let changed_provider =
+        ConnectorExecutionDeclaration::starrocks("catalog", [7; 16], "first").expect("declaration");
     let changed_binding =
         ConnectorExecutionDeclaration::iceberg("catalog", [7; 16], "second").expect("declaration");
     let changed_generation =
         ConnectorExecutionDeclaration::iceberg("catalog", [8; 16], "first").expect("declaration");
 
     let digest = |declaration: &ConnectorExecutionDeclaration| {
-        connector_execution_binding_declaration_digest(&encode_connector_execution_declaration(
-            declaration,
-        ))
-        .expect("generated declaration canonicalizes")
+        decode_connector_execution_declaration(encode_connector_execution_declaration(declaration))
+            .expect("BE accepts real FE adapter output")
+            .digest()
     };
+    assert_ne!(digest(&first), digest(&changed_provider));
     assert_ne!(digest(&first), digest(&changed_binding));
     assert_ne!(digest(&first), digest(&changed_generation));
 }

@@ -469,10 +469,6 @@ impl ConnectorScanPlanning for InsertTestControl {
 }
 
 impl ConnectorExecutionDistribution for InsertTestControl {
-    fn provider_kind(&self) -> novarocks_spi::connector::ConnectorExecutionProviderKind {
-        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
-    }
-
     fn declaration(
         &self,
         _context: &novarocks_spi::connector::ConnectorRequestContext,

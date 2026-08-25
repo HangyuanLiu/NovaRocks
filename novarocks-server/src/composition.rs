@@ -55,14 +55,14 @@ use novarocks_frontend::{
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
 use novarocks_spi::connector::{
     ConnectorControlFactory, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionInstaller, ConnectorRequestContext, ConnectorTableMetadata,
-    MvCreatedTargetObservation, MvLakeDescriptorProjection, MvLakePackageObservation,
-    MvLakePublicationObservation, MvMaintenanceMetadataObservation, MvObservedField,
-    MvObservedMaintenancePolicy, MvObservedPartitionField, MvObservedPartitionSpec,
-    MvObservedPartitionTransform, MvObservedRefreshMarker, MvObservedSnapshot,
-    MvPublishedBaseObservation, MvPublishedRefreshObservation, MvPublishedRefreshTechnique,
-    MvRefreshBaseObservation, MvRefreshTargetObservation, MvSchemaValidationObservation,
-    MvStorageObservationPort, WriteCommitEvidenceLimits,
+    ConnectorExecutionInstaller, ConnectorExecutionProviderKind, ConnectorRequestContext,
+    ConnectorTableMetadata, MvCreatedTargetObservation, MvLakeDescriptorProjection,
+    MvLakePackageObservation, MvLakePublicationObservation, MvMaintenanceMetadataObservation,
+    MvObservedField, MvObservedMaintenancePolicy, MvObservedPartitionField,
+    MvObservedPartitionSpec, MvObservedPartitionTransform, MvObservedRefreshMarker,
+    MvObservedSnapshot, MvPublishedBaseObservation, MvPublishedRefreshObservation,
+    MvPublishedRefreshTechnique, MvRefreshBaseObservation, MvRefreshTargetObservation,
+    MvSchemaValidationObservation, MvStorageObservationPort, WriteCommitEvidenceLimits,
 };
 use novarocks_spi::state_store::{
     MAX_KEY_BYTES, StateStoreProviderAccessMode, StateStoreProviderDescriptor,
@@ -371,20 +371,17 @@ pub fn compose_backend_execution_installers(
         vec![std::sync::Arc::new(IcebergConnectorInstaller::new(
             iceberg_resources,
         ))];
-    let expected = novarocks_spi::connector::ConnectorProviderId::parse(
-        novarocks_connector_iceberg::PROVIDER_ID,
-    )
-    .map_err(|error| anyhow::anyhow!("invalid composed provider ID: {error}"))?;
+    let expected = ConnectorExecutionProviderKind::Iceberg;
     let mut installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
         vec![std::sync::Arc::new(StarRocksExecutionInstaller::new(
             StarRocksExecutionBindings::new(),
         ))];
     for installer in &iceberg_installers {
-        if installer.provider_id() != &expected {
+        if installer.provider_kind() != expected {
             anyhow::bail!(
-                "composed connector execution installer has provider `{}`; expected `{}`",
-                installer.provider_id().as_str(),
-                expected.as_str()
+                "composed connector execution installer has kind {:?}; expected {:?}",
+                installer.provider_kind(),
+                expected
             );
         }
     }
@@ -1062,6 +1059,7 @@ mod tests {
         compose_backend_execution_installers, compose_frontend_control_factories,
         run_all_in_one_until,
     };
+    use novarocks_spi::connector::ConnectorExecutionProviderKind;
 
     #[test]
     fn all_in_one_report_listener_preserves_the_backend_address_family() {
@@ -1110,7 +1108,8 @@ mod tests {
         assert_eq!(
             installers
                 .iter()
-                .filter(|installer| installer.provider_id() == &iceberg)
+                .filter(|installer| installer.provider_kind()
+                    == ConnectorExecutionProviderKind::Iceberg)
                 .count(),
             1
         );

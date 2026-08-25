@@ -33,8 +33,8 @@ use crate::fragment::decode::request::decode_native_query_execution_id;
 
 // Design: ADR-0105 (docs/adr/ADR-0105-wire-authority-and-domain-carrier-separation.md)
 /// Backend-local result of wire validation. The digest is deliberately made
-/// from the original generated DTO before it is translated into the SPI domain
-/// declaration; the execution Host never recomputes a wire identity.
+/// from the original generated DTO only after it has been translated into the
+/// SPI domain declaration; the execution Host never recomputes a wire identity.
 #[derive(Clone, Debug)]
 pub struct AdmittedConnectorExecutionDeclaration {
     digest: [u8; 32],
@@ -79,7 +79,7 @@ pub(crate) fn decode_ensure_request(
         invalid_declaration("connector execution binding request is missing declaration")
     })?;
     let declaration = decode_connector_execution_declaration(declaration)
-        .map_err(|_| invalid_declaration("invalid connector execution declaration"))?;
+        .map_err(|detail| invalid_declaration(&detail))?;
     Ok((execution_id, declaration))
 }
 
@@ -91,27 +91,35 @@ pub(crate) fn decode_ensure_request(
 pub fn decode_connector_execution_declaration(
     raw: novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration,
 ) -> Result<AdmittedConnectorExecutionDeclaration, String> {
-    let digest = connector_execution_binding_declaration_digest(&raw)
-        .map_err(|_| "cannot canonicalize connector execution declaration".to_string())?;
     let incarnation: [u8; 16] = raw
         .incarnation
         .as_slice()
         .try_into()
         .map_err(|_| "connector execution declaration has invalid incarnation".to_string())?;
-    let declaration = match raw.provider {
+    let declaration = match raw.provider.as_ref() {
         Some(
             novarocks_protocol::novarocks::connector_execution_binding_declaration::Provider::Iceberg(
                 provider,
             ),
-        ) => ConnectorExecutionDeclaration::iceberg(&raw.instance_id, incarnation, provider.access_binding),
+        ) => ConnectorExecutionDeclaration::iceberg(
+            &raw.instance_id,
+            incarnation,
+            &provider.access_binding,
+        ),
         Some(
             novarocks_protocol::novarocks::connector_execution_binding_declaration::Provider::Starrocks(
                 provider,
             ),
-        ) => ConnectorExecutionDeclaration::starrocks(&raw.instance_id, incarnation, provider.local_binding),
+        ) => ConnectorExecutionDeclaration::starrocks(
+            &raw.instance_id,
+            incarnation,
+            &provider.local_binding,
+        ),
         None => return Err("connector execution declaration has no provider".to_string()),
     }
     .map_err(|_| "connector execution declaration is invalid".to_string())?;
+    let digest = connector_execution_binding_declaration_digest(&raw)
+        .map_err(|_| "cannot canonicalize connector execution declaration".to_string())?;
     Ok(AdmittedConnectorExecutionDeclaration {
         digest,
         declaration,
@@ -157,6 +165,24 @@ fn invalid_declaration(detail: &str) -> EnsureConnectorExecutionBindingResult {
 mod tests {
     use super::*;
 
+    fn iceberg_declaration(
+        instance_id: impl Into<String>,
+        incarnation: Vec<u8>,
+        access_binding: impl Into<String>,
+    ) -> novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+        novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+            instance_id: instance_id.into(),
+            incarnation,
+            provider: Some(
+                novarocks_protocol::novarocks::connector_execution_binding_declaration::Provider::Iceberg(
+                    novarocks_protocol::novarocks::IcebergExecutionBindingDeclaration {
+                        access_binding: access_binding.into(),
+                    },
+                ),
+            ),
+        }
+    }
+
     #[test]
     fn ensure_request_rejects_missing_typed_declaration() {
         let result = decode_ensure_request(EnsureConnectorExecutionBindingRequest {
@@ -171,19 +197,103 @@ mod tests {
 
     #[test]
     fn wire_declaration_rejects_noncanonical_instance_id() {
+        let result = decode_connector_execution_declaration(iceberg_declaration(
+            "MyCatalog",
+            vec![7; 16],
+            "local",
+        ));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn admitted_digest_is_calculated_from_the_successfully_validated_raw_dto() {
+        let raw = iceberg_declaration("catalog", vec![7; 16], "local");
+        let expected = connector_execution_binding_declaration_digest(&raw)
+            .expect("test declaration canonicalizes");
+
+        let admitted =
+            decode_connector_execution_declaration(raw).expect("valid raw declaration is admitted");
+
+        assert_eq!(admitted.digest(), expected);
+    }
+
+    #[test]
+    fn wire_declaration_rejects_invalid_incarnation_length() {
+        let result = decode_connector_execution_declaration(iceberg_declaration(
+            "catalog",
+            vec![7; 15],
+            "local",
+        ));
+
+        assert_eq!(
+            result.unwrap_err(),
+            "connector execution declaration has invalid incarnation"
+        );
+    }
+
+    #[test]
+    fn wire_declaration_rejects_missing_provider_oneof() {
         let result = decode_connector_execution_declaration(
             novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
-                instance_id: "MyCatalog".to_string(),
+                instance_id: "catalog".to_string(),
                 incarnation: vec![7; 16],
-                provider: Some(
-                    novarocks_protocol::novarocks::connector_execution_binding_declaration::Provider::Iceberg(
-                        novarocks_protocol::novarocks::IcebergExecutionBindingDeclaration {
-                            access_binding: "local".to_string(),
-                        },
-                    ),
-                ),
+                provider: None,
             },
         );
-        assert!(result.is_err());
+
+        assert_eq!(
+            result.unwrap_err(),
+            "connector execution declaration has no provider"
+        );
+    }
+
+    #[test]
+    fn wire_declaration_rejects_oversized_provider_binding() {
+        let result = decode_connector_execution_declaration(iceberg_declaration(
+            "catalog",
+            vec![7; 16],
+            "x".repeat(257),
+        ));
+
+        assert_eq!(
+            result.unwrap_err(),
+            "connector execution declaration is invalid"
+        );
+    }
+
+    #[test]
+    fn ensure_request_preserves_safe_declaration_failure_detail() {
+        let result = decode_ensure_request(EnsureConnectorExecutionBindingRequest {
+            execution_id: Some(novarocks_protocol::novarocks::QueryExecutionId {
+                query_id: Some(novarocks_protocol::common::UniqueId { hi: 7, lo: 9 }),
+                attempt_id: 1,
+            }),
+            declaration: Some(
+                novarocks_protocol::novarocks::ConnectorExecutionBindingDeclaration {
+                    instance_id: "catalog".to_string(),
+                    incarnation: vec![7; 16],
+                    provider: None,
+                },
+            ),
+        })
+        .expect_err("missing provider must reject admission");
+
+        match result.outcome() {
+            novarocks_protocol::provider::EnsureConnectorExecutionBindingOutcome::Rejected(
+                rejection,
+            ) => {
+                assert_eq!(
+                    rejection.reason(),
+                    EnsureConnectorExecutionBindingRejectionReason::InvalidDeclaration
+                );
+                assert_eq!(
+                    rejection.safe_detail(),
+                    "connector execution declaration has no provider"
+                );
+            }
+            novarocks_protocol::provider::EnsureConnectorExecutionBindingOutcome::Ensured => {
+                panic!("missing provider must not be ensured")
+            }
+        }
     }
 }

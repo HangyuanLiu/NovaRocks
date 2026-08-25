@@ -679,8 +679,7 @@ impl ConnectorDistributedRewriteLease {
     ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
         let declaration = self.distribution.declaration(context)?;
         let key = declaration.binding_key();
-        if declaration.provider_kind() != self.distribution.provider_kind()
-            || declaration.provider_id() != self.descriptor.provider_id.as_str()
+        if declaration.provider_id() != self.descriptor.provider_id.as_str()
             || key.instance_id != self.descriptor.instance_id
             || key.incarnation != self.key.incarnation
         {
@@ -791,6 +790,7 @@ impl ConnectorDistributedRewriteLease {
         ConnectorWriteLease::new_with_execution_distribution(
             self.key.clone(),
             self.write.clone(),
+            self.descriptor.provider_id.clone(),
             self.distribution.clone(),
             move || drop(retained),
         )

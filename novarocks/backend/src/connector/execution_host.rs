@@ -28,8 +28,8 @@ use novarocks_protocol::provider::{
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
-    ConnectorExecutionResolver, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorExecutionProviderKind, ConnectorExecutionResolver, ConnectorRequestContext,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
 use super::binding_decode::AdmittedConnectorExecutionDeclaration;
@@ -46,7 +46,7 @@ pub struct ConnectorExecutionHost {
 }
 
 struct ExecutionHostState {
-    installers: Vec<Arc<dyn ConnectorExecutionInstaller>>,
+    installers: BTreeMap<ConnectorExecutionProviderKind, Arc<dyn ConnectorExecutionInstaller>>,
     bindings: BTreeMap<ConnectorExecutionBindingKey, Arc<BindingCell>>,
     retiring: BTreeSet<ConnectorExecutionBindingKey>,
     query_leases: BTreeMap<QueryExecutionId, BTreeSet<ConnectorExecutionBindingKey>>,
@@ -216,29 +216,27 @@ impl ConnectorExecutionHost {
     pub fn try_new(
         installers: impl IntoIterator<Item = Arc<dyn ConnectorExecutionInstaller>>,
     ) -> Result<Self, ConnectorError> {
-        let installers: Vec<_> = installers.into_iter().collect();
-        for expected in ["iceberg", "starrocks"] {
-            if installers
-                .iter()
-                .filter(|installer| installer.provider_id().as_str() == expected)
-                .count()
-                != 1
-            {
+        let mut sealed_installers = BTreeMap::new();
+        for installer in installers {
+            let kind = installer.provider_kind();
+            if sealed_installers.insert(kind, installer).is_some() {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
-                    format!("startup installer set must contain exactly one {expected} installer"),
+                    format!("startup installer set contains duplicate {kind:?} installer"),
                 ));
             }
         }
-        if installers.len() != 2 {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "startup installer set contains an unknown connector provider kind",
-            ));
+        for kind in ConnectorExecutionProviderKind::ALL {
+            if !sealed_installers.contains_key(&kind) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("startup installer set is missing {kind:?} installer"),
+                ));
+            }
         }
         Ok(Self {
             state: Arc::new(Mutex::new(ExecutionHostState {
-                installers,
+                installers: sealed_installers,
                 bindings: BTreeMap::new(),
                 retiring: BTreeSet::new(),
                 query_leases: BTreeMap::new(),
@@ -251,7 +249,7 @@ impl ConnectorExecutionHost {
     pub(crate) fn empty_for_tests() -> Self {
         Self {
             state: Arc::new(Mutex::new(ExecutionHostState {
-                installers: Vec::new(),
+                installers: BTreeMap::new(),
                 bindings: BTreeMap::new(),
                 retiring: BTreeSet::new(),
                 query_leases: BTreeMap::new(),
@@ -294,11 +292,7 @@ impl ConnectorExecutionHost {
                 if let Err(rejection) = ensure_admissible(&state, query, &key) {
                     return rejected(rejection);
                 }
-                let Some(installer) = state
-                    .installers
-                    .iter()
-                    .find(|installer| installer.provider_id().as_str() == declaration.provider_id())
-                    .cloned()
+                let Some(installer) = state.installers.get(&declaration.provider_kind()).cloned()
                 else {
                     return rejected(host_unavailable(
                         "connector execution provider is not installed",
@@ -379,7 +373,8 @@ impl ConnectorExecutionHost {
         }
         match installed {
             Ok(binding)
-                if binding.key() == key && binding.provider_id() == installer.provider_id() =>
+                if binding.key() == key
+                    && binding.provider_id().as_str() == declaration.provider_id() =>
             {
                 Completion::Ready(Arc::new(binding))
             }
@@ -763,14 +758,15 @@ mod tests {
     }
 
     struct TestInstaller {
+        provider_kind: ConnectorExecutionProviderKind,
         provider_id: ConnectorProviderId,
         installs: Arc<AtomicUsize>,
         error: Option<ConnectorError>,
     }
 
     impl ConnectorExecutionInstaller for TestInstaller {
-        fn provider_id(&self) -> &ConnectorProviderId {
-            &self.provider_id
+        fn provider_kind(&self) -> ConnectorExecutionProviderKind {
+            self.provider_kind
         }
         fn install(
             &self,
@@ -791,12 +787,14 @@ mod tests {
     }
 
     fn installer(
-        provider: &str,
+        provider_kind: ConnectorExecutionProviderKind,
         installs: Arc<AtomicUsize>,
         error: Option<ConnectorError>,
     ) -> Arc<dyn ConnectorExecutionInstaller> {
         Arc::new(TestInstaller {
-            provider_id: ConnectorProviderId::parse(provider).expect("provider ID"),
+            provider_kind,
+            provider_id: ConnectorProviderId::parse(provider_kind.provider_id())
+                .expect("provider ID"),
             installs,
             error,
         })
@@ -804,8 +802,12 @@ mod tests {
 
     fn host(installs: Arc<AtomicUsize>, error: Option<ConnectorError>) -> ConnectorExecutionHost {
         ConnectorExecutionHost::try_new([
-            installer("iceberg", installs, error),
-            installer("starrocks", Arc::new(AtomicUsize::new(0)), None),
+            installer(ConnectorExecutionProviderKind::Iceberg, installs, error),
+            installer(
+                ConnectorExecutionProviderKind::StarRocks,
+                Arc::new(AtomicUsize::new(0)),
+                None,
+            ),
         ])
         .expect("complete installer set")
     }
@@ -843,13 +845,21 @@ mod tests {
     fn sealed_set_rejects_missing_and_duplicate_installers() {
         let installs = Arc::new(AtomicUsize::new(0));
         assert!(
-            ConnectorExecutionHost::try_new([installer("iceberg", Arc::clone(&installs), None,)])
-                .is_err()
+            ConnectorExecutionHost::try_new([installer(
+                ConnectorExecutionProviderKind::Iceberg,
+                Arc::clone(&installs),
+                None,
+            )])
+            .is_err()
         );
         assert!(
             ConnectorExecutionHost::try_new([
-                installer("iceberg", Arc::clone(&installs), None),
-                installer("iceberg", installs, None),
+                installer(
+                    ConnectorExecutionProviderKind::Iceberg,
+                    Arc::clone(&installs),
+                    None
+                ),
+                installer(ConnectorExecutionProviderKind::Iceberg, installs, None),
             ])
             .is_err()
         );

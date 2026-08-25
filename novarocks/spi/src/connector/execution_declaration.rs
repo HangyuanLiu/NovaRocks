@@ -25,13 +25,15 @@ use super::{
 const MAX_LOCAL_BINDING_BYTES: usize = 256;
 
 /// The closed provider variant carried by an execution declaration.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ConnectorExecutionProviderKind {
     Iceberg,
     StarRocks,
 }
 
 impl ConnectorExecutionProviderKind {
+    pub const ALL: [Self; 2] = [Self::Iceberg, Self::StarRocks];
+
     pub const fn provider_id(self) -> &'static str {
         match self {
             Self::Iceberg => "iceberg",
@@ -61,6 +63,24 @@ impl ConnectorExecutionBindingKey {
 enum ConnectorExecutionBindingProvider {
     Iceberg { access_binding: Arc<str> },
     StarRocks { local_binding: Arc<str> },
+}
+
+/// Borrowed, transport-neutral provider facts from a validated execution
+/// declaration.  Consumers must match this closed enum rather than infer a
+/// provider from an identifier string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorExecutionDeclarationProvider<'a> {
+    Iceberg { access_binding: &'a str },
+    StarRocks { local_binding: &'a str },
+}
+
+impl ConnectorExecutionDeclarationProvider<'_> {
+    pub const fn kind(self) -> ConnectorExecutionProviderKind {
+        match self {
+            Self::Iceberg { .. } => ConnectorExecutionProviderKind::Iceberg,
+            Self::StarRocks { .. } => ConnectorExecutionProviderKind::StarRocks,
+        }
+    }
 }
 
 impl ConnectorExecutionBindingProvider {
@@ -130,6 +150,17 @@ impl ConnectorExecutionDeclaration {
         &self.binding_key
     }
 
+    pub fn provider(&self) -> ConnectorExecutionDeclarationProvider<'_> {
+        match &self.provider {
+            ConnectorExecutionBindingProvider::Iceberg { access_binding } => {
+                ConnectorExecutionDeclarationProvider::Iceberg { access_binding }
+            }
+            ConnectorExecutionBindingProvider::StarRocks { local_binding } => {
+                ConnectorExecutionDeclarationProvider::StarRocks { local_binding }
+            }
+        }
+    }
+
     pub const fn provider_kind(&self) -> ConnectorExecutionProviderKind {
         self.provider.kind()
     }
@@ -171,7 +202,10 @@ fn bounded_binding(value: &str) -> Result<Arc<str>, ConnectorError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnectorExecutionDeclaration, ConnectorExecutionProviderKind};
+    use super::{
+        ConnectorExecutionDeclaration, ConnectorExecutionDeclarationProvider,
+        ConnectorExecutionProviderKind,
+    };
 
     #[test]
     fn constructors_validate_canonical_identity_and_local_binding() {
@@ -187,5 +221,11 @@ mod tests {
             ConnectorExecutionProviderKind::Iceberg
         );
         assert_eq!(declaration.provider_id(), "iceberg");
+        assert!(matches!(
+            declaration.provider(),
+            ConnectorExecutionDeclarationProvider::Iceberg {
+                access_binding: "local"
+            }
+        ));
     }
 }

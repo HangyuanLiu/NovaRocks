@@ -892,22 +892,28 @@ mod tests {
 
     struct TestDistribution {
         key: ConnectorExecutionBindingKey,
+        provider_kind: ConnectorExecutionProviderKind,
     }
 
     impl ConnectorExecutionDistribution for TestDistribution {
-        fn provider_kind(&self) -> ConnectorExecutionProviderKind {
-            ConnectorExecutionProviderKind::Iceberg
-        }
-
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,
         ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-            ConnectorExecutionDeclaration::iceberg(
-                self.key.instance_id.as_str(),
-                self.key.incarnation.to_bytes(),
-                "session-test-binding",
-            )
+            match self.provider_kind {
+                ConnectorExecutionProviderKind::Iceberg => ConnectorExecutionDeclaration::iceberg(
+                    self.key.instance_id.as_str(),
+                    self.key.incarnation.to_bytes(),
+                    "session-test-binding",
+                ),
+                ConnectorExecutionProviderKind::StarRocks => {
+                    ConnectorExecutionDeclaration::starrocks(
+                        self.key.instance_id.as_str(),
+                        self.key.incarnation.to_bytes(),
+                        "session-test-binding",
+                    )
+                }
+            }
             .map_err(|error| {
                 ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
             })
@@ -1102,12 +1108,44 @@ mod tests {
         ConnectorWriteLease::new_with_execution_distribution(
             key.clone(),
             control,
-            Arc::new(TestDistribution { key }),
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            Arc::new(TestDistribution {
+                key,
+                provider_kind: ConnectorExecutionProviderKind::Iceberg,
+            }),
             move || {
                 release_calls.fetch_add(1, Ordering::SeqCst);
             },
         )
         .expect("exact write lease")
+    }
+
+    #[test]
+    fn write_lease_rejects_execution_declaration_from_another_provider() {
+        let key = owner();
+        let control: Arc<dyn ConnectorWriteControl> = Arc::new(TestControl {
+            key: key.clone(),
+            plan_calls: Arc::new(AtomicUsize::new(0)),
+            commit_calls: Arc::new(AtomicUsize::new(0)),
+            abort_calls: Arc::new(AtomicUsize::new(0)),
+            fence_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let lease = ConnectorWriteLease::new_with_execution_distribution(
+            key.clone(),
+            control,
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            Arc::new(TestDistribution {
+                key,
+                provider_kind: ConnectorExecutionProviderKind::StarRocks,
+            }),
+            || {},
+        )
+        .expect("exact write lease");
+
+        let error = lease
+            .execution_declaration(&context())
+            .expect_err("a declaration from another provider must be rejected");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
 
     fn fence(

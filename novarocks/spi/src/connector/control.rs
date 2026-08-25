@@ -23,7 +23,7 @@ use super::{
     ConnectorCtasStagedPublication, ConnectorCtasStagedPublicationLease, ConnectorDataMutation,
     ConnectorDataMutationResolver, ConnectorDistributedRewrite,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionProviderKind,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
     ConnectorHistoricalCtasStagedPublicationRecovery, ConnectorHistoricalDataMutationRecovery,
     ConnectorHistoricalMaintenanceRecovery, ConnectorHistoricalMaintenanceResolver,
     ConnectorHistoricalWriteRecovery, ConnectorInstanceDescriptor, ConnectorInstanceId,
@@ -57,8 +57,6 @@ pub trait ConnectorScanPlanning: Send + Sync {
 /// FE-only capability that turns a logical control binding into the typed
 /// Protocol declaration accepted by a BE execution installer.
 pub trait ConnectorExecutionDistribution: Send + Sync {
-    fn provider_kind(&self) -> ConnectorExecutionProviderKind;
-
     fn declaration(
         &self,
         context: &ConnectorRequestContext,
@@ -915,8 +913,7 @@ impl ConnectorControlBinding {
     ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
         let declaration = self.distribution.declaration(context)?;
         let key = declaration.binding_key();
-        if declaration.provider_kind() != self.distribution.provider_kind()
-            || declaration.provider_id() != self.descriptor.provider_id.as_str()
+        if declaration.provider_id() != self.descriptor.provider_id.as_str()
             || key.instance_id != self.descriptor.instance_id
             || key.incarnation != self.incarnation
         {
@@ -1009,11 +1006,16 @@ impl ConnectorControlPlanningLease {
             )
         })?;
         let distribution = self.binding.execution_distribution().clone();
+        let provider_id = self.binding.descriptor().provider_id.clone();
         let key = write.binding_key().clone();
         let retained_planning_lease = self.clone();
-        ConnectorWriteLease::new_with_execution_distribution(key, write, distribution, move || {
-            drop(retained_planning_lease)
-        })
+        ConnectorWriteLease::new_with_execution_distribution(
+            key,
+            write,
+            provider_id,
+            distribution,
+            move || drop(retained_planning_lease),
+        )
         .map(|lease| lease.with_metadata(Arc::clone(&self.binding.metadata)))
     }
 

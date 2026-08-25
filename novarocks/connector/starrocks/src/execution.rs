@@ -23,10 +23,10 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
-    ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
-    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorRequestContext, ConnectorScanUnitDomainFacts,
-    ConnectorScanUnitFactsMissingReason, ConnectorSplit,
+    ConnectorExecutionProviderKind, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
+    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext,
+    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason, ConnectorSplit,
 };
 
 use crate::STARROCKS_PROVIDER_ID;
@@ -142,8 +142,8 @@ impl StarRocksExecutionInstaller {
 }
 
 impl ConnectorExecutionInstaller for StarRocksExecutionInstaller {
-    fn provider_id(&self) -> &ConnectorProviderId {
-        &self.provider_id
+    fn provider_kind(&self) -> ConnectorExecutionProviderKind {
+        ConnectorExecutionProviderKind::StarRocks
     }
 
     fn install(

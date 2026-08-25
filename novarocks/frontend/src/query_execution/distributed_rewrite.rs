@@ -738,10 +738,6 @@ mod tests {
         key: ConnectorExecutionBindingKey,
     }
     impl ConnectorExecutionDistribution for TestDistribution {
-        fn provider_kind(&self) -> novarocks_spi::connector::ConnectorExecutionProviderKind {
-            novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
-        }
-
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,

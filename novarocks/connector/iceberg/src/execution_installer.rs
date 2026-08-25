@@ -24,10 +24,10 @@ use std::time::Instant;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
-    ConnectorInstanceId, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
-    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
-    ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext,
-    ConnectorScanUnitDomainFacts, ConnectorSplit,
+    ConnectorExecutionProviderKind, ConnectorInstanceId, ConnectorOpenReaderRequest,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
+    ConnectorPreparedScanUnitSet, ConnectorProviderId, ConnectorReadExecution,
+    ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorSplit,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -69,8 +69,8 @@ impl IcebergConnectorInstaller {
 }
 
 impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
-    fn provider_id(&self) -> &ConnectorProviderId {
-        &self.provider_id
+    fn provider_kind(&self) -> ConnectorExecutionProviderKind {
+        ConnectorExecutionProviderKind::Iceberg
     }
 
     fn install(

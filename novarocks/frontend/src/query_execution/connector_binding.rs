@@ -245,9 +245,7 @@ pub(crate) fn compile_install_plan(
                             "scheduled connector split has no prepared read for fragment {fragment_id} node {node_id}"
                         ))
                     })?;
-                let instance_id =
-                    ConnectorInstanceId::parse(read.declaration.binding_key().instance_id())
-                        .expect("Protocol validates canonical execution binding instance IDs");
+                let instance_id = read.declaration.binding_key().instance_id.clone();
                 match entry.1.get(&instance_id) {
                     Some(existing) if existing != &read.declaration => {
                         return Err(contract_error(format!(
@@ -267,8 +265,7 @@ pub(crate) fn compile_install_plan(
 
     for attachment in connector_write_plans.values() {
         let declaration = attachment.execution_declaration();
-        let instance_id = ConnectorInstanceId::parse(declaration.binding_key().instance_id())
-            .expect("Protocol validates canonical execution binding instance IDs");
+        let instance_id = declaration.binding_key().instance_id.clone();
         for writer in attachment.manifest().writers() {
             let fragment_id = u32::try_from(writer.fragment_id()).map_err(|_| {
                 contract_error("connector writer manifest contains a negative fragment ID")

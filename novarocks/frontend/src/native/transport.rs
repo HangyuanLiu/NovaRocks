@@ -39,6 +39,7 @@ use novarocks_protocol::provider::{
     EnsureConnectorExecutionBindingOutcome, EnsureConnectorExecutionBindingResult,
     RetireConnectorExecutionBindingOutcome, RetireConnectorExecutionBindingResult,
 };
+use novarocks_spi::connector::ConnectorExecutionDeclarationProvider;
 use novarocks_types::{UniqueId, format_host_for_url};
 
 use super::data_runtime::FrontendDataRuntime;
@@ -63,21 +64,17 @@ pub fn encode_connector_execution_declaration(
     declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
 ) -> ConnectorExecutionBindingDeclaration {
     let binding_key = declaration.binding_key();
-    let provider = match (
-        declaration.iceberg_access_binding(),
-        declaration.starrocks_local_binding(),
-    ) {
-        (Some(access_binding), None) => {
+    let provider = match declaration.provider() {
+        ConnectorExecutionDeclarationProvider::Iceberg { access_binding } => {
             ConnectorExecutionBindingProvider::Iceberg(IcebergExecutionBindingDeclaration {
                 access_binding: access_binding.to_string(),
             })
         }
-        (None, Some(local_binding)) => {
+        ConnectorExecutionDeclarationProvider::StarRocks { local_binding } => {
             ConnectorExecutionBindingProvider::Starrocks(StarRocksExecutionBindingDeclaration {
                 local_binding: local_binding.to_string(),
             })
         }
-        _ => unreachable!("validated connector execution declaration has an invalid provider"),
     };
     ConnectorExecutionBindingDeclaration {
         instance_id: binding_key.instance_id.as_str().to_string(),

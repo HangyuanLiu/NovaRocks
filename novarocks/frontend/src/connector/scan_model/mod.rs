@@ -715,10 +715,6 @@ struct FixtureDistribution {
 }
 
 impl ConnectorExecutionDistribution for FixtureDistribution {
-    fn provider_kind(&self) -> ConnectorExecutionProviderKind {
-        ConnectorExecutionProviderKind::Iceberg
-    }
-
     fn declaration(
         &self,
         context: &ConnectorRequestContext,

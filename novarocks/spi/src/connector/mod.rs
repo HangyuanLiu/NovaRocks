@@ -136,7 +136,8 @@ pub use execution::{
     MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT,
 };
 pub use execution_declaration::{
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionProviderKind,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
+    ConnectorExecutionDeclarationProvider, ConnectorExecutionProviderKind,
 };
 pub use external_write_fence::{
     ConnectorClusterIdentity, ConnectorExternalFenceGeneration, ConnectorExternalFenceReceipt,

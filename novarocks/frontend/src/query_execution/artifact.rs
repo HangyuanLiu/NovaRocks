@@ -2203,10 +2203,6 @@ mod tests {
     }
 
     impl ConnectorExecutionDistribution for TestWriteDistribution {
-        fn provider_kind(&self) -> novarocks_spi::connector::ConnectorExecutionProviderKind {
-            novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
-        }
-
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,
@@ -2347,6 +2343,7 @@ mod tests {
         let lease = ConnectorWriteLease::new_with_execution_distribution(
             owner.clone(),
             control,
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),
             Arc::new(TestWriteDistribution { key: owner.clone() }),
             || {},
         )

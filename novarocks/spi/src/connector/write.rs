@@ -34,9 +34,10 @@ use super::{
     ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
     ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorExternalFenceReceipt,
     ConnectorExternalFenceRequest, ConnectorExternalOperationFence, ConnectorMutationFailure,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorWriteFencing, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ConnectorWriteFencing,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 
 pub const CONNECTOR_WRITE_CONTRACT_VERSION: u32 = 1;
@@ -3160,6 +3161,7 @@ pub trait ConnectorWriteControl: Send + Sync {
 pub struct ConnectorWriteLease {
     binding_key: ConnectorExecutionBindingKey,
     control: Arc<dyn ConnectorWriteControl>,
+    execution_provider_id: Option<ConnectorProviderId>,
     execution_distribution: Option<Arc<dyn ConnectorExecutionDistribution>>,
     metadata: Option<Arc<dyn super::ConnectorMetadata>>,
     fence: Arc<Mutex<Option<ConnectorEstablishedWriteFence>>>,
@@ -3203,6 +3205,7 @@ impl ConnectorWriteLease {
         Ok(Self {
             binding_key,
             control,
+            execution_provider_id: None,
             execution_distribution: None,
             metadata: None,
             fence: Arc::new(Mutex::new(None)),
@@ -3305,10 +3308,12 @@ impl ConnectorWriteLease {
     pub fn new_with_execution_distribution(
         binding_key: ConnectorExecutionBindingKey,
         control: Arc<dyn ConnectorWriteControl>,
+        execution_provider_id: ConnectorProviderId,
         execution_distribution: Arc<dyn ConnectorExecutionDistribution>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
         let mut lease = Self::new(binding_key, control, release)?;
+        lease.execution_provider_id = Some(execution_provider_id);
         lease.execution_distribution = Some(execution_distribution);
         Ok(lease)
     }
@@ -3454,9 +3459,15 @@ impl ConnectorWriteLease {
                 "connector write lease has no execution distribution capability",
             )
         })?;
+        let provider_id = self.execution_provider_id.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "connector write lease has no retained execution provider identity",
+            )
+        })?;
         let declaration = distribution.declaration(context)?;
         let key = declaration.binding_key();
-        if declaration.provider_kind() != distribution.provider_kind() || key != &self.binding_key {
+        if declaration.provider_id() != provider_id.as_str() || key != &self.binding_key {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector write declaration does not match its retained binding generation",

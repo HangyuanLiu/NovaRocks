@@ -22,9 +22,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorOpenReaderRequest, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsSummary,
-    ConnectorSplit, ConnectorWriteExecution,
+    ConnectorExecutionDeclaration, ConnectorExecutionProviderKind, ConnectorOpenReaderRequest,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorScanUnitDomainFacts,
+    ConnectorScanUnitFactsSummary, ConnectorSplit, ConnectorWriteExecution,
 };
 
 /// A hard bound on the independently schedulable physical leaves carried by
@@ -503,7 +503,7 @@ impl ConnectorExecutionBinding {
 /// credential-free domain declaration and use only local process bindings for
 /// credentials and clients.
 pub trait ConnectorExecutionInstaller: Send + Sync {
-    fn provider_id(&self) -> &ConnectorProviderId;
+    fn provider_kind(&self) -> ConnectorExecutionProviderKind;
 
     fn install(
         &self,

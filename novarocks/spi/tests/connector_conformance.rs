@@ -569,10 +569,6 @@ struct OwnerDistribution {
 }
 
 impl ConnectorExecutionDistribution for OwnerDistribution {
-    fn provider_kind(&self) -> novarocks_spi::connector::ConnectorExecutionProviderKind {
-        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
-    }
-
     fn declaration(
         &self,
         _: &novarocks_spi::connector::ConnectorRequestContext,

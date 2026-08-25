@@ -3332,7 +3332,6 @@ dependencies = [
  "novarocks-failpoint",
  "novarocks-frontend",
  "novarocks-fs",
- "novarocks-protocol",
  "novarocks-spi",
  "novarocks-state-store-foundationdb",
  "novarocks-state-store-mysql",

@@ -23,15 +23,14 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
-    ConnectorExecutionProviderKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
-    ConnectorNamespaceRequest, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
-    ConnectorProviderId, ConnectorReadSelector, ConnectorReadSessionLease, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit,
-    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTablePlanningFacts, ConnectorTableRequest, StatisticsDataVersion,
-    validate_static_predicates,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
+    ConnectorReadSelector, ConnectorReadSessionLease, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorTableHandle,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
+    ConnectorTableRequest, StatisticsDataVersion, validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 
@@ -636,10 +635,6 @@ impl Provider {
 }
 
 impl ConnectorExecutionDistribution for Provider {
-    fn provider_kind(&self) -> ConnectorExecutionProviderKind {
-        ConnectorExecutionProviderKind::StarRocks
-    }
-
     fn declaration(
         &self,
         context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -803,8 +798,8 @@ fn unsupported_version(subject: &str, version: u16) -> ConnectorError {
 mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use novarocks_spi::connector::{
-        ConnectorBatchBudget, ConnectorCancellation, ConnectorReadSelector,
-        ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
+        ConnectorBatchBudget, ConnectorCancellation, ConnectorExecutionProviderKind,
+        ConnectorReadSelector, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
         ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
     };
     use std::num::NonZeroUsize;

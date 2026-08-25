@@ -652,10 +652,6 @@ impl ConnectorScanPlanning for FakeProvider {
 }
 
 impl ConnectorExecutionDistribution for FakeProvider {
-    fn provider_kind(&self) -> novarocks_spi::connector::ConnectorExecutionProviderKind {
-        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
-    }
-
     fn declaration(
         &self,
         _context: &ConnectorRequestContext,
