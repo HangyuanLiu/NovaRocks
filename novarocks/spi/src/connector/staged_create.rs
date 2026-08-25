@@ -2074,6 +2074,45 @@ mod tests {
     }
 
     #[test]
+    fn prepare_rejects_a_child_operation_identity_before_provider_dispatch() {
+        let (descriptor, incarnation) = owner();
+        let capability = Arc::new(FakeCapability {
+            descriptor: descriptor.clone(),
+            incarnation,
+            aborts: AtomicUsize::new(0),
+            prepares: AtomicUsize::new(0),
+            unknown_prepare: false,
+            fail_prepare: false,
+            malformed_prepare: false,
+            noop_publish: false,
+            unknown_abort: false,
+            known_uncommitted_reconcile: false,
+            binds: AtomicUsize::new(0),
+            publishes: AtomicUsize::new(0),
+        });
+        let lease = ConnectorStagedCreateLease::new(
+            ConnectorExecutionBindingKey {
+                instance_id: descriptor.instance_id,
+                incarnation,
+            },
+            capability.clone(),
+            || {},
+        )
+        .unwrap();
+        let operation_id = ConnectorStagedCreateOperationId::new();
+        let mut request = prepare_request(lease.owner().clone(), operation_id);
+        request.publication_id = LakePublicationId::new_v7();
+
+        let error = lease.prepare(request).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message(),
+            "staged-create operation ID must equal its statement publication ID"
+        );
+        assert_eq!(capability.prepares.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn prepare_dispatch_error_locks_reservation_without_redispatch() {
         let (descriptor, incarnation) = owner();
         let capability = Arc::new(FakeCapability {
