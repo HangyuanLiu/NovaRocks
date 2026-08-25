@@ -41,6 +41,7 @@ use crate::common::backend_topology::{
     BackendTopologySnapshot, BackendTopologyValidationError, HeartbeatOutcome, LiveBackendTarget,
     publish_backend_topology_metrics,
 };
+use crate::metrics::{record_backend_announce, record_backend_heartbeat};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::heartbeat as native_heartbeat;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
@@ -285,6 +286,20 @@ impl ClusterBackendService {
         descriptor: BackendProcessDescriptor,
         reported_state: BackendReportedState,
     ) -> Result<(), String> {
+        let result = self.record_announce_inner(descriptor, reported_state);
+        record_backend_announce(if result.is_ok() {
+            "accepted"
+        } else {
+            "rejected"
+        });
+        result
+    }
+
+    fn record_announce_inner(
+        &self,
+        descriptor: BackendProcessDescriptor,
+        reported_state: BackendReportedState,
+    ) -> Result<(), String> {
         if reported_state == BackendReportedState::Unspecified {
             return Err("announced backend state must be running or draining".to_string());
         }
@@ -505,6 +520,7 @@ impl ClusterBackendService {
         let mut state = self.state.lock().unwrap();
         let before = eligible_members(&state);
         let Some(announced) = state.processes.get(&process_id).cloned() else {
+            record_backend_heartbeat("unknown_process");
             return;
         };
         let exact = descriptor.as_proto() == announced.descriptor.as_proto();
@@ -556,6 +572,11 @@ impl ClusterBackendService {
         if changed {
             self.publish_snapshot();
         }
+        record_backend_heartbeat(if exact {
+            "verified"
+        } else {
+            "identity_mismatch"
+        });
     }
 
     #[cfg(test)]
@@ -567,6 +588,7 @@ impl ClusterBackendService {
         process_id: BackendProcessId,
         error: impl Into<String>,
     ) -> bool {
+        record_backend_heartbeat("failed");
         self.refresh_expired_announce_leases(std::time::Instant::now());
         let mut state = self.state.lock().unwrap();
         let before = eligible_members(&state);

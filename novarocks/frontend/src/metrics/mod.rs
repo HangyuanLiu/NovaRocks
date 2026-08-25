@@ -124,13 +124,35 @@ static BACKEND_TOPOLOGY_REVISION: Lazy<IntGauge> = Lazy::new(|| {
     .expect("register novarocks_backend_topology_revision")
 });
 
+static BACKEND_ANNOUNCE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_announce_total",
+            "Total BE self-registration announce outcomes observed by FE.",
+        ),
+        &["outcome"],
+    )
+    .expect("register novarocks_backend_announce_total")
+});
+
+static BACKEND_HEARTBEAT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_heartbeat_total",
+            "Total FE-pull BE heartbeat outcomes.",
+        ),
+        &["outcome"],
+    )
+    .expect("register novarocks_backend_heartbeat_total")
+});
+
 static PRE_READY_REPLAN_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         Opts::new(
-        "novarocks_pre_ready_replan_total",
-        "Total pre-ControlReady whole-round replans by typed topology reason.",
+            "novarocks_pre_ready_replan_total",
+            "Total pre-ControlReady whole-round replans by typed topology reason.",
         ),
-        &["reason"]
+        &["reason"],
     )
     .expect("register novarocks_pre_ready_replan_total")
 });
@@ -138,10 +160,10 @@ static PRE_READY_REPLAN_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 static PRE_READY_EFFECT_GATE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         Opts::new(
-        "novarocks_pre_ready_effect_gate_total",
-        "Total pre-ControlReady effect-gate decisions.",
+            "novarocks_pre_ready_effect_gate_total",
+            "Total pre-ControlReady effect-gate decisions.",
         ),
-        &["outcome"]
+        &["outcome"],
     )
     .expect("register novarocks_pre_ready_effect_gate_total")
 });
@@ -238,6 +260,8 @@ impl FrontendMetricsRegistry {
             Box::new(BACKEND_ENDPOINT_OWNERSHIP.clone()),
             Box::new(BACKEND_ELIGIBLE.clone()),
             Box::new(BACKEND_TOPOLOGY_REVISION.clone()),
+            Box::new(BACKEND_ANNOUNCE_TOTAL.clone()),
+            Box::new(BACKEND_HEARTBEAT_TOTAL.clone()),
             Box::new(PRE_READY_REPLAN_TOTAL.clone()),
             Box::new(PRE_READY_EFFECT_GATE_TOTAL.clone()),
             Box::new(WAITING_FOR_BACKEND_SECONDS.clone()),
@@ -276,6 +300,14 @@ pub(crate) fn observe_native_trust_transport_rejection(listener: &'static str) {
     NATIVE_TRUST_TRANSPORT_REJECTIONS
         .with_label_values(&[listener])
         .inc();
+}
+
+pub(crate) fn record_backend_announce(outcome: &'static str) {
+    BACKEND_ANNOUNCE_TOTAL.with_label_values(&[outcome]).inc();
+}
+
+pub(crate) fn record_backend_heartbeat(outcome: &'static str) {
+    BACKEND_HEARTBEAT_TOTAL.with_label_values(&[outcome]).inc();
 }
 
 pub(crate) fn record_pre_ready_replan(reason: &'static str) {
@@ -518,10 +550,8 @@ fn refresh_frontend_gauges() {
     Lazy::force(&BACKEND_ENDPOINT_OWNERSHIP);
     Lazy::force(&BACKEND_ELIGIBLE);
     Lazy::force(&BACKEND_TOPOLOGY_REVISION);
-    Lazy::force(&PRE_READY_REPLAN_TOTAL);
-    Lazy::force(&PRE_READY_EFFECT_GATE_TOTAL);
-    Lazy::force(&WAITING_FOR_BACKEND_SECONDS);
-    Lazy::force(&PRE_READY_REPLAN_SECONDS);
+    Lazy::force(&BACKEND_ANNOUNCE_TOTAL);
+    Lazy::force(&BACKEND_HEARTBEAT_TOTAL);
     Lazy::force(&PRE_READY_REPLAN_TOTAL);
     Lazy::force(&PRE_READY_EFFECT_GATE_TOTAL);
     Lazy::force(&WAITING_FOR_BACKEND_SECONDS);
@@ -546,11 +576,11 @@ fn ensure_frontend_metric_label_families() {
     for state in ["owned", "unowned", "unknown"] {
         let _ = BACKEND_ENDPOINT_OWNERSHIP.get_metric_with_label_values(&[state]);
     }
-    for reason in ["topology_changed", "topology_ineligible", "replacement_ready"] {
-        let _ = PRE_READY_REPLAN_TOTAL.get_metric_with_label_values(&[reason]);
+    for outcome in ["accepted", "rejected"] {
+        let _ = BACKEND_ANNOUNCE_TOTAL.get_metric_with_label_values(&[outcome]);
     }
-    for outcome in ["allowed", "rejected"] {
-        let _ = PRE_READY_EFFECT_GATE_TOTAL.get_metric_with_label_values(&[outcome]);
+    for outcome in ["verified", "identity_mismatch", "unknown_process", "failed"] {
+        let _ = BACKEND_HEARTBEAT_TOTAL.get_metric_with_label_values(&[outcome]);
     }
     for reason in [
         "backend_draining",
@@ -615,6 +645,8 @@ mod tests {
         assert!(body.contains("novarocks_heartbeat_rtt_seconds"));
         assert!(body.contains("novarocks_backend_registry_entries"));
         assert!(body.contains("novarocks_backend_eligible"));
+        assert!(body.contains("novarocks_backend_announce_total"));
+        assert!(body.contains("novarocks_backend_heartbeat_total"));
         assert!(body.contains("novarocks_pre_ready_replan_total"));
         assert!(body.contains("novarocks_pre_ready_effect_gate_total"));
         assert!(body.contains("novarocks_waiting_for_backend_seconds"));
