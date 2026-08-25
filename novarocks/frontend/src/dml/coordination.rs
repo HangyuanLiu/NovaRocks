@@ -1389,9 +1389,7 @@ impl ActiveDmlOperation {
         payload: &OperationPayload,
         requested: Option<i64>,
     ) -> Result<Option<i64>, DmlError> {
-        if let OperationPayload::CtasSaga(record) = payload
-            && record.is_crash_only_publication()
-        {
+        if matches!(payload, OperationPayload::CtasSaga(_)) {
             return Ok(None);
         }
         if state.is_finished() {

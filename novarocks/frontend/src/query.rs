@@ -497,7 +497,7 @@ pub struct FrontendQueryService {
 
 impl FrontendQueryService {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_recovery_bound(
+    pub(crate) fn new(
         session_catalog_resolver: SessionCatalogResolver,
         query_compiler: FrontendQueryCompiler,
         catalog_command_executor: CatalogCommandExecutor,

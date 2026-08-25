@@ -3973,14 +3973,18 @@ fn is_sha256(value: Option<&str>) -> bool {
     reason = "Preserves the frozen DML error contract without a broad ABI migration."
 )]
 fn validate_ctas_record(record: &CtasSagaRecord) -> Result<(), DmlError> {
-    let publication_id = record.prepare_operation_id;
-    if publication_id.is_nil()
-        || record.write_operation_id != publication_id
-        || record.publish_operation_id != publication_id
-        || record.abort_staging_operation_id != publication_id
-    {
+    let child_ids = [
+        record.prepare_operation_id,
+        record.write_operation_id,
+        record.publish_operation_id,
+        record.abort_staging_operation_id,
+    ];
+    let one_publication_id = child_ids.iter().all(|id| *id == child_ids[0]);
+    let legacy_distinct_ids =
+        child_ids.iter().copied().collect::<BTreeSet<_>>().len() == child_ids.len();
+    if child_ids.iter().any(Uuid::is_nil) || !(one_publication_id || legacy_distinct_ids) {
         return Err(DmlError::journal_corruption(
-            "CTAS lifecycle IDs must equal one non-nil statement publication ID",
+            "CTAS lifecycle IDs must be one publication ID or a decode-only legacy quartet",
         ));
     }
     if !matches!(

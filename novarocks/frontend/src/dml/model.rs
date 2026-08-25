@@ -2278,11 +2278,10 @@ pub struct DmlCtasRecoveryRecord {
 
 impl DmlCtasRecoveryRecord {
     pub fn requires_recovery_scan(&self) -> bool {
-        self.next_action != StatementNextAction::None
-            || matches!(
-                self.cleanup_retention,
-                DmlCtasCleanupRetention::Pending | DmlCtasCleanupRetention::ManualRetention
-            )
+        // CP-3D recovery authority was retired by LNP-1. Existing side
+        // records are decode-only quarantine evidence; they can never compel
+        // a new process to inspect or mutate a catalog generation.
+        false
     }
 }
 
@@ -3050,9 +3049,7 @@ pub fn operation_requires_recovery_scan(
     payload: &OperationPayload,
     historical_write_recovery: Option<&DmlHistoricalWriteRecoveryRecord>,
 ) -> bool {
-    if let OperationPayload::CtasSaga(record) = payload
-        && record.is_crash_only_publication()
-    {
+    if matches!(payload, OperationPayload::CtasSaga(_)) {
         return false;
     }
     if !state.is_finished() {

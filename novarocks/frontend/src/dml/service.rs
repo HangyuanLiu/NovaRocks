@@ -18,17 +18,16 @@
 use std::sync::{Arc, RwLock};
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
-use crate::query_execution::dml::ctas::CtasEngine;
 use tokio::runtime::Handle;
 
 use crate::coordination::FrontendCoordinationRuntime;
 use crate::dml::coordination::{ActiveDmlOperation, DmlCoordinator};
-use crate::dml::ctas::recovery::{CtasRecoveryProfile, CtasRecoveryProgress};
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
     CreatePreparingRequest, CreateStatementOperationRequest, DmlOperationId, DmlRecoveryCandidate,
-    StoredOperation, WriteTransactionOutcome, WriteTransactionSpec,
+    OperationPayload, OperationState, StatementNextAction, StoredOperation,
+    WriteTransactionOutcome, WriteTransactionSpec,
 };
 use crate::dml::runner::{
     ActiveWriteTransactionRunner, AlwaysAdmit, WriteAdmission, WriteExecutor,
@@ -38,7 +37,6 @@ use crate::dml::statement_recovery::{
     HistoricalDataMutationRecoveryResolver, StatementRecoveryProfile, StatementRecoveryProgress,
     direct_mutation_kind, is_authority_loss,
 };
-use crate::dml::write_recovery::HistoricalWriteRecoveryResolver;
 use crate::statistics::{FrontendStatisticsService, StatisticsColumn};
 
 /// The frontend DML application owner. Composes the narrow ports (journal +
@@ -56,8 +54,6 @@ pub struct DmlService {
     /// service without it defers statement-family recovery instead of
     /// classifying anything.
     statement_recovery: Option<StatementRecoveryProfile>,
-    ctas_recovery: RwLock<Option<Arc<dyn CtasEngine>>>,
-    ctas_write_recovery: RwLock<Option<Arc<dyn HistoricalWriteRecoveryResolver>>>,
 }
 
 #[derive(Debug)]
@@ -67,11 +63,6 @@ pub(crate) enum DmlRecoveryProgress {
         reason = "Retained for staged DML recovery and durable-journal integration."
     )]
     Statement(StatementRecoveryProgress),
-    #[allow(
-        dead_code,
-        reason = "Retained for staged DML recovery and durable-journal integration."
-    )]
-    Ctas(CtasRecoveryProgress),
 }
 
 impl DmlService {
@@ -99,8 +90,6 @@ impl DmlService {
             coordinator: None,
             allow_unfenced_focused_test_support: true,
             statement_recovery: None,
-            ctas_recovery: RwLock::new(None),
-            ctas_write_recovery: RwLock::new(None),
         }
     }
 
@@ -124,8 +113,6 @@ impl DmlService {
             coordinator: Some(DmlCoordinator::new(frontend, runtime)),
             allow_unfenced_focused_test_support: false,
             statement_recovery: None,
-            ctas_recovery: RwLock::new(None),
-            ctas_write_recovery: RwLock::new(None),
         }
     }
 
@@ -140,25 +127,6 @@ impl DmlService {
         resolver: Arc<dyn HistoricalDataMutationRecoveryResolver>,
     ) {
         self.statement_recovery = Some(StatementRecoveryProfile::new(resolver));
-    }
-
-    /// Install the current-generation Core CTAS historical reverse port.
-    /// The bounded controller may start before this late-bound dependency;
-    /// until installation, CTAS candidates are safely deferred.
-    pub fn install_ctas_recovery(&self, engine: Arc<dyn CtasEngine>) {
-        *self
-            .ctas_recovery
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(engine);
-    }
-
-    /// Install the current-generation CP-3B historical write resolver used by
-    /// CTAS takeover before any retained staged target may be cleaned up.
-    pub fn install_ctas_write_recovery(&self, resolver: Arc<dyn HistoricalWriteRecoveryResolver>) {
-        *self
-            .ctas_write_recovery
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolver);
     }
 
     /// Build a service with a custom admission gate (CP-3 fencing).
@@ -179,8 +147,6 @@ impl DmlService {
             coordinator: None,
             allow_unfenced_focused_test_support: true,
             statement_recovery: None,
-            ctas_recovery: RwLock::new(None),
-            ctas_write_recovery: RwLock::new(None),
         }
     }
 
@@ -300,31 +266,13 @@ impl DmlService {
             return Ok(None);
         };
         // The scan candidate carries no family, so the decision is taken from
-        // the claimed operation itself. CTAS and direct mutations share this
-        // one bounded scheduler but retain independent typed profiles.
+        // the claimed operation itself. CP-3D CTAS recovery is retired:
+        // retained records are locally quarantined, never re-driven against a
+        // provider. Direct mutations retain their independent typed profile.
         let result = if active.stored.operation_kind
             == crate::dml::model::OperationKind::CreateTableAsSelect
         {
-            let engine = self
-                .ctas_recovery
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            match engine {
-                Some(engine) => {
-                    let write_recovery = self
-                        .ctas_write_recovery
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    CtasRecoveryProfile::new(engine, write_recovery)
-                }
-                .drive(&mut active, now_ms)
-                .map(|progress| Some(DmlRecoveryProgress::Ctas(progress))),
-                None => active
-                    .reschedule_recovery_due(Some(deferred_due_at_ms))
-                    .map(|()| None),
-            }
+            quarantine_legacy_ctas(&mut active).map(|()| None)
         } else if direct_mutation_kind(active.stored.operation_kind).is_some() {
             match self.statement_recovery.as_ref() {
                 Some(profile) => profile
@@ -524,6 +472,21 @@ impl DmlService {
     pub fn list_unfinished_operations(&self) -> Result<Vec<StoredOperation>, DmlError> {
         self.require_journal()?.list_unfinished()
     }
+}
+
+fn quarantine_legacy_ctas(active: &mut ActiveDmlOperation) -> Result<(), DmlError> {
+    let OperationPayload::CtasSaga(mut saga) = active.stored.payload.clone() else {
+        return Err(DmlError::journal_corruption(
+            "CTAS recovery candidate has a non-CTAS payload",
+        ));
+    };
+    saga.next_action = StatementNextAction::ManualInspect;
+    let state = if active.stored.state.is_finished() {
+        active.stored.state
+    } else {
+        OperationState::CommitUnknown
+    };
+    active.mutate_statement(state, OperationPayload::CtasSaga(saga), None)
 }
 
 fn local_table_columns(

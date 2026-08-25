@@ -17,11 +17,10 @@
 
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
-use crate::query_execution::dml::ctas::CtasEngine;
 use crate::query_execution::service::QueryExecutionService;
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
 use novarocks_spi::connector::ConnectorControlFactory;
@@ -120,7 +119,7 @@ pub struct FrontendApplicationHost {
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     dml_service: Option<Arc<DmlService>>,
-    ctas_recovery_binding: Option<CtasRecoveryBinding>,
+    dml_recovery_controller: Option<DmlRecoveryController>,
     statistics_application_service: Option<Arc<StatisticsApplicationService>>,
     statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
     catalog_application_port: Option<Arc<FrontendCatalogApplicationPort>>,
@@ -142,62 +141,6 @@ pub struct FrontendApplicationHost {
     topology: Option<Arc<ClusterBackendService>>,
     optimizer_query_mem_limit_bytes: u64,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
-}
-
-/// The one ordered handoff from Frontend composition to the CTAS recovery
-/// facet.  It admits no SQL and cannot create a second scheduler: binding the
-/// current-generation engine happens first, then the single controller starts.
-#[derive(Clone)]
-pub(crate) struct CtasRecoveryBinding {
-    dml: Arc<DmlService>,
-    controller: Arc<Mutex<Option<DmlRecoveryController>>>,
-    installed: Arc<Mutex<bool>>,
-    start_controller: bool,
-}
-
-impl CtasRecoveryBinding {
-    fn new(dml: Arc<DmlService>, start_controller: bool) -> Self {
-        Self {
-            dml,
-            controller: Arc::new(Mutex::new(None)),
-            installed: Arc::new(Mutex::new(false)),
-            start_controller,
-        }
-    }
-
-    pub(crate) fn install_ctas_engine(&self, engine: Arc<dyn CtasEngine>) -> Result<(), String> {
-        let mut installed = self
-            .installed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *installed {
-            return Err("CTAS recovery engine is already bound for this frontend host".to_string());
-        }
-        self.dml.install_ctas_recovery(engine);
-        *installed = true;
-        if self.start_controller {
-            let mut controller = self
-                .controller
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if controller.is_some() {
-                return Err("DML recovery controller is already running".to_string());
-            }
-            *controller = Some(DmlRecoveryController::start(Arc::clone(&self.dml)));
-        }
-        Ok(())
-    }
-
-    async fn shutdown(&self) {
-        let controller = self
-            .controller
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(mut controller) = controller {
-            controller.shutdown().await;
-        }
-    }
 }
 
 /// Matches the historical `[runtime] optimizer_query_mem_limit_bytes` default.
@@ -383,7 +326,7 @@ impl FrontendApplicationHost {
             catalog_runtime_projection,
             statistics_service: None,
             dml_service: None,
-            ctas_recovery_binding: None,
+            dml_recovery_controller: None,
             statistics_application_service: None,
             statistics_application_port: None,
             catalog_application_port: None,
@@ -546,15 +489,11 @@ impl FrontendApplicationHost {
                     &connector_control,
                 )),
             );
-            dml.install_ctas_write_recovery(crate::dml::write_recovery::control_registry_resolver(
-                connector_control,
-            ));
             dml
         }));
-        host.ctas_recovery_binding = Some(CtasRecoveryBinding::new(
-            host.dml_service(),
-            host.coordination.is_some(),
-        ));
+        if host.coordination.is_some() {
+            host.dml_recovery_controller = Some(DmlRecoveryController::start(host.dml_service()));
+        }
         match FrontendViewService::open(host.state_store(), tokio::runtime::Handle::current()).await
         {
             Ok(view_service) => host.view_service = Some(Arc::new(view_service)),
@@ -780,15 +719,6 @@ impl FrontendApplicationHost {
                 .as_ref()
                 .expect("frontend DML service is installed before host open returns"),
         )
-    }
-
-    /// Returns the one-shot ordered CTAS recovery binding owned by this host.
-    /// Server composition must complete it before it exposes the SQL listener.
-    pub(crate) fn ctas_recovery_binding(&self) -> CtasRecoveryBinding {
-        self.ctas_recovery_binding
-            .as_ref()
-            .expect("frontend CTAS recovery binding is installed before host open returns")
-            .clone()
     }
 
     pub fn statistics_application_service(&self) -> Arc<StatisticsApplicationService> {
@@ -1136,10 +1066,9 @@ impl FrontendApplicationHost {
                 primary_error = Some(table_maintenance_error);
             }
         }
-        if let Some(binding) = self.ctas_recovery_binding.as_ref() {
-            binding.shutdown().await;
+        if let Some(mut controller) = self.dml_recovery_controller.take() {
+            controller.shutdown().await;
         }
-        self.ctas_recovery_binding.take();
         let dml_coordination_error = if let Some(service) = self.dml_service.as_ref() {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(5),

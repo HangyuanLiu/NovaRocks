@@ -22,8 +22,6 @@
 //! operation IDs and the durable ordering barriers around every external
 //! effect.
 
-pub(crate) mod recovery;
-
 use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::ctas::{
     CtasCommand, CtasEngine, CtasFailure, CtasFailureKind, CtasTargetFacts,
