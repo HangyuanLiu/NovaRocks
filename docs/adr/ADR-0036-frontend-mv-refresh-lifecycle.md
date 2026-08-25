@@ -2,9 +2,9 @@
 id: ADR-0036
 title: "Frontend-owned MV refresh lifecycle"
 domain: [frontend-mv, provider-spi]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0104
 date: 2026-08-01
 provenance:
   - "discussion: MVX-2 frontend refresh lifecycle"

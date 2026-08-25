@@ -2,9 +2,9 @@
 id: ADR-0035
 title: "Connector orphan cleanup uses immutable receipts and reconcile-only unknowns"
 domain: [provider-spi, table-maintenance]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0104
 date: 2026-08-03
 provenance:
   - "discussion: 2026-08-03 connector orphan cleanup recovery semantics"

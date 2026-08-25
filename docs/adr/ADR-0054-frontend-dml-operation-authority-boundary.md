@@ -2,9 +2,9 @@
 id: ADR-0054
 title: "Frontend DML uses operation-scoped StateStore authority without claiming external commit fencing"
 domain: [frontend-dml]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0104
 date: 2026-08-10
 provenance:
   - "discussion: 2026-08-10 frontend DML operation authority and recovery scope"
