@@ -54,13 +54,13 @@ async fn open_host(
 
 fn backend_config() -> ClusterBackendOpenConfig {
     ClusterBackendOpenConfig::new(
-        novarocks_types::ClusterRole::AllInOne,
+        novarocks_types::ClusterRole::Fe,
         Vec::new(),
         Duration::from_secs(1),
         1,
         Duration::from_secs(1),
     )
-    .expect("valid all-in-one backend config")
+    .expect("valid frontend backend config")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -86,12 +86,18 @@ async fn configured_sqlite_opens_and_reopens_mv_repository() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn absent_state_store_keeps_host_available_but_mv_unavailable() {
-    let host = open_host(None)
-        .await
-        .expect("host without StateStore remains available");
-    assert!(!host.mv_repository().availability().is_available());
-    host.shutdown().await.expect("disabled host shutdown");
+async fn absent_state_store_rejects_frontend_before_mv_services_open() {
+    let error = match open_host(None).await {
+        Ok(host) => {
+            host.shutdown().await.expect("shutdown unexpected host");
+            panic!("role=fe requires durable StateStore before MV services open");
+        }
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        FrontendApplicationErrorKind::ClusterBackendOpen
+    );
 }
 
 #[tokio::test]

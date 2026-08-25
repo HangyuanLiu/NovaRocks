@@ -559,12 +559,6 @@ impl ClusterBackendService {
             ClusterRole::Be => {
                 return Err("role=be must not open ClusterBackendService".to_string());
             }
-            ClusterRole::AllInOne => {
-                return Err(
-                    "role=all-in-one must be resolved by the Server launch supervisor before opening Frontend membership"
-                        .to_string(),
-                );
-            }
         };
         let service = Arc::new(Self::new(
             storage,

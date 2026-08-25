@@ -261,7 +261,7 @@ fn default_decommission_timeout_secs() -> u64 {
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
-            role: ClusterRole::default(),
+            role: ClusterRole::Fe,
             backends: Vec::new(),
             advertise_host: String::new(),
             advertise_port: 0,
@@ -292,14 +292,6 @@ impl ClusterConfig {
                 if !self.backends.is_empty() {
                     return Err(format!(
                         "role=be must not configure [cluster].backends (got {} entries)",
-                        self.backends.len()
-                    ));
-                }
-            }
-            ClusterRole::AllInOne => {
-                if !self.backends.is_empty() {
-                    return Err(format!(
-                        "role=all-in-one must not configure [cluster].backends (got {} entries)",
                         self.backends.len()
                     ));
                 }
@@ -2403,13 +2395,13 @@ mem_limit = "0"
     }
 
     #[test]
-    fn test_cluster_default_is_all_in_one() {
+    fn test_cluster_builder_default_is_frontend_only() {
         let toml = r#"
 [server]
 host = "127.0.0.1"
 "#;
         let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse default");
-        assert_eq!(cfg.cluster.role, super::ClusterRole::AllInOne);
+        assert_eq!(cfg.cluster.role, super::ClusterRole::Fe);
         assert!(cfg.cluster.backends.is_empty());
     }
 
@@ -2504,59 +2496,6 @@ role = "leader"
 "#;
         let result: Result<NovaRocksConfig, _> = toml::from_str(toml);
         assert!(result.is_err(), "invalid role string should fail parse");
-    }
-
-    #[test]
-    fn test_all_in_one_rejects_non_empty_backends() {
-        // I2: role=all-in-one with non-empty backends must be rejected.
-        let toml = r#"
-[cluster]
-role = "all-in-one"
-backends = ["127.0.0.1:9070"]
-"#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse all-in-one with backends");
-        let err = cfg
-            .cluster
-            .validate()
-            .expect_err("all-in-one with backends should fail");
-        assert!(
-            err.contains("all-in-one") && err.contains("backends"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_all_in_one_with_no_backends_passes_validation() {
-        // Default all-in-one with no backends must still pass.
-        let toml = r#"
-[cluster]
-role = "all-in-one"
-"#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse all-in-one");
-        cfg.cluster
-            .validate()
-            .expect("all-in-one with no backends should pass");
-    }
-
-    #[test]
-    fn test_all_in_one_rejects_multiple_backends() {
-        // I2: multiple backends should also be rejected for all-in-one.
-        let toml = r#"
-[cluster]
-role = "all-in-one"
-backends = ["127.0.0.1:9070", "127.0.0.1:9071"]
-"#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
-        let err = cfg
-            .cluster
-            .validate()
-            .expect_err("all-in-one with 2 backends should fail");
-        assert!(
-            err.contains("all-in-one") && err.contains("backends"),
-            "unexpected error: {err}"
-        );
-        // Error message should contain the count.
-        assert!(err.contains('2'), "expected count 2 in error: {err}");
     }
 
     #[test]

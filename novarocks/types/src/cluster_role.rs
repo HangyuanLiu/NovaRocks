@@ -16,13 +16,11 @@
 // under the License.
 
 /// Native deployment role shared by server composition and role applications.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClusterRole {
     Fe,
     Be,
-    #[default]
-    AllInOne,
 }
 
 #[cfg(test)]
@@ -35,18 +33,8 @@ mod tests {
     }
 
     #[test]
-    fn default_is_all_in_one() {
-        assert_eq!(ClusterRole::default(), ClusterRole::AllInOne);
-    }
-
-    #[test]
     fn deserializes_kebab_case_roles() {
-        assert_eq!(
-            toml::from_str::<RoleWire>("role = \"all-in-one\"")
-                .expect("parse role")
-                .role,
-            ClusterRole::AllInOne,
-        );
+        assert!(toml::from_str::<RoleWire>("role = \"all-in-one\"").is_err());
         assert_eq!(
             toml::from_str::<RoleWire>("role = \"fe\"")
                 .expect("parse role")

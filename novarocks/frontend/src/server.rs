@@ -78,9 +78,7 @@ pub struct FrontendServerConfig {
     pub state_store_provider_registry: StateStoreProviderRegistry,
 }
 
-/// Opens the frontend services once for an externally composed server. The
-/// all-in-one composition root uses the returned host both to run MySQL and
-/// to provide the terminal fallback ingress installed on the native backend endpoint.
+/// Opens the frontend services once for an externally composed server.
 pub async fn open_frontend_application_for_server(
     config: &FrontendServerConfig,
     data_runtime: Handle,

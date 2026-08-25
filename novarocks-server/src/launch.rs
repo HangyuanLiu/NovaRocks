@@ -229,7 +229,6 @@ fn role_name(role: ClusterRole) -> &'static str {
     match role {
         ClusterRole::Fe => "fe",
         ClusterRole::Be => "be",
-        ClusterRole::AllInOne => "all-in-one",
     }
 }
 

@@ -17,7 +17,6 @@
 
 use bytes::Bytes;
 use novarocks_frontend::OperationId;
-use novarocks_frontend::dml::{DmlErrorKind, DmlOperationId};
 use novarocks_frontend::state_store::coordination::{ControlPlaneMode, IncarnationGate};
 use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::view::{
@@ -62,13 +61,13 @@ async fn open_host(
 
 fn backend_config() -> ClusterBackendOpenConfig {
     ClusterBackendOpenConfig::new(
-        novarocks_types::ClusterRole::AllInOne,
+        novarocks_types::ClusterRole::Fe,
         Vec::new(),
         Duration::from_secs(1),
         1,
         Duration::from_secs(1),
     )
-    .expect("valid all-in-one backend config")
+    .expect("valid frontend backend config")
 }
 
 fn fe_backend_config() -> ClusterBackendOpenConfig {
@@ -177,7 +176,7 @@ fn sqlite_config(_temp: &TempDir) -> novarocks_frontend::StateStoreHostInput {
 
 #[tokio::test]
 async fn host_exposes_one_statistics_service_identity() {
-    let host = open_host(None).await.expect("host");
+    let host = open_host(Some(state_store_input())).await.expect("host");
     let first = host.statistics_application_service();
     let second = host.statistics_application_service();
     assert!(Arc::ptr_eq(&first, &second));
@@ -191,27 +190,10 @@ async fn host_exposes_one_statistics_service_identity() {
 
 #[tokio::test]
 async fn host_exposes_one_dml_service_identity() {
-    let host = open_host(None).await.expect("host");
+    let host = open_host(Some(state_store_input())).await.expect("host");
     let first = host.dml_service();
     let second = host.dml_service();
     assert!(Arc::ptr_eq(&first, &second));
-    host.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
-async fn absent_state_store_builds_dml_service_with_disabled_journal() {
-    let host = open_host(None).await.expect("host");
-    let error = host
-        .dml_service()
-        .load_operation(DmlOperationId::new_v7())
-        .expect_err("disabled DML journal must reject operation access");
-    assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
-    assert!(
-        error
-            .to_string()
-            .contains("state store is required for Iceberg DML"),
-        "{error}"
-    );
     host.shutdown().await.expect("shutdown");
 }
 
@@ -260,40 +242,6 @@ async fn sqlite_host_bootstraps_once_and_preserves_reconciling_mode() {
     assert_eq!(preserved.incarnation(), reconciling.incarnation());
     drop(gate);
     reopened.shutdown().await.expect("reopened shutdown");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn absent_config_opens_disabled_host() {
-    let host = open_host(None)
-        .await
-        .expect("absent state store configuration must open a disabled host");
-
-    assert!(host.state_store().is_none());
-    assert_eq!(host.state_store_provider_id(), None);
-    assert!(
-        matches!(
-            parse_typed_statement("SELECT 1")
-                .expect("the parser-owned Query AST should construct SELECT")
-                .as_slice(),
-            [novarocks_parser::ast::Statement::Query(_)]
-        ),
-        "ordinary SQL must remain a typed Query, not a typed maintenance statement"
-    );
-    let _query_execution = host.query_execution_service();
-    let _backend_activity = host.backend_query_activity();
-    let _backend_event_sink = host.backend_query_event_sink();
-    assert!(
-        execute_view_statement(
-            host.view_service().as_ref(),
-            &SessionViewEngine,
-            "CREATE VIEW memory_view AS SELECT 1",
-            view_context(),
-        )
-        .is_ok()
-    );
-    host.shutdown()
-        .await
-        .expect("disabled host shutdown must succeed");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

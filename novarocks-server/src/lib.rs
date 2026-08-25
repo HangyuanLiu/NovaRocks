@@ -24,3 +24,4 @@ pub mod memory_limit;
 pub mod network;
 pub mod state_store_config;
 mod state_store_limits;
+pub mod supervisor;
