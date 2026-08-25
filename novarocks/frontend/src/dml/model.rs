@@ -3448,4 +3448,55 @@ mod tests {
             "the direct-mutation variant must preserve the same crash-only boundary"
         );
     }
+
+    #[test]
+    fn crash_only_ctas_unknown_never_schedules_recovery() {
+        let publication_id = Uuid::now_v7();
+        let payload = OperationPayload::CtasSaga(CtasSagaRecord {
+            phase: CtasSagaPhase::PublishUnknown,
+            prepare_operation_id: publication_id,
+            write_operation_id: publication_id,
+            publish_operation_id: publication_id,
+            abort_staging_operation_id: publication_id,
+            create_policy: CTAS_CREATE_POLICY_FAIL_IF_EXISTS.to_string(),
+            provider_id: Some("iceberg".to_string()),
+            connector_instance_id: Some("rest".to_string()),
+            connector_incarnation: Some("01".repeat(16)),
+            source_plan_digest: Some("source".to_string()),
+            source_schema_digest: Some("schema".to_string()),
+            source_execution_identity: Some("execution".to_string()),
+            write_cohort_id: Some("cohort".to_string()),
+            staged_handle_digest: Some("staged".to_string()),
+            write_cohort_set_digest: None,
+            aggregate_write_digest: Some("write".to_string()),
+            prepare_fact: None,
+            write_fact: None,
+            publish_fact: Some(DurableExternalFact {
+                outcome: ExternalFactOutcome::CommitUnknown,
+                receipt: None,
+                evidence: Some("publication response lost".to_string()),
+                finalization_failure: None,
+                failure: Some("publication unknown".to_string()),
+            }),
+            abort_staging_fact: None,
+            next_action: StatementNextAction::ManualInspect,
+        });
+        let OperationPayload::CtasSaga(saga) = &payload else {
+            unreachable!("the test constructs a CTAS payload");
+        };
+        assert!(saga.is_crash_only_publication());
+        assert!(
+            !operation_requires_recovery_scan(OperationState::CommitUnknown, &payload, None),
+            "manual inspection must not grant a new process authority to recover a CTAS attempt"
+        );
+        assert!(
+            !operation_requires_recovery_scan_with_direct_mutation(
+                OperationState::CommitUnknown,
+                &payload,
+                None,
+                None,
+            ),
+            "the extended recovery scan must preserve the same crash-only CTAS boundary"
+        );
+    }
 }

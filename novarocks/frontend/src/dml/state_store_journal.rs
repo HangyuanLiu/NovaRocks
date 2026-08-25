@@ -2714,6 +2714,12 @@ impl DmlSideRecord {
                         operation.operation_id
                     )));
                 };
+                if saga.is_crash_only_publication() {
+                    return Err(DmlError::journal_unresolved(format!(
+                        "DML operation {} is a crash-only CTAS publication and cannot schedule catalog recovery",
+                        operation.operation_id
+                    )));
+                }
                 validate_ctas_recovery_against_saga(recovery, saga)?;
                 if recovery.recovery_attempt_id != authority.coordination_attempt_id() {
                     return Err(DmlError::journal_unresolved(format!(
