@@ -162,24 +162,6 @@ impl DeleteNativeEncoding<'_> {
 }
 
 pub(crate) trait PreparedDeleteExecution: Send + Sync {
-    /// Expose the exact write authority this preparation activated, so the
-    /// coordinator can fence it before anything is dispatched.
-    ///
-    /// The default refuses. There is deliberately no unfenced dispatch: an
-    /// execution that cannot expose its write authority must not run a writer.
-    fn external_fence_authority(
-        &self,
-    ) -> Result<
-        crate::query_execution::dml::external_write_fence::ExternalWriteFenceAuthority,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        Err(
-            crate::query_execution::dml::external_write_fence::external_fence_authority_unavailable(
-                "DELETE execution does not expose an external operation fence authority",
-            ),
-        )
-    }
-
     fn native_encoding(
         &self,
     ) -> Result<DeleteNativeEncoding<'_>, crate::dml::error::DmlExecutionError>;

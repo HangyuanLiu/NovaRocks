@@ -197,26 +197,6 @@ struct DistributedDeleteWriteExecutor {
 }
 
 impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
-    /// DELETE activates its write generation during preparation, so the
-    /// authority already exists before anything is dispatched. The resource
-    /// identity comes from the activated template, never from a name the
-    /// frontend supplied.
-    fn external_fence_authority(
-        &self,
-    ) -> Result<
-        crate::query_execution::dml::external_write_fence::ExternalWriteFenceAuthority,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        crate::query_execution::dml::external_write_fence::ExternalWriteFenceAuthority::try_new(
-            self.connector_write.lease(),
-            self.connector_write.operation_id(),
-            &self.target.namespace,
-            &self.target.table,
-            self.connector_write.preparation().target_ref().clone(),
-            self.connector_context.clone(),
-        )
-    }
-
     fn native_encoding(
         &self,
     ) -> Result<

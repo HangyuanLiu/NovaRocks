@@ -39,10 +39,10 @@ use crate::query_execution::write_transaction::{
 };
 use novarocks_parser::ast::{Query, Statement};
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorTableHandle, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteIntent,
-    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
-    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    ConnectorTableHandle, ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest,
+    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteLease,
+    ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWritePreparationOutcome,
+    ConnectorWritePreparationRequest,
 };
 #[cfg(test)]
 use novarocks_sql::literal::bytes_to_latin1_string;
@@ -442,30 +442,6 @@ impl PreparedIcebergWrite {
 
     pub(crate) fn base_snapshot_id(&self) -> Option<i64> {
         self.spec.commit.base_snapshot_id
-    }
-
-    /// The exact write authority this preparation activated, ready to be fenced.
-    ///
-    /// INSERT APPEND and INSERT OVERWRITE both activate their write generation
-    /// during preparation, so the authority already exists before the frontend
-    /// dispatches anything. The identity comes from the activated template: its
-    /// operation id and provider-signed target ref, plus the resolved target
-    /// namespace and table the same generation loaded.
-    pub(crate) fn external_fence_authority(
-        &self,
-    ) -> Result<
-        crate::query_execution::dml::external_write_fence::ExternalWriteFenceAuthority,
-        ConnectorError,
-    > {
-        let template = &self.executor.connector_write;
-        crate::query_execution::dml::external_write_fence::ExternalWriteFenceAuthority::try_new(
-            template.lease(),
-            template.operation_id(),
-            &self.executor.target.namespace,
-            &self.executor.target.table,
-            template.preparation().target_ref().clone(),
-            self.executor.connector_context.clone(),
-        )
     }
 
     fn prepare_native_assembly(
