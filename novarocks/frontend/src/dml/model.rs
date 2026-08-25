@@ -783,16 +783,6 @@ impl DmlHistoricalWriteRecoveryRecord {
     }
 }
 
-/// Authorized mutation that attaches a confirmed external fence receipt to one
-/// DML operation attempt.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DmlExternalFenceMutationRequest {
-    pub operation_id: DmlOperationId,
-    pub expected_revision: u64,
-    pub mutation_id: Uuid,
-    pub fence: DmlExternalFenceReceiptRecord,
-}
-
 /// Authorized mutation that publishes a historical write recovery request or
 /// its typed result.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1485,14 +1475,6 @@ impl DmlHistoricalDataMutationRecoveryRecord {
 
 /// Authorized mutation that attaches a confirmed direct-mutation fence receipt
 /// to one TRUNCATE or ADD FILES attempt.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DmlDirectMutationFenceMutationRequest {
-    pub operation_id: DmlOperationId,
-    pub expected_revision: u64,
-    pub mutation_id: Uuid,
-    pub fence: DmlDirectMutationFenceReceiptRecord,
-}
-
 /// Authorized mutation that publishes a historical data-mutation recovery
 /// request or its typed result.
 #[derive(Clone, Debug, Eq, PartialEq)]

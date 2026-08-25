@@ -27,13 +27,11 @@ use crate::dml::error::DmlError;
 use crate::dml::model::{
     AddFilesArtifact, AddFilesMutationRequest, CreatePreparingRequest,
     CreateStatementOperationRequest, DML_COORDINATION_RESOURCE_CODEC_VERSION,
-    DML_RECOVERY_SHARD_COUNT, DmlCoordinationClaimRequest, DmlDirectMutationFenceMutationRequest,
-    DmlDirectMutationFenceReceiptRecord, DmlExternalFenceMutationRequest,
-    DmlExternalFenceReceiptRecord, DmlHistoricalDataMutationRecoveryMutationRequest,
-    DmlHistoricalDataMutationRecoveryRecord, DmlHistoricalWriteRecoveryMutationRequest,
-    DmlHistoricalWriteRecoveryRecord, DmlOperationId, DmlRecoveryCandidate,
-    DmlRecoveryDueRescheduleRequest, OperationFact, OperationMutationRequest, OperationState,
-    StoredOperation,
+    DML_RECOVERY_SHARD_COUNT, DmlCoordinationClaimRequest,
+    DmlHistoricalDataMutationRecoveryMutationRequest, DmlHistoricalDataMutationRecoveryRecord,
+    DmlHistoricalWriteRecoveryMutationRequest, DmlHistoricalWriteRecoveryRecord, DmlOperationId,
+    DmlRecoveryCandidate, DmlRecoveryDueRescheduleRequest, OperationFact, OperationMutationRequest,
+    OperationState, StoredOperation,
 };
 
 #[async_trait]
@@ -222,33 +220,11 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
-    /// Persist the external operation fence one attempt confirmed before any
-    /// writer or commit dispatch could produce an irreversible external effect.
+    /// Persist a legacy historical-write record for manual inspection.
     ///
-    /// The mutation validates the live lease fence and the expected operation
-    /// revision inside the same StateStore transaction that writes the receipt,
-    /// so a stale holder can never install a fence receipt.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
-    fn record_external_fence_authorized(
-        &self,
-        _request: DmlExternalFenceMutationRequest,
-        _recovery_due_at_ms: Option<i64>,
-        _authority: DmlMutationAuthority,
-    ) -> Result<StoredOperation, DmlError> {
-        Err(DmlError::journal_unavailable(
-            "authorized DML external fence receipt mutation is not supported by this journal",
-        ))
-    }
-
-    /// Persist a historical write recovery request, the fence the current
-    /// generation raised above the old authority, or the typed result of one
-    /// provider inspection.
-    ///
-    /// The mutation is fenced exactly like every other authorized mutation and
-    /// refuses to drop a retained cleanup obligation.
+    /// This compatibility surface does not grant any provider authority. New
+    /// crash-only paths do not create or drive these records; retained values
+    /// are only projected locally and their external residue waits for GC.
     #[allow(
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
@@ -264,36 +240,11 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
-    /// Persist the external operation fence one TRUNCATE or ADD FILES attempt
-    /// confirmed before its irreversible direct mutation could be dispatched.
+    /// Persist a legacy historical-data-mutation record for manual inspection.
     ///
-    /// Direct mutation reuses the CP-3B fence value rather than a second fence
-    /// type; the record adds only the mutation family and, for ADD FILES, the
-    /// immutable source scope the fence was minted for. The mutation validates
-    /// the live lease fence and the expected operation revision inside the same
-    /// StateStore transaction that writes the receipt.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
-    fn record_direct_mutation_fence_authorized(
-        &self,
-        _request: DmlDirectMutationFenceMutationRequest,
-        _recovery_due_at_ms: Option<i64>,
-        _authority: DmlMutationAuthority,
-    ) -> Result<StoredOperation, DmlError> {
-        Err(DmlError::journal_unavailable(
-            "authorized DML direct mutation fence receipt mutation is not supported by this journal",
-        ))
-    }
-
-    /// Persist a historical data-mutation recovery request, the fence the
-    /// current generation raised above the old authority, or the typed result of
-    /// one provider inspection.
-    ///
-    /// The mutation is fenced exactly like every other authorized mutation. It
-    /// refuses to drop a retained cleanup obligation, and it refuses a result
-    /// bound to any source scope other than the sealed request's.
+    /// This compatibility surface does not grant any provider authority. New
+    /// crash-only paths do not create or drive these records; retained values
+    /// are only projected locally and their external residue waits for GC.
     #[allow(
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
@@ -313,19 +264,6 @@ pub trait OperationJournal: Send + Sync {
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
     )]
-    fn load_external_fence(
-        &self,
-        _operation_id: DmlOperationId,
-    ) -> Result<Option<DmlExternalFenceReceiptRecord>, DmlError> {
-        Err(DmlError::journal_unavailable(
-            "DML external fence receipt loading is not supported by this journal",
-        ))
-    }
-
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
     fn load_historical_write_recovery(
         &self,
         _operation_id: DmlOperationId,
@@ -335,25 +273,7 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
-    /// Validate that a confirmed fence receipt can be durably encoded before
-    /// the caller asks a provider to establish it. Failing closed keeps the
-    /// fence-before-dispatch ordering honest: a receipt that could never be
-    /// recorded must not be created.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
-    fn preflight_external_fence(
-        &self,
-        _request: &DmlExternalFenceMutationRequest,
-    ) -> Result<(), DmlError> {
-        Err(DmlError::journal_unavailable(
-            "DML external fence receipt preflight is not supported by this journal",
-        ))
-    }
-
-    /// Validate that a historical write recovery record can be durably encoded
-    /// before the caller raises a fence or inspects the old operation.
+    /// Validate that a legacy historical-write record can be durably encoded.
     #[allow(
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
@@ -371,19 +291,6 @@ pub trait OperationJournal: Send + Sync {
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
     )]
-    fn load_direct_mutation_fence(
-        &self,
-        _operation_id: DmlOperationId,
-    ) -> Result<Option<DmlDirectMutationFenceReceiptRecord>, DmlError> {
-        Err(DmlError::journal_unavailable(
-            "DML direct mutation fence receipt loading is not supported by this journal",
-        ))
-    }
-
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
     fn load_historical_data_mutation_recovery(
         &self,
         _operation_id: DmlOperationId,
@@ -393,25 +300,8 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
-    /// Validate that a confirmed direct-mutation fence receipt can be durably
-    /// encoded before the caller asks a provider to establish it. Failing closed
-    /// keeps the fence-before-dispatch ordering honest for a destructive
-    /// TRUNCATE just as it does for a distributed write.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
-    fn preflight_direct_mutation_fence(
-        &self,
-        _request: &DmlDirectMutationFenceMutationRequest,
-    ) -> Result<(), DmlError> {
-        Err(DmlError::journal_unavailable(
-            "DML direct mutation fence receipt preflight is not supported by this journal",
-        ))
-    }
-
-    /// Validate that a historical data-mutation recovery record can be durably
-    /// encoded before the caller raises a fence or inspects the old operation.
+    /// Validate that a legacy historical-data-mutation record can be durably
+    /// encoded.
     #[allow(
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."

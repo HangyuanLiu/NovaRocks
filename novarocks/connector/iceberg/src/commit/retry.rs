@@ -25,13 +25,9 @@
 /// conflict that warrants a retry (after re-loading the table). Network / IO /
 /// data-invalid / programmer errors are non-retryable.
 ///
-/// A failed assertion on a provider-owned *write fence* ref is never retryable,
-/// whatever else the error looks like: it means another owner took the
-/// operation over, and re-staging would rebuild the write under an authority we
-/// no longer hold. Callers that carry a fence assertion classify the outcome
-/// authoritatively by re-observing the fence ref
-/// (`commit::helpers::submit_fenced_action`); this text check is the backstop
-/// that keeps every *other* retry loop from spinning on a fence.
+/// A legacy write-fence ref in a catalog error is never retryable. New write
+/// paths never mention that namespace; this backstop prevents an old malformed
+/// request from being interpreted as a normal target-ref conflict.
 pub fn is_retryable_commit_conflict(err: &crate::iceberg::Error) -> bool {
     use crate::iceberg::ErrorKind;
     let msg = format!("{err}").to_ascii_lowercase();

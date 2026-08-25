@@ -25,7 +25,6 @@ mod domain_facts;
 mod error;
 mod execution;
 mod execution_declaration;
-mod external_write_fence;
 mod handle;
 mod historical_maintenance_recovery;
 mod identity;
@@ -102,10 +101,7 @@ pub use domain_facts::{
     MAX_CONNECTOR_SCAN_UNIT_FACT_COLUMNS, MAX_CONNECTOR_SCAN_UNIT_FACT_PAYLOAD_BYTES,
     MAX_CONNECTOR_SCAN_UNIT_FACT_VARIABLE_VALUE_BYTES,
 };
-pub use error::{
-    ConnectorError, ConnectorErrorKind, ConnectorExternalFenceFailure,
-    ConnectorTableObjectBindingFailure,
-};
+pub use error::{ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure};
 pub use execution::{
     ConnectorExecutionBinding, ConnectorExecutionInstaller, ConnectorExecutionResolver,
     ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
@@ -115,12 +111,6 @@ pub use execution::{
 pub use execution_declaration::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
     ConnectorExecutionDeclarationProvider, ConnectorExecutionProviderKind,
-};
-pub use external_write_fence::{
-    ConnectorClusterIdentity, ConnectorExternalFenceGeneration, ConnectorExternalFenceReceipt,
-    ConnectorExternalFenceRequest, ConnectorExternalOperationFence, ConnectorWriteFencing,
-    MAX_CONNECTOR_EXTERNAL_FENCE_CLUSTER_ID_BYTES, MAX_CONNECTOR_EXTERNAL_FENCE_IDENTITY_BYTES,
-    MAX_CONNECTOR_EXTERNAL_FENCE_RECEIPT_BYTES,
 };
 pub use handle::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
@@ -306,31 +296,30 @@ pub use view_metadata::{
 pub use write::{
     CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorActivatedWriteCohort, ConnectorBatchWriter,
     ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
-    ConnectorEstablishedWriteFence, ConnectorManagedPartitionField,
-    ConnectorManagedPartitionSpecObservation, ConnectorManagedPartitionSpecReplacement,
-    ConnectorManagedPartitionSpecReplacementId, ConnectorManagedPartitionSpecReplacementTarget,
-    ConnectorManagedPartitionTransform, ConnectorManagedPublicationEmptyInputDisposition,
-    ConnectorManagedPublicationIntent, ConnectorManagedPublicationTechnique,
-    ConnectorOpenWriterRequest, ConnectorSealedWriteCohortSet, ConnectorStagedReport,
-    ConnectorStagedReportFrame, ConnectorStagedReportSummary, ConnectorWriteAbortOutcome,
-    ConnectorWriteAbortRequest, ConnectorWriteActivation, ConnectorWriteActivationIntent,
-    ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
-    ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
-    ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteExecution,
-    ConnectorWriteExecutionId, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
-    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
-    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationCompletion,
-    ConnectorWriteOperationId, ConnectorWritePlan, ConnectorWritePlanningRequest,
-    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
-    ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ConnectorWriteTargetRef,
-    ConnectorWriterHandle, ConnectorWriterIdentity, ConnectorWriterTerminalState,
-    DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES, DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES,
-    MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES, MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS,
-    MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES, MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES,
-    MAX_CONNECTOR_STAGED_REPORT_PARTS, MAX_CONNECTOR_STAGED_REPORT_PAYLOAD_BYTES,
-    MAX_CONNECTOR_WRITE_ACTIVATIONS, MAX_CONNECTOR_WRITE_COHORTS,
-    MAX_CONNECTOR_WRITE_OPERATION_PAYLOAD_BYTES, MAX_CONNECTOR_WRITE_OPERATION_WRITERS,
-    MAX_CONNECTOR_WRITE_RECEIPT_BYTES, WriteCommitEvidenceLedger, WriteCommitEvidenceLimits,
-    WriteCommitEvidenceUsage,
+    ConnectorManagedPartitionField, ConnectorManagedPartitionSpecObservation,
+    ConnectorManagedPartitionSpecReplacement, ConnectorManagedPartitionSpecReplacementId,
+    ConnectorManagedPartitionSpecReplacementTarget, ConnectorManagedPartitionTransform,
+    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationIntent,
+    ConnectorManagedPublicationTechnique, ConnectorOpenWriterRequest,
+    ConnectorSealedWriteCohortSet, ConnectorStagedReport, ConnectorStagedReportFrame,
+    ConnectorStagedReportSummary, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
+    ConnectorWriteActivation, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
+    ConnectorWriteActivationSource, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion, ConnectorWriteCohortCompletion,
+    ConnectorWriteCohortDescriptor, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
+    ConnectorWriteControl, ConnectorWriteExecution, ConnectorWriteExecutionId,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
+    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
+    ConnectorWriteLease, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
+    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
+    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ConnectorWriteReceipt,
+    ConnectorWriteReconcileRequest, ConnectorWriteTargetRef, ConnectorWriterHandle,
+    ConnectorWriterIdentity, ConnectorWriterTerminalState, DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES,
+    DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES, MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES,
+    MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS, MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES,
+    MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES, MAX_CONNECTOR_STAGED_REPORT_PARTS,
+    MAX_CONNECTOR_STAGED_REPORT_PAYLOAD_BYTES, MAX_CONNECTOR_WRITE_ACTIVATIONS,
+    MAX_CONNECTOR_WRITE_COHORTS, MAX_CONNECTOR_WRITE_OPERATION_PAYLOAD_BYTES,
+    MAX_CONNECTOR_WRITE_OPERATION_WRITERS, MAX_CONNECTOR_WRITE_RECEIPT_BYTES,
+    WriteCommitEvidenceLedger, WriteCommitEvidenceLimits, WriteCommitEvidenceUsage,
 };

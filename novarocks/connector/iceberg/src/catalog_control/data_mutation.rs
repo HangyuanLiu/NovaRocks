@@ -34,20 +34,15 @@ use novarocks_spi::connector::{
     ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExternalFenceReceipt, ConnectorExternalFenceRequest,
-    ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorMutationOperationId, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use super::add_files::{
     AddFilesManifest, plan_manifest_for_table, preflight_caller_managed_source_domain,
     revalidate_manifest_for_table,
 };
-use crate::commit::write_control::{
-    encode_fence_receipt_payload, fence_failure_to_connector_error,
-};
-use crate::commit::write_fence::{IcebergFenceAssertion, IcebergWriteFenceFacts};
 use crate::commit::{
     CleanupAttempt, CleanupPathMapper, CommitServiceError, IcebergCommitCollector,
     RecoveryEvidence, RunInput, run_iceberg_commit,
@@ -165,18 +160,6 @@ struct TerminalRecord {
 }
 
 trait IcebergDataMutationBackend: Send + Sync {
-    /// Publish this attempt's fence marker so that a later execute can assert
-    /// it atomically inside the same catalog update that mutates the table.
-    ///
-    /// There is deliberately no "remember the fence locally" variant: the
-    /// marker is the fence. `execute` re-derives its assertion from external
-    /// truth, so a backend that acknowledged a fence without publishing one
-    /// would make every fenced direct mutation fail closed at commit time.
-    fn establish_fence(
-        &self,
-        facts: &IcebergWriteFenceFacts,
-    ) -> Result<IcebergFenceAssertion, ConnectorError>;
-
     fn plan(
         &self,
         request: &ConnectorDataMutationPlanningRequest,
@@ -194,7 +177,6 @@ trait IcebergDataMutationBackend: Send + Sync {
         &self,
         planned: &PlannedIcebergMutation,
         marker: &IcebergDataMutationMarkerV1,
-        fencing: &novarocks_spi::connector::ConnectorWriteFencing,
     ) -> Result<CommitOutcome, CommitServiceError>;
 
     fn lookup_marker(
@@ -243,40 +225,6 @@ impl RegisteredIcebergDataMutationBackend {
 }
 
 impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
-    /// Publish the marker snapshot on the provider-private fence ref derived
-    /// from this operation's stable id.
-    ///
-    /// The table is loaded from the fence's *own* resource identity rather than
-    /// from a registered plan: establishing a fence must not require an exact
-    /// prepared operation, because a recovering owner has to be able to fence an
-    /// operation whose runtime state it never had. For the same reason this
-    /// deliberately does not run `validate_frozen_table`, which asserts the
-    /// table still matches an exact plan the recovering owner does not hold.
-    fn establish_fence(
-        &self,
-        facts: &IcebergWriteFenceFacts,
-    ) -> Result<IcebergFenceAssertion, ConnectorError> {
-        let table = self.reload_table(&facts.namespace, &facts.table_name)?;
-        let file_io = table.file_io().clone();
-        let catalog = Arc::clone(self.runtime.catalog());
-        let facts = facts.clone();
-        self.runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                crate::commit::write_fence::establish_fence(
-                    catalog.as_ref(),
-                    &table,
-                    &file_io,
-                    &facts,
-                )
-                .await
-            })
-            .map_err(|error| internal(format!("Iceberg data mutation fence runtime: {error}")))?
-            .map(|established| established.assertion)
-            .map_err(fence_failure_to_connector_error)
-    }
-
     fn plan(
         &self,
         request: &ConnectorDataMutationPlanningRequest,
@@ -393,42 +341,18 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         &self,
         planned: &PlannedIcebergMutation,
         marker: &IcebergDataMutationMarkerV1,
-        fencing: &novarocks_spi::connector::ConnectorWriteFencing,
     ) -> Result<CommitOutcome, CommitServiceError> {
         let payload = planned.payload();
         let table = self
             .reload_table(&payload.namespace, &payload.table)
             .map_err(connector_error_as_pre_dispatch)?;
-        // Derive this attempt's fence assertion from external truth first, the
-        // same way the row-DML commit path does: re-observing the fence ref is
-        // what lets a superseded attempt fail closed before it inspects or
-        // stages anything.
-        let fence_assertion = match fencing.fence() {
-            Some(spi_fence) => {
-                let facts = crate::commit::write_fence::fence_facts_from_spi(spi_fence);
-                Some(
-                    crate::commit::write_fence::derive_established_assertion(
-                        table.metadata(),
-                        &facts,
-                    )
-                    .map_err(|error| {
-                        connector_error_as_pre_dispatch(ConnectorError::new(
-                            ConnectorErrorKind::InvalidRequest,
-                            error.to_string(),
-                        ))
-                    })?,
-                )
-            }
-            None => None,
-        };
         match planned {
             PlannedIcebergMutation::RegisterExistingFiles { .. } => {
                 validate_add_files_target_shape(&table, payload)
                     .map_err(connector_error_as_pre_dispatch)?;
             }
             PlannedIcebergMutation::Truncate { .. } => {
-                validate_frozen_table(&table, payload, fence_assertion.is_some())
-                    .map_err(connector_error_as_pre_dispatch)?;
+                validate_frozen_table(&table, payload).map_err(connector_error_as_pre_dispatch)?;
             }
         }
         match self.lookup_marker(
@@ -836,28 +760,6 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
         &self.key
     }
 
-    /// Publish this attempt's fence marker so that a later direct mutation can
-    /// assert it atomically, exactly as the distributed write path does.
-    ///
-    /// Replaying the identical fence reuses the existing marker; a lower
-    /// generation, another operation's marker, or an uninterpretable marker all
-    /// refuse with a typed external-fence failure.
-    ///
-    /// Design: ADR-0068 (docs/adr/ADR-0068-external-write-fence-as-catalog-linearization-point.md)
-    fn establish_external_fence(
-        &self,
-        request: ConnectorExternalFenceRequest,
-    ) -> Result<ConnectorExternalFenceReceipt, ConnectorError> {
-        self.ensure_owner(&request.owner)?;
-        request.validate(&self.key)?;
-        let facts = crate::commit::write_fence::fence_facts_from_spi(&request.fence);
-        let assertion = self.backend.establish_fence(&facts)?;
-        ConnectorExternalFenceReceipt::try_new(
-            &request.fence,
-            encode_fence_receipt_payload(&assertion),
-        )
-    }
-
     fn plan_mutation(
         &self,
         request: ConnectorDataMutationPlanningRequest,
@@ -960,44 +862,39 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                 ),
                 evidence: self.evidence(&request.plan, cached.private.payload())?,
             },
-            MarkerLookup::Missing => {
-                match self
-                    .backend
-                    .execute(&cached.private, &marker, &request.fence)
-                {
-                    Ok(commit) => self.committed(
-                        &request.plan,
-                        commit.new_snapshot_id,
-                        ExternalMutationFinalization::Complete,
-                    )?,
-                    Err(CommitServiceError::KnownUncommitted { message, .. })
-                    | Err(CommitServiceError::InvalidInput { message }) => {
-                        ExternalMutationOutcome::KnownUncommitted {
-                            failure: failure(ConnectorMutationFailureKind::Conflict, message),
-                        }
+            MarkerLookup::Missing => match self.backend.execute(&cached.private, &marker) {
+                Ok(commit) => self.committed(
+                    &request.plan,
+                    commit.new_snapshot_id,
+                    ExternalMutationFinalization::Complete,
+                )?,
+                Err(CommitServiceError::KnownUncommitted { message, .. })
+                | Err(CommitServiceError::InvalidInput { message }) => {
+                    ExternalMutationOutcome::KnownUncommitted {
+                        failure: failure(ConnectorMutationFailureKind::Conflict, message),
                     }
-                    Err(CommitServiceError::Unknown { message, .. }) => {
-                        ExternalMutationOutcome::CommitUnknown {
-                            failure: failure(ConnectorMutationFailureKind::Unavailable, message),
-                            evidence: self.evidence(&request.plan, cached.private.payload())?,
-                        }
-                    }
-                    Err(CommitServiceError::FinalizeFailedKnownCommitted {
-                        outcome,
-                        finalize_error,
-                        ..
-                    }) => self.committed(
-                        &request.plan,
-                        outcome
-                            .map(|outcome| outcome.new_snapshot_id)
-                            .unwrap_or_default(),
-                        ExternalMutationFinalization::Failed(failure(
-                            ConnectorMutationFailureKind::Internal,
-                            finalize_error,
-                        )),
-                    )?,
                 }
-            }
+                Err(CommitServiceError::Unknown { message, .. }) => {
+                    ExternalMutationOutcome::CommitUnknown {
+                        failure: failure(ConnectorMutationFailureKind::Unavailable, message),
+                        evidence: self.evidence(&request.plan, cached.private.payload())?,
+                    }
+                }
+                Err(CommitServiceError::FinalizeFailedKnownCommitted {
+                    outcome,
+                    finalize_error,
+                    ..
+                }) => self.committed(
+                    &request.plan,
+                    outcome
+                        .map(|outcome| outcome.new_snapshot_id)
+                        .unwrap_or_default(),
+                    ExternalMutationFinalization::Failed(failure(
+                        ConnectorMutationFailureKind::Internal,
+                        finalize_error,
+                    )),
+                )?,
+            },
         };
         self.terminal
             .lock()
@@ -1097,17 +994,10 @@ fn validate_evidence_request(
     Ok(())
 }
 
-/// Fail closed unless the table is still the base state this plan froze.
-///
-/// `fence_is_established` says this attempt already published its own fence
-/// marker on this table. That publication is itself a metadata commit, so it
-/// necessarily advances the table's metadata version; see the comment on the
-/// version comparison below for why that one dimension then yields to the fence
-/// assertion instead of rejecting the operation.
+/// Fail closed unless the table is still the exact base state this plan froze.
 fn validate_frozen_table(
     table: &crate::iceberg::table::Table,
     payload: &IcebergDataMutationPlanPayloadV1,
-    fence_is_established: bool,
 ) -> Result<(), ConnectorError> {
     let metadata = table.metadata();
     if metadata.uuid().to_string() != payload.table_uuid
@@ -1119,16 +1009,8 @@ fn validate_frozen_table(
             "Iceberg data mutation table state advanced after planning",
         ));
     }
-    // The metadata *version* is a pre-dispatch heuristic, not something the
-    // commit can assert. This attempt's own fence marker is published as an
-    // ordinary metadata commit, so comparing the version after establishing a
-    // fence would reject every fenced mutation for its own act. When the fence
-    // is established, its assertion replaces this check with a stronger one:
-    // the commit pins the fence ref to this attempt's marker atomically, so a
-    // superseded owner is refused inside the catalog update rather than here.
-    if !fence_is_established
-        && hex_encode(metadata_version_digest(table.metadata_location()))
-            != payload.metadata_version_digest_hex
+    if hex_encode(metadata_version_digest(table.metadata_location()))
+        != payload.metadata_version_digest_hex
     {
         return Err(conflict(
             "Iceberg data mutation table state advanced after planning",
@@ -1484,18 +1366,6 @@ mod tests {
     }
 
     impl IcebergDataMutationBackend for FakeBackend {
-        /// This fake owns no catalog, so it cannot publish a marker. Refusing
-        /// keeps the "a fence is a published marker" invariant true even in
-        /// focused tests: nothing here may look fenced without one.
-        fn establish_fence(
-            &self,
-            _facts: &IcebergWriteFenceFacts,
-        ) -> Result<IcebergFenceAssertion, ConnectorError> {
-            Err(internal(
-                "fake Iceberg data mutation backend cannot publish a fence marker",
-            ))
-        }
-
         fn plan(
             &self,
             _request: &ConnectorDataMutationPlanningRequest,
@@ -1532,7 +1402,6 @@ mod tests {
             &self,
             planned: &PlannedIcebergMutation,
             _marker: &IcebergDataMutationMarkerV1,
-            _fencing: &novarocks_spi::connector::ConnectorWriteFencing,
         ) -> Result<CommitOutcome, CommitServiceError> {
             self.execute_count.fetch_add(1, Ordering::SeqCst);
             Err(CommitServiceError::unknown(
@@ -1704,14 +1573,8 @@ mod tests {
         )
         .expect("planning request");
         let plan = adapter.plan_mutation(planning).expect("plan truncate");
-        let request = ConnectorDataMutationExecuteRequest::try_new(
-            plan,
-            novarocks_spi::connector::ConnectorWriteFencing::NotFencedByThisPhase {
-                reason: "test does not exercise direct-mutation fencing",
-            },
-            table_context(),
-        )
-        .expect("execute request");
+        let request = ConnectorDataMutationExecuteRequest::try_new(plan, table_context())
+            .expect("execute request");
         let first = adapter.execute(request.clone()).expect("execute truncate");
         let replay = adapter.execute(request).expect("replay truncate");
         assert!(matches!(
@@ -1719,210 +1582,6 @@ mod tests {
             ExternalMutationOutcome::KnownCommitted { .. }
         ));
         assert_eq!(first, replay);
-    }
-
-    /// The SPI fence value one direct-mutation attempt seals, at an explicit
-    /// generation. The frontend derives the write operation id from the
-    /// direct-mutation operation id, so the fence and the mutation name the same
-    /// operation and cannot borrow another statement's marker.
-    fn direct_mutation_fence(
-        operation_id: ConnectorMutationOperationId,
-        control_plane_incarnation: u64,
-        resource_epoch: u64,
-        coordination_attempt: u64,
-    ) -> novarocks_spi::connector::ConnectorExternalOperationFence {
-        novarocks_spi::connector::ConnectorExternalOperationFence::try_new(
-            novarocks_spi::connector::ConnectorClusterIdentity::derive(
-                "iceberg-direct-mutation-test-cluster",
-            )
-            .expect("cluster identity"),
-            novarocks_spi::connector::ConnectorExternalFenceGeneration::try_new(
-                control_plane_incarnation,
-                resource_epoch,
-                coordination_attempt,
-            )
-            .expect("fence generation"),
-            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(
-                operation_id.to_bytes(),
-            ),
-            [8; 16],
-            ConnectorTableIdentity {
-                instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
-                namespace: Arc::from("db"),
-                table: Arc::from("t"),
-            },
-            novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-        )
-        .expect("external operation fence")
-    }
-
-    fn fence_request(
-        adapter: &IcebergDataMutationAdapter,
-        fence: &novarocks_spi::connector::ConnectorExternalOperationFence,
-    ) -> novarocks_spi::connector::ConnectorExternalFenceRequest {
-        novarocks_spi::connector::ConnectorExternalFenceRequest {
-            owner: adapter.binding_key().clone(),
-            fence: fence.clone(),
-            context: table_context(),
-        }
-    }
-
-    fn reload_physical_table(provider: &IcebergControlProvider) -> crate::iceberg::table::Table {
-        provider
-            .runtime()
-            .control_state()
-            .invalidate_table_cache("db", "t");
-        provider
-            .runtime()
-            .load_table("db", "t")
-            .expect("reload table")
-            .into_table()
-    }
-
-    /// The property the whole direct-mutation fence exists for: establishing it
-    /// publishes a marker on external truth, so the fenced execute can derive
-    /// its assertion and actually commit.
-    ///
-    /// A lease that only remembered the fence locally would leave `execute`
-    /// deriving its assertion from a table with no marker, and every fenced
-    /// TRUNCATE would fail closed with `NotEstablished`.
-    #[test]
-    fn a_fenced_truncate_publishes_its_marker_and_commits() {
-        let (_executor, _warehouse, provider) = exact_provider_with_empty_table();
-        let adapter = IcebergDataMutationAdapter::try_new(Arc::clone(&provider)).expect("adapter");
-        let handle = provider
-            .load_table(ConnectorTableRequest {
-                table: ConnectorTableIdentity {
-                    instance_id: provider.descriptor().instance_id.clone(),
-                    namespace: Arc::from("db"),
-                    table: Arc::from("t"),
-                },
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                context: table_context(),
-            })
-            .expect("load table")
-            .table;
-        let operation_id = ConnectorMutationOperationId::new();
-
-        // Production order: plan first, then fence, then dispatch.
-        let plan = adapter
-            .plan_mutation(
-                ConnectorDataMutationPlanningRequest::try_new(
-                    operation_id,
-                    adapter.binding_key().clone(),
-                    ConnectorDataMutationOperation::truncate(handle, "main")
-                        .expect("truncate operation"),
-                    table_context(),
-                )
-                .expect("planning request"),
-            )
-            .expect("plan truncate");
-
-        let fence = direct_mutation_fence(operation_id, 1, 1, 1);
-        let facts = crate::commit::write_fence::fence_facts_from_spi(&fence);
-
-        // Nothing is fenced yet, so a fenced execute has no authority at all.
-        let error = crate::commit::write_fence::derive_established_assertion(
-            reload_physical_table(&provider).metadata(),
-            &facts,
-        )
-        .expect_err("an unestablished fence must not yield an assertion");
-        assert!(
-            matches!(
-                error,
-                crate::commit::write_fence::FenceError::NotEstablished { .. }
-            ),
-            "an unpublished marker must be NotEstablished, got {error:?}"
-        );
-
-        let receipt = adapter
-            .establish_external_fence(fence_request(&adapter, &fence))
-            .expect("establish the direct mutation fence");
-        assert!(
-            receipt.matches(&fence),
-            "the receipt must acknowledge exactly this fence"
-        );
-
-        // The marker is now external truth: this is the assertion the fenced
-        // execute carries into its atomic catalog update.
-        crate::commit::write_fence::derive_established_assertion(
-            reload_physical_table(&provider).metadata(),
-            &facts,
-        )
-        .expect("the published marker must be derivable from external truth");
-
-        let outcome = adapter
-            .execute(
-                ConnectorDataMutationExecuteRequest::try_new(
-                    plan,
-                    novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence),
-                    table_context(),
-                )
-                .expect("execute request"),
-            )
-            .expect("fenced truncate must reach the catalog");
-        assert!(
-            matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }),
-            "a fenced TRUNCATE must actually commit, got {outcome:?}"
-        );
-    }
-
-    /// A strictly higher generation of the same operation supersedes the
-    /// established fence: the later owner takes the marker over, and the older
-    /// attempt can no longer derive an assertion.
-    #[test]
-    fn a_higher_direct_mutation_fence_generation_supersedes_the_established_marker() {
-        let (_executor, _warehouse, provider) = exact_provider_with_empty_table();
-        let adapter = IcebergDataMutationAdapter::try_new(Arc::clone(&provider)).expect("adapter");
-        let operation_id = ConnectorMutationOperationId::new();
-
-        let first = direct_mutation_fence(operation_id, 1, 1, 1);
-        let first_facts = crate::commit::write_fence::fence_facts_from_spi(&first);
-        adapter
-            .establish_external_fence(fence_request(&adapter, &first))
-            .expect("establish the first fence");
-
-        // Replaying the identical fence is idempotent, not a second marker.
-        let replay = adapter
-            .establish_external_fence(fence_request(&adapter, &first))
-            .expect("replaying an identical fence must be idempotent");
-        assert!(replay.matches(&first));
-
-        let second = direct_mutation_fence(operation_id, 1, 1, 2);
-        let second_facts = crate::commit::write_fence::fence_facts_from_spi(&second);
-        let raised = adapter
-            .establish_external_fence(fence_request(&adapter, &second))
-            .expect("a strictly higher generation must supersede");
-        assert!(raised.matches(&second));
-
-        let metadata = reload_physical_table(&provider);
-        crate::commit::write_fence::derive_established_assertion(
-            metadata.metadata(),
-            &second_facts,
-        )
-        .expect("the raised fence must own the marker");
-        let error = crate::commit::write_fence::derive_established_assertion(
-            metadata.metadata(),
-            &first_facts,
-        )
-        .expect_err("a superseded generation must not keep its assertion");
-        assert!(
-            matches!(
-                error,
-                crate::commit::write_fence::FenceError::Superseded { .. }
-            ),
-            "the older attempt must be reported superseded, got {error:?}"
-        );
-
-        // And the older attempt cannot re-establish behind the raised fence.
-        let error = adapter
-            .establish_external_fence(fence_request(&adapter, &first))
-            .expect_err("a lower generation must not be able to fence again");
-        assert_eq!(
-            error.external_fence_failure(),
-            Some(novarocks_spi::connector::ConnectorExternalFenceFailure::Superseded),
-            "a superseded fence must stay a typed fence failure, got {error:?}"
-        );
     }
 
     #[test]
@@ -2089,14 +1748,8 @@ mod tests {
                 "main",
             ))
             .expect("plan");
-        let execute = ConnectorDataMutationExecuteRequest::try_new(
-            plan.clone(),
-            novarocks_spi::connector::ConnectorWriteFencing::NotFencedByThisPhase {
-                reason: "test does not exercise direct-mutation fencing",
-            },
-            test_context(),
-        )
-        .expect("execute");
+        let execute = ConnectorDataMutationExecuteRequest::try_new(plan.clone(), test_context())
+            .expect("execute");
         let first = adapter.execute(execute.clone()).expect("unknown");
         let evidence = match first {
             ExternalMutationOutcome::CommitUnknown { evidence, .. } => evidence,
@@ -2133,14 +1786,8 @@ mod tests {
                 "main",
             ))
             .expect("plan");
-        let execute = ConnectorDataMutationExecuteRequest::try_new(
-            plan.clone(),
-            novarocks_spi::connector::ConnectorWriteFencing::NotFencedByThisPhase {
-                reason: "test does not exercise direct-mutation fencing",
-            },
-            test_context(),
-        )
-        .expect("execute");
+        let execute = ConnectorDataMutationExecuteRequest::try_new(plan.clone(), test_context())
+            .expect("execute");
         let ExternalMutationOutcome::CommitUnknown { evidence, .. } =
             adapter.execute(execute).expect("unknown")
         else {

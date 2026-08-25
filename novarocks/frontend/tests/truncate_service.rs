@@ -27,9 +27,7 @@ use novarocks_frontend::common::admitted_query_context::{RequestAdmission, Reque
 use novarocks_frontend::common::backend_topology::BackendTopologySnapshot;
 use novarocks_frontend::common::query_cancellation::QueryCancellationSource;
 use novarocks_frontend::dml::model::{
-    DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_OPERATION_SCHEMA_VERSION,
-    DmlDirectMutationFenceMutationRequest, DmlDirectMutationFenceReceiptRecord,
-    DmlDirectMutationKind, validate_direct_mutation_fence_receipt, validate_operation_transition,
+    DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_OPERATION_SCHEMA_VERSION, validate_operation_transition,
 };
 use novarocks_frontend::dml::truncate::{
     decode_truncate_evidence_hex, encode_truncate_evidence_hex,
@@ -133,24 +131,6 @@ impl FakeTruncateEngine {
 }
 
 impl TruncateEngine for FakeTruncateEngine {
-    /// Acknowledge the sealed fence the way a provider does: with a receipt
-    /// that names exactly this fence. The establish-before-dispatch ordering
-    /// and the journalled receipt are what these tests exercise, not the
-    /// provider's marker publication itself.
-    fn establish_truncate_external_fence(
-        &self,
-        _prepared: &dyn novarocks_frontend::query_execution::dml::truncate::TruncatePrepared,
-        fence: novarocks_spi::connector::ConnectorExternalOperationFence,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorExternalFenceReceipt,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        novarocks_spi::connector::ConnectorExternalFenceReceipt::try_new(
-            &fence,
-            Bytes::from_static(b"truncate-fence-marker"),
-        )
-    }
-
     fn plan_truncate(
         &self,
         request: PlanTruncateRequest,
@@ -388,7 +368,6 @@ struct FakeJournal {
     fail_mutation_at: Mutex<Option<usize>>,
     injected_error: Mutex<Option<DmlError>>,
     max_statement_bytes: AtomicUsize,
-    direct_mutation_fences: Mutex<Vec<DmlDirectMutationFenceReceiptRecord>>,
 }
 
 impl Default for FakeJournal {
@@ -402,7 +381,6 @@ impl Default for FakeJournal {
             fail_mutation_at: Mutex::new(None),
             injected_error: Mutex::new(None),
             max_statement_bytes: AtomicUsize::new(usize::MAX),
-            direct_mutation_fences: Mutex::new(Vec::new()),
         }
     }
 }
@@ -412,10 +390,6 @@ impl FakeJournal {
         let operations = self.operations.lock().unwrap();
         assert_eq!(operations.len(), 1);
         operations.values().next().unwrap().clone()
-    }
-
-    fn direct_mutation_fences(&self) -> Vec<DmlDirectMutationFenceReceiptRecord> {
-        self.direct_mutation_fences.lock().unwrap().clone()
     }
 
     fn history(&self) -> Vec<StoredOperation> {
@@ -494,11 +468,11 @@ impl OperationJournal for FakeJournal {
     /// This fake has no transaction to admit inside, so it cannot run the
     /// validator; admission itself is covered by the StateStore journal tests.
     /// Here it only needs to let a coordinated operation be created, so these
-    /// tests exercise TRUNCATE routing under a real fence.
+    /// tests exercise the normal TRUNCATE route.
     /// Claiming is an ownership transition this fake does not model; the real
     /// claim semantics are covered by the StateStore journal tests. Returning
     /// the stored operation lets the coordinated route proceed so these tests
-    /// can exercise TRUNCATE under a real fence.
+    /// can exercise normal TRUNCATE dispatch.
     fn claim_operation_admitted(
         &self,
         request: novarocks_frontend::dml::model::DmlCoordinationClaimRequest,
@@ -551,9 +525,8 @@ impl OperationJournal for FakeJournal {
         Ok(stored)
     }
 
-    /// The coordinated path validates the fence inside the journal
-    /// transaction. This fake has no transaction, so it delegates to the plain
-    /// mutation; fence validation is covered by the StateStore journal tests.
+    /// The coordinated path owns this mutation inside the journal transaction.
+    /// This fake has no transaction, so it delegates to the plain mutation.
     fn mutate_statement_operation_authorized(
         &self,
         request: OperationMutationRequest,
@@ -608,49 +581,13 @@ impl OperationJournal for FakeJournal {
             Ok(())
         }
     }
-
-    fn preflight_direct_mutation_fence(
-        &self,
-        request: &DmlDirectMutationFenceMutationRequest,
-    ) -> Result<(), DmlError> {
-        validate_direct_mutation_fence_receipt(&request.fence)
-            .map_err(|_| Self::journal_limit_error())
-    }
-
-    /// The coordinated path validates the live lease fence inside the same
-    /// transaction that writes the receipt. This fake has no transaction, so it
-    /// records the receipt and advances the revision the way the real journal
-    /// does; the transactional guarantees are covered by the StateStore journal
-    /// tests.
-    fn record_direct_mutation_fence_authorized(
-        &self,
-        request: DmlDirectMutationFenceMutationRequest,
-        _recovery_due_at_ms: Option<i64>,
-        _authority: novarocks_frontend::dml::DmlMutationAuthority,
-    ) -> Result<StoredOperation, DmlError> {
-        self.preflight_direct_mutation_fence(&request)?;
-        let mut operations = self.operations.lock().unwrap();
-        let operation = operations
-            .get_mut(request.operation_id.as_uuid())
-            .expect("fenced fake operation");
-        assert_eq!(operation.revision, request.expected_revision);
-        operation.revision += 1;
-        operation.last_mutation_id = request.mutation_id;
-        let stored = operation.clone();
-        drop(operations);
-        self.direct_mutation_fences
-            .lock()
-            .unwrap()
-            .push(request.fence);
-        Ok(stored)
-    }
 }
 
 /// A service wired to real coordination, holding its runtime alive.
 ///
-/// Dispatch is fenced now, and a fence can only be minted from a live
-/// coordination lease, so a service composed without coordination cannot
-/// dispatch at all. Derefs to `DmlService` so the call sites stay unchanged.
+/// Dispatch requires a live coordination lease, so a service composed without
+/// coordination cannot dispatch at all. Derefs to `DmlService` so the call
+/// sites stay unchanged.
 struct TestService {
     dml: DmlService,
     _coordination: common::coordination_fixture::BlockingCoordination,
@@ -870,19 +807,6 @@ fn committed_truncate_persists_exact_plan_and_versioned_receipt_then_finishes() 
         hex::encode(br#"{"snapshot_id":42}"#)
     );
     assert!(fact.receipt.as_ref().unwrap().len() <= DML_EXTERNAL_FACT_ENCODED_LIMIT);
-
-    // The fence the provider acknowledged must be durable before the
-    // destructive execute, and it must bind this exact statement: a later owner
-    // recovers the historical fence from this record alone. TRUNCATE owns no
-    // source set, so it must not bind a source scope.
-    let fences = journal.direct_mutation_fences();
-    assert_eq!(fences.len(), 1, "one fence receipt per TRUNCATE attempt");
-    assert_eq!(fences[0].operation_kind, DmlDirectMutationKind::Truncate);
-    assert_eq!(fences[0].source_scope_digest, None);
-    assert_eq!(
-        fences[0].mutation_operation_id().into_bytes(),
-        plan_context[0].2
-    );
 }
 
 #[test]

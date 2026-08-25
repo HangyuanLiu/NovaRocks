@@ -107,21 +107,6 @@ impl FakeDeleteEngine {
 }
 
 impl DeleteEngine for FakeDeleteEngine {
-    /// Distributed write fails closed until a fence is established, so the fake
-    /// engine must expose a real write authority to fence against.
-    fn establish_delete_external_fence(
-        &self,
-        _prepared: &dyn novarocks_frontend::query_execution::dml::delete::DeletePrepared,
-        proposal: &dyn novarocks_frontend::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorEstablishedWriteFence,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        common::fence_fixture::establish_from_proposal(|operation_id, table, target_ref| {
-            proposal.seal(operation_id, table, target_ref)
-        })
-    }
-
     fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
         let sql_source = request.source.to_string();
         self.prepare_calls.lock().unwrap().push((

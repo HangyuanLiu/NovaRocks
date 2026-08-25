@@ -19,20 +19,20 @@ use std::sync::{Arc, Mutex};
 
 use super::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
-    ConnectorCleanupMaintenance, ConnectorCleanupMaintenanceResolver,
-    ConnectorDataMutation, ConnectorDataMutationResolver, ConnectorDistributedRewrite,
+    ConnectorCleanupMaintenance, ConnectorCleanupMaintenanceResolver, ConnectorDataMutation,
+    ConnectorDataMutationResolver, ConnectorDistributedRewrite,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
     ConnectorHistoricalMaintenanceRecovery, ConnectorHistoricalMaintenanceResolver,
-    ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorMetadataMaintenance,
-    ConnectorMetadataMaintenanceResolver, ConnectorMvAttemptDiscovery,
-    ConnectorMvPublicationFencing, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
-    ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
-    ConnectorStagedCreate, ConnectorStagedCreateLease, ConnectorStagedPublicationRecovery,
-    ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
-    ConnectorTableHandle, ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease,
-    ConnectorViewMetadata, ConnectorWriteControl, ConnectorWriteLease,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver,
+    ConnectorMvAttemptDiscovery, ConnectorMvPublicationFencing, ConnectorProviderId,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
+    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsLease,
+    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorUnanchoredCtasCleanup,
+    ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata, ConnectorWriteControl,
+    ConnectorWriteLease,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -1022,7 +1022,6 @@ impl ConnectorControlPlanningLease {
             drop(retained_planning_lease)
         })
     }
-
 }
 
 impl Drop for PlanningLeaseRelease {

@@ -39,7 +39,6 @@ pub mod service;
 pub mod state_store_journal;
 pub mod truncate;
 
-pub use coordination::DmlExternalFenceProposal;
 pub use error::{DmlError, DmlErrorKind};
 pub use insert::{InsertCommand, InsertCommandSource, convert_insert_command, reorder_insert_rows};
 pub use journal::{

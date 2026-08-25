@@ -1165,7 +1165,6 @@ mod tests {
         plan_is_durable: Arc<AtomicBool>,
         evidence_is_durable: Arc<AtomicBool>,
         preflight_calls: AtomicUsize,
-        direct_mutation_fences: Mutex<Vec<crate::dml::model::DmlDirectMutationFenceReceiptRecord>>,
     }
 
     impl FakeJournal {
@@ -1173,12 +1172,6 @@ mod tests {
             let operations = self.operations.lock().unwrap();
             assert_eq!(operations.len(), 1);
             operations.values().next().unwrap().clone()
-        }
-
-        fn recorded_direct_mutation_fences(
-            &self,
-        ) -> Vec<crate::dml::model::DmlDirectMutationFenceReceiptRecord> {
-            self.direct_mutation_fences.lock().unwrap().clone()
         }
     }
 
@@ -1228,7 +1221,7 @@ mod tests {
         /// transaction. This fake has no transaction to do that inside; the
         /// transactional guarantees are covered by the StateStore journal
         /// tests. Here these only need to let a coordinated operation proceed
-        /// so ADD FILES routing runs under a real fence.
+        /// so ADD FILES routing exercises the normal statement path.
         fn create_statement_operation_admitted(
             &self,
             request: CreateStatementOperationRequest,
@@ -1296,35 +1289,6 @@ mod tests {
             Ok(())
         }
 
-        fn preflight_direct_mutation_fence(
-            &self,
-            request: &crate::dml::model::DmlDirectMutationFenceMutationRequest,
-        ) -> Result<(), DmlError> {
-            crate::dml::model::validate_direct_mutation_fence_receipt(&request.fence)
-                .map_err(DmlError::journal_corruption)
-        }
-
-        fn record_direct_mutation_fence_authorized(
-            &self,
-            request: crate::dml::model::DmlDirectMutationFenceMutationRequest,
-            _recovery_due_at_ms: Option<i64>,
-            _authority: crate::dml::journal::DmlMutationAuthority,
-        ) -> Result<StoredOperation, DmlError> {
-            crate::dml::model::validate_direct_mutation_fence_receipt(&request.fence)
-                .map_err(DmlError::journal_corruption)?;
-            let mut operations = self.operations.lock().unwrap();
-            let operation = operations
-                .get_mut(request.operation_id.as_uuid())
-                .expect("fenced DML operation must exist in this fake journal");
-            assert_eq!(operation.revision, request.expected_revision);
-            operation.revision += 1;
-            operation.last_mutation_id = request.mutation_id;
-            self.direct_mutation_fences
-                .lock()
-                .unwrap()
-                .push(request.fence);
-            Ok(operation.clone())
-        }
         fn apply_add_files_mutation_authorized(
             &self,
             request: AddFilesMutationRequest,
@@ -1402,12 +1366,10 @@ mod tests {
 
     /// Real coordination over a temporary SQLite StateStore.
     ///
-    /// Dispatch is fenced now, and a fence can only be minted from a live
-    /// coordination lease, so a service composed without coordination cannot
-    /// dispatch at all. These tests therefore stand up the genuine coordination
-    /// runtime rather than reaching for a test-only fence -- the seam that
-    /// would have given them one also disables the guard asserting that an
-    /// operation without authority cannot dispatch.
+    /// Dispatch requires a live coordination lease, so a service composed
+    /// without coordination cannot dispatch at all. These tests therefore stand
+    /// up the genuine coordination runtime rather than a test-only authority
+    /// seam that could bypass the guard.
     fn coordination() -> Arc<crate::coordination::FrontendCoordinationRuntime> {
         let dir = tempfile::tempdir().expect("temp dir").keep();
         let registry = crate::state_store::testing::builtin_state_store_provider_registry()
@@ -1509,11 +1471,6 @@ mod tests {
         assert_eq!(record.source_ownership, SourceScopeOwnership::Unclaimed);
         assert!(record.plan_artifact.is_some());
         assert!(record.receipt_artifact.is_some());
-
-        assert!(
-            journal.recorded_direct_mutation_fences().is_empty(),
-            "ordinary ADD FILES must not create a connector external fence"
-        );
     }
 
     #[test]

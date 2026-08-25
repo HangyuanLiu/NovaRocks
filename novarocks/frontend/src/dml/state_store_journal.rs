@@ -43,16 +43,12 @@ use crate::dml::model::{
     DML_EXTERNAL_FACT_ENCODED_LIMIT, DML_FOREGROUND_RECOVERY_VISIBILITY_MS,
     DML_OPERATION_SCHEMA_VERSION, DML_RECOVERY_DUE_SCHEMA_VERSION, DML_RECOVERY_PAGE_SIZE,
     DML_RECOVERY_SHARD_COUNT, DML_UNFINISHED_SCHEMA_VERSION, DmlCoordinationClaimRequest,
-    DmlDirectMutationFenceMutationRequest, DmlDirectMutationFenceReceiptRecord,
-    DmlExternalFenceMutationRequest, DmlExternalFenceReceiptRecord,
     DmlHistoricalDataMutationRecoveryMutationRequest, DmlHistoricalDataMutationRecoveryRecord,
     DmlHistoricalWriteRecoveryMutationRequest, DmlHistoricalWriteRecoveryRecord, DmlOperationId,
     DmlRecoveryCandidate, DmlRecoveryDueRescheduleRequest, DurableExternalFact,
     ExternalFactOutcome, OperationFact, OperationKind, OperationMutationRequest, OperationPayload,
     OperationState, OperationTarget, SourceScopeOwnership, StatementNextAction, StoredOperation,
     operation_requires_recovery_scan, operation_requires_recovery_scan_with_direct_mutation,
-    validate_direct_mutation_fence_receipt, validate_direct_mutation_fence_transition,
-    validate_external_fence_receipt, validate_external_fence_transition,
     validate_historical_data_mutation_recovery,
     validate_historical_data_mutation_recovery_transition, validate_historical_write_recovery,
     validate_historical_write_recovery_transition, validate_operation_transition,
@@ -65,26 +61,11 @@ const UNFINISHED_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/unfinished/";
 const RECOVERY_DUE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/recovery-due/";
 const ADD_FILES_ARTIFACT_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/add-files-artifacts/";
 const ADD_FILES_SOURCE_SCOPE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/add-files-source-scopes/";
-const EXTERNAL_FENCE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/external-fences/";
 const HISTORICAL_WRITE_RECOVERY_PREFIX: &[u8] =
     b"novarocks/frontend/dml/v1/historical-write-recoveries/";
-const DIRECT_MUTATION_FENCE_PREFIX: &[u8] = b"novarocks/frontend/dml/v1/direct-mutation-fences/";
 const HISTORICAL_DATA_MUTATION_RECOVERY_PREFIX: &[u8] =
     b"novarocks/frontend/dml/v1/historical-data-mutation-recoveries/";
 const ADD_FILES_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
-
-/// Operation states in which an external operation fence receipt may still be
-/// attached. A fence must be confirmed before any writer or commit dispatch, so
-/// an operation that already carries an external outcome cannot accept one.
-///
-/// TRUNCATE and ADD FILES seal their fence in `Preparing` or `Committing`, so
-/// the direct-mutation receipt shares this rule instead of restating it.
-const EXTERNAL_FENCE_ALLOWED_STATES: [OperationState; 4] = [
-    OperationState::Preparing,
-    OperationState::Writing,
-    OperationState::Collecting,
-    OperationState::Committing,
-];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct StoredAddFilesSourceScopeV1 {
@@ -1093,23 +1074,6 @@ impl StateStoreOperationJournal {
         .await
     }
 
-    async fn record_external_fence_async(
-        &self,
-        request: DmlExternalFenceMutationRequest,
-        recovery_due_at_ms: Option<i64>,
-        authority: DmlMutationAuthority,
-    ) -> Result<StoredOperation, DmlError> {
-        self.apply_side_record_mutation_async(
-            request.operation_id,
-            request.expected_revision,
-            request.mutation_id,
-            recovery_due_at_ms,
-            DmlSideRecord::ExternalFence(Box::new(request.fence)),
-            authority,
-        )
-        .await
-    }
-
     async fn record_historical_write_recovery_async(
         &self,
         request: DmlHistoricalWriteRecoveryMutationRequest,
@@ -1122,23 +1086,6 @@ impl StateStoreOperationJournal {
             request.mutation_id,
             recovery_due_at_ms,
             DmlSideRecord::HistoricalWriteRecovery(Box::new(request.recovery)),
-            authority,
-        )
-        .await
-    }
-
-    async fn record_direct_mutation_fence_async(
-        &self,
-        request: DmlDirectMutationFenceMutationRequest,
-        recovery_due_at_ms: Option<i64>,
-        authority: DmlMutationAuthority,
-    ) -> Result<StoredOperation, DmlError> {
-        self.apply_side_record_mutation_async(
-            request.operation_id,
-            request.expected_revision,
-            request.mutation_id,
-            recovery_due_at_ms,
-            DmlSideRecord::DirectMutationFence(Box::new(request.fence)),
             authority,
         )
         .await
@@ -1361,17 +1308,6 @@ impl StateStoreOperationJournal {
             .await
     }
 
-    async fn load_external_fence_async(
-        &self,
-        operation_id: DmlOperationId,
-    ) -> Result<Option<DmlExternalFenceReceiptRecord>, DmlError> {
-        let key = external_fence_key(operation_id)?;
-        self.load_side_record(&key)
-            .await?
-            .map(|value| decode_external_fence(&key, value))
-            .transpose()
-    }
-
     async fn load_historical_write_recovery_async(
         &self,
         operation_id: DmlOperationId,
@@ -1380,17 +1316,6 @@ impl StateStoreOperationJournal {
         self.load_side_record(&key)
             .await?
             .map(|value| decode_historical_write_recovery(&key, value))
-            .transpose()
-    }
-
-    async fn load_direct_mutation_fence_async(
-        &self,
-        operation_id: DmlOperationId,
-    ) -> Result<Option<DmlDirectMutationFenceReceiptRecord>, DmlError> {
-        let key = direct_mutation_fence_key(operation_id)?;
-        self.load_side_record(&key)
-            .await?
-            .map(|value| decode_direct_mutation_fence(&key, value))
             .transpose()
     }
 
@@ -2144,15 +2069,6 @@ impl OperationJournal for StateStoreOperationJournal {
         ))
     }
 
-    fn record_external_fence_authorized(
-        &self,
-        request: DmlExternalFenceMutationRequest,
-        recovery_due_at_ms: Option<i64>,
-        authority: DmlMutationAuthority,
-    ) -> Result<StoredOperation, DmlError> {
-        self.blocking(self.record_external_fence_async(request, recovery_due_at_ms, authority))
-    }
-
     fn record_historical_write_recovery_authorized(
         &self,
         request: DmlHistoricalWriteRecoveryMutationRequest,
@@ -2166,28 +2082,11 @@ impl OperationJournal for StateStoreOperationJournal {
         ))
     }
 
-    fn load_external_fence(
-        &self,
-        operation_id: DmlOperationId,
-    ) -> Result<Option<DmlExternalFenceReceiptRecord>, DmlError> {
-        self.blocking(self.load_external_fence_async(operation_id))
-    }
-
     fn load_historical_write_recovery(
         &self,
         operation_id: DmlOperationId,
     ) -> Result<Option<DmlHistoricalWriteRecoveryRecord>, DmlError> {
         self.blocking(self.load_historical_write_recovery_async(operation_id))
-    }
-
-    fn preflight_external_fence(
-        &self,
-        request: &DmlExternalFenceMutationRequest,
-    ) -> Result<(), DmlError> {
-        validate_external_fence_receipt(&request.fence).map_err(DmlError::journal_corruption)?;
-        DmlSideRecord::ExternalFence(Box::new(request.fence.clone()))
-            .encode(self.store.limits().max_value_bytes)
-            .map(|_| ())
     }
 
     fn preflight_historical_write_recovery(
@@ -2199,19 +2098,6 @@ impl OperationJournal for StateStoreOperationJournal {
         DmlSideRecord::HistoricalWriteRecovery(Box::new(request.recovery.clone()))
             .encode(self.store.limits().max_value_bytes)
             .map(|_| ())
-    }
-
-    fn record_direct_mutation_fence_authorized(
-        &self,
-        request: DmlDirectMutationFenceMutationRequest,
-        recovery_due_at_ms: Option<i64>,
-        authority: DmlMutationAuthority,
-    ) -> Result<StoredOperation, DmlError> {
-        self.blocking(self.record_direct_mutation_fence_async(
-            request,
-            recovery_due_at_ms,
-            authority,
-        ))
     }
 
     fn record_historical_data_mutation_recovery_authorized(
@@ -2227,29 +2113,11 @@ impl OperationJournal for StateStoreOperationJournal {
         ))
     }
 
-    fn load_direct_mutation_fence(
-        &self,
-        operation_id: DmlOperationId,
-    ) -> Result<Option<DmlDirectMutationFenceReceiptRecord>, DmlError> {
-        self.blocking(self.load_direct_mutation_fence_async(operation_id))
-    }
-
     fn load_historical_data_mutation_recovery(
         &self,
         operation_id: DmlOperationId,
     ) -> Result<Option<DmlHistoricalDataMutationRecoveryRecord>, DmlError> {
         self.blocking(self.load_historical_data_mutation_recovery_async(operation_id))
-    }
-
-    fn preflight_direct_mutation_fence(
-        &self,
-        request: &DmlDirectMutationFenceMutationRequest,
-    ) -> Result<(), DmlError> {
-        validate_direct_mutation_fence_receipt(&request.fence)
-            .map_err(DmlError::journal_corruption)?;
-        DmlSideRecord::DirectMutationFence(Box::new(request.fence.clone()))
-            .encode(self.store.limits().max_value_bytes)
-            .map(|_| ())
     }
 
     fn preflight_historical_data_mutation_recovery(
@@ -2403,27 +2271,21 @@ impl StateStoreOperationJournal {
 /// fenced mutation is the only way to change any of them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum DmlSideRecord {
-    ExternalFence(Box<DmlExternalFenceReceiptRecord>),
     HistoricalWriteRecovery(Box<DmlHistoricalWriteRecoveryRecord>),
-    DirectMutationFence(Box<DmlDirectMutationFenceReceiptRecord>),
     HistoricalDataMutationRecovery(Box<DmlHistoricalDataMutationRecoveryRecord>),
 }
 
 impl DmlSideRecord {
     const fn label(&self) -> &'static str {
         match self {
-            Self::ExternalFence(_) => "external fence receipt",
             Self::HistoricalWriteRecovery(_) => "historical write recovery",
-            Self::DirectMutationFence(_) => "direct mutation fence receipt",
             Self::HistoricalDataMutationRecovery(_) => "historical data mutation recovery",
         }
     }
 
     const fn action(&self) -> &'static str {
         match self {
-            Self::ExternalFence(_) => "record frontend DML external fence receipt",
             Self::HistoricalWriteRecovery(_) => "record frontend DML historical write recovery",
-            Self::DirectMutationFence(_) => "record frontend DML direct mutation fence receipt",
             Self::HistoricalDataMutationRecovery(_) => {
                 "record frontend DML historical data mutation recovery"
             }
@@ -2436,9 +2298,7 @@ impl DmlSideRecord {
     )]
     fn key(&self, operation_id: DmlOperationId) -> Result<Key, DmlError> {
         match self {
-            Self::ExternalFence(_) => external_fence_key(operation_id),
             Self::HistoricalWriteRecovery(_) => historical_write_recovery_key(operation_id),
-            Self::DirectMutationFence(_) => direct_mutation_fence_key(operation_id),
             Self::HistoricalDataMutationRecovery(_) => {
                 historical_data_mutation_recovery_key(operation_id)
             }
@@ -2451,12 +2311,8 @@ impl DmlSideRecord {
     )]
     fn decode(&self, key: &Key, value: Value) -> Result<Self, DmlError> {
         match self {
-            Self::ExternalFence(_) => decode_external_fence(key, value)
-                .map(|record| Self::ExternalFence(Box::new(record))),
             Self::HistoricalWriteRecovery(_) => decode_historical_write_recovery(key, value)
                 .map(|record| Self::HistoricalWriteRecovery(Box::new(record))),
-            Self::DirectMutationFence(_) => decode_direct_mutation_fence(key, value)
-                .map(|record| Self::DirectMutationFence(Box::new(record))),
             Self::HistoricalDataMutationRecovery(_) => {
                 decode_historical_data_mutation_recovery(key, value)
                     .map(|record| Self::HistoricalDataMutationRecovery(Box::new(record)))
@@ -2470,9 +2326,7 @@ impl DmlSideRecord {
     )]
     fn encode(&self, max_value_bytes: usize) -> Result<Value, DmlError> {
         let encoded = match self {
-            Self::ExternalFence(record) => serde_json::to_vec(record.as_ref()),
             Self::HistoricalWriteRecovery(record) => serde_json::to_vec(record.as_ref()),
-            Self::DirectMutationFence(record) => serde_json::to_vec(record.as_ref()),
             Self::HistoricalDataMutationRecovery(record) => serde_json::to_vec(record.as_ref()),
         }
         .map_err(DmlError::journal_corruption)?;
@@ -2497,32 +2351,6 @@ impl DmlSideRecord {
         authority: &DmlMutationAuthority,
     ) -> Result<(), DmlError> {
         match (self, existing) {
-            (Self::ExternalFence(fence), existing) => {
-                let existing = match existing {
-                    Some(Self::ExternalFence(existing)) => Some(existing.as_ref()),
-                    Some(_) => {
-                        return Err(DmlError::journal_corruption(
-                            "DML external fence key holds another record kind",
-                        ));
-                    }
-                    None => None,
-                };
-                if fence.identity.coordination_attempt_id != authority.coordination_attempt_id() {
-                    return Err(DmlError::journal_unresolved(format!(
-                        "DML operation {} external fence receipt was minted by another coordination attempt",
-                        operation.operation_id
-                    )));
-                }
-                if !EXTERNAL_FENCE_ALLOWED_STATES.contains(&operation.state) {
-                    return Err(DmlError::journal_unresolved(format!(
-                        "DML operation {} cannot accept an external fence receipt in state {}",
-                        operation.operation_id,
-                        operation.state.as_str()
-                    )));
-                }
-                validate_external_fence_transition(existing, fence)
-                    .map_err(DmlError::journal_corruption)
-            }
             (Self::HistoricalWriteRecovery(recovery), existing) => {
                 let existing = match existing {
                     Some(Self::HistoricalWriteRecovery(existing)) => Some(existing.as_ref()),
@@ -2540,41 +2368,6 @@ impl DmlSideRecord {
                     )));
                 }
                 validate_historical_write_recovery_transition(existing, recovery)
-                    .map_err(DmlError::journal_corruption)
-            }
-            (Self::DirectMutationFence(fence), existing) => {
-                let existing = match existing {
-                    Some(Self::DirectMutationFence(existing)) => Some(existing.as_ref()),
-                    Some(_) => {
-                        return Err(DmlError::journal_corruption(
-                            "DML direct mutation fence key holds another record kind",
-                        ));
-                    }
-                    None => None,
-                };
-                if fence.fence.identity.coordination_attempt_id
-                    != authority.coordination_attempt_id()
-                {
-                    return Err(DmlError::journal_unresolved(format!(
-                        "DML operation {} direct mutation fence receipt was minted by another coordination attempt",
-                        operation.operation_id
-                    )));
-                }
-                if operation.operation_kind != fence.operation_kind.operation_kind() {
-                    return Err(DmlError::journal_corruption(format!(
-                        "DML operation {} cannot accept a {} fence receipt",
-                        operation.operation_id,
-                        fence.operation_kind.as_str()
-                    )));
-                }
-                if !EXTERNAL_FENCE_ALLOWED_STATES.contains(&operation.state) {
-                    return Err(DmlError::journal_unresolved(format!(
-                        "DML operation {} cannot accept a direct mutation fence receipt in state {}",
-                        operation.operation_id,
-                        operation.state.as_str()
-                    )));
-                }
-                validate_direct_mutation_fence_transition(existing, fence)
                     .map_err(DmlError::journal_corruption)
             }
             (Self::HistoricalDataMutationRecovery(recovery), existing) => {
@@ -2611,24 +2404,8 @@ impl DmlSideRecord {
     clippy::result_large_err,
     reason = "Preserves the frozen DML error contract without a broad ABI migration."
 )]
-fn external_fence_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
-    key_for(EXTERNAL_FENCE_PREFIX, operation_id)
-}
-
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
 fn historical_write_recovery_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
     key_for(HISTORICAL_WRITE_RECOVERY_PREFIX, operation_id)
-}
-
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-fn direct_mutation_fence_key(operation_id: DmlOperationId) -> Result<Key, DmlError> {
-    key_for(DIRECT_MUTATION_FENCE_PREFIX, operation_id)
 }
 
 #[allow(
@@ -2643,21 +2420,6 @@ fn historical_data_mutation_recovery_key(operation_id: DmlOperationId) -> Result
     clippy::result_large_err,
     reason = "Preserves the frozen DML error contract without a broad ABI migration."
 )]
-fn decode_external_fence(
-    key: &Key,
-    value: Value,
-) -> Result<DmlExternalFenceReceiptRecord, DmlError> {
-    decode_key(EXTERNAL_FENCE_PREFIX, key)?;
-    let record: DmlExternalFenceReceiptRecord =
-        serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
-    validate_external_fence_receipt(&record).map_err(DmlError::journal_corruption)?;
-    Ok(record)
-}
-
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
 fn decode_historical_write_recovery(
     key: &Key,
     value: Value,
@@ -2666,21 +2428,6 @@ fn decode_historical_write_recovery(
     let record: DmlHistoricalWriteRecoveryRecord =
         serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
     validate_historical_write_recovery(&record).map_err(DmlError::journal_corruption)?;
-    Ok(record)
-}
-
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-fn decode_direct_mutation_fence(
-    key: &Key,
-    value: Value,
-) -> Result<DmlDirectMutationFenceReceiptRecord, DmlError> {
-    decode_key(DIRECT_MUTATION_FENCE_PREFIX, key)?;
-    let record: DmlDirectMutationFenceReceiptRecord =
-        serde_json::from_slice(value.as_bytes()).map_err(DmlError::journal_corruption)?;
-    validate_direct_mutation_fence_receipt(&record).map_err(DmlError::journal_corruption)?;
     Ok(record)
 }
 

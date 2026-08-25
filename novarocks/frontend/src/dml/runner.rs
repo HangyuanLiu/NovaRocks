@@ -23,18 +23,12 @@
 
 use std::convert::Infallible;
 
-#[cfg(test)]
-use novarocks_spi::connector::{
-    ConnectorError, ConnectorEstablishedWriteFence, ConnectorExternalFenceFailure,
-};
 use novarocks_spi::connector::{
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteAbortOutcome,
     ConnectorWriteReceipt, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use crate::dml::coordination::ActiveDmlOperation;
-#[cfg(test)]
-use crate::dml::coordination::DmlExternalFenceProposal;
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
@@ -654,405 +648,10 @@ fn empty_receipt() -> Result<ConnectorWriteReceipt, DmlError> {
 mod tests {
     use std::collections::BTreeMap;
     use std::convert::Infallible;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-
-    use bytes::Bytes;
-    use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorExternalFenceReceipt,
-        ConnectorExternalFenceRequest, ConnectorExternalOperationFence, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorRequestContext, ConnectorTableIdentity,
-        ConnectorWriteAbortRequest, ConnectorWriteCommitRequest, ConnectorWriteControl,
-        ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlan,
-        ConnectorWritePlanningRequest, ConnectorWriteReconcileRequest, ConnectorWriteTargetRef,
-    };
-    use novarocks_spi::state_store::WriteTransaction;
-    use uuid::Uuid;
+    use std::sync::Arc;
 
     use super::*;
     use crate::dml::journal::testing::InMemoryOperationJournal;
-    use crate::dml::journal::{DmlMutationAuthority, DmlMutationAuthorityValidator};
-    use crate::dml::model::{
-        AddFilesArtifact, CreateStatementOperationRequest, DmlExternalFenceGeneration,
-        DmlExternalFenceMutationRequest, DmlExternalFenceReceiptRecord, OperationFact,
-        StoredOperation, validate_external_fence_receipt,
-    };
-
-    // ---------------------------------------------------------------------
-    // CP-3B external fence fixtures.
-    //
-    // The runner only ever sees SPI values, so the fixtures build a real
-    // `ConnectorWriteLease` over a recording control instead of faking the
-    // established fence type.
-    // ---------------------------------------------------------------------
-
-    const FENCE_MARKER: &[u8] = b"runner-test-fence-marker";
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
-    fn connector_context() -> ConnectorRequestContext {
-        ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(5),
-            Arc::new(NeverCancelled),
-            1024,
-            4096,
-        )
-        .expect("connector request context")
-    }
-
-    fn binding_key() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
-            instance_id: ConnectorInstanceId::parse("runner-test").expect("instance id"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([5; 16]),
-        }
-    }
-
-    fn connector_table() -> ConnectorTableIdentity {
-        ConnectorTableIdentity {
-            instance_id: binding_key().instance_id,
-            namespace: Arc::from("db"),
-            table: Arc::from("target"),
-        }
-    }
-
-    fn connector_write_operation_id() -> ConnectorWriteOperationId {
-        ConnectorWriteOperationId::from_bytes([9; 16])
-    }
-
-    struct FenceControl {
-        key: ConnectorExecutionBindingKey,
-    }
-
-    impl ConnectorWriteControl for FenceControl {
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-            &self.key
-        }
-
-        fn establish_external_fence(
-            &self,
-            request: ConnectorExternalFenceRequest,
-        ) -> Result<ConnectorExternalFenceReceipt, ConnectorError> {
-            request.validate(&self.key)?;
-            ConnectorExternalFenceReceipt::try_new(&request.fence, Bytes::from_static(FENCE_MARKER))
-        }
-
-        fn plan_write(
-            &self,
-            _request: ConnectorWritePlanningRequest,
-        ) -> Result<ConnectorWritePlan, ConnectorError> {
-            Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                "runner fence fixture does not plan writes",
-            ))
-        }
-
-        fn commit(
-            &self,
-            _request: ConnectorWriteCommitRequest,
-        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-            Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                "runner fence fixture does not commit",
-            ))
-        }
-
-        fn abort(
-            &self,
-            _request: ConnectorWriteAbortRequest,
-        ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
-            Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                "runner fence fixture does not abort",
-            ))
-        }
-
-        fn reconcile(
-            &self,
-            _request: ConnectorWriteReconcileRequest,
-        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-            Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                "runner fence fixture does not reconcile",
-            ))
-        }
-    }
-
-    fn fence_lease() -> ConnectorWriteLease {
-        let key = binding_key();
-        ConnectorWriteLease::new(key.clone(), Arc::new(FenceControl { key }), || {})
-            .expect("exact write lease")
-    }
-
-    /// Complete a proposal exactly the way a production route must: the
-    /// connector half comes from the write authority, never from the frontend.
-    fn establish_test_fence(
-        proposal: &DmlExternalFenceProposal,
-    ) -> Result<ConnectorEstablishedWriteFence, ConnectorError> {
-        let fence = proposal.seal(
-            connector_write_operation_id(),
-            connector_table(),
-            ConnectorWriteTargetRef::main(),
-        )?;
-        fence_lease().establish_external_fence(fence, connector_context())
-    }
-
-    fn test_generation() -> DmlExternalFenceGeneration {
-        DmlExternalFenceGeneration {
-            control_plane_incarnation: 3,
-            resource_epoch: 7,
-            fence_generation: 11,
-        }
-    }
-
-    fn test_proposal(operation_id: DmlOperationId) -> DmlExternalFenceProposal {
-        DmlExternalFenceProposal::testing(
-            operation_id,
-            "runner-test-cluster",
-            Uuid::now_v7(),
-            test_generation(),
-        )
-        .expect("external fence proposal")
-    }
-
-    struct AlwaysCurrentAuthority;
-
-    #[async_trait::async_trait]
-    impl DmlMutationAuthorityValidator for AlwaysCurrentAuthority {
-        async fn validate_in(
-            &self,
-            _transaction: &mut dyn WriteTransaction,
-        ) -> Result<(), DmlError> {
-            Ok(())
-        }
-    }
-
-    /// In-memory journal that also accepts the CP-3B fence receipt record and
-    /// records the order in which it was written relative to dispatch.
-    #[derive(Default)]
-    struct FenceRecordingJournal {
-        inner: InMemoryOperationJournal,
-        fences: Mutex<Vec<DmlExternalFenceReceiptRecord>>,
-        events: Arc<Mutex<Vec<&'static str>>>,
-        refuse_preflight: bool,
-    }
-
-    impl FenceRecordingJournal {
-        fn with_events(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
-            Self {
-                inner: InMemoryOperationJournal::default(),
-                fences: Mutex::new(Vec::new()),
-                events,
-                refuse_preflight: false,
-            }
-        }
-
-        fn refusing_preflight(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
-            Self {
-                refuse_preflight: true,
-                ..Self::with_events(events)
-            }
-        }
-
-        fn only_operation(&self) -> StoredOperation {
-            self.inner.only_operation()
-        }
-
-        fn recorded_fences(&self) -> Vec<DmlExternalFenceReceiptRecord> {
-            self.fences.lock().expect("recorded fences").clone()
-        }
-    }
-
-    impl OperationJournal for FenceRecordingJournal {
-        fn create_preparing(
-            &self,
-            request: CreatePreparingRequest,
-        ) -> Result<DmlOperationId, DmlError> {
-            self.inner.create_preparing(request)
-        }
-
-        fn transition(
-            &self,
-            operation_id: DmlOperationId,
-            to: OperationState,
-        ) -> Result<(), DmlError> {
-            self.inner.transition(operation_id, to)
-        }
-
-        fn record_fact(
-            &self,
-            operation_id: DmlOperationId,
-            fact: OperationFact,
-        ) -> Result<(), DmlError> {
-            self.inner.record_fact(operation_id, fact)
-        }
-
-        fn load(&self, operation_id: DmlOperationId) -> Result<Option<StoredOperation>, DmlError> {
-            self.inner.load(operation_id)
-        }
-
-        fn list_operations(&self) -> Result<Vec<StoredOperation>, DmlError> {
-            self.inner.list_operations()
-        }
-
-        fn list_unfinished(&self) -> Result<Vec<StoredOperation>, DmlError> {
-            self.inner.list_unfinished()
-        }
-
-        fn create_statement_operation(
-            &self,
-            request: CreateStatementOperationRequest,
-        ) -> Result<StoredOperation, DmlError> {
-            self.inner.create_statement_operation(request)
-        }
-
-        fn load_add_files_artifact(
-            &self,
-            operation_id: DmlOperationId,
-            artifact: &crate::dml::model::AddFilesArtifactDescriptor,
-        ) -> Result<AddFilesArtifact, DmlError> {
-            self.inner.load_add_files_artifact(operation_id, artifact)
-        }
-
-        fn preflight_external_fence(
-            &self,
-            request: &DmlExternalFenceMutationRequest,
-        ) -> Result<(), DmlError> {
-            self.events
-                .lock()
-                .expect("journal events")
-                .push("preflight-fence");
-            if self.refuse_preflight {
-                return Err(DmlError::journal_corruption(
-                    "test journal cannot hold an external fence receipt",
-                ));
-            }
-            validate_external_fence_receipt(&request.fence).map_err(DmlError::journal_corruption)
-        }
-
-        fn load_historical_write_recovery(
-            &self,
-            _operation_id: DmlOperationId,
-        ) -> Result<Option<crate::dml::model::DmlHistoricalWriteRecoveryRecord>, DmlError> {
-            Ok(None)
-        }
-
-        fn record_external_fence_authorized(
-            &self,
-            request: DmlExternalFenceMutationRequest,
-            _recovery_due_at_ms: Option<i64>,
-            _authority: DmlMutationAuthority,
-        ) -> Result<StoredOperation, DmlError> {
-            validate_external_fence_receipt(&request.fence)
-                .map_err(DmlError::journal_corruption)?;
-            self.events
-                .lock()
-                .expect("journal events")
-                .push("record-fence");
-            self.fences
-                .lock()
-                .expect("recorded fences")
-                .push(request.fence);
-            self.inner.load(request.operation_id)?.ok_or_else(|| {
-                DmlError::journal_unresolved("fenced test operation cannot be read back")
-            })
-        }
-    }
-
-    fn fenced_operation(
-        journal: Arc<FenceRecordingJournal>,
-        stored: StoredOperation,
-        proposal: DmlExternalFenceProposal,
-    ) -> ActiveDmlOperation {
-        ActiveDmlOperation::testing_fenced(
-            journal,
-            stored,
-            proposal,
-            Arc::new(AlwaysCurrentAuthority),
-        )
-    }
-
-    /// Executor bound to one exact write lease, exactly like a production
-    /// route: the fence is established on the lease, and the connector write
-    /// operation only begins afterwards.
-    struct LeaseBoundFenceExecutor {
-        lease: ConnectorWriteLease,
-        events: Arc<Mutex<Vec<&'static str>>>,
-        establish_failure: Option<ConnectorExternalFenceFailure>,
-        foreign_attempt_id: bool,
-    }
-
-    impl LeaseBoundFenceExecutor {
-        fn new(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
-            Self {
-                lease: fence_lease(),
-                events,
-                establish_failure: None,
-                foreign_attempt_id: false,
-            }
-        }
-
-        fn failing(
-            events: Arc<Mutex<Vec<&'static str>>>,
-            failure: ConnectorExternalFenceFailure,
-        ) -> Self {
-            Self {
-                establish_failure: Some(failure),
-                ..Self::new(events)
-            }
-        }
-
-        fn foreign(events: Arc<Mutex<Vec<&'static str>>>) -> Self {
-            Self {
-                foreign_attempt_id: true,
-                ..Self::new(events)
-            }
-        }
-
-        fn push(&self, event: &'static str) {
-            self.events.lock().expect("executor events").push(event);
-        }
-    }
-
-    impl WriteExecutor for LeaseBoundFenceExecutor {
-        type CommitHandle = Infallible;
-        type AbortHandle = Infallible;
-
-        fn run_coordinated_write(
-            &self,
-            _spec: &WriteTransactionSpec,
-        ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, DmlError>
-        {
-            self.push("begin-write-operation");
-            Ok(CoordinatedWriteReport::NoOp)
-        }
-
-        fn abort(
-            &self,
-            _spec: &WriteTransactionSpec,
-            handle: &Self::AbortHandle,
-        ) -> Result<ConnectorWriteAbortOutcome, String> {
-            match *handle {}
-        }
-
-        fn commit(
-            &self,
-            _spec: &WriteTransactionSpec,
-            handle: &Self::CommitHandle,
-        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
-            match *handle {}
-        }
-
-        fn finalize(&self, _spec: &WriteTransactionSpec) -> Result<(), String> {
-            self.push("finalize");
-            Ok(())
-        }
-    }
 
     struct KnownUncommittedAbortExecutor;
 
@@ -1203,22 +802,24 @@ mod tests {
         );
     }
 
-    fn begin_fenced(journal: &Arc<FenceRecordingJournal>) -> (DmlOperationId, ActiveDmlOperation) {
+    fn begin_active(
+        journal: &Arc<InMemoryOperationJournal>,
+    ) -> (DmlOperationId, ActiveDmlOperation) {
         let operation_id = journal
             .create_preparing(preparing_request(&spec()))
             .expect("intent");
         let stored = journal.load(operation_id).unwrap().unwrap();
-        let proposal = test_proposal(operation_id);
+        let operation_journal: Arc<dyn OperationJournal> = journal.clone();
         (
             operation_id,
-            fenced_operation(Arc::clone(journal), stored, proposal),
+            ActiveDmlOperation::legacy(operation_journal, stored),
         )
     }
 
     #[test]
     fn active_runner_persists_terminal_abort_through_active_operation() {
-        let journal = Arc::new(FenceRecordingJournal::default());
-        let (_, operation) = begin_fenced(&journal);
+        let journal = Arc::new(InMemoryOperationJournal::default());
+        let (_, operation) = begin_active(&journal);
 
         let error = ActiveWriteTransactionRunner::new(operation, &KnownUncommittedAbortExecutor)
             .run(spec())
@@ -1236,8 +837,8 @@ mod tests {
 
     #[test]
     fn active_runner_keeps_commit_dispatch_adapter_failure_recoverable() {
-        let journal = Arc::new(FenceRecordingJournal::default());
-        let (operation_id, operation) = begin_fenced(&journal);
+        let journal = Arc::new(InMemoryOperationJournal::default());
+        let (operation_id, operation) = begin_active(&journal);
 
         let error = ActiveWriteTransactionRunner::new(operation, &CommitEnvelopeFailureExecutor)
             .run(spec())
@@ -1259,8 +860,8 @@ mod tests {
 
     #[test]
     fn active_runner_keeps_abort_dispatch_adapter_failure_recoverable() {
-        let journal = Arc::new(FenceRecordingJournal::default());
-        let (operation_id, operation) = begin_fenced(&journal);
+        let journal = Arc::new(InMemoryOperationJournal::default());
+        let (operation_id, operation) = begin_active(&journal);
 
         let error = ActiveWriteTransactionRunner::new(operation, &AbortEnvelopeFailureExecutor)
             .run(spec())
@@ -1278,57 +879,5 @@ mod tests {
         let stored = journal.only_operation();
         assert_eq!(stored.state, OperationState::Aborting);
         assert!(stored.recovery_due_at_ms.is_some());
-    }
-
-    #[test]
-    fn ordinary_active_runner_dispatches_without_an_external_fence() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let journal = Arc::new(FenceRecordingJournal::with_events(Arc::clone(&events)));
-        let (_, operation) = begin_fenced(&journal);
-        let executor = LeaseBoundFenceExecutor::new(Arc::clone(&events));
-
-        ActiveWriteTransactionRunner::new(operation, &executor)
-            .run(spec())
-            .expect("ordinary no-op write completes");
-
-        assert_eq!(*events.lock().expect("events"), ["begin-write-operation"]);
-        assert!(
-            executor
-                .lease
-                .established_external_fence()
-                .expect("fence slot")
-                .is_none(),
-            "ordinary writes must not create a connector external fence"
-        );
-        assert!(journal.recorded_fences().is_empty());
-    }
-
-    #[test]
-    fn replaying_the_identical_fence_is_idempotent() {
-        let proposal = test_proposal(DmlOperationId::new_v7());
-        let lease = fence_lease();
-        let fence = proposal
-            .seal(
-                connector_write_operation_id(),
-                connector_table(),
-                ConnectorWriteTargetRef::main(),
-            )
-            .expect("sealed fence");
-        let first = lease
-            .establish_external_fence(fence.clone(), connector_context())
-            .expect("first establishment");
-        let replay = lease
-            .establish_external_fence(fence, connector_context())
-            .expect("identical replay is idempotent");
-        assert_eq!(first.fence().digest(), replay.fence().digest());
-        assert_eq!(first.receipt().digest(), replay.receipt().digest());
-        assert_eq!(
-            reconcile::external_fence_receipt_record(&first)
-                .expect("record")
-                .fence_digest,
-            reconcile::external_fence_receipt_record(&replay)
-                .expect("record")
-                .fence_digest
-        );
     }
 }

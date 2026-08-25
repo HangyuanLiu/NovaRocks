@@ -20,10 +20,9 @@ use arrow::record_batch::RecordBatch;
 
 use super::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExternalFenceRequest, ConnectorExternalOperationFence,
-    ConnectorMetadata, ConnectorRequestContext, ConnectorTableObjectBinding,
+    ConnectorMetadata, ConnectorTableObjectBinding,
     ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest,
-    ConnectorTableObjectRebindRequest, ConnectorWriteControl,
+    ConnectorTableObjectRebindRequest,
 };
 
 pub fn assert_batch_reader_contract(
@@ -89,102 +88,6 @@ fn validate_batch(
 fn close_idempotently(reader: &mut dyn ConnectorBatchReader) -> Result<(), ConnectorError> {
     reader.close()?;
     reader.close()
-}
-
-/// The two fence generations one external-fence conformance run needs. The
-/// `raised` fence must strictly supersede `established` within one authority.
-#[derive(Clone)]
-pub struct ConnectorExternalFenceConformanceInput {
-    pub established: ConnectorExternalOperationFence,
-    pub raised: ConnectorExternalOperationFence,
-    pub context: ConnectorRequestContext,
-}
-
-/// Assert the frozen external write fence contract against a provider.
-///
-/// This exercises all four fence invariants end to end:
-/// 1. establishing one fence returns a receipt bound to exactly that fence;
-/// 2. replaying the identical fence is idempotent;
-/// 3. a strictly higher generation supersedes the established fence;
-/// 4. the superseded generation can no longer be established, and is refused
-///    with a typed, non-retryable fence failure that is neither `Unsupported`
-///    nor a commit-unknown kind.
-pub fn assert_external_write_fence_contract(
-    control: &dyn ConnectorWriteControl,
-    owner: &ConnectorExecutionBindingKey,
-    input: ConnectorExternalFenceConformanceInput,
-) -> Result<(), ConnectorError> {
-    let ConnectorExternalFenceConformanceInput {
-        established,
-        raised,
-        context,
-    } = input;
-    if !raised.supersedes(&established)? {
-        return Err(contract(
-            "external fence conformance input must supply a strictly higher raised fence",
-        ));
-    }
-    let request = |fence: &ConnectorExternalOperationFence| ConnectorExternalFenceRequest {
-        owner: owner.clone(),
-        fence: fence.clone(),
-        context: context.clone(),
-    };
-
-    let first = control.establish_external_fence(request(&established))?;
-    first.validate()?;
-    if !first.matches(&established) {
-        return Err(contract(
-            "connector external fence receipt does not acknowledge the established fence",
-        ));
-    }
-    let replay = control.establish_external_fence(request(&established))?;
-    replay.validate()?;
-    if replay != first {
-        return Err(contract(
-            "connector external fence establishment is not idempotent for one generation",
-        ));
-    }
-
-    let higher = control.establish_external_fence(request(&raised))?;
-    higher.validate()?;
-    if !higher.matches(&raised) {
-        return Err(contract(
-            "connector external fence receipt does not acknowledge the raised fence",
-        ));
-    }
-
-    match control.establish_external_fence(request(&established)) {
-        Ok(_) => Err(contract(
-            "connector external fence accepted a superseded generation after a higher fence",
-        )),
-        Err(error) => assert_typed_fence_conflict(&error),
-    }
-}
-
-/// Assert that a rejected fenced request carries the frozen typed stale/conflict
-/// classification instead of an unknown, unsupported, or retryable result.
-pub fn assert_typed_fence_conflict(error: &ConnectorError) -> Result<(), ConnectorError> {
-    if error.external_fence_failure().is_none() {
-        return Err(contract(
-            "a fenced request rejection must carry a typed external fence failure",
-        ));
-    }
-    if error.retryable_before_progress() {
-        return Err(contract(
-            "an external fence conflict must never be retryable before progress",
-        ));
-    }
-    if matches!(
-        error.kind(),
-        ConnectorErrorKind::Unsupported
-            | ConnectorErrorKind::Unavailable
-            | ConnectorErrorKind::Internal
-    ) {
-        return Err(contract(
-            "an external fence conflict must never be downgraded to an unsupported or commit-unknown kind",
-        ));
-    }
-    Ok(())
 }
 
 /// Capture and immediately rebind one current table object through the same
@@ -274,7 +177,7 @@ fn contract(message: &'static str) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::Schema;
@@ -282,14 +185,12 @@ mod tests {
 
     use super::*;
     use crate::connector::{
-        ConnectorCancellation, ConnectorClusterIdentity, ConnectorExternalFenceGeneration,
-        ConnectorExternalFenceReceipt, ConnectorExternalOperationFence, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
-        ConnectorNamespaceRequest, ConnectorTableDefinitionFacts, ConnectorTableHandle,
-        ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableObjectId,
-        ConnectorTableObjectSelector, ConnectorTablePlanningFacts, ConnectorTableRequest,
-        ConnectorTableResolution, ConnectorWriteOperationId, ConnectorWritePlan,
-        ConnectorWritePlanningRequest, ConnectorWriteTargetRef,
+        ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorRequestContext,
+        ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+        ConnectorTableDefinitionFacts, ConnectorTableHandle, ConnectorTableIdentity,
+        ConnectorTableMetadata, ConnectorTableObjectId, ConnectorTableObjectSelector,
+        ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
     };
 
     struct NeverCancelled;
@@ -314,119 +215,6 @@ mod tests {
         ConnectorExecutionBindingKey {
             instance_id: ConnectorInstanceId::parse("catalog.ice").expect("instance id"),
             incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
-        }
-    }
-
-    fn fence(epoch: u64) -> ConnectorExternalOperationFence {
-        ConnectorExternalOperationFence::try_new(
-            ConnectorClusterIdentity::derive("conformance-cluster").expect("cluster identity"),
-            ConnectorExternalFenceGeneration::try_new(1, epoch, 1).expect("generation"),
-            ConnectorWriteOperationId::from_bytes([3; 16]),
-            [4; 16],
-            ConnectorTableIdentity {
-                instance_id: owner().instance_id,
-                namespace: Arc::from("db"),
-                table: Arc::from("orders"),
-            },
-            ConnectorWriteTargetRef::main(),
-        )
-        .expect("fence")
-    }
-
-    /// A minimal fenced control. `downgrade_conflict` models the failure this
-    /// conformance assertion exists to catch: reporting a superseded generation
-    /// as an unsupported capability instead of a typed fence conflict.
-    struct FencedControl {
-        key: ConnectorExecutionBindingKey,
-        established: Mutex<Option<ConnectorExternalFenceGeneration>>,
-        downgrade_conflict: bool,
-    }
-
-    impl ConnectorWriteControl for FencedControl {
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-            &self.key
-        }
-
-        fn establish_external_fence(
-            &self,
-            request: ConnectorExternalFenceRequest,
-        ) -> Result<ConnectorExternalFenceReceipt, ConnectorError> {
-            request.validate(&self.key)?;
-            let mut established = self.established.lock().expect("fence table");
-            if let Some(current) = *established
-                && request.fence.generation() < current
-            {
-                return Err(if self.downgrade_conflict {
-                    ConnectorError::new(
-                        ConnectorErrorKind::Unsupported,
-                        "provider laundered a fence conflict",
-                    )
-                } else {
-                    ConnectorError::external_fence(
-                        crate::connector::ConnectorExternalFenceFailure::Stale,
-                        "fence generation is behind the established fence",
-                    )
-                });
-            }
-            *established = Some(request.fence.generation());
-            ConnectorExternalFenceReceipt::try_new(
-                &request.fence,
-                Bytes::from_static(b"fence-marker"),
-            )
-        }
-
-        fn plan_write(
-            &self,
-            _request: ConnectorWritePlanningRequest,
-        ) -> Result<ConnectorWritePlan, ConnectorError> {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "conformance control does not plan writes",
-            ))
-        }
-
-        fn commit(
-            &self,
-            _request: crate::connector::ConnectorWriteCommitRequest,
-        ) -> Result<
-            crate::connector::ExternalMutationOutcome<crate::connector::ConnectorWriteReceipt>,
-            ConnectorError,
-        > {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "conformance control does not commit",
-            ))
-        }
-
-        fn abort(
-            &self,
-            _request: crate::connector::ConnectorWriteAbortRequest,
-        ) -> Result<crate::connector::ConnectorWriteAbortOutcome, ConnectorError> {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "conformance control does not abort",
-            ))
-        }
-
-        fn reconcile(
-            &self,
-            _request: crate::connector::ConnectorWriteReconcileRequest,
-        ) -> Result<
-            crate::connector::ExternalMutationOutcome<crate::connector::ConnectorWriteReceipt>,
-            ConnectorError,
-        > {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "conformance control does not reconcile",
-            ))
-        }
-    }
-
-    fn input() -> ConnectorExternalFenceConformanceInput {
-        ConnectorExternalFenceConformanceInput {
-            established: fence(1),
-            raised: fence(2),
-            context: context(),
         }
     }
 
@@ -561,72 +349,6 @@ mod tests {
             selector: capture.selector,
             context: capture.context,
         }
-    }
-
-    #[test]
-    fn fence_conformance_accepts_a_monotonic_fencing_provider() {
-        let control = FencedControl {
-            key: owner(),
-            established: Mutex::new(None),
-            downgrade_conflict: false,
-        };
-        assert_external_write_fence_contract(&control, &owner(), input())
-            .expect("a monotonic fencing provider satisfies the contract");
-    }
-
-    #[test]
-    fn fence_conformance_rejects_a_conflict_downgraded_to_unsupported() {
-        let control = FencedControl {
-            key: owner(),
-            established: Mutex::new(None),
-            downgrade_conflict: true,
-        };
-        let error = assert_external_write_fence_contract(&control, &owner(), input())
-            .expect_err("a laundered fence conflict must fail the contract");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-    }
-
-    #[test]
-    fn fence_conformance_requires_a_strictly_higher_raised_fence() {
-        let control = FencedControl {
-            key: owner(),
-            established: Mutex::new(None),
-            downgrade_conflict: false,
-        };
-        let error = assert_external_write_fence_contract(
-            &control,
-            &owner(),
-            ConnectorExternalFenceConformanceInput {
-                established: fence(2),
-                raised: fence(2),
-                context: context(),
-            },
-        )
-        .expect_err("an equal raised fence is not a valid conformance input");
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-    }
-
-    #[test]
-    fn typed_fence_conflict_assertion_rejects_a_retryable_or_untyped_error() {
-        assert_typed_fence_conflict(&ConnectorError::external_fence(
-            crate::connector::ConnectorExternalFenceFailure::Superseded,
-            "superseded",
-        ))
-        .expect("a typed fence conflict is accepted");
-        assert!(
-            assert_typed_fence_conflict(&ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "untyped",
-            ))
-            .is_err()
-        );
-        assert!(
-            assert_typed_fence_conflict(
-                &ConnectorError::new(ConnectorErrorKind::Unavailable, "transient")
-                    .with_retryable_before_progress(),
-            )
-            .is_err()
-        );
     }
 
     #[test]

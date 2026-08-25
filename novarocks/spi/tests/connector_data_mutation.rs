@@ -23,19 +23,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorClusterIdentity, ConnectorDataMutation,
-    ConnectorDataMutationExecuteRequest, ConnectorDataMutationLease,
-    ConnectorDataMutationOperation, ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
-    ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
-    ConnectorDataMutationReconcileRequest, ConnectorDataMutationSourceScope, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorExternalFenceFailure,
-    ConnectorExternalFenceGeneration, ConnectorExternalFenceReceipt, ConnectorExternalFenceRequest,
-    ConnectorExternalOperationFence, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorCancellation, ConnectorDataMutation, ConnectorDataMutationExecuteRequest,
+    ConnectorDataMutationLease, ConnectorDataMutationOperation, ConnectorDataMutationPlan,
+    ConnectorDataMutationPlanSummary, ConnectorDataMutationPlanningRequest,
+    ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest,
+    ConnectorDataMutationSourceScope, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
     ConnectorNamespaceRequest, ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest, ConnectorWriteFencing,
-    ConnectorWriteOperationId, ConnectorWriteTargetRef, ExternalMutationEffect,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
     MAX_CONNECTOR_DATA_MUTATION_FILES, MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
 };
@@ -104,29 +101,10 @@ struct FakeDataMutation {
     plans: Mutex<HashMap<ConnectorMutationOperationId, ([u8; 32], ConnectorDataMutationPlan)>>,
     mode: Mutex<ExecuteMode>,
     execute_calls: Mutex<usize>,
-    /// Every fence this provider was actually asked to publish. A lease that
-    /// only remembered a fence locally would leave this empty.
-    fence_calls: Mutex<Vec<ConnectorExternalOperationFence>>,
-    publishes_fence: bool,
 }
 
 impl FakeDataMutation {
     fn new(provider: &str, instance: &str, incarnation: [u8; 16]) -> Arc<Self> {
-        Self::build(provider, instance, incarnation, true)
-    }
-
-    /// A provider that installs no external fencing capability at all, which is
-    /// what the trait default describes.
-    fn without_fencing(provider: &str, instance: &str, incarnation: [u8; 16]) -> Arc<Self> {
-        Self::build(provider, instance, incarnation, false)
-    }
-
-    fn build(
-        provider: &str,
-        instance: &str,
-        incarnation: [u8; 16],
-        publishes_fence: bool,
-    ) -> Arc<Self> {
         let instance_id = ConnectorInstanceId::parse(instance).expect("instance ID");
         Arc::new(Self {
             descriptor: ConnectorInstanceDescriptor {
@@ -140,13 +118,7 @@ impl FakeDataMutation {
             plans: Mutex::new(HashMap::new()),
             mode: Mutex::new(ExecuteMode::Committed),
             execute_calls: Mutex::new(0),
-            fence_calls: Mutex::new(Vec::new()),
-            publishes_fence,
         })
-    }
-
-    fn fence_calls(&self) -> Vec<ConnectorExternalOperationFence> {
-        self.fence_calls.lock().expect("fence calls").clone()
     }
 
     fn lease(self: &Arc<Self>) -> ConnectorDataMutationLease {
@@ -201,27 +173,6 @@ impl ConnectorDataMutation for FakeDataMutation {
 
     fn binding_key(&self) -> &ConnectorExecutionBindingKey {
         &self.key
-    }
-
-    fn establish_external_fence(
-        &self,
-        request: ConnectorExternalFenceRequest,
-    ) -> Result<ConnectorExternalFenceReceipt, ConnectorError> {
-        if !self.publishes_fence {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "this fake provider publishes no external fence marker",
-            ));
-        }
-        request.validate(&self.key)?;
-        self.fence_calls
-            .lock()
-            .expect("fence calls")
-            .push(request.fence.clone());
-        ConnectorExternalFenceReceipt::try_new(
-            &request.fence,
-            Bytes::from_static(b"fake-fence-marker"),
-        )
     }
 
     fn plan_mutation(
@@ -333,107 +284,6 @@ fn source_scope() -> ConnectorDataMutationSourceScope {
     ConnectorDataMutationSourceScope::try_new_directory([7; 32]).expect("source scope")
 }
 
-fn fence_value(
-    fake: &FakeDataMutation,
-    operation_id: ConnectorMutationOperationId,
-    coordination_attempt: u64,
-) -> ConnectorExternalOperationFence {
-    ConnectorExternalOperationFence::try_new(
-        ConnectorClusterIdentity::derive("data-mutation-fence-test-cluster")
-            .expect("cluster identity"),
-        ConnectorExternalFenceGeneration::try_new(1, 1, coordination_attempt)
-            .expect("fence generation"),
-        ConnectorWriteOperationId::from_bytes(operation_id.to_bytes()),
-        [4; 16],
-        ConnectorTableIdentity {
-            instance_id: fake.key.instance_id.clone(),
-            namespace: Arc::from("db"),
-            table: Arc::from("orders"),
-        },
-        ConnectorWriteTargetRef::main(),
-    )
-    .expect("external operation fence")
-}
-
-/// Establishing a direct-mutation fence must reach the provider, because the
-/// provider is the only party that can publish the marker its own execute later
-/// asserts. A lease that recorded the fence locally would report `Fenced` while
-/// external truth carried nothing.
-#[test]
-fn a_direct_mutation_fence_is_published_by_the_provider_before_the_lease_reports_fenced() {
-    let fake = FakeDataMutation::new("fake-alpha", "alpha", [1; 16]);
-    let lease = fake.lease();
-    let operation_id = ConnectorMutationOperationId::from_bytes([9; 16]);
-    assert!(
-        matches!(
-            lease.fencing().expect("fencing"),
-            ConnectorWriteFencing::NotFencedByThisPhase { .. }
-        ),
-        "an operation that never established a fence must say so"
-    );
-
-    let fence = fence_value(&fake, operation_id, 2);
-    let receipt = lease
-        .establish_external_fence(fence.clone(), context())
-        .expect("establish the direct mutation fence");
-    assert!(receipt.matches(&fence));
-    assert_eq!(
-        fake.fence_calls(),
-        vec![fence.clone()],
-        "the lease must ask the provider to publish this exact marker"
-    );
-    assert_eq!(
-        lease.fencing().expect("fencing"),
-        ConnectorWriteFencing::Fenced(fence.clone())
-    );
-
-    // Monotonicity is preserved and is checked before the provider is
-    // contacted: a generation behind the established fence never reaches it.
-    let stale = fence_value(&fake, operation_id, 1);
-    let error = lease
-        .establish_external_fence(stale, context())
-        .expect_err("a stale generation must be refused");
-    assert_eq!(
-        error.external_fence_failure(),
-        Some(ConnectorExternalFenceFailure::Stale)
-    );
-    assert_eq!(fake.fence_calls().len(), 1);
-
-    // A strictly higher generation supersedes, and is published in turn.
-    let raised = fence_value(&fake, operation_id, 3);
-    lease
-        .establish_external_fence(raised.clone(), context())
-        .expect("a strictly higher generation must supersede");
-    assert_eq!(fake.fence_calls(), vec![fence, raised.clone()]);
-    assert_eq!(
-        lease.fencing().expect("fencing"),
-        ConnectorWriteFencing::Fenced(raised)
-    );
-}
-
-/// A provider that publishes no marker must leave the operation unfenced.
-///
-/// This is the failure the local-cell implementation hid: the session reported
-/// `Fenced` on a fence no provider had ever seen, and the fenced execute then
-/// failed closed at the catalog with nothing to assert.
-#[test]
-fn a_provider_that_publishes_no_marker_leaves_the_direct_mutation_unfenced() {
-    let fake = FakeDataMutation::without_fencing("fake-beta", "beta", [2; 16]);
-    let lease = fake.lease();
-    let fence = fence_value(&fake, ConnectorMutationOperationId::from_bytes([10; 16]), 1);
-    let error = lease
-        .establish_external_fence(fence, context())
-        .expect_err("a provider without fencing must refuse");
-    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-    assert!(
-        matches!(
-            lease.fencing().expect("fencing"),
-            ConnectorWriteFencing::NotFencedByThisPhase { .. }
-        ),
-        "a fence the provider never published must not make the lease look fenced"
-    );
-}
-
 #[test]
 fn two_non_iceberg_providers_obey_replay_conflict_and_redaction_contracts() {
     for fake in [
@@ -475,12 +325,7 @@ fn lease_validates_all_execute_and_reconcile_outcomes() {
         let plan = lease.plan_mutation(request).expect("plan");
         lease
             .execute(
-                ConnectorDataMutationExecuteRequest::try_new(
-                    plan,
-                    lease.fencing().expect("fencing decision"),
-                    context(),
-                )
-                .expect("execute"),
+                ConnectorDataMutationExecuteRequest::try_new(plan, context()).expect("execute"),
             )
             .expect("valid outcome");
     }
@@ -490,12 +335,7 @@ fn lease_validates_all_execute_and_reconcile_outcomes() {
     let plan = lease.plan_mutation(request).expect("plan");
     let outcome = lease
         .execute(
-            ConnectorDataMutationExecuteRequest::try_new(
-                plan.clone(),
-                lease.fencing().expect("fencing decision"),
-                context(),
-            )
-            .expect("execute"),
+            ConnectorDataMutationExecuteRequest::try_new(plan.clone(), context()).expect("execute"),
         )
         .expect("unknown outcome");
     let ExternalMutationOutcome::CommitUnknown { evidence, .. } = outcome else {
@@ -518,12 +358,7 @@ fn lease_validates_all_execute_and_reconcile_outcomes() {
     assert_eq!(
         lease
             .execute(
-                ConnectorDataMutationExecuteRequest::try_new(
-                    plan,
-                    lease.fencing().expect("fencing decision"),
-                    context()
-                )
-                .expect("execute")
+                ConnectorDataMutationExecuteRequest::try_new(plan, context()).expect("execute")
             )
             .expect_err("foreign receipt must be rejected")
             .kind(),

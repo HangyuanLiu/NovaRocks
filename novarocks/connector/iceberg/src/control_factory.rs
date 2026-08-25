@@ -332,6 +332,10 @@ mod tests {
         let mut properties = vec![
             ("iceberg.catalog.type".to_string(), "rest".to_string()),
             ("uri".to_string(), uri),
+            (
+                "iceberg.catalog.warehouse".to_string(),
+                "file:///tmp/novarocks-rest-factory-warehouse".to_string(),
+            ),
         ];
         properties.extend(extra);
         ConnectorControlFactoryRequest::try_new(
@@ -651,7 +655,10 @@ mod tests {
             .create_control(rest_factory_request(&factory, uri, Vec::new()))
             .expect("advertised REST control");
         server.join().expect("config server");
-
+        assert!(
+            creation.binding().staged_create().is_some(),
+            "standard REST staged create must not depend on a retired private capability"
+        );
     }
 
     #[test]
@@ -681,7 +688,10 @@ mod tests {
             .create_control(request)
             .expect("vanilla REST control");
         server.join().expect("config server");
-
+        assert!(
+            creation.binding().staged_create().is_some(),
+            "a user-supplied retired capability property cannot alter the standard path"
+        );
     }
 
     #[test]
@@ -716,5 +726,9 @@ mod tests {
         .expect("Hive factory request");
 
         let creation = factory.create_control(request).expect("Hive control");
+        assert!(
+            creation.binding().staged_create().is_none(),
+            "Hadoop/Hive catalogs must not expose REST-only staged create"
+        );
     }
 }
