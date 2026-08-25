@@ -942,6 +942,11 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         {
             return Err(invalid("Iceberg staged-create prepare has a foreign owner"));
         }
+        if request.operation_id.to_bytes() != request.publication_id.to_bytes() {
+            return Err(invalid(
+                "Iceberg staged-create operation ID must equal its publication ID",
+            ));
+        }
         if let Err(error) = Self::validate_context(&request.context) {
             return Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted {
                 failure: failure_from_connector(error),

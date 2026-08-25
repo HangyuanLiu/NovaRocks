@@ -634,6 +634,11 @@ impl ConnectorStagedCreateLease {
         if request.owner != self.owner || request.table.instance_id != self.owner.instance_id {
             return Err(invalid("staged-create prepare request has a foreign owner"));
         }
+        if request.operation_id.to_bytes() != request.publication_id.to_bytes() {
+            return Err(invalid(
+                "staged-create operation ID must equal its statement publication ID",
+            ));
+        }
         let operation_id = request.operation_id;
         {
             let mut operations = self
@@ -1773,7 +1778,7 @@ mod tests {
                 table: Arc::from("t"),
             },
             owner,
-            publication_id: LakePublicationId::new_v7(),
+            publication_id: LakePublicationId::from_bytes(operation_id.to_bytes()),
             operation_id,
             columns: Vec::new(),
             partitioning: Vec::new(),
