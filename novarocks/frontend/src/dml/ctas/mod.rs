@@ -28,7 +28,8 @@ use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::ctas::{
     CtasCommand, CtasEngine, CtasFailure, CtasFailureKind, CtasTargetFacts,
     CtasTargetPreflightOutcome, CtasWriteOutcome, PrepareCtasSourceRequest, PreparedCtasSource,
-    PreparedCtasTarget, PreparedCtasWrite,
+    PreparedCtasTarget, PreparedCtasWrite, PreparedStandardCtasTarget, PreparedStandardCtasWrite,
+    StandardCtasPublishOutcome, StandardCtasStageOutcome, StandardCtasTargetFacts,
 };
 use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
@@ -162,7 +163,7 @@ impl DmlService {
             })
             .map_err(|error| journal_error(error, operation_id))?;
 
-        let result = execute_ctas_operation(
+        let result = execute_standard_ctas_operation(
             engine,
             statement,
             source,
@@ -175,6 +176,365 @@ impl DmlService {
         );
         let _ = active.release();
         result
+    }
+}
+
+/// Execute CTAS through the crash-only staged-create contract.  The only
+/// externally visible frontier is standard staged-create publication; frontend
+/// neither reconstructs catalog authority nor cleans up a possibly-live staged
+/// target.  Definite failures are terminal and all ambiguous outcomes remain
+/// explicitly inspectable until age-based GC retires their owned roots.
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The statement boundary keeps its source, session, and durable owner explicit."
+)]
+fn execute_standard_ctas_operation(
+    engine: &dyn CtasEngine,
+    statement: &novarocks_parser::ast::CreateTableAsSelect,
+    source: &str,
+    context: &RequestContext,
+    query_options: Option<&QueryOptions>,
+    command: CtasCommand,
+    prepare_operation_id: Uuid,
+    policy: CreatePolicy,
+    active: &mut ActiveDmlOperation,
+) -> Result<(), DmlError> {
+    let session = context.session();
+    let statement_source = source;
+    let publication_id =
+        novarocks_spi::connector::LakePublicationId::from_bytes(*prepare_operation_id.as_bytes());
+
+    active.check_before_dispatch()?;
+    let preflight = match engine.preflight_standard_ctas_target(
+        statement,
+        source,
+        &command,
+        session.current_catalog(),
+        session.current_database(),
+    ) {
+        Ok(CtasTargetPreflightOutcome::ExistsNoOp) => {
+            return finalize_standard_ctas_noop(active);
+        }
+        Ok(CtasTargetPreflightOutcome::Ready(preflight)) => preflight,
+        Err(failure) => {
+            return finish_source_failure(active, active.stored.clone(), source, failure);
+        }
+    };
+    validate_preflight_facts(&active.stored, &preflight.facts)?;
+
+    let source = match engine.prepare_standard_ctas_source(
+        preflight.handle.as_ref(),
+        PrepareCtasSourceRequest {
+            command,
+            current_catalog: session.current_catalog().map(ToOwned::to_owned),
+            current_database: session.current_database().to_string(),
+            query_options: query_options.cloned(),
+            execution: context.execution().clone(),
+        },
+    ) {
+        Ok(source) => source,
+        Err(failure) => {
+            return finish_source_failure(active, active.stored.clone(), source, failure);
+        }
+    };
+    validate_source_facts(
+        &active.stored,
+        &source,
+        session.current_catalog(),
+        session.current_database(),
+    )?;
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = CtasSagaPhase::PreparingStagedTable;
+    saga.provider_id = Some(preflight.facts.provider_id.clone());
+    saga.connector_instance_id = Some(preflight.facts.instance_id.clone());
+    saga.connector_incarnation = Some(hex::encode(preflight.facts.incarnation));
+    saga.source_plan_digest = Some(hex::encode(source.facts.plan_digest));
+    saga.source_schema_digest = Some(hex::encode(source.facts.schema_digest));
+    saga.source_execution_identity = Some(hex::encode(source.facts.execution_identity));
+    saga.next_action = StatementNextAction::None;
+    active.mutate_statement(
+        OperationState::Preparing,
+        OperationPayload::CtasSaga(saga),
+        None,
+    )?;
+
+    let stage =
+        match engine.prepare_standard_ctas_target(source.handle.as_ref(), publication_id, policy) {
+            Ok(action) => {
+                active.check_before_dispatch()?;
+                engine.stage_standard_ctas_target(action.handle.as_ref())
+            }
+            Err(failure) => {
+                return finish_standard_known_uncommitted(
+                    active,
+                    CtasSagaPhase::Failed,
+                    FactSlot::Prepare,
+                    failure,
+                    Some(statement_source),
+                );
+            }
+        };
+    let target = match stage {
+        Ok(StandardCtasStageOutcome::Prepared { target, receipt }) => {
+            validate_standard_target_facts(&active.stored, &preflight.facts, &target.facts)?;
+            let mut saga = ctas_record(&active.stored)?;
+            saga.phase = CtasSagaPhase::Staged;
+            saga.staged_handle_digest = Some(hex::encode(target.facts.target_handle_digest));
+            saga.prepare_fact = Some(staged_create_fact(
+                ExternalFactOutcome::KnownCommitted,
+                &receipt,
+            ));
+            saga.next_action = StatementNextAction::None;
+            active.mutate_statement(
+                OperationState::Writing,
+                OperationPayload::CtasSaga(saga),
+                None,
+            )?;
+            target
+        }
+        Ok(StandardCtasStageOutcome::KnownUncommitted { failure }) => {
+            return finish_standard_known_uncommitted(
+                active,
+                CtasSagaPhase::Failed,
+                FactSlot::Prepare,
+                failure,
+                Some(statement_source),
+            );
+        }
+        Ok(StandardCtasStageOutcome::CommitUnknown { failure, evidence }) => {
+            return finish_standard_unknown(
+                active,
+                CtasSagaPhase::PrepareUnknown,
+                FactSlot::Prepare,
+                failure,
+                evidence,
+                "CTAS staged-create",
+            );
+        }
+        Err(failure) => {
+            return finish_standard_known_uncommitted(
+                active,
+                CtasSagaPhase::Failed,
+                FactSlot::Prepare,
+                failure,
+                Some(statement_source),
+            );
+        }
+    };
+
+    execute_standard_foreground_write(engine, active, source, target, publication_id)
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
+fn execute_standard_foreground_write(
+    engine: &dyn CtasEngine,
+    active: &mut ActiveDmlOperation,
+    source: PreparedCtasSource,
+    target: PreparedStandardCtasTarget,
+    publication_id: novarocks_spi::connector::LakePublicationId,
+) -> Result<(), DmlError> {
+    let prepared = match engine.prepare_standard_ctas_write(
+        source.handle.as_ref(),
+        target.handle.as_ref(),
+        ConnectorWriteOperationId::from(publication_id),
+    ) {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            return finish_standard_known_uncommitted(
+                active,
+                CtasSagaPhase::Failed,
+                FactSlot::Write,
+                failure,
+                None,
+            );
+        }
+    };
+    let native_bundle = match standard_native_bundle(&prepared) {
+        Ok(bundle) => bundle,
+        Err(failure) => {
+            return finish_standard_known_uncommitted(
+                active,
+                CtasSagaPhase::Failed,
+                FactSlot::Write,
+                failure,
+                None,
+            );
+        }
+    };
+    if let Err(failure) =
+        engine.bind_standard_ctas_write_native_bundle(prepared.handle.as_ref(), native_bundle)
+    {
+        return finish_standard_known_uncommitted(
+            active,
+            CtasSagaPhase::Failed,
+            FactSlot::Write,
+            failure,
+            None,
+        );
+    }
+    validate_standard_prepared_write(&active.stored, &source, &target, &prepared)?;
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = CtasSagaPhase::Writing;
+    saga.write_cohort_set_digest = Some(hex::encode(prepared.cohort_set_digest));
+    active.mutate_statement(
+        OperationState::Writing,
+        OperationPayload::CtasSaga(saga),
+        None,
+    )?;
+    active.check_before_dispatch()?;
+    match engine.execute_standard_ctas_write(prepared.handle.as_ref()) {
+        CtasWriteOutcome::Completed {
+            completion,
+            execution_identity,
+            established_fence,
+        } => {
+            if established_fence.is_some() {
+                return finish_standard_known_uncommitted(
+                    active,
+                    CtasSagaPhase::Failed,
+                    FactSlot::Write,
+                    CtasFailure {
+                        kind: CtasFailureKind::Internal,
+                        message: "standard CTAS writer returned legacy fence authority".to_string(),
+                        user_error: None,
+                    },
+                    None,
+                );
+            }
+            validate_standard_completion(
+                &active.stored,
+                &source,
+                &target,
+                &prepared,
+                &completion,
+                execution_identity,
+            )?;
+            let (encoded, cohort) = encode_write_completion(&completion)?;
+            let mut saga = ctas_record(&active.stored)?;
+            saga.phase = CtasSagaPhase::Publishing;
+            saga.write_cohort_id = Some(cohort);
+            saga.aggregate_write_digest = Some(hex::encode(completion.aggregate_digest()));
+            saga.write_fact = Some(DurableExternalFact {
+                outcome: ExternalFactOutcome::KnownCommitted,
+                receipt: Some(encoded),
+                evidence: None,
+                finalization_failure: None,
+                failure: None,
+            });
+            active.mutate_statement(
+                OperationState::Committing,
+                OperationPayload::CtasSaga(saga),
+                None,
+            )?;
+            execute_standard_publish(engine, active, target, publication_id, completion)
+        }
+        CtasWriteOutcome::KnownUncommitted { failure } => finish_standard_known_uncommitted(
+            active,
+            CtasSagaPhase::Failed,
+            FactSlot::Write,
+            failure,
+            None,
+        ),
+        CtasWriteOutcome::CommitUnknown {
+            failure,
+            evidence,
+            established_fence,
+        } => {
+            if established_fence.is_some() {
+                return finish_standard_unknown(
+                    active,
+                    CtasSagaPhase::WriteUnknown,
+                    FactSlot::Write,
+                    CtasFailure {
+                        kind: CtasFailureKind::Internal,
+                        message: "standard CTAS writer outcome included legacy fence authority"
+                            .to_string(),
+                        user_error: None,
+                    },
+                    evidence,
+                    "CTAS writer",
+                );
+            }
+            finish_standard_unknown(
+                active,
+                CtasSagaPhase::WriteUnknown,
+                FactSlot::Write,
+                failure,
+                evidence,
+                "CTAS writer",
+            )
+        }
+    }
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
+fn execute_standard_publish(
+    engine: &dyn CtasEngine,
+    active: &mut ActiveDmlOperation,
+    target: PreparedStandardCtasTarget,
+    publication_id: novarocks_spi::connector::LakePublicationId,
+    completion: ConnectorWriteOperationCompletion,
+) -> Result<(), DmlError> {
+    let action = match engine.prepare_standard_publish_ctas(
+        target.handle.as_ref(),
+        publication_id,
+        completion,
+    ) {
+        Ok(action) => action,
+        Err(failure) => {
+            return finish_standard_known_uncommitted(
+                active,
+                CtasSagaPhase::Failed,
+                FactSlot::Publish,
+                failure,
+                None,
+            );
+        }
+    };
+    active.check_before_dispatch()?;
+    match engine.publish_standard_ctas(action.handle.as_ref()) {
+        Ok(StandardCtasPublishOutcome::Applied { receipt }) => {
+            finalize_standard_ctas_publication(active, CtasSagaPhase::Committed, receipt)
+        }
+        Ok(StandardCtasPublishOutcome::NoOp { receipt }) => {
+            finalize_standard_ctas_publication(active, CtasSagaPhase::NoOp, receipt)
+        }
+        Ok(StandardCtasPublishOutcome::KnownUncommitted { failure }) => {
+            finish_standard_known_uncommitted(
+                active,
+                CtasSagaPhase::Failed,
+                FactSlot::Publish,
+                failure,
+                None,
+            )
+        }
+        Ok(StandardCtasPublishOutcome::CommitUnknown { failure, evidence }) => {
+            finish_standard_unknown(
+                active,
+                CtasSagaPhase::PublishUnknown,
+                FactSlot::Publish,
+                failure,
+                evidence,
+                "CTAS publication",
+            )
+        }
+        Err(failure) => finish_standard_known_uncommitted(
+            active,
+            CtasSagaPhase::Failed,
+            FactSlot::Publish,
+            failure,
+            None,
+        ),
     }
 }
 
@@ -1707,6 +2067,7 @@ fn finish_source_failure(
 #[derive(Clone, Copy)]
 enum FactSlot {
     Prepare,
+    Write,
     Publish,
     Abort,
 }
@@ -1799,6 +2160,208 @@ fn validate_completion(
     }
 }
 
+fn validate_standard_target_facts(
+    stored: &StoredOperation,
+    preflight: &crate::query_execution::dml::ctas::CtasTargetPreflightFacts,
+    facts: &StandardCtasTargetFacts,
+) -> Result<(), DmlError> {
+    if facts.publication_id.to_bytes() == *stored.operation_id.as_uuid().as_bytes()
+        && facts.provider_id == preflight.provider_id
+        && facts.instance_id == preflight.instance_id
+        && facts.incarnation == preflight.incarnation
+    {
+        Ok(())
+    } else {
+        Err(operation_error(
+            DmlErrorKind::Commit,
+            stored.operation_id,
+            StatementNextAction::ManualInspect,
+            "standard CTAS staged target facts conflict with its publication identity",
+        ))
+    }
+}
+
+fn validate_standard_prepared_write(
+    stored: &StoredOperation,
+    source: &PreparedCtasSource,
+    target: &PreparedStandardCtasTarget,
+    write: &PreparedStandardCtasWrite,
+) -> Result<(), DmlError> {
+    let expected = ctas_record(stored)?.write_operation_id;
+    if write.write_operation_id.to_bytes() == *expected.as_bytes()
+        && write.execution_identity == source.facts.execution_identity
+        && write.handle.execution_identity() == source.facts.execution_identity
+        && write.target_facts == target.facts
+    {
+        Ok(())
+    } else {
+        Err(operation_error(
+            DmlErrorKind::Executor,
+            stored.operation_id,
+            StatementNextAction::ManualInspect,
+            "standard CTAS prepared write facts drifted from the source or staged target",
+        ))
+    }
+}
+
+fn validate_standard_completion(
+    stored: &StoredOperation,
+    source: &PreparedCtasSource,
+    target: &PreparedStandardCtasTarget,
+    prepared: &PreparedStandardCtasWrite,
+    completion: &ConnectorWriteOperationCompletion,
+    execution_identity: [u8; 32],
+) -> Result<(), DmlError> {
+    let expected_write = ctas_record(stored)?.write_operation_id;
+    let matching = execution_identity == source.facts.execution_identity
+        && execution_identity == prepared.execution_identity
+        && completion.owner().instance_id.as_str() == target.facts.instance_id
+        && completion.owner().incarnation.to_bytes() == target.facts.incarnation
+        && completion.sealed().operation_id().to_bytes() == *expected_write.as_bytes()
+        && completion.sealed().cohorts().len() == 1;
+    if matching {
+        Ok(())
+    } else {
+        Err(operation_error(
+            DmlErrorKind::Commit,
+            stored.operation_id,
+            StatementNextAction::ManualInspect,
+            "standard CTAS writer completion conflicts with durable source/target identity",
+        ))
+    }
+}
+
+fn standard_native_bundle(
+    prepared: &PreparedStandardCtasWrite,
+) -> Result<crate::query_execution::native_fragment::NativeFragmentAttachment, CtasFailure> {
+    let encoding = prepared.handle.native_encoding()?;
+    let input = encoding.input()?;
+    crate::native::fragment_encoder::encode_native_fragment_bundle(input.encoding_view()).map_err(
+        |message| CtasFailure {
+            kind: CtasFailureKind::Internal,
+            message,
+            user_error: None,
+        },
+    )
+}
+
+fn finalize_standard_ctas_noop(active: &mut ActiveDmlOperation) -> Result<(), DmlError> {
+    let mut record = ctas_record(&active.stored)?;
+    record.phase = CtasSagaPhase::NoOp;
+    record.next_action = StatementNextAction::None;
+    active.mutate_statement(
+        OperationState::Committing,
+        OperationPayload::CtasSaga(record.clone()),
+        None,
+    )?;
+    active.mutate_statement(
+        OperationState::Committed,
+        OperationPayload::CtasSaga(record.clone()),
+        None,
+    )?;
+    active.mutate_statement(
+        OperationState::Finalized,
+        OperationPayload::CtasSaga(record),
+        None,
+    )
+}
+
+fn finalize_standard_ctas_publication(
+    active: &mut ActiveDmlOperation,
+    phase: CtasSagaPhase,
+    receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
+) -> Result<(), DmlError> {
+    let outcome = if phase == CtasSagaPhase::NoOp {
+        ExternalFactOutcome::NoOp
+    } else {
+        ExternalFactOutcome::KnownCommitted
+    };
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = phase;
+    saga.publish_fact = Some(staged_create_fact(outcome, &receipt));
+    saga.next_action = StatementNextAction::None;
+    active.mutate_statement(
+        OperationState::Committed,
+        OperationPayload::CtasSaga(saga.clone()),
+        None,
+    )?;
+    active.mutate_statement(
+        OperationState::Finalized,
+        OperationPayload::CtasSaga(saga),
+        None,
+    )
+}
+
+fn staged_create_fact(
+    outcome: ExternalFactOutcome,
+    _receipt: &novarocks_spi::connector::ConnectorStagedCreateReceipt,
+) -> DurableExternalFact {
+    DurableExternalFact {
+        outcome,
+        // Standard staged-create receipts intentionally have no generic
+        // semantic digest: their provider payload remains opaque and is not
+        // recovery authority. The durable fact records only the known
+        // outcome; publication truth is the catalog's atomic frontier.
+        receipt: None,
+        evidence: None,
+        finalization_failure: None,
+        failure: None,
+    }
+}
+
+fn finish_standard_known_uncommitted(
+    active: &mut ActiveDmlOperation,
+    phase: CtasSagaPhase,
+    slot: FactSlot,
+    failure: CtasFailure,
+    source: Option<&str>,
+) -> Result<(), DmlError> {
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = if failure.kind == CtasFailureKind::Unsupported {
+        CtasSagaPhase::Unsupported
+    } else {
+        phase
+    };
+    install_fact(&mut saga, slot, failure_fact(&failure));
+    saga.next_action = StatementNextAction::None;
+    active.mutate_statement(
+        OperationState::FailedKnownUncommitted,
+        OperationPayload::CtasSaga(saga),
+        None,
+    )?;
+    Err(source_failure_error(active.operation_id(), source, failure))
+}
+
+fn finish_standard_unknown(
+    active: &mut ActiveDmlOperation,
+    phase: CtasSagaPhase,
+    slot: FactSlot,
+    failure: CtasFailure,
+    evidence: ExternalMutationEvidence,
+    label: &str,
+) -> Result<(), DmlError> {
+    let mut saga = ctas_record(&active.stored)?;
+    saga.phase = phase;
+    install_fact(
+        &mut saga,
+        slot,
+        DurableExternalFact {
+            outcome: ExternalFactOutcome::CommitUnknown,
+            receipt: None,
+            evidence: encode_evidence(&evidence).ok(),
+            finalization_failure: None,
+            failure: Some(encode_failure(&failure)),
+        },
+    );
+    saga.next_action = StatementNextAction::ManualInspect;
+    active.mutate_statement(
+        OperationState::CommitUnknown,
+        OperationPayload::CtasSaga(saga),
+        Some(crate::dml::now_unix_millis()),
+    )?;
+    Err(unknown_error(active.operation_id(), label, &failure))
+}
+
 fn failure_fact(failure: &CtasFailure) -> DurableExternalFact {
     DurableExternalFact {
         outcome: match failure.kind {
@@ -1818,6 +2381,7 @@ fn failure_fact(failure: &CtasFailure) -> DurableExternalFact {
 fn install_fact(record: &mut CtasSagaRecord, slot: FactSlot, fact: DurableExternalFact) {
     match slot {
         FactSlot::Prepare => record.prepare_fact = Some(fact),
+        FactSlot::Write => record.write_fact = Some(fact),
         FactSlot::Publish => record.publish_fact = Some(fact),
         FactSlot::Abort => record.abort_staging_fact = Some(fact),
     }
