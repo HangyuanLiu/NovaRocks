@@ -28,9 +28,7 @@ mod execution;
 mod execution_declaration;
 mod external_write_fence;
 mod handle;
-mod historical_data_mutation_recovery;
 mod historical_maintenance_recovery;
-mod historical_write_recovery;
 mod identity;
 mod metadata;
 mod metadata_maintenance;
@@ -152,21 +150,6 @@ pub use handle::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
-pub use historical_data_mutation_recovery::{
-    ConnectorHistoricalDataMutationApplication, ConnectorHistoricalDataMutationCheckpoint,
-    ConnectorHistoricalDataMutationCleanupReceipt, ConnectorHistoricalDataMutationCleanupRequest,
-    ConnectorHistoricalDataMutationContinuation, ConnectorHistoricalDataMutationDescriptor,
-    ConnectorHistoricalDataMutationDispatchState, ConnectorHistoricalDataMutationDisposition,
-    ConnectorHistoricalDataMutationFamily, ConnectorHistoricalDataMutationFence,
-    ConnectorHistoricalDataMutationFenceFacts, ConnectorHistoricalDataMutationFenceRaiseRequest,
-    ConnectorHistoricalDataMutationIdentity, ConnectorHistoricalDataMutationObservation,
-    ConnectorHistoricalDataMutationOutcomeFacts, ConnectorHistoricalDataMutationPhase,
-    ConnectorHistoricalDataMutationProof, ConnectorHistoricalDataMutationRecovery,
-    MAX_CONNECTOR_HISTORICAL_DATA_MUTATION_CHECKPOINTS,
-    MAX_CONNECTOR_HISTORICAL_DATA_MUTATION_CONTINUATION_BYTES,
-    MAX_CONNECTOR_HISTORICAL_DATA_MUTATION_PROOF_BYTES,
-    validate_historical_data_mutation_recovery_owner,
-};
 pub use historical_maintenance_recovery::{
     ConnectorHistoricalDispatchFacts, ConnectorHistoricalMaintenanceArtifact,
     ConnectorHistoricalMaintenanceCleanupReceipt, ConnectorHistoricalMaintenanceCleanupRequest,
@@ -180,18 +163,6 @@ pub use historical_maintenance_recovery::{
     MAX_CONNECTOR_HISTORICAL_MAINTENANCE_CONTINUATION_BYTES,
     MAX_CONNECTOR_HISTORICAL_MAINTENANCE_PROOF_BYTES,
     validate_historical_maintenance_recovery_owner,
-};
-pub use historical_write_recovery::{
-    ConnectorHistoricalWriteApplication, ConnectorHistoricalWriteCheckpoint,
-    ConnectorHistoricalWriteCleanupReceipt, ConnectorHistoricalWriteCleanupRequest,
-    ConnectorHistoricalWriteContinuation, ConnectorHistoricalWriteDescriptor,
-    ConnectorHistoricalWriteDispatchState, ConnectorHistoricalWriteDisposition,
-    ConnectorHistoricalWriteFence, ConnectorHistoricalWriteFenceFacts,
-    ConnectorHistoricalWriteFenceRaiseRequest, ConnectorHistoricalWriteIdentity,
-    ConnectorHistoricalWriteObservation, ConnectorHistoricalWriteOutcomeFacts,
-    ConnectorHistoricalWritePhase, ConnectorHistoricalWriteProof, ConnectorHistoricalWriteRecovery,
-    MAX_CONNECTOR_HISTORICAL_WRITE_CHECKPOINTS, MAX_CONNECTOR_HISTORICAL_WRITE_CONTINUATION_BYTES,
-    MAX_CONNECTOR_HISTORICAL_WRITE_PROOF_BYTES, validate_historical_write_recovery_owner,
 };
 pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};
 pub use metadata::{

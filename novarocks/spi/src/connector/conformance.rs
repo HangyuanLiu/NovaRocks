@@ -21,10 +21,9 @@ use arrow::record_batch::RecordBatch;
 use super::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExternalFenceRequest, ConnectorExternalOperationFence,
-    ConnectorHistoricalWriteDescriptor, ConnectorHistoricalWriteObservation,
-    ConnectorHistoricalWriteRecovery, ConnectorMetadata, ConnectorRequestContext,
-    ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
-    ConnectorTableObjectCaptureRequest, ConnectorTableObjectRebindRequest, ConnectorWriteControl,
+    ConnectorMetadata, ConnectorRequestContext, ConnectorTableObjectBinding,
+    ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest,
+    ConnectorTableObjectRebindRequest, ConnectorWriteControl,
 };
 
 pub fn assert_batch_reader_contract(
@@ -267,42 +266,6 @@ pub fn assert_table_object_binding_unsupported(
         ));
     }
     Ok(())
-}
-
-/// Assert the frozen historical write recovery contract for one immutable
-/// descriptor.
-///
-/// The observation must answer exactly this descriptor, stay digest sealed,
-/// classify the same immutable input identically on replay, and respect the
-/// disposition rules: only a proven not-dispatched operation may carry a
-/// continuation, only an applied operation may carry finalization facts, and an
-/// unresolved operation may not request cleanup.
-pub fn assert_historical_write_recovery_contract(
-    recovery: &dyn ConnectorHistoricalWriteRecovery,
-    descriptor: ConnectorHistoricalWriteDescriptor,
-    context: ConnectorRequestContext,
-) -> Result<ConnectorHistoricalWriteObservation, ConnectorError> {
-    descriptor.validate()?;
-    let observation = recovery.inspect(descriptor.clone(), context.clone())?;
-    observation.validate_for(&descriptor)?;
-    if observation.continuation.is_some() && !observation.disposition.may_continue() {
-        return Err(contract(
-            "historical write observation carries a continuation for a dispatched disposition",
-        ));
-    }
-    if observation.cleanup_required && !observation.disposition.is_resolved() {
-        return Err(contract(
-            "historical write observation requests cleanup for an unresolved disposition",
-        ));
-    }
-    let replay = recovery.inspect(descriptor.clone(), context)?;
-    replay.validate_for(&descriptor)?;
-    if replay.digest() != observation.digest() {
-        return Err(contract(
-            "historical write inspection is not idempotent for one immutable descriptor",
-        ));
-    }
-    Ok(observation)
 }
 
 fn contract(message: &'static str) -> ConnectorError {

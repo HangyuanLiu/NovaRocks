@@ -618,17 +618,6 @@ mod tests {
             recovery.binding_key().incarnation,
             creation.binding().incarnation()
         );
-        assert!(
-            creation.binding().historical_write_recovery().is_none(),
-            "crash-only bindings must not install historical write takeover"
-        );
-        assert!(
-            creation
-                .binding()
-                .historical_data_mutation_recovery()
-                .is_none(),
-            "crash-only bindings must not install historical direct-mutation takeover"
-        );
         let views = creation.binding().view_metadata().expect("view metadata");
         assert_eq!(views.descriptor(), creation.binding().descriptor());
         assert_eq!(views.incarnation(), creation.binding().incarnation());
