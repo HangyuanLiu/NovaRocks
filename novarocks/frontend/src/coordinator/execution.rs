@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::common::backend_topology::LiveBackendTarget;
+use crate::common::backend_topology::{BackendTopologyValidationError, LiveBackendTarget};
 use crate::native::fragment_transport::{FetchOutcome, FragmentDispatcher};
 use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::artifact::{
@@ -35,7 +35,7 @@ use crate::query_execution::artifact::{
 use crate::query_execution::contract::{
     ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
     DistributedQueryErrorKind, DistributedQueryIntent, DistributedQueryOutcome,
-    DistributedQueryRequest, ProfileTerminalBuilder,
+    DistributedQueryRequest, PreReadyTopologyOutcome, ProfileTerminalBuilder,
 };
 #[cfg(test)]
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
@@ -941,7 +941,7 @@ impl FrontendDistributedQueryCoordinator {
         }
         self.backend_topology
             .validate_snapshot(&parts.topology)
-            .map_err(|error| failed(error.to_string()))?;
+            .map_err(pre_ready_topology_validation_error)?;
         #[cfg(test)]
         let backend_services = match &self.backend_services {
             Some(services) => services.resolve(parts.topology.targets())?,
@@ -967,7 +967,7 @@ impl FrontendDistributedQueryCoordinator {
             .scheduled_backend_ownership(&schedule.backend_ids())?;
         self.backend_topology
             .validate_snapshot(&parts.topology)
-            .map_err(|error| failed(error.to_string()))?;
+            .map_err(pre_ready_topology_validation_error)?;
         self.registry
             .set_scheduled_backend_ownership(query_id, &scheduled_backend_ownership)?;
         let binding_attachment =
@@ -1340,6 +1340,33 @@ fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
 }
 
+/// Snapshot validation runs before the Init + ControlReady boundary.  Only a
+/// concrete missing/replaced captured process becomes typed topology evidence;
+/// revision-only and availability errors are not guessed into retryability.
+fn pre_ready_topology_validation_error(
+    error: BackendTopologyValidationError,
+) -> DistributedQueryError {
+    match error {
+        BackendTopologyValidationError::GenerationChanged {
+            backend_idx,
+            captured_generation,
+            ..
+        }
+        | BackendTopologyValidationError::TargetMissing {
+            backend_idx,
+            captured_generation,
+            ..
+        } => DistributedQueryError::pre_ready_topology(
+            PreReadyTopologyOutcome::BackendNotEligible {
+                backend_idx,
+                process_id: captured_generation,
+            },
+            error.to_string(),
+        ),
+        other => failed(other.to_string()),
+    }
+}
+
 fn abort_query_lifecycle(
     lease: &mut Option<QueryLifecycleLease>,
     message: impl Into<String>,
@@ -1352,10 +1379,33 @@ fn abort_query_lifecycle(
 
 #[cfg(test)]
 mod tests {
-    use super::{FrontendReportEndpointBinding, QueryIdSource, UniqueQueryIdSource};
+    use super::{
+        FrontendReportEndpointBinding, QueryIdSource, UniqueQueryIdSource,
+        pre_ready_topology_validation_error,
+    };
+    use crate::common::backend_topology::BackendTopologyValidationError;
     use crate::common::backend_topology::CoordinatorReportEndpointSink;
-    use crate::query_execution::contract::DistributedQueryErrorKind;
-    use novarocks_types::QueryProcessNamespace;
+    use crate::query_execution::contract::{DistributedQueryErrorKind, PreReadyTopologyOutcome};
+    use novarocks_types::{BackendProcessId, QueryProcessNamespace};
+
+    #[test]
+    fn missing_captured_process_is_typed_pre_ready_not_eligible() {
+        let process_id = BackendProcessId::new_v7();
+        let error =
+            pre_ready_topology_validation_error(BackendTopologyValidationError::TargetMissing {
+                backend_idx: 2,
+                captured_generation: process_id,
+                captured_revision: 7,
+                current_revision: 8,
+            });
+        assert_eq!(
+            error.pre_ready_topology_outcome(),
+            Some(PreReadyTopologyOutcome::BackendNotEligible {
+                backend_idx: 2,
+                process_id,
+            })
+        );
+    }
 
     #[test]
     fn unique_query_id_source_uses_one_namespace_with_continuous_positive_sequences() {

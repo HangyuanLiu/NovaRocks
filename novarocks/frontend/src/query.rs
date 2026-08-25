@@ -23,11 +23,12 @@ use std::time::{Duration, Instant};
 
 use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
-use crate::common::admitted_query_context::{
-    LakePublicationRuntimePolicy, RequestContext, SessionOptimizerSettings, StatementAdmissionContext,
-};
 #[cfg(test)]
 use crate::common::admitted_query_context::RequestAdmission;
+use crate::common::admitted_query_context::{
+    LakePublicationRuntimePolicy, RequestContext, SessionOptimizerSettings,
+    StatementAdmissionContext,
+};
 use crate::common::backend_topology::BackendTopologyService;
 use crate::common::engine_error::EngineError;
 use crate::common::query_cancellation::QueryCancellationReason;
