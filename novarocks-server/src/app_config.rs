@@ -597,7 +597,7 @@ pub struct ConnectorConfig {
     pub object_store: Option<ConnectorObjectStoreConfig>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConnectorObjectStoreConfigWire {
     endpoint: Option<String>,
@@ -605,18 +605,6 @@ struct ConnectorObjectStoreConfigWire {
     access_key_secret: Option<String>,
     region: Option<String>,
     enable_path_style_access: Option<bool>,
-}
-
-impl Default for ConnectorObjectStoreConfigWire {
-    fn default() -> Self {
-        Self {
-            endpoint: None,
-            access_key_id: None,
-            access_key_secret: None,
-            region: None,
-            enable_path_style_access: None,
-        }
-    }
 }
 
 #[derive(Deserialize, Default)]
