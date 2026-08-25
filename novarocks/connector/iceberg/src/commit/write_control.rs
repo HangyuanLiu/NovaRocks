@@ -42,7 +42,9 @@ use novarocks_spi::connector::{
     ConnectorManagedPartitionSpecPreviewRequest, ConnectorManagedPartitionSpecReplacement,
     ConnectorManagedPartitionTransform, ConnectorManagedPublicationEmptyInputDisposition,
     ConnectorManagedPublicationTechnique, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorRowMutationActivationRequest,
+    ConnectorMutationOperationId, ConnectorPreReadyWritePlanningProof,
+    ConnectorPreReadyWritePlanningRequest, ConnectorRequestContext,
+    ConnectorRowMutationActivationRequest,
     ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationExecutionPlan,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
     ConnectorTableObjectId, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
@@ -1799,6 +1801,19 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 Ok(activation)
             }
         }
+    }
+
+    fn certify_pre_ready_write_planning(
+        &self,
+        request: ConnectorPreReadyWritePlanningRequest,
+    ) -> Result<ConnectorPreReadyWritePlanningProof, ConnectorError> {
+        // Iceberg activation and placement planning below only reserve and
+        // update generation-local control-memory state. Writer opening,
+        // staging/object creation, catalog publication, and all unknown
+        // provider boundaries occur after ControlReady and are therefore not
+        // covered by this proof.
+        validate_context(&request.activation().context)?;
+        ConnectorPreReadyWritePlanningProof::try_issue(self.key.clone(), &request)
     }
 
     fn plan_write(
@@ -3862,14 +3877,14 @@ mod tests {
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
         CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorInstanceId,
-        ConnectorManagedDescriptorProperties, ConnectorManagedPublicationIntent,
+    ConnectorManagedDescriptorProperties, ConnectorManagedPublicationIntent,
         ConnectorManagedPublicationTarget, ConnectorProviderId, ConnectorSealedWriteCohortSet,
         ConnectorStagedPublicationBaseFact, ConnectorStagedReport, ConnectorStagedReportSummary,
         ConnectorTableHandle, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
         ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteFieldBinding,
         ConnectorWriteFieldToken, ConnectorWriteIntent, ConnectorWriteOperationCompletion,
         ConnectorWritePreparation, ConnectorWriteTargetRef, ConnectorWriterIdentity,
-        ConnectorWriterTerminalState,
+        ConnectorWriterTerminalState, ConnectorPreReadyWritePlanningRequest,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -4310,6 +4325,24 @@ mod tests {
                 .target,
             "ice.db.t"
         );
+    }
+
+    #[test]
+    fn effect_free_pre_ready_proof_binds_the_exact_activation_request() {
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let request = ConnectorPreReadyWritePlanningRequest::new(activation_request(
+            &owner,
+            ConnectorWriteOperationId::new(),
+            1,
+        ));
+
+        let proof = control
+            .certify_pre_ready_write_planning(request.clone())
+            .expect("Iceberg control proves its pre-ready control-memory path");
+        proof
+            .validates(&owner, &request)
+            .expect("proof retains exact owner and activation semantics");
     }
 
     #[test]

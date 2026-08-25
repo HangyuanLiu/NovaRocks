@@ -1788,6 +1788,84 @@ impl ConnectorWriteActivationRequest {
     }
 }
 
+/// Provider-owned request for a proof that the activation and placement-plan
+/// steps for one write operation cannot create an external effect before every
+/// participant reaches ControlReady. It is intentionally separate from a
+/// write activation: Frontend must ask before it relies on a topology retry.
+#[derive(Clone)]
+pub struct ConnectorPreReadyWritePlanningRequest {
+    activation: ConnectorWriteActivationRequest,
+}
+
+impl ConnectorPreReadyWritePlanningRequest {
+    pub fn new(activation: ConnectorWriteActivationRequest) -> Self {
+        Self { activation }
+    }
+
+    pub fn activation(&self) -> &ConnectorWriteActivationRequest {
+        &self.activation
+    }
+
+    pub fn validate(
+        &self,
+        owner: &ConnectorExecutionBindingKey,
+    ) -> Result<[u8; 32], ConnectorError> {
+        self.activation.validate(owner)
+    }
+}
+
+/// A non-durable, exact-generation proof issued only by the provider control
+/// that owns a write operation. The default Connector SPI implementation does
+/// not issue this proof, so unknown providers fail closed for pre-ready DML
+/// retry instead of inheriting an Iceberg-specific assumption.
+#[derive(Clone)]
+pub struct ConnectorPreReadyWritePlanningProof {
+    owner: ConnectorExecutionBindingKey,
+    operation_id: ConnectorWriteOperationId,
+    activation_source_digest: [u8; 32],
+}
+
+impl ConnectorPreReadyWritePlanningProof {
+    pub fn try_issue(
+        owner: ConnectorExecutionBindingKey,
+        request: &ConnectorPreReadyWritePlanningRequest,
+    ) -> Result<Self, ConnectorError> {
+        Ok(Self {
+            operation_id: request.activation.operation_id,
+            activation_source_digest: request.validate(&owner)?,
+            owner,
+        })
+    }
+
+    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+        &self.owner
+    }
+
+    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
+        self.operation_id
+    }
+
+    pub fn validates(
+        &self,
+        owner: &ConnectorExecutionBindingKey,
+        request: &ConnectorPreReadyWritePlanningRequest,
+    ) -> Result<(), ConnectorError> {
+        if &self.owner != owner || self.operation_id != request.activation.operation_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "pre-ready write-planning proof does not match its exact control owner",
+            ));
+        }
+        if self.activation_source_digest != request.validate(owner)? {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "pre-ready write-planning proof does not match its activation request",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// One provider-signed activated cohort. Only this value may enter planning.
 #[derive(Clone)]
 pub struct ConnectorActivatedWriteCohort {
@@ -3344,6 +3422,21 @@ pub trait ConnectorWriteControl: Send + Sync {
         ))
     }
 
+    /// Issue an operation-scoped proof only when this provider guarantees that
+    /// the matching activation and all later `plan_write` calls remain free of
+    /// staging, object, catalog, publication, and other external effects until
+    /// ControlReady. Providers that cannot prove this must keep the default
+    /// rejection; Frontend then reports `TopologyRetryUnsupported` for DML.
+    fn certify_pre_ready_write_planning(
+        &self,
+        _request: ConnectorPreReadyWritePlanningRequest,
+    ) -> Result<ConnectorPreReadyWritePlanningProof, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector write control does not prove effect-free pre-ready planning",
+        ))
+    }
+
     fn plan_write(
         &self,
         request: ConnectorWritePlanningRequest,
@@ -3528,6 +3621,18 @@ impl ConnectorWriteLease {
             ));
         }
         Ok(activation)
+    }
+
+    pub fn certify_pre_ready_write_planning(
+        &self,
+        request: ConnectorPreReadyWritePlanningRequest,
+    ) -> Result<ConnectorPreReadyWritePlanningProof, ConnectorError> {
+        request.validate(&self.binding_key)?;
+        let proof = self
+            .control
+            .certify_pre_ready_write_planning(request.clone())?;
+        proof.validates(&self.binding_key, &request)?;
+        Ok(proof)
     }
 
     /// Return whether two leases retain the same provider control generation.
