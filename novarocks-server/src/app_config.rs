@@ -456,23 +456,65 @@ pub struct NovaRocksConfig {
 impl NovaRocksConfig {
     // Design: ADR-0107 (docs/adr/ADR-0107-static-startup-secret-resolution.md)
     pub fn load_from_file(path: &Path) -> Result<Self> {
-        let s = std::fs::read_to_string(path)
-            .with_context(|| format!("read config file: {}", path.display()))?;
-        let mut value: toml::Value =
-            toml::from_str(&s).with_context(|| format!("parse config TOML: {}", path.display()))?;
-        resolve_env_references(&mut value).with_context(|| {
-            format!("resolve config environment references: {}", path.display())
-        })?;
-        let cfg: NovaRocksConfig = value
-            .try_into()
-            .with_context(|| format!("deserialize config TOML: {}", path.display()))?;
-        validate_state_store_configuration(&cfg)?;
-        validate_query_control_config(&cfg.runtime)?;
-        validate_lake_publication_runtime_policy(&cfg.runtime)?;
-        #[cfg(not(debug_assertions))]
-        reject_fault_injection_environment()?;
+        deserialize_loaded_config(path, load_resolved_config_value(path)?)
+    }
+
+    /// Load a deployable role configuration. Unlike the generic deserializer
+    /// used by in-process test builders, a server config must name its role
+    /// explicitly and may only describe one application role.
+    pub fn load_deployable_from_file(path: &Path) -> Result<Self> {
+        let document = load_resolved_config_value(path)?;
+        let cluster = document
+            .get("cluster")
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "config {}: missing required [cluster] table",
+                    path.display()
+                )
+            })?;
+        let role = cluster
+            .get("role")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!("config {}: missing required [cluster].role", path.display())
+            })?;
+        if !matches!(role, "fe" | "be") {
+            bail!(
+                "config {}: [cluster].role must be `fe` or `be`, got `{role}`",
+                path.display()
+            );
+        }
+
+        let cfg = deserialize_loaded_config(path, document)?;
+        cfg.cluster
+            .validate()
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("validate [cluster]: {}", path.display()))?;
         Ok(cfg)
     }
+}
+
+fn load_resolved_config_value(path: &Path) -> Result<toml::Value> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("read config file: {}", path.display()))?;
+    let mut value: toml::Value = toml::from_str(&source)
+        .with_context(|| format!("parse config TOML: {}", path.display()))?;
+    resolve_env_references(&mut value)
+        .with_context(|| format!("resolve config environment references: {}", path.display()))?;
+    Ok(value)
+}
+
+fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRocksConfig> {
+    let cfg: NovaRocksConfig = value
+        .try_into()
+        .with_context(|| format!("deserialize config TOML: {}", path.display()))?;
+    validate_state_store_configuration(&cfg)?;
+    validate_query_control_config(&cfg.runtime)?;
+    validate_lake_publication_runtime_policy(&cfg.runtime)?;
+    #[cfg(not(debug_assertions))]
+    reject_fault_injection_environment()?;
+    Ok(cfg)
 }
 
 /// Reject runner-owned fault-injection environment variables in release builds.

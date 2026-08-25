@@ -18,6 +18,7 @@
 pub mod app_config;
 pub mod composition;
 mod env_reference;
+pub mod launch;
 pub mod logging;
 pub mod memory_limit;
 pub mod network;
