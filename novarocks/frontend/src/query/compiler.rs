@@ -255,6 +255,14 @@ impl PreparedDistributedRoundFactory for FrontendDistributedRoundFactory {
                 )
             })
     }
+
+    fn close_after_control_ready(&self) {
+        self.effect_tracker.close_after_control_ready();
+    }
+
+    fn close_after_stage_or_start(&self) {
+        self.effect_tracker.close_after_stage_or_start();
+    }
 }
 
 impl FrontendQueryCompiler {

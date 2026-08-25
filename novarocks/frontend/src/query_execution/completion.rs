@@ -40,6 +40,16 @@ pub(crate) trait PreparedDistributedRoundFactory: Send {
     fn permit_pre_ready_retry(
         &self,
     ) -> Result<(), crate::query_execution::contract::DistributedQueryError>;
+
+    /// The coordinator calls this only after every participant has completed
+    /// ControlReady. A factory with an effect tracker must close its retry
+    /// permit here even if later execution returns an unrelated error.
+    fn close_after_control_ready(&self) {}
+
+    /// Stage/Start is an additional one-way retry boundary. It is separate
+    /// from ControlReady so future factory implementations cannot weaken the
+    /// carrier by relying on a caller's control-flow shape.
+    fn close_after_stage_or_start(&self) {}
 }
 
 #[expect(
