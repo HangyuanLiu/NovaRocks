@@ -77,7 +77,8 @@ SET CATALOG default_catalog;
 SET catalog = default_catalog;
 
 -- query 13
--- Client transaction setup remains an accepted no-op.
+-- This interoperability statement does not create a transaction or claim that
+-- NovaRocks implements transaction-isolation semantics.
 -- @skip_result_check=true
 SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
 

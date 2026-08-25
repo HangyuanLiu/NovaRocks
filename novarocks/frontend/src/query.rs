@@ -711,17 +711,16 @@ impl FrontendQuerySession {
         if !variable.value.eq_ignore_ascii_case("autocommit") {
             return Ok(());
         }
-        let value = session_setting_value(&assignment.value)?;
-        if parse_bool(&value)? {
-            return Ok(());
+        match lower_autocommit_setting(&assignment.value)? {
+            AutocommitSetting::Enabled => Ok(()),
+            AutocommitSetting::Disabled => Err(QueryServiceError::from_user_error(
+                crate::session_error::SessionAdmitError::TransactionUnsupported.to_user_error(
+                    source,
+                    assignment.span,
+                    "SET autocommit=0 is not supported because NovaRocks only provides statement-level autocommit frontiers",
+                ),
+            )),
         }
-        Err(QueryServiceError::from_user_error(
-            crate::session_error::SessionAdmitError::TransactionUnsupported.to_user_error(
-                source,
-                assignment.span,
-                "SET autocommit=0 is not supported because NovaRocks only provides statement-level autocommit frontiers",
-            ),
-        ))
     }
 
     async fn apply_session_set_assignment(
@@ -814,7 +813,14 @@ impl FrontendQuerySession {
             return self.apply_session_catalog(value);
         }
         if name == "autocommit" {
-            debug_assert!(parse_bool(value).unwrap_or(false));
+            // `admit_session_set_assignment` has already lowered and accepted
+            // only the truthful enabled spelling. Do not turn this into a
+            // session state bit: the portable SQL profile has no transaction
+            // state to retain across statements.
+            debug_assert!(matches!(
+                lower_autocommit_value(value),
+                Ok(AutocommitSetting::Enabled)
+            ));
             return Ok(());
         }
         let mut state = self.state.lock().map_err(poisoned_state)?;
@@ -1185,6 +1191,32 @@ fn session_setting_value(value: &ast::SetValue) -> Result<String, QueryServiceEr
     }
 }
 
+/// Closed lowering for the one session setting that would otherwise create a
+/// cross-statement publication boundary. Other boolean settings remain on the
+/// generic session-value path; autocommit must not silently inherit its
+/// permissive/no-op behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutocommitSetting {
+    Enabled,
+    Disabled,
+}
+
+fn lower_autocommit_setting(value: &ast::SetValue) -> Result<AutocommitSetting, QueryServiceError> {
+    let value = session_setting_value(value)?;
+    lower_autocommit_value(&value)
+}
+
+fn lower_autocommit_value(value: &str) -> Result<AutocommitSetting, QueryServiceError> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" => Ok(AutocommitSetting::Enabled),
+        "0" | "off" | "false" => Ok(AutocommitSetting::Disabled),
+        _ => Err(QueryServiceError::new(
+            QueryServiceErrorKind::InvalidValue,
+            format!("invalid autocommit value `{value}`; expected 1, ON, TRUE, 0, OFF, or FALSE"),
+        )),
+    }
+}
+
 fn session_catalog_value(value: &ast::SetValue) -> Result<String, QueryServiceError> {
     if let ast::SetValue::Expression(value) = value {
         return Ok(print_expr(value)
@@ -1210,7 +1242,8 @@ fn session_catalog_value(value: &ast::SetValue) -> Result<String, QueryServiceEr
 fn is_known_session_setting(name: &str) -> bool {
     matches!(
         name,
-        "catalog"
+        "autocommit"
+            | "catalog"
             | "query_timeout"
             | "group_concat_max_len"
             | "pipeline_dop"
@@ -2562,6 +2595,52 @@ mod tests {
             session_setting_value(&statement.assignments[0].value).expect("boolean value"),
             "on"
         );
+    }
+
+    #[test]
+    fn autocommit_lowering_is_closed_over_truthful_boolean_spellings() {
+        for (source, expected) in [
+            ("SET autocommit = 1", AutocommitSetting::Enabled),
+            ("SET autocommit = ON", AutocommitSetting::Enabled),
+            ("SET autocommit = TRUE", AutocommitSetting::Enabled),
+            ("SET autocommit = 0", AutocommitSetting::Disabled),
+            ("SET autocommit = OFF", AutocommitSetting::Disabled),
+            ("SET autocommit = FALSE", AutocommitSetting::Disabled),
+        ] {
+            let statements = novarocks_parser::parse(source).expect("SET must parse");
+            let [ParsedStatement::Session(ast::SessionStatement::Set(statement))] =
+                statements.as_slice()
+            else {
+                panic!("expected one SET statement");
+            };
+            assert_eq!(
+                lower_autocommit_setting(&statement.assignments[0].value)
+                    .expect("autocommit spelling must lower"),
+                expected,
+                "source={source}"
+            );
+        }
+    }
+
+    #[test]
+    fn autocommit_lowering_rejects_values_outside_the_closed_boolean_surface() {
+        for source in ["SET autocommit = 2", "SET autocommit = inherited"] {
+            let statements = novarocks_parser::parse(source).expect("SET must parse");
+            let [ParsedStatement::Session(ast::SessionStatement::Set(statement))] =
+                statements.as_slice()
+            else {
+                panic!("expected one SET statement");
+            };
+            let error = lower_autocommit_setting(&statement.assignments[0].value)
+                .expect_err("unrecognized autocommit value must be rejected");
+            assert_eq!(error.kind(), QueryServiceErrorKind::InvalidValue);
+            assert!(error.message().contains("invalid autocommit value"));
+        }
+    }
+
+    #[test]
+    fn autocommit_is_not_an_unknown_global_no_op() {
+        assert!(is_known_session_setting("autocommit"));
     }
 
     #[test]
