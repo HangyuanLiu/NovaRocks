@@ -925,6 +925,20 @@ impl FrontendDistributedQueryCoordinator {
                 error.to_string(),
             )
         })?;
+        self.execute_round(query_id, execution_id, request)
+    }
+
+    /// Execute exactly one move-only distributed round. A future statement
+    /// controller retains the logical `query_id`, advances only the attempt
+    /// id, and supplies a newly planned request here after the old pre-ready
+    /// attempt has been aborted. This method never patches or reuses an old
+    /// round's artifacts.
+    fn execute_round(
+        &self,
+        query_id: QueryId,
+        execution_id: QueryExecutionId,
+        request: DistributedQueryRequest,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         let parts = request.into_parts();
         let connector_write_session = parts
             .connector_write
