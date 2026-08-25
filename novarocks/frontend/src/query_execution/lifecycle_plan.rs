@@ -630,6 +630,7 @@ pub(crate) fn compile_query_init_plan(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::OnceLock;
     use std::time::Duration;
 
     use super::{QueryInitOptions, compile_query_init_plan};
@@ -652,10 +653,18 @@ mod tests {
     }
 
     fn backend(backend_idx: usize) -> LiveBackendTarget {
+        static PROCESS_IDS: OnceLock<[BackendProcessId; 3]> = OnceLock::new();
+        let process_ids = PROCESS_IDS.get_or_init(|| {
+            [
+                BackendProcessId::new_v7(),
+                BackendProcessId::new_v7(),
+                BackendProcessId::new_v7(),
+            ]
+        });
         LiveBackendTarget::new(
             backend_idx,
             BackendProcessDescriptor::new(
-                BackendProcessId::new_v7(),
+                process_ids[backend_idx],
                 novarocks_proto::lifecycle::QueryControlEndpoint::new(
                     "127.0.0.1",
                     u16::try_from(19040 + backend_idx).expect("valid port"),
