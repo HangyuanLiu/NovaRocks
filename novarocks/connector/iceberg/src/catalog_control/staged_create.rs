@@ -103,6 +103,10 @@ impl From<ConnectorError> for RestStagedPrepareFailure {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The REST stage-create boundary keeps every SQL-visible creation input explicit."
+)]
 pub(crate) fn prepare_rest_staged_table(
     runtime: &IcebergControlRuntime,
     _operation_id: ConnectorStagedCreateOperationId,

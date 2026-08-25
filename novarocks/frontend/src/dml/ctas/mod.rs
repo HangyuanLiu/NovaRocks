@@ -38,7 +38,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::common::engine_error::EngineError;
+use crate::common::engine_error::EngineErrorCode;
 use crate::dml::coordination::ActiveDmlOperation;
 use crate::dml::error::{AdmitError, DmlError, DmlErrorKind};
 use crate::dml::model::{
@@ -789,8 +789,7 @@ fn finish_standard_known_uncommitted(
     // semantic outcome at the SQL boundary rather than degrading it to the
     // generic executor error used for source preparation failures.
     let error = source_failure_error(active.operation_id(), source, failure);
-    let engine_error = EngineError::commit_known_uncommitted(error.to_string());
-    Err(error.with_engine_error(engine_error))
+    Err(error.with_engine_error_code(EngineErrorCode::CommitKnownUncommitted))
 }
 
 fn finish_standard_unknown(
@@ -821,8 +820,7 @@ fn finish_standard_unknown(
         Some(crate::dml::now_unix_millis()),
     )?;
     let error = unknown_error(active.operation_id(), label, &failure);
-    let engine_error = EngineError::commit_unknown(error.to_string());
-    Err(error.with_engine_error(engine_error))
+    Err(error.with_engine_error_code(EngineErrorCode::CommitUnknown))
 }
 
 fn failure_fact(failure: &CtasFailure) -> DurableExternalFact {

@@ -17,7 +17,7 @@
 
 use std::fmt;
 
-use crate::common::engine_error::EngineError;
+use crate::common::engine_error::EngineErrorCode;
 use novarocks_parser::Span;
 use novarocks_spi::connector::{
     ConnectorWriteReceipt, LakePublicationDisposition, LakePublicationFamily,
@@ -137,7 +137,7 @@ pub struct DmlError {
     committed_receipt: Option<Box<ConnectorWriteReceipt>>,
     publication_terminal: Option<LakePublicationTerminal>,
     user_error: Option<UserError>,
-    engine_error: Option<EngineError>,
+    engine_error_code: Option<EngineErrorCode>,
 }
 
 /// DML-local carrier for a SQL analysis error before the frontend client
@@ -215,7 +215,7 @@ impl DmlError {
             committed_receipt: None,
             publication_terminal: None,
             user_error: None,
-            engine_error: None,
+            engine_error_code: None,
         }
     }
 
@@ -296,7 +296,7 @@ impl DmlError {
             committed_receipt: committed_receipt.map(Box::new),
             publication_terminal: None,
             user_error: None,
-            engine_error: None,
+            engine_error_code: None,
         }
     }
 
@@ -315,7 +315,7 @@ impl DmlError {
             committed_receipt: Some(Box::new(committed_receipt)),
             publication_terminal: None,
             user_error: None,
-            engine_error: None,
+            engine_error_code: None,
         }
     }
 
@@ -333,7 +333,7 @@ impl DmlError {
             committed_receipt: None,
             publication_terminal: None,
             user_error: None,
-            engine_error: None,
+            engine_error_code: None,
         }
     }
 
@@ -352,7 +352,7 @@ impl DmlError {
             committed_receipt: None,
             publication_terminal: None,
             user_error: Some(error),
-            engine_error: None,
+            engine_error_code: None,
         }
     }
 
@@ -368,10 +368,10 @@ impl DmlError {
         Self::new(DmlErrorKind::CoordinationUnresolved, error)
     }
 
-    /// Carries an explicit engine-level outcome to the SQL boundary.  DML
-    /// must never reconstruct these codes by parsing its own display text.
-    pub(crate) fn with_engine_error(mut self, error: EngineError) -> Self {
-        self.engine_error = Some(error);
+    /// Carries an explicit engine-level code to the SQL boundary. DML must
+    /// never reconstruct these codes by parsing its own display text.
+    pub(crate) fn with_engine_error_code(mut self, code: EngineErrorCode) -> Self {
+        self.engine_error_code = Some(code);
         self
     }
 
@@ -395,8 +395,8 @@ impl DmlError {
         self.user_error.as_ref()
     }
 
-    pub(crate) fn engine_error(&self) -> Option<&EngineError> {
-        self.engine_error.as_ref()
+    pub(crate) const fn engine_error_code(&self) -> Option<EngineErrorCode> {
+        self.engine_error_code
     }
 
     pub fn publication_terminal(&self) -> Option<&LakePublicationTerminal> {

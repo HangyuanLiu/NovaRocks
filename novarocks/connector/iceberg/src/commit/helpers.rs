@@ -106,6 +106,10 @@ impl OccSubmitError {
 /// Each retry re-stages the action against the freshly loaded base, rebuilding
 /// its target-ref requirements. Unknown submission outcomes never enter this
 /// loop; only definite catalog requirement conflicts do.
+#[expect(
+    clippy::type_complexity,
+    reason = "The callback type is the narrow table-reload validation contract for one OCC attempt."
+)]
 pub(super) async fn submit_occ_action<A>(
     catalog: &dyn Catalog,
     base: &Table,

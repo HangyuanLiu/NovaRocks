@@ -67,24 +67,6 @@ impl AbortLog {
             .push(path);
     }
 
-    /// Snapshot the exact registered artifacts without consuming cleanup
-    /// authority. Catalog-native CTAS serializes this bounded description into
-    /// its guarded abort action so a process crash cannot lose the cleanup
-    /// inputs after the catalog records `Aborted`.
-    pub(crate) fn snapshot_paths(&self) -> (Vec<String>, Vec<String>) {
-        let data = self
-            .staged_data_files
-            .lock()
-            .expect("abort log poisoned")
-            .clone();
-        let manifests = self
-            .written_manifests
-            .lock()
-            .expect("abort log poisoned")
-            .clone();
-        (data, manifests)
-    }
-
     /// Drain and return all registered data files, clearing the internal list.
     pub fn drain_data_files(&self) -> Vec<String> {
         std::mem::take(&mut *self.staged_data_files.lock().expect("abort log poisoned"))

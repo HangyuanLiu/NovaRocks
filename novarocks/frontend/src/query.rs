@@ -304,8 +304,8 @@ fn dml_statement_result(
     result.map(|()| StatementResult::Ok).map_err(|error| {
         if let Some(user_error) = error.user_error().cloned() {
             RoutedExecutionError::User(user_error)
-        } else if let Some(engine_error) = error.engine_error() {
-            RoutedExecutionError::Engine(engine_error.to_bracketed_user_message())
+        } else if let Some(engine_error_code) = error.engine_error_code() {
+            RoutedExecutionError::Engine(format!("[{}] {error}", engine_error_code.as_str()))
         } else if let Some(terminal) = error.publication_terminal().cloned() {
             RoutedExecutionError::Publication {
                 message: error.to_string(),

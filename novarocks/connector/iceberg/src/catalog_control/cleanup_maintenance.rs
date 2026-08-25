@@ -954,6 +954,10 @@ fn reconcile_frozen_batch(
         .collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Exact ref retirement keeps every provenance field explicit at the destructive boundary."
+)]
 fn execute_owned_ref(
     runtime: &IcebergControlRuntime,
     payload: &PlanPayload,
@@ -1020,6 +1024,10 @@ fn execute_owned_ref(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Exact ref observation revalidates the same immutable candidate fields as retirement."
+)]
 fn reconcile_owned_ref(
     runtime: &IcebergControlRuntime,
     payload: &PlanPayload,
