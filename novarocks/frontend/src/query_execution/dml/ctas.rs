@@ -518,6 +518,14 @@ pub enum CtasWriteOutcome {
 /// One-to-one core capability consumed by the frontend CTAS application
 /// owner. It is intentionally not a generic connector DML facade.
 pub trait CtasEngine: Send + Sync {
+    /// Standard CTAS is admissible only when its control generation can
+    /// enumerate and exactly retire warehouse-owned roots for absent targets.
+    /// The default is deliberately closed until that catalog capability is
+    /// wired end-to-end.
+    fn supports_unanchored_ctas_cleanup(&self) -> bool {
+        false
+    }
+
     /// Crash-only standard staged-create preflight.  The standard path is
     /// intentionally separate from the legacy fenced surface while T50 still
     /// compiles the historical recovery implementation.
@@ -2076,6 +2084,22 @@ impl CtasEngine for DmlExecutionKernel {
             current_database,
         )
         .map_err(internal_failure)?;
+        // A standard staged-create commit can publish a table atomically, but
+        // an absent target leaves its staging root outside every table-owned
+        // cleanup domain. Until the control generation proves a catalog-wide
+        // unanchored-root enumerator and exact cleanup capability, admitting a
+        // CTAS would create crash residue that no correct GC can discover.
+        // Reject before source planning, writer reservation, or stage-create.
+        if !self.supports_unanchored_ctas_cleanup() {
+            return Err(CtasFailure {
+                kind: CtasFailureKind::Unsupported,
+                message: format!(
+                    "standard CTAS for {}.{} is unsupported until unanchored staging-root GC is available",
+                    target.namespace, target.table
+                ),
+                user_error: None,
+            });
+        }
         let context =
             crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))
                 .map_err(internal_failure)?;
