@@ -3,8 +3,8 @@
 //! These wrappers retain the generated messages unchanged. File-system and
 //! execution-specific interpretation remains with the Backend decoder.
 
-use super::error::ContractError;
-use crate::novarocks;
+use crate::ProtocolError;
+use novarocks_proto_models::novarocks;
 
 /// A validated generated `ScanRangeParams` value.
 #[derive(Clone, Debug, PartialEq)]
@@ -13,11 +13,11 @@ pub struct ScanRangeParams {
 }
 
 impl ScanRangeParams {
-    pub fn parse(raw: novarocks::ScanRangeParams) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::ScanRangeParams) -> Result<Self, ProtocolError> {
         let range = raw
             .range
             .clone()
-            .ok_or_else(|| ContractError::invalid_value("native ScanRangeParams requires range"))?;
+            .ok_or_else(|| ProtocolError::invalid_value("native ScanRangeParams requires range"))?;
         ScanRange::parse(range)?;
         Ok(Self { raw })
     }
@@ -27,7 +27,7 @@ impl ScanRangeParams {
         volume_id: Option<i32>,
         empty: Option<bool>,
         has_more: Option<bool>,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::ScanRangeParams {
             range: Some(range.into_proto()),
             volume_id,
@@ -74,13 +74,13 @@ pub struct ScanRange {
 }
 
 impl ScanRange {
-    pub fn parse(raw: novarocks::ScanRange) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::ScanRange) -> Result<Self, ProtocolError> {
         match raw.kind.as_ref() {
             Some(novarocks::scan_range::Kind::File(file)) => {
                 FileScanRange::parse(file.clone())?;
             }
             None => {
-                return Err(ContractError::invalid_value(
+                return Err(ProtocolError::invalid_value(
                     "native ScanRange requires kind",
                 ));
             }
@@ -88,7 +88,7 @@ impl ScanRange {
         Ok(Self { raw })
     }
 
-    pub fn file(file: FileScanRange) -> Result<Self, ContractError> {
+    pub fn file(file: FileScanRange) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::ScanRange {
             kind: Some(novarocks::scan_range::Kind::File(file.into_proto())),
         })
@@ -119,9 +119,9 @@ pub struct FileScanRange {
 impl FileScanRange {
     /// Validates only wire-owned shape. Backend owns the execution-specific
     /// file-format and pruning interpretation.
-    pub fn parse(raw: novarocks::FileScanRange) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::FileScanRange) -> Result<Self, ProtocolError> {
         if raw.file_format.trim().is_empty() {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "native FileScanRange requires file_format",
             ));
         }
@@ -142,7 +142,7 @@ mod tests {
     use prost::Message;
 
     use super::{FileScanRange, ScanRange, ScanRangeParams};
-    use crate::novarocks;
+    use novarocks_proto_models::novarocks;
 
     #[test]
     fn preserves_fixed_file_scan_range_wire_bytes() {

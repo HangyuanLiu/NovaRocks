@@ -22,19 +22,15 @@ use crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot;
 use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
-use novarocks_proto::{
-    common, filter,
-    lifecycle::{
-        AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantRole,
-        ParticipantTerminalOutcome as ProtocolParticipantTerminalOutcome, QueryAbortRequest,
-        QueryControlAttach, QueryControlEndpoint, QueryExecutionId, QueryInitOutcome,
-        QueryInitRequest, QueryOptions, QueryStageOutcome, QueryStageRequest, QueryStartOutcome,
-        QueryStartRequest, QueryTerminalReportAck, QueryTerminalReportOutcome,
-        QueryTerminationReason, RuntimeFilterContribution, StageDigest, StageDigestVersion,
-        StageFragment,
-    },
-    novarocks as proto_novarocks, plan,
+use novarocks_proto::lifecycle::{
+    AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantRole,
+    ParticipantTerminalOutcome as ProtocolParticipantTerminalOutcome, QueryAbortRequest,
+    QueryControlAttach, QueryControlEndpoint, QueryExecutionId, QueryInitOutcome, QueryInitRequest,
+    QueryOptions, QueryStageOutcome, QueryStageRequest, QueryStartOutcome, QueryStartRequest,
+    QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminationReason,
+    RuntimeFilterContribution, StageDigest, StageDigestVersion, StageFragment,
 };
+use novarocks_proto_models::{common, filter, novarocks as proto_novarocks, plan};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 use prost::Message;
@@ -66,7 +62,7 @@ trait TestManifestResult {
     fn execution_id(&self) -> QueryExecutionId;
 }
 
-impl TestManifestResult for Result<ParticipantManifest, novarocks_proto::lifecycle::ContractError> {
+impl TestManifestResult for Result<ParticipantManifest, novarocks_proto::ProtocolError> {
     fn execution_id(&self) -> QueryExecutionId {
         self.as_ref()
             .expect("validated init request retains a manifest")
@@ -466,7 +462,7 @@ fn terminal_fallback_conflict_releases_bounded_delivery_record() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _control = attach_control(&registry, &request);
     registry
@@ -522,7 +518,7 @@ fn terminal_fallback_gone_releases_bounded_delivery_record() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _control = attach_control(&registry, &request);
     registry
@@ -612,7 +608,7 @@ fn query_control_attachment_requires_backend_identity_binding() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::RejectedStaleBackend
+        QueryInitOutcome::QueryInitRejectedStaleBackend
     );
     registry
         .bind_backend_identity(LOCAL_BACKEND_ID)
@@ -629,7 +625,7 @@ fn query_control_attachment_requires_backend_identity_binding() {
             .init_query(request)
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
 }
 
@@ -646,14 +642,14 @@ fn attach_reserves_p0_before_control_ready_and_releases_on_terminal_cleanup() {
             .init_query(first.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     assert_eq!(
         registry
             .init_query(second.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
 
     let mut first_attachment = attach_control(&registry, &first);
@@ -706,7 +702,7 @@ fn injected_p0_faults_reject_before_control_ready_and_leave_entry_retryable() {
                 .init_query(request.clone())
                 .outcome()
                 .expect("validated lifecycle acknowledgement"),
-            QueryInitOutcome::Applied
+            QueryInitOutcome::QueryInitApplied
         );
         registry.inject_terminal_fault_for_test(execution_id, fault);
 
@@ -769,14 +765,14 @@ fn restoration_status_counts_all_retained_execution_indexes_without_clearing_the
             .init_query(active.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     assert_eq!(
         registry
             .init_query(lifecycle_tombstone.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     registry
         .abort_query(
@@ -992,7 +988,9 @@ fn terminal_ack_from_outcome(
     let outcome = ProtocolParticipantTerminalOutcome::parse(outcome)
         .expect("registry emitted a Protocol-valid terminal outcome");
     novarocks_proto::lifecycle::QueryTerminalAck::parse(proto_novarocks::QueryControlTerminalAck {
-        execution_id: Some(outcome.execution_id().to_proto()),
+        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+            outcome.execution_id(),
+        )),
         init_digest: outcome.init_digest().as_bytes().to_vec(),
         snapshot_version: 1,
         snapshot_digest: outcome.digest().to_vec(),
@@ -1089,7 +1087,7 @@ fn stage_and_start_are_idempotent_after_control_ready() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _attachment = attach_control(&registry, &request);
     let stage = stage_request(&request, 4, &[expected[1], expected[0]]);
@@ -1138,7 +1136,7 @@ fn stage_requires_matching_manifest_exact_set_and_control_attachment() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
 
     assert_eq!(
@@ -1191,7 +1189,7 @@ fn service_only_empty_stage_starts_and_abort_prevents_late_start() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _attachment = attach_control(&registry, &request);
     let stage = stage_request(&request, 6, &[]);
@@ -1237,7 +1235,7 @@ fn stage_resource_ledger_rejects_second_staged_bundle_and_releases_on_start() {
                 .init_query(request.clone())
                 .outcome()
                 .expect("validated lifecycle acknowledgement"),
-            QueryInitOutcome::Applied
+            QueryInitOutcome::QueryInitApplied
         );
         let _attachment = attach_control(&registry, request);
     }
@@ -1282,7 +1280,7 @@ fn stage_builder_limit_is_held_until_commit_or_drop() {
                 .init_query(request.clone())
                 .outcome()
                 .expect("validated lifecycle acknowledgement"),
-            QueryInitOutcome::Applied
+            QueryInitOutcome::QueryInitApplied
         );
         let _attachment = attach_control(&registry, request);
     }
@@ -1316,14 +1314,14 @@ fn query_lifecycle_registry_same_digest_init_is_idempotent_and_installs_once() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     assert_eq!(
         registry
             .init_query(request)
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::AlreadyApplied
+        QueryInitOutcome::QueryInitAlreadyApplied
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 1);
 }
@@ -1338,7 +1336,7 @@ fn query_lifecycle_abort_digest_mismatch_keeps_live_entry_attachable() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
 
     assert_eq!(
@@ -1377,7 +1375,7 @@ fn query_lifecycle_terminal_event_survives_saturated_heartbeat_queue() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let mut attachment = attach_control(&registry, &request);
 
@@ -1419,7 +1417,7 @@ fn query_lifecycle_observations_coalesce_without_consuming_correctness_capacity(
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let mut attachment = attach_control(&registry, &request);
 
@@ -1469,7 +1467,7 @@ fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let mut attachment = attach_control(&registry, &request);
     let stage = stage_request(&request, 104, &[]);
@@ -1547,7 +1545,7 @@ fn query_lifecycle_registry_different_digest_conflicts() {
             ))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     assert_eq!(
         registry
@@ -1559,7 +1557,7 @@ fn query_lifecycle_registry_different_digest_conflicts() {
             ))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::RejectedConflict
+        QueryInitOutcome::QueryInitRejectedConflict
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 1);
 }
@@ -1579,7 +1577,7 @@ fn query_lifecycle_registry_capacity_rejects_without_install() {
             ))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     assert_eq!(
         registry
@@ -1591,7 +1589,7 @@ fn query_lifecycle_registry_capacity_rejects_without_install() {
             ))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::RejectedCapacity
+        QueryInitOutcome::QueryInitRejectedCapacity
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 1);
 }
@@ -1611,7 +1609,7 @@ fn query_lifecycle_registry_backend_epoch_mismatch_rejects() {
             ))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::RejectedStaleBackend
+        QueryInitOutcome::QueryInitRejectedStaleBackend
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 0);
 }
@@ -1635,7 +1633,7 @@ fn query_lifecycle_registry_unbound_application_identity_rejects_init() {
             ))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::RejectedStaleBackend
+        QueryInitOutcome::QueryInitRejectedStaleBackend
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 0);
 }
@@ -1663,7 +1661,7 @@ fn query_lifecycle_init_abort_race_never_publishes_initialized_and_rolls_back_on
         termination
             .accepted_reason()
             .expect("validated termination acknowledgement"),
-        QueryTerminationReason::CoordinatorAbort
+        QueryTerminationReason::QueryTerminationCoordinatorAbort
     );
     runtime.release_install();
 
@@ -1673,7 +1671,7 @@ fn query_lifecycle_init_abort_race_never_publishes_initialized_and_rolls_back_on
             .expect("init thread")
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::RejectedTerminated
+        QueryInitOutcome::QueryInitRejectedTerminated
     );
     assert_eq!(runtime.runtime_filter_abort_calls(), 1);
     assert_eq!(
@@ -1734,7 +1732,7 @@ fn query_lifecycle_admission_requires_control_ready_and_commits_exactly_once() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
 
     assert_eq!(
@@ -1773,7 +1771,7 @@ fn query_lifecycle_admission_rejects_outside_set_and_service_only_participant() 
             .init_query(fragment_request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _fragment_control = attach_control(&registry, &fragment_request);
     assert_eq!(
@@ -1791,7 +1789,7 @@ fn query_lifecycle_admission_rejects_outside_set_and_service_only_participant() 
             .init_query(service_request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _service_control = attach_control(&registry, &service_request);
     assert_eq!(
@@ -1814,7 +1812,7 @@ fn query_lifecycle_admission_dropped_permit_rolls_back_in_flight() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _control = attach_control(&registry, &request);
 
@@ -1841,7 +1839,7 @@ fn query_lifecycle_admission_commit_does_not_hold_entry_while_waiting_for_regist
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _control = attach_control(&registry, &request);
     let permit = registry
@@ -1906,7 +1904,7 @@ fn query_lifecycle_registry_abort_rejects_late_permit_commit() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _control = attach_control(&registry, &request);
     let permit = registry
@@ -1952,7 +1950,7 @@ fn fragment_failure_emits_query_local_failure() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let mut attachment = attach_control(&registry, &request);
     assert_control_ready(&mut attachment);
@@ -1979,7 +1977,7 @@ fn fragment_failure_emits_query_local_failure() {
     ));
     assert_eq!(
         registry.termination_reason(execution_id),
-        Some(QueryTerminationReason::LocalFailure)
+        Some(QueryTerminationReason::QueryTerminationLocalFailure)
     );
     assert_eq!(
         runtime
@@ -1991,7 +1989,7 @@ fn fragment_failure_emits_query_local_failure() {
         &[(
             execution_id,
             vec![expected],
-            QueryTerminationReason::LocalFailure,
+            QueryTerminationReason::QueryTerminationLocalFailure,
             "fragment execution error (pipeline): pipeline worker failed".to_string(),
         )]
     );
@@ -2011,7 +2009,7 @@ fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let mut attachment = attach_control(&registry, &request);
     assert_control_ready(&mut attachment);
@@ -2096,7 +2094,7 @@ fn terminal_p1_faults_keep_the_attestation_delivery_permit() {
                 .init_query(request.clone())
                 .outcome()
                 .expect("validated lifecycle acknowledgement"),
-            QueryInitOutcome::Applied
+            QueryInitOutcome::QueryInitApplied
         );
         let mut attachment = attach_control(&registry, &request);
         assert_control_ready(&mut attachment);
@@ -2184,7 +2182,7 @@ fn injected_p2_faults_keep_terminal_proof_and_publish_typed_unavailability() {
                 .init_query(request.clone())
                 .outcome()
                 .expect("validated lifecycle acknowledgement"),
-            QueryInitOutcome::Applied
+            QueryInitOutcome::QueryInitApplied
         );
         let mut attachment = attach_control(&registry, &request);
         assert_control_ready(&mut attachment);
@@ -2260,7 +2258,7 @@ fn injected_terminal_stream_drops_use_unary_fallback_without_losing_outcomes() {
                 .init_query(request.clone())
                 .outcome()
                 .expect("validated lifecycle acknowledgement"),
-            QueryInitOutcome::Applied
+            QueryInitOutcome::QueryInitApplied
         );
         let mut attachment = attach_control(&registry, &request);
         assert_control_ready(&mut attachment);
@@ -2336,7 +2334,7 @@ fn failure_drain_sweep_does_not_close_runtime_filter_before_terminal_capture() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _attachment = attach_control(&registry, &request);
     for fragment in [failed, pending] {
@@ -2389,7 +2387,7 @@ fn spi5b_local_failure_then_coordinator_abort_acknowledges_the_abort_command() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let mut attachment = attach_control(&registry, &request);
     assert_control_ready(&mut attachment);
@@ -2468,7 +2466,7 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
             .init_query(failed_request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let mut failed_attachment = attach_control(&registry, &failed_request);
     registry
@@ -2499,7 +2497,7 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
             .init_query(aborted_request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let mut aborted_attachment = attach_control(&registry, &aborted_request);
     registry
@@ -2531,7 +2529,7 @@ fn terminal_closeout_preserves_first_wins_termination_reason_metrics() {
             .init_query(expired_request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let mut expired_attachment = attach_control(&registry, &expired_request);
     registry
@@ -2566,7 +2564,7 @@ fn coordinator_abort_immediately_retains_incomplete_drain_proof_for_admitted_par
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let mut attachment = attach_control(&registry, &request);
     assert_control_ready(&mut attachment);
@@ -2615,7 +2613,7 @@ fn query_lifecycle_registry_rejects_fragment_executor_without_exact_set() {
             .init_query(fragment_init_request_fixture(76, &[]))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::RejectedInvalidManifest
+        QueryInitOutcome::QueryInitRejectedInvalidManifest
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 0);
 }
@@ -2630,7 +2628,7 @@ fn query_lifecycle_attach_distinguishes_duplicate_active_from_terminated() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _control = attach_control(&registry, &request);
     let attach = QueryControlAttach::new(
@@ -2678,7 +2676,7 @@ fn query_lifecycle_tombstone_capacity_evicts_only_oldest_tombstone() {
             .init_query(active.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let mut terminated = Vec::new();
     for query_low in [81, 82, 83] {
@@ -2689,7 +2687,7 @@ fn query_lifecycle_tombstone_capacity_evicts_only_oldest_tombstone() {
                 .init_query(request.clone())
                 .outcome()
                 .expect("validated lifecycle acknowledgement"),
-            QueryInitOutcome::Applied
+            QueryInitOutcome::QueryInitApplied
         );
         registry
             .abort_query(
@@ -2733,7 +2731,7 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
             .init_query(first.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _first_control = attach_control(&registry, &first);
     registry
@@ -2762,7 +2760,7 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
             .init_query(second.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     registry
         .abort_query(
@@ -2801,7 +2799,7 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
             .init_query(replacement.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _replacement_control = attach_control(&registry, &replacement);
     registry
@@ -2834,7 +2832,7 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
             .init_query(first.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _first_control = attach_control(&registry, &first);
     registry
@@ -2863,7 +2861,7 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
             .init_query(eviction.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     registry
         .abort_query(
@@ -2884,7 +2882,7 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
             .init_query(replacement.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _replacement_control = attach_control(&registry, &replacement);
     registry
@@ -2910,7 +2908,7 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
             .init_query(competing.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _competing_control = attach_control(&registry, &competing);
     assert_eq!(
@@ -2933,7 +2931,7 @@ fn query_lifecycle_tombstone_releases_active_capacity() {
             .init_query(first.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     registry
         .abort_query(
@@ -2956,7 +2954,7 @@ fn query_lifecycle_tombstone_releases_active_capacity() {
             ))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
 }
 
@@ -2979,7 +2977,7 @@ fn query_lifecycle_tombstone_retention_reclaims_expired_tombstone_incrementally(
             .init_query(terminated.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     registry
         .abort_query(
@@ -2999,7 +2997,7 @@ fn query_lifecycle_tombstone_retention_reclaims_expired_tombstone_incrementally(
             .init_query(fragment_init_request_fixture(87, &[UniqueId::new(87, 1)],))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     assert!(!registry.contains(terminated_id));
 }
@@ -3026,7 +3024,7 @@ fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
             .init_query(first.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _first_control = attach_control(&registry, &first);
     registry
@@ -3062,7 +3060,7 @@ fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
             .init_query(replacement.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _replacement_control = attach_control(&registry, &replacement);
     registry
@@ -3085,7 +3083,7 @@ fn query_lifecycle_pre_start_timeout_terminates_fragment_participant_without_acc
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _control = attach_control(&registry, &request);
 
@@ -3098,7 +3096,7 @@ fn query_lifecycle_pre_start_timeout_terminates_fragment_participant_without_acc
     );
     assert_eq!(
         registry.termination_reason(execution_id),
-        Some(QueryTerminationReason::PreStartTimeout)
+        Some(QueryTerminationReason::QueryTerminationPreStartTimeout)
     );
     assert_eq!(
         runtime
@@ -3123,7 +3121,7 @@ fn query_lifecycle_pre_start_timeout_is_disarmed_by_first_accept_and_service_con
             .init_query(fragment_request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let fragment_control = attach_control(&registry, &fragment_request);
     registry
@@ -3139,7 +3137,7 @@ fn query_lifecycle_pre_start_timeout_is_disarmed_by_first_accept_and_service_con
             .init_query(service_request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let service_control = attach_control(&registry, &service_request);
 
@@ -3176,7 +3174,7 @@ fn query_lifecycle_heartbeat_timeout_terminates_control_attached_entry() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let _control = attach_control(&registry, &request);
 
@@ -3185,7 +3183,7 @@ fn query_lifecycle_heartbeat_timeout_terminates_control_attached_entry() {
 
     assert_eq!(
         registry.termination_reason(execution_id),
-        Some(QueryTerminationReason::CoordinatorHeartbeatTimeout)
+        Some(QueryTerminationReason::QueryTerminationCoordinatorHeartbeatTimeout)
     );
     assert_eq!(registry.metrics_snapshot().heartbeat_timeouts, 1);
     assert_eq!(
@@ -3210,7 +3208,7 @@ fn query_lifecycle_registry_metrics_follow_state_rejection_and_termination() {
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let initialized = registry.metrics_snapshot();
     assert_eq!(initialized.initialized, 1);
@@ -3253,7 +3251,7 @@ fn query_lifecycle_registry_termination_is_first_wins_and_runs_local_cleanup_onc
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     let mut attachment = attach_control(&registry, &request);
 
@@ -3274,7 +3272,7 @@ fn query_lifecycle_registry_termination_is_first_wins_and_runs_local_cleanup_onc
     }
     assert_eq!(
         registry.termination_reason(execution_id),
-        Some(QueryTerminationReason::CoordinatorAbort)
+        Some(QueryTerminationReason::QueryTerminationCoordinatorAbort)
     );
     assert_eq!(
         runtime
@@ -3313,10 +3311,13 @@ fn query_lifecycle_registry_same_digest_concurrent_init_is_single_flight() {
     });
     runtime.release_install();
 
-    assert_eq!(first.join().expect("first init"), QueryInitOutcome::Applied);
+    assert_eq!(
+        first.join().expect("first init"),
+        QueryInitOutcome::QueryInitApplied
+    );
     assert_eq!(
         second.join().expect("second init"),
-        QueryInitOutcome::AlreadyApplied
+        QueryInitOutcome::QueryInitAlreadyApplied
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 1);
 }
@@ -3334,7 +3335,7 @@ fn query_lifecycle_registry_runtime_filter_install_failure_rolls_back_workspace(
             .init_query(request)
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::RejectedInvalidManifest
+        QueryInitOutcome::QueryInitRejectedInvalidManifest
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 1);
     assert_eq!(runtime.runtime_filter_abort_calls(), 0);
@@ -3347,7 +3348,7 @@ fn query_lifecycle_registry_runtime_filter_install_failure_rolls_back_workspace(
             .init_query(fragment_init_request_fixture(97, &[UniqueId::new(97, 1)],))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
 }
 
@@ -3363,7 +3364,7 @@ fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_ret
             .init_query(request.clone())
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
     runtime.fail_abort();
 
@@ -3390,7 +3391,7 @@ fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_ret
             .init_query(fragment_init_request_fixture(962, &[UniqueId::new(962, 1)],))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::RejectedCapacity
+        QueryInitOutcome::QueryInitRejectedCapacity
     );
 
     runtime.allow_abort();
@@ -3406,7 +3407,7 @@ fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_ret
             .init_query(fragment_init_request_fixture(963, &[UniqueId::new(963, 1)],))
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::Applied
+        QueryInitOutcome::QueryInitApplied
     );
 }
 
@@ -3432,7 +3433,7 @@ fn query_lifecycle_install_failure_racing_abort_preserves_first_reason_without_p
             .expect("abort is accepted")
             .accepted_reason()
             .expect("validated termination acknowledgement"),
-        QueryTerminationReason::CoordinatorAbort
+        QueryTerminationReason::QueryTerminationCoordinatorAbort
     );
     runtime.release_install();
 
@@ -3442,11 +3443,11 @@ fn query_lifecycle_install_failure_racing_abort_preserves_first_reason_without_p
             .expect("init thread")
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::RejectedInvalidManifest
+        QueryInitOutcome::QueryInitRejectedInvalidManifest
     );
     assert_eq!(
         registry.termination_reason(execution_id),
-        Some(QueryTerminationReason::CoordinatorAbort)
+        Some(QueryTerminationReason::QueryTerminationCoordinatorAbort)
     );
     assert_eq!(
         registry.phase(execution_id),
@@ -3486,7 +3487,7 @@ fn query_lifecycle_registry_abort_before_init_leaves_fail_closed_tombstone() {
             .init_query(request)
             .outcome()
             .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::RejectedTerminated
+        QueryInitOutcome::QueryInitRejectedTerminated
     );
     assert_eq!(runtime.runtime_filter_install_calls(), 0);
 }

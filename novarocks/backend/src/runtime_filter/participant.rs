@@ -2034,7 +2034,8 @@ mod tests {
     #[test]
     fn terminal_prepare_seals_one_idempotent_observation_proof() {
         let (participant, producer, _) = final_domain_participant(1024);
-        let first = participant.prepare_terminal_capture(QueryTerminationReason::LocalFailure);
+        let first = participant
+            .prepare_terminal_capture(QueryTerminationReason::QueryTerminationLocalFailure);
         assert!(
             first
                 .channels()
@@ -2054,7 +2055,8 @@ mod tests {
                 channel: late_channel,
             });
 
-        let second = participant.prepare_terminal_capture(QueryTerminationReason::LocalFailure);
+        let second = participant
+            .prepare_terminal_capture(QueryTerminationReason::QueryTerminationLocalFailure);
         assert_eq!(second, first, "terminal proof is frozen exactly once");
         assert_eq!(
             participant.capture_runtime_filter_observation(),
@@ -2078,7 +2080,8 @@ mod tests {
                 version: LogicalVersion::FIRST,
             });
 
-        let first = participant.prepare_terminal_capture(QueryTerminationReason::LocalFailure);
+        let first = participant
+            .prepare_terminal_capture(QueryTerminationReason::QueryTerminationLocalFailure);
         let channel = first
             .channels()
             .iter()
@@ -2095,7 +2098,8 @@ mod tests {
         assert_eq!(channel.completed(), 1);
         assert_eq!(channel.cancelled(), 0);
 
-        let second = participant.prepare_terminal_capture(QueryTerminationReason::LocalFailure);
+        let second = participant
+            .prepare_terminal_capture(QueryTerminationReason::QueryTerminationLocalFailure);
         assert_eq!(
             second, first,
             "repeated cancellation capture preserves the same completed proof"
@@ -2213,7 +2217,7 @@ mod tests {
         );
 
         participant
-            .close(QueryTerminationReason::LocalFailure)
+            .close(QueryTerminationReason::QueryTerminationLocalFailure)
             .expect("participant cancellation");
         let session = participant
             .session_for_fragment(execution_id(), fragment_instance, true)

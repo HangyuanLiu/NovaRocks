@@ -899,7 +899,7 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
 mod tests {
     use super::reconstruct_runtime_query_options;
     use novarocks_proto::lifecycle::QueryOptions;
-    use novarocks_proto::novarocks;
+    use novarocks_proto_models::novarocks;
 
     #[test]
     fn reconstructed_runtime_options_preserve_protocol_scalars() {

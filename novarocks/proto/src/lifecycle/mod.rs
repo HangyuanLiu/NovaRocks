@@ -3,7 +3,6 @@
 //! Modules are added incrementally as the Core parallel models are retired.
 
 pub mod control;
-pub mod error;
 pub mod identity;
 pub mod manifest;
 pub mod query_options;
@@ -17,8 +16,9 @@ pub use control::{
     QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminationAck,
     QueryTerminationReason,
 };
-pub use error::{ContractError, ContractErrorCode};
-pub use identity::{AttemptId, QueryExecutionId};
+pub use identity::{
+    AttemptId, QueryExecutionId, decode_query_execution_id, encode_query_execution_id,
+};
 pub use manifest::{
     ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,
     ParticipantManifestDigest, ParticipantRole, QueryControlEndpoint, RuntimeFilterContribution,

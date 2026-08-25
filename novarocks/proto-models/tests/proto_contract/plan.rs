@@ -17,7 +17,7 @@
 
 use prost::Message;
 
-use novarocks_proto::{common, expr, plan};
+use novarocks_proto_models::{common, expr, plan};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IPlan {

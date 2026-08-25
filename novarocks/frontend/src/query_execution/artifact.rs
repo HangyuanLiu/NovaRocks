@@ -59,8 +59,8 @@ use novarocks_proto::lifecycle::{
     AttemptId as ProtocolAttemptId, QueryExecutionId as ProtocolQueryExecutionId,
 };
 use novarocks_proto::lifecycle::{ExchangeRouteManifest, QueryExecutionId, StageFragment};
-use novarocks_proto::plan::RuntimeFilterBindingTable;
-use novarocks_proto::{common, novarocks};
+use novarocks_proto_models::plan::RuntimeFilterBindingTable;
+use novarocks_proto_models::{common, novarocks};
 use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
 use novarocks_types::SlotId;
 use novarocks_types::UniqueId;
@@ -158,7 +158,7 @@ pub struct RuntimeFilterBindingAttachment {
 /// validated schedule. Core validates only artifact/topology membership.
 pub struct RuntimeFilterDeploymentAttachment {
     artifact_id: RuntimeFilterArtifactId,
-    contributions: BTreeMap<usize, novarocks_proto::novarocks::RuntimeFilterContribution>,
+    contributions: BTreeMap<usize, novarocks_proto_models::novarocks::RuntimeFilterContribution>,
 }
 
 impl RuntimeFilterBindingAttachment {
@@ -390,7 +390,10 @@ impl ScheduleBoundDistributedQuery {
     pub fn seal_runtime_filter_deployment(
         &self,
         contributions: impl IntoIterator<
-            Item = (usize, novarocks_proto::novarocks::RuntimeFilterContribution),
+            Item = (
+                usize,
+                novarocks_proto_models::novarocks::RuntimeFilterContribution,
+            ),
         >,
     ) -> Result<RuntimeFilterDeploymentAttachment, DistributedQueryError> {
         self.runtime_filter_scheduled_view().seal(contributions)
@@ -496,8 +499,8 @@ impl<'a> RuntimeFilterScheduledView<'a> {
         self.execution_id
     }
 
-    pub fn query_id_wire(self) -> novarocks_proto::common::UniqueId {
-        novarocks_proto::common::UniqueId {
+    pub fn query_id_wire(self) -> novarocks_proto_models::common::UniqueId {
+        novarocks_proto_models::common::UniqueId {
             hi: self.execution_id.query_id().high(),
             lo: self.execution_id.query_id().low(),
         }
@@ -537,7 +540,10 @@ impl<'a> RuntimeFilterScheduledView<'a> {
     pub fn seal(
         self,
         contributions: impl IntoIterator<
-            Item = (usize, novarocks_proto::novarocks::RuntimeFilterContribution),
+            Item = (
+                usize,
+                novarocks_proto_models::novarocks::RuntimeFilterContribution,
+            ),
         >,
     ) -> Result<RuntimeFilterDeploymentAttachment, DistributedQueryError> {
         let mut by_backend = BTreeMap::new();
@@ -601,7 +607,7 @@ pub struct RuntimeFilterDeploymentReadyDistributedQuery {
     schedule: ValidatedFragmentSchedule,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
     runtime_filter_contributions:
-        BTreeMap<usize, novarocks_proto::novarocks::RuntimeFilterContribution>,
+        BTreeMap<usize, novarocks_proto_models::novarocks::RuntimeFilterContribution>,
 }
 
 impl RuntimeFilterDeploymentReadyDistributedQuery {
@@ -1438,8 +1444,8 @@ pub struct ValidatedNativeSubmission {
     backend_idx: usize,
     finst_id: UniqueId,
     execution_id: QueryExecutionId,
-    plan: novarocks_proto::plan::PlanFragment,
-    instance_params: novarocks_proto::novarocks::InstanceParams,
+    plan: novarocks_proto_models::plan::PlanFragment,
+    instance_params: novarocks_proto_models::novarocks::InstanceParams,
 }
 
 impl ValidatedNativeSubmission {
@@ -1447,8 +1453,8 @@ impl ValidatedNativeSubmission {
         backend_idx: usize,
         fragment_instance_id: UniqueId,
         execution_id: QueryExecutionId,
-        plan: novarocks_proto::plan::PlanFragment,
-        instance_params: novarocks_proto::novarocks::InstanceParams,
+        plan: novarocks_proto_models::plan::PlanFragment,
+        instance_params: novarocks_proto_models::novarocks::InstanceParams,
     ) -> Self {
         Self {
             backend_idx,
@@ -2008,7 +2014,7 @@ mod tests {
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_proto::lifecycle::{AttemptId, ExchangeRouteManifest, QueryExecutionId};
-    use novarocks_proto::{common, novarocks};
+    use novarocks_proto_models::{common, novarocks};
     use novarocks_sql::plan_read::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };

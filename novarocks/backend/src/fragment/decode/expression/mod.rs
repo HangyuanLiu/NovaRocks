@@ -24,7 +24,7 @@ use super::type_decode::{decode_field_type, decode_type};
 use novarocks_execution::exec::chunk::ChunkFieldSchema;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_proto::FieldPath;
-use novarocks_proto::expr;
+use novarocks_proto_models::expr;
 use novarocks_types::SlotId;
 
 mod binary;
@@ -634,7 +634,7 @@ pub(crate) mod tests {
     use novarocks_execution::exec::expr::{
         ExprArena, ExprNode, LiteralValue, function::FunctionKind,
     };
-    use novarocks_proto::{common, expr};
+    use novarocks_proto_models::{common, expr};
     use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
 

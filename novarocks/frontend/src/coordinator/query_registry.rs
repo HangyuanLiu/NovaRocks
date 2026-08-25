@@ -827,7 +827,7 @@ mod tests {
     use novarocks_proto::lifecycle::{
         AttemptId, ParticipantTerminalOutcome, QueryTerminalSnapshot, TerminalizationProof,
     };
-    use novarocks_proto::{common, novarocks as proto};
+    use novarocks_proto_models::{common, novarocks as proto};
 
     struct RetainedControl {
         execution_id: QueryExecutionId,
@@ -895,7 +895,9 @@ mod tests {
         };
         let snapshot = QueryTerminalSnapshot::seal(proto::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(execution_id.into()),
+            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+                execution_id,
+            )),
             backend: Some(backend.clone()),
             init_digest: vec![3; 32],
             fragments: vec![fragment],
@@ -914,7 +916,9 @@ mod tests {
         .expect("terminal snapshot");
         let proof = TerminalizationProof::seal(proto::TerminalizationProof {
             version: 1,
-            execution_id: Some(execution_id.into()),
+            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+                execution_id,
+            )),
             backend: Some(backend),
             init_digest: vec![3; 32],
             fragments: vec![proto::TerminalizationProofFragment {

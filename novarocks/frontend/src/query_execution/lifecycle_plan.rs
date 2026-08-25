@@ -26,13 +26,13 @@ use crate::query_execution::contract::{
 use crate::query_execution::schedule::FragmentLifecycleProjection;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_proto::common;
 use novarocks_proto::lifecycle::{
     ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest, ParticipantRole,
     QueryControlEndpoint, QueryExecutionId, QueryOptions as ProtocolQueryOptions,
     RuntimeFilterContribution,
 };
-use novarocks_proto::novarocks;
+use novarocks_proto_models::common;
+use novarocks_proto_models::novarocks;
 
 use crate::query_execution::launch::StageParticipantBinding;
 use crate::query_execution::terminal_set::QueryTerminalSet;
@@ -73,9 +73,7 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
 }
 
-fn protocol_contract_error(
-    error: novarocks_proto::lifecycle::ContractError,
-) -> DistributedQueryError {
+fn protocol_contract_error(error: novarocks_proto::ProtocolError) -> DistributedQueryError {
     contract_error(error.to_string())
 }
 
@@ -580,7 +578,9 @@ pub(crate) fn compile_query_init_plan(
             roles.insert(ParticipantRole::RuntimeFilterService);
         }
         let manifest = ParticipantManifest::parse(novarocks::ParticipantManifest {
-            execution_id: Some(options.execution_id.to_proto()),
+            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+                options.execution_id,
+            )),
             backend: Some(backend.as_proto().clone()),
             participant_roles: roles.into_iter().map(i32::from).collect(),
             expected_fragment_instance_ids: expected_instances
@@ -632,7 +632,7 @@ mod tests {
     use novarocks_proto::lifecycle::{
         AttemptId, ParticipantRole, QueryExecutionId, QueryOptions, RuntimeFilterContribution,
     };
-    use novarocks_proto::novarocks;
+    use novarocks_proto_models::novarocks;
     use novarocks_types::UniqueId;
 
     fn execution_id() -> QueryExecutionId {

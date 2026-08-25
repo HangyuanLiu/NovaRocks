@@ -194,11 +194,11 @@ mod request_context_tests {
     #[test]
     fn protocol_query_timeout_preserves_connector_deadline_defaults() {
         let unset = novarocks_proto::lifecycle::QueryOptions::parse(
-            novarocks_proto::novarocks::QueryOptions::default(),
+            novarocks_proto_models::novarocks::QueryOptions::default(),
         )
         .expect("default protocol query options are valid");
         let configured = novarocks_proto::lifecycle::QueryOptions::parse(
-            novarocks_proto::novarocks::QueryOptions {
+            novarocks_proto_models::novarocks::QueryOptions {
                 query_timeout: 17,
                 ..Default::default()
             },

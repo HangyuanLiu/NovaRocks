@@ -29,7 +29,7 @@ use crate::fragment::decode::type_decode::{decode_field_type, decode_type};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_proto::{FieldPath, ProtocolErrorKind};
-use novarocks_proto::{common, plan};
+use novarocks_proto_models::{common, plan};
 use novarocks_types::SlotId;
 
 #[derive(Clone, Debug)]

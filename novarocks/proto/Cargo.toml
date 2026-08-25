@@ -2,7 +2,6 @@
 name = "novarocks-proto"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 
 [lib]
 doctest = false
@@ -13,7 +12,5 @@ prost = "0.13"
 prost-reflect = "0.14"
 sha2 = "0.10"
 novarocks-types = { path = "../types" }
-
-[build-dependencies]
-prost-build = "0.13"
-protoc-bin-vendored = "3"
+novarocks-proto-models = { path = "../proto-models" }
+novarocks-spi = { path = "../spi" }

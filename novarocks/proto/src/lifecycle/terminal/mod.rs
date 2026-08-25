@@ -6,11 +6,11 @@
 
 use std::collections::BTreeSet;
 
-use crate::{canonical, common, novarocks};
+use crate::{ProtocolError, canonical};
+use novarocks_proto_models::{common, novarocks};
 
 use super::{
-    error::ContractError,
-    identity::QueryExecutionId,
+    identity::{QueryExecutionId, decode_query_execution_id},
     manifest::{ParticipantBackendIdentity, ParticipantManifestDigest},
 };
 
@@ -34,7 +34,7 @@ pub struct QueryTerminalSnapshot {
 }
 
 impl QueryTerminalSnapshot {
-    pub fn parse(raw: novarocks::QueryTerminalSnapshot) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::QueryTerminalSnapshot) -> Result<Self, ProtocolError> {
         validate_snapshot(&raw)?;
         verify_digest("novarocks.QueryTerminalSnapshot", &raw.digest, || {
             let mut projected = raw.clone();
@@ -49,7 +49,7 @@ impl QueryTerminalSnapshot {
     }
 
     /// Validates, computes, and installs the canonical snapshot digest.
-    pub fn seal(mut raw: novarocks::QueryTerminalSnapshot) -> Result<Self, ContractError> {
+    pub fn seal(mut raw: novarocks::QueryTerminalSnapshot) -> Result<Self, ProtocolError> {
         raw.fragments.sort_by_key(fragment_key);
         raw.digest = vec![0; 32];
         validate_snapshot(&raw)?;
@@ -120,7 +120,7 @@ pub struct TerminalizationProof {
 }
 
 impl TerminalizationProof {
-    pub fn parse(raw: novarocks::TerminalizationProof) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::TerminalizationProof) -> Result<Self, ProtocolError> {
         validate_proof(&raw)?;
         verify_digest("novarocks.TerminalizationProof", &raw.digest, || {
             let mut projected = raw.clone();
@@ -130,7 +130,7 @@ impl TerminalizationProof {
         Ok(Self { raw })
     }
 
-    pub fn seal(mut raw: novarocks::TerminalizationProof) -> Result<Self, ContractError> {
+    pub fn seal(mut raw: novarocks::TerminalizationProof) -> Result<Self, ProtocolError> {
         raw.fragments.sort_by_key(proof_fragment_key);
         raw.digest = vec![0; 32];
         validate_proof(&raw)?;
@@ -185,7 +185,7 @@ pub struct NegativeAttestation {
 }
 
 impl NegativeAttestation {
-    pub fn parse(raw: novarocks::NegativeAttestation) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::NegativeAttestation) -> Result<Self, ProtocolError> {
         validate_attestation(&raw)?;
         verify_digest("novarocks.NegativeAttestation", &raw.digest, || {
             let mut projected = raw.clone();
@@ -199,7 +199,7 @@ impl NegativeAttestation {
         Ok(Self { raw })
     }
 
-    pub fn seal(mut raw: novarocks::NegativeAttestation) -> Result<Self, ContractError> {
+    pub fn seal(mut raw: novarocks::NegativeAttestation) -> Result<Self, ProtocolError> {
         bound_detail(&mut raw.detail, &mut raw.detail_truncated);
         raw.digest = vec![0; 32];
         validate_attestation(&raw)?;
@@ -260,15 +260,15 @@ pub struct ParticipantTerminalOutcome {
 }
 
 impl ParticipantTerminalOutcome {
-    pub fn parse(raw: novarocks::ParticipantTerminalOutcome) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::ParticipantTerminalOutcome) -> Result<Self, ProtocolError> {
         match raw.outcome.as_ref().ok_or_else(|| {
-            ContractError::invalid_value("participant terminal outcome variant is required")
+            ProtocolError::invalid_value("participant terminal outcome variant is required")
         })? {
             novarocks::participant_terminal_outcome::Outcome::Proof(proof) => {
                 let proof = TerminalizationProof::parse(proof.clone())?;
                 let snapshot =
                     QueryTerminalSnapshot::parse(raw.snapshot.clone().ok_or_else(|| {
-                        ContractError::invalid_value(
+                        ProtocolError::invalid_value(
                             "participant terminal proof requires its immutable snapshot",
                         )
                     })?)?;
@@ -276,7 +276,7 @@ impl ParticipantTerminalOutcome {
             }
             novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(attestation) => {
                 if raw.snapshot.is_some() {
-                    return Err(ContractError::invalid_value(
+                    return Err(ProtocolError::invalid_value(
                         "negative attestation must not carry a terminal snapshot",
                     ));
                 }
@@ -406,7 +406,7 @@ pub struct FragmentTerminalOutcome {
 }
 
 impl FragmentTerminalOutcome {
-    pub fn parse(raw: novarocks::TerminalizationProofFragment) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::TerminalizationProofFragment) -> Result<Self, ProtocolError> {
         validate_proof_fragment(&raw)?;
         Ok(Self { raw })
     }
@@ -454,14 +454,14 @@ pub struct FragmentTerminalSnapshot {
 }
 
 impl FragmentTerminalSnapshot {
-    pub fn parse(raw: novarocks::QueryTerminalFragmentSnapshot) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::QueryTerminalFragmentSnapshot) -> Result<Self, ProtocolError> {
         validate_fragment_snapshot(&raw)?;
         Ok(Self { raw })
     }
 
     /// Bounds UTF-8 diagnostics before validation while preserving the explicit
     /// `error_detail_truncated` P0 indicator.
-    pub fn seal(mut raw: novarocks::QueryTerminalFragmentSnapshot) -> Result<Self, ContractError> {
+    pub fn seal(mut raw: novarocks::QueryTerminalFragmentSnapshot) -> Result<Self, ProtocolError> {
         bound_fragment_diagnostics(&mut raw);
         Self::parse(raw)
     }
@@ -520,7 +520,7 @@ pub struct QueryTerminalProfileContributionV1 {
 impl QueryTerminalProfileContributionV1 {
     pub fn parse(
         raw: novarocks::QueryTerminalProfileContributionV1,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         validate_profile_contribution(&raw)?;
         Ok(Self { raw })
     }
@@ -528,7 +528,7 @@ impl QueryTerminalProfileContributionV1 {
     /// Establishes the wire's required key ordering before validation.
     pub fn seal(
         mut raw: novarocks::QueryTerminalProfileContributionV1,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         raw.channels.sort_by_key(channel_key);
         raw.producer_streams.sort_by_key(producer_stream_key);
         raw.transport_routes.sort_by_key(transport_route_key);
@@ -570,7 +570,7 @@ pub struct TerminalTelemetryUnavailable {
 }
 
 impl TerminalTelemetryUnavailable {
-    pub fn parse(raw: novarocks::TerminalTelemetryUnavailable) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::TerminalTelemetryUnavailable) -> Result<Self, ProtocolError> {
         validate_unavailable(&raw)?;
         Ok(Self { raw })
     }
@@ -595,7 +595,7 @@ pub struct FragmentTerminalProfileTelemetry {
 }
 
 impl FragmentTerminalProfileTelemetry {
-    pub fn parse(raw: novarocks::FragmentTerminalProfileTelemetry) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::FragmentTerminalProfileTelemetry) -> Result<Self, ProtocolError> {
         validate_fragment_profile_telemetry(&raw)?;
         Ok(Self { raw })
     }
@@ -635,7 +635,7 @@ pub struct QueryTerminalProfileContributionTelemetry {
 impl QueryTerminalProfileContributionTelemetry {
     pub fn parse(
         raw: novarocks::QueryTerminalProfileContributionTelemetry,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         validate_profile_contribution_telemetry(&raw)?;
         Ok(Self { raw })
     }
@@ -676,13 +676,13 @@ impl QueryTerminalProfileContributionTelemetry {
 /// dependency while retaining the former reservation calculation.
 pub fn p0_max_encoded_len(
     manifest: &novarocks::ParticipantManifest,
-) -> Result<usize, ContractError> {
+) -> Result<usize, ProtocolError> {
     let backend = manifest
         .backend
         .as_ref()
-        .ok_or_else(|| ContractError::invalid_value("terminal reservation backend is required"))?;
+        .ok_or_else(|| ProtocolError::invalid_value("terminal reservation backend is required"))?;
     validate_backend(backend)?;
-    let fixed_header = 4
+    let fixed_header: usize = 4
         + 8
         + 8
         + 8
@@ -732,9 +732,9 @@ pub fn p0_max_encoded_len(
     Ok(proof_max.max(attestation_max))
 }
 
-fn validate_snapshot(raw: &novarocks::QueryTerminalSnapshot) -> Result<(), ContractError> {
+fn validate_snapshot(raw: &novarocks::QueryTerminalSnapshot) -> Result<(), ProtocolError> {
     if raw.version != QUERY_TERMINAL_SNAPSHOT_VERSION_V1 {
-        return Err(ContractError::version_mismatch(
+        return Err(ProtocolError::version_mismatch(
             "unsupported query terminal snapshot version",
         ));
     }
@@ -745,7 +745,7 @@ fn validate_snapshot(raw: &novarocks::QueryTerminalSnapshot) -> Result<(), Contr
     validate_backend(
         raw.backend
             .as_ref()
-            .ok_or_else(|| ContractError::invalid_value("terminal backend identity is required"))?,
+            .ok_or_else(|| ProtocolError::invalid_value("terminal backend identity is required"))?,
     )?;
     require_digest_len(
         &raw.init_digest,
@@ -764,7 +764,7 @@ fn validate_snapshot(raw: &novarocks::QueryTerminalSnapshot) -> Result<(), Contr
         validate_fragment_snapshot(fragment)?;
     }
     validate_profile_contribution_telemetry(raw.profile_contribution.as_ref().ok_or_else(|| {
-        ContractError::invalid_value("query terminal profile contribution telemetry is required")
+        ProtocolError::invalid_value("query terminal profile contribution telemetry is required")
     })?)
 }
 
@@ -782,9 +782,9 @@ fn proof_fragment_key(value: &novarocks::TerminalizationProofFragment) -> (i64, 
         .map_or((i64::MIN, i64::MIN), |id| (id.hi, id.lo))
 }
 
-fn validate_proof(raw: &novarocks::TerminalizationProof) -> Result<(), ContractError> {
+fn validate_proof(raw: &novarocks::TerminalizationProof) -> Result<(), ProtocolError> {
     if raw.version != TERMINALIZATION_PROOF_VERSION_V1 {
-        return Err(ContractError::version_mismatch(
+        return Err(ProtocolError::version_mismatch(
             "unsupported terminalization proof version",
         ));
     }
@@ -793,7 +793,7 @@ fn validate_proof(raw: &novarocks::TerminalizationProof) -> Result<(), ContractE
         "terminalization proof execution id is required",
     )?;
     validate_backend(raw.backend.as_ref().ok_or_else(|| {
-        ContractError::invalid_value("terminalization proof backend is required")
+        ProtocolError::invalid_value("terminalization proof backend is required")
     })?)?;
     require_digest_len(
         &raw.init_digest,
@@ -814,13 +814,13 @@ fn validate_proof(raw: &novarocks::TerminalizationProof) -> Result<(), ContractE
     Ok(())
 }
 
-fn validate_attestation(raw: &novarocks::NegativeAttestation) -> Result<(), ContractError> {
+fn validate_attestation(raw: &novarocks::NegativeAttestation) -> Result<(), ProtocolError> {
     validate_execution(
         raw.execution_id.as_ref(),
         "negative attestation execution id is required",
     )?;
     validate_backend(raw.backend.as_ref().ok_or_else(|| {
-        ContractError::invalid_value("negative attestation backend is required")
+        ProtocolError::invalid_value("negative attestation backend is required")
     })?)?;
     require_digest_len(
         &raw.init_digest,
@@ -840,14 +840,14 @@ fn validate_attestation(raw: &novarocks::NegativeAttestation) -> Result<(), Cont
 
 fn validate_fragment_snapshot(
     raw: &novarocks::QueryTerminalFragmentSnapshot,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     validate_nonzero_id(
         raw.fragment_instance_id.as_ref(),
         "terminal fragment instance id is required",
         "terminal fragment instance id must be nonzero",
     )?;
     if raw.backend_num < 0 {
-        return Err(ContractError::invalid_value(
+        return Err(ProtocolError::invalid_value(
             "terminal fragment backend number must be nonnegative",
         ));
     }
@@ -863,15 +863,15 @@ fn validate_fragment_snapshot(
         "terminal fragment outcome detail exceeds the byte limit",
     )?;
     if raw.load_stats.is_none() {
-        return Err(ContractError::invalid_value(
+        return Err(ProtocolError::invalid_value(
             "terminal fragment load stats are required",
         ));
     }
     validate_fragment_profile_telemetry(raw.profile.as_ref().ok_or_else(|| {
-        ContractError::invalid_value("terminal fragment profile telemetry is required")
+        ProtocolError::invalid_value("terminal fragment profile telemetry is required")
     })?)?;
     if raw.statistics_payload.len() > QUERY_TERMINAL_STATISTICS_PAYLOAD_MAX_BYTES {
-        return Err(ContractError::capacity(
+        return Err(ProtocolError::capacity(
             "terminal fragment statistics payload exceeds the connector statistics limit",
         ));
     }
@@ -880,14 +880,14 @@ fn validate_fragment_snapshot(
 
 fn validate_proof_fragment(
     raw: &novarocks::TerminalizationProofFragment,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     validate_nonzero_id(
         raw.fragment_instance_id.as_ref(),
         "terminalization proof fragment instance id is required",
         "terminalization proof fragment instance id must be nonzero",
     )?;
     if raw.backend_num < 0 {
-        return Err(ContractError::invalid_value(
+        return Err(ProtocolError::invalid_value(
             "terminalization proof fragment backend number must be nonnegative",
         ));
     }
@@ -904,7 +904,7 @@ fn validate_proof_fragment(
     )
 }
 
-fn validate_fragment_outcome(outcome: i32, code: &str, _detail: &str) -> Result<(), ContractError> {
+fn validate_fragment_outcome(outcome: i32, code: &str, _detail: &str) -> Result<(), ProtocolError> {
     match novarocks::QueryTerminalFragmentOutcome::try_from(outcome) {
         Ok(novarocks::QueryTerminalFragmentOutcome::Succeeded)
         | Ok(novarocks::QueryTerminalFragmentOutcome::Cancelled)
@@ -912,7 +912,7 @@ fn validate_fragment_outcome(outcome: i32, code: &str, _detail: &str) -> Result<
         Ok(novarocks::QueryTerminalFragmentOutcome::Failed) if !code.trim().is_empty() => Ok(()),
         Ok(novarocks::QueryTerminalFragmentOutcome::Failed)
         | Ok(novarocks::QueryTerminalFragmentOutcome::Unspecified)
-        | Err(_) => Err(ContractError::invalid_value(
+        | Err(_) => Err(ProtocolError::invalid_value(
             "invalid terminal fragment outcome",
         )),
     }
@@ -920,12 +920,12 @@ fn validate_fragment_outcome(outcome: i32, code: &str, _detail: &str) -> Result<
 
 fn validate_profile_contribution_telemetry(
     raw: &novarocks::QueryTerminalProfileContributionTelemetry,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     use novarocks::query_terminal_profile_contribution_telemetry::Telemetry;
     match raw.telemetry.as_ref() {
         Some(Telemetry::Available(value)) => validate_profile_contribution(value),
         Some(Telemetry::Unavailable(reason)) => validate_unavailable(reason),
-        None => Err(ContractError::invalid_value(
+        None => Err(ProtocolError::invalid_value(
             "query terminal profile contribution telemetry is required",
         )),
     }
@@ -933,12 +933,12 @@ fn validate_profile_contribution_telemetry(
 
 fn validate_fragment_profile_telemetry(
     raw: &novarocks::FragmentTerminalProfileTelemetry,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     use novarocks::fragment_terminal_profile_telemetry::Telemetry;
     match raw.telemetry.as_ref() {
         Some(Telemetry::Available(profile)) => validate_runtime_profile(profile),
         Some(Telemetry::Unavailable(reason)) => validate_unavailable(reason),
-        None => Err(ContractError::invalid_value(
+        None => Err(ProtocolError::invalid_value(
             "terminal fragment profile telemetry is required",
         )),
     }
@@ -946,28 +946,28 @@ fn validate_fragment_profile_telemetry(
 
 fn validate_unavailable(
     raw: &novarocks::TerminalTelemetryUnavailable,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     if raw.stage.trim().is_empty() || raw.code.trim().is_empty() {
-        return Err(ContractError::invalid_value(
+        return Err(ProtocolError::invalid_value(
             "terminal telemetry unavailable stage and code must be nonempty",
         ));
     }
     Ok(())
 }
 
-fn validate_runtime_profile(raw: &novarocks::RuntimeProfileTree) -> Result<(), ContractError> {
+fn validate_runtime_profile(raw: &novarocks::RuntimeProfileTree) -> Result<(), ProtocolError> {
     let root = raw
         .root
         .as_ref()
-        .ok_or_else(|| ContractError::invalid_value("RuntimeProfileTree missing root"))?;
+        .ok_or_else(|| ProtocolError::invalid_value("RuntimeProfileTree missing root"))?;
     validate_profile_node(root)
 }
 
-fn validate_profile_node(raw: &novarocks::ProfileNode) -> Result<(), ContractError> {
+fn validate_profile_node(raw: &novarocks::ProfileNode) -> Result<(), ProtocolError> {
     for counter in &raw.counters {
         match novarocks::ProfileUnit::try_from(counter.unit) {
             Ok(novarocks::ProfileUnit::Unspecified) | Err(_) => {
-                return Err(ContractError::invalid_value(
+                return Err(ProtocolError::invalid_value(
                     "invalid ProfileUnit in native runtime profile",
                 ));
             }
@@ -982,9 +982,9 @@ fn validate_profile_node(raw: &novarocks::ProfileNode) -> Result<(), ContractErr
 
 fn validate_profile_contribution(
     raw: &novarocks::QueryTerminalProfileContributionV1,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     if raw.version != QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1 {
-        return Err(ContractError::version_mismatch(
+        return Err(ProtocolError::version_mismatch(
             "unsupported query terminal profile contribution version",
         ));
     }
@@ -995,7 +995,7 @@ fn validate_profile_contribution(
         ("consumer", raw.consumers.len()),
     ] {
         if len > QUERY_TERMINAL_PROFILE_SECTION_MAX_ENTRIES {
-            return Err(ContractError::capacity(format!(
+            return Err(ProtocolError::capacity(format!(
                 "terminal runtime-filter {label} section exceeds the cardinality limit"
             )));
         }
@@ -1008,7 +1008,7 @@ fn validate_profile_contribution(
 
 fn validate_channels(
     values: &[novarocks::QueryTerminalRuntimeFilterChannelV1],
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     let mut previous = None;
     for value in values {
         let key = (value.channel_binding_id, value.channel_id);
@@ -1026,7 +1026,7 @@ fn validate_channels(
             | Ok(novarocks::QueryTerminalRuntimeFilterChannelTerminalStateV1::Unavailable)
             | Ok(novarocks::QueryTerminalRuntimeFilterChannelTerminalStateV1::Cancelled) => {}
             _ => {
-                return Err(ContractError::invalid_value(
+                return Err(ProtocolError::invalid_value(
                     "invalid terminal runtime-filter channel terminal state",
                 ));
             }
@@ -1036,7 +1036,7 @@ fn validate_channels(
             "terminal runtime-filter latest published logical version must be nonzero",
         )?;
         if (value.published_count == 0) != value.latest_published_logical_version.is_none() {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "terminal runtime-filter published count and latest version disagree",
             ));
         }
@@ -1063,7 +1063,7 @@ fn validate_channels(
             _ => false,
         };
         if !valid {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "terminal runtime-filter channel state and terminal counters disagree",
             ));
         }
@@ -1122,7 +1122,7 @@ fn consumer_key(
 fn validate_producer_streams(
     values: &[novarocks::QueryTerminalRuntimeFilterProducerStreamV1],
     channels: &[novarocks::QueryTerminalRuntimeFilterChannelV1],
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     let known = channel_keys(channels);
     let mut previous = None;
     for value in values {
@@ -1132,7 +1132,7 @@ fn validate_producer_streams(
             .producer_fragment_instance_id
             .as_ref()
             .ok_or_else(|| {
-                ContractError::invalid_value(
+                ProtocolError::invalid_value(
                     "terminal runtime-filter producer fragment instance id is required",
                 )
             })?;
@@ -1141,7 +1141,7 @@ fn validate_producer_streams(
             "terminal runtime-filter producer fragment instance id must be nonzero",
         )?;
         if (value.accepted_count == 0) != value.latest_accepted_sequence.is_none() {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "terminal runtime-filter accepted count and latest sequence disagree",
             ));
         }
@@ -1167,14 +1167,14 @@ fn validate_producer_streams(
 fn validate_transport_routes(
     values: &[novarocks::QueryTerminalRuntimeFilterTransportRouteV1],
     channels: &[novarocks::QueryTerminalRuntimeFilterChannelV1],
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     let known = channel_keys(channels);
     let mut previous = None;
     for value in values {
         let channel = (value.channel_binding_id, value.channel_id);
         validate_channel_reference(channel, &known)?;
         if value.route_edge_id == 0 {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "terminal runtime-filter route edge id must be nonzero",
             ));
         }
@@ -1182,7 +1182,7 @@ fn validate_transport_routes(
             .sent_count
             .checked_add(value.retried_count)
             .ok_or_else(|| {
-                ContractError::invalid_value(
+                ProtocolError::invalid_value(
                     "terminal runtime-filter transport delivery counter overflow",
                 )
             })?;
@@ -1190,12 +1190,12 @@ fn validate_transport_routes(
             .sent_bytes
             .checked_add(value.retried_bytes)
             .ok_or_else(|| {
-                ContractError::invalid_value(
+                ProtocolError::invalid_value(
                     "terminal runtime-filter transport delivery bytes overflow",
                 )
             })?;
         if value.acked_count > delivery_count || value.acked_bytes > delivery_bytes {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "terminal runtime-filter transport acknowledgement exceeds delivery totals",
             ));
         }
@@ -1211,19 +1211,19 @@ fn validate_transport_routes(
 fn validate_consumers(
     values: &[novarocks::QueryTerminalRuntimeFilterConsumerV1],
     channels: &[novarocks::QueryTerminalRuntimeFilterChannelV1],
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     let known = channel_keys(channels);
     let mut previous = None;
     for value in values {
         let channel = (value.channel_binding_id, value.channel_id);
         validate_channel_reference(channel, &known)?;
         if value.consumer_binding_id == 0 {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "terminal runtime-filter consumer binding id must be nonzero",
             ));
         }
         let id = value.fragment_instance_id.as_ref().ok_or_else(|| {
-            ContractError::invalid_value(
+            ProtocolError::invalid_value(
                 "terminal runtime-filter consumer fragment instance id is required",
             )
         })?;
@@ -1241,12 +1241,12 @@ fn validate_consumers(
         )?;
         if let Some(applied) = value.latest_applied_logical_version {
             let delivered = value.latest_delivered_logical_version.ok_or_else(|| {
-                ContractError::invalid_value(
+                ProtocolError::invalid_value(
                     "terminal runtime-filter applied version requires a delivered version",
                 )
             })?;
             if applied > delivered {
-                return Err(ContractError::invalid_value(
+                return Err(ProtocolError::invalid_value(
                     "terminal runtime-filter applied version exceeds delivered version",
                 ));
             }
@@ -1260,12 +1260,12 @@ fn validate_consumers(
             | Ok(novarocks::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Cancelled)
             | Ok(novarocks::QueryTerminalRuntimeFilterSubscriptionTerminalV1::Completed)
             | Ok(novarocks::QueryTerminalRuntimeFilterSubscriptionTerminalV1::CompletedWithoutArtifact) => {}
-            _ => return Err(ContractError::invalid_value("invalid terminal runtime-filter subscription terminal state")),
+            _ => return Err(ProtocolError::invalid_value("invalid terminal runtime-filter subscription terminal state")),
         }
         if value.output_rows > value.input_rows
             || (value.row_evaluations == 0 && (value.input_rows != 0 || value.output_rows != 0))
         {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "terminal runtime-filter row counters are inconsistent",
             ));
         }
@@ -1273,12 +1273,12 @@ fn validate_consumers(
             .scan_kept
             .checked_add(value.scan_pruned)
             .ok_or_else(|| {
-                ContractError::invalid_value(
+                ProtocolError::invalid_value(
                     "terminal runtime-filter scan evaluated counters overflow",
                 )
             })?;
         let reasons = value.scan_not_evaluated_reasons.as_ref().ok_or_else(|| {
-            ContractError::invalid_value(
+            ProtocolError::invalid_value(
                 "terminal runtime-filter scan not-evaluated counters are required",
             )
         })?;
@@ -1297,7 +1297,7 @@ fn validate_consumers(
                 "terminal runtime-filter scan not-evaluated counters overflow",
             )? != value.scan_not_evaluated
         {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "terminal runtime-filter scan counters are inconsistent",
             ));
         }
@@ -1313,17 +1313,17 @@ fn validate_consumers(
 fn verify_proof_matches_snapshot(
     proof: &novarocks::TerminalizationProof,
     snapshot: &novarocks::QueryTerminalSnapshot,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     if proof.execution_id != snapshot.execution_id
         || proof.backend != snapshot.backend
         || proof.init_digest != snapshot.init_digest
     {
-        return Err(ContractError::conflict(
+        return Err(ProtocolError::conflict(
             "terminalization proof does not match the immutable terminal snapshot",
         ));
     }
     if proof.fragments.len() != snapshot.fragments.len() {
-        return Err(ContractError::conflict(
+        return Err(ProtocolError::conflict(
             "terminalization proof does not match the immutable terminal snapshot",
         ));
     }
@@ -1335,7 +1335,7 @@ fn verify_proof_matches_snapshot(
             || proof_fragment.error_detail != snapshot_fragment.error_detail
             || proof_fragment.error_detail_truncated != snapshot_fragment.error_detail_truncated
         {
-            return Err(ContractError::conflict(
+            return Err(ProtocolError::conflict(
                 "terminalization proof does not match the immutable terminal snapshot",
             ));
         }
@@ -1346,34 +1346,34 @@ fn verify_proof_matches_snapshot(
 fn validate_execution(
     raw: Option<&novarocks::QueryExecutionId>,
     required: &'static str,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     required_execution_id(raw, required).map(|_| ())
 }
 
 fn required_execution_id(
     raw: Option<&novarocks::QueryExecutionId>,
     required: &'static str,
-) -> Result<QueryExecutionId, ContractError> {
-    QueryExecutionId::try_from_proto(raw.ok_or_else(|| ContractError::invalid_value(required))?)
+) -> Result<QueryExecutionId, ProtocolError> {
+    decode_query_execution_id(raw.ok_or_else(|| ProtocolError::invalid_value(required))?)
 }
 
-fn validate_backend(raw: &novarocks::ParticipantBackendIdentity) -> Result<(), ContractError> {
+fn validate_backend(raw: &novarocks::ParticipantBackendIdentity) -> Result<(), ProtocolError> {
     let endpoint = raw
         .endpoint
         .as_ref()
-        .ok_or_else(|| ContractError::invalid_value("query control endpoint is required"))?;
+        .ok_or_else(|| ProtocolError::invalid_value("query control endpoint is required"))?;
     if endpoint.host.trim().is_empty() {
-        return Err(ContractError::invalid_value(
+        return Err(ProtocolError::invalid_value(
             "query control endpoint host must not be empty",
         ));
     }
     if endpoint.port == 0 || endpoint.port > u16::MAX as u32 {
-        return Err(ContractError::invalid_value(
+        return Err(ProtocolError::invalid_value(
             "query control endpoint port must be a nonzero u16",
         ));
     }
     if raw.start_epoch == 0 {
-        return Err(ContractError::invalid_value(
+        return Err(ProtocolError::invalid_value(
             "backend start epoch must be nonzero",
         ));
     }
@@ -1383,19 +1383,19 @@ fn validate_backend(raw: &novarocks::ParticipantBackendIdentity) -> Result<(), C
 fn required_backend(
     raw: Option<&novarocks::ParticipantBackendIdentity>,
     required: &'static str,
-) -> Result<ParticipantBackendIdentity, ContractError> {
-    let raw = raw.ok_or_else(|| ContractError::invalid_value(required))?;
+) -> Result<ParticipantBackendIdentity, ProtocolError> {
+    let raw = raw.ok_or_else(|| ProtocolError::invalid_value(required))?;
     ParticipantBackendIdentity::parse(raw.clone())
 }
 
-fn validate_attestation_reason(value: i32) -> Result<(), ContractError> {
+fn validate_attestation_reason(value: i32) -> Result<(), ProtocolError> {
     match novarocks::NegativeAttestationReason::try_from(value) {
         Ok(novarocks::NegativeAttestationReason::AttemptAborted)
         | Ok(novarocks::NegativeAttestationReason::AttemptTombstoned)
         | Ok(novarocks::NegativeAttestationReason::TerminalStateInvalid)
         | Ok(novarocks::NegativeAttestationReason::CorrectnessEvidenceEncodingFailed)
         | Ok(novarocks::NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted) => Ok(()),
-        _ => Err(ContractError::invalid_value(
+        _ => Err(ProtocolError::invalid_value(
             "invalid negative attestation reason",
         )),
     }
@@ -1405,17 +1405,17 @@ fn require_known_enum(
     value: i32,
     expected: i32,
     detail: &'static str,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     if value == expected {
         Ok(())
     } else {
-        Err(ContractError::invalid_value(detail))
+        Err(ProtocolError::invalid_value(detail))
     }
 }
 
-fn validate_channel_key(key: (u32, u32)) -> Result<(), ContractError> {
+fn validate_channel_key(key: (u32, u32)) -> Result<(), ProtocolError> {
     if key.0 == 0 || key.1 == 0 {
-        return Err(ContractError::invalid_value(
+        return Err(ProtocolError::invalid_value(
             "terminal runtime-filter channel identity must be nonzero",
         ));
     }
@@ -1432,10 +1432,10 @@ fn channel_keys(values: &[novarocks::QueryTerminalRuntimeFilterChannelV1]) -> BT
 fn validate_channel_reference(
     key: (u32, u32),
     known: &BTreeSet<(u32, u32)>,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     validate_channel_key(key)?;
     if !known.contains(&key) {
-        return Err(ContractError::invalid_value(
+        return Err(ProtocolError::invalid_value(
             "terminal runtime-filter section references an unknown channel",
         ));
     }
@@ -1446,9 +1446,9 @@ fn validate_nonzero_id(
     raw: Option<&common::UniqueId>,
     missing: &'static str,
     zero: &'static str,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     validate_nonzero_unique_id(
-        raw.ok_or_else(|| ContractError::invalid_value(missing))?,
+        raw.ok_or_else(|| ProtocolError::invalid_value(missing))?,
         zero,
     )
 }
@@ -1456,9 +1456,9 @@ fn validate_nonzero_id(
 fn validate_nonzero_unique_id(
     raw: &common::UniqueId,
     detail: &'static str,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     if raw.hi == 0 && raw.lo == 0 {
-        return Err(ContractError::invalid_value(detail));
+        return Err(ProtocolError::invalid_value(detail));
     }
     Ok(())
 }
@@ -1467,11 +1467,11 @@ fn validate_sorted_unique_ids<T>(
     values: &[T],
     id: impl Fn(&T) -> Option<&common::UniqueId>,
     detail: &'static str,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     let mut previous = None;
     for value in values {
         let id = id(value).ok_or_else(|| {
-            ContractError::invalid_value("terminal fragment instance id is required")
+            ProtocolError::invalid_value("terminal fragment instance id is required")
         })?;
         validate_nonzero_unique_id(id, "terminal fragment instance id must be nonzero")?;
         validate_sorted_key(&mut previous, (id.hi, id.lo), detail)?;
@@ -1483,9 +1483,9 @@ fn validate_sorted_key<K: Ord + Copy>(
     previous: &mut Option<K>,
     current: K,
     detail: &'static str,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     if previous.is_some_and(|value| value >= current) {
-        return Err(ContractError::invalid_value(detail));
+        return Err(ProtocolError::invalid_value(detail));
     }
     *previous = Some(current);
     Ok(())
@@ -1494,9 +1494,9 @@ fn validate_sorted_key<K: Ord + Copy>(
 fn validate_optional_nonzero(
     value: Option<u64>,
     detail: &'static str,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     if value == Some(0) {
-        Err(ContractError::invalid_value(detail))
+        Err(ProtocolError::invalid_value(detail))
     } else {
         Ok(())
     }
@@ -1505,10 +1505,10 @@ fn validate_optional_nonzero(
 fn checked_sum<const N: usize>(
     values: [u64; N],
     detail: &'static str,
-) -> Result<u64, ContractError> {
+) -> Result<u64, ProtocolError> {
     values.into_iter().try_fold(0_u64, |sum, value| {
         sum.checked_add(value)
-            .ok_or_else(|| ContractError::invalid_value(detail))
+            .ok_or_else(|| ProtocolError::invalid_value(detail))
     })
 }
 
@@ -1516,48 +1516,48 @@ fn validate_bounded_string(
     value: &str,
     limit: usize,
     detail: &'static str,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     if value.len() > limit {
-        Err(ContractError::capacity(detail))
+        Err(ProtocolError::capacity(detail))
     } else {
         Ok(())
     }
 }
 
-fn require_digest_len(value: &[u8], detail: &'static str) -> Result<(), ContractError> {
+fn require_digest_len(value: &[u8], detail: &'static str) -> Result<(), ProtocolError> {
     if value.len() == 32 {
         Ok(())
     } else {
-        Err(ContractError::invalid_value(detail))
+        Err(ProtocolError::invalid_value(detail))
     }
 }
 
-fn digest_array(value: &[u8]) -> Result<[u8; 32], ContractError> {
+fn digest_array(value: &[u8]) -> Result<[u8; 32], ProtocolError> {
     value
         .try_into()
-        .map_err(|_| ContractError::invalid_value("terminal digest must be 32 bytes"))
+        .map_err(|_| ProtocolError::invalid_value("terminal digest must be 32 bytes"))
 }
 
 fn canonical_digest<M: prost::Message>(
     domain: &[u8],
     name: &str,
     raw: &M,
-) -> Result<[u8; 32], ContractError> {
+) -> Result<[u8; 32], ProtocolError> {
     canonical::digest_message(domain, name, raw)
-        .map_err(|error| ContractError::invalid_value(error.detail()))
+        .map_err(|error| ProtocolError::invalid_value(error.detail()))
 }
 
 fn verify_digest(
     name: &str,
     supplied: &[u8],
     compute: impl FnOnce() -> Result<[u8; 32], canonical::CanonicalError>,
-) -> Result<(), ContractError> {
+) -> Result<(), ProtocolError> {
     let supplied = digest_array(supplied)?;
-    let computed = compute().map_err(|error| ContractError::invalid_value(error.detail()))?;
+    let computed = compute().map_err(|error| ProtocolError::invalid_value(error.detail()))?;
     if supplied == computed {
         Ok(())
     } else {
-        Err(ContractError::digest_mismatch(format!(
+        Err(ProtocolError::digest_mismatch(format!(
             "{name} digest does not match canonical content"
         )))
     }
@@ -1667,8 +1667,8 @@ mod tests {
         assert_eq!(
             QueryTerminalSnapshot::parse(sealed)
                 .expect_err("digest mismatch")
-                .code(),
-            super::super::error::ContractErrorCode::DigestMismatch
+                .kind(),
+            crate::ProtocolErrorKind::DigestMismatch
         );
     }
 

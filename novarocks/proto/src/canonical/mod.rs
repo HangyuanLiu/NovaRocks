@@ -38,7 +38,7 @@ impl fmt::Display for CanonicalError {
 impl std::error::Error for CanonicalError {}
 
 static NATIVE_DESCRIPTOR_POOL: Lazy<DescriptorPool> = Lazy::new(|| {
-    DescriptorPool::decode(crate::FILE_DESCRIPTOR_SET)
+    DescriptorPool::decode(novarocks_proto_models::FILE_DESCRIPTOR_SET)
         .expect("native protobuf descriptor set is valid")
 });
 
@@ -233,7 +233,7 @@ fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::{common, novarocks};
+    use novarocks_proto_models::{common, novarocks};
 
     use super::digest_message;
 

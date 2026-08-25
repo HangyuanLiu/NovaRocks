@@ -32,9 +32,9 @@ use novarocks_execution::exec::fragment::sink::{
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
 use novarocks_execution::runtime::query_options::query_expire_durations;
-use novarocks_proto::novarocks as native_proto;
 use novarocks_proto::{FieldPath, ProtocolErrorKind};
-use novarocks_proto::{common, expr, plan};
+use novarocks_proto_models::novarocks as native_proto;
+use novarocks_proto_models::{common, expr, plan};
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
     ConnectorOpenWriterRequest, ConnectorRequestContext, ConnectorRowMutationEffect,
@@ -1095,7 +1095,7 @@ mod tests {
     use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
     use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
     use novarocks_proto::ProtocolErrorKind;
-    use novarocks_proto::{common, expr, novarocks as proto, plan};
+    use novarocks_proto_models::{common, expr, novarocks as proto, plan};
     use novarocks_spi::connector::ConnectorRowMutationEffect;
     use novarocks_types::SlotId;
 

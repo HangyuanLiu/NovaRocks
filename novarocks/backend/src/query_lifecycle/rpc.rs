@@ -24,12 +24,13 @@ use std::sync::{Mutex, OnceLock};
 use tokio_stream::wrappers::ReceiverStream;
 
 use novarocks_proto::lifecycle::{
-    ContractError, ContractErrorCode, QueryAbortRequest, QueryControlAttach,
-    QueryControlCommand as ProtocolQueryControlCommand, QueryControlEvent, QueryExecutionId,
-    QueryInitOutcome, QueryInitRequest, QueryStageRequest, QueryStartRequest, QueryTerminalAck,
-    QueryTerminationReason,
+    QueryAbortRequest, QueryControlAttach, QueryControlCommand as ProtocolQueryControlCommand,
+    QueryControlEvent, QueryInitOutcome, QueryInitRequest, QueryStageRequest, QueryStartRequest,
+    QueryTerminalAck, QueryTerminationReason,
 };
-use novarocks_proto::novarocks as proto;
+use novarocks_proto::{ProtocolError, ProtocolErrorKind};
+use novarocks_proto_models::novarocks as proto;
+use novarocks_types::QueryExecutionId;
 
 use crate::query_lifecycle::{
     BackendQueryControl, QueryLifecycleError, QueryLifecycleErrorCode, QueryLifecycleIngress,
@@ -758,15 +759,20 @@ pub(crate) fn status_from_lifecycle_error(error: QueryLifecycleError) -> tonic::
     }
 }
 
-pub(crate) fn status_from_contract_error(error: ContractError) -> tonic::Status {
+pub(crate) fn status_from_contract_error(error: ProtocolError) -> tonic::Status {
     let detail = error.detail().to_string();
-    match error.code() {
-        ContractErrorCode::InvalidValue | ContractErrorCode::VersionMismatch => {
-            tonic::Status::invalid_argument(detail)
-        }
-        ContractErrorCode::Conflict | ContractErrorCode::DigestMismatch => {
+    match error.kind() {
+        ProtocolErrorKind::MissingField
+        | ProtocolErrorKind::InvalidEnum
+        | ProtocolErrorKind::InvalidValue
+        | ProtocolErrorKind::OutOfRange
+        | ProtocolErrorKind::DuplicateField
+        | ProtocolErrorKind::InconsistentFields
+        | ProtocolErrorKind::Unsupported
+        | ProtocolErrorKind::VersionMismatch => tonic::Status::invalid_argument(detail),
+        ProtocolErrorKind::Conflict | ProtocolErrorKind::DigestMismatch => {
             tonic::Status::already_exists(detail)
         }
-        ContractErrorCode::Capacity => tonic::Status::resource_exhausted(detail),
+        ProtocolErrorKind::Capacity => tonic::Status::resource_exhausted(detail),
     }
 }

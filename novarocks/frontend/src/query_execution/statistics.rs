@@ -1981,7 +1981,7 @@ mod tests {
         view: crate::query_execution::native_fragment::NativeFragmentEncodingView<'_>,
     ) -> crate::query_execution::native_fragment::NativeFragmentAttachment {
         let fragments = view.distributed_plan().fragments().iter().map(|fragment| {
-            novarocks_proto::plan::PlanFragment {
+            novarocks_proto_models::plan::PlanFragment {
                 fragment_id: fragment.fragment_id,
                 ..Default::default()
             }

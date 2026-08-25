@@ -31,7 +31,7 @@ use novarocks_execution::runtime::fragment::{
 };
 use novarocks_proto::FieldPath;
 use novarocks_proto::lifecycle::ScanRangeParams;
-use novarocks_proto::{novarocks as proto, plan};
+use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
 
 use crate::fragment::decode::envelope::{require_root, require_sink};
@@ -191,7 +191,7 @@ mod tests {
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_proto::ProtocolErrorKind;
     use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
-    use novarocks_proto::{common, expr, novarocks as proto, plan};
+    use novarocks_proto_models::{common, expr, novarocks as proto, plan};
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
         ConnectorExecutionBindingKey, ConnectorExecutionResolver,

@@ -7,10 +7,11 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use super::error::ContractError;
-use super::identity::QueryExecutionId;
+use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
 use super::query_options::QueryOptions;
-use crate::{canonical, common, novarocks};
+use crate::ProtocolError;
+use crate::canonical;
+use novarocks_proto_models::{common, novarocks};
 
 const PARTICIPANT_MANIFEST_V1_DOMAIN: &[u8] =
     b"novarocks.query-lifecycle.participant-manifest.v1\0";
@@ -31,26 +32,26 @@ impl QueryControlEndpoint {
     /// Constructs a generated endpoint before applying the canonical
     /// lifecycle validation. This is a convenience for role-local assembly
     /// and tests; the generated message remains the stored representation.
-    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, ContractError> {
+    pub fn new(host: impl Into<String>, port: u16) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::QueryControlEndpoint {
             host: host.into(),
             port: u32::from(port),
         })
     }
 
-    pub fn parse(raw: novarocks::QueryControlEndpoint) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::QueryControlEndpoint) -> Result<Self, ProtocolError> {
         if raw.host.trim().is_empty() {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "query control endpoint host must not be empty",
             ));
         }
         if raw.port == 0 {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "query control endpoint port must be nonzero",
             ));
         }
         if raw.port > u32::from(u16::MAX) {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "query control endpoint port exceeds u16 range",
             ));
         }
@@ -83,7 +84,7 @@ impl ParticipantBackendIdentity {
         backend_id: u64,
         endpoint: QueryControlEndpoint,
         start_epoch: u64,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::ParticipantBackendIdentity {
             backend_id,
             endpoint: Some(endpoint.as_proto().clone()),
@@ -91,13 +92,13 @@ impl ParticipantBackendIdentity {
         })
     }
 
-    pub fn parse(raw: novarocks::ParticipantBackendIdentity) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::ParticipantBackendIdentity) -> Result<Self, ProtocolError> {
         let endpoint = raw.endpoint.clone().ok_or_else(|| {
-            ContractError::invalid_value("participant backend endpoint is required")
+            ProtocolError::invalid_value("participant backend endpoint is required")
         })?;
         QueryControlEndpoint::parse(endpoint)?;
         if raw.start_epoch == 0 {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "backend start epoch must be nonzero",
             ));
         }
@@ -112,7 +113,7 @@ impl ParticipantBackendIdentity {
         self.raw.backend_id
     }
 
-    pub fn endpoint(&self) -> Result<QueryControlEndpoint, ContractError> {
+    pub fn endpoint(&self) -> Result<QueryControlEndpoint, ProtocolError> {
         required_endpoint(
             &self.raw.endpoint,
             "participant backend endpoint is required",
@@ -139,7 +140,7 @@ impl ExchangeRouteManifest {
         destination_node_id: i32,
         sender_ordinal: u32,
         sender_count: u32,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::ExchangeRouteManifest {
             source_fragment_instance_id: Some(source_fragment_instance_id),
             destination_fragment_instance_id: Some(destination_fragment_instance_id),
@@ -149,7 +150,7 @@ impl ExchangeRouteManifest {
         })
     }
 
-    pub fn parse(raw: novarocks::ExchangeRouteManifest) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::ExchangeRouteManifest) -> Result<Self, ProtocolError> {
         let source = required_unique_id(
             &raw.source_fragment_instance_id,
             "exchange route source fragment instance id is required",
@@ -159,17 +160,17 @@ impl ExchangeRouteManifest {
             "exchange route destination fragment instance id is required",
         )?;
         if is_missing_unique_id(source) || is_missing_unique_id(destination) {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "exchange route fragment instance ids must be nonzero",
             ));
         }
         if raw.destination_node_id < 0 {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "exchange route destination node id must be nonnegative",
             ));
         }
         if raw.sender_count == 0 || raw.sender_ordinal >= raw.sender_count {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "exchange route sender ordinal must be less than nonzero sender count",
             ));
         }
@@ -180,14 +181,14 @@ impl ExchangeRouteManifest {
         &self.raw
     }
 
-    pub fn source_fragment_instance_id(&self) -> Result<common::UniqueId, ContractError> {
+    pub fn source_fragment_instance_id(&self) -> Result<common::UniqueId, ProtocolError> {
         required_unique_id(
             &self.raw.source_fragment_instance_id,
             "exchange route source fragment instance id is required",
         )
     }
 
-    pub fn destination_fragment_instance_id(&self) -> Result<common::UniqueId, ContractError> {
+    pub fn destination_fragment_instance_id(&self) -> Result<common::UniqueId, ProtocolError> {
         required_unique_id(
             &self.raw.destination_fragment_instance_id,
             "exchange route destination fragment instance id is required",
@@ -218,14 +219,14 @@ pub struct RuntimeFilterContribution {
 }
 
 impl RuntimeFilterContribution {
-    pub fn parse(raw: novarocks::RuntimeFilterContribution) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::RuntimeFilterContribution) -> Result<Self, ProtocolError> {
         if raw.participant_id == 0 {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "runtime filter participant id must be nonzero",
             ));
         }
         if raw.contribution_digest.len() != 32 {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "runtime filter contribution digest must be 32 bytes",
             ));
         }
@@ -254,9 +255,9 @@ impl ParticipantManifestDigest {
         Self(bytes)
     }
 
-    pub fn try_from_slice(bytes: &[u8]) -> Result<Self, ContractError> {
+    pub fn try_from_slice(bytes: &[u8]) -> Result<Self, ProtocolError> {
         let bytes = bytes.try_into().map_err(|_| {
-            ContractError::invalid_value("participant manifest digest must be 32 bytes")
+            ProtocolError::invalid_value("participant manifest digest must be 32 bytes")
         })?;
         Ok(Self(bytes))
     }
@@ -290,12 +291,12 @@ impl ParticipantManifest {
         runtime_filter: Option<RuntimeFilterContribution>,
         pre_start_timeout: Duration,
         report_endpoint: QueryControlEndpoint,
-    ) -> Result<Self, ContractError> {
+    ) -> Result<Self, ProtocolError> {
         let pre_start_timeout_ms = u64::try_from(pre_start_timeout.as_millis()).map_err(|_| {
-            ContractError::invalid_value("pre-start timeout exceeds u64 milliseconds")
+            ProtocolError::invalid_value("pre-start timeout exceeds u64 milliseconds")
         })?;
         Self::parse(novarocks::ParticipantManifest {
-            execution_id: Some(execution_id.to_proto()),
+            execution_id: Some(encode_query_execution_id(execution_id)),
             backend: Some(backend.as_proto().clone()),
             participant_roles: roles.into_iter().map(|role| role as i32).collect(),
             expected_fragment_instance_ids: expected_fragment_instance_ids.into_iter().collect(),
@@ -313,7 +314,7 @@ impl ParticipantManifest {
 
     /// Validates all manifest and leaf invariants without normalizing or
     /// rebuilding the generated message.
-    pub fn parse(raw: novarocks::ParticipantManifest) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::ParticipantManifest) -> Result<Self, ProtocolError> {
         required_execution_id(&raw.execution_id)?;
         required_backend(&raw.backend)?;
 
@@ -321,11 +322,11 @@ impl ParticipantManifest {
         for role in raw.participant_roles.iter().copied() {
             let role = parse_role(role)?;
             if !roles.insert(role) {
-                return Err(ContractError::invalid_value("duplicate participant role"));
+                return Err(ProtocolError::invalid_value("duplicate participant role"));
             }
         }
         if roles.is_empty() {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "participant roles must not be empty",
             ));
         }
@@ -333,25 +334,25 @@ impl ParticipantManifest {
         let mut fragment_ids = BTreeSet::new();
         for fragment_id in raw.expected_fragment_instance_ids.iter().copied() {
             if is_missing_unique_id(fragment_id) {
-                return Err(ContractError::invalid_value(
+                return Err(ProtocolError::invalid_value(
                     "expected fragment instance ids must be nonzero",
                 ));
             }
             if !fragment_ids.insert((fragment_id.hi, fragment_id.lo)) {
-                return Err(ContractError::invalid_value(
+                return Err(ProtocolError::invalid_value(
                     "duplicate fragment instance id",
                 ));
             }
         }
         if !roles.contains(&ParticipantRole::FragmentExecutor) && !fragment_ids.is_empty() {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "service-only participant must not declare fragment instances",
             ));
         }
 
         let options = raw
             .query_options
-            .ok_or_else(|| ContractError::invalid_value("query options are required"))?;
+            .ok_or_else(|| ProtocolError::invalid_value("query options are required"))?;
         QueryOptions::parse(options)?;
 
         let mut exchange_routes = BTreeSet::new();
@@ -369,7 +370,7 @@ impl ParticipantManifest {
                 route.sender_count(),
             );
             if !exchange_routes.insert(route_key) {
-                return Err(ContractError::invalid_value("duplicate exchange route"));
+                return Err(ProtocolError::invalid_value("duplicate exchange route"));
             }
         }
 
@@ -379,17 +380,17 @@ impl ParticipantManifest {
             .map(RuntimeFilterContribution::parse)
             .transpose()?;
         if runtime_filter.is_some() != roles.contains(&ParticipantRole::RuntimeFilterService) {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "runtime filter contribution and participant role must be present together",
             ));
         }
         if raw.query_deadline_unix_ms == 0 {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "query deadline must be nonzero",
             ));
         }
         if raw.pre_start_timeout_ms == 0 {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "pre-start timeout must be nonzero",
             ));
         }
@@ -402,15 +403,15 @@ impl ParticipantManifest {
         &self.raw
     }
 
-    pub fn execution_id(&self) -> Result<QueryExecutionId, ContractError> {
+    pub fn execution_id(&self) -> Result<QueryExecutionId, ProtocolError> {
         required_execution_id(&self.raw.execution_id)
     }
 
-    pub fn backend(&self) -> Result<ParticipantBackendIdentity, ContractError> {
+    pub fn backend(&self) -> Result<ParticipantBackendIdentity, ProtocolError> {
         required_backend(&self.raw.backend)
     }
 
-    pub fn roles(&self) -> Result<Vec<ParticipantRole>, ContractError> {
+    pub fn roles(&self) -> Result<Vec<ParticipantRole>, ProtocolError> {
         self.raw
             .participant_roles
             .iter()
@@ -423,11 +424,11 @@ impl ParticipantManifest {
         self.raw.expected_fragment_instance_ids.clone()
     }
 
-    pub fn query_options(&self) -> Result<QueryOptions, ContractError> {
+    pub fn query_options(&self) -> Result<QueryOptions, ProtocolError> {
         let raw = self
             .raw
             .query_options
-            .ok_or_else(|| ContractError::invalid_value("query options are required"))?;
+            .ok_or_else(|| ProtocolError::invalid_value("query options are required"))?;
         QueryOptions::parse(raw)
     }
 
@@ -435,7 +436,7 @@ impl ParticipantManifest {
         self.raw.query_deadline_unix_ms
     }
 
-    pub fn exchange_routes(&self) -> Result<Vec<ExchangeRouteManifest>, ContractError> {
+    pub fn exchange_routes(&self) -> Result<Vec<ExchangeRouteManifest>, ProtocolError> {
         self.raw
             .exchange_routes
             .iter()
@@ -444,7 +445,7 @@ impl ParticipantManifest {
             .collect()
     }
 
-    pub fn runtime_filter(&self) -> Result<Option<RuntimeFilterContribution>, ContractError> {
+    pub fn runtime_filter(&self) -> Result<Option<RuntimeFilterContribution>, ProtocolError> {
         self.raw
             .runtime_filter
             .clone()
@@ -456,14 +457,14 @@ impl ParticipantManifest {
         self.raw.pre_start_timeout_ms
     }
 
-    pub fn report_endpoint(&self) -> Result<QueryControlEndpoint, ContractError> {
+    pub fn report_endpoint(&self) -> Result<QueryControlEndpoint, ProtocolError> {
         required_endpoint(&self.raw.report_endpoint, "report endpoint is required")
     }
 
     /// Computes the descriptor-driven digest of the complete generated
     /// manifest, so new schema fields enter the fence without a hand-written
     /// projection update.
-    pub fn digest(&self) -> Result<ParticipantManifestDigest, ContractError> {
+    pub fn digest(&self) -> Result<ParticipantManifestDigest, ProtocolError> {
         canonical::digest_message(
             PARTICIPANT_MANIFEST_V1_DOMAIN,
             "novarocks.ParticipantManifest",
@@ -471,7 +472,7 @@ impl ParticipantManifest {
         )
         .map(ParticipantManifestDigest::new)
         .map_err(|error| {
-            ContractError::invalid_value(format!(
+            ProtocolError::invalid_value(format!(
                 "cannot compute participant manifest digest: {error}"
             ))
         })
@@ -480,45 +481,45 @@ impl ParticipantManifest {
 
 fn required_execution_id(
     raw: &Option<novarocks::QueryExecutionId>,
-) -> Result<QueryExecutionId, ContractError> {
+) -> Result<QueryExecutionId, ProtocolError> {
     let raw = raw
         .as_ref()
-        .ok_or_else(|| ContractError::invalid_value("query execution id is required"))?;
-    QueryExecutionId::try_from_proto(raw)
+        .ok_or_else(|| ProtocolError::invalid_value("query execution id is required"))?;
+    decode_query_execution_id(raw)
 }
 
 fn required_backend(
     raw: &Option<novarocks::ParticipantBackendIdentity>,
-) -> Result<ParticipantBackendIdentity, ContractError> {
+) -> Result<ParticipantBackendIdentity, ProtocolError> {
     let raw = raw
         .clone()
-        .ok_or_else(|| ContractError::invalid_value("participant backend identity is required"))?;
+        .ok_or_else(|| ProtocolError::invalid_value("participant backend identity is required"))?;
     ParticipantBackendIdentity::parse(raw)
 }
 
 fn required_endpoint(
     raw: &Option<novarocks::QueryControlEndpoint>,
     missing_detail: &'static str,
-) -> Result<QueryControlEndpoint, ContractError> {
+) -> Result<QueryControlEndpoint, ProtocolError> {
     let raw = raw
         .clone()
-        .ok_or_else(|| ContractError::invalid_value(missing_detail))?;
+        .ok_or_else(|| ProtocolError::invalid_value(missing_detail))?;
     QueryControlEndpoint::parse(raw)
 }
 
 fn required_unique_id(
     raw: &Option<common::UniqueId>,
     missing_detail: &'static str,
-) -> Result<common::UniqueId, ContractError> {
-    (*raw).ok_or_else(|| ContractError::invalid_value(missing_detail))
+) -> Result<common::UniqueId, ProtocolError> {
+    (*raw).ok_or_else(|| ProtocolError::invalid_value(missing_detail))
 }
 
-fn parse_role(raw: i32) -> Result<ParticipantRole, ContractError> {
+fn parse_role(raw: i32) -> Result<ParticipantRole, ProtocolError> {
     match ParticipantRole::try_from(raw) {
         Ok(role @ (ParticipantRole::FragmentExecutor | ParticipantRole::RuntimeFilterService)) => {
             Ok(role)
         }
-        Ok(ParticipantRole::Unspecified) | Err(_) => Err(ContractError::invalid_value(format!(
+        Ok(ParticipantRole::Unspecified) | Err(_) => Err(ProtocolError::invalid_value(format!(
             "unknown participant role {raw}"
         ))),
     }
@@ -534,7 +535,8 @@ mod tests {
         ExchangeRouteManifest, ParticipantManifest, ParticipantManifestDigest, ParticipantRole,
         QueryControlEndpoint, RuntimeFilterContribution,
     };
-    use crate::{common, lifecycle::error::ContractErrorCode, novarocks};
+    use crate::ProtocolErrorKind;
+    use novarocks_proto_models::{common, novarocks};
     use novarocks_types::QueryId;
 
     fn id(hi: i64, lo: i64) -> common::UniqueId {
@@ -598,7 +600,7 @@ mod tests {
 
     fn assert_invalid(raw: novarocks::ParticipantManifest, detail: &str) {
         let error = ParticipantManifest::parse(raw).expect_err("fixture must be invalid");
-        assert_eq!(error.code(), ContractErrorCode::InvalidValue);
+        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
         assert_eq!(error.detail(), detail);
     }
 
@@ -752,10 +754,12 @@ mod tests {
             .participant_roles
             .push(ParticipantRole::RuntimeFilterService as i32);
         changed_raw.runtime_filter = Some(novarocks::RuntimeFilterContribution {
-            lifecycle: Some(crate::filter::RuntimeFilterQueryLifecycleOptions {
-                delivery_expire_ms: 1,
-                ..Default::default()
-            }),
+            lifecycle: Some(
+                novarocks_proto_models::filter::RuntimeFilterQueryLifecycleOptions {
+                    delivery_expire_ms: 1,
+                    ..Default::default()
+                },
+            ),
             ..contribution()
         });
         let changed = ParticipantManifest::parse(changed_raw.clone()).expect("valid manifest");

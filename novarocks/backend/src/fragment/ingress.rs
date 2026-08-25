@@ -19,15 +19,12 @@
 
 use std::fmt;
 
-use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto::connector::AdmittedConnectorExecutionDeclaration;
 use novarocks_proto::provider::{
     EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingResult,
 };
 use novarocks_spi::connector::ConnectorExecutionBindingKey;
-use novarocks_types::QueryId;
-use novarocks_types::UniqueId;
-
-use crate::connector::binding_decode::AdmittedConnectorExecutionDeclaration;
+use novarocks_types::{QueryExecutionId, QueryId, UniqueId};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(

@@ -19,7 +19,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto::connector::AdmittedConnectorExecutionDeclaration;
+#[cfg(test)]
+use novarocks_proto::connector::{
+    decode_connector_execution_declaration, encode_connector_execution_declaration,
+};
 use novarocks_proto::provider::{
     EnsureConnectorExecutionBindingRejection, EnsureConnectorExecutionBindingRejectionReason,
     EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingOutcome,
@@ -31,8 +35,7 @@ use novarocks_spi::connector::{
     ConnectorExecutionProviderKind, ConnectorExecutionResolver, ConnectorRequestContext,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
-
-use super::binding_decode::AdmittedConnectorExecutionDeclaration;
+use novarocks_types::QueryExecutionId;
 
 const CONNECTOR_BINDING_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -819,14 +822,8 @@ mod tests {
     fn admitted(
         declaration: ConnectorExecutionDeclaration,
     ) -> AdmittedConnectorExecutionDeclaration {
-        let mut digest = [0; 32];
-        digest[0] = declaration.binding_key().incarnation.to_bytes()[0];
-        digest[1] = declaration
-            .iceberg_access_binding()
-            .unwrap_or_default()
-            .bytes()
-            .fold(0, u8::wrapping_add);
-        super::super::binding_decode::admitted_for_tests(declaration, digest)
+        decode_connector_execution_declaration(encode_connector_execution_declaration(&declaration))
+            .expect("test declaration is Protocol-valid")
     }
     fn query(value: i64) -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(1, value), AttemptId::new(1).expect("attempt"))

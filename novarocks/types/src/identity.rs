@@ -83,6 +83,87 @@ impl fmt::Display for QueryId {
     }
 }
 
+/// Transport-neutral validation failure for a native execution identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionIdentityError {
+    ZeroAttemptId,
+    ZeroQueryId,
+}
+
+impl fmt::Display for ExecutionIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ZeroAttemptId => "attempt id must be nonzero",
+            Self::ZeroQueryId => "query id must be nonzero",
+        })
+    }
+}
+
+impl std::error::Error for ExecutionIdentityError {}
+
+/// Nonzero ordinal for one physical attempt of a logical query.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AttemptId(u64);
+
+impl AttemptId {
+    pub fn new(value: u64) -> Result<Self, ExecutionIdentityError> {
+        if value == 0 {
+            return Err(ExecutionIdentityError::ZeroAttemptId);
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Immutable identity for one physical execution attempt of a logical query.
+///
+/// This deliberately remains a small `Copy` value rather than a transport
+/// representation: FE and BE registries use it as a map key.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct QueryExecutionId {
+    query_id: QueryId,
+    attempt_id: AttemptId,
+}
+
+impl QueryExecutionId {
+    pub fn new(query_id: QueryId, attempt_id: AttemptId) -> Result<Self, ExecutionIdentityError> {
+        if query_id.high() == 0 && query_id.low() == 0 {
+            return Err(ExecutionIdentityError::ZeroQueryId);
+        }
+        Ok(Self {
+            query_id,
+            attempt_id,
+        })
+    }
+
+    pub const fn query_id(self) -> QueryId {
+        self.query_id
+    }
+
+    pub const fn attempt_id(self) -> AttemptId {
+        self.attempt_id
+    }
+}
+
+impl Ord for QueryExecutionId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.query_id.high(), self.query_id.low(), self.attempt_id).cmp(&(
+            other.query_id.high(),
+            other.query_id.low(),
+            other.attempt_id,
+        ))
+    }
+}
+
+impl PartialOrd for QueryExecutionId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Process-local, high-entropy namespace carried in the high half of a native
 /// query identity.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -211,8 +292,8 @@ mod tests {
     use std::collections::{BTreeSet, HashSet};
 
     use super::{
-        LocalQuerySequence, QueryId, QueryIdAttribution, QueryProcessNamespace, UniqueId,
-        format_uuid,
+        AttemptId, ExecutionIdentityError, LocalQuerySequence, QueryExecutionId, QueryId,
+        QueryIdAttribution, QueryProcessNamespace, UniqueId, format_uuid,
     };
 
     #[test]
@@ -268,5 +349,32 @@ mod tests {
         assert!(LocalQuerySequence::new((i64::MAX as u64) + 1).is_none());
         assert!(QueryId::new(1, 0).process_attribution().is_none());
         assert!(QueryId::new(1, -1).process_attribution().is_none());
+    }
+
+    #[test]
+    fn execution_identity_is_nonzero_ordered_and_hashable() {
+        assert_eq!(
+            AttemptId::new(0),
+            Err(ExecutionIdentityError::ZeroAttemptId)
+        );
+        let first = QueryExecutionId::new(
+            QueryId::new(7, 9),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("nonzero query id");
+        let second = QueryExecutionId::new(
+            QueryId::new(7, 9),
+            AttemptId::new(2).expect("nonzero attempt"),
+        )
+        .expect("nonzero query id");
+        assert!(first < second);
+        assert_eq!(
+            QueryExecutionId::new(QueryId::new(0, 0), first.attempt_id()),
+            Err(ExecutionIdentityError::ZeroQueryId)
+        );
+
+        let mut values = HashSet::new();
+        values.insert(first);
+        assert!(values.contains(&first));
     }
 }

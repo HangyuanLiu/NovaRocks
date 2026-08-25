@@ -147,7 +147,7 @@ impl<'a> NativeSubmissionEncodingView<'a> {
     /// construction capability.
     pub fn native_fragments_in_id_order(
         &self,
-    ) -> impl ExactSizeIterator<Item = (FragmentId, &novarocks_proto::plan::PlanFragment)> + '_
+    ) -> impl ExactSizeIterator<Item = (FragmentId, &novarocks_proto_models::plan::PlanFragment)> + '_
     {
         self.native_fragments.fragments_in_id_order()
     }

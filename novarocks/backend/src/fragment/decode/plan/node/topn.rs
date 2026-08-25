@@ -25,7 +25,7 @@ use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::sort::SortNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_proto::FieldPath;
-use novarocks_proto::plan;
+use novarocks_proto_models::plan;
 
 pub(super) fn lower_topn_node(
     node: &plan::DistributedNode,
@@ -118,7 +118,7 @@ mod tests {
     use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
-    use novarocks_proto::{common, expr, plan};
+    use novarocks_proto_models::{common, expr, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")

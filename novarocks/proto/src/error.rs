@@ -81,6 +81,10 @@ pub enum ProtocolErrorKind {
     DuplicateField,
     InconsistentFields,
     Unsupported,
+    Conflict,
+    Capacity,
+    VersionMismatch,
+    DigestMismatch,
 }
 
 impl fmt::Display for ProtocolErrorKind {
@@ -93,6 +97,10 @@ impl fmt::Display for ProtocolErrorKind {
             Self::DuplicateField => f.write_str("duplicate field"),
             Self::InconsistentFields => f.write_str("inconsistent fields"),
             Self::Unsupported => f.write_str("unsupported"),
+            Self::Conflict => f.write_str("conflict"),
+            Self::Capacity => f.write_str("capacity"),
+            Self::VersionMismatch => f.write_str("version mismatch"),
+            Self::DigestMismatch => f.write_str("digest mismatch"),
         }
     }
 }
@@ -123,6 +131,46 @@ impl ProtocolError {
 
     pub fn detail(&self) -> &str {
         &self.detail
+    }
+
+    pub(crate) fn invalid_value(detail: impl Into<String>) -> Self {
+        Self::new(
+            FieldPath::root("native_query_lifecycle"),
+            ProtocolErrorKind::InvalidValue,
+            detail,
+        )
+    }
+
+    pub(crate) fn conflict(detail: impl Into<String>) -> Self {
+        Self::new(
+            FieldPath::root("native_query_lifecycle"),
+            ProtocolErrorKind::Conflict,
+            detail,
+        )
+    }
+
+    pub(crate) fn capacity(detail: impl Into<String>) -> Self {
+        Self::new(
+            FieldPath::root("native_query_lifecycle"),
+            ProtocolErrorKind::Capacity,
+            detail,
+        )
+    }
+
+    pub(crate) fn version_mismatch(detail: impl Into<String>) -> Self {
+        Self::new(
+            FieldPath::root("native_query_lifecycle"),
+            ProtocolErrorKind::VersionMismatch,
+            detail,
+        )
+    }
+
+    pub(crate) fn digest_mismatch(detail: impl Into<String>) -> Self {
+        Self::new(
+            FieldPath::root("native_query_lifecycle"),
+            ProtocolErrorKind::DigestMismatch,
+            detail,
+        )
     }
 }
 

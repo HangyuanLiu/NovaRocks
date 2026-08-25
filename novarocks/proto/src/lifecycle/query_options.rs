@@ -1,7 +1,7 @@
 //! Validated wire query options shared by lifecycle participants.
 
-use super::error::ContractError;
-use crate::novarocks;
+use crate::ProtocolError;
+use novarocks_proto_models::novarocks;
 
 /// A parsed `novarocks.QueryOptions` contract value.
 ///
@@ -18,7 +18,7 @@ impl QueryOptions {
     /// Zero-valued scalar options retain their existing native meaning of
     /// "unset". This constructor does not fill defaults or translate to an
     /// Execution-owned runtime options structure.
-    pub fn parse(raw: novarocks::QueryOptions) -> Result<Self, ContractError> {
+    pub fn parse(raw: novarocks::QueryOptions) -> Result<Self, ProtocolError> {
         validate_spill_options(&raw)?;
         Ok(Self { raw })
     }
@@ -29,7 +29,7 @@ impl QueryOptions {
     }
 }
 
-fn validate_spill_options(raw: &novarocks::QueryOptions) -> Result<(), ContractError> {
+fn validate_spill_options(raw: &novarocks::QueryOptions) -> Result<(), ProtocolError> {
     if !raw.enable_spill {
         return Ok(());
     }
@@ -37,22 +37,22 @@ fn validate_spill_options(raw: &novarocks::QueryOptions) -> Result<(), ContractE
     let spill = raw
         .spill_options
         .as_ref()
-        .ok_or_else(|| ContractError::invalid_value("enable_spill=true requires spill_options"))?;
+        .ok_or_else(|| ProtocolError::invalid_value("enable_spill=true requires spill_options"))?;
     match spill.spill_mode {
         0..=2 => {}
         3 => {
-            return Err(ContractError::invalid_value(
+            return Err(ProtocolError::invalid_value(
                 "spill_mode RANDOM is not supported yet",
             ));
         }
         value => {
-            return Err(ContractError::invalid_value(format!(
+            return Err(ProtocolError::invalid_value(format!(
                 "unknown spill_mode value {value}"
             )));
         }
     }
     if !spill.spill_mem_limit_threshold.is_finite() {
-        return Err(ContractError::invalid_value(
+        return Err(ProtocolError::invalid_value(
             "spill_mem_limit_threshold must be finite",
         ));
     }
@@ -64,8 +64,8 @@ mod tests {
     use prost::Message;
 
     use super::QueryOptions;
-    use crate::lifecycle::error::ContractErrorCode;
-    use crate::novarocks;
+    use crate::ProtocolErrorKind;
+    use novarocks_proto_models::novarocks;
 
     #[test]
     fn preserves_the_exact_generated_query_options_message() {
@@ -93,7 +93,7 @@ mod tests {
         })
         .expect_err("spill options are required when spilling is enabled");
 
-        assert_eq!(error.code(), ContractErrorCode::InvalidValue);
+        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
         assert_eq!(error.detail(), "enable_spill=true requires spill_options");
     }
 
@@ -112,7 +112,7 @@ mod tests {
                 ..Default::default()
             })
             .expect_err("invalid spill mode");
-            assert_eq!(error.code(), ContractErrorCode::InvalidValue);
+            assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
             assert_eq!(error.detail(), expected);
         }
     }
@@ -129,7 +129,7 @@ mod tests {
         })
         .expect_err("non-finite values cannot enter a canonical contract");
 
-        assert_eq!(error.code(), ContractErrorCode::InvalidValue);
+        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
         assert_eq!(error.detail(), "spill_mem_limit_threshold must be finite");
     }
 

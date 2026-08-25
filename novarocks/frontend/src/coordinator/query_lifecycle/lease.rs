@@ -961,8 +961,8 @@ impl AttemptControl {
                     .session
                     .send(
                         control_command(
-                            novarocks_proto::novarocks::query_control_request::Command::Abort(
-                                novarocks_proto::novarocks::QueryControlAbort {
+                            novarocks_proto_models::novarocks::query_control_request::Command::Abort(
+                                novarocks_proto_models::novarocks::QueryControlAbort {
                                     reason: reason.to_string(),
                                 },
                             ),
@@ -997,18 +997,21 @@ impl AttemptControl {
             }
         }
 
-        let request = QueryAbortRequest::parse(novarocks_proto::novarocks::AbortQueryRequest {
-            execution_id: Some(self.execution_id.into()),
-            init_digest: participant.digest.as_bytes().to_vec(),
-            reason: reason.to_string(),
-        })
-        .map_err(|error| {
-            AbortCleanupFailure::new(
-                participant,
-                QueryLifecycleTransportErrorKind::InvalidResponse,
-                error.to_string(),
-            )
-        })?;
+        let request =
+            QueryAbortRequest::parse(novarocks_proto_models::novarocks::AbortQueryRequest {
+                execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+                    self.execution_id,
+                )),
+                init_digest: participant.digest.as_bytes().to_vec(),
+                reason: reason.to_string(),
+            })
+            .map_err(|error| {
+                AbortCleanupFailure::new(
+                    participant,
+                    QueryLifecycleTransportErrorKind::InvalidResponse,
+                    error.to_string(),
+                )
+            })?;
         let ack = self
             .transport
             .abort_query(participant.target, request, self.config.attach_timeout())
@@ -1328,8 +1331,8 @@ impl AttemptControl {
                         session
                             .session
                             .send(control_command(
-                                novarocks_proto::novarocks::query_control_request::Command::Finalize(
-                                    novarocks_proto::novarocks::QueryControlFinalize {},
+                                novarocks_proto_models::novarocks::query_control_request::Command::Finalize(
+                                    novarocks_proto_models::novarocks::QueryControlFinalize {},
                                 ),
                             )?)
                             .map_err(|error| error.to_string())
@@ -1475,9 +1478,9 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
                 return;
             }
         };
-        if let Some(novarocks_proto::novarocks::query_control_response::Event::LocalFailure(
-            failure,
-        )) = event.as_proto().event.as_ref()
+        if let Some(
+            novarocks_proto_models::novarocks::query_control_response::Event::LocalFailure(failure),
+        ) = event.as_proto().event.as_ref()
         {
             control.supervisor_failed(
                 format!(
@@ -1496,7 +1499,11 @@ fn control_event_reader(control: Weak<AttemptControl>, session: ActiveSession) {
         }
         let terminal_outcome = matches!(
             event.as_proto().event.as_ref(),
-            Some(novarocks_proto::novarocks::query_control_response::Event::TerminalOutcome(_))
+            Some(
+                novarocks_proto_models::novarocks::query_control_response::Event::TerminalOutcome(
+                    _
+                )
+            )
         );
         if let Err(error) = control.handle_control_event(&session, event) {
             control.record_reader_failure(error);
@@ -1521,7 +1528,7 @@ impl AttemptControl {
         event: QueryControlEvent,
     ) -> Result<(), String> {
         match event.as_proto().event.as_ref() {
-            Some(novarocks_proto::novarocks::query_control_response::Event::HeartbeatAck(
+            Some(novarocks_proto_models::novarocks::query_control_response::Event::HeartbeatAck(
                 heartbeat,
             )) => {
                 let mut terminal = self.terminal.0.lock().expect("query terminal state");
@@ -1533,7 +1540,7 @@ impl AttemptControl {
                 self.terminal.1.notify_all();
                 Ok(())
             }
-            Some(novarocks_proto::novarocks::query_control_response::Event::LocalDrained(_)) => {
+            Some(novarocks_proto_models::novarocks::query_control_response::Event::LocalDrained(_)) => {
                 let newly_drained = self
                     .terminal
                     .0
@@ -1548,7 +1555,7 @@ impl AttemptControl {
                 Ok(())
             }
             Some(
-                novarocks_proto::novarocks::query_control_response::Event::TerminationAccepted(
+                novarocks_proto_models::novarocks::query_control_response::Event::TerminationAccepted(
                     accepted,
                 ),
             ) => {
@@ -1564,7 +1571,7 @@ impl AttemptControl {
                 Ok(())
             }
             Some(
-                novarocks_proto::novarocks::query_control_response::Event::FragmentObservation(
+                novarocks_proto_models::novarocks::query_control_response::Event::FragmentObservation(
                     observation,
                 ),
             ) => {
@@ -1573,7 +1580,7 @@ impl AttemptControl {
                 let _ = self.store_fragment_observation(session, observation);
                 Ok(())
             }
-            Some(novarocks_proto::novarocks::query_control_response::Event::TerminalOutcome(
+            Some(novarocks_proto_models::novarocks::query_control_response::Event::TerminalOutcome(
                 outcome,
             )) => {
                 let outcome = ParticipantTerminalOutcome::parse(outcome.clone())
@@ -1609,7 +1616,7 @@ impl AttemptControl {
                         )
                     })
             }
-            Some(novarocks_proto::novarocks::query_control_response::Event::LocalFailure(
+            Some(novarocks_proto_models::novarocks::query_control_response::Event::LocalFailure(
                 failure,
             )) => Err(format!(
                 "query lifecycle local failure on backend {} ({}): {}",
@@ -1617,7 +1624,7 @@ impl AttemptControl {
                 failure.code,
                 failure.detail
             )),
-            Some(novarocks_proto::novarocks::query_control_response::Event::ControlReady(_)) => {
+            Some(novarocks_proto_models::novarocks::query_control_response::Event::ControlReady(_)) => {
                 Err(format!(
                     "backend {} emitted duplicate ControlReady after attachment",
                     session.target.backend_idx()
@@ -1757,21 +1764,24 @@ fn conflicting_terminal_outcome(
     outcome: &ParticipantTerminalOutcome,
 ) -> Result<ParticipantTerminalOutcome, String> {
     let attestation = novarocks_proto::lifecycle::NegativeAttestation::seal(
-        novarocks_proto::novarocks::NegativeAttestation {
-            execution_id: Some(outcome.execution_id().into()),
+        novarocks_proto_models::novarocks::NegativeAttestation {
+            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+                outcome.execution_id(),
+            )),
             backend: Some(outcome.backend().as_proto().clone()),
             init_digest: outcome.init_digest().as_bytes().to_vec(),
-            reason: novarocks_proto::novarocks::NegativeAttestationReason::TerminalStateInvalid
-                as i32,
+            reason:
+                novarocks_proto_models::novarocks::NegativeAttestationReason::TerminalStateInvalid
+                    as i32,
             detail: "same participant produced a conflicting terminal outcome".to_string(),
             detail_truncated: false,
             digest: Vec::new(),
         },
     )
     .map_err(|error| error.to_string())?;
-    ParticipantTerminalOutcome::parse(novarocks_proto::novarocks::ParticipantTerminalOutcome {
+    ParticipantTerminalOutcome::parse(novarocks_proto_models::novarocks::ParticipantTerminalOutcome {
         outcome: Some(
-            novarocks_proto::novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(
+            novarocks_proto_models::novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(
                 attestation.as_proto().clone(),
             ),
         ),
@@ -1917,8 +1927,8 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
         let sessions = control.sessions();
         for session in &sessions {
             let command = match control_command(
-                novarocks_proto::novarocks::query_control_request::Command::Heartbeat(
-                    novarocks_proto::novarocks::QueryControlHeartbeat {
+                novarocks_proto_models::novarocks::query_control_request::Command::Heartbeat(
+                    novarocks_proto_models::novarocks::QueryControlHeartbeat {
                         sequence,
                         sent_mono_ns: started.elapsed().as_nanos() as u64,
                     },
@@ -2082,9 +2092,9 @@ fn marker_execution_id(
 }
 
 fn control_command(
-    command: novarocks_proto::novarocks::query_control_request::Command,
+    command: novarocks_proto_models::novarocks::query_control_request::Command,
 ) -> Result<QueryControlCommand, String> {
-    QueryControlCommand::parse(novarocks_proto::novarocks::QueryControlRequest {
+    QueryControlCommand::parse(novarocks_proto_models::novarocks::QueryControlRequest {
         command: Some(command),
     })
     .map_err(|error| error.to_string())
@@ -2096,15 +2106,17 @@ fn terminal_ack_command(
     let snapshot = outcome.snapshot().ok_or_else(|| {
         "negative terminal attestation cannot be acknowledged as a snapshot".to_string()
     })?;
-    let ack = QueryTerminalAck::parse(novarocks_proto::novarocks::QueryControlTerminalAck {
-        execution_id: Some(outcome.execution_id().into()),
+    let ack = QueryTerminalAck::parse(novarocks_proto_models::novarocks::QueryControlTerminalAck {
+        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+            outcome.execution_id(),
+        )),
         init_digest: outcome.init_digest().as_bytes().to_vec(),
         snapshot_version: snapshot.version(),
         snapshot_digest: outcome.digest().to_vec(),
     })
     .map_err(|error| error.to_string())?;
     control_command(
-        novarocks_proto::novarocks::query_control_request::Command::TerminalAck(
+        novarocks_proto_models::novarocks::query_control_request::Command::TerminalAck(
             ack.as_proto().clone(),
         ),
     )

@@ -2640,7 +2640,8 @@ fn find_matching_paren(sql: &str, open: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_proto::{lifecycle::QueryOptions, novarocks};
+    use novarocks_proto::lifecycle::QueryOptions;
+    use novarocks_proto_models::novarocks;
 
     #[test]
     fn explain_analyze_query_options_only_enable_profile() {

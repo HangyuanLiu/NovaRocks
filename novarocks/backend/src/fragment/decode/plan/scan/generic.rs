@@ -41,7 +41,7 @@ use novarocks_execution::exec::variant_read::{
 };
 use novarocks_execution::runtime::query_options::query_expire_durations;
 use novarocks_proto::ProtocolErrorKind;
-use novarocks_proto::plan;
+use novarocks_proto_models::plan;
 use novarocks_types::SlotId;
 
 use super::super::context::NativePlanDecodeContext;

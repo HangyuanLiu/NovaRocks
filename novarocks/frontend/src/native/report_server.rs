@@ -16,10 +16,10 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use novarocks_proto::lifecycle::{
-    ContractError, ContractErrorCode, ParticipantTerminalOutcome, QueryTerminalReportAck,
-    QueryTerminalReportOutcome,
+    ParticipantTerminalOutcome, QueryTerminalReportAck, QueryTerminalReportOutcome,
 };
-use novarocks_proto::{filter, novarocks as proto};
+use novarocks_proto::{ProtocolError, ProtocolErrorKind};
+use novarocks_proto_models::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tonic::body::boxed;
@@ -511,7 +511,7 @@ fn runtime_filter_participant_available_debug(
 }
 
 fn runtime_filter_unique_id_debug(
-    id: novarocks_proto::common::UniqueId,
+    id: novarocks_proto_models::common::UniqueId,
 ) -> RuntimeFilterUniqueIdDebug {
     RuntimeFilterUniqueIdDebug {
         high: id.hi,
@@ -872,7 +872,7 @@ mod tests {
         AttemptId, NegativeAttestation, ParticipantBackendIdentity, ParticipantTerminalOutcome,
         QueryExecutionId, QueryTerminalReportAck, QueryTerminalReportOutcome,
     };
-    use novarocks_proto::novarocks as proto;
+    use novarocks_proto_models::novarocks as proto;
     use novarocks_types::QueryId;
 
     struct FixedIngress {
@@ -914,7 +914,9 @@ mod tests {
         })
         .expect("backend identity");
         let attestation = NegativeAttestation::seal(proto::NegativeAttestation {
-            execution_id: Some(execution_id.into()),
+            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+                execution_id,
+            )),
             backend: Some(backend.as_proto().clone()),
             init_digest: vec![3; 32],
             reason: proto::NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted as i32,
@@ -981,7 +983,7 @@ mod tests {
                             channel_binding_id: 3,
                             channel_id: 5,
                             producer_fragment_instance_id: Some(
-                                novarocks_proto::common::UniqueId { hi: 9, lo: 10 },
+                                novarocks_proto_models::common::UniqueId { hi: 9, lo: 10 },
                             ),
                             partition_id: 0,
                             latest_accepted_sequence: Some(0),
@@ -1008,7 +1010,7 @@ mod tests {
                             channel_binding_id: 3,
                             channel_id: 5,
                             consumer_binding_id: 8,
-                            fragment_instance_id: Some(novarocks_proto::common::UniqueId {
+                            fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
                                 hi: 12,
                                 lo: 14,
                             }),
@@ -1190,16 +1192,21 @@ fn status_from_lifecycle_error(error: QueryLifecycleError) -> tonic::Status {
     }
 }
 
-fn status_from_contract_error(error: ContractError) -> tonic::Status {
+fn status_from_contract_error(error: ProtocolError) -> tonic::Status {
     let detail = error.detail().to_string();
-    match error.code() {
-        ContractErrorCode::InvalidValue | ContractErrorCode::VersionMismatch => {
-            tonic::Status::invalid_argument(detail)
-        }
-        ContractErrorCode::Conflict | ContractErrorCode::DigestMismatch => {
+    match error.kind() {
+        ProtocolErrorKind::MissingField
+        | ProtocolErrorKind::InvalidEnum
+        | ProtocolErrorKind::InvalidValue
+        | ProtocolErrorKind::OutOfRange
+        | ProtocolErrorKind::DuplicateField
+        | ProtocolErrorKind::InconsistentFields
+        | ProtocolErrorKind::Unsupported
+        | ProtocolErrorKind::VersionMismatch => tonic::Status::invalid_argument(detail),
+        ProtocolErrorKind::Conflict | ProtocolErrorKind::DigestMismatch => {
             tonic::Status::already_exists(detail)
         }
-        ContractErrorCode::Capacity => tonic::Status::resource_exhausted(detail),
+        ProtocolErrorKind::Capacity => tonic::Status::resource_exhausted(detail),
     }
 }
 

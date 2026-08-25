@@ -11,7 +11,7 @@ use crate::query_execution::{
     RuntimeFilterConsumerTarget, RuntimeFilterContributionKind, RuntimeFilterLateApplyGranularity,
     RuntimeFilterProducerTarget,
 };
-use novarocks_proto::plan;
+use novarocks_proto_models::plan;
 
 use super::semantic_encoder;
 

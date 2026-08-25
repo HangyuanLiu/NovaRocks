@@ -25,7 +25,7 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::outcome::FragmentProfileSet;
 use crate::query_execution::terminal_codec::decode_runtime_profile_tree;
 use novarocks_proto::lifecycle::{QueryTerminalProfileContributionV1, QueryTerminalSnapshot};
-use novarocks_proto::novarocks;
+use novarocks_proto_models::novarocks;
 
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
 const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
@@ -1100,7 +1100,7 @@ mod tests {
     use crate::query_execution::contract::QueryId;
     use novarocks_execution::runtime::profile::{ProfileUnit, Profiler};
     use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
-    use novarocks_proto::{common, novarocks};
+    use novarocks_proto_models::{common, novarocks};
 
     fn runtime_filter_snapshot(
         backend_id: u64,
@@ -1113,7 +1113,7 @@ mod tests {
                 .expect("execution id");
         QueryTerminalSnapshot::seal(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(execution_id.into()),
+            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(execution_id)),
             backend: Some(novarocks::ParticipantBackendIdentity {
                 backend_id,
                 endpoint: Some(novarocks::QueryControlEndpoint {
@@ -1234,11 +1234,10 @@ mod tests {
     fn profile_terminal_builder_ignores_canonical_empty_contribution() {
         let snapshot = QueryTerminalSnapshot::seal(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(
+            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
                 QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
-                    .expect("execution id")
-                    .into(),
-            ),
+                    .expect("execution id"),
+            )),
             backend: Some(novarocks::ParticipantBackendIdentity {
                 backend_id: 1,
                 endpoint: Some(novarocks::QueryControlEndpoint {

@@ -1,6 +1,7 @@
 //! Wire-level execution-binding helpers and typed control-plane outcomes.
 
-use crate::{FieldPath, ProtocolError, ProtocolErrorKind, canonical, novarocks};
+use crate::{FieldPath, ProtocolError, ProtocolErrorKind, canonical};
+use novarocks_proto_models::novarocks;
 
 const DECLARATION_DIGEST_DOMAIN: &[u8] = b"novarocks.connector.execution-binding-declaration.v1\0";
 const DECLARATION_MESSAGE_NAME: &str = "novarocks.ConnectorExecutionBindingDeclaration";
@@ -552,7 +553,8 @@ mod tests {
 
     #[test]
     fn generated_descriptor_exposes_only_the_closed_provider_and_result_sets() {
-        let pool = DescriptorPool::decode(crate::FILE_DESCRIPTOR_SET).expect("descriptor set");
+        let pool = DescriptorPool::decode(novarocks_proto_models::FILE_DESCRIPTOR_SET)
+            .expect("descriptor set");
         let declaration = pool
             .get_message_by_name("novarocks.ConnectorExecutionBindingDeclaration")
             .expect("declaration descriptor");

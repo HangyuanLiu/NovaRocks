@@ -89,8 +89,8 @@ impl std::fmt::Display for QueryLifecycleError {
 
 impl std::error::Error for QueryLifecycleError {}
 
-impl From<novarocks_proto::lifecycle::ContractError> for QueryLifecycleError {
-    fn from(error: novarocks_proto::lifecycle::ContractError) -> Self {
+impl From<novarocks_proto::ProtocolError> for QueryLifecycleError {
+    fn from(error: novarocks_proto::ProtocolError) -> Self {
         Self::invalid_manifest(error.detail())
     }
 }

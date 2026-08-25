@@ -30,7 +30,7 @@ use novarocks_proto::lifecycle::{
     QueryExecutionId, QueryInitOutcome, QueryStageAck, QueryStageRequest, QueryStartAck,
     QueryStartRequest,
 };
-use novarocks_proto::novarocks as protocol_wire;
+use novarocks_proto_models::novarocks as protocol_wire;
 
 use super::QueryLifecycleTransport;
 use super::lease::{
@@ -955,7 +955,9 @@ fn attach_one(
     config: FrontendQueryLifecycleConfig,
 ) -> Result<ActiveSession, (Option<ActiveSession>, String)> {
     let attach = QueryControlAttach::parse(protocol_wire::QueryControlAttach {
-        execution_id: Some(participant_execution_id(participant).to_proto()),
+        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+            participant_execution_id(participant),
+        )),
         init_digest: participant.digest.as_bytes().to_vec(),
         frontend_owner_epoch,
     })
