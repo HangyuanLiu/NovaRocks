@@ -235,12 +235,11 @@ pub(crate) fn observe_native_trust_transport_rejection(listener: &'static str) {
         .with_label_values(&[listener])
         .inc();
 }
-/// Publishes already-counted backend registry states as neutral scalars.
+/// Publishes already-counted backend registry facts as neutral scalars.
 ///
-/// Backend membership authority is owned outside this module (`ADR-0013`), so
-/// the metrics surface deliberately names no membership type: it accepts the
-/// counts and owns only the `novarocks_backends` label set they map onto. That
-/// keeps the membership owner and this listener independently relocatable.
+/// The runtime registry remains the membership owner. This module owns only
+/// the stable metric names and label sets, so observability does not become a
+/// second membership authority.
 pub(crate) fn publish_backend_topology_metrics(
     entries: usize,
     announce_lease_valid: usize,

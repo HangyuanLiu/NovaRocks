@@ -1693,11 +1693,17 @@ fn scrape_prometheus_metrics(port: u16) -> Result<String> {
     Ok(body.to_string())
 }
 
-const FRONTEND_METRIC_FAMILIES: [&str; 8] = [
+const FRONTEND_METRIC_FAMILIES: [&str; 14] = [
     "novarocks_fragment_scheduled_total",
     "novarocks_heartbeat_rtt_seconds",
-    "novarocks_live_backends",
-    "novarocks_backends",
+    "novarocks_backend_registry_entries",
+    "novarocks_backend_announce_lease_valid",
+    "novarocks_backend_identity_verified",
+    "novarocks_backend_reported_state",
+    "novarocks_backend_compatibility",
+    "novarocks_backend_endpoint_ownership",
+    "novarocks_backend_eligible",
+    "novarocks_backend_topology_revision",
     "novarocks_frontend_query_lifecycle_active_attempts",
     "novarocks_frontend_query_lifecycle_init_total",
     "novarocks_frontend_query_lifecycle_control_total",

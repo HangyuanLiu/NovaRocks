@@ -124,7 +124,6 @@ user = "root"
 
 [cluster]
 role = "fe"
-backends = ["127.0.0.1:{be_grpc_port}"]
 heartbeat_interval_ms = 100
 heartbeat_timeout_retries = 10
 
@@ -357,7 +356,7 @@ fn assert_role_scoped_surfaces(pair: &ConfigPair, lifecycle_debug_enabled: bool)
 
     let fe_metrics = scrape_metrics(pair.fe_http_port);
     assert!(
-        fe_metrics.contains("novarocks_live_backends"),
+        fe_metrics.contains("novarocks_backend_registry_entries"),
         "FE metrics: {fe_metrics}"
     );
     assert!(
@@ -370,7 +369,7 @@ fn assert_role_scoped_surfaces(pair: &ConfigPair, lifecycle_debug_enabled: bool)
         "BE metrics: {be_metrics}"
     );
     assert!(
-        !be_metrics.contains("novarocks_live_backends"),
+        !be_metrics.contains("novarocks_backend_registry_entries"),
         "BE management leaked FE metrics: {be_metrics}"
     );
 
