@@ -21,9 +21,6 @@
 use crate::commit::retry::{
     COMMIT_RETRY_BACKOFF_MS, COMMIT_RETRY_MAX_ATTEMPTS, is_retryable_commit_conflict,
 };
-use crate::commit::write_fence::{
-    IcebergFenceAssertion, WRITE_FENCE_SUPERSEDED_SIGNAL, observe_fence,
-};
 use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::{
     FormatVersion, ManifestContentType, ManifestFile, ManifestListWriter, Summary, TableMetadata,
@@ -74,23 +71,15 @@ pub(super) async fn submit_action_commit(
     catalog.update_table(commit).await.map(Some)
 }
 
-/// Result of submitting a fenced write.
-pub(super) enum FencedSubmit {
+/// Result of submitting an optimistic-concurrency write.
+pub(super) enum OccSubmit {
     Committed(Table),
     /// The action proved itself a no-op against the observed base state.
     NoOp,
 }
 
-/// Why a fenced write submission did not commit.
-pub(super) enum FencedSubmitError {
-    /// Another owner raised this operation's fence. The attempt lost its
-    /// authority to write.
-    ///
-    /// This is terminal on purpose: it must never be reported as a retryable
-    /// conflict (retrying would re-stage under an authority we no longer hold)
-    /// and never as an unknown outcome (we have positive proof the commit did
-    /// not land).
-    FenceSuperseded { detail: String },
+/// Why an optimistic-concurrency write submission did not commit.
+pub(super) enum OccSubmitError {
     /// Ordinary optimistic-concurrency conflict on the data ref that survived
     /// every retry.
     Conflict { detail: String },
@@ -98,18 +87,15 @@ pub(super) enum FencedSubmitError {
     Failed { detail: String },
 }
 
-impl FencedSubmitError {
+impl OccSubmitError {
     pub(super) fn into_detail(self) -> String {
         match self {
-            Self::FenceSuperseded { detail }
-            | Self::Conflict { detail }
-            | Self::Failed { detail } => detail,
+            Self::Conflict { detail } | Self::Failed { detail } => detail,
         }
     }
 }
 
-/// Submit one write action under an external fence, re-staging on data-ref
-/// conflicts.
+/// Submit one write action with target-ref OCC, re-staging on conflicts.
 ///
 /// This deliberately replaces `Transaction::commit` for distributed DML.
 /// `do_commit` reloads the table, re-applies every action against the
@@ -117,51 +103,21 @@ impl FencedSubmitError {
 /// recomputed from the value it is about to assert — self-consistent by
 /// construction, and therefore incapable of rejecting a stale writer.
 ///
-/// The loop below keeps the useful half of that behaviour (re-stage against a
-/// freshly loaded base so ordinary concurrent writers still make progress)
-/// while adding the half `do_commit` cannot express: the fence assertion is
-/// carried into every attempt unchanged, so a fence raised by another owner
-/// turns into a terminal `FenceSuperseded` instead of another retry.
-///
-/// A conflict is classified by re-observing the fence ref rather than by
-/// matching catalog error text: if the fence ref no longer points at this
-/// attempt's marker, the attempt was fenced; if it does still point there, the
-/// conflict came from the data ref and is retryable.
-///
-// Design: ADR-0068 (docs/adr/ADR-0068-external-write-fence-as-catalog-linearization-point.md)
-pub(super) async fn submit_fenced_action<A>(
+/// Each retry re-stages the action against the freshly loaded base, rebuilding
+/// its target-ref requirements. Unknown submission outcomes never enter this
+/// loop; only definite catalog requirement conflicts do.
+pub(super) async fn submit_occ_action<A>(
     catalog: &dyn Catalog,
     base: &Table,
     action: Arc<A>,
-    fence: Option<&IcebergFenceAssertion>,
     label: &str,
     before_attempt: Option<&(dyn Fn(&Table) -> Result<(), String> + Send + Sync)>,
-) -> Result<FencedSubmit, FencedSubmitError>
+) -> Result<OccSubmit, OccSubmitError>
 where
     A: TransactionAction + 'static,
 {
     let ident = base.identifier().clone();
-    // A fenced attempt must re-load before staging; an unfenced one must not.
-    //
-    // Establishing this attempt's fence published a marker snapshot on the
-    // same table, so a fenced caller's handle is already one commit behind.
-    // Staging against it would compute `last_sequence_number() + 1` from
-    // pre-fence metadata and hand out a sequence number the marker already
-    // used.
-    //
-    // Unfenced families keep the exact base they were given: MV refresh pins
-    // its base metadata deliberately (ADR-0060), and silently re-pointing it at
-    // the latest metadata would defeat that pin. They still re-load on a
-    // conflict below, which is what `Transaction::commit` already did for them.
-    let mut current = match fence {
-        Some(_) => catalog
-            .load_table(&ident)
-            .await
-            .map_err(|error| FencedSubmitError::Failed {
-                detail: format!("{label} could not load the table before staging: {error}"),
-            })?,
-        None => base.clone(),
-    };
+    let mut current = base.clone();
     let mut last_conflict: Option<String> = None;
 
     for (attempt, backoff_ms) in COMMIT_RETRY_BACKOFF_MS
@@ -176,26 +132,22 @@ where
             // therefore a definite non-publication (for ADD FILES this is the
             // refreshed-base duplicate-file check), not a response-unknown
             // commit failure.
-            before_attempt(&current).map_err(|detail| FencedSubmitError::Failed {
+            before_attempt(&current).map_err(|detail| OccSubmitError::Failed {
                 detail: format!("catalog commit conflict: {detail}"),
             })?;
         }
         let staged = Arc::clone(&action)
             .commit(&current)
             .await
-            .map_err(|error| FencedSubmitError::Failed {
+            .map_err(|error| OccSubmitError::Failed {
                 detail: format!("{label} stage failed: {error}"),
             })?;
-        let extra_requirements = fence
-            .map(IcebergFenceAssertion::requirements)
-            .unwrap_or_default();
-
-        match submit_action_commit(catalog, ident.clone(), staged, extra_requirements).await {
-            Ok(Some(table)) => return Ok(FencedSubmit::Committed(table)),
-            Ok(None) => return Ok(FencedSubmit::NoOp),
+        match submit_action_commit(catalog, ident.clone(), staged, Vec::new()).await {
+            Ok(Some(table)) => return Ok(OccSubmit::Committed(table)),
+            Ok(None) => return Ok(OccSubmit::NoOp),
             Err(error) => {
                 if !is_retryable_commit_conflict(&error) {
-                    return Err(FencedSubmitError::Failed {
+                    return Err(OccSubmitError::Failed {
                         detail: format!("{label} commit failed: {error}"),
                     });
                 }
@@ -206,46 +158,11 @@ where
                     catalog
                         .load_table(&ident)
                         .await
-                        .map_err(|reload_error| FencedSubmitError::Failed {
+                        .map_err(|reload_error| OccSubmitError::Failed {
                             detail: format!(
                                 "{label} commit conflicted ({error}) and reloading the table to classify it failed: {reload_error}"
                             ),
                         })?;
-                if let Some(assertion) = fence {
-                    match observe_fence(refreshed.metadata(), assertion.fence_ref()) {
-                        Ok(Some(observed))
-                            if observed.snapshot_id == assertion.fence_snapshot_id() =>
-                        {
-                            // Fence still ours: an ordinary data-ref race.
-                        }
-                        Ok(Some(observed)) => {
-                            return Err(FencedSubmitError::FenceSuperseded {
-                                detail: format!(
-                                    "{WRITE_FENCE_SUPERSEDED_SIGNAL}: {label} was fenced, ref '{}' moved to snapshot {} (attempt held {})",
-                                    assertion.fence_ref(),
-                                    observed.snapshot_id,
-                                    assertion.fence_snapshot_id()
-                                ),
-                            });
-                        }
-                        Ok(None) => {
-                            return Err(FencedSubmitError::FenceSuperseded {
-                                detail: format!(
-                                    "{WRITE_FENCE_SUPERSEDED_SIGNAL}: {label} was fenced, ref '{}' no longer exists (attempt held {})",
-                                    assertion.fence_ref(),
-                                    assertion.fence_snapshot_id()
-                                ),
-                            });
-                        }
-                        Err(fence_error) => {
-                            return Err(FencedSubmitError::Failed {
-                                detail: format!(
-                                    "{label} commit conflicted ({error}) and the fence could not be classified: {fence_error}"
-                                ),
-                            });
-                        }
-                    }
-                }
                 last_conflict = Some(format!("{error}"));
                 current = refreshed;
                 if attempt + 1 < COMMIT_RETRY_MAX_ATTEMPTS {
@@ -255,7 +172,7 @@ where
         }
     }
 
-    Err(FencedSubmitError::Conflict {
+    Err(OccSubmitError::Conflict {
         detail: format!(
             "{label} commit conflicted after {COMMIT_RETRY_MAX_ATTEMPTS} attempts: {}",
             last_conflict.unwrap_or_else(|| "unknown conflict".to_string())

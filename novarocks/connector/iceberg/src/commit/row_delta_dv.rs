@@ -59,9 +59,9 @@ use uuid::Uuid;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::{commit_empty_iceberg_mv_snapshot, register_puffin_stats};
 use super::helpers::{
-    FencedSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
+    OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
     metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary,
-    snapshot_total_records, submit_fenced_action, target_ref_snapshot_id, write_manifest_list,
+    snapshot_total_records, submit_occ_action, target_ref_snapshot_id, write_manifest_list,
 };
 use super::row_delta_dv_metadata::{
     WrittenDvFile, build_snapshot_index_with_dv_merge, dv_summary, dv_total_records,
@@ -117,17 +117,8 @@ impl IcebergCommitAction for RowDeltaDvCommit {
                 .clone()
         };
 
-        match submit_fenced_action(
-            ctx.catalog,
-            ctx.table,
-            action,
-            ctx.fence,
-            "RowDeltaDv",
-            None,
-        )
-        .await
-        {
-            Ok(FencedSubmit::Committed(table_after)) => {
+        match submit_occ_action(ctx.catalog, ctx.table, action, "RowDeltaDv", None).await {
+            Ok(OccSubmit::Committed(table_after)) => {
                 let new_snapshot_id = required_target_ref_snapshot_id(
                     table_after.metadata(),
                     ctx.target_ref,
@@ -159,7 +150,7 @@ impl IcebergCommitAction for RowDeltaDvCommit {
             // `commit_empty_iceberg_mv_snapshot` above, and the action always
             // stages a snapshot, so this arm reports the same value that path
             // reports for an empty change set.
-            Ok(FencedSubmit::NoOp) => Ok(CommitOutcome {
+            Ok(OccSubmit::NoOp) => Ok(CommitOutcome {
                 new_snapshot_id: prev_snapshot_id.unwrap_or(0),
                 written_manifest_paths: written_manifest_paths(),
             }),

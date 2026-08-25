@@ -18,7 +18,7 @@
 //! Self-assembled fast-append action for INSERT INTO.
 //!
 //! Every append — v2 and v3 — is staged by `FastAppendV3TxnAction` and
-//! submitted through `helpers::submit_fenced_action`. iceberg-rust's built-in
+//! submitted through `helpers::submit_occ_action`. iceberg-rust's built-in
 //! `Transaction::fast_append` is deliberately unused: `Transaction::commit`
 //! re-runs every action against the base it just reloaded and therefore
 //! recomputes each requirement from the value it is about to assert, which can
@@ -44,9 +44,9 @@ use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::helpers::{
-    FencedSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
+    OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
     metadata_dir, now_ms, read_snapshot_manifest_list, required_target_ref_snapshot_id,
-    snapshot_summary, snapshot_total_records, submit_fenced_action, target_ref_snapshot_id,
+    snapshot_summary, snapshot_total_records, submit_occ_action, target_ref_snapshot_id,
     write_manifest_list,
 };
 use super::overwrite::write_added_data_manifest;
@@ -339,17 +339,8 @@ async fn commit_self_assembled_append(
     let sketch_sets = ctx.collector.take_sketch_sets();
 
     let guard = ctx.collector.fast_append_attempt_guard();
-    match submit_fenced_action(
-        ctx.catalog,
-        ctx.table,
-        action,
-        ctx.fence,
-        label,
-        guard.as_deref(),
-    )
-    .await
-    {
-        Ok(FencedSubmit::Committed(table_after)) => {
+    match submit_occ_action(ctx.catalog, ctx.table, action, label, guard.as_deref()).await {
+        Ok(OccSubmit::Committed(table_after)) => {
             let new_snapshot_id =
                 required_target_ref_snapshot_id(table_after.metadata(), ctx.target_ref, label)?;
             let new_sequence_number = table_after.metadata().last_sequence_number();
@@ -374,7 +365,7 @@ async fn commit_self_assembled_append(
         // An append always stages `AddSnapshot` + `SetSnapshotRef`, so it never
         // proves itself a no-op. Report the same outcome an empty append input
         // reports at the entry points above rather than inventing a new one.
-        Ok(FencedSubmit::NoOp) => Ok(CommitOutcome {
+        Ok(OccSubmit::NoOp) => Ok(CommitOutcome {
             new_snapshot_id: target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref)
                 .unwrap_or(0),
             written_manifest_paths: collected_manifest_paths(&manifest_paths_out),

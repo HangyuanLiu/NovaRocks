@@ -49,8 +49,8 @@ use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_prope
 use super::data_file::clone_data_file_with_first_row_id;
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
-    FencedSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
-    metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary, submit_fenced_action,
+    OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
+    metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary, submit_occ_action,
     target_ref_snapshot_id, write_manifest_list,
 };
 use super::overwrite::{
@@ -136,17 +136,8 @@ impl IcebergCommitAction for OverwritePartitionsCommit {
                 .clone()
         };
 
-        match submit_fenced_action(
-            ctx.catalog,
-            ctx.table,
-            action,
-            ctx.fence,
-            "OverwritePartitions",
-            None,
-        )
-        .await
-        {
-            Ok(FencedSubmit::Committed(table_after)) => {
+        match submit_occ_action(ctx.catalog, ctx.table, action, "OverwritePartitions", None).await {
+            Ok(OccSubmit::Committed(table_after)) => {
                 let new_snapshot_id = match required_target_ref_snapshot_id(
                     table_after.metadata(),
                     ctx.target_ref,
@@ -176,7 +167,7 @@ impl IcebergCommitAction for OverwritePartitionsCommit {
             // The action always stages a snapshot, so this arm reports the same
             // outcome an unchanged target ref has: the previous snapshot id, or
             // 0 when the ref does not exist yet.
-            Ok(FencedSubmit::NoOp) => Ok(CommitOutcome {
+            Ok(OccSubmit::NoOp) => Ok(CommitOutcome {
                 new_snapshot_id: prev_snapshot_id.unwrap_or(0),
                 written_manifest_paths: written_manifest_paths(),
             }),

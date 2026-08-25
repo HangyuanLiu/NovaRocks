@@ -54,8 +54,8 @@ use uuid::Uuid;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
-    FencedSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
-    metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary, submit_fenced_action,
+    OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
+    metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary, submit_occ_action,
     target_ref_snapshot_id, write_manifest_list,
 };
 use crate::commit::abort::AbortLog;
@@ -70,17 +70,16 @@ impl IcebergCommitAction for OverwriteCommit {
         let staged = prepare_overwrite_action(&ctx)?;
         let sketch_sets = ctx.collector.take_sketch_sets();
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
-        match submit_fenced_action(
+        match submit_occ_action(
             ctx.catalog,
             ctx.table,
             Arc::clone(&staged.action),
-            ctx.fence,
             "Overwrite",
             None,
         )
         .await
         {
-            Ok(FencedSubmit::Committed(table_after)) => {
+            Ok(OccSubmit::Committed(table_after)) => {
                 let new_snapshot_id = match required_target_ref_snapshot_id(
                     table_after.metadata(),
                     ctx.target_ref,
@@ -110,7 +109,7 @@ impl IcebergCommitAction for OverwriteCommit {
             // Empty input over an empty base with no provider properties: the
             // action proved there is nothing to publish, so the target ref
             // stays where it was (0 when it does not exist yet).
-            Ok(FencedSubmit::NoOp) => Ok(CommitOutcome {
+            Ok(OccSubmit::NoOp) => Ok(CommitOutcome {
                 new_snapshot_id: prev_snapshot_id.unwrap_or(0),
                 written_manifest_paths: staged.written_manifest_paths(),
             }),

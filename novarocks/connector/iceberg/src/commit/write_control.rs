@@ -5496,21 +5496,12 @@ mod tests {
         )
         .expect("operation completion");
         let aggregate_digest = completion.aggregate_digest();
-        // Publish the fence marker first: a commit derives its assertion from
-        // external truth, so an attempt that never established a fence is
-        // refused before it reaches the table.
-        let commit_fence = fence(operation_id);
-        control
-            .establish_external_fence(ConnectorExternalFenceRequest {
-                owner: owner.clone(),
-                fence: commit_fence.clone(),
-                context: context(),
-            })
-            .expect("establish external fence");
         let outcome = control
             .commit(ConnectorWriteCommitRequest {
                 completion,
-                fence: novarocks_spi::connector::ConnectorWriteFencing::Fenced(commit_fence),
+                fence: novarocks_spi::connector::ConnectorWriteFencing::NotFencedByThisPhase {
+                    reason: "ordinary write publication uses target-ref OCC",
+                },
                 context: context(),
             })
             .expect("commit empty overwrite");
@@ -5543,27 +5534,23 @@ mod tests {
             loaded.table.metadata().default_partition_spec_id(),
             committed_partitioning.spec_id()
         );
-        // The fence marker is itself a snapshot on the provider-private fence
-        // ref, so count only data snapshots: this assertion is about the
-        // managed repartition committing exactly once, not about how many
-        // snapshots the metadata holds in total.
-        let data_snapshots = loaded
-            .table
-            .metadata()
-            .snapshots()
-            .filter(|snapshot| {
-                !crate::commit::write_fence::is_fence_marker_snapshot(snapshot.summary())
-            })
-            .count();
+        let data_snapshots = loaded.table.metadata().snapshots().count();
         assert_eq!(data_snapshots, 1);
-        let marker = operation_marker_from_snapshot(snapshot)
-            .expect("decode operation marker")
+        let raw_marker = snapshot
+            .summary()
+            .additional_properties
+            .get(ICEBERG_WRITE_OPERATION_MARKER_PROPERTY)
             .expect("operation marker");
+        let marker: IcebergWriteOperationMarkerV1 =
+            serde_json::from_str(raw_marker).expect("decode operation marker");
         assert_eq!(
             marker.publication.publication_id().to_bytes(),
             operation_id.to_bytes()
         );
-        assert_eq!(marker.publication.family(), LakePublicationFamily::Write);
+        assert_eq!(
+            marker.publication.family(),
+            LakePublicationFamily::MaterializedViewRefresh
+        );
         assert_eq!(
             decode_marker_fixed::<32>(&marker.cohort_set_digest_base64, "cohort digest")
                 .expect("cohort digest"),
