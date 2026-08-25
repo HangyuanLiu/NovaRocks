@@ -156,8 +156,8 @@ user = "root"
 
 [connector.object_store]
 endpoint = "http://127.0.0.1:9000"
-access_key_id = "admin"
-access_key_secret = "admin123"
+access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"
+access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
 enable_path_style_access = true
 ```
 
@@ -165,6 +165,9 @@ enable_path_style_access = true
 user tables belong to explicitly created external Iceberg catalogs;
 `[connector.object_store]` supplies process-local object-store credentials for
 connector execution and does not create a native internal table store.
+Secret-bearing scalars may be literal for local development or an exact
+`${ENV:VAR}` reference. References are resolved once by Server startup; missing,
+empty, malformed, and non-UTF-8 values fail startup without exposing the value.
 
 ## Run
 

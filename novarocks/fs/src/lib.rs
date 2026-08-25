@@ -52,6 +52,7 @@ pub use catalog_properties::{
     object_store_config_from_aws_s3_catalog_property_pairs,
 };
 pub use error::{FileError, FileErrorKind, FileResult};
+pub use novarocks_secret::SecretValue;
 pub use object_store_credentials::{ObjectStoreCredentials, ObjectStoreCredentialsSource};
 pub use object_store_settings::ObjectStoreRetrySettings;
 pub use physical_reader::{

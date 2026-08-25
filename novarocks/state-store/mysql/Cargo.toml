@@ -20,6 +20,7 @@ bytes = "1"
 futures = "0.3"
 hex = "0.4"
 mysql_async = { version = "=0.37.0", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12"] }
+novarocks-secret = { path = "../../secret" }
 novarocks-spi = { path = "../../spi" }
 rustls = { version = "0.23", default-features = false }
 serde = { version = "1", features = ["derive"] }

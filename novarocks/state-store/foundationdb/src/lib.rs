@@ -145,7 +145,7 @@ mod default_tests {
                 tls_key_path: None,
                 tls_ca_path: None,
                 tls_verify_peers: None,
-                tls_password_env: None,
+                tls_password: None,
             },
         ) {
             Ok(_) => panic!("default FoundationDB package must not create a native factory"),

@@ -21,6 +21,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use novarocks_secret::SecretValue;
 use uuid::Uuid;
 
 use crate::state_store_limits::{
@@ -127,7 +128,7 @@ pub struct MySqlClientConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
-    pub password_env: String,
+    pub password: SecretValue,
     pub tls_mode: MySqlTlsMode,
     pub tls_ca_path: Option<PathBuf>,
     pub tls_cert_path: Option<PathBuf>,
@@ -149,10 +150,8 @@ impl MySqlClientConfig {
         if self.username.trim().is_empty() {
             bail!("InvalidStateStoreConfig: mysql_client.username must not be empty");
         }
-        if !valid_environment_variable_name(&self.password_env) {
-            bail!(
-                "InvalidStateStoreConfig: mysql_client.password_env must be a non-empty environment variable name"
-            );
+        if self.password.is_empty() {
+            bail!("InvalidStateStoreConfig: mysql_client.password must not be empty");
         }
         if self.connect_timeout_ms == 0 || self.connect_timeout_ms > MYSQL_MAX_CONNECT_TIMEOUT_MS {
             bail!(
@@ -212,10 +211,7 @@ impl fmt::Debug for MySqlClientConfig {
             .field("host_configured", &!self.host.trim().is_empty())
             .field("port_configured", &(self.port != 0))
             .field("username_configured", &!self.username.trim().is_empty())
-            .field(
-                "password_env_configured",
-                &valid_environment_variable_name(&self.password_env),
-            )
+            .field("password_configured", &!self.password.is_empty())
             .field("tls_enabled", &(self.tls_mode != MySqlTlsMode::Disabled))
             .field(
                 "tls_verify_identity",
@@ -248,15 +244,6 @@ fn mysql_host_is_ip_address(host: &str) -> bool {
     normalized.parse::<IpAddr>().is_ok()
 }
 
-fn valid_environment_variable_name(name: &str) -> bool {
-    let mut bytes = name.bytes();
-    let Some(first) = bytes.next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || first == b'_')
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StateStoreAppConfig {
     pub store: StateStoreConfig,
@@ -286,7 +273,7 @@ pub struct FoundationDbClientConfig {
     pub tls_key_path: Option<PathBuf>,
     pub tls_ca_path: Option<PathBuf>,
     pub tls_verify_peers: Option<String>,
-    pub tls_password_env: Option<String>,
+    pub tls_password: Option<SecretValue>,
 }
 
 impl FoundationDbClientConfig {
@@ -301,7 +288,7 @@ impl FoundationDbClientConfig {
             || self.tls_key_path.is_some()
             || self.tls_ca_path.is_some()
             || self.tls_verify_peers.is_some()
-            || self.tls_password_env.is_some();
+            || self.tls_password.is_some();
         if tls_configured
             && (self.tls_cert_path.is_none()
                 || self.tls_key_path.is_none()
@@ -329,16 +316,12 @@ impl FoundationDbClientConfig {
         {
             bail!("InvalidStateStoreConfig: tls_verify_peers must not be empty");
         }
-        if let Some(variable) = self.tls_password_env.as_deref() {
-            if variable.trim().is_empty() {
-                bail!("InvalidStateStoreConfig: tls_password_env must not be empty");
-            }
-            let value = std::env::var_os(variable).ok_or_else(|| {
-                anyhow::anyhow!("InvalidStateStoreConfig: tls_password_env variable is not defined")
-            })?;
-            if value.is_empty() {
-                bail!("InvalidStateStoreConfig: tls_password_env variable must not be empty");
-            }
+        if self
+            .tls_password
+            .as_ref()
+            .is_some_and(SecretValue::is_empty)
+        {
+            bail!("InvalidStateStoreConfig: tls_password must not be empty");
         }
 
         Ok(())
@@ -360,10 +343,7 @@ impl fmt::Debug for FoundationDbClientConfig {
                 "tls_verify_peers_configured",
                 &self.tls_verify_peers.is_some(),
             )
-            .field(
-                "tls_password_env_configured",
-                &self.tls_password_env.is_some(),
-            )
+            .field("tls_password_configured", &self.tls_password.is_some())
             .finish()
     }
 }

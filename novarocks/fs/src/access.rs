@@ -27,7 +27,7 @@ use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer, RetryLayer, TimeoutLayer};
 use url::Url;
 
-use crate::{FileCancellation, FileError, FileErrorKind, FileReadRange, FileResult};
+use crate::{FileCancellation, FileError, FileErrorKind, FileReadRange, FileResult, SecretValue};
 
 const DEFAULT_OBJECT_STORE_RETRY_MAX_TIMES: usize = 6;
 const DEFAULT_OBJECT_STORE_RETRY_MIN_DELAY_MS: u64 = 100;
@@ -558,9 +558,9 @@ impl FileIdentity {
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct ObjectStoreConfig {
     pub endpoint: String,
-    pub access_key_id: String,
-    pub access_key_secret: String,
-    pub session_token: Option<String>,
+    pub access_key_id: SecretValue,
+    pub access_key_secret: SecretValue,
+    pub session_token: Option<SecretValue>,
     pub enable_path_style_access: Option<bool>,
     pub region: Option<String>,
     pub retry_max_times: Option<usize>,
@@ -831,13 +831,13 @@ fn build_object_store_operator(bucket: &str, config: &ObjectStoreConfig) -> File
         .endpoint(&endpoint)
         .bucket(bucket)
         .region(region)
-        .access_key_id(&config.access_key_id)
-        .secret_access_key(&config.access_key_secret);
+        .access_key_id(config.access_key_id.expose_secret())
+        .secret_access_key(config.access_key_secret.expose_secret());
     if !use_path_style {
         builder = builder.enable_virtual_host_style();
     }
-    if let Some(session_token) = config.session_token.as_deref() {
-        builder = builder.session_token(session_token);
+    if let Some(session_token) = config.session_token.as_ref() {
+        builder = builder.session_token(session_token.expose_secret());
     }
     let mut operator = Operator::new(builder)
         .map_err(|error| map_opendal_error("initialize object store operator", error))?

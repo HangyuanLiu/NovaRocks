@@ -34,6 +34,7 @@ use crate::{
     MYSQL_MAX_KEY_BYTES, MySqlClientConfig, MySqlTlsMode, MysqlTestLimitOverrides,
     MysqlTestProviderConfig, MysqlTestStoreConfig,
 };
+use novarocks_secret::SecretValue;
 use novarocks_spi::state_store::{
     ChangeCursor, ChangePollRequest, CommitOutcome, CommitResolution, ContinuationToken,
     Direction as StoreDirection, FeDeploymentView, Key, KeyRange,
@@ -666,7 +667,7 @@ fn client_config(id: u64) -> Result<MySqlClientConfig, ProtocolError> {
         host: required_env(id, "NOVAROCKS_MYSQL_HOST")?,
         port,
         username: required_env(id, "NOVAROCKS_MYSQL_USERNAME")?,
-        password_env: required_env(id, "NOVAROCKS_MYSQL_PASSWORD_ENV")?,
+        password: SecretValue::new(required_fixture_password(id)?),
         tls_mode: MySqlTlsMode::Disabled,
         tls_ca_path: None,
         tls_cert_path: None,
@@ -678,7 +679,12 @@ fn client_config(id: u64) -> Result<MySqlClientConfig, ProtocolError> {
     })
 }
 
-fn required_env(id: u64, name: &'static str) -> Result<String, ProtocolError> {
+fn required_fixture_password(id: u64) -> Result<String, ProtocolError> {
+    let password_env = required_env(id, "NOVAROCKS_MYSQL_PASSWORD_ENV")?;
+    required_env(id, &password_env)
+}
+
+fn required_env(id: u64, name: &str) -> Result<String, ProtocolError> {
     std::env::var(name)
         .ok()
         .filter(|value| !value.is_empty())

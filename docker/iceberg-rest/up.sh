@@ -379,8 +379,8 @@ user = "root"
 
 [connector.object_store]
 endpoint = "$minio_endpoint"
-access_key_id = "$minio_user"
-access_key_secret = "$minio_password"
+access_key_id = "\${ENV:AWS_S3_ACCESS_KEY_ID}"
+access_key_secret = "\${ENV:AWS_S3_SECRET_ACCESS_KEY}"
 # Every generated and suite-owned CREATE EXTERNAL CATALOG statement declares
 # aws.s3.region, and the Iceberg control factory rejects a catalog whose
 # object-store credentials differ from this server-composed binding, so the
@@ -415,8 +415,8 @@ mv_refresh_scheduler_max_failure_backoff_ms = 2000
 
 [connector.object_store]
 endpoint = "$minio_endpoint"
-access_key_id = "$minio_user"
-access_key_secret = "$minio_password"
+access_key_id = "\${ENV:AWS_S3_ACCESS_KEY_ID}"
+access_key_secret = "\${ENV:AWS_S3_SECRET_ACCESS_KEY}"
 # Every generated and suite-owned CREATE EXTERNAL CATALOG statement declares
 # aws.s3.region, and the Iceberg control factory rejects a catalog whose
 # object-store credentials differ from this server-composed binding, so the

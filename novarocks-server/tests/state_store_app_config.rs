@@ -16,6 +16,7 @@
 // under the License.
 
 use std::path::PathBuf;
+use std::process::Command;
 
 use novarocks_server::app_config::NovaRocksConfig;
 use novarocks_server::state_store_config::{MySqlTlsMode, StateStoreProviderConfig};
@@ -62,7 +63,7 @@ database = "novarocks_control_plane"
 host = "mysql.internal.example"
 port = 3306
 username = "novarocks_state_store"
-password_env = "NOVAROCKS_STATE_STORE_MYSQL_PASSWORD_UNSET"
+password = "mysql-password"
 tls_mode = "verify_identity"
 tls_ca_path = "{}"
 tls_cert_path = "{}"
@@ -89,10 +90,7 @@ inactive_connection_ttl_ms = 30000
     assert_eq!(client.host, "mysql.internal.example");
     assert_eq!(client.port, 3306);
     assert_eq!(client.username, "novarocks_state_store");
-    assert_eq!(
-        client.password_env,
-        "NOVAROCKS_STATE_STORE_MYSQL_PASSWORD_UNSET"
-    );
+    assert_eq!(client.password.expose_secret(), "mysql-password");
     assert_eq!(client.tls_mode, MySqlTlsMode::VerifyIdentity);
     assert_eq!(client.tls_ca_path.as_deref(), Some(ca.as_path()));
     assert_eq!(client.tls_cert_path.as_deref(), Some(cert.as_path()));
@@ -102,6 +100,132 @@ inactive_connection_ttl_ms = 30000
     assert_eq!(client.pool_max, 16);
     assert_eq!(client.inactive_connection_ttl_ms, 30_000);
     Ok(())
+}
+
+#[test]
+fn server_load_resolves_environment_references_once_without_secret_diagnostics()
+-> anyhow::Result<()> {
+    const CHILD_CONFIG_ENV: &str = "NOVAROCKS_NWT1_ENV_REFERENCE_CONFIG";
+    const CHILD_SCENARIO_ENV: &str = "NOVAROCKS_NWT1_ENV_REFERENCE_SCENARIO";
+    const ACCESS_KEY_ENV: &str = "NOVAROCKS_NWT1_ACCESS_KEY";
+    const ACCESS_SECRET_ENV: &str = "NOVAROCKS_NWT1_ACCESS_SECRET";
+    const CANARY: &str = "nwt-1-config-secret-canary";
+
+    if let Some(config_path) = std::env::var_os(CHILD_CONFIG_ENV) {
+        let result = NovaRocksConfig::load_from_file(std::path::Path::new(&config_path));
+        match std::env::var(CHILD_SCENARIO_ENV).as_deref() {
+            Ok("success") => {
+                let config = result?;
+                let object_store = config
+                    .connector
+                    .object_store
+                    .expect("object store configuration");
+                assert_eq!(
+                    object_store
+                        .access_key_id
+                        .as_ref()
+                        .map(|value| value.expose_secret()),
+                    Some(CANARY)
+                );
+                assert_eq!(
+                    object_store
+                        .access_key_secret
+                        .as_ref()
+                        .map(|value| value.expose_secret()),
+                    Some(CANARY)
+                );
+                assert!(!format!("{object_store:?}").contains(CANARY));
+            }
+            Ok("missing") => assert_error_category(result, "missing"),
+            Ok("empty") => assert_error_category(result, "empty"),
+            Ok("malformed") => assert_error_category(result, "not an exact ${ENV:VAR} reference"),
+            scenario => panic!("unexpected environment-reference child scenario: {scenario:?}"),
+        }
+        return Ok(());
+    }
+
+    for (scenario, config, access_key, access_secret) in [
+        (
+            "success",
+            r#"
+[connector.object_store]
+endpoint = "http://object-store:9000"
+access_key_id = "${ENV:NOVAROCKS_NWT1_ACCESS_KEY}"
+access_key_secret = "${ENV:NOVAROCKS_NWT1_ACCESS_SECRET}"
+"#,
+            Some(CANARY),
+            Some(CANARY),
+        ),
+        (
+            "missing",
+            r#"
+[connector.object_store]
+access_key_id = "${ENV:NOVAROCKS_NWT1_ACCESS_KEY}"
+"#,
+            None,
+            None,
+        ),
+        (
+            "empty",
+            r#"
+[connector.object_store]
+access_key_id = "${ENV:NOVAROCKS_NWT1_ACCESS_KEY}"
+"#,
+            Some(""),
+            None,
+        ),
+        (
+            "malformed",
+            r#"
+[connector.object_store]
+access_key_id = "prefix-${ENV:NOVAROCKS_NWT1_ACCESS_KEY}"
+"#,
+            Some(CANARY),
+            None,
+        ),
+    ] {
+        let config_path = tempfile::NamedTempFile::new()?;
+        std::fs::write(config_path.path(), config)?;
+        let output = Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg("server_load_resolves_environment_references_once_without_secret_diagnostics")
+            .arg("--nocapture")
+            .env(CHILD_CONFIG_ENV, config_path.path())
+            .env(CHILD_SCENARIO_ENV, scenario)
+            .env_remove(ACCESS_KEY_ENV)
+            .env_remove(ACCESS_SECRET_ENV)
+            .envs(access_key.map(|value| (ACCESS_KEY_ENV, value)))
+            .envs(access_secret.map(|value| (ACCESS_SECRET_ENV, value)))
+            .output()?;
+        let diagnostics = format!(
+            "stdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success(),
+            "{scenario} child failed\n{diagnostics}"
+        );
+        assert!(
+            !diagnostics.contains(CANARY),
+            "{scenario} child diagnostics leaked secret\n{diagnostics}"
+        );
+    }
+
+    Ok(())
+}
+
+fn assert_error_category(result: anyhow::Result<NovaRocksConfig>, expected: &str) {
+    let error = match result {
+        Ok(_) => panic!("environment reference must fail"),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(expected),
+        "expected {expected:?}, got {message:?}"
+    );
+    assert!(!message.contains("nwt-1-config-secret-canary"));
 }
 
 #[test]
@@ -120,7 +244,7 @@ path = "meta/state-store.sqlite"
 host = "mysql.internal.example"
 port = 3306
 username = "novarocks"
-password_env = "NOVAROCKS_MYSQL_PASSWORD"
+password = "mysql-password"
 tls_mode = "required"
 connect_timeout_ms = 1000
 pool_min = 1
@@ -141,7 +265,7 @@ deployment_owner = "fe-a"
 host = "mysql.internal.example"
 port = 3306
 username = "novarocks"
-password_env = "NOVAROCKS_MYSQL_PASSWORD"
+password = "mysql-password"
 tls_mode = "required"
 connect_timeout_ms = 1000
 pool_min = 1
@@ -170,7 +294,7 @@ database = "novarocks_control_plane"
 host = "mysql.internal.example"
 port = 3306
 username = "novarocks"
-password_env = "NOVAROCKS_MYSQL_PASSWORD"
+password = "mysql-password"
 tls_mode = "required"
 connect_timeout_ms = 1000
 pool_min = 1
@@ -191,7 +315,7 @@ database = "invalid-database-name"
 host = "mysql.internal.example"
 port = 3306
 username = "novarocks"
-password_env = "NOVAROCKS_MYSQL_PASSWORD"
+password = "mysql-password"
 tls_mode = "required"
 connect_timeout_ms = 1000
 pool_min = 1
@@ -309,7 +433,7 @@ fn foundationdb_config_loads_complete_tls_client_configuration() -> anyhow::Resu
     const PASSWORD_ENV: &str = "NOVAROCKS_TEST_FDB_TLS_PASSWORD";
 
     if let Some(config_path) = std::env::var_os(FIXTURE_ENV) {
-        return assert_complete_tls_client_configuration(PathBuf::from(config_path), PASSWORD_ENV);
+        return assert_complete_tls_client_configuration(PathBuf::from(config_path));
     }
 
     let fixture_dir = tempfile::tempdir()?;
@@ -335,7 +459,7 @@ tls_cert_path = "{}"
 tls_key_path = "{}"
 tls_ca_path = "{}"
 tls_verify_peers = "Check.Valid=1"
-tls_password_env = "{}"
+tls_password = "${{ENV:{}}}"
 "#,
         cluster_file.display(),
         tls_cert.display(),
@@ -361,10 +485,7 @@ tls_password_env = "{}"
     Ok(())
 }
 
-fn assert_complete_tls_client_configuration(
-    config_path: PathBuf,
-    password_env: &str,
-) -> anyhow::Result<()> {
+fn assert_complete_tls_client_configuration(config_path: PathBuf) -> anyhow::Result<()> {
     let fixture_dir = config_path.parent().expect("fixture directory");
     let cluster_file = fixture_dir.join("fdb.cluster");
     let tls_cert = fixture_dir.join("client.crt");
@@ -387,7 +508,13 @@ fn assert_complete_tls_client_configuration(
     assert_eq!(client.tls_key_path.as_deref(), Some(tls_key.as_path()));
     assert_eq!(client.tls_ca_path.as_deref(), Some(tls_ca.as_path()));
     assert_eq!(client.tls_verify_peers.as_deref(), Some("Check.Valid=1"));
-    assert_eq!(client.tls_password_env.as_deref(), Some(password_env));
+    assert_eq!(
+        client
+            .tls_password
+            .as_ref()
+            .map(|value| value.expose_secret()),
+        Some("test-password")
+    );
 
     let debug = format!("{client:?}");
     for secret in [
@@ -395,7 +522,7 @@ fn assert_complete_tls_client_configuration(
         tls_key.to_string_lossy().as_ref(),
         tls_ca.to_string_lossy().as_ref(),
         "Check.Valid=1",
-        password_env,
+        "test-password",
     ] {
         assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
     }

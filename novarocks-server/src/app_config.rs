@@ -18,11 +18,13 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 
+use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{
     FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, StateStoreAppConfig,
     StateStoreConfig, StateStoreProviderConfig,
 };
 use crate::state_store_limits::StateStoreLimitOverrides;
+use novarocks_secret::SecretValue;
 use novarocks_types::ClusterRole;
 use uuid::Uuid;
 
@@ -105,7 +107,7 @@ struct MySqlClientConfigWire {
     host: String,
     port: u16,
     username: String,
-    password_env: String,
+    password: String,
     tls_mode: MySqlTlsModeWire,
     tls_ca_path: Option<PathBuf>,
     tls_cert_path: Option<PathBuf>,
@@ -121,7 +123,7 @@ impl From<MySqlClientConfigWire> for MySqlClientConfig {
             host: w.host,
             port: w.port,
             username: w.username,
-            password_env: w.password_env,
+            password: SecretValue::new(w.password),
             tls_mode: match w.tls_mode {
                 MySqlTlsModeWire::Disabled => MySqlTlsMode::Disabled,
                 MySqlTlsModeWire::Required => MySqlTlsMode::Required,
@@ -211,7 +213,7 @@ struct FoundationDbClientConfigWire {
     tls_key_path: Option<PathBuf>,
     tls_ca_path: Option<PathBuf>,
     tls_verify_peers: Option<String>,
-    tls_password_env: Option<String>,
+    tls_password: Option<String>,
 }
 fn deserialize_foundationdb_client<'de, D: Deserializer<'de>>(
     d: D,
@@ -223,7 +225,7 @@ fn deserialize_foundationdb_client<'de, D: Deserializer<'de>>(
             tls_key_path: w.tls_key_path,
             tls_ca_path: w.tls_ca_path,
             tls_verify_peers: w.tls_verify_peers,
-            tls_password_env: w.tls_password_env,
+            tls_password: w.tls_password.map(SecretValue::new),
         }),
     )
 }
@@ -441,7 +443,7 @@ pub struct NovaRocksConfig {
     #[serde(default)]
     pub standalone_server: Option<StandaloneServerConfig>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_connector_config")]
     pub connector: ConnectorConfig,
 
     #[serde(default)]
@@ -455,8 +457,14 @@ impl NovaRocksConfig {
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path)
             .with_context(|| format!("read config file: {}", path.display()))?;
-        let cfg: NovaRocksConfig =
-            toml::from_str(&s).with_context(|| format!("parse toml: {}", path.display()))?;
+        let mut value: toml::Value =
+            toml::from_str(&s).with_context(|| format!("parse config TOML: {}", path.display()))?;
+        resolve_env_references(&mut value).with_context(|| {
+            format!("resolve config environment references: {}", path.display())
+        })?;
+        let cfg: NovaRocksConfig = value
+            .try_into()
+            .with_context(|| format!("deserialize config TOML: {}", path.display()))?;
         validate_state_store_configuration(&cfg)?;
         validate_query_control_config(&cfg.runtime)?;
         validate_lake_publication_runtime_policy(&cfg.runtime)?;
@@ -574,24 +582,63 @@ impl Default for ServerConfig {
 /// Shared object-store credentials loaded independently by every backend at
 /// startup. Native plans may reference this binding but must never carry its
 /// values.
-#[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConnectorObjectStoreConfig {
-    #[serde(default)]
     pub endpoint: Option<String>,
-    #[serde(default)]
-    pub access_key_id: Option<String>,
-    #[serde(default)]
-    pub access_key_secret: Option<String>,
-    #[serde(default)]
+    pub access_key_id: Option<SecretValue>,
+    pub access_key_secret: Option<SecretValue>,
     pub region: Option<String>,
-    #[serde(default)]
     pub enable_path_style_access: Option<bool>,
 }
 
-#[derive(Clone, Debug, Deserialize, Default, PartialEq, Eq)]
-#[serde(default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConnectorConfig {
     pub object_store: Option<ConnectorObjectStoreConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ConnectorObjectStoreConfigWire {
+    endpoint: Option<String>,
+    access_key_id: Option<String>,
+    access_key_secret: Option<String>,
+    region: Option<String>,
+    enable_path_style_access: Option<bool>,
+}
+
+impl Default for ConnectorObjectStoreConfigWire {
+    fn default() -> Self {
+        Self {
+            endpoint: None,
+            access_key_id: None,
+            access_key_secret: None,
+            region: None,
+            enable_path_style_access: None,
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct ConnectorConfigWire {
+    object_store: Option<ConnectorObjectStoreConfigWire>,
+}
+
+fn deserialize_connector_config<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<ConnectorConfig, D::Error> {
+    let wire = ConnectorConfigWire::deserialize(deserializer)?;
+    Ok(ConnectorConfig {
+        object_store: wire
+            .object_store
+            .map(|object_store| ConnectorObjectStoreConfig {
+                endpoint: object_store.endpoint,
+                access_key_id: object_store.access_key_id.map(SecretValue::new),
+                access_key_secret: object_store.access_key_secret.map(SecretValue::new),
+                region: object_store.region,
+                enable_path_style_access: object_store.enable_path_style_access,
+            }),
+    })
 }
 
 impl ConnectorConfig {
@@ -611,11 +658,14 @@ impl ConnectorConfig {
         let credentials = novarocks_fs::ObjectStoreCredentials::from_parts(
             novarocks_fs::ObjectStoreCredentialsSource::ConnectorStartupConfig,
             object_store.endpoint.as_deref().unwrap_or_default(),
-            object_store.access_key_id.as_deref().unwrap_or_default(),
+            object_store
+                .access_key_id
+                .clone()
+                .unwrap_or_else(|| SecretValue::new("")),
             object_store
                 .access_key_secret
-                .as_deref()
-                .unwrap_or_default(),
+                .clone()
+                .unwrap_or_else(|| SecretValue::new("")),
             object_store.region.as_deref(),
             object_store.enable_path_style_access,
         )?;
@@ -1979,7 +2029,7 @@ deployment_owner = "fe-a"
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("parse toml"));
+        assert!(error.to_string().contains("deserialize config TOML"));
         Ok(())
     }
 
@@ -2002,7 +2052,7 @@ deployment_owner = "fe-a"
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("parse toml"));
+        assert!(error.to_string().contains("deserialize config TOML"));
         Ok(())
     }
 

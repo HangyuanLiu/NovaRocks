@@ -276,8 +276,8 @@ mod tests {
     fn object_store_config() -> novarocks_fs::ObjectStoreConfig {
         novarocks_fs::ObjectStoreConfig {
             endpoint: "http://minio:9000".to_string(),
-            access_key_id: "server-access".to_string(),
-            access_key_secret: "server-secret".to_string(),
+            access_key_id: novarocks_fs::SecretValue::new("server-access"),
+            access_key_secret: novarocks_fs::SecretValue::new("server-secret"),
             session_token: None,
             enable_path_style_access: Some(true),
             region: None,
@@ -470,11 +470,11 @@ mod tests {
                 ("aws.s3.endpoint".to_string(), config.endpoint.clone()),
                 (
                     "aws.s3.access_key".to_string(),
-                    config.access_key_id.clone(),
+                    config.access_key_id.expose_secret().to_string(),
                 ),
                 (
                     "aws.s3.secret_key".to_string(),
-                    config.access_key_secret.clone(),
+                    config.access_key_secret.expose_secret().to_string(),
                 ),
                 (
                     "aws.s3.enable_path_style_access".to_string(),

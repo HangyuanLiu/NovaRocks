@@ -31,7 +31,7 @@ use novarocks_connector_iceberg::iceberg::spec::{
 use novarocks_connector_iceberg::iceberg::{
     Catalog, ErrorKind, NamespaceIdent, TableCreation, TableIdent,
 };
-use novarocks_connector_iceberg::novarocks_fs::ObjectStoreConfig;
+use novarocks_connector_iceberg::novarocks_fs::{ObjectStoreConfig, SecretValue};
 use sha2::{Digest, Sha256};
 
 const CHILD_ENV: &str = "NR_HADOOP_FENCE_CHILD";
@@ -391,9 +391,11 @@ fn object_store_config(warehouse: &str) -> Option<ObjectStoreConfig> {
     }
     Some(ObjectStoreConfig {
         endpoint: required_env("AWS_S3_ENDPOINT"),
-        access_key_id: required_env("AWS_S3_ACCESS_KEY_ID"),
-        access_key_secret: required_env("AWS_S3_SECRET_ACCESS_KEY"),
-        session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+        access_key_id: SecretValue::new(required_env("AWS_S3_ACCESS_KEY_ID")),
+        access_key_secret: SecretValue::new(required_env("AWS_S3_SECRET_ACCESS_KEY")),
+        session_token: std::env::var("AWS_SESSION_TOKEN")
+            .ok()
+            .map(SecretValue::new),
         enable_path_style_access: Some(true),
         region: std::env::var("AWS_REGION").ok(),
         retry_max_times: None,

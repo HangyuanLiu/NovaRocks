@@ -912,9 +912,9 @@ mod tests {
     ) -> novarocks_fs::ObjectStoreConfig {
         novarocks_fs::ObjectStoreConfig {
             endpoint: endpoint.to_string(),
-            access_key_id: access_key_id.to_string(),
-            access_key_secret: access_key_secret.to_string(),
-            session_token: Some("session-token".to_string()),
+            access_key_id: novarocks_fs::SecretValue::new(access_key_id),
+            access_key_secret: novarocks_fs::SecretValue::new(access_key_secret),
+            session_token: Some(novarocks_fs::SecretValue::new("session-token")),
             enable_path_style_access: Some(true),
             region: Some("us-east-1".to_string()),
             retry_max_times: None,

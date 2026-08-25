@@ -76,7 +76,6 @@ pub(crate) struct MysqlAsyncPoolLifecycle {
 
 pub(crate) struct ResolvedMysqlClient {
     config: MySqlClientConfig,
-    password: MysqlPassword,
 }
 
 #[cfg_attr(not(feature = "state-store-test-hooks"), allow(dead_code))]
@@ -90,8 +89,6 @@ pub(crate) struct MysqlClientReadiness {
     pub(crate) character_set: String,
     pub(crate) connection_id: u64,
 }
-
-struct MysqlPassword(String);
 
 pub(crate) struct MysqlPoolConnection {
     connection: Option<Conn>,
@@ -302,28 +299,7 @@ impl ResolvedMysqlClient {
                 "MySQL client configuration is invalid",
             )
         })?;
-        let password = std::env::var_os(&config.password_env).ok_or_else(|| {
-            StateStoreError::new(
-                StateStoreErrorKind::InvalidConfiguration,
-                "MySQL password environment value is missing",
-            )
-        })?;
-        let password = password.into_string().map_err(|_| {
-            StateStoreError::new(
-                StateStoreErrorKind::InvalidConfiguration,
-                "MySQL password environment value is not valid UTF-8",
-            )
-        })?;
-        if password.is_empty() {
-            return Err(StateStoreError::new(
-                StateStoreErrorKind::InvalidConfiguration,
-                "MySQL password environment value is empty",
-            ));
-        }
-        Ok(Self {
-            config,
-            password: MysqlPassword(password),
-        })
+        Ok(Self { config })
     }
 
     pub(crate) fn build_pool(
@@ -348,7 +324,7 @@ impl ResolvedMysqlClient {
             .ip_or_hostname(self.config.host.clone())
             .tcp_port(self.config.port)
             .user(Some(self.config.username.clone()))
-            .pass(Some(self.password.0.clone()))
+            .pass(Some(self.config.password.expose_secret().to_owned()))
             .db_name(Some(database.to_owned()))
             .prefer_socket(false)
             .pool_opts(pool_opts)
@@ -462,13 +438,7 @@ impl fmt::Debug for ResolvedMysqlClient {
                 "tls_enabled",
                 &(self.config.tls_mode != MySqlTlsMode::Disabled),
             )
-            .field("password_resolved", &true)
+            .field("password_configured", &!self.config.password.is_empty())
             .finish()
-    }
-}
-
-impl fmt::Debug for MysqlPassword {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("MysqlPassword([REDACTED])")
     }
 }
