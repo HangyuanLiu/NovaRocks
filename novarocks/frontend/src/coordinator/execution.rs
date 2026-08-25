@@ -32,7 +32,7 @@ use crate::query_execution::artifact::{
     ConnectorBindingDispatcher, ConnectorBindingInstallObserver,
     DispatchingConnectorBindingBarrier, RunningNativeExecutionParts,
 };
-use crate::query_execution::completion::PreparedDistributedRoundFactory;
+use crate::query_execution::completion::PreReadyRetryBoundary;
 use crate::query_execution::contract::{
     ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
     DistributedQueryErrorKind, DistributedQueryIntent, DistributedQueryOutcome,
@@ -961,7 +961,7 @@ impl FrontendDistributedQueryCoordinator {
         execution_id: QueryExecutionId,
         statement_deadline: Instant,
         request: DistributedQueryRequest,
-        retry_boundary: Option<&dyn PreparedDistributedRoundFactory>,
+        retry_boundary: Option<&dyn PreReadyRetryBoundary>,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         let parts = request.into_parts();
         let connector_write_session = parts
@@ -1396,7 +1396,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         let first_execution_id = execution_id_for_round(query_id, 1)?;
         let first_retry_boundary = round_factory
             .as_deref()
-            .map(|factory| factory as &dyn PreparedDistributedRoundFactory);
+            .map(|factory| factory as &dyn PreReadyRetryBoundary);
         match self.execute_round(
             query_id,
             first_execution_id,
@@ -1459,6 +1459,66 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                     None,
                 )
                 .and_then(|outcome| replacement_completion.complete(outcome).map_err(failed))
+            }
+        }
+    }
+
+    fn execute_prepared_raw(
+        &self,
+        operation: crate::query_execution::completion::PreparedRetriableDistributedRequest,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        let query_id = self.query_ids.next_query_id()?;
+        let (first_request, mut round_factory) = operation.into_parts();
+        let first_revision = first_request.topology().revision();
+        let retry_deadline = statement_deadline_for_request(&first_request)?;
+        let first_execution_id = execution_id_for_round(query_id, 1)?;
+        match self.execute_round(
+            query_id,
+            first_execution_id,
+            retry_deadline,
+            first_request,
+            Some(round_factory.as_ref() as &dyn PreReadyRetryBoundary),
+        ) {
+            Ok(outcome) => Ok(outcome),
+            Err(first_error) => {
+                if first_error.pre_ready_topology_outcome().is_none() {
+                    return Err(first_error);
+                }
+                let reason = pre_ready_topology_reason(
+                    first_error
+                        .pre_ready_topology_outcome()
+                        .expect("pre-ready topology outcome checked above"),
+                );
+                if let Err(error) = round_factory.permit_pre_ready_retry() {
+                    record_pre_ready_effect_gate("rejected");
+                    return Err(error);
+                }
+                record_pre_ready_effect_gate("permitted");
+                record_pre_ready_replan(reason);
+                let waiting_started_at = Instant::now();
+                let fresh_topology = self
+                    .backend_topology
+                    .wait_for_eligible_after(first_revision, retry_deadline)
+                    .map_err(|error| {
+                        observe_waiting_for_backend(waiting_started_at.elapsed());
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::Failed,
+                            error.to_string(),
+                        )
+                    })?;
+                observe_waiting_for_backend(waiting_started_at.elapsed());
+                let replan_started_at = Instant::now();
+                let replacement = round_factory.replan(fresh_topology);
+                observe_pre_ready_replan(replan_started_at.elapsed());
+                let replacement = replacement?;
+                let replacement_execution_id = execution_id_for_round(query_id, 2)?;
+                self.execute_round(
+                    query_id,
+                    replacement_execution_id,
+                    retry_deadline,
+                    replacement,
+                    None,
+                )
             }
         }
     }
@@ -1611,7 +1671,9 @@ mod tests {
         ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
     };
     use crate::query_execution::completion::{
-        PreparedDistributedQuery, PreparedDistributedRoundFactory, PreparedQueryCompletion,
+        PreReadyRetryBoundary, PreparedDistributedQuery, PreparedDistributedRequestFactory,
+        PreparedDistributedRoundFactory, PreparedQueryCompletion,
+        PreparedRetriableDistributedRequest,
     };
     use crate::query_execution::contract::{
         DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
@@ -1941,7 +2003,22 @@ mod tests {
                 PreparedQueryCompletion::result(),
             ))
         }
+    }
 
+    impl PreparedDistributedRequestFactory for RecordingRetryFactory {
+        fn replan(
+            &mut self,
+            topology: crate::common::backend_topology::BackendTopologySnapshot,
+        ) -> Result<DistributedQueryRequest, DistributedQueryError> {
+            self.replanned_topologies
+                .lock()
+                .expect("replanned topologies")
+                .push(topology.clone());
+            fresh_result_request(topology)
+        }
+    }
+
+    impl PreReadyRetryBoundary for RecordingRetryFactory {
         fn permit_pre_ready_retry(&self) -> Result<(), DistributedQueryError> {
             self.permits.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -2109,6 +2186,90 @@ mod tests {
         // The first pre-ready attempt has no attached control stream, so its
         // cleanup must use the unary Abort RPC. The second attempt reaches
         // Start and is cancelled through its attached control stream instead.
+        assert_eq!(state.abort_attempts, vec![1]);
+        assert_eq!(state.stage_attempts, vec![2]);
+        assert_eq!(state.start_attempts, vec![2]);
+    }
+
+    #[test]
+    fn raw_pre_ready_draining_replans_without_losing_the_write_outcome_boundary() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = runtime.enter();
+        let endpoint: SocketAddr = "127.0.0.1:19043".parse().expect("test endpoint");
+        let old = descriptor(BackendProcessId::new_v7(), endpoint);
+        let replacement = descriptor(BackendProcessId::new_v7(), endpoint);
+        let topology = Arc::new(ClusterBackendService::new_transient_for_test(1));
+        topology
+            .record_announce(old.clone(), BackendReportedState::Running)
+            .expect("initial announce");
+        verify(topology.as_ref(), &old, 1);
+        let first_snapshot = topology.snapshot().expect("initial topology");
+        let old_scheduler = FrontendFragmentScheduler::new(
+            FrontendBackendSnapshot::from_live_targets(first_snapshot.targets().to_vec())
+                .expect("old scheduler"),
+        );
+        let replacement_scheduler = FrontendFragmentScheduler::new(
+            FrontendBackendSnapshot::from_live_targets(vec![LiveBackendTarget::new(
+                0,
+                replacement.clone(),
+            )])
+            .expect("replacement scheduler"),
+        );
+        let state = Arc::new(Mutex::new(RetryTransportState::default()));
+        let transport = Arc::new(DrainingThenReadyTransport {
+            state: Arc::clone(&state),
+            topology: Arc::clone(&topology),
+            replacement: replacement.clone(),
+        });
+        let coordinator =
+            FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence_and_topology(
+                QueryId::new(7, 13),
+                "127.0.0.1:19070".parse().expect("report endpoint"),
+                vec![old_scheduler, replacement_scheduler],
+                Arc::new(FailingAfterStartDispatcher),
+                NonZeroUsize::new(1).expect("nonzero workers"),
+                Arc::new(()),
+                transport,
+                Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
+            );
+        let permits = Arc::new(AtomicUsize::new(0));
+        let control_ready_closures = Arc::new(AtomicUsize::new(0));
+        let stage_or_start_closures = Arc::new(AtomicUsize::new(0));
+        let replanned_topologies = Arc::new(Mutex::new(Vec::new()));
+        let operation = PreparedRetriableDistributedRequest::new(
+            fresh_result_request(first_snapshot.clone()).expect("first request"),
+            Box::new(RecordingRetryFactory {
+                permits: Arc::clone(&permits),
+                control_ready_closures,
+                stage_or_start_closures,
+                replanned_topologies: Arc::clone(&replanned_topologies),
+            }),
+        );
+
+        let error = match coordinator.execute_prepared_raw(operation) {
+            Ok(_) => panic!("second raw round reaches the scripted post-start fetch failure"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .message()
+                .contains("test fetch failure after retry stage/start")
+        );
+        assert_eq!(permits.load(Ordering::SeqCst), 1);
+        let replanned = replanned_topologies.lock().expect("replanned topologies");
+        assert_eq!(replanned.len(), 1);
+        assert!(replanned[0].revision() > first_snapshot.revision());
+        assert_eq!(
+            replanned[0].targets()[0]
+                .process_id()
+                .expect("replacement process id"),
+            replacement.process_id().expect("replacement process id"),
+        );
+        let state = state.lock().expect("retry transport state");
+        assert_eq!(state.init_attempts, vec![1, 2]);
         assert_eq!(state.abort_attempts, vec![1]);
         assert_eq!(state.stage_attempts, vec![2]);
         assert_eq!(state.start_attempts, vec![2]);

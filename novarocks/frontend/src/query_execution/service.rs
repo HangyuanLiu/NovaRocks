@@ -19,7 +19,9 @@
 
 use std::sync::Arc;
 
-use crate::query_execution::completion::PreparedDistributedQuery;
+use crate::query_execution::completion::{
+    PreparedDistributedQuery, PreparedRetriableDistributedRequest,
+};
 use crate::query_execution::contract::{
     ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
     DistributedQueryOutcome, DistributedQueryRequest,
@@ -58,6 +60,15 @@ impl QueryExecutionService {
         operation: PreparedDistributedQuery,
     ) -> Result<StatementResult, DistributedQueryError> {
         self.coordinator.execute_prepared(operation)
+    }
+
+    /// Submit a statement-owned operation whose caller must retain the raw
+    /// distributed outcome, including write terminal handles.
+    pub(crate) fn execute_prepared_raw(
+        &self,
+        operation: PreparedRetriableDistributedRequest,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        self.coordinator.execute_prepared_raw(operation)
     }
 
     /// Seal every cohort against the application-retained exact control lease

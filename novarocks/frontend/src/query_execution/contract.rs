@@ -977,6 +977,24 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
             .complete(outcome)
             .map_err(|error| DistributedQueryError::new(DistributedQueryErrorKind::Failed, error))
     }
+
+    /// Execute a statement operation whose caller retains its raw outcome.
+    /// This is deliberately separate from `execute_prepared`: a distributed
+    /// write must preserve connector commit/abort handles for the frontend
+    /// transaction runner and cannot be rendered as a `StatementResult`.
+    fn execute_prepared_raw(
+        &self,
+        operation: crate::query_execution::completion::PreparedRetriableDistributedRequest,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        let (request, _round_factory) = operation.into_parts();
+        Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            format!(
+                "injected coordinator does not implement raw pre-ready replan for {:?}",
+                request.intent()
+            ),
+        ))
+    }
 }
 
 #[cfg(test)]

@@ -38,7 +38,7 @@ use crate::query_execution::compiler::{
     TableLookupMode, freeze_query_mv_rewrite_definition_index, query_catalog_service_snapshot,
     query_statistics_snapshot,
 };
-use crate::query_execution::completion::PreparedDistributedRoundFactory;
+use crate::query_execution::completion::{PreReadyRetryBoundary, PreparedDistributedRoundFactory};
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::kernels::{
     QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
@@ -243,7 +243,9 @@ impl PreparedDistributedRoundFactory for FrontendDistributedRoundFactory {
         })?;
         Ok(PreparedQueryDistributedOperation::new(request, completion))
     }
+}
 
+impl PreReadyRetryBoundary for FrontendDistributedRoundFactory {
     fn permit_pre_ready_retry(&self) -> Result<(), DistributedQueryError> {
         self.effect_tracker
             .issue_topology_retry_permit()
