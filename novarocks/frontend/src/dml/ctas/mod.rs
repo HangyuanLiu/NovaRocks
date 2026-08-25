@@ -111,9 +111,13 @@ impl DmlService {
         // warehouse-owned, unanchored CTAS root.  It must therefore be the
         // admission publication ID, not a second child UUID.
         let prepare_operation_id = *operation_id.as_uuid();
-        let write_operation_id = Uuid::now_v7();
-        let publish_operation_id = Uuid::now_v7();
-        let abort_staging_operation_id = Uuid::now_v7();
+        // These fields retain their phase names for durable-payload
+        // compatibility, but they are not child attempts. A CTAS statement
+        // has exactly one publication identity across prepare, write,
+        // publication and any diagnostic record.
+        let write_operation_id = prepare_operation_id;
+        let publish_operation_id = prepare_operation_id;
+        let abort_staging_operation_id = prepare_operation_id;
         let policy = if command.if_not_exists {
             CreatePolicy::NoOpIfExists
         } else {
