@@ -1236,7 +1236,7 @@ fn validate_live_backend_topology(
     if rows.len() == expected
         && live == expected
         && observed_ports == configured_ports
-        && identities.len() == 1
+        && (expected == 0 || identities.len() == 1)
     {
         return Ok(());
     }
@@ -4352,6 +4352,20 @@ mod tests {
             },
         ];
         assert!(validate_live_backend_topology(&expected, &incompatible).is_err());
+    }
+
+    #[test]
+    fn empty_seed_backend_topology_is_ready_only_when_show_backends_is_empty() {
+        validate_live_backend_topology(&[], &[])
+            .expect("an empty dynamic-membership registry should be ready before ADD BACKEND");
+
+        let unexpected = vec![backend_row(19070, "Live", true)];
+        let error = validate_live_backend_topology(&[], &unexpected)
+            .expect_err("an empty seed set must reject an unexpected backend row");
+        assert!(
+            error.to_string().contains("registered=1 expected=0"),
+            "{error}"
+        );
     }
 
     #[test]
