@@ -495,57 +495,6 @@ impl PreparedIcebergWrite {
         )
     }
 
-    /// Build an entirely new topology-dependent write assembly from the
-    /// immutable first-admission binding. This never reads a newer table
-    /// binding, clones an old assembly, or patches old split/writer/RF state.
-    /// A caller may use it only after the first assembly sealed the binding
-    /// store, and must still possess a provider-issued pre-ready effect proof.
-    #[allow(
-        dead_code,
-        reason = "Consumed by the pending INSERT whole-round retry factory."
-    )]
-    pub(crate) fn prepare_replanned_native_assembly(
-        &self,
-        topology: crate::common::backend_topology::BackendTopologySnapshot,
-    ) -> Result<
-        crate::query_execution::compiler::PreparedDmlWriteAssembly,
-        crate::dml::error::DmlExecutionError,
-    > {
-        if !self
-            .semantic_binding
-            .table_bindings
-            .is_sealed_for_topology_replan()
-        {
-            return Err(crate::dml::error::DmlExecutionError::from(
-                "Iceberg write topology replan requires a sealed first-round semantic binding store".to_string(),
-            ));
-        }
-        let execution = self.semantic_binding.execution_for_topology(topology)?;
-        let pre_ready_planning_proof = self
-            .semantic_binding
-            .connector_write
-            .lease()
-            .certify_pre_ready_write_planning(
-                self.semantic_binding.pre_ready_planning_request.clone(),
-            )
-            .map_err(|error| {
-                crate::dml::error::DmlExecutionError::from(format!(
-                    "Iceberg write topology replan has no effect-free planning proof: {error}"
-                ))
-            })?;
-        pre_ready_planning_proof
-            .validates(
-                self.semantic_binding.connector_write.lease().binding_key(),
-                &self.semantic_binding.pre_ready_planning_request,
-            )
-            .map_err(|error| {
-                crate::dml::error::DmlExecutionError::from(format!(
-                    "Iceberg write topology replan lost its effect-free planning proof: {error}"
-                ))
-            })?;
-        self.prepare_native_assembly_for_execution(Some(&execution))
-    }
-
     pub(crate) fn native_encoding(
         &self,
     ) -> Result<PreparedIcebergWriteNativeEncoding<'_>, crate::dml::error::DmlExecutionError> {
@@ -573,14 +522,48 @@ impl PreparedIcebergWrite {
         &self,
         native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<QueryExecutionResult, String> {
-        self.native_assembly
+        let assembly = self
+            .native_assembly
             .lock()
             .expect("prepared Iceberg write native assembly lock poisoned")
             .take()
             .ok_or_else(|| {
                 "prepared Iceberg write native assembly was already consumed".to_string()
-            })?
-            .finish(native_bundle)
+            })?;
+        let (query_execution, request) = assembly.into_request(native_bundle)?;
+        let publication_id = novarocks_spi::connector::LakePublicationId::try_from_bytes(
+            self.semantic_binding
+                .connector_write
+                .operation_id()
+                .to_bytes(),
+        )
+        .map_err(|error| {
+            format!("Iceberg write operation lacks a UUIDv7 publication identity: {error}")
+        })?;
+        let outcome = query_execution
+            .execute_prepared_raw(
+                crate::query_execution::completion::PreparedRetriableDistributedRequest::new(
+                    request,
+                    Box::new(IcebergWriteRoundFactory {
+                        binding: Arc::clone(&self.semantic_binding),
+                        effect_tracker:
+                            crate::common::statement_effect::StatementEffectTracker::mutating(
+                                publication_id,
+                            ),
+                    }),
+                ),
+            )
+            .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
+            .map_err(|error| error.to_string())?;
+        let (query_result, write_commit, write_abort, connector_completion) =
+            outcome.into_parts_with_connector();
+        Ok(QueryExecutionResult {
+            query_result,
+            write_commit,
+            write_abort,
+            connector_completion,
+            fragment_profiles: Vec::new(),
+        })
     }
 
     /// Convert a validated Iceberg write into SQL's inert distributed-write
@@ -634,6 +617,53 @@ struct FrozenIcebergWriteSemanticBinding {
 }
 
 impl FrozenIcebergWriteSemanticBinding {
+    fn prepare_replanned_native_assembly(
+        &self,
+        topology: crate::common::backend_topology::BackendTopologySnapshot,
+    ) -> Result<
+        crate::query_execution::compiler::PreparedDmlWriteAssembly,
+        crate::dml::error::DmlExecutionError,
+    > {
+        if !self.table_bindings.is_sealed_for_topology_replan() {
+            return Err(crate::dml::error::DmlExecutionError::from(
+                "Iceberg write topology replan requires a sealed first-round semantic binding store".to_string(),
+            ));
+        }
+        let execution = self.execution_for_topology(topology)?;
+        let proof = self
+            .connector_write
+            .lease()
+            .certify_pre_ready_write_planning(self.pre_ready_planning_request.clone())
+            .map_err(|error| {
+                crate::dml::error::DmlExecutionError::from(format!(
+                    "Iceberg write topology replan has no effect-free planning proof: {error}"
+                ))
+            })?;
+        proof
+            .validates(
+                self.connector_write.lease().binding_key(),
+                &self.pre_ready_planning_request,
+            )
+            .map_err(|error| {
+                crate::dml::error::DmlExecutionError::from(format!(
+                    "Iceberg write topology replan lost its effect-free planning proof: {error}"
+                ))
+            })?;
+        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_context(
+            &self.state,
+            Some(&self.target.catalog),
+            &self.target.namespace,
+            &self.query,
+            self.sql_write_input.clone(),
+            Arc::clone(&self.table_bindings),
+            None,
+            novarocks_sql::compiler::RootDistributionRequirement::Any,
+            Some(&execution),
+            &self.connector_context,
+            Some(self.connector_write.clone()),
+        )
+    }
+
     fn execution_for_topology(
         &self,
         topology: crate::common::backend_topology::BackendTopologySnapshot,
@@ -657,6 +687,71 @@ impl FrozenIcebergWriteSemanticBinding {
             first.cancellation().clone(),
             first.optimizer_settings().clone(),
         )
+    }
+}
+
+struct IcebergWriteRoundFactory {
+    binding: Arc<FrozenIcebergWriteSemanticBinding>,
+    effect_tracker: crate::common::statement_effect::StatementEffectTracker,
+}
+
+impl crate::query_execution::completion::PreReadyRetryBoundary for IcebergWriteRoundFactory {
+    fn permit_pre_ready_retry(
+        &self,
+    ) -> Result<(), crate::query_execution::contract::DistributedQueryError> {
+        self.effect_tracker
+            .issue_topology_retry_permit()
+            .map(|_| ())
+            .map_err(|error| {
+                crate::query_execution::contract::DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::TopologyRetryUnsupported,
+                    format!("Iceberg write topology retry is not effect-free: {error:?}"),
+                )
+            })
+    }
+
+    fn close_after_control_ready(&self) {
+        self.effect_tracker.close_after_control_ready();
+    }
+
+    fn close_after_stage_or_start(&self) {
+        self.effect_tracker.close_after_stage_or_start();
+    }
+}
+
+impl crate::query_execution::completion::PreparedDistributedRequestFactory
+    for IcebergWriteRoundFactory
+{
+    fn replan(
+        &mut self,
+        topology: crate::common::backend_topology::BackendTopologySnapshot,
+    ) -> Result<
+        crate::query_execution::contract::DistributedQueryRequest,
+        crate::query_execution::contract::DistributedQueryError,
+    > {
+        let assembly = self.binding.prepare_replanned_native_assembly(topology).map_err(|error| {
+            crate::query_execution::contract::DistributedQueryError::new(
+                crate::query_execution::contract::DistributedQueryErrorKind::TopologyRetryUnsupported,
+                error.to_string(),
+            )
+        })?;
+        let native_bundle = crate::native::fragment_encoder::encode_native_fragment_bundle(
+            assembly.encoding().encoding_view(),
+        )
+        .map_err(|error| {
+            crate::query_execution::contract::DistributedQueryError::new(
+                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
+                error,
+            )
+        })?;
+        let (_query_execution, request) =
+            assembly.into_request(native_bundle).map_err(|error| {
+                crate::query_execution::contract::DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::Failed,
+                    error,
+                )
+            })?;
+        Ok(request)
     }
 }
 
