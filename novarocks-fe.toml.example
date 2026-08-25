@@ -1,0 +1,35 @@
+# Copy to a deployment-specific path and start with:
+# novarocks standalone --role fe --config ./novarocks-fe.toml
+
+log_level = "info"
+
+[server]
+host = "127.0.0.1"
+# Native coordinator-report gRPC listener. This listener does not expose
+# management HTTP routes.
+grpc_port = 9080
+# FE management HTTP listener for FE-scoped metrics and gated lifecycle debug.
+http_port = 8040
+
+[cluster]
+role = "fe"
+# Additive durable-membership seeds. SQL ADD/DROP BACKEND remains authoritative
+# after the first successful FE start.
+backends = ["127.0.0.1:9081"]
+
+[state_store]
+provider = "sqlite"
+cluster_id = "production-cluster"
+path = "meta/frontend-state.sqlite"
+deployment_owner = "fe-a"
+
+[standalone_server]
+mysql_port = 9030
+user = "root"
+
+[connector.object_store]
+endpoint = "http://10.0.0.20:9000"
+access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"
+access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
+region = "us-east-1"
+enable_path_style_access = true

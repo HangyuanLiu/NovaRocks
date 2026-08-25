@@ -58,7 +58,8 @@ Start NovaRocks standalone with the generated worktree config:
 
 ```bash
 NO_PROXY=127.0.0.1,localhost \
-cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
 ```
 
 In another shell, source the same environment and run the bootstrap script:

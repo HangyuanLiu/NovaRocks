@@ -27,15 +27,17 @@ whose refresh policy is driven by the standalone MV refresh scheduler:
 - `REFRESH ASYNC EVERY INTERVAL <n> <unit>`
 - `ALTER MATERIALIZED VIEW ... PAUSE/RESUME REFRESH`
 
-The suite requires a standalone process started with scheduler-enabled
-configuration. In the generated Iceberg REST test environment, use:
+The suite requires the scheduler-enabled generated FE config. In the Iceberg
+REST test environment, start the canonical FE/BE pair with all-in-one:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/up.sh
 NO_PROXY=127.0.0.1,localhost \
 target/debug/novarocks standalone \
-  --config "$NOVAROCKS_STANDALONE_SCHEDULER_CONFIG"
+  --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" \
+  --be-config "$NOVAROCKS_BE_CONFIG"
 
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \

@@ -15,41 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Thin smoke coverage for the `novarocks` server binary.
+//! External-contract smoke coverage for the `novarocks` server binary.
 //!
-//! This target owns exactly two closures, and nothing else:
-//!
-//! 1. all-in-one composition/readiness: the binary wires the FE/BE application
-//!    boundary and the MySQL protocol entrypoint together;
-//! 2. BE signal/exit/restart: the binary honours SIGINT, releases its ports and
-//!    restarts from the same frozen config.
-//!
-//! Everything else belongs to a lower canonical owner:
-//!
-//! - real 1FE+NBE topology, restart, faults and artifacts live in
-//!   `novarocks-cluster-harness`, driven by `novarocks-system-test-runner`;
-//! - SQL, result, expected-error and plan-shape contracts live in the SQL suites;
-//! - Frontend/Backend/Connector/StateStore state machines live in their own
-//!   owner-local component tests;
-//! - process, readiness, log and TCP-port mechanics live in
-//!   `novarocks-test-support`.
-//!
-//! The helpers below exist only to serve these two smoke closures. They must not
-//! grow into a second cluster lifecycle owner.
+//! The fixtures deliberately build a normal FE/BE deployable pair. That exact
+//! pair must work both as two processes and under the Server-owned all-in-one
+//! supervisor; this target must never revive a third application role or a
+//! single all-in-one configuration shape.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
 use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
-use tempfile::{Builder as TempFileBuilder, NamedTempFile};
+use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 
 static SERVER_BINARY_SMOKE_LOCK: Mutex<()> = Mutex::new(());
+
+const PROCESS_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const LIFECYCLE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
 
 fn lock_server_binary_smoke() -> MutexGuard<'static, ()> {
     SERVER_BINARY_SMOKE_LOCK
@@ -64,42 +52,196 @@ fn runtime_dir() -> PathBuf {
 }
 
 /// Freeze a port through the canonical reservation owner. The reservation is
-/// released before the child spawns; the mechanics themselves are asserted by
-/// `novarocks-test-support`, not here.
+/// released immediately before its owning role process starts.
 fn reserve_port() -> ReservedTcpPort {
     ReservedTcpPort::new().expect("reserve TCP port")
 }
 
-fn write_config(name: &str, content: &str) -> NamedTempFile {
+fn write_config(dir: &Path, name: &str, content: &str) -> NamedTempFile {
     let file = TempFileBuilder::new()
         .prefix(name)
         .suffix(".toml")
-        .tempfile_in(runtime_dir())
+        .tempfile_in(dir)
         .expect("create config temp file");
     std::fs::write(file.path(), content).expect("write config");
     file
 }
 
-const PROCESS_READY_TIMEOUT: Duration = Duration::from_secs(30);
+struct ConfigPair {
+    runtime: TempDir,
+    fe_config: NamedTempFile,
+    be_config: NamedTempFile,
+    fe_mysql_port: u16,
+    fe_http_port: u16,
+    fe_grpc_port: u16,
+    be_http_port: u16,
+    be_grpc_port: u16,
+    fe_mysql: Option<ReservedTcpPort>,
+    fe_http: Option<ReservedTcpPort>,
+    fe_grpc: Option<ReservedTcpPort>,
+    be_http: Option<ReservedTcpPort>,
+    be_grpc: Option<ReservedTcpPort>,
+    lifecycle_fault_dir: PathBuf,
+}
+
+impl ConfigPair {
+    fn new() -> Self {
+        let runtime = tempfile::tempdir_in(runtime_dir()).expect("create smoke runtime");
+        let fe_mysql = reserve_port();
+        let fe_http = reserve_port();
+        let fe_grpc = reserve_port();
+        let be_http = reserve_port();
+        let be_grpc = reserve_port();
+        let fe_mysql_port = fe_mysql.port();
+        let fe_http_port = fe_http.port();
+        let fe_grpc_port = fe_grpc.port();
+        let be_http_port = be_http.port();
+        let be_grpc_port = be_grpc.port();
+        let state_store = runtime.path().join("frontend-state.sqlite");
+        let log_dir = runtime.path().join("logs");
+        let lifecycle_fault_dir = runtime.path().join("query-lifecycle-faults");
+        std::fs::create_dir_all(&lifecycle_fault_dir).expect("create lifecycle fault directory");
+
+        let fe_config = write_config(
+            runtime.path(),
+            "fe",
+            &format!(
+                r#"
+sys_log_dir = "{}"
+
+[server]
+host = "127.0.0.1"
+http_port = {fe_http_port}
+grpc_port = {fe_grpc_port}
+
+[standalone_server]
+mysql_port = {fe_mysql_port}
+user = "root"
+
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:{be_grpc_port}"]
+heartbeat_interval_ms = 100
+heartbeat_timeout_retries = 10
+
+[state_store]
+provider = "sqlite"
+cluster_id = "server-binary-smoke"
+path = "{}"
+deployment_owner = "server-binary-smoke-fe"
+"#,
+                log_dir.display(),
+                state_store.display(),
+            ),
+        );
+        let be_config = write_config(
+            runtime.path(),
+            "be",
+            &format!(
+                r#"
+sys_log_dir = "{}"
+
+[server]
+host = "127.0.0.1"
+http_port = {be_http_port}
+grpc_port = {be_grpc_port}
+
+[cluster]
+role = "be"
+"#,
+                log_dir.display(),
+            ),
+        );
+        Self {
+            runtime,
+            fe_config,
+            be_config,
+            fe_mysql_port,
+            fe_http_port,
+            fe_grpc_port,
+            be_http_port,
+            be_grpc_port,
+            fe_mysql: Some(fe_mysql),
+            fe_http: Some(fe_http),
+            fe_grpc: Some(fe_grpc),
+            be_http: Some(be_http),
+            be_grpc: Some(be_grpc),
+            lifecycle_fault_dir,
+        }
+    }
+
+    fn release_be(&mut self) {
+        drop(self.be_http.take());
+        drop(self.be_grpc.take());
+    }
+
+    fn release_fe(&mut self) {
+        drop(self.fe_mysql.take());
+        drop(self.fe_http.take());
+        drop(self.fe_grpc.take());
+    }
+
+    fn release_all(&mut self) {
+        self.release_be();
+        self.release_fe();
+    }
+}
 
 fn spawn_novarocks(
+    role: &str,
     config_path: &Path,
     ready_marker: &str,
-    debug_env: &[(&str, &str)],
+    debug_env: &[(&str, &Path)],
 ) -> ManagedProcess {
     let mut command = Command::new(env!("CARGO_BIN_EXE_novarocks"));
-    command.arg("standalone").arg("--config").arg(config_path);
+    command
+        .arg("standalone")
+        .arg("--role")
+        .arg(role)
+        .arg("--config")
+        .arg(config_path)
+        .env("NO_PROXY", "127.0.0.1,localhost");
     for (name, value) in debug_env {
         command.env(name, value);
     }
     ManagedProcess::spawn(
-        format!("novarocks {}", config_path.display()),
+        format!("novarocks role={role} config={}", config_path.display()),
         command,
         ReadyMarker::StdoutContains(ready_marker.to_string()),
         PROCESS_READY_TIMEOUT,
-        config_path.with_extension("process.log"),
+        config_path.with_extension(format!("{role}.process.log")),
     )
-    .unwrap_or_else(|error| panic!("spawn novarocks {}: {error:#}", config_path.display()))
+    .unwrap_or_else(|error| panic!("spawn novarocks role={role}: {error:#}"))
+}
+
+fn spawn_all_in_one(pair: &ConfigPair, debug_env: &[(&str, &Path)]) -> ManagedProcess {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_novarocks"));
+    command
+        .arg("standalone")
+        .arg("--role")
+        .arg("all-in-one")
+        .arg("--fe-config")
+        .arg(pair.fe_config.path())
+        .arg("--be-config")
+        .arg(pair.be_config.path())
+        .env("NO_PROXY", "127.0.0.1,localhost");
+    for (name, value) in debug_env {
+        command.env(name, value);
+    }
+    ManagedProcess::spawn(
+        format!(
+            "novarocks role=all-in-one fe={} be={}",
+            pair.fe_config.path().display(),
+            pair.be_config.path().display()
+        ),
+        command,
+        ReadyMarker::StdoutContains("NOVAROCKS_READY mysql_port=".to_string()),
+        PROCESS_READY_TIMEOUT,
+        pair.fe_config
+            .path()
+            .with_extension("all-in-one.process.log"),
+    )
+    .unwrap_or_else(|error| panic!("spawn novarocks role=all-in-one: {error:#}"))
 }
 
 fn connect_mysql(port: u16) -> MysqlConn {
@@ -114,62 +256,52 @@ fn connect_mysql(port: u16) -> MysqlConn {
             .write_timeout(Some(Duration::from_secs(10)));
         match MysqlConn::new(builder) {
             Ok(conn) => return conn,
-            Err(err) => {
-                if Instant::now() >= deadline {
-                    panic!("mysql connection failed: {err}");
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            Err(error) => panic!("mysql connection failed: {error}"),
         }
     }
 }
 
-fn start_all_in_one_with_debug_env(debug_env: &[(&str, &str)]) -> (ManagedProcess, u16, u16) {
-    let mysql = reserve_port();
-    let http = reserve_port();
-    let grpc = reserve_port();
-    let mysql_port = mysql.port();
-    let http_port = http.port();
-    let grpc_port = grpc.port();
-    let config = write_config(
-        "all-in-one",
-        &format!(
-            r#"
-[server]
-host = "127.0.0.1"
-http_port = {http_port}
-grpc_port = {grpc_port}
-
-[standalone_server]
-mysql_port = {mysql_port}
-
-[cluster]
-role = "all-in-one"
-"#
-        ),
-    );
-    let _ = mysql.release();
-    let _ = http.release();
-    let _ = grpc.release();
-    let process = spawn_novarocks(config.path(), "NOVAROCKS_READY mysql_port=", debug_env);
-    (process, mysql_port, http_port)
+fn assert_select_one(port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let mut conn = connect_mysql(port);
+        match conn.query::<i64, _>("SELECT 1") {
+            Ok(rows) => {
+                assert_eq!(rows, vec![1]);
+                return;
+            }
+            Err(error) if Instant::now() < deadline => {
+                eprintln!("SELECT 1 waiting for FE/BE heartbeat: {error}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => panic!("SELECT 1 failed after topology wait: {error}"),
+        }
+    }
 }
 
-fn scrape_metrics(port: u16) -> String {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect metrics endpoint");
+fn http_request(port: u16, method: &str, path: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect HTTP listener");
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("set metrics read timeout");
+        .expect("set HTTP read timeout");
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
-        .expect("set metrics write timeout");
-    stream
-        .write_all(b"GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .expect("request metrics");
+        .expect("set HTTP write timeout");
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write HTTP request");
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
-        .expect("read metrics response");
+        .expect("read HTTP response");
+    response
+}
+
+fn scrape_metrics(port: u16) -> String {
+    let response = http_request(port, "GET", "/metrics");
     let (headers, body) = response
         .split_once("\r\n\r\n")
         .expect("split metrics HTTP response");
@@ -180,92 +312,307 @@ fn scrape_metrics(port: u16) -> String {
     body.to_string()
 }
 
-/// Smoke closure 1: the binary composes FE and BE into one process, publishes the
-/// ready marker, answers a minimal query over the public MySQL entrypoint, and
-/// reaches the native typed gRPC fetch path.
-#[test]
-fn all_in_one_loopback_stage_start_select_succeeds() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
-    let _lock = lock_server_binary_smoke();
-
-    let (mut srv, mysql_port, _) =
-        start_all_in_one_with_debug_env(&[("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER", "1")]);
-    let mut conn = connect_mysql(mysql_port);
-    let rows: Vec<i64> = conn.query("SELECT 1").expect("SELECT 1");
-    assert_eq!(rows, vec![1]);
-    srv.wait_for_log_contains("NOVAROCKS_GRPC_FETCH_TYPED status=", Duration::from_secs(3))
-        .expect("wait for typed gRPC fetch marker");
-}
-
-/// All-in-one keeps the production FE/BE application boundary while exposing
-/// one process metrics endpoint, so both role-owned metric families must be
-/// visible through that endpoint.
-#[test]
-fn all_in_one_metrics_surface_contains_both_role_families() {
-    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
-    let _lock = lock_server_binary_smoke();
-
-    let (_srv, _, http_port) = start_all_in_one_with_debug_env(&[]);
-    let metrics = scrape_metrics(http_port);
+fn assert_native_rejects_management(port: u16, path: &str) {
+    let response = http_request(port, "GET", path);
     assert!(
-        metrics.contains("novarocks_live_backends"),
-        "all-in-one metrics omitted frontend family: {metrics}"
+        response.contains("grpc-status: 12"),
+        "native response: {response}"
     );
     assert!(
-        metrics.contains("novarocks_backend_query_lifecycle_entries"),
-        "all-in-one metrics omitted backend family: {metrics}"
+        !response.contains("novarocks_"),
+        "native listener must not render management data: {response}"
     );
 }
 
-/// Smoke closure 2: `role=be` reaches readiness, shuts down cleanly on SIGINT,
-/// frees its gRPC port immediately, and restarts from the same frozen config.
-#[cfg(unix)]
+fn assert_role_scoped_surfaces(pair: &ConfigPair, lifecycle_debug_enabled: bool) {
+    assert_native_rejects_management(pair.fe_grpc_port, "/metrics");
+    assert_native_rejects_management(pair.be_grpc_port, "/metrics");
+    assert_native_rejects_management(pair.fe_grpc_port, LIFECYCLE_DEBUG_PATH);
+
+    let fe_metrics = scrape_metrics(pair.fe_http_port);
+    assert!(
+        fe_metrics.contains("novarocks_live_backends"),
+        "FE metrics: {fe_metrics}"
+    );
+    assert!(
+        !fe_metrics.contains("novarocks_backend_query_lifecycle_entries"),
+        "FE management leaked BE metrics: {fe_metrics}"
+    );
+    let be_metrics = scrape_metrics(pair.be_http_port);
+    assert!(
+        be_metrics.contains("novarocks_backend_query_lifecycle_entries"),
+        "BE metrics: {be_metrics}"
+    );
+    assert!(
+        !be_metrics.contains("novarocks_live_backends"),
+        "BE management leaked FE metrics: {be_metrics}"
+    );
+
+    let debug_response = http_request(pair.fe_http_port, "POST", LIFECYCLE_DEBUG_PATH);
+    let expected_status = if lifecycle_debug_enabled {
+        "405"
+    } else {
+        "404"
+    };
+    assert!(
+        debug_response.starts_with(&format!("HTTP/1.1 {expected_status}"))
+            || debug_response.starts_with(&format!("HTTP/1.0 {expected_status}")),
+        "FE management debug gate expected {expected_status}: {debug_response}"
+    );
+}
+
+fn run_binary(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_novarocks"))
+        .args(args)
+        .output()
+        .expect("run novarocks")
+}
+
+fn assert_rejected(args: &[&str], expected: &str) {
+    let output = run_binary(args);
+    assert!(
+        !output.status.success(),
+        "args unexpectedly succeeded: {args:?}"
+    );
+    let diagnostics = format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostics.contains(expected),
+        "expected {expected:?} for {args:?}, got {diagnostics}"
+    );
+}
+
+/// The same normal FE/BE config pair must work first as independent roles and
+/// then, without rewrites, through the all-in-one supervisor. It also proves
+/// all five bound ports and the four listener surfaces have their role-local
+/// ownership in both forms.
 #[test]
-fn native_be_signal_shutdown_releases_port_for_restart() {
+fn same_config_pair_has_cross_process_and_all_in_one_listener_parity() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {
         return;
     }
     let _lock = lock_server_binary_smoke();
+    let mut pair = ConfigPair::new();
+    let lifecycle_fault_dir = pair.lifecycle_fault_dir.clone();
+    let frontend_debug_env = [(
+        novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
+        lifecycle_fault_dir.as_path(),
+    )];
 
-    let grpc = reserve_port();
-    let grpc_port = grpc.port();
-    let http = reserve_port();
-    let http_port = http.port();
-    let config = write_config(
-        "native-be-signal-restart",
+    pair.release_be();
+    let mut backend = spawn_novarocks("be", pair.be_config.path(), "NOVAROCKS_READY role=be", &[]);
+    pair.release_fe();
+    let mut frontend = spawn_novarocks(
+        "fe",
+        pair.fe_config.path(),
+        "NOVAROCKS_READY mysql_port=",
+        &frontend_debug_env,
+    );
+    assert_select_one(pair.fe_mysql_port);
+    assert_role_scoped_surfaces(&pair, true);
+    frontend
+        .interrupt_and_wait(Duration::from_secs(10))
+        .expect("shut down FE cleanly");
+    backend
+        .interrupt_and_wait(Duration::from_secs(10))
+        .expect("shut down BE cleanly");
+
+    let mut all_in_one = spawn_all_in_one(&pair, &[]);
+    assert_select_one(pair.fe_mysql_port);
+    assert_role_scoped_surfaces(&pair, false);
+    all_in_one
+        .interrupt_and_wait(Duration::from_secs(10))
+        .expect("shut down all-in-one roles cleanly");
+
+    for port in [
+        pair.fe_mysql_port,
+        pair.fe_http_port,
+        pair.fe_grpc_port,
+        pair.be_http_port,
+        pair.be_grpc_port,
+    ] {
+        let rebound = TcpListener::bind(("127.0.0.1", port)).unwrap_or_else(|error| {
+            panic!("port {port} must be reusable after parity smoke: {error}")
+        });
+        drop(rebound);
+    }
+}
+
+/// CLI shape is a binary contract, not merely a parser unit. These cases reject
+/// the removed aliases and every incomplete or mismatched launch group before a
+/// role runtime is started.
+#[test]
+fn binary_rejects_removed_and_ambiguous_launch_shapes() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_server_binary_smoke();
+    let pair = ConfigPair::new();
+    let missing_role = write_config(
+        pair.runtime.path(),
+        "missing-role",
+        "[server]\nhost = \"127.0.0.1\"\n",
+    );
+    let legacy_all_in_one = write_config(
+        pair.runtime.path(),
+        "legacy-all-in-one",
+        "[cluster]\nrole = \"all-in-one\"\n",
+    );
+
+    assert_rejected(&["standalone"], "missing required --role");
+    assert_rejected(
+        &["standalone", "--role", "fe", "--port", "9030"],
+        "--port is not supported",
+    );
+    assert_rejected(
+        &[
+            "standalone",
+            "--role",
+            "all-in-one",
+            "--config",
+            pair.fe_config.path().to_str().expect("utf8 config path"),
+        ],
+        "does not accept --config",
+    );
+    assert_rejected(
+        &[
+            "standalone",
+            "--role",
+            "all-in-one",
+            "--fe-config",
+            pair.fe_config.path().to_str().expect("utf8 config path"),
+        ],
+        "requires both --fe-config",
+    );
+    assert_rejected(
+        &[
+            "standalone",
+            "--role",
+            "be",
+            "--config",
+            pair.fe_config.path().to_str().expect("utf8 config path"),
+        ],
+        "requires [cluster].role=be",
+    );
+    assert_rejected(
+        &[
+            "standalone",
+            "--role",
+            "fe",
+            "--config",
+            missing_role.path().to_str().expect("utf8 config path"),
+        ],
+        "missing required [cluster] table",
+    );
+    assert_rejected(
+        &[
+            "standalone",
+            "--role",
+            "fe",
+            "--config",
+            legacy_all_in_one.path().to_str().expect("utf8 config path"),
+        ],
+        "must be `fe` or `be`",
+    );
+}
+
+/// Cross-role bind overlap must fail in launch preflight, before logging,
+/// StateStore creation, or a listener side effect. The reserved port is
+/// released solely so a mistaken late bind would be observable here.
+#[test]
+fn all_in_one_preflight_conflict_has_no_startup_side_effects() {
+    let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
+    if !binary.exists() {
+        return;
+    }
+    let _lock = lock_server_binary_smoke();
+    let mut pair = ConfigPair::new();
+    let conflict_port = pair.fe_grpc_port;
+    let state_store = pair.runtime.path().join("preflight-state.sqlite");
+    let log_dir = pair.runtime.path().join("preflight-logs");
+    let conflicting_be = write_config(
+        pair.runtime.path(),
+        "conflicting-be",
         &format!(
             r#"
+sys_log_dir = "{}"
+
 [server]
 host = "127.0.0.1"
-grpc_port = {grpc_port}
-http_port = {http_port}
+http_port = {}
+grpc_port = {conflict_port}
 
 [cluster]
 role = "be"
-"#
+"#,
+            log_dir.display(),
+            pair.be_http_port,
         ),
     );
+    let conflicting_fe = write_config(
+        pair.runtime.path(),
+        "conflicting-fe",
+        &format!(
+            r#"
+sys_log_dir = "{}"
 
-    let _ = grpc.release();
-    let _ = http.release();
-    let mut first = spawn_novarocks(config.path(), "NOVAROCKS_READY role=be", &[]);
-    first
-        .interrupt_and_wait(Duration::from_secs(10))
-        .expect("shut down first BE cleanly");
+[server]
+host = "127.0.0.1"
+http_port = {}
+grpc_port = {}
 
-    let rebound = TcpListener::bind(("127.0.0.1", grpc_port))
-        .expect("native BE gRPC port must be reusable immediately after SIGINT shutdown");
+[standalone_server]
+mysql_port = {}
+
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:{}"]
+
+[state_store]
+provider = "sqlite"
+cluster_id = "preflight"
+path = "{}"
+deployment_owner = "preflight-fe"
+"#,
+            log_dir.display(),
+            pair.fe_http_port,
+            pair.fe_grpc_port,
+            pair.fe_mysql_port,
+            pair.be_grpc_port,
+            state_store.display(),
+        ),
+    );
+    pair.release_all();
+    let output = run_binary(&[
+        "standalone",
+        "--role",
+        "all-in-one",
+        "--fe-config",
+        conflicting_fe.path().to_str().expect("utf8 config path"),
+        "--be-config",
+        conflicting_be.path().to_str().expect("utf8 config path"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "conflicting all-in-one launch succeeded"
+    );
+    let diagnostics = format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        diagnostics.contains("bind endpoint conflict"),
+        "{diagnostics}"
+    );
+    assert!(!state_store.exists(), "preflight created StateStore");
+    assert!(!log_dir.exists(), "preflight created log directory");
+    let rebound = TcpListener::bind(("127.0.0.1", conflict_port))
+        .expect("preflight must not start conflicting native listener");
     drop(rebound);
-
-    let mut restarted = spawn_novarocks(config.path(), "NOVAROCKS_READY role=be", &[]);
-    restarted
-        .interrupt_and_wait(Duration::from_secs(10))
-        .expect("shut down restarted BE cleanly");
 }

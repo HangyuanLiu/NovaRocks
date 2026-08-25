@@ -129,19 +129,16 @@ Build artifacts:
 
 ## Configuration
 
-NovaRocks loads config in this order:
+Deployable role configuration is explicit. Use the two templates as a pair:
 
-1. `--config <path>`
-2. `NOVAROCKS_CONFIG=<path>`
-3. `./novarocks.toml`
+- `novarocks-fe.toml.example`: FE MySQL, coordinator-report gRPC, management
+  HTTP, StateStore, and additive backend seeds.
+- `novarocks-be.toml.example`: BE Native gRPC, management HTTP, and local
+  connector execution binding.
 
-Useful files:
-
-- `novarocks.toml`: local runtime config
-- `novarocks.toml.example`: extended documented template
-
-Standalone mode is configured through `[standalone_server]`. A frontend role
-also uses `[state_store]` for its durable application state:
+Both files must contain `[cluster].role`; the command line asserts that role
+and never changes it. A frontend role uses `[state_store]` for durable backend
+membership. A minimal FE outline is:
 
 ```toml
 [state_store]
@@ -149,6 +146,14 @@ provider = "sqlite"
 path = "meta/frontend-state.sqlite"
 cluster_id = "local-cluster"
 deployment_owner = "fe-1"
+
+[server]
+grpc_port = 9080
+http_port = 8040
+
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:9081"]
 
 [standalone_server]
 mysql_port = 9030
@@ -176,9 +181,9 @@ empty, malformed, and non-UTF-8 values fail startup without exposing the value.
 The only server command is `standalone`:
 
 ```bash
-novarocks standalone --role fe --config ./novarocks.toml
-novarocks standalone --role be --config ./be.toml
-novarocks standalone --role all-in-one --config ./novarocks.toml
+novarocks standalone --role fe --config ./novarocks-fe.toml
+novarocks standalone --role be --config ./novarocks-be.toml
+novarocks standalone --role all-in-one --fe-config ./novarocks-fe.toml --be-config ./novarocks-be.toml
 ```
 
 `--help` and `-h` show the command contract. Historical daemon commands
@@ -187,12 +192,13 @@ novarocks standalone --role all-in-one --config ./novarocks.toml
 Native role examples:
 
 ```bash
-# One process that composes a real FE and BE through the gRPC boundary.
-cargo run -p novarocks-server -- standalone --role all-in-one --config ./novarocks.toml
+# One process that supervises the normal FE and BE role runners.
+cargo run -p novarocks-server -- standalone --role all-in-one \
+  --fe-config ./novarocks-fe.toml --be-config ./novarocks-be.toml
 
 # Split FE/BE deployment.
-cargo run -p novarocks-server -- standalone --role be --config ./be.toml
-cargo run -p novarocks-server -- standalone --role fe --config ./fe.toml
+cargo run -p novarocks-server -- standalone --role be --config ./novarocks-be.toml
+cargo run -p novarocks-server -- standalone --role fe --config ./novarocks-fe.toml
 ```
 
 Connect with a MySQL client:
@@ -228,7 +234,8 @@ Useful generated values:
 - `NOVAROCKS_ICEBERG_REST_URI`
 - `NOVAROCKS_ICEBERG_REST_WAREHOUSE`
 - `AWS_S3_ENDPOINT`
-- `NOVAROCKS_STANDALONE_CONFIG`
+- `NOVAROCKS_FE_CONFIG`
+- `NOVAROCKS_BE_CONFIG`
 - `NOVAROCKS_SQL_TEST_CONFIG`
 - `NOVAROCKS_ICE_REST_CATALOG_SQL`
 - `NOVAROCKS_SPARK_DEFAULTS`
@@ -240,7 +247,8 @@ Start standalone with the generated object-store config:
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
-cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
 ```
 
 Generate an Iceberg format-v3 table through Spark using the same REST Catalog
@@ -256,7 +264,8 @@ Spark uses the Docker-network endpoints `http://rest:8181` and
 `http://minio:9000`; NovaRocks uses the host endpoints exported in `env.sh`.
 The Docker services are shared across worktrees by default and use the
 service-default host ports configured in `docker/iceberg-rest/shared.env`;
-the NovaRocks standalone port is allocated per worktree.
+the NovaRocks FE MySQL and four FE/BE Native/management listener ports are
+allocated per worktree.
 
 Run the cross-engine Iceberg compatibility SQL suite:
 

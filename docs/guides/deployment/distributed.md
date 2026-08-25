@@ -41,9 +41,8 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 
 | 角色 | 作用 | 对外端口 |
 | --- | --- | --- |
-| `fe` | 接收 MySQL 连接，解析 SQL，优化计划，调度 fragment 到后端 | `[standalone_server].mysql_port`；同时使用 `[server].grpc_port` 提供 coordinator report gRPC |
-| `be` | 执行 FE 下发的 fragment，处理 exchange 和结果回传 | `[server].grpc_port` |
-| `all-in-one` | 单进程测试与本地验证便利；进程内仍由独立 FE/BE application host 通过 NovaRocksGrpc 通信，不走 direct-call shortcut | `[standalone_server].mysql_port`；`[server].grpc_port` |
+| `fe` | 接收 MySQL 连接，解析 SQL，优化计划，调度 fragment 到后端 | MySQL：`[standalone_server].mysql_port`；Native coordinator-report gRPC：`[server].grpc_port`；FE management HTTP：`[server].http_port` |
+| `be` | 执行 FE 下发的 fragment，处理 exchange 和结果回传 | Native fragment/exchange gRPC：`[server].grpc_port`；BE management HTTP：`[server].http_port` |
 
 ## 前提条件
 
@@ -74,7 +73,11 @@ cargo build
 
 ## 配置 BE 节点
 
-BE 节点使用 `server.grpc_port` 提供 NovaRocksGrpc 服务，默认端口是 `9080`。不同机器上的 BE 可以都使用默认端口；只有多个 NovaRocks 进程部署在同一台机器并发生端口冲突时，才需要为其中的进程改成其他端口。如果节点有多张网卡，建议显式配置 `advertise_host`，端口统一使用 `server.grpc_port`。
+BE 节点使用 `server.grpc_port` 提供 Native NovaRocksGrpc 服务，使用独立的
+`server.http_port` 提供 BE-scoped management metrics。Native listener 不提供任何
+management route，management listener 也不提供 Native gRPC service。不同机器上的
+BE 可以都使用默认端口；同一 address family 内不能让任意 Native/management
+listener 复用相同端口，wildcard bind 也会与同端口具体地址冲突。
 
 示例 `be-1.toml`：
 
@@ -84,6 +87,7 @@ log_level = "info"
 [server]
 host = "0.0.0.0"
 grpc_port = 9080
+http_port = 8040
 
 [cluster]
 role = "be"
@@ -123,7 +127,11 @@ affected process. Credentials never enter native fragments or FE-to-BE transport
 
 ## 配置 FE 节点
 
-FE 节点也会启动 `server.grpc_port`，用于接收 BE 回报执行状态。该配置默认是 `9080`，如果没有端口冲突可以不显式配置。FE 必须配置 `[state_store]`，以持久化 backend membership；`[cluster].backends` 则是可选的 additive seeds，endpoint 应指向 BE 的 `grpc_port`。
+FE 节点启动 `server.grpc_port` 接收 BE coordinator report，并启动独立
+`server.http_port` 暴露 FE-scoped metrics 和现有 gated lifecycle debug。Native
+listener 不承载 management HTTP。FE 必须配置 `[state_store]`，以持久化 backend
+membership；`[cluster].backends` 则是可选的 additive seeds，endpoint 应指向 BE 的
+`grpc_port`。
 
 示例 `fe.toml`：
 
@@ -139,6 +147,7 @@ deployment_owner = "fe-a"
 [server]
 host = "0.0.0.0"
 grpc_port = 9080
+http_port = 8040
 
 [standalone_server]
 mysql_port = 9030
@@ -245,4 +254,5 @@ ADD/DROP 的最终 desired membership 先写入 FE 的 StateStore，因此 clean
 | 查询报 `role=fe: no live backend available` | 当前 FE 没有可调度的 live BE；先恢复或注册 BE。 |
 | FE 启动时提示缺少 StateStore | 为 `role=fe` 配置 `[state_store]`；不要使用 core metadata 或内存 registry 作为 membership fallback。 |
 | BE 启动时配置校验失败 | `role=be` 不能配置 `[cluster].backends`。 |
-| all-in-one 配置校验失败 | `role=all-in-one` 不能配置 `[cluster].backends`。 |
+| Native 或 management endpoint 冲突 | 让 FE MySQL、FE Native gRPC、FE management HTTP、BE Native gRPC、BE management HTTP 使用不重叠的 bind endpoint；同时检查 wildcard bind。 |
+| `/metrics` 在 gRPC port 不可用 | 改访问对应 role 的 `[server].http_port`；metrics 使用 role-local registry，不会跨 FE/BE 混合。 |

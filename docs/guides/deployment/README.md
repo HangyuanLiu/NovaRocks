@@ -19,8 +19,9 @@ under the License.
 
 # 部署NovaRocks
 
-本文介绍 NovaRocks 的 native 角色部署。生产角色只有 `fe` 和 `be`；
-`all-in-one` 是本地验证与测试便利，不是单独的生产拓扑。
+本文介绍 NovaRocks 的 native 角色部署。application role 只有 `fe` 和 `be`；
+`all-in-one` 是 Server 读取一对正常 FE/BE 配置后的本地 supervisor，不是单独的
+application role 或生产拓扑。
 
 - [分布式部署](distributed.md)：将 NovaRocks `fe` 与一个或多个 `be` 拆开运行。
 - [all-in-one 部署](standalone.md)：在一个进程中运行 native FE/BE application host，适合本地验证和功能测试。
@@ -40,8 +41,8 @@ under the License.
 
 | 部署模式 | 适用场景 | 编译重点 | SQL 入口 | 计算节点 | 主要配置 |
 | --- | --- | --- | --- | --- | --- |
-| 分布式部署 | 多节点执行、分布式查询验证、生产或准生产环境 | `cargo build --release -p novarocks-server`，将同一 native 二进制部署到 FE/BE 节点 | NovaRocks FE 的 MySQL 协议端口 | 一个或多个 NovaRocks BE 进程 | `[cluster]`、`[server]`、`[standalone_server]` |
-| all-in-one 部署 | 单机开发、快速试用、SQL 回归测试 | `cargo build -p novarocks-server` 用于本地验证；部署建议 release | 当前进程的 MySQL 协议端口 | 当前进程内的 native BE host | `[standalone_server]`、对象存储配置 |
+| 分布式部署 | 多节点执行、分布式查询验证、生产或准生产环境 | `cargo build --release -p novarocks-server`，将同一 native 二进制部署到 FE/BE 节点 | NovaRocks FE 的 MySQL 协议端口 | 一个或多个 NovaRocks BE 进程 | 独立 `fe.toml` 与每个 `be.toml`，均含 `[cluster].role` |
+| all-in-one 部署 | 单机开发、快速试用、SQL 回归测试 | `cargo build -p novarocks-server` 用于本地验证；部署建议 release | 当前进程 FE 的 MySQL 协议端口 | 当前进程内的正常 native BE host | 一对普通 `fe.toml` / `be.toml`；命令显式传入 `--fe-config` 与 `--be-config` |
 
 ## 分布式部署
 
@@ -51,7 +52,7 @@ under the License.
 
 ## standalone部署
 
-all-in-one 部署使用单个 NovaRocks 进程完成 native FE/BE application host 的 SQL 接入、分析、优化和执行。它适合快速验证 external Iceberg catalog、SQL 功能和本地测试环境；它不提供内部 StarRocks 表类型。
+all-in-one 部署使用单个 NovaRocks 进程并发运行完整 native FE/BE role runner。它适合快速验证 external Iceberg catalog、SQL 功能和本地测试环境；它不提供内部 StarRocks 表类型，也不绕过 Native gRPC、StateStore、topology 或 listener 路径。
 
 阅读：[standalone部署](standalone.md)
 

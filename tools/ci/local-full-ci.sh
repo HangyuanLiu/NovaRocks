@@ -284,7 +284,7 @@ init_run_dir() {
 
 cleanup() {
   local status=$?
-  ci_stop_standalone_server || true
+  ci_stop_all_in_one_server || true
 
   if [ "$CI_RUNTIME_PREPARED" = "true" ] && [ "$KEEP_RUNTIME" != "true" ]; then
     {
@@ -319,12 +319,14 @@ prepare_runtime() {
     docker/iceberg-rest/up.sh
     echo "+ source docker/iceberg-rest/runtime/current/env.sh"
     . docker/iceberg-rest/runtime/current/env.sh
-    require_runtime_var NOVAROCKS_STANDALONE_CONFIG
+    require_runtime_var NOVAROCKS_FE_CONFIG
+    require_runtime_var NOVAROCKS_BE_CONFIG
     require_runtime_var NOVAROCKS_SQL_TEST_CONFIG
     require_runtime_var NOVA_ENV_RUNTIME_DIR
     require_runtime_var NOVA_ENV_MYSQL_PORT
     require_runtime_var NOVAROCKS_ICEBERG_REST_URI
-    echo "NOVAROCKS_STANDALONE_CONFIG=$NOVAROCKS_STANDALONE_CONFIG"
+    echo "NOVAROCKS_FE_CONFIG=$NOVAROCKS_FE_CONFIG"
+    echo "NOVAROCKS_BE_CONFIG=$NOVAROCKS_BE_CONFIG"
     echo "NOVAROCKS_SQL_TEST_CONFIG=$NOVAROCKS_SQL_TEST_CONFIG"
     echo "NOVA_ENV_RUNTIME_DIR=$NOVA_ENV_RUNTIME_DIR"
     echo "NOVA_ENV_MYSQL_PORT=$NOVA_ENV_MYSQL_PORT"
@@ -348,7 +350,7 @@ prepare_runtime() {
   fi
 
   CI_RUNTIME_PREPARED="true"
-  ci_set_runtime_context "$NOVAROCKS_STANDALONE_CONFIG" "$NOVAROCKS_SQL_TEST_CONFIG" "$NOVA_ENV_MYSQL_PORT"
+  ci_set_runtime_context "$NOVAROCKS_FE_CONFIG" "$NOVAROCKS_SQL_TEST_CONFIG" "$NOVA_ENV_MYSQL_PORT"
   ci_record_stage "prepare runtime" "PASS" "$duration" "$log_path"
   ci_render_summary "RUNNING"
 }
@@ -504,18 +506,19 @@ start_server_stage() {
   local duration
 
   start="$(ci_epoch)"
-  ci_start_standalone_server "$NOVAROCKS_STANDALONE_CONFIG" "$log_path" 60 "$NOVA_CI_CARGO_PROFILE"
+  ci_start_all_in_one_server \
+    "$NOVAROCKS_FE_CONFIG" "$NOVAROCKS_BE_CONFIG" "$log_path" 60 "$NOVA_CI_CARGO_PROFILE"
   code=$?
   duration=$(($(ci_epoch) - start))
 
   if [ "$code" -ne 0 ]; then
-    ci_record_stage "standalone" "FAIL" "$duration" "$log_path"
-    ci_mark_failure_tail "standalone failed to become ready" "$log_path"
+    ci_record_stage "all-in-one" "FAIL" "$duration" "$log_path"
+    ci_mark_failure_tail "all-in-one failed to become ready" "$log_path"
     ci_render_summary "FAIL"
     exit "$code"
   fi
 
-  ci_record_stage "standalone" "PASS" "$duration" "$log_path"
+  ci_record_stage "all-in-one" "PASS" "$duration" "$log_path"
   ci_render_summary "RUNNING"
 }
 
@@ -941,20 +944,20 @@ stop_server_for_native_cross_process_stage() {
 
   start="$(ci_epoch)"
   {
-    echo "Stopping standalone before native cross-process SQL suites."
-    ci_stop_standalone_server
+    echo "Stopping all-in-one before native cross-process SQL suites."
+    ci_stop_all_in_one_server
   } >"$log_path" 2>&1
   code=$?
   duration=$(($(ci_epoch) - start))
 
   if [ "$code" -ne 0 ]; then
-    ci_record_stage "standalone stop for native cross-process" "FAIL" "$duration" "$log_path"
-    ci_mark_failure_tail "standalone stop for native cross-process failed" "$log_path"
+    ci_record_stage "all-in-one stop for native cross-process" "FAIL" "$duration" "$log_path"
+    ci_mark_failure_tail "all-in-one stop for native cross-process failed" "$log_path"
     ci_render_summary "FAIL"
     exit "$code"
   fi
 
-  ci_record_stage "standalone stop for native cross-process" "PASS" "$duration" "$log_path"
+  ci_record_stage "all-in-one stop for native cross-process" "PASS" "$duration" "$log_path"
   ci_render_summary "RUNNING"
 }
 
