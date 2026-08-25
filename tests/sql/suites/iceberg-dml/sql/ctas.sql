@@ -18,7 +18,7 @@
 -- @order_sensitive=true
 -- Ordinary iceberg-dml runs without the test-only fenced REST proxy. CTAS
 -- therefore has to fail closed before source execution. The positive CTAS
--- publication and takeover matrix lives in the explicit-only ctas-takeover
+-- publication fault matrix lives in the explicit-only lake-publication
 -- suite, where the runner-owned fenced catalog capability is enabled.
 
 -- query 1

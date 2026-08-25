@@ -71,7 +71,7 @@ fn publication_evidence(
             instance_id: ConnectorInstanceId::parse("statistics-test").expect("instance ID"),
         },
         ConnectorInstanceIncarnation::default(),
-        ConnectorMutationOperationId::from_bytes(*job.operation_id.as_bytes()),
+        ConnectorMutationOperationId::from_bytes(job.operation_id.to_bytes()),
         "statistics-publish",
         Bytes::from_static(b"operation-evidence"),
     )
@@ -230,7 +230,7 @@ async fn records_are_versioned_durable_and_identical_analyze_requests_remain_dis
         StatisticsColumnIntent::Explicit(vec!["v".to_string()])
     );
     assert_eq!(first.job_id.get_version_num(), 7);
-    assert_eq!(first.operation_id.get_version_num(), 7);
+    assert_eq!(first.operation_id.as_uuid().get_version_num(), 7);
     assert_eq!(
         repository
             .list_by_state(StatisticsJobState::Submitted)
@@ -735,7 +735,7 @@ async fn worker_reconciles_publishing_without_recollecting() {
     .expect("decode publishing job evidence");
     assert_eq!(
         stored_evidence.operation_id().to_bytes(),
-        *created.operation_id.as_bytes()
+        created.operation_id.to_bytes()
     );
 
     let concrete_executor = Arc::new(SucceedingStatisticsExecutor {

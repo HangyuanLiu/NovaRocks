@@ -82,6 +82,14 @@ pub enum IcebergMutationEvidenceTarget {
         table_uuid: String,
         operation_marker: String,
     },
+    MvMetadataOnlyStage {
+        namespace: String,
+        table: String,
+        table_uuid: String,
+        staging_branch: String,
+        staging_snapshot_id: i64,
+        provenance_hash: String,
+    },
     Ref {
         namespace: String,
         table: String,

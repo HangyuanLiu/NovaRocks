@@ -49,8 +49,6 @@ use super::maintenance::{
     MaintenanceCoordinatorConfig, MaintenanceExecutionReport,
 };
 
-const MAINTENANCE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-
 /// Dependencies bound by the frontend host after Core has completed restore,
 /// recovery, provider binding and table-maintenance recovery.
 #[derive(Clone)]
@@ -61,6 +59,7 @@ pub(crate) struct FrontendMaintenanceWorkerDependencies {
     pub(crate) table_maintenance_service: Arc<dyn TableMaintenanceService>,
     pub(crate) activity_gate: MvActivityGate,
     pub(crate) coordinator_config: MaintenanceCoordinatorConfig,
+    pub(crate) attempt_timeout: Duration,
 }
 
 /// A maintenance pass is intentionally observable, including every complete
@@ -316,7 +315,7 @@ impl FrontendMaintenanceWorker {
                 lease
                     .cancellation()
                     .unwrap_or_else(|| QueryCancellationSource::new().view()),
-                Instant::now() + MAINTENANCE_ATTEMPT_TIMEOUT,
+                Instant::now() + self.dependencies.attempt_timeout,
             ),
         };
         let execution = MaintenanceCoordinator::execute_attempt(&attempt, &mut runner);

@@ -285,7 +285,7 @@ mod tests {
                 StatisticsApplicationCommand::AnalyzeTable { target, .. } => Ok(
                     StatisticsApplicationResult::JobSubmitted(StatisticsJobView {
                         job_id: Uuid::nil(),
-                        operation_id: Uuid::nil(),
+                        operation_id: Uuid::nil().into(),
                         state: "SUBMITTED".into(),
                         attempt: 0,
                         target,

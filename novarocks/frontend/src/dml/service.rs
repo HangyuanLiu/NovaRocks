@@ -18,27 +18,21 @@
 use std::sync::{Arc, RwLock};
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
-use crate::query_execution::dml::ctas::CtasEngine;
 use tokio::runtime::Handle;
 
 use crate::coordination::FrontendCoordinationRuntime;
 use crate::dml::coordination::{ActiveDmlOperation, DmlCoordinator};
-use crate::dml::ctas::recovery::{CtasRecoveryProfile, CtasRecoveryProgress};
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
     CreatePreparingRequest, CreateStatementOperationRequest, DmlOperationId, DmlRecoveryCandidate,
-    StoredOperation, WriteTransactionOutcome, WriteTransactionSpec,
+    OperationKind, OperationPayload, OperationState, StatementNextAction, StoredOperation,
+    WriteTransactionOutcome, WriteTransactionSpec,
 };
 use crate::dml::runner::{
     ActiveWriteTransactionRunner, AlwaysAdmit, WriteAdmission, WriteExecutor,
     WriteTransactionRunner, preparing_request,
 };
-use crate::dml::statement_recovery::{
-    HistoricalDataMutationRecoveryResolver, StatementRecoveryProfile, StatementRecoveryProgress,
-    direct_mutation_kind, is_authority_loss,
-};
-use crate::dml::write_recovery::HistoricalWriteRecoveryResolver;
 use crate::statistics::{FrontendStatisticsService, StatisticsColumn};
 
 /// The frontend DML application owner. Composes the narrow ports (journal +
@@ -51,28 +45,10 @@ pub struct DmlService {
     admission: Arc<dyn WriteAdmission>,
     coordinator: Option<DmlCoordinator>,
     allow_unfenced_focused_test_support: bool,
-    /// The CP-3C direct data-mutation recovery profile, installed only when the
-    /// host can resolve the current provider generation's historical facet. A
-    /// service without it defers statement-family recovery instead of
-    /// classifying anything.
-    statement_recovery: Option<StatementRecoveryProfile>,
-    ctas_recovery: RwLock<Option<Arc<dyn CtasEngine>>>,
-    ctas_write_recovery: RwLock<Option<Arc<dyn HistoricalWriteRecoveryResolver>>>,
 }
 
 #[derive(Debug)]
-pub(crate) enum DmlRecoveryProgress {
-    #[allow(
-        dead_code,
-        reason = "Retained for staged DML recovery and durable-journal integration."
-    )]
-    Statement(StatementRecoveryProgress),
-    #[allow(
-        dead_code,
-        reason = "Retained for staged DML recovery and durable-journal integration."
-    )]
-    Ctas(CtasRecoveryProgress),
-}
+pub(crate) enum DmlRecoveryProgress {}
 
 impl DmlService {
     /// Build a journal-backed service with frontend-local statistics observation.
@@ -98,9 +74,6 @@ impl DmlService {
             admission: Arc::new(AlwaysAdmit),
             coordinator: None,
             allow_unfenced_focused_test_support: true,
-            statement_recovery: None,
-            ctas_recovery: RwLock::new(None),
-            ctas_write_recovery: RwLock::new(None),
         }
     }
 
@@ -123,42 +96,7 @@ impl DmlService {
             admission: Arc::new(AlwaysAdmit),
             coordinator: Some(DmlCoordinator::new(frontend, runtime)),
             allow_unfenced_focused_test_support: false,
-            statement_recovery: None,
-            ctas_recovery: RwLock::new(None),
-            ctas_write_recovery: RwLock::new(None),
         }
-    }
-
-    /// Install the CP-3C direct data-mutation recovery profile.
-    ///
-    /// The resolver reaches the *current* provider generation's separately
-    /// installed historical facet. Without it the bounded controller keeps
-    /// deferring TRUNCATE and ADD FILES rather than guessing anything about
-    /// external truth.
-    pub fn install_statement_recovery(
-        &mut self,
-        resolver: Arc<dyn HistoricalDataMutationRecoveryResolver>,
-    ) {
-        self.statement_recovery = Some(StatementRecoveryProfile::new(resolver));
-    }
-
-    /// Install the current-generation Core CTAS historical reverse port.
-    /// The bounded controller may start before this late-bound dependency;
-    /// until installation, CTAS candidates are safely deferred.
-    pub fn install_ctas_recovery(&self, engine: Arc<dyn CtasEngine>) {
-        *self
-            .ctas_recovery
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(engine);
-    }
-
-    /// Install the current-generation CP-3B historical write resolver used by
-    /// CTAS takeover before any retained staged target may be cleaned up.
-    pub fn install_ctas_write_recovery(&self, resolver: Arc<dyn HistoricalWriteRecoveryResolver>) {
-        *self
-            .ctas_write_recovery
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolver);
     }
 
     /// Build a service with a custom admission gate (CP-3 fencing).
@@ -178,9 +116,6 @@ impl DmlService {
             admission,
             coordinator: None,
             allow_unfenced_focused_test_support: true,
-            statement_recovery: None,
-            ctas_recovery: RwLock::new(None),
-            ctas_write_recovery: RwLock::new(None),
         }
     }
 
@@ -293,47 +228,27 @@ impl DmlService {
     pub(crate) fn drive_recovery_candidate(
         &self,
         candidate: DmlRecoveryCandidate,
-        now_ms: i64,
+        _now_ms: i64,
         deferred_due_at_ms: i64,
     ) -> Result<Option<DmlRecoveryProgress>, DmlError> {
         let Some(mut active) = self.claim_recovery_candidate(candidate)? else {
             return Ok(None);
         };
         // The scan candidate carries no family, so the decision is taken from
-        // the claimed operation itself. CTAS and direct mutations share this
-        // one bounded scheduler but retain independent typed profiles.
+        // the claimed operation itself. CP-3D CTAS recovery is retired:
+        // retained records are locally quarantined, never re-driven against a
+        // provider. Direct-mutation takeover is retired as well: retained
+        // records become local manual-inspection evidence and no new process
+        // may inspect, replay, or clean the old catalog attempt.
         let result = if active.stored.operation_kind
             == crate::dml::model::OperationKind::CreateTableAsSelect
         {
-            let engine = self
-                .ctas_recovery
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            match engine {
-                Some(engine) => {
-                    let write_recovery = self
-                        .ctas_write_recovery
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    CtasRecoveryProfile::new(engine, write_recovery)
-                }
-                .drive(&mut active, now_ms)
-                .map(|progress| Some(DmlRecoveryProgress::Ctas(progress))),
-                None => active
-                    .reschedule_recovery_due(Some(deferred_due_at_ms))
-                    .map(|()| None),
-            }
-        } else if direct_mutation_kind(active.stored.operation_kind).is_some() {
-            match self.statement_recovery.as_ref() {
-                Some(profile) => profile
-                    .drive(&mut active, now_ms)
-                    .map(|progress| Some(DmlRecoveryProgress::Statement(progress))),
-                None => active
-                    .reschedule_recovery_due(Some(deferred_due_at_ms))
-                    .map(|()| None),
-            }
+            quarantine_legacy_ctas(&mut active).map(|()| None)
+        } else if matches!(
+            active.stored.operation_kind,
+            OperationKind::Truncate | OperationKind::AddFiles
+        ) {
+            quarantine_legacy_direct_mutation(&mut active).map(|()| None)
         } else {
             active
                 .reschedule_recovery_due(Some(deferred_due_at_ms))
@@ -345,20 +260,11 @@ impl DmlService {
         match result {
             Ok(progress) => release.map(|()| progress),
             Err(error) => {
-                // Losing the lease mid-cycle is an ordinary takeover, not a
-                // fault: the new owner re-drives the same immutable request.
-                // The release failure, if any, is subordinate to the cycle
-                // failure that already explains this operation's state.
+                // The lease release is subordinate to the mutation failure.
                 if let Err(release_error) = release {
                     tracing::debug!(
                         error = %release_error,
-                        "historical data mutation recovery could not release its lease"
-                    );
-                }
-                if is_authority_loss(&error) {
-                    tracing::debug!(
-                        error = %error,
-                        "historical data mutation recovery lost its authority mid-cycle"
+                        "DML recovery quarantine could not release its lease"
                     );
                 }
                 Err(error)
@@ -526,6 +432,45 @@ impl DmlService {
     }
 }
 
+fn quarantine_legacy_ctas(active: &mut ActiveDmlOperation) -> Result<(), DmlError> {
+    let OperationPayload::CtasSaga(mut saga) = active.stored.payload.clone() else {
+        return Err(DmlError::journal_corruption(
+            "CTAS recovery candidate has a non-CTAS payload",
+        ));
+    };
+    saga.next_action = StatementNextAction::ManualInspect;
+    let state = if active.stored.state.is_finished() {
+        active.stored.state
+    } else {
+        OperationState::CommitUnknown
+    };
+    active.mutate_statement(state, OperationPayload::CtasSaga(saga), None)
+}
+
+fn quarantine_legacy_direct_mutation(active: &mut ActiveDmlOperation) -> Result<(), DmlError> {
+    let payload = match active.stored.payload.clone() {
+        OperationPayload::TruncateLifecycle(mut lifecycle) => {
+            lifecycle.next_action = StatementNextAction::ManualInspect;
+            OperationPayload::TruncateLifecycle(lifecycle)
+        }
+        OperationPayload::AddFilesLifecycle(mut lifecycle) => {
+            lifecycle.next_action = StatementNextAction::ManualInspect;
+            OperationPayload::AddFilesLifecycle(lifecycle)
+        }
+        payload => {
+            return Err(DmlError::journal_corruption(format!(
+                "direct-mutation recovery candidate has incompatible payload {payload:?}"
+            )));
+        }
+    };
+    let state = if active.stored.state.is_finished() {
+        active.stored.state
+    } else {
+        OperationState::CommitUnknown
+    };
+    active.mutate_statement(state, payload, None)
+}
+
 fn local_table_columns(
     catalog_service: &QueryCatalogService,
     database: &str,
@@ -608,6 +553,7 @@ mod tests {
 
     fn spec() -> WriteTransactionSpec {
         WriteTransactionSpec {
+            publication_id: crate::dml::DmlOperationId::new_v7(),
             target: OperationTarget {
                 catalog: "c".to_string(),
                 namespace: "n".to_string(),

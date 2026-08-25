@@ -35,7 +35,6 @@ use uuid::Uuid;
 use super::collector::IcebergCommitCollector;
 use crate::commit::CommitOutcome;
 use crate::commit::abort::AbortLog;
-use crate::commit::write_fence::IcebergFenceAssertion;
 use crate::commit::{MV_PROVENANCE_V1_PROP, MV_REFRESH_ROW_COUNT_PROP, MvProvenanceV1};
 
 pub struct CommitCtx<'a> {
@@ -49,13 +48,6 @@ pub struct CommitCtx<'a> {
     /// values are used for branch-qualified DML (`INSERT INTO t.branch_<x>`).
     pub target_ref: &'a str,
     pub snapshot_properties: &'a BTreeMap<String, String>,
-    /// External write fence for a coordinated distributed-DML commit.
-    ///
-    /// `None` marks a commit family CP-3B does not fence — MV refresh,
-    /// maintenance and rewrite have no coordinated frontend write operation to
-    /// fence. The fail-closed requirement for DML lives at the write-control
-    /// boundary, which always supplies `Some` for INSERT/DELETE/UPDATE/MERGE.
-    pub fence: Option<&'a IcebergFenceAssertion>,
 }
 
 pub(super) fn merge_snapshot_summary_properties(

@@ -109,9 +109,7 @@ code-anchors:
 - ADR-0056 — 摘除 Core 对 provider 的测试依赖时，无法用冻结 SPI facts 表达的断言为何归位到实现旁而非复刻或删除（active）
 - ADR-0061 — MV repartition 为何由 Provider 在单次原子 write commit 中同时切换 partition spec 与 snapshot（active）
 - ADR-0063 — Copy-on-Write row mutation 的match与rewrite读源为何由Provider按exact base签发（active）
-- ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（active）
 - ADR-0077 — Hadoop catalog 创建表为何以 storage 条件创建 v1 metadata 作为线性化点（active）
-- ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（active）
 - ADR-0085 — durable caller 为何通过既有 exact metadata lease capture/rebind 物理表对象，而不依赖统计能力或新增平行 authority（active）
 - ADR-0080 — 统计证据为何拆成 collection 级覆盖度与 per-metric 基准版本/来源/数值性质/集合关系四个独立维度（active）
 - ADR-0081 — 统计为何是带版本、允许陈旧、由读侧逐 metric 决定可用性的估计事实（active）
@@ -119,6 +117,7 @@ code-anchors:
 - ADR-0084 — durable statistics job 为何持久化逻辑目标、物理对象 ID 与列意图，并在 attempt 时解析当前数据版本（active）
 - ADR-0097 — durable MV 与维护基表 identity 为何保持 opaque、只在 provider-local 边界解释（active）
 - ADR-0089 — Predicate-driven Parquet page pruning 为何只在 FS reader-open 按实际 physical leaf 计算（active）
+- ADR-0104 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 
 #### 历史
 
@@ -127,6 +126,8 @@ code-anchors:
 - ADR-0060 — MV refresh base pin 为何必须从同一 exact metadata 投影 UUID 与 current snapshot（superseded → ADR-0086）
 - ADR-0047 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（superseded → ADR-0103）
 - ADR-0103 — 中央 Provider wire authority 与同构 Native build admission 为何统一由 Protocol 和 Frontend topology 拥有（superseded → ADR-0105）
+- ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（superseded → ADR-0104）
+- ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（superseded → ADR-0104）
 ### distributed-query-lifecycle
 
 领域哲学：FE coordinator 拥有全局编排，BE query lifecycle 拥有本地执行与资源；两者是独立进程、故障域与状态机，
@@ -237,27 +238,26 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 - ADR-0020 — DELETE/equality-delete application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
 - ADR-0021 — native frontend INSERT 为何只支持 Iceberg，并与 external StarRocks connector 隔离（active）
-- ADR-0032 — Frontend CTAS 为何使用 provider-owned staged publication，而不对可见表做破坏性补偿（active）
+- ADR-0104 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0033 — UPDATE/MERGE 为何由 frontend 拥有 application lifecycle、core 保留 opaque mutation reverse port（active）
-- ADR-0046 — ADD FILES 为何以 provider canonical source scope 保护 frontend durable ownership（active）
-- ADR-0054 — Frontend DML 为何使用 operation-scoped StateStore authority、且不把它宣称为 external commit fencing（active）
 - ADR-0063 — Copy-on-Write row mutation 的match与rewrite读源为何由Provider按exact base签发（active）
-- ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（active）
-- ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（active）
 
 #### 历史
 
 - ADR-0045 — change-stream 为何由 SQL 绑定 layout、Iceberg Connector 拥有 provider binding，DML/MV 只共享该 binding（superseded → ADR-0049）
 - ADR-0062 — Copy-on-Write row mutation 的读源为何由 Provider 按 cohort 冻结并以中立 recipe 签发（superseded → ADR-0063）
+- ADR-0032 — Frontend CTAS 为何使用 provider-owned staged publication，而不对可见表做破坏性补偿（superseded → ADR-0104）
+- ADR-0046 — ADD FILES 为何以 provider canonical source scope 保护 frontend durable ownership（superseded → ADR-0104）
+- ADR-0054 — Frontend DML 为何使用 operation-scoped StateStore authority、且不把它宣称为 external commit fencing（superseded → ADR-0104）
+- ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（superseded → ADR-0104）
+- ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（superseded → ADR-0104）
 
 ### frontend-mv
 
 领域哲学：Frontend 拥有当前 MV refresh attempt 的 application state、durable ledger、query orchestration 与用户结果；SQL、provider 和 Backend 各自只承担其真实职责。commit truth使用typed provider evidence，不从错误文本猜测，不通过双journal或aggregate facade掩盖owner。
 
-- ADR-0036 — MV refresh 为什么由Frontend拥有 lifecycle，并以 provider-neutral committed version 保持receipt隔离（active）
-- ADR-0037 — 历史 MV refresh 为什么只能跨 incarnation 做 lake inspection 与 guarded cleanup（active）
+- ADR-0104 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0038 — Frontend 为何拥有 MV background worker lifecycle 与 per-target activity gate（active）
-- ADR-0064 — MV publication 为何需要 lake 上专用的 fence ref，并在推进 main 的同一 commit 中做四方 exact 比较（active）
 - ADR-0096 — MV refresh 所有权为何按 target 上锁、且必须在每个事务内校验（active）
 - ADR-0075 — ledger 丢失后 MV attempt 为何以 lake-first 有界发现 + 保守分类收敛，而非按时间/ID 猜 winner（active）
 - ADR-0086 — MV storage observation 为何以中立 SPI facts 连接 provider 与 Frontend durable contracts（active）
@@ -265,6 +265,9 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 #### 历史
 
 - ADR-0019 — INSERT application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（superseded by ADR-0021）
+- ADR-0036 — MV refresh 为什么由Frontend拥有 lifecycle，并以 provider-neutral committed version 保持receipt隔离（superseded → ADR-0104）
+- ADR-0037 — 历史 MV refresh 为什么只能跨 incarnation 做 lake inspection 与 guarded cleanup（superseded → ADR-0104）
+- ADR-0064 — MV publication 为何需要 lake 上专用的 fence ref，并在推进 main 的同一 commit 中做四方 exact 比较（superseded → ADR-0104）
 
 ### table-maintenance
 
@@ -274,7 +277,7 @@ durable truth；单 FE 恢复与未来多 FE lease/fence/takeover 分阶段决�
 fallback 模糊 owner 和故障语义。
 
 - ADR-0083 — 表维护 execution port 为何必须随 query assembly 归 Frontend，不能以 Core cohort bridge 留存（active）
-- ADR-0035 — Connector orphan cleanup 为何使用 immutable manifest、逐 batch receipt 与 reconcile-only unknown（active）
+- ADR-0104 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0057 — MV 维护事实为何按「是否需要 provider runtime IO」切成观测口投影与 SPI capability 两条通道（active）
 - ADR-0065 — 同一张表的维护为何以单个 per-table lease attempt 为唯一派发权威、并在同事务内校验 fence（active）
 - ADR-0067 — 收敛已死 generation 的维护为何是独立 provider capability，而不是放宽 exact-generation reconcile（active）
@@ -282,6 +285,7 @@ fallback 模糊 owner 和故障语义。
 #### 历史
 
 - ADR-0009 — 表维护为何由 frontend 拥有 application/lifecycle，并通过 core domain port 调用 connector truth（superseded → ADR-0083）
+- ADR-0035 — Connector orphan cleanup 为何使用 immutable manifest、逐 batch receipt 与 reconcile-only unknown（superseded → ADR-0104）
 
 ### crate-boundary
 

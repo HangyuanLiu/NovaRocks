@@ -58,6 +58,14 @@ pub const CLEANUP_OPERATION_SCHEMA_VERSION: u8 = 6;
 pub const CLEANUP_MAX_PAYLOAD_BYTES: usize = 10 * 1024;
 pub const CLEANUP_RECORD_ENCODED_LIMIT: usize = 56 * 1024;
 pub const CLEANUP_MAX_BATCHES: u16 = 256;
+/// V7 is a GC-only observation record. It never represents execution
+/// authority, an operation attempt, or a provider-side recovery obligation.
+/// The record preserves one stable owned-ref observation across frontend
+/// restart so the GC caller can require a second identical observation after
+/// its safety window before retiring a catalog ref.
+pub const GC_OWNED_REF_OBSERVATION_SCHEMA_VERSION: u8 = 7;
+pub const GC_OWNED_REF_OBSERVATION_MAX_REF_NAME_BYTES: usize = 256;
+pub const GC_OWNED_REF_OBSERVATION_RECORD_ENCODED_LIMIT: usize = 4 * 1024;
 /// A fencing token contributes at most 8 KiB after durable hex encoding,
 /// leaving the enclosing operation records well below their 48/56 KiB limits.
 pub const MAINTENANCE_FENCING_TOKEN_MAX_BYTES: usize = 4 * 1024;
@@ -73,6 +81,83 @@ pub const OPTIMIZE_JOB_RECORD_ENCODED_LIMIT: usize = 48 * 1024;
 pub struct MaintenanceAuthorityV1 {
     pub attempt_id: Uuid,
     pub fencing_token_v1: Vec<u8>,
+}
+
+/// One exact catalog-owned-ref observation made by GC.
+///
+/// This is deliberately not an attempt record. The cleanup runtime supplies
+/// the provider-validated head and provenance facts; this value only records
+/// when that exact tuple was first observed. Any tuple change resets the
+/// clock, so a ref that is recreated or advanced cannot inherit the age of a
+/// former ref with the same name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GcOwnedRefObservation {
+    pub table_uuid: Uuid,
+    pub ref_name: String,
+    pub head_snapshot_id: i64,
+    pub provenance_version: u16,
+    pub provenance_digest: [u8; 32],
+    pub first_observed_at_ms: i64,
+}
+
+impl GcOwnedRefObservation {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        table_uuid: Uuid,
+        ref_name: String,
+        head_snapshot_id: i64,
+        provenance_version: u16,
+        provenance_digest: [u8; 32],
+        first_observed_at_ms: i64,
+    ) -> Result<Self, String> {
+        let observation = Self {
+            table_uuid,
+            ref_name,
+            head_snapshot_id,
+            provenance_version,
+            provenance_digest,
+            first_observed_at_ms,
+        };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        Self::validate_key(self.table_uuid, &self.ref_name)?;
+        if self.head_snapshot_id <= 0 {
+            return Err("GC owned-ref observation head snapshot ID must be positive".to_string());
+        }
+        if self.provenance_version == 0 {
+            return Err("GC owned-ref observation provenance version must be non-zero".to_string());
+        }
+        if self.first_observed_at_ms <= 0 {
+            return Err("GC owned-ref observation timestamp must be positive".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn validate_key(table_uuid: Uuid, ref_name: &str) -> Result<(), String> {
+        if table_uuid.is_nil() {
+            return Err("GC owned-ref observation table UUID must not be nil".to_string());
+        }
+        if ref_name.is_empty() || ref_name.len() > GC_OWNED_REF_OBSERVATION_MAX_REF_NAME_BYTES {
+            return Err(format!(
+                "GC owned-ref observation ref name must contain 1..={} bytes",
+                GC_OWNED_REF_OBSERVATION_MAX_REF_NAME_BYTES
+            ));
+        }
+        Ok(())
+    }
+
+    /// Equality of the provider-observed facts, excluding the durable first
+    /// observation timestamp.
+    pub fn matches_facts(&self, other: &Self) -> bool {
+        self.table_uuid == other.table_uuid
+            && self.ref_name == other.ref_name
+            && self.head_snapshot_id == other.head_snapshot_id
+            && self.provenance_version == other.provenance_version
+            && self.provenance_digest == other.provenance_digest
+    }
 }
 
 impl MaintenanceAuthorityV1 {
@@ -1075,6 +1160,58 @@ impl From<&StoredCleanupOperationV4> for CleanupOperation {
     }
 }
 
+/// Durable v7 encoding of one GC-owned-ref first observation. The table UUID
+/// and ref name are duplicated from the key so decoding can reject any record
+/// copied under the wrong identity before it influences a retirement decision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoredGcOwnedRefObservationV7 {
+    pub schema_version: u8,
+    pub table_uuid: Uuid,
+    pub ref_name: String,
+    pub head_snapshot_id: i64,
+    pub provenance_version: u16,
+    pub provenance_digest: [u8; 32],
+    pub first_observed_at_ms: i64,
+}
+
+impl DurableRecord for StoredGcOwnedRefObservationV7 {
+    const RECORD_KIND: &'static str = "table-maintenance-gc-owned-ref-observation";
+    const SCHEMA_VERSION: u8 = GC_OWNED_REF_OBSERVATION_SCHEMA_VERSION;
+    const ENCODED_LIMIT: usize = GC_OWNED_REF_OBSERVATION_RECORD_ENCODED_LIMIT;
+}
+
+impl From<&GcOwnedRefObservation> for StoredGcOwnedRefObservationV7 {
+    fn from(value: &GcOwnedRefObservation) -> Self {
+        Self {
+            schema_version: GC_OWNED_REF_OBSERVATION_SCHEMA_VERSION,
+            table_uuid: value.table_uuid,
+            ref_name: value.ref_name.clone(),
+            head_snapshot_id: value.head_snapshot_id,
+            provenance_version: value.provenance_version,
+            provenance_digest: value.provenance_digest,
+            first_observed_at_ms: value.first_observed_at_ms,
+        }
+    }
+}
+
+impl TryFrom<StoredGcOwnedRefObservationV7> for GcOwnedRefObservation {
+    type Error = String;
+
+    fn try_from(value: StoredGcOwnedRefObservationV7) -> Result<Self, Self::Error> {
+        if value.schema_version != GC_OWNED_REF_OBSERVATION_SCHEMA_VERSION {
+            return Err("GC owned-ref observation has unsupported schema version".to_string());
+        }
+        Self::try_new(
+            value.table_uuid,
+            value.ref_name,
+            value.head_snapshot_id,
+            value.provenance_version,
+            value.provenance_digest,
+            value.first_observed_at_ms,
+        )
+    }
+}
+
 #[cfg(test)]
 mod durable_record_budget_tests {
     use novarocks_spi::state_store::{MAX_VALUE_BYTES, StateStoreLimits};
@@ -1343,6 +1480,22 @@ mod durable_record_budget_tests {
             action: StoredCleanupTransactionActionV4::TargetReplaced,
             operation_id: Uuid::nil(),
             post_operation: cleanup_operation(),
+        });
+        assert_budget(StoredGcOwnedRefObservationV7 {
+            schema_version: GC_OWNED_REF_OBSERVATION_SCHEMA_VERSION,
+            table_uuid: Uuid::from_u128(u128::MAX),
+            ref_name: SENTINEL
+                .as_bytes()
+                .iter()
+                .copied()
+                .cycle()
+                .take(GC_OWNED_REF_OBSERVATION_MAX_REF_NAME_BYTES)
+                .map(char::from)
+                .collect(),
+            head_snapshot_id: i64::MAX,
+            provenance_version: u16::MAX,
+            provenance_digest: [u8::MAX; 32],
+            first_observed_at_ms: i64::MAX,
         });
     }
 

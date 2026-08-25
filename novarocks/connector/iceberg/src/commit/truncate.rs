@@ -79,27 +79,24 @@ impl IcebergCommitAction for TruncateCommit {
             snapshot_properties: ctx.snapshot_properties.clone(),
         };
 
-        // TRUNCATE goes through the same fenced submission seam as the row-DML
-        // families: it destroys table content, so a stale owner's late commit
-        // has to be refused at the catalog rather than merely reported.
-        let submitted = crate::commit::helpers::submit_fenced_action(
+        let submitted = crate::commit::helpers::submit_occ_action(
             ctx.catalog,
             ctx.table,
             Arc::new(action),
-            ctx.fence,
             "Truncate",
+            None,
         )
         .await
-        .map_err(crate::commit::helpers::FencedSubmitError::into_detail)?;
+        .map_err(crate::commit::helpers::OccSubmitError::into_detail)?;
         let new_snapshot_id = match submitted {
-            crate::commit::helpers::FencedSubmit::Committed(table_after) => table_after
+            crate::commit::helpers::OccSubmit::Committed(table_after) => table_after
                 .metadata()
                 .current_snapshot()
                 .map(|s| s.snapshot_id())
                 .unwrap_or(0),
             // An empty TRUNCATE over an empty base changes nothing; the
             // previous behaviour reported the current snapshot, or 0.
-            crate::commit::helpers::FencedSubmit::NoOp => ctx
+            crate::commit::helpers::OccSubmit::NoOp => ctx
                 .table
                 .metadata()
                 .current_snapshot()

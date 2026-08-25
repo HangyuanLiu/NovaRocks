@@ -32,10 +32,11 @@ use novarocks_spi::connector::{
     ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableObjectBinding,
     ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
     ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableRequest,
-    ConnectorTableResolution, ExternalMutationEvidence, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsBasisRelation,
-    StatisticsDataVersion, StatisticsMetric, StatisticsMetricRequest, StatisticsMetricSource,
-    StatisticsMetricState, StatisticsMetricValue, StatisticsNumericNature, StatisticsReadRequest,
+    ConnectorTableResolution, ExternalMutationEvidence, LakePublicationId,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsBasisRelation, StatisticsDataVersion,
+    StatisticsMetric, StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState,
+    StatisticsMetricValue, StatisticsNumericNature, StatisticsReadRequest,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -75,7 +76,7 @@ pub struct StatisticsTargetCapture {
 /// strictly attempt-local.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsAttemptRequest {
-    pub operation_id: Uuid,
+    pub operation_id: LakePublicationId,
     pub connector_instance_id: String,
     pub namespace: String,
     pub table: String,
@@ -531,7 +532,7 @@ pub enum StatisticsApplicationCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsJobView {
     pub job_id: Uuid,
-    pub operation_id: Uuid,
+    pub operation_id: LakePublicationId,
     pub state: String,
     pub attempt: u32,
     pub target: StatisticsTableTarget,

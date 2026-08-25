@@ -172,6 +172,7 @@ fn connector_ref_action(action: &IcebergReferenceAction) -> Result<ConnectorRefA
             name: Arc::from(name.value.as_str()),
             snapshot_id: snapshot_anchor(anchor)?,
             policy: policy(*or_replace, *if_not_exists),
+            expected_table_uuid: None,
         },
         IcebergReferenceAction::Drop {
             kind,

@@ -25,6 +25,7 @@
 
 use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
 use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
+use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RefActionPlan {
@@ -41,12 +42,14 @@ pub enum RefAction {
         snapshot_id: i64,
         replace: bool,
         if_not_exists: bool,
+        expected_table_uuid: Option<Uuid>,
     },
     CreateTag {
         name: String,
         snapshot_id: i64,
         replace: bool,
         if_not_exists: bool,
+        expected_table_uuid: Option<Uuid>,
     },
     DropBranch {
         name: String,
@@ -106,6 +109,7 @@ pub fn lower_ref_action(
             name,
             snapshot_id,
             policy,
+            expected_table_uuid,
         } => {
             if name.eq_ignore_ascii_case("main") {
                 return Err(ConnectorError::new(
@@ -114,6 +118,22 @@ pub fn lower_ref_action(
                 ));
             }
             assert_kind(metadata, &name, kind)?;
+            let expected_table_uuid = expected_table_uuid
+                .as_deref()
+                .map(Uuid::parse_str)
+                .transpose()
+                .map_err(|error| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        format!("Iceberg ref create has an invalid expected table UUID: {error}"),
+                    )
+                })?;
+            if expected_table_uuid.is_some_and(|uuid| uuid != metadata.uuid()) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "Iceberg ref create target table incarnation changed",
+                ));
+            }
             let snapshot_id = match snapshot_id.or_else(|| metadata.current_snapshot_id()) {
                 Some(snapshot_id) if metadata.snapshot_by_id(snapshot_id).is_some() => snapshot_id,
                 _ => {
@@ -134,12 +154,14 @@ pub fn lower_ref_action(
                     snapshot_id,
                     replace,
                     if_not_exists,
+                    expected_table_uuid,
                 },
                 ConnectorRefKind::Tag => RefAction::CreateTag {
                     name: name.to_string(),
                     snapshot_id,
                     replace,
                     if_not_exists,
+                    expected_table_uuid,
                 },
             }
         }
@@ -184,6 +206,86 @@ pub enum RefActionOutcome {
     NoOp,
 }
 
+/// Result of an internal cleanup-only ref retirement attempt.
+///
+/// `Abandoned` is deliberately non-error: every mismatch means the proof
+/// observed during candidate discovery has gone stale, so this GC pass leaks
+/// rather than guessing whether the ref is still NovaRocks-owned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExactBranchDropOutcome {
+    Retired,
+    Abandoned,
+}
+
+fn build_exact_branch_drop_commit(
+    ident: TableIdent,
+    expected_table_uuid: Uuid,
+    name: &str,
+    expected_head_snapshot_id: i64,
+) -> TableCommit {
+    TableCommit::builder()
+        .ident(ident)
+        .updates(vec![TableUpdate::RemoveSnapshotRef {
+            ref_name: name.to_string(),
+        }])
+        .requirements(vec![
+            // The pre-read is only candidate discovery. Keep the incarnation
+            // proof in the destructive commit so DROP/recreate abandons GC.
+            TableRequirement::UuidMatch {
+                uuid: expected_table_uuid,
+            },
+            TableRequirement::RefSnapshotIdMatch {
+                r#ref: name.to_string(),
+                snapshot_id: Some(expected_head_snapshot_id),
+            },
+        ])
+        .build()
+}
+
+/// Drop one provider-owned branch only if its table incarnation and observed
+/// head are unchanged. This is intentionally separate from SQL `DROP BRANCH`:
+/// it has no `IF EXISTS` mode and never converts a missing or changed ref into
+/// a successful cleanup result.
+pub async fn drop_branch_if_exact(
+    catalog: &dyn Catalog,
+    namespace: &str,
+    table: &str,
+    expected_table_uuid: &str,
+    name: &str,
+    expected_head_snapshot_id: i64,
+) -> Result<ExactBranchDropOutcome, String> {
+    let ident = TableIdent::from_strs([namespace, table])
+        .map_err(|error| format!("iceberg cleanup ref: invalid table identifier: {error}"))?;
+    let loaded = catalog
+        .load_table(&ident)
+        .await
+        .map_err(|error| format!("iceberg cleanup ref: load table failed: {error}"))?;
+    let metadata = loaded.metadata();
+    if metadata.uuid().to_string() != expected_table_uuid {
+        return Ok(ExactBranchDropOutcome::Abandoned);
+    }
+    let Some(reference) = metadata.refs().get(name) else {
+        return Ok(ExactBranchDropOutcome::Abandoned);
+    };
+    if !reference.is_branch()
+        || reference.snapshot_id != expected_head_snapshot_id
+        || metadata.snapshot_by_id(expected_head_snapshot_id).is_none()
+    {
+        return Ok(ExactBranchDropOutcome::Abandoned);
+    }
+    let commit =
+        build_exact_branch_drop_commit(ident, metadata.uuid(), name, expected_head_snapshot_id);
+    match catalog.update_table(commit).await {
+        Ok(_) => Ok(ExactBranchDropOutcome::Retired),
+        // A concurrently moved/deleted ref is a failed compare-and-swap proof,
+        // not a reason to retry a destructive action in this GC pass.
+        Err(error) if error.to_string().contains("Requirement") => {
+            Ok(ExactBranchDropOutcome::Abandoned)
+        }
+        Err(error) => Err(format!("iceberg cleanup ref: exact drop failed: {error}")),
+    }
+}
+
 pub async fn execute_ref_action(
     catalog: &dyn Catalog,
     plan: &RefActionPlan,
@@ -202,6 +304,7 @@ pub async fn execute_ref_action(
             snapshot_id,
             replace,
             if_not_exists,
+            expected_table_uuid,
         } => match metadata.refs().get(name) {
             Some(_existing) if *if_not_exists => return Ok(RefActionOutcome::NoOp),
             Some(_existing) if !*replace => {
@@ -209,6 +312,13 @@ pub async fn execute_ref_action(
             }
             existing => {
                 let parent = existing.map(|r| r.snapshot_id);
+                let mut requirements = vec![TableRequirement::RefSnapshotIdMatch {
+                    r#ref: name.clone(),
+                    snapshot_id: parent,
+                }];
+                if let Some(uuid) = expected_table_uuid {
+                    requirements.insert(0, TableRequirement::UuidMatch { uuid: *uuid });
+                }
                 (
                     vec![TableUpdate::SetSnapshotRef {
                         ref_name: name.clone(),
@@ -221,10 +331,7 @@ pub async fn execute_ref_action(
                             },
                         },
                     }],
-                    vec![TableRequirement::RefSnapshotIdMatch {
-                        r#ref: name.clone(),
-                        snapshot_id: parent,
-                    }],
+                    requirements,
                 )
             }
         },
@@ -233,6 +340,7 @@ pub async fn execute_ref_action(
             snapshot_id,
             replace,
             if_not_exists,
+            expected_table_uuid,
         } => match metadata.refs().get(name) {
             Some(_existing) if *if_not_exists => return Ok(RefActionOutcome::NoOp),
             Some(_existing) if !*replace => {
@@ -240,6 +348,13 @@ pub async fn execute_ref_action(
             }
             existing => {
                 let parent = existing.map(|r| r.snapshot_id);
+                let mut requirements = vec![TableRequirement::RefSnapshotIdMatch {
+                    r#ref: name.clone(),
+                    snapshot_id: parent,
+                }];
+                if let Some(uuid) = expected_table_uuid {
+                    requirements.insert(0, TableRequirement::UuidMatch { uuid: *uuid });
+                }
                 (
                     vec![TableUpdate::SetSnapshotRef {
                         ref_name: name.clone(),
@@ -250,10 +365,7 @@ pub async fn execute_ref_action(
                             },
                         },
                     }],
-                    vec![TableRequirement::RefSnapshotIdMatch {
-                        r#ref: name.clone(),
-                        snapshot_id: parent,
-                    }],
+                    requirements,
                 )
             }
         },
@@ -365,4 +477,31 @@ pub async fn execute_ref_action(
         .map_err(|e| format!("iceberg ref: commit failed: {e}"))?;
 
     Ok(RefActionOutcome::Committed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_branch_drop_commit_pins_table_incarnation_and_branch_head() {
+        let table_uuid = Uuid::new_v4();
+        let mut commit = build_exact_branch_drop_commit(
+            TableIdent::from_strs(["db", "orders"]).expect("valid table identifier"),
+            table_uuid,
+            "__novarocks_mv_refresh",
+            42,
+        );
+
+        assert_eq!(
+            commit.take_requirements(),
+            vec![
+                TableRequirement::UuidMatch { uuid: table_uuid },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "__novarocks_mv_refresh".to_string(),
+                    snapshot_id: Some(42),
+                },
+            ]
+        );
+    }
 }

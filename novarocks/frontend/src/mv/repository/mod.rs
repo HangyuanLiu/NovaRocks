@@ -2449,16 +2449,11 @@ impl StateStoreMvRepository {
                         .await?;
                     }
                     let mut recovery = request.recovery;
-                    recovery.status = if recovery
-                        .observation
-                        .as_ref()
-                        .is_some_and(|observation| observation.cleanup_required)
-                        && recovery.cleanup_state != Some(FrontendMvRefreshActionState::KnownCommitted)
-                    {
-                        FrontendMvRefreshRecoveryStatus::CleanupPending
-                    } else {
-                        FrontendMvRefreshRecoveryStatus::ResolvedPublished
-                    };
+                    // Recovery never performs catalog cleanup. Once inspection
+                    // proves the published frontier, the StateStore projection
+                    // is complete; any retained branch or object is owned by
+                    // the age-gated catalog/object GC contract.
+                    recovery.status = FrontendMvRefreshRecoveryStatus::ResolvedPublished;
                     refresh.frontend_recovery = Some(recovery);
                     put_refresh_transaction(
                         transaction,
@@ -3712,15 +3707,10 @@ async fn finalize_refresh_transaction(
     definition.refresh_target_snapshots.clear();
     refresh.state = MvRefreshState::Finalized;
     if let Some(recovery) = refresh.frontend_recovery.as_mut() {
-        recovery.status = if refresh
-            .frontend_ledger
-            .as_ref()
-            .is_some_and(|ledger| ledger.cleanup_pending)
-        {
-            FrontendMvRefreshRecoveryStatus::CleanupPending
-        } else {
-            FrontendMvRefreshRecoveryStatus::ResolvedPublished
-        };
+        // A final lake publication is a complete frontend recovery result.
+        // Legacy cleanup bookkeeping cannot reopen an already published
+        // frontier; residual catalog refs and objects age out through GC.
+        recovery.status = FrontendMvRefreshRecoveryStatus::ResolvedPublished;
         recovery.validate().map_err(invalid_state_store)?;
     }
     put_definition_transaction(

@@ -39,10 +39,10 @@ use uuid::Uuid;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::register_puffin_stats;
 use super::helpers::{
-    FencedSubmit, debug_assert_single_unmarked_row_bearing_data_manifest, effective_next_row_id,
+    OccSubmit, debug_assert_single_unmarked_row_bearing_data_manifest, effective_next_row_id,
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    required_target_ref_snapshot_id, snapshot_summary, submit_fenced_action,
-    target_ref_snapshot_id, write_manifest_list,
+    required_target_ref_snapshot_id, snapshot_summary, submit_occ_action, target_ref_snapshot_id,
+    write_manifest_list,
 };
 use super::overwrite::{write_added_data_manifest, write_overwrite_deletes_manifest};
 use crate::commit::abort::AbortLog;
@@ -122,8 +122,8 @@ impl IcebergCommitAction for CowUpdateCommit {
                 .clone()
         };
 
-        match submit_fenced_action(ctx.catalog, ctx.table, action, ctx.fence, "CowUpdate").await {
-            Ok(FencedSubmit::Committed(table_after)) => {
+        match submit_occ_action(ctx.catalog, ctx.table, action, "CowUpdate", None).await {
+            Ok(OccSubmit::Committed(table_after)) => {
                 let new_snapshot_id = required_target_ref_snapshot_id(
                     table_after.metadata(),
                     ctx.target_ref,
@@ -152,7 +152,7 @@ impl IcebergCommitAction for CowUpdateCommit {
             // A rewrite set with nothing to rewrite already returned above, and
             // the action always stages a snapshot, so this arm reports the same
             // value that empty-rewrite no-op reports.
-            Ok(FencedSubmit::NoOp) => Ok(CommitOutcome {
+            Ok(OccSubmit::NoOp) => Ok(CommitOutcome {
                 new_snapshot_id: prev_snapshot_id.unwrap_or(0),
                 written_manifest_paths: written_manifest_paths(),
             }),

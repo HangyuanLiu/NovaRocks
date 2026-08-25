@@ -31,6 +31,7 @@ use novarocks_parser::ast::{
     DmlStatement, MergeClause, MergeMatchedAction, MutationSource, ObjectName as ParsedObjectName,
 };
 use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_spi::connector::LakePublicationId;
 use novarocks_sql::semantic::ObjectName;
 
 const PREPARED: u8 = 0;
@@ -48,6 +49,7 @@ pub enum MutationStatementKind {
 /// One admitted frontend mutation request. The typed statement establishes the
 /// command family; `source` may only be read through spans carried by it.
 pub struct PrepareMutationRequest<'a> {
+    pub publication_id: LakePublicationId,
     pub statement: &'a DmlStatement,
     pub source: &'a str,
     pub current_catalog: Option<String>,
@@ -72,6 +74,7 @@ pub trait MutationAbort: Send + Sync {
 /// The concrete COW/MOR provider action remains inside opaque handles/evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MutationOperation {
+    pub publication_id: LakePublicationId,
     pub kind: MutationStatementKind,
     pub catalog: String,
     pub namespace: String,
@@ -148,30 +151,6 @@ pub trait MutationEngine: Send + Sync {
         String,
     > {
         Err("mutation engine does not expose a connector terminal commit outcome".to_string())
-    }
-
-    /// Establish this attempt's external write fence before anything is
-    /// dispatched.
-    ///
-    /// UPDATE and MERGE derive their write lease at preparation precisely so
-    /// this can happen before staging: `derive_write_lease` mints a fresh fence
-    /// cell on every call, so a fence established on a lease derived later would
-    /// not be the one the commit travels through.
-    ///
-    /// The default fails closed. There is deliberately no unfenced dispatch.
-    fn establish_mutation_external_fence(
-        &self,
-        _prepared: &dyn MutationPrepared,
-        _proposal: &dyn crate::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorEstablishedWriteFence,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        Err(
-            crate::query_execution::dml::external_write_fence::external_fence_authority_unavailable(
-                "mutation engine does not expose an external operation fence authority",
-            ),
-        )
     }
 
     fn finalize_mutation(&self, prepared: &dyn MutationPrepared) -> Result<(), String>;
@@ -461,33 +440,6 @@ fn abort_handle(abort: &dyn MutationAbort) -> Result<&CoreMutationAbort, String>
 }
 
 impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
-    fn establish_mutation_external_fence(
-        &self,
-        prepared: &dyn MutationPrepared,
-        proposal: &dyn crate::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorEstablishedWriteFence,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        let handle = prepared_handle(prepared)
-            .map_err(crate::query_execution::dml::external_write_fence::invalid_fence_request)?;
-        let kernel = handle.kernel.lock().map_err(|error| {
-            crate::query_execution::dml::external_write_fence::invalid_fence_request(format!(
-                "mutation prepared kernel lock: {error}"
-            ))
-        })?;
-        let kernel = kernel.as_ref().ok_or_else(|| {
-            crate::query_execution::dml::external_write_fence::invalid_fence_request(
-                "mutation prepared kernel was already consumed".to_string(),
-            )
-        })?;
-        match kernel {
-            PreparedKernel::Update(update) => update.external_fence_authority()?,
-            PreparedKernel::Merge(merge) => merge.external_fence_authority()?,
-        }
-        .establish(proposal)
-    }
-
     fn prepare_mutation(
         &self,
         request: PrepareMutationRequest<'_>,
@@ -506,6 +458,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                     &request.current_database,
                     &request.execution,
                     &connector_context,
+                    request.publication_id,
                 )?;
                 // The provider signed this during admission for the exact
                 // target ref; the journal records that value rather than
@@ -527,6 +480,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                     &request.current_database,
                     &request.execution,
                     &connector_context,
+                    request.publication_id,
                 )?;
                 let base_snapshot_id = prepared.admitted_base_snapshot_id;
                 (
@@ -557,12 +511,13 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
             ),
         };
         let operation = MutationOperation {
+            publication_id: request.publication_id,
             kind,
             catalog,
             namespace,
             table,
             target_ref,
-            attempt_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id: request.publication_id.to_string(),
             base_snapshot_id,
         };
         let handle: Arc<dyn MutationPrepared> = Arc::new(CoreMutationPrepared {
@@ -822,6 +777,7 @@ mod tests {
     fn prepared(kind: MutationStatementKind, attempt_id: &str) -> CoreMutationPrepared {
         CoreMutationPrepared {
             operation: MutationOperation {
+                publication_id: novarocks_spi::connector::LakePublicationId::new_v7(),
                 kind,
                 catalog: "iceberg".to_string(),
                 namespace: "db".to_string(),

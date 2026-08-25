@@ -35,22 +35,22 @@ pub mod catalog_mutation;
 mod cleanup_candidates;
 #[path = "catalog_control/cleanup_maintenance.rs"]
 pub mod cleanup_maintenance;
-#[path = "catalog_control/ctas_fenced_publication.rs"]
-pub mod ctas_fenced_publication;
 #[path = "catalog_control/data_mutation.rs"]
 pub mod data_mutation;
-#[path = "catalog_control/historical_ctas_recovery.rs"]
-pub mod historical_ctas_recovery;
 #[path = "catalog_control/historical_maintenance_recovery.rs"]
 pub(crate) mod historical_maintenance_recovery;
 #[path = "catalog_control/metadata_maintenance.rs"]
 pub(crate) mod metadata_maintenance;
+#[path = "catalog_control/owned_ref_cleanup.rs"]
+mod owned_ref_cleanup;
 #[path = "catalog_control/staged_create.rs"]
 pub mod staged_create;
 #[path = "catalog_control/statistics.rs"]
 pub mod statistics;
 #[path = "catalog_control/type_mapping.rs"]
 pub(crate) mod type_mapping;
+#[path = "catalog_control/unanchored_ctas_cleanup.rs"]
+pub(crate) mod unanchored_ctas_cleanup;
 #[path = "catalog_control/views.rs"]
 pub(crate) mod views;
 

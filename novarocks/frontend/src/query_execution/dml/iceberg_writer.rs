@@ -39,10 +39,10 @@ use crate::query_execution::write_transaction::{
 };
 use novarocks_parser::ast::{Query, Statement};
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorTableHandle, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteIntent,
-    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
-    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    ConnectorTableHandle, ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest,
+    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteLease,
+    ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWritePreparationOutcome,
+    ConnectorWritePreparationRequest,
 };
 #[cfg(test)]
 use novarocks_sql::literal::bytes_to_latin1_string;
@@ -102,37 +102,6 @@ impl IcebergWritePreparationOptions {
         self.snapshot_properties = snapshot_properties;
         self
     }
-}
-
-/// Core Iceberg write preparation shared by the frontend INSERT adapter,
-/// CTAS, and mutation flows. Construction validates and plans the write but
-/// never starts a distributed writer or external metadata commit.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_iceberg_write(
-    state: &DmlExecutionKernel,
-    target: &TargetBackend,
-    resolved: &ResolvedTable,
-    insert_columns: &[String],
-    source: &IcebergWriteInput,
-    overwrite_mode: IcebergWriteMode,
-    target_ref: &str,
-    execution: Option<QueryExecutionContext>,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> Result<PreparedIcebergWrite, String> {
-    prepare_iceberg_write_with_options(
-        state,
-        target,
-        resolved,
-        insert_columns,
-        source,
-        overwrite_mode,
-        target_ref,
-        execution,
-        connector_context,
-        IcebergWritePreparationOptions::new(ConnectorWriteOperationId::new()),
-        planning_lease,
-    )
 }
 
 /// Prepare an Iceberg write with an application-preallocated operation
@@ -467,40 +436,12 @@ impl PreparedIcebergWrite {
         &self.executor.target
     }
 
-    pub(crate) fn attempt_id(&self) -> &str {
-        &self.spec.attempt_id
-    }
-
     pub(crate) fn is_overwrite(&self) -> bool {
         self.spec.is_overwrite
     }
 
     pub(crate) fn base_snapshot_id(&self) -> Option<i64> {
         self.spec.commit.base_snapshot_id
-    }
-
-    /// The exact write authority this preparation activated, ready to be fenced.
-    ///
-    /// INSERT APPEND and INSERT OVERWRITE both activate their write generation
-    /// during preparation, so the authority already exists before the frontend
-    /// dispatches anything. The identity comes from the activated template: its
-    /// operation id and provider-signed target ref, plus the resolved target
-    /// namespace and table the same generation loaded.
-    pub(crate) fn external_fence_authority(
-        &self,
-    ) -> Result<
-        crate::query_execution::dml::external_write_fence::ExternalWriteFenceAuthority,
-        ConnectorError,
-    > {
-        let template = &self.executor.connector_write;
-        crate::query_execution::dml::external_write_fence::ExternalWriteFenceAuthority::try_new(
-            template.lease(),
-            template.operation_id(),
-            &self.executor.target.namespace,
-            &self.executor.target.table,
-            template.preparation().target_ref().clone(),
-            self.executor.connector_context.clone(),
-        )
     }
 
     fn prepare_native_assembly(

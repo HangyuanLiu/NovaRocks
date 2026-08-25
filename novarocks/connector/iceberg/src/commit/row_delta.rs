@@ -49,9 +49,9 @@ use uuid::Uuid;
 
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::helpers::{
-    FencedSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
+    OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
     metadata_dir, now_ms, read_snapshot_manifest_list, required_target_ref_snapshot_id,
-    snapshot_summary, submit_fenced_action, target_ref_snapshot_id, write_manifest_list,
+    snapshot_summary, submit_occ_action, target_ref_snapshot_id, write_manifest_list,
 };
 use crate::commit::abort::AbortLog;
 use crate::commit::{CommitOutcome, WrittenFile};
@@ -110,8 +110,8 @@ impl IcebergCommitAction for RowDeltaCommit {
                 .clone()
         };
 
-        match submit_fenced_action(ctx.catalog, ctx.table, action, ctx.fence, "RowDelta").await {
-            Ok(FencedSubmit::Committed(table_after)) => {
+        match submit_occ_action(ctx.catalog, ctx.table, action, "RowDelta", None).await {
+            Ok(OccSubmit::Committed(table_after)) => {
                 let new_snapshot_id = required_target_ref_snapshot_id(
                     table_after.metadata(),
                     ctx.target_ref,
@@ -125,7 +125,7 @@ impl IcebergCommitAction for RowDeltaCommit {
             // Delete-file input is non-empty here (spec §4.1 handled the empty
             // case above) and the action always stages a snapshot, so this arm
             // reports the same value the empty-input no-op above reports.
-            Ok(FencedSubmit::NoOp) => Ok(CommitOutcome {
+            Ok(OccSubmit::NoOp) => Ok(CommitOutcome {
                 new_snapshot_id: prev_snapshot_id.unwrap_or(0),
                 written_manifest_paths: written_manifest_paths(),
             }),

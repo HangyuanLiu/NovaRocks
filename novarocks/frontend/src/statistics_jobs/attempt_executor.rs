@@ -24,7 +24,7 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::common::backend_topology::BackendTopologyService;
 use crate::query_execution::service::QueryExecutionService;
@@ -51,6 +51,7 @@ pub(crate) struct StatisticsAttemptExecutionPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     backend_topology: BackendTopologyService,
     query_execution: QueryExecutionService,
+    attempt_timeout: Duration,
 }
 
 impl StatisticsAttemptExecutionPorts {
@@ -59,12 +60,14 @@ impl StatisticsAttemptExecutionPorts {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         backend_topology: BackendTopologyService,
         query_execution: QueryExecutionService,
+        attempt_timeout: Duration,
     ) -> Self {
         Self {
             execution_role,
             connector_control,
             backend_topology,
             query_execution,
+            attempt_timeout,
         }
     }
 }
@@ -80,9 +83,14 @@ impl FrontendStatisticsAttemptExecutor {
         Self { ports }
     }
 
-    fn collection_context() -> Result<ConnectorRequestContext, StatisticsApplicationError> {
+    fn collection_context(&self) -> Result<ConnectorRequestContext, StatisticsApplicationError> {
+        let deadline = Instant::now()
+            .checked_add(self.ports.attempt_timeout)
+            .ok_or_else(|| {
+                StatisticsApplicationError::new("statistics attempt deadline overflow")
+            })?;
         ConnectorRequestContext::try_new(
-            Instant::now() + crate::query_execution::statistics::MAX_STATISTICS_ATTEMPT_DURATION,
+            deadline,
             Arc::new(NeverCancelled),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -166,7 +174,7 @@ impl FrontendStatisticsAttemptExecutor {
     }
 
     fn operation_id(request: &StatisticsAttemptRequest) -> ConnectorMutationOperationId {
-        ConnectorMutationOperationId::from_bytes(*request.operation_id.as_bytes())
+        ConnectorMutationOperationId::from_bytes(request.operation_id.to_bytes())
     }
 
     fn collected(
@@ -227,7 +235,7 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
         &self,
         request: &StatisticsAttemptRequest,
     ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsApplicationError> {
-        let context = Self::collection_context()?;
+        let context = self.collection_context()?;
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse(&request.connector_instance_id)
                 .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
@@ -259,7 +267,7 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
             plan,
             crate::query_execution::statistics::StatisticsExecutionPolicy::try_new(
                 crate::query_execution::statistics::StatisticsExecutionMode::DurableJobAttempt,
-                crate::query_execution::statistics::MAX_STATISTICS_ATTEMPT_DURATION,
+                self.ports.attempt_timeout,
             )
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
         )
@@ -273,7 +281,13 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
         let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
             self.ports.execution_role,
             topology,
-            Some(Instant::now() + program.policy().attempt_timeout()),
+            Some(
+                Instant::now()
+                    .checked_add(program.policy().attempt_timeout())
+                    .ok_or_else(|| {
+                        StatisticsApplicationError::new("statistics attempt deadline overflow")
+                    })?,
+            ),
             cancellation.view(),
             novarocks_sql::compiler::SessionOptimizerSettings::default(),
         );
@@ -362,7 +376,7 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
             lease
                 .reconcile(StatisticsReconcileRequest {
                     evidence: evidence.clone(),
-                    context: Self::collection_context()?,
+                    context: self.collection_context()?,
                 })
                 .map_err(|error| StatisticsApplicationError::reconcile(error.to_string()))?,
         )

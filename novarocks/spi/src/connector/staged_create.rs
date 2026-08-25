@@ -37,13 +37,16 @@ use super::{
     ConnectorTableHandle, ConnectorTableIdentity, ConnectorWriteIntent,
     ConnectorWriteOperationCompletion, ConnectorWriteOperationId, CreatePolicy,
     ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
 };
 
 pub const CONNECTOR_STAGED_CREATE_CONTRACT_VERSION: u32 = 1;
+pub const CONNECTOR_CTAS_UNANCHORED_CLEANUP_CONTRACT_VERSION: u16 = 1;
 pub type ConnectorStagedCreateOperationId = ConnectorMutationOperationId;
 
 const HANDLE_DOMAIN: &[u8] = b"novarocks.connector-staged-table-handle.v1\0";
+const UNANCHORED_CTAS_PROVENANCE_DOMAIN: &[u8] =
+    b"novarocks.connector-ctas-unanchored-provenance.v1\0";
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConnectorStagedTableHandle {
@@ -211,6 +214,10 @@ impl std::fmt::Debug for ConnectorStagedTableHandle {
 #[derive(Clone)]
 pub struct ConnectorStagedCreatePrepareRequest {
     pub owner: ConnectorExecutionBindingKey,
+    /// The statement-level identity shared by the staged root, Iceberg marker
+    /// and eventual unanchored-GC provenance.  `operation_id` remains the
+    /// lease-local dispatch key; it must not become a second durable owner.
+    pub publication_id: LakePublicationId,
     pub operation_id: ConnectorStagedCreateOperationId,
     pub table: ConnectorTableIdentity,
     pub columns: Vec<ConnectorColumnDefinition>,
@@ -426,6 +433,245 @@ pub trait ConnectorStagedCreate: Send + Sync {
     ) -> Result<ConnectorStagedCreateReconcileOutcome, ConnectorError>;
 }
 
+/// Provenance frozen by CTAS staging and re-checked by unanchored cleanup.
+///
+/// A table UUID is optional only when the stage-create response was lost: in
+/// that case the cleanup adapter must retain the prefix, rather than infer a
+/// match from the target name or from a warehouse listing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorCtasUnanchoredProvenance {
+    pub publication_id: LakePublicationId,
+    pub target: ConnectorTableIdentity,
+    pub expected_absent: bool,
+    pub staged_table_uuid: Option<[u8; 16]>,
+    pub created_at_ms: i64,
+    pub digest: [u8; 32],
+}
+
+impl ConnectorCtasUnanchoredProvenance {
+    pub fn try_new(
+        publication_id: LakePublicationId,
+        target: ConnectorTableIdentity,
+        expected_absent: bool,
+        staged_table_uuid: Option<[u8; 16]>,
+        created_at_ms: i64,
+    ) -> Result<Self, ConnectorError> {
+        if target.namespace.is_empty()
+            || target.table.is_empty()
+            || !expected_absent
+            || created_at_ms <= 0
+        {
+            return Err(invalid(
+                "unanchored CTAS provenance must name an absent target and a positive creation time",
+            ));
+        }
+        let digest = unanchored_provenance_digest(
+            publication_id,
+            &target,
+            expected_absent,
+            staged_table_uuid,
+            created_at_ms,
+        );
+        Ok(Self {
+            publication_id,
+            target,
+            expected_absent,
+            staged_table_uuid,
+            created_at_ms,
+            digest,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        let expected = unanchored_provenance_digest(
+            self.publication_id,
+            &self.target,
+            self.expected_absent,
+            self.staged_table_uuid,
+            self.created_at_ms,
+        );
+        if self.digest != expected {
+            return Err(invalid("unanchored CTAS provenance digest is invalid"));
+        }
+        Self::try_new(
+            self.publication_id,
+            self.target.clone(),
+            self.expected_absent,
+            self.staged_table_uuid,
+            self.created_at_ms,
+        )
+        .map(|_| ())
+    }
+}
+
+/// Exact cleanup input for a staged CTAS whose target table was never
+/// registered. This is deliberately not a table-orphan cleanup request: its
+/// root is a deterministic warehouse namespace and cannot be discovered from
+/// a table handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorCtasUnanchoredCleanupRequest {
+    pub owner: ConnectorExecutionBindingKey,
+    pub warehouse_root: Arc<str>,
+    pub cutoff_ms: i64,
+    pub provenance: ConnectorCtasUnanchoredProvenance,
+}
+
+/// Catalog-wide discovery input for the deterministic CTAS staging namespace.
+/// It carries the same age boundary as exact deletion, so a provider cannot
+/// list young roots and leave filtering to a later, potentially skewed owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorCtasUnanchoredDiscoveryRequest {
+    pub owner: ConnectorExecutionBindingKey,
+    pub warehouse_root: Arc<str>,
+    pub cutoff_ms: i64,
+}
+
+impl ConnectorCtasUnanchoredDiscoveryRequest {
+    pub fn try_new(
+        owner: ConnectorExecutionBindingKey,
+        warehouse_root: Arc<str>,
+        cutoff_ms: i64,
+    ) -> Result<Self, ConnectorError> {
+        if warehouse_root.trim_end_matches('/').is_empty() || cutoff_ms <= 0 {
+            return Err(invalid(
+                "unanchored CTAS discovery requires an explicit warehouse root and positive cutoff",
+            ));
+        }
+        Ok(Self {
+            owner,
+            warehouse_root,
+            cutoff_ms,
+        })
+    }
+}
+
+impl ConnectorCtasUnanchoredCleanupRequest {
+    pub fn try_new(
+        owner: ConnectorExecutionBindingKey,
+        warehouse_root: Arc<str>,
+        cutoff_ms: i64,
+        provenance: ConnectorCtasUnanchoredProvenance,
+    ) -> Result<Self, ConnectorError> {
+        if warehouse_root.trim_end_matches('/').is_empty() || cutoff_ms <= 0 {
+            return Err(invalid(
+                "unanchored CTAS cleanup requires an explicit warehouse root and positive cutoff",
+            ));
+        }
+        provenance.validate()?;
+        if provenance.target.instance_id != owner.instance_id {
+            return Err(invalid(
+                "unanchored CTAS cleanup target has a foreign connector owner",
+            ));
+        }
+        Ok(Self {
+            owner,
+            warehouse_root,
+            cutoff_ms,
+            provenance,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorCtasUnanchoredCleanupOutcome {
+    Deleted,
+    Retained,
+    CommitUnknown { failure: ConnectorMutationFailure },
+}
+
+/// CTAS-specific cleanup capability.  It first performs an exact target
+/// lookup, validates provenance at the deterministic prefix, and only then
+/// deletes that prefix. Any negative or ambiguous observation is retained.
+pub trait ConnectorUnanchoredCtasCleanup: Send + Sync {
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor;
+    fn incarnation(&self) -> ConnectorInstanceIncarnation;
+    fn warehouse_root(&self) -> Result<Arc<str>, ConnectorError>;
+
+    /// Enumerate only provenance sidecars under the fixed warehouse prefix.
+    /// Missing, malformed, young, or unverifiable roots are deliberately not
+    /// candidates; the caller has no durable recovery index to compensate.
+    fn discover_unanchored_ctas(
+        &self,
+        request: ConnectorCtasUnanchoredDiscoveryRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<Vec<ConnectorCtasUnanchoredProvenance>, ConnectorError>;
+
+    fn inspect_then_delete_unanchored_ctas(
+        &self,
+        request: ConnectorCtasUnanchoredCleanupRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorCtasUnanchoredCleanupOutcome, ConnectorError>;
+}
+
+/// Lease for the catalog-wide CTAS staging namespace. Unlike a staged-create
+/// lease it has no statement-local operation registry: the caller supplies a
+/// fully frozen provenance record and the provider must independently re-read
+/// both the target and sidecar before deleting one exact root.
+#[derive(Clone)]
+pub struct ConnectorUnanchoredCtasCleanupLease {
+    owner: ConnectorExecutionBindingKey,
+    capability: Arc<dyn ConnectorUnanchoredCtasCleanup>,
+    _release: Arc<StagedCreateLeaseRelease>,
+}
+
+impl ConnectorUnanchoredCtasCleanupLease {
+    pub fn new(
+        owner: ConnectorExecutionBindingKey,
+        capability: Arc<dyn ConnectorUnanchoredCtasCleanup>,
+        release: impl FnOnce() + Send + Sync + 'static,
+    ) -> Result<Self, ConnectorError> {
+        if capability.descriptor().instance_id != owner.instance_id
+            || capability.incarnation() != owner.incarnation
+        {
+            return Err(invalid(
+                "unanchored CTAS cleanup capability does not match its lease generation",
+            ));
+        }
+        Ok(Self {
+            owner,
+            capability,
+            _release: Arc::new(StagedCreateLeaseRelease {
+                release: Mutex::new(Some(Box::new(release))),
+            }),
+        })
+    }
+
+    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+        &self.owner
+    }
+
+    pub fn warehouse_root(&self) -> Result<Arc<str>, ConnectorError> {
+        self.capability.warehouse_root()
+    }
+
+    pub fn inspect_then_delete_unanchored_ctas(
+        &self,
+        request: ConnectorCtasUnanchoredCleanupRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorCtasUnanchoredCleanupOutcome, ConnectorError> {
+        if request.owner != self.owner {
+            return Err(invalid(
+                "unanchored CTAS cleanup request has a foreign owner",
+            ));
+        }
+        self.capability
+            .inspect_then_delete_unanchored_ctas(request, context)
+    }
+
+    pub fn discover_unanchored_ctas(
+        &self,
+        request: ConnectorCtasUnanchoredDiscoveryRequest,
+        context: ConnectorRequestContext,
+    ) -> Result<Vec<ConnectorCtasUnanchoredProvenance>, ConnectorError> {
+        if request.owner != self.owner {
+            return Err(invalid(
+                "unanchored CTAS discovery request has a foreign owner",
+            ));
+        }
+        self.capability.discover_unanchored_ctas(request, context)
+    }
+}
+
 #[derive(Clone)]
 pub struct ConnectorStagedCreateLease {
     owner: ConnectorExecutionBindingKey,
@@ -495,6 +741,11 @@ impl ConnectorStagedCreateLease {
     ) -> Result<ConnectorStagedCreatePrepareOutcome, ConnectorError> {
         if request.owner != self.owner || request.table.instance_id != self.owner.instance_id {
             return Err(invalid("staged-create prepare request has a foreign owner"));
+        }
+        if request.operation_id.to_bytes() != request.publication_id.to_bytes() {
+            return Err(invalid(
+                "staged-create operation ID must equal its statement publication ID",
+            ));
         }
         let operation_id = request.operation_id;
         {
@@ -1261,6 +1512,33 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
 }
 
+fn unanchored_provenance_digest(
+    publication_id: LakePublicationId,
+    target: &ConnectorTableIdentity,
+    expected_absent: bool,
+    staged_table_uuid: Option<[u8; 16]>,
+    created_at_ms: i64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(UNANCHORED_CTAS_PROVENANCE_DOMAIN);
+    hasher.update(publication_id.to_bytes());
+    hasher.update(target.instance_id.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update(target.namespace.as_bytes());
+    hasher.update([0]);
+    hasher.update(target.table.as_bytes());
+    hasher.update([expected_absent as u8]);
+    match staged_table_uuid {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value);
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update(created_at_ms.to_be_bytes());
+    hasher.finalize().into()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1280,6 +1558,42 @@ mod tests {
         fn is_cancelled(&self) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn unanchored_ctas_cleanup_provenance_is_target_bound_and_tamper_evident() {
+        let instance_id = ConnectorInstanceId::parse("ice").unwrap();
+        let target = ConnectorTableIdentity {
+            instance_id: instance_id.clone(),
+            namespace: Arc::from("db"),
+            table: Arc::from("orders"),
+        };
+        let provenance = ConnectorCtasUnanchoredProvenance::try_new(
+            LakePublicationId::new_v7(),
+            target.clone(),
+            true,
+            Some([7; 16]),
+            42,
+        )
+        .unwrap();
+        let request = ConnectorCtasUnanchoredCleanupRequest::try_new(
+            ConnectorExecutionBindingKey {
+                instance_id,
+                incarnation: ConnectorInstanceIncarnation::new(),
+            },
+            Arc::from("s3://warehouse/root"),
+            100,
+            provenance.clone(),
+        );
+        assert!(request.is_ok());
+
+        let mut tampered = provenance;
+        tampered.target = ConnectorTableIdentity {
+            instance_id: target.instance_id,
+            namespace: Arc::from("db"),
+            table: Arc::from("different"),
+        };
+        assert!(tampered.validate().is_err());
     }
 
     struct FakeCapability {
@@ -1572,6 +1886,7 @@ mod tests {
                 table: Arc::from("t"),
             },
             owner,
+            publication_id: LakePublicationId::from_bytes(operation_id.to_bytes()),
             operation_id,
             columns: Vec::new(),
             partitioning: Vec::new(),
@@ -1864,6 +2179,45 @@ mod tests {
                 .is_err()
         );
         assert_eq!(capability.prepares.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn prepare_rejects_a_child_operation_identity_before_provider_dispatch() {
+        let (descriptor, incarnation) = owner();
+        let capability = Arc::new(FakeCapability {
+            descriptor: descriptor.clone(),
+            incarnation,
+            aborts: AtomicUsize::new(0),
+            prepares: AtomicUsize::new(0),
+            unknown_prepare: false,
+            fail_prepare: false,
+            malformed_prepare: false,
+            noop_publish: false,
+            unknown_abort: false,
+            known_uncommitted_reconcile: false,
+            binds: AtomicUsize::new(0),
+            publishes: AtomicUsize::new(0),
+        });
+        let lease = ConnectorStagedCreateLease::new(
+            ConnectorExecutionBindingKey {
+                instance_id: descriptor.instance_id,
+                incarnation,
+            },
+            capability.clone(),
+            || {},
+        )
+        .unwrap();
+        let operation_id = ConnectorStagedCreateOperationId::new();
+        let mut request = prepare_request(lease.owner().clone(), operation_id);
+        request.publication_id = LakePublicationId::new_v7();
+
+        let error = lease.prepare(request).unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            error.message(),
+            "staged-create operation ID must equal its statement publication ID"
+        );
+        assert_eq!(capability.prepares.load(Ordering::SeqCst), 0);
     }
 
     #[test]

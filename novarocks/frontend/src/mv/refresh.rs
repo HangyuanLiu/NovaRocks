@@ -50,10 +50,10 @@ use crate::query_execution::service::QueryExecutionService;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt, ConnectorControlRegistry,
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMutationOperationId,
-    ConnectorRefAction, ConnectorRefKind, ConnectorRefreshPublicationGuard,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorWriteReceipt, CreateOrReplacePolicy,
-    DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ConnectorMvMetadataOnlyBaseFact, ConnectorMvMetadataOnlyProvenance, ConnectorRefAction,
+    ConnectorRefKind, ConnectorRefreshPublicationGuard, ConnectorRequestContext,
+    ConnectorTableIdentity, ConnectorWriteReceipt, CreateOrReplacePolicy, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
 use sha2::{Digest, Sha256};
@@ -254,8 +254,8 @@ pub(super) fn execute(
 
     let base_snapshots = required_base_snapshots(&refresh.finalize)?;
     let base_table_object_ids = refresh.finalize.base_table_object_ids.clone();
-    let has_external_actions = matches!(&refresh.work, PreparedMvRefreshWork::DataProducing { .. });
-    let ledger = new_ledger(&refresh, &planning_lease, has_external_actions)?;
+    let has_external_actions = !matches!(&refresh.work, PreparedMvRefreshWork::NoOp);
+    let ledger = new_ledger(&refresh, &planning_lease)?;
     repository
         .begin_frontend_refresh_intent(BeginFrontendMvRefreshIntentRequest {
             refresh_id: refresh.attempt.refresh_id,
@@ -280,7 +280,7 @@ pub(super) fn execute(
         ..
     } = refresh;
     match work {
-        PreparedMvRefreshWork::NoOp | PreparedMvRefreshWork::MetadataOnly => {
+        PreparedMvRefreshWork::NoOp => {
             repository
                 .finalize_frontend_refresh_without_external_actions(MvRefreshFinalizeRequest {
                     refresh_id: attempt.refresh_id,
@@ -293,6 +293,15 @@ pub(super) fn execute(
                 .map_err(repository_error)?;
             Ok(MvStatementResult::Ok)
         }
+        PreparedMvRefreshWork::MetadataOnly { intent } => execute_metadata_only_refresh(
+            repository,
+            &planning_lease,
+            attempt,
+            finalize,
+            intent,
+            base_snapshots,
+            connector_context,
+        ),
         PreparedMvRefreshWork::DataProducing { write } => execute_data_refresh(
             repository,
             dependencies,
@@ -305,6 +314,166 @@ pub(super) fn execute(
             execution,
         ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_metadata_only_refresh(
+    repository: &dyn MvRepository,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    attempt: MvRefreshAttemptIdentity,
+    finalize: MvRefreshFinalizeFacts,
+    intent: crate::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
+    base_snapshots: BTreeMap<String, i64>,
+    connector_context: ConnectorRequestContext,
+) -> Result<MvStatementResult, MvApplicationError> {
+    if finalize.expected_target_snapshot_id.is_none() {
+        return Err(invalid(
+            "metadata-only MV refresh requires an existing published target snapshot",
+        ));
+    }
+    let mutation_lease = planning_lease
+        .derive_mutation_lease()
+        .map_err(|error| unavailable(error.to_string()))?;
+    let table = table_identity(&finalize, mutation_lease.descriptor().instance_id.clone());
+    let expected_table_uuid = exact_target_table_uuid(&finalize)?;
+    let staged = resolve_catalog_mutation_with_lease(
+        &mutation_lease,
+        ConnectorMutationOperationId::from_bytes(attempt.staging_create_operation_id),
+        ConnectorCatalogMutationOperation::AlterRef {
+            table: table.clone(),
+            action: ConnectorRefAction::Create {
+                kind: ConnectorRefKind::Branch,
+                name: attempt.staging_branch.clone().into(),
+                snapshot_id: finalize.expected_target_snapshot_id,
+                policy: CreateOrReplacePolicy::NoOpIfExists,
+                expected_table_uuid: Some(expected_table_uuid.into()),
+            },
+        },
+        connector_context.clone(),
+    );
+    record_catalog_action(
+        repository,
+        attempt.refresh_id,
+        FrontendMvRefreshActionPhase::StagingCreate,
+        attempt.staging_create_operation_id,
+        staged,
+        None,
+    )?;
+
+    let provenance = ConnectorMvMetadataOnlyProvenance {
+        refresh_id: intent.refresh_id(),
+        materialization_id: intent.mv_id(),
+        marker_token: intent.marker_token().into(),
+        bases: intent
+            .bases()
+            .iter()
+            .map(|base| ConnectorMvMetadataOnlyBaseFact {
+                table: base.table_fqn().into(),
+                object_id: base.table_object_id().clone(),
+                from_snapshot_id: base.from_snapshot(),
+                to_snapshot_id: base.to_snapshot(),
+            })
+            .collect(),
+        definition_fingerprint: intent.definition_fingerprint().into(),
+    };
+    let staged_snapshot = record_catalog_action(
+        repository,
+        attempt.refresh_id,
+        FrontendMvRefreshActionPhase::Write,
+        attempt.write_operation_id.to_bytes(),
+        resolve_catalog_mutation_with_lease(
+            &mutation_lease,
+            ConnectorMutationOperationId::from_bytes(attempt.write_operation_id.to_bytes()),
+            ConnectorCatalogMutationOperation::StageMvMetadataOnlySnapshot {
+                table: table.clone(),
+                expected_table_uuid: expected_table_uuid.into(),
+                expected_main_snapshot_id: finalize.expected_target_snapshot_id,
+                staging_branch: attempt.staging_branch.clone().into(),
+                expected_staging_snapshot_id: finalize.expected_target_snapshot_id,
+                provenance,
+            },
+            connector_context.clone(),
+        ),
+        None,
+    )?;
+    let committed_version = staged_snapshot
+        .receipt
+        .committed_version()
+        .cloned()
+        .ok_or_else(|| invalid("metadata-only MV staging committed without a snapshot version"))?;
+    let rows = staged_snapshot
+        .receipt
+        .resulting_row_count()
+        .ok_or_else(|| {
+            invalid("metadata-only MV staging committed without its inherited row count")
+        })?;
+    let rows =
+        i64::try_from(rows).map_err(|_| invalid("metadata-only MV row count exceeds i64"))?;
+    let staged_frontend_version = frontend_version(&committed_version)?;
+    recovery_phase_barrier("write-committed")?;
+
+    let guard = ConnectorRefreshPublicationGuard::try_new(
+        attempt.refresh_id,
+        finalize.mv_id,
+        attempt.marker_token.clone(),
+    )
+    .map_err(|error| invalid(error.to_string()))?;
+    let publication = record_catalog_action(
+        repository,
+        attempt.refresh_id,
+        FrontendMvRefreshActionPhase::Publication,
+        attempt.publication_operation_id,
+        resolve_catalog_mutation_with_lease(
+            &mutation_lease,
+            ConnectorMutationOperationId::from_bytes(attempt.publication_operation_id),
+            ConnectorCatalogMutationOperation::AlterRef {
+                table,
+                action: ConnectorRefAction::FastForwardBranch {
+                    source_branch: attempt.staging_branch.clone().into(),
+                    target_branch: "main".into(),
+                    committed_version,
+                    expected_target_snapshot_id: finalize.expected_target_snapshot_id,
+                    expected_table_uuid: expected_table_uuid.into(),
+                    guard,
+                },
+            },
+            connector_context,
+        ),
+        Some(staged_frontend_version),
+    )?;
+    let published_version = publication
+        .receipt
+        .committed_version()
+        .cloned()
+        .ok_or_else(|| {
+            invalid("metadata-only MV publication committed without a snapshot version")
+        })?;
+    let published_version = frontend_version(&published_version)?;
+    recovery_phase_barrier("publication-committed")?;
+    record_proof_only_phase(
+        repository,
+        attempt.refresh_id,
+        FrontendMvRefreshActionPhase::StagingDrop,
+        attempt.staging_drop_operation_id,
+        None,
+        None,
+    )?;
+    repository
+        .finalize_refresh(MvRefreshFinalizeRequest {
+            refresh_id: attempt.refresh_id,
+            rows,
+            base_snapshots,
+            base_table_object_ids: finalize.base_table_object_ids,
+            target_snapshot_id: published_version.snapshot_id,
+            partition_spec: None,
+        })
+        .map_err(|error| {
+            MvApplicationError::new(
+                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+                error.to_string(),
+            )
+        })?;
+    Ok(MvStatementResult::Ok)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -359,6 +528,7 @@ fn execute_data_refresh(
                     name: attempt.staging_branch.clone().into(),
                     snapshot_id: finalize.expected_target_snapshot_id,
                     policy: CreateOrReplacePolicy::NoOpIfExists,
+                    expected_table_uuid: Some(exact_target_table_uuid(&finalize)?.into()),
                 },
             },
             connector_context.clone(),
@@ -502,6 +672,7 @@ fn execute_data_refresh(
                     target_branch: "main".into(),
                     committed_version: committed_version.clone(),
                     expected_target_snapshot_id: finalize.expected_target_snapshot_id,
+                    expected_table_uuid: exact_target_table_uuid(&finalize)?.into(),
                     guard,
                 },
             },
@@ -527,40 +698,17 @@ fn execute_data_refresh(
 
     recovery_phase_barrier("publication-committed")?;
 
-    if atomic_repartition {
-        record_proof_only_phase(
-            repository,
-            attempt.refresh_id,
-            FrontendMvRefreshActionPhase::StagingDrop,
-            attempt.staging_drop_operation_id,
-            None,
-            None,
-        )?;
-    } else {
-        let cleanup = resolve_catalog_mutation_with_lease(
-            mutation_lease
-                .as_ref()
-                .expect("ordinary MV refresh has a mutation lease"),
-            ConnectorMutationOperationId::from_bytes(attempt.staging_drop_operation_id),
-            ConnectorCatalogMutationOperation::AlterRef {
-                table: table.expect("ordinary MV refresh has a target"),
-                action: ConnectorRefAction::Drop {
-                    kind: ConnectorRefKind::Branch,
-                    name: attempt.staging_branch.clone().into(),
-                    policy: DropPolicy::NoOpIfMissing,
-                },
-            },
-            connector_context.clone(),
-        );
-        record_catalog_action(
-            repository,
-            attempt.refresh_id,
-            FrontendMvRefreshActionPhase::StagingDrop,
-            attempt.staging_drop_operation_id,
-            cleanup,
-            None,
-        )?;
-    }
+    // A published staging branch remains an owned Catalog object. Its exact
+    // head is retired only by the age-gated GC pass; a success-path DROP would
+    // turn a completed frontier into a second post-publication mutation.
+    record_proof_only_phase(
+        repository,
+        attempt.refresh_id,
+        FrontendMvRefreshActionPhase::StagingDrop,
+        attempt.staging_drop_operation_id,
+        None,
+        None,
+    )?;
 
     let committed_partitioning = published.committed().committed_partitioning();
     let partition_spec = committed_partitioning
@@ -600,15 +748,15 @@ fn execute_data_refresh(
 fn new_ledger(
     refresh: &PreparedMvRefresh,
     lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    has_external_actions: bool,
 ) -> Result<FrontendMvRefreshLedger, MvApplicationError> {
     let cohort_ids = match &refresh.work {
         PreparedMvRefreshWork::DataProducing { write } => {
             vec![hex::encode(write.primary_cohort().to_bytes())]
         }
-        PreparedMvRefreshWork::NoOp | PreparedMvRefreshWork::MetadataOnly => Vec::new(),
+        PreparedMvRefreshWork::NoOp | PreparedMvRefreshWork::MetadataOnly { .. } => Vec::new(),
     };
-    if has_external_actions && cohort_ids.is_empty() {
+    if matches!(&refresh.work, PreparedMvRefreshWork::DataProducing { .. }) && cohort_ids.is_empty()
+    {
         return Err(invalid(
             "MV refresh data preparation contains no writer cohorts",
         ));
@@ -662,6 +810,16 @@ fn table_identity(
         namespace: facts.target.database.clone().into(),
         table: facts.target.name.clone().into(),
     }
+}
+
+fn exact_target_table_uuid(facts: &MvRefreshFinalizeFacts) -> Result<&str, MvApplicationError> {
+    let uuid = facts.target_table_uuid.trim();
+    if uuid.is_empty() {
+        return Err(invalid(
+            "MV refresh has no frozen target table UUID for staged publication",
+        ));
+    }
+    Ok(uuid)
 }
 
 /// A committed write terminal, kept together with the effect the provider

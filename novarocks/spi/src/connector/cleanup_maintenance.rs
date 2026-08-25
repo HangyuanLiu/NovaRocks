@@ -31,14 +31,224 @@ use super::{
     ConnectorTableHandle,
 };
 
-pub const CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION: u16 = 1;
+pub const CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION: u16 = 2;
 pub const MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS: usize = 1024;
 pub const MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES: usize = 64 * 1024;
+pub const MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS: usize = 1024;
 pub const MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS: u32 = 1024;
 pub const MAX_CONNECTOR_CLEANUP_BATCHES: u32 = 256;
 
 pub const REMOVE_UNREFERENCED_OBJECTS_KIND: &str = "remove-unreferenced-objects";
+
+/// The exact Catalog identity that authorizes retiring an owned ref.
+///
+/// This deliberately excludes `created_at_ms`: that timestamp is evidence for
+/// the frontend's durable age observation, not Catalog compare-and-swap
+/// identity. A later planning request may select a ref only by this complete
+/// immutable identity; a name alone is never a deletion capability.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConnectorCleanupOwnedRefIdentity {
+    name: Arc<str>,
+    head_snapshot_id: i64,
+    provenance_version: u16,
+    provenance_digest: [u8; 32],
+}
+
+impl ConnectorCleanupOwnedRefIdentity {
+    pub fn try_new(
+        name: Arc<str>,
+        head_snapshot_id: i64,
+        provenance_version: u16,
+        provenance_digest: [u8; 32],
+    ) -> Result<Self, ConnectorError> {
+        let identity = Self {
+            name,
+            head_snapshot_id,
+            provenance_version,
+            provenance_digest,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn head_snapshot_id(&self) -> i64 {
+        self.head_snapshot_id
+    }
+
+    pub const fn provenance_version(&self) -> u16 {
+        self.provenance_version
+    }
+
+    pub const fn provenance_digest(&self) -> [u8; 32] {
+        self.provenance_digest
+    }
+
+    fn validate(&self) -> Result<(), ConnectorError> {
+        if self.name.is_empty() || self.head_snapshot_id <= 0 || self.provenance_version == 0 {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cleanup owned ref exact identity is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    fn digest_into(&self, hash: &mut Sha256) {
+        digest_bytes(hash, self.name.as_bytes());
+        hash.update(self.head_snapshot_id.to_be_bytes());
+        hash.update(self.provenance_version.to_be_bytes());
+        hash.update(self.provenance_digest);
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.name.len() + 8 + 2 + 32
+    }
+}
+
+/// A bounded canonical set of owned refs selected after a read-only discovery
+/// pass. `Some(empty)` is meaningful: it proves that discovery found owned
+/// refs but none survived the frontend age observation. Providers must return
+/// an empty ref phase, never promote that request into an object sweep.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorCleanupOwnedRefSelection {
+    identities: Vec<ConnectorCleanupOwnedRefIdentity>,
+}
+
+impl ConnectorCleanupOwnedRefSelection {
+    pub fn try_new(
+        identities: Vec<ConnectorCleanupOwnedRefIdentity>,
+    ) -> Result<Self, ConnectorError> {
+        let selection = Self { identities };
+        selection.validate()?;
+        Ok(selection)
+    }
+
+    pub fn identities(&self) -> &[ConnectorCleanupOwnedRefIdentity] {
+        &self.identities
+    }
+
+    fn validate(&self) -> Result<(), ConnectorError> {
+        if self.identities.len() > MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS
+            || self
+                .identities
+                .iter()
+                .any(|identity| identity.validate().is_err())
+            || self
+                .identities
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1] || pair[0].name() == pair[1].name())
+            || self
+                .identities
+                .iter()
+                .try_fold(0_usize, |total, identity| {
+                    total.checked_add(identity.encoded_len())
+                })
+                .is_none_or(|bytes| bytes > MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cleanup owned ref selection is invalid or exceeds its hard limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn digest_into(&self, hash: &mut Sha256) {
+        hash.update((self.identities.len() as u32).to_be_bytes());
+        for identity in &self.identities {
+            identity.digest_into(hash);
+        }
+    }
+}
+
+/// A provider-neutral, read-only projection of one cleanup candidate.
+///
+/// Object identity remains provider-private in the immutable cleanup manifest;
+/// an owned ref instead exposes the exact Catalog compare-and-swap input so
+/// callers can distinguish a ref-retirement pass from an object-sweep pass.
+/// The closed form is deliberate: callers must not infer delete authority from
+/// an arbitrary location or ref name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorCleanupCandidate {
+    Object {
+        location: Arc<str>,
+    },
+    OwnedRef {
+        /// Provider-confirmed table identity used only for the frontend's
+        /// durable GC observation key. It is not a ref deletion capability.
+        table_uuid: Uuid,
+        name: Arc<str>,
+        head_snapshot_id: i64,
+        provenance_version: u16,
+        provenance_digest: [u8; 32],
+        created_at_ms: i64,
+    },
+}
+
+impl ConnectorCleanupCandidate {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Object { .. } => "object",
+            Self::OwnedRef { .. } => "owned_ref",
+        }
+    }
+
+    pub fn display_key(&self) -> Arc<str> {
+        match self {
+            Self::Object { location } => Arc::clone(location),
+            Self::OwnedRef { name, .. } => Arc::from(format!("ref:{name}")),
+        }
+    }
+
+    pub fn owned_ref_identity(&self) -> Option<ConnectorCleanupOwnedRefIdentity> {
+        match self {
+            Self::OwnedRef {
+                name,
+                head_snapshot_id,
+                provenance_version,
+                provenance_digest,
+                ..
+            } => ConnectorCleanupOwnedRefIdentity::try_new(
+                Arc::clone(name),
+                *head_snapshot_id,
+                *provenance_version,
+                *provenance_digest,
+            )
+            .ok(),
+            Self::Object { .. } => None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConnectorError> {
+        match self {
+            Self::Object { location } if !location.is_empty() => Ok(()),
+            Self::OwnedRef {
+                table_uuid,
+                name,
+                head_snapshot_id,
+                provenance_version,
+                provenance_digest: _,
+                created_at_ms,
+            } if !table_uuid.is_nil()
+                && !name.is_empty()
+                && *head_snapshot_id > 0
+                && *provenance_version > 0
+                && *created_at_ms > 0 =>
+            {
+                Ok(())
+            }
+            _ => Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cleanup candidate has an invalid exact identity",
+            )),
+        }
+    }
+}
 
 const REQUEST_DOMAIN: &[u8] = b"novarocks.connector-cleanup-maintenance.request.v1\0";
 const PLAN_DOMAIN: &[u8] = b"novarocks.connector-cleanup-maintenance.plan.v1\0";
@@ -132,6 +342,7 @@ pub struct ConnectorCleanupPlanningRequest {
     operation_id: ConnectorCleanupOperationId,
     owner: ConnectorExecutionBindingKey,
     operation: ConnectorCleanupOperation,
+    owned_ref_selection: Option<ConnectorCleanupOwnedRefSelection>,
     request_digest: [u8; 32],
     pub context: ConnectorRequestContext,
 }
@@ -150,11 +361,41 @@ impl ConnectorCleanupPlanningRequest {
                 "cleanup table handle does not match exact owner",
             ));
         }
-        let request_digest = request_digest(operation_id, &owner, &operation);
+        let request_digest = request_digest(operation_id, &owner, &operation, None);
         Ok(Self {
             operation_id,
             owner,
             operation,
+            owned_ref_selection: None,
+            request_digest,
+            context,
+        })
+    }
+
+    /// Build the second, selected ref-retirement planning request. Unlike the
+    /// discovery request, this mode can never authorize an object sweep.
+    pub fn try_new_selected_owned_refs(
+        operation_id: ConnectorCleanupOperationId,
+        owner: ConnectorExecutionBindingKey,
+        operation: ConnectorCleanupOperation,
+        owned_ref_selection: ConnectorCleanupOwnedRefSelection,
+        context: ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        operation.validate()?;
+        owned_ref_selection.validate()?;
+        if operation.table().owner() != &owner.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cleanup table handle does not match exact owner",
+            ));
+        }
+        let request_digest =
+            request_digest(operation_id, &owner, &operation, Some(&owned_ref_selection));
+        Ok(Self {
+            operation_id,
+            owner,
+            operation,
+            owned_ref_selection: Some(owned_ref_selection),
             request_digest,
             context,
         })
@@ -176,11 +417,25 @@ impl ConnectorCleanupPlanningRequest {
         self.request_digest
     }
 
+    /// `None` denotes discovery. `Some`, including an empty selection,
+    /// denotes the second ref-retirement plan and is never an object sweep.
+    pub fn owned_ref_selection(&self) -> Option<&ConnectorCleanupOwnedRefSelection> {
+        self.owned_ref_selection.as_ref()
+    }
+
     pub fn validate(&self) -> Result<(), ConnectorError> {
         self.operation.validate()?;
         if self.operation.table().owner() != &self.owner.instance_id
-            || request_digest(self.operation_id, &self.owner, &self.operation)
-                != self.request_digest
+            || self
+                .owned_ref_selection
+                .as_ref()
+                .is_some_and(|selection| selection.validate().is_err())
+            || request_digest(
+                self.operation_id,
+                &self.owner,
+                &self.operation,
+                self.owned_ref_selection.as_ref(),
+            ) != self.request_digest
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -197,6 +452,13 @@ impl fmt::Debug for ConnectorCleanupPlanningRequest {
             .field("operation_id", &self.operation_id)
             .field("owner", &self.owner)
             .field("operation_kind", &self.operation.kind())
+            .field(
+                "owned_ref_selection_count",
+                &self
+                    .owned_ref_selection
+                    .as_ref()
+                    .map(|selection| selection.identities().len()),
+            )
             .field("request_digest", &self.request_digest)
             .finish_non_exhaustive()
     }
@@ -812,7 +1074,7 @@ pub struct CandidatePage {
     operation_id: ConnectorCleanupOperationId,
     manifest_digest: [u8; 32],
     offset: u64,
-    locations: Vec<Arc<str>>,
+    candidates: Vec<ConnectorCleanupCandidate>,
     complete: bool,
 }
 
@@ -822,7 +1084,7 @@ impl CandidatePage {
         operation_id: ConnectorCleanupOperationId,
         manifest_digest: [u8; 32],
         offset: u64,
-        locations: Vec<Arc<str>>,
+        candidates: Vec<ConnectorCleanupCandidate>,
         complete: bool,
     ) -> Result<Self, ConnectorError> {
         let page = Self {
@@ -830,7 +1092,7 @@ impl CandidatePage {
             operation_id,
             manifest_digest,
             offset,
-            locations,
+            candidates,
             complete,
         };
         page.validate()?;
@@ -848,20 +1110,37 @@ impl CandidatePage {
     pub const fn offset(&self) -> u64 {
         self.offset
     }
-    pub fn locations(&self) -> &[Arc<str>] {
-        &self.locations
+    pub fn candidates(&self) -> &[ConnectorCleanupCandidate] {
+        &self.candidates
+    }
+    /// Backward-compatible read-only display projection. It never carries
+    /// delete authority and is intentionally unsuitable for dispatch.
+    pub fn display_keys(&self) -> Vec<Arc<str>> {
+        self.candidates
+            .iter()
+            .map(ConnectorCleanupCandidate::display_key)
+            .collect()
     }
     pub const fn complete(&self) -> bool {
         self.complete
     }
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        if self.locations.len() > MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS
-            || self.locations.iter().any(|location| location.is_empty())
-            || self.locations.windows(2).any(|pair| pair[0] >= pair[1])
+        let display_keys = self.display_keys();
+        if self.candidates.len() > MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS
             || self
-                .locations
+                .candidates
                 .iter()
-                .map(|location| location.len())
+                .any(|candidate| candidate.validate().is_err())
+            || display_keys.windows(2).any(|pair| pair[0] >= pair[1])
+            || self
+                .candidates
+                .iter()
+                .map(|candidate| match candidate {
+                    ConnectorCleanupCandidate::Object { location } => location.len(),
+                    ConnectorCleanupCandidate::OwnedRef { name, .. } => {
+                        16 + name.len() + 8 + 2 + 32 + 8
+                    }
+                })
                 .sum::<usize>()
                 > MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES
         {
@@ -1153,7 +1432,7 @@ impl ConnectorCleanupMaintenanceLease {
             || page.operation_id != request.plan.operation_id
             || page.manifest_digest != request.plan.manifest_digest
             || page.offset != request.offset
-            || page.locations.len() > request.limit as usize
+            || page.candidates.len() > request.limit as usize
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -1250,6 +1529,7 @@ fn request_digest(
     id: ConnectorCleanupOperationId,
     owner: &ConnectorExecutionBindingKey,
     operation: &ConnectorCleanupOperation,
+    owned_ref_selection: Option<&ConnectorCleanupOwnedRefSelection>,
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(REQUEST_DOMAIN);
@@ -1258,6 +1538,13 @@ fn request_digest(
     digest_bytes(&mut hash, owner.instance_id.as_str().as_bytes());
     hash.update(owner.incarnation.to_bytes());
     operation.digest_into(&mut hash);
+    match owned_ref_selection {
+        None => hash.update([0]),
+        Some(selection) => {
+            hash.update([1]);
+            selection.digest_into(&mut hash);
+        }
+    }
     hash.finalize().into()
 }
 fn plan_digest(
@@ -1341,11 +1628,15 @@ fn digest_bytes(hash: &mut Sha256, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
     use bytes::Bytes;
 
     use super::*;
     use crate::connector::{
-        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorProviderId,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        ConnectorProviderId,
     };
 
     fn owner() -> ConnectorExecutionBindingKey {
@@ -1353,6 +1644,29 @@ mod tests {
             instance_id: ConnectorInstanceId::parse("iceberg.main").unwrap(),
             incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
         }
+    }
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            1024,
+            2048,
+        )
+        .expect("test connector context")
+    }
+
+    fn table_handle() -> ConnectorTableHandle {
+        ConnectorTableHandle::try_new(owner().instance_id, Bytes::from_static(b"table"))
+            .expect("test table handle")
     }
 
     #[test]
@@ -1382,7 +1696,14 @@ mod tests {
             ConnectorCleanupOperationId::new(),
             [0; 32],
             0,
-            vec![Arc::from("s3://bucket/a"), Arc::from("s3://bucket/b")],
+            vec![
+                ConnectorCleanupCandidate::Object {
+                    location: Arc::from("s3://bucket/a"),
+                },
+                ConnectorCleanupCandidate::Object {
+                    location: Arc::from("s3://bucket/b"),
+                },
+            ],
             true,
         );
         assert!(page.is_ok());
@@ -1391,10 +1712,85 @@ mod tests {
             ConnectorCleanupOperationId::new(),
             [0; 32],
             0,
-            vec![Arc::from("b"), Arc::from("a")],
+            vec![
+                ConnectorCleanupCandidate::Object {
+                    location: Arc::from("b"),
+                },
+                ConnectorCleanupCandidate::Object {
+                    location: Arc::from("a"),
+                },
+            ],
             true,
         );
         assert!(noncanonical.is_err());
+    }
+
+    #[test]
+    fn owned_ref_candidate_keeps_exact_retirement_identity() {
+        let page = CandidatePage::try_new(
+            owner(),
+            ConnectorCleanupOperationId::new(),
+            [9; 32],
+            0,
+            vec![ConnectorCleanupCandidate::OwnedRef {
+                table_uuid: Uuid::from_u128(7),
+                name: Arc::from("__novarocks_mv_refresh_7"),
+                head_snapshot_id: 41,
+                provenance_version: 1,
+                provenance_digest: [7; 32],
+                created_at_ms: 1_700_000_000_000,
+            }],
+            true,
+        )
+        .expect("owned ref candidate");
+        assert_eq!(page.candidates()[0].kind(), "owned_ref");
+        assert_eq!(
+            page.display_keys(),
+            vec![Arc::from("ref:__novarocks_mv_refresh_7")]
+        );
+        let identity = page.candidates()[0]
+            .owned_ref_identity()
+            .expect("owned ref has an exact selection identity");
+        assert_eq!(identity.name(), "__novarocks_mv_refresh_7");
+        assert_eq!(identity.head_snapshot_id(), 41);
+        assert_eq!(identity.provenance_version(), 1);
+        assert_eq!(identity.provenance_digest(), [7; 32]);
+    }
+
+    #[test]
+    fn selected_owned_refs_are_bounded_canonical_and_digest_bound() {
+        let first = ConnectorCleanupOwnedRefIdentity::try_new(Arc::from("a"), 1, 1, [1; 32])
+            .expect("first identity");
+        let second = ConnectorCleanupOwnedRefIdentity::try_new(Arc::from("b"), 2, 1, [2; 32])
+            .expect("second identity");
+        let selection = ConnectorCleanupOwnedRefSelection::try_new(vec![first.clone(), second])
+            .expect("canonical selection");
+        let operation = ConnectorCleanupOperation::remove_unreferenced_objects(table_handle(), 1)
+            .expect("cleanup operation");
+        let selected = ConnectorCleanupPlanningRequest::try_new_selected_owned_refs(
+            ConnectorCleanupOperationId::new(),
+            owner(),
+            operation.clone(),
+            selection,
+            context(),
+        )
+        .expect("selected request");
+        let discovery = ConnectorCleanupPlanningRequest::try_new(
+            selected.operation_id(),
+            owner(),
+            operation,
+            context(),
+        )
+        .expect("discovery request");
+        assert_ne!(selected.request_digest(), discovery.request_digest());
+        assert!(ConnectorCleanupOwnedRefSelection::try_new(vec![first.clone(), first]).is_err());
+        assert!(
+            ConnectorCleanupOwnedRefSelection::try_new(vec![
+                ConnectorCleanupOwnedRefIdentity::try_new(Arc::from("b"), 2, 1, [2; 32]).unwrap(),
+                ConnectorCleanupOwnedRefIdentity::try_new(Arc::from("a"), 1, 1, [1; 32]).unwrap(),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

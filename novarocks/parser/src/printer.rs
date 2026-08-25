@@ -159,6 +159,9 @@ impl Printer {
                 self.output.push(' ');
                 self.write_literal(&statement.connection_id);
             }
+            SessionStatement::TransactionControl(statement) => {
+                self.output.push_str(statement.kind.sql());
+            }
         }
     }
 

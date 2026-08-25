@@ -118,6 +118,10 @@ pub struct MvRefreshFinalizeFacts {
     pub base_snapshots: BTreeMap<String, Option<i64>>,
     pub base_table_object_ids: BTreeMap<String, novarocks_spi::connector::ConnectorTableObjectId>,
     pub expected_target_snapshot_id: Option<i64>,
+    /// Immutable target identity observed during refresh preparation. It is
+    /// carried into the staged-ref and publication CASes to reject a
+    /// DROP/recreate under the same logical table name.
+    pub target_table_uuid: String,
 }
 
 #[cfg(test)]

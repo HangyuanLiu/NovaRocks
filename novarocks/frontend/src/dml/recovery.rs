@@ -15,21 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Bounded CP-3A recovery scheduling.
+//! Bounded, local-only DML recovery scheduling.
 //!
-//! The controller claims due operations under their exact operation lease and
-//! hands each claim to the family profile that owns it. CP-3C installs the
-//! first one: a direct data-mutation family (TRUNCATE, ADD FILES) converges
-//! through [`crate::dml::statement_recovery`], which raises a strictly higher
-//! external fence, classifies the historical attempt against immutable external
-//! truth, and finalizes, cleans up, or stays unresolved.
-//!
-//! CP-3D installs CTAS takeover beside that direct-mutation profile. Every
-//! other family keeps the original behaviour — claim, defer, change no business
-//! lifecycle and no external evidence — until its own profile lands. The same
-//! bounded budgets apply to every path: the poll interval, claims-per-poll cap,
-//! and round-robin shard offsets are unchanged, so installing a profile cannot
-//! make the scan busier than the deferral it replaced.
+//! A due operation is claimed under its exact local lease only to project an
+//! old CTAS, TRUNCATE, or ADD FILES record to `ManualInspect`. It never
+//! contacts a provider, replays a publication, classifies a historical attempt,
+//! or cleans external resources. Other retained operation families are merely
+//! deferred. Catalog and object-store residue is reclaimed by age-based GC.
 
 use std::sync::Arc;
 use std::time::Duration;

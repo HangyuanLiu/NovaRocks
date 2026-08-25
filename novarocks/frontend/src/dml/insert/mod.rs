@@ -27,6 +27,7 @@ use crate::query_execution::dml::insert::{
     PrepareIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
 };
 use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_spi::connector::{LakePublicationFamily, LakePublicationId};
 
 use crate::dml::error::{AdmitError, DmlError};
 use crate::dml::runner::{ActiveWriteTransactionRunner, preparing_request};
@@ -135,6 +136,7 @@ impl DmlService {
         query_options: Option<&QueryOptions>,
     ) -> Result<(), DmlError> {
         self.require_journal()?;
+        let publication_id = LakePublicationId::new_v7();
         let (source, prepared_insert_columns) = match source {
             InsertCommandSource::Values(rows) => (
                 IcebergInsertSource::Rows(
@@ -157,6 +159,7 @@ impl DmlService {
         };
         let prepared = engine
             .prepare_iceberg_write(PrepareIcebergInsert {
+                publication_id,
                 target: target.clone(),
                 insert_columns: prepared_insert_columns,
                 sql_source: sql_source.to_string(),
@@ -174,9 +177,19 @@ impl DmlService {
         let spec = write_transaction_spec(&prepared);
         let executor = IcebergInsertWriteExecutor::new(engine, &prepared);
         let operation = self.begin_write_operation(preparing_request(&spec))?;
+        let target = spec.target.clone();
         ActiveWriteTransactionRunner::new(operation, &executor)
             .run(spec)
             .map(|_| ())
+            .map_err(|error| {
+                error.with_publication_context(
+                    LakePublicationFamily::Write,
+                    target.catalog,
+                    target.namespace,
+                    target.table,
+                    target.ref_name,
+                )
+            })
     }
 }
 

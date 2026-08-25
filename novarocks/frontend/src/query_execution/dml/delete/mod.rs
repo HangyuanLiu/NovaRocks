@@ -57,6 +57,7 @@ impl DeleteStatement<'_> {
 /// slices selected by a parser-owned AST span; it must not be reparsed or used
 /// to rediscover the statement family.
 pub struct PrepareDeleteRequest<'a> {
+    pub publication_id: novarocks_spi::connector::LakePublicationId,
     pub statement: DeleteStatement<'a>,
     pub source: &'a str,
     pub current_catalog: Option<String>,
@@ -81,6 +82,7 @@ pub trait DeleteCommit: Send + Sync {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeleteOperation {
+    pub publication_id: novarocks_spi::connector::LakePublicationId,
     pub catalog: String,
     pub namespace: String,
     pub table: String,
@@ -160,24 +162,6 @@ impl DeleteNativeEncoding<'_> {
 }
 
 pub(crate) trait PreparedDeleteExecution: Send + Sync {
-    /// Expose the exact write authority this preparation activated, so the
-    /// coordinator can fence it before anything is dispatched.
-    ///
-    /// The default refuses. There is deliberately no unfenced dispatch: an
-    /// execution that cannot expose its write authority must not run a writer.
-    fn external_fence_authority(
-        &self,
-    ) -> Result<
-        crate::query_execution::dml::external_write_fence::ExternalWriteFenceAuthority,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        Err(
-            crate::query_execution::dml::external_write_fence::external_fence_authority_unavailable(
-                "DELETE execution does not expose an external operation fence authority",
-            ),
-        )
-    }
-
     fn native_encoding(
         &self,
     ) -> Result<DeleteNativeEncoding<'_>, crate::dml::error::DmlExecutionError>;
@@ -201,26 +185,6 @@ pub(crate) trait PreparedDeleteExecution: Send + Sync {
 // Design: ADR-0020 (docs/adr/ADR-0020-frontend-delete-application-owner.md)
 pub trait DeleteEngine: Send + Sync {
     fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String>;
-
-    /// Establish this attempt's external write fence before anything is
-    /// dispatched.
-    ///
-    /// The default fails closed. There is deliberately no unfenced dispatch: an
-    /// engine that cannot expose its write authority must not run a writer.
-    fn establish_delete_external_fence(
-        &self,
-        _prepared: &dyn DeletePrepared,
-        _proposal: &dyn crate::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorEstablishedWriteFence,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        Err(
-            crate::query_execution::dml::external_write_fence::external_fence_authority_unavailable(
-                "DELETE engine does not expose an external operation fence authority",
-            ),
-        )
-    }
 
     fn run_delete(&self, prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String>;
     fn delete_native_encoding<'a>(
@@ -254,21 +218,6 @@ pub trait DeleteEngine: Send + Sync {
 }
 
 impl DeleteEngine for DmlExecutionKernel {
-    fn establish_delete_external_fence(
-        &self,
-        prepared: &dyn DeletePrepared,
-        proposal: &dyn crate::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorEstablishedWriteFence,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        downcast_prepared(prepared)
-            .map_err(crate::query_execution::dml::external_write_fence::invalid_fence_request)?
-            .execution
-            .external_fence_authority()?
-            .establish(proposal)
-    }
-
     fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
         let connector_context = crate::connector::connector_request_context_for_execution(
             request.query_options.as_ref(),
@@ -283,6 +232,7 @@ impl DeleteEngine for DmlExecutionKernel {
                 &request.current_database,
                 &request.execution,
                 &connector_context,
+                request.publication_id,
             ),
             DeleteStatement::Equality(statement) => equality::prepare_equality_delete_statement(
                 self,
@@ -291,6 +241,7 @@ impl DeleteEngine for DmlExecutionKernel {
                 &request.current_database,
                 &request.execution,
                 &connector_context,
+                request.publication_id,
             ),
         }?;
         prepared.sql_source = request.source.to_string();

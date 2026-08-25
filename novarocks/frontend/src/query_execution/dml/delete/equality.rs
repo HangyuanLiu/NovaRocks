@@ -34,7 +34,7 @@ use crate::query_execution::planning::write_sink::{
 use novarocks_parser::ast::{AddEqualityDelete, LiteralKind, ObjectName, Query, Statement};
 use novarocks_spi::connector::{
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
-    ConnectorWriteIntent, ConnectorWriteOperationId,
+    ConnectorWriteIntent,
 };
 use novarocks_sql::literal::{parse_date_string_to_days, parse_datetime_string_to_micros};
 use novarocks_sql::planning::dml::DmlWriteSinkMode;
@@ -51,6 +51,7 @@ pub(crate) fn prepare_equality_delete_statement(
     current_database: &str,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    publication_id: novarocks_spi::connector::LakePublicationId,
 ) -> Result<PreparedDelete, String> {
     let table = sql_object_name(&stmt.target);
     let target = resolve_existing_table_target(state, &table, current_catalog, current_database)?;
@@ -130,6 +131,7 @@ pub(crate) fn prepare_equality_delete_statement(
         execution,
         connector_context,
         planning_lease,
+        publication_id,
     )
 }
 
@@ -189,24 +191,6 @@ struct DistributedEqualityDeleteWriteExecutor {
 }
 
 impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
-    /// Equality DELETE activates its write generation during preparation, so the
-    /// authority already exists before anything is dispatched.
-    fn external_fence_authority(
-        &self,
-    ) -> Result<
-        crate::query_execution::dml::external_write_fence::ExternalWriteFenceAuthority,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        crate::query_execution::dml::external_write_fence::ExternalWriteFenceAuthority::try_new(
-            self.connector_write.lease(),
-            self.connector_write.operation_id(),
-            &self.target.namespace,
-            &self.target.table,
-            self.connector_write.preparation().target_ref().clone(),
-            self.connector_context.clone(),
-        )
-    }
-
     fn native_encoding(
         &self,
     ) -> Result<
@@ -295,6 +279,7 @@ fn prepare_equality_delete_distributed_write(
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    publication_id: novarocks_spi::connector::LakePublicationId,
 ) -> Result<PreparedDelete, String> {
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let write_lease = planning_lease
@@ -331,7 +316,7 @@ fn prepare_equality_delete_distributed_write(
         novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
     )?;
 
-    let connector_operation_id = ConnectorWriteOperationId::new();
+    let connector_operation_id = publication_id.into();
     let connector_write =
         crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
             connector_operation_id,
@@ -353,6 +338,7 @@ fn prepare_equality_delete_distributed_write(
     };
     Ok(prepared_delete(
         DeleteOperation {
+            publication_id,
             catalog: target.catalog.clone(),
             namespace: target.namespace.clone(),
             table: target.table.clone(),

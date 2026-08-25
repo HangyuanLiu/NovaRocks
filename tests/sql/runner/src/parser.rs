@@ -108,30 +108,25 @@ fn parse_imv_stateless_rebuild(raw: &str) -> anyhow::Result<ImvStatelessDirectiv
     Ok(ImvStatelessDirective { mv, level, catalog })
 }
 
-fn parse_fenced_catalog_fault(raw: &str) -> anyhow::Result<FencedCatalogFaultDirective> {
+fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatalogFaultDirective> {
     let (action, fault) = raw
         .split_once(',')
-        .ok_or_else(|| anyhow::anyhow!("@fenced_catalog_fault requires <action>,<fault>"))?;
+        .ok_or_else(|| anyhow::anyhow!("@publication_catalog_fault requires <action>,<fault>"))?;
     let action = match action.trim() {
-        "advance-fence" => FencedCatalogAction::AdvanceFence,
-        "stage" => FencedCatalogAction::Stage,
-        "publish" => FencedCatalogAction::Publish,
-        "abort" => FencedCatalogAction::Abort,
+        "stage-create" => PublicationCatalogAction::StageCreate,
+        "table-commit" => PublicationCatalogAction::TableCommit,
         other => anyhow::bail!(
-            "invalid @fenced_catalog_fault action `{other}`; expected advance-fence, stage, publish, abort"
+            "invalid @publication_catalog_fault action `{other}`; expected stage-create, table-commit"
         ),
     };
     let fault = match fault.trim() {
-        "before-accept" => FencedCatalogFault::BeforeAccept,
-        "after-accept" => FencedCatalogFault::AfterAccept,
-        "after-downstream-before-terminal" => FencedCatalogFault::AfterDownstreamBeforeTerminal,
-        "after-downstream-before-response" => FencedCatalogFault::AfterDownstreamBeforeResponse,
-        "delayed-old-request" => FencedCatalogFault::DelayedOldRequest,
+        "before-dispatch" => PublicationCatalogFault::BeforeDispatch,
+        "after-commit-before-response" => PublicationCatalogFault::AfterCommitBeforeResponse,
         other => anyhow::bail!(
-            "invalid @fenced_catalog_fault fault `{other}`; expected before-accept, after-accept, after-downstream-before-terminal, after-downstream-before-response, delayed-old-request"
+            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, after-commit-before-response"
         ),
     };
-    Ok(FencedCatalogFaultDirective { action, fault })
+    Ok(PublicationCatalogFaultDirective { action, fault })
 }
 
 fn parse_query_lifecycle_fault(raw: &str) -> anyhow::Result<QueryLifecycleFaultDirective> {
@@ -254,10 +249,12 @@ fn parse_runtime_filter_total_at_least(
             RuntimeFilterTotalMetric::valid_names()
         )
     })?;
-    let value = value
-        .trim()
-        .parse::<u64>()
-        .with_context(|| format!("invalid runtime-filter total lower bound {:?}", value.trim()))?;
+    let value = value.trim().parse::<u64>().with_context(|| {
+        format!(
+            "invalid runtime-filter total lower bound {:?}",
+            value.trim()
+        )
+    })?;
     if value == 0 {
         bail!("runtime-filter total lower bound must be positive");
     }
@@ -460,8 +457,8 @@ fn parse_meta_with_sql_error_descriptors(
                 }
                 meta.cleanup_fault = Some(raw_value);
             }
-            "fenced_catalog_fault" => {
-                meta.fenced_catalog_fault = Some(parse_fenced_catalog_fault(&raw_value)?);
+            "publication_catalog_fault" => {
+                meta.publication_catalog_fault = Some(parse_publication_catalog_fault(&raw_value)?);
             }
             "drop_next_init_ack_be_index" => {
                 let value = raw_value
@@ -577,15 +574,17 @@ fn parse_meta_with_sql_error_descriptors(
                             "invalid expect_runtime_filter_available: {raw_value}; expected available"
                         )
                     })?;
-                structured_assertion_mut(&mut meta).runtime_filter_availability = Some(availability);
+                structured_assertion_mut(&mut meta).runtime_filter_availability =
+                    Some(availability);
             }
             "expect_runtime_filter_detail" => {
-                let detail = RuntimeFilterDetailExpectation::parse(&raw_value).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid expect_runtime_filter_detail: {raw_value}; expected one of {}",
-                        RuntimeFilterDetailExpectation::valid_names()
-                    )
-                })?;
+                let detail =
+                    RuntimeFilterDetailExpectation::parse(&raw_value).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "invalid expect_runtime_filter_detail: {raw_value}; expected one of {}",
+                            RuntimeFilterDetailExpectation::valid_names()
+                        )
+                    })?;
                 structured_assertion_mut(&mut meta)
                     .runtime_filter_details
                     .push(detail);
@@ -885,9 +884,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .cleanup_fault
             .clone()
             .or_else(|| base.cleanup_fault.clone()),
-        fenced_catalog_fault: override_meta
-            .fenced_catalog_fault
-            .or(base.fenced_catalog_fault),
+        publication_catalog_fault: override_meta
+            .publication_catalog_fault
+            .or(base.publication_catalog_fault),
         kill_query_after_control_ready_count: override_meta
             .kill_query_after_control_ready_count
             .or(base.kill_query_after_control_ready_count),
@@ -1352,29 +1351,30 @@ mod opt5_directive_tests {
     }
 
     #[test]
-    fn parse_meta_parses_typed_fenced_catalog_fault() {
+    fn parse_meta_parses_typed_publication_catalog_fault() {
         let re = meta_re();
-        let lines =
-            vec!["-- @fenced_catalog_fault=publish,after-downstream-before-response".to_string()];
-        let meta = parse_meta(&lines, &re).expect("parse fenced catalog fault");
+        let lines = vec![
+            "-- @publication_catalog_fault=table-commit,after-commit-before-response".to_string(),
+        ];
+        let meta = parse_meta(&lines, &re).expect("parse publication catalog fault");
         assert_eq!(
-            meta.fenced_catalog_fault,
-            Some(FencedCatalogFaultDirective {
-                action: FencedCatalogAction::Publish,
-                fault: FencedCatalogFault::AfterDownstreamBeforeResponse,
+            meta.publication_catalog_fault,
+            Some(PublicationCatalogFaultDirective {
+                action: PublicationCatalogAction::TableCommit,
+                fault: PublicationCatalogFault::AfterCommitBeforeResponse,
             })
         );
     }
 
     #[test]
-    fn parse_meta_rejects_unknown_fenced_catalog_fault_action() {
+    fn parse_meta_rejects_unknown_publication_catalog_fault_action() {
         let re = meta_re();
-        let lines = vec!["-- @fenced_catalog_fault=inspect,before-accept".to_string()];
+        let lines = vec!["-- @publication_catalog_fault=inspect,before-dispatch".to_string()];
         let error = parse_meta(&lines, &re).expect_err("unknown action must fail closed");
         assert!(
             error
                 .to_string()
-                .contains("invalid @fenced_catalog_fault action")
+                .contains("invalid @publication_catalog_fault action")
         );
     }
 

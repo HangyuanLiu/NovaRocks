@@ -21,9 +21,9 @@ mod cluster;
 mod config;
 mod extension_manifest;
 mod fault_injection;
-mod fenced_catalog;
 mod iceberg_orphan_fixture;
 mod parser;
+mod publication_catalog;
 mod results;
 mod runner;
 mod session;
@@ -635,7 +635,7 @@ struct SuiteRunContext {
     marker_re: Regex,
     fail_fast: bool,
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
-    fenced_catalog_control: Option<fenced_catalog::FixtureControl>,
+    publication_catalog_control: Option<publication_catalog::FixtureControl>,
 }
 
 struct CaseOutcome {
@@ -1303,16 +1303,15 @@ fn await_lifecycle_structured_snapshot_after(
 fn runtime_filter_details(
     rollup: &novarocks_cluster_harness::RuntimeFilterTerminalRollup,
 ) -> Result<Vec<&novarocks_cluster_harness::RuntimeFilterParticipantTerminalDetails>> {
-    let novarocks_cluster_harness::RuntimeFilterTerminalRollup::Available {
-        participants,
-        ..
-    } = rollup
+    let novarocks_cluster_harness::RuntimeFilterTerminalRollup::Available { participants, .. } =
+        rollup
     else {
         bail!("runtime-filter terminal facts are unavailable: {rollup:?}");
     };
     participants
         .iter()
-        .map(|participant| match &participant.telemetry {
+        .map(|participant| {
+            match &participant.telemetry {
             novarocks_cluster_harness::RuntimeFilterParticipantTerminalTelemetryValue::Available(
                 details,
             ) => Ok(details),
@@ -1322,6 +1321,7 @@ fn runtime_filter_details(
                 "runtime-filter participant telemetry is unavailable for {:?}: {unavailable:?}",
                 participant.participant
             ),
+        }
         })
         .collect()
 }
@@ -1402,12 +1402,14 @@ fn verify_runtime_filter_structured_assertion(
                     .iter()
                     .any(|consumer| consumer.latest_delivered_logical_version.is_some())
             }),
-            RuntimeFilterDetailExpectation::DeliveredAppliedConsumer => details.iter().any(|details| {
-                details.consumers.iter().any(|consumer| {
-                    consumer.latest_delivered_logical_version.is_some()
-                        && consumer.latest_applied_logical_version.is_some()
+            RuntimeFilterDetailExpectation::DeliveredAppliedConsumer => {
+                details.iter().any(|details| {
+                    details.consumers.iter().any(|consumer| {
+                        consumer.latest_delivered_logical_version.is_some()
+                            && consumer.latest_applied_logical_version.is_some()
+                    })
                 })
-            }),
+            }
         };
         if !present {
             bail!(
@@ -1423,7 +1425,10 @@ fn verify_runtime_filter_structured_assertion(
         let novarocks_cluster_harness::RuntimeFilterTerminalRollup::Available { totals, .. } =
             &after.runtime_filter
         else {
-            bail!("runtime-filter totals are unavailable: {:?}", after.runtime_filter);
+            bail!(
+                "runtime-filter totals are unavailable: {:?}",
+                after.runtime_filter
+            );
         };
         let novarocks_cluster_harness::RuntimeFilterTerminalTotalsTelemetry::Available(totals) =
             totals
@@ -2129,14 +2134,14 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             }
             None => None,
         };
-        let fenced_catalog_fault_guard = match step.meta.fenced_catalog_fault {
-            Some(directive) => match ctx.fenced_catalog_control.as_ref() {
+        let publication_catalog_fault_guard = match step.meta.publication_catalog_fault {
+            Some(directive) => match ctx.publication_catalog_control.as_ref() {
                 Some(control) => {
                     match control.arm_next(directive.action.as_str(), directive.fault.as_str()) {
                         Ok(guard) => {
                             let _ = writeln!(
                                 log,
-                                "    @fenced_catalog_fault armed action={} fault={}",
+                                "    @publication_catalog_fault armed action={} fault={}",
                                 directive.action.as_str(),
                                 directive.fault.as_str()
                             );
@@ -2144,7 +2149,8 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         }
                         Err(error) => {
                             case_failed = true;
-                            let _ = writeln!(log, "    ❌ arm fenced catalog fault: {error:#}");
+                            let _ =
+                                writeln!(log, "    ❌ arm publication catalog fault: {error:#}");
                             break;
                         }
                     }
@@ -2153,7 +2159,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     case_failed = true;
                     let _ = writeln!(
                         log,
-                        "    ❌ @fenced_catalog_fault requires the runner-owned fenced catalog fixture"
+                        "    ❌ @publication_catalog_fault requires the runner-owned publication catalog fixture"
                     );
                     break;
                 }
@@ -2968,14 +2974,14 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             }
         }
 
-        if let Some(guard) = fenced_catalog_fault_guard {
+        if let Some(guard) = publication_catalog_fault_guard {
             match guard.finish() {
                 Ok(()) => {
-                    let _ = writeln!(log, "    @fenced_catalog_fault consumed and cleared");
+                    let _ = writeln!(log, "    @publication_catalog_fault consumed and cleared");
                 }
                 Err(error) => {
                     case_failed = true;
-                    let _ = writeln!(log, "    ❌ fenced catalog fault cleanup: {error:#}");
+                    let _ = writeln!(log, "    ❌ publication catalog fault cleanup: {error:#}");
                 }
             }
         }
@@ -3512,56 +3518,50 @@ fn validate_selected_suite_cluster(
     Ok(())
 }
 
-fn validate_ctas_takeover_preflight(
-    runner_config: &RunnerConfig,
+fn validate_lake_publication_preflight(
     suite_names: &[String],
     mode: ClusterMode,
     cluster_size: usize,
     jobs: usize,
 ) -> Result<()> {
-    if !suite_names.iter().any(|suite| suite == "ctas-takeover") {
+    if !suite_names.iter().any(|suite| suite == "lake-publication") {
         return Ok(());
     }
-    let fixture_enabled = runner_config
-        .values
-        .get("fenced_catalog.enabled")
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-    if !fixture_enabled {
-        bail!("ctas-takeover requires fenced_catalog.enabled=true");
-    }
     if mode != ClusterMode::CrossProcess || cluster_size != 3 {
-        bail!("ctas-takeover requires --cluster-mode cross-process --cluster-size 3");
+        bail!("lake-publication requires --cluster-mode cross-process --cluster-size 3");
     }
     if jobs != 1 {
-        bail!("ctas-takeover requires -j 1 because its fixture owns one bounded fault token");
+        bail!("lake-publication requires -j 1 because its fixture owns one bounded fault token");
     }
     Ok(())
 }
 
-fn validate_fenced_catalog_directives(
+fn validate_publication_catalog_directives(
     suite_name: &str,
     cases: &[SqlCase],
     fixture_available: bool,
 ) -> Result<()> {
     for case in cases {
         for step in &case.steps {
-            if step.meta.fenced_catalog_fault.is_none() {
+            if step.meta.publication_catalog_fault.is_none() {
                 continue;
             }
-            if suite_name != "ctas-takeover" {
+            if suite_name != "lake-publication" {
                 bail!(
-                    "@fenced_catalog_fault is acceptance-only and is only valid in ctas-takeover (found in {suite_name}/{})",
+                    "@publication_catalog_fault is acceptance-only and is only valid in lake-publication (found in {suite_name}/{})",
                     case.case_id
                 );
             }
             if !case.sequential {
                 bail!(
-                    "@fenced_catalog_fault requires file-level @sequential=true (ctas-takeover/{})",
+                    "@publication_catalog_fault requires file-level @sequential=true (lake-publication/{})",
                     case.case_id
                 );
             }
             if !fixture_available {
-                bail!("@fenced_catalog_fault requires the runner-owned fenced catalog fixture");
+                bail!(
+                    "@publication_catalog_fault requires the runner-owned publication catalog fixture"
+                );
             }
         }
     }
@@ -3760,8 +3760,7 @@ fn run() -> Result<i32> {
         println!("❌ ERROR: {error}");
         return Ok(1);
     }
-    if let Err(error) = validate_ctas_takeover_preflight(
-        &runner_config,
+    if let Err(error) = validate_lake_publication_preflight(
         &suite_names,
         selected_cluster_mode,
         selected_cluster_size,
@@ -3770,10 +3769,11 @@ fn run() -> Result<i32> {
         println!("❌ ERROR: {error}");
         return Ok(1);
     }
-    let fenced_catalog_fixture = start_fenced_catalog_fixture(&mut runner_config, &suite_names)?;
-    let fenced_catalog_control = fenced_catalog_fixture
+    let publication_catalog_fixture =
+        start_publication_catalog_fixture(&mut runner_config, &suite_names)?;
+    let publication_catalog_control = publication_catalog_fixture
         .as_ref()
-        .map(fenced_catalog::FixtureHandle::control)
+        .map(publication_catalog::FixtureHandle::control)
         .transpose()?;
 
     // Validate: per-suite path overrides conflict with multi-suite
@@ -4124,10 +4124,10 @@ fn run() -> Result<i32> {
                 return Ok(1);
             }
 
-            if let Err(error) = validate_fenced_catalog_directives(
+            if let Err(error) = validate_publication_catalog_directives(
                 &suite.name,
                 &cases,
-                fenced_catalog_control.is_some(),
+                publication_catalog_control.is_some(),
             ) {
                 println!("❌ ERROR: suite {}: {error}", suite.name);
                 return Ok(1);
@@ -4286,7 +4286,7 @@ fn run() -> Result<i32> {
                 marker_re: marker_re.clone(),
                 fail_fast: cli.fail_fast,
                 server_handle: Arc::clone(&server_handle),
-                fenced_catalog_control: fenced_catalog_control.clone(),
+                publication_catalog_control: publication_catalog_control.clone(),
             };
 
             prepared_suites.push(PreparedSuite {
@@ -4429,37 +4429,22 @@ fn run() -> Result<i32> {
     finish_run_with_server_cleanup(server_handle, primary_result)
 }
 
-fn start_fenced_catalog_fixture(
+fn start_publication_catalog_fixture(
     runner_config: &mut RunnerConfig,
     selected_suites: &[String],
-) -> Result<Option<fenced_catalog::FixtureHandle>> {
-    let enabled = runner_config
-        .values
-        .get("fenced_catalog.enabled")
-        .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-    if !enabled {
+) -> Result<Option<publication_catalog::FixtureHandle>> {
+    if !selected_suites
+        .iter()
+        .any(|suite| suite == "lake-publication")
+    {
         return Ok(None);
-    }
-    let allowed_suites = runner_config
-        .values
-        .get("fenced_catalog.suites")
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
-    if allowed_suites.is_empty() {
-        bail!("fenced_catalog.enabled requires an explicit fenced_catalog.suites allowlist");
     }
     if let Some(disallowed) = selected_suites
         .iter()
-        .find(|suite| !allowed_suites.contains(suite.as_str()))
+        .find(|suite| suite.as_str() != "lake-publication")
     {
         bail!(
-            "fenced catalog fixture is acceptance-only; selected suite {disallowed} is not in fenced_catalog.suites"
+            "publication catalog fixture is acceptance-only; selected suite {disallowed} cannot run with lake-publication"
         );
     }
     let downstream = runner_config
@@ -4467,20 +4452,9 @@ fn start_fenced_catalog_fixture(
         .get("iceberg_rest_uri")
         .cloned()
         .or_else(|| std::env::var("NOVAROCKS_ICEBERG_REST_URI").ok())
-        .context("fenced_catalog.enabled requires iceberg_rest_uri")?;
-    let sqlite = runner_config
-        .values
-        .get("fenced_catalog.sqlite_path")
-        .map(PathBuf::from)
-        .or_else(|| {
-            runner_config
-                .path
-                .as_ref()
-                .and_then(|path| path.parent())
-                .map(|parent| parent.join("fenced-catalog.sqlite"))
-        })
-        .context("fenced_catalog.enabled requires a runner config path or sqlite_path")?;
-    let fixture = fenced_catalog::FixtureHandle::start(downstream, sqlite)?;
+        .filter(|uri| !uri.trim().is_empty())
+        .context("lake-publication requires iceberg_rest_uri")?;
+    let fixture = publication_catalog::FixtureHandle::start(downstream)?;
     runner_config
         .values
         .insert("iceberg_rest_uri".to_string(), fixture.uri().to_string());
@@ -4501,8 +4475,7 @@ mod tests {
     use crate::sql_error_codes::SqlErrorPhase;
     use crate::types::{
         QueryExecution, QueryLifecycleStructuredAssertion, QueryMeta, ResultSet,
-        RunnerConfig, RuntimeFilterDetailExpectation, SqlCase, SqlErrorLocation, SqlErrorTier,
-        SqlStep,
+        RuntimeFilterDetailExpectation, SqlCase, SqlErrorLocation, SqlErrorTier, SqlStep,
     };
     use crate::{
         AlterJobPollState, Cli, annotate_failure_with_engine_error_code,
@@ -4510,8 +4483,8 @@ mod tests {
         evaluate_expected_error_branch_with_sql_error_descriptors, execute_target_session_sql_with,
         expected_engine_error_code_diff_result, expected_engine_error_code_result,
         finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
-        statement_starts_dml_operation, validate_ctas_takeover_preflight,
-        validate_dml_cluster_jobs, validate_fault_injection_jobs, validate_selected_suite_cluster,
+        statement_starts_dml_operation, validate_dml_cluster_jobs, validate_fault_injection_jobs,
+        validate_lake_publication_preflight, validate_selected_suite_cluster,
         verify_runtime_filter_structured_assertion,
     };
     use clap::Parser;
@@ -4710,7 +4683,9 @@ mod tests {
             "expect_runtime_filter_total_at_least=transport_acked_count,1",
         ] {
             assert!(
-                sql_text_has_query_lifecycle_fault_directive(&format!("-- @{directive}\nSELECT 1;")),
+                sql_text_has_query_lifecycle_fault_directive(&format!(
+                    "-- @{directive}\nSELECT 1;"
+                )),
                 "structured runtime-filter directive must enable lifecycle debug scope: {directive}"
             );
         }
@@ -4823,31 +4798,18 @@ mod tests {
     }
 
     #[test]
-    fn ctas_takeover_requires_fenced_native_serial_selection() {
-        let suites = vec!["ctas-takeover".to_string()];
-        let mut config = RunnerConfig::default();
-        let error =
-            validate_ctas_takeover_preflight(&config, &suites, ClusterMode::CrossProcess, 3, 1)
-                .expect_err("fixture must be explicitly enabled");
-        assert!(
-            error
-                .to_string()
-                .contains("ctas-takeover requires fenced_catalog.enabled=true")
-        );
-
-        config
-            .values
-            .insert("fenced_catalog.enabled".to_string(), "true".to_string());
-        validate_ctas_takeover_preflight(&config, &suites, ClusterMode::CrossProcess, 3, 1)
-            .expect("canonical fenced native selection");
+    fn lake_publication_requires_native_serial_selection() {
+        let suites = vec!["lake-publication".to_string()];
+        validate_lake_publication_preflight(&suites, ClusterMode::CrossProcess, 3, 1)
+            .expect("canonical native selection");
         for (mode, size, jobs) in [
             (ClusterMode::AllInOne, 1, 1),
             (ClusterMode::CrossProcess, 2, 1),
             (ClusterMode::CrossProcess, 3, 2),
         ] {
             assert!(
-                validate_ctas_takeover_preflight(&config, &suites, mode, size, jobs).is_err(),
-                "noncanonical ctas-takeover selection must fail"
+                validate_lake_publication_preflight(&suites, mode, size, jobs).is_err(),
+                "noncanonical lake-publication selection must fail"
             );
         }
     }
@@ -5934,38 +5896,40 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn fenced_catalog_fixture_rejects_an_unlisted_ordinary_suite() {
+    fn publication_catalog_fixture_rejects_mixed_suite_selection() {
         let mut config = crate::types::RunnerConfig::default();
-        config
-            .values
-            .insert("fenced_catalog.enabled".to_string(), "true".to_string());
         config.values.insert(
-            "fenced_catalog.suites".to_string(),
-            "ctas-takeover".to_string(),
+            "iceberg_rest_uri".to_string(),
+            "http://127.0.0.1:8181".to_string(),
         );
-        let result = super::start_fenced_catalog_fixture(
+        let result = super::start_publication_catalog_fixture(
             &mut config,
-            &["iceberg-compatibility".to_string()],
+            &[
+                "lake-publication".to_string(),
+                "iceberg-compatibility".to_string(),
+            ],
         );
         let error = match result {
-            Ok(_) => panic!("ordinary compatibility suite must not use the fenced fixture"),
+            Ok(_) => panic!("ordinary compatibility suite must not use the publication fixture"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("acceptance-only"));
     }
 
     #[test]
-    fn fenced_catalog_fixture_requires_an_explicit_suite_allowlist() {
+    fn publication_catalog_fixture_requires_a_rest_endpoint() {
         let mut config = crate::types::RunnerConfig::default();
         config
             .values
-            .insert("fenced_catalog.enabled".to_string(), "true".to_string());
-        let result =
-            super::start_fenced_catalog_fixture(&mut config, &["ctas-takeover".to_string()]);
+            .insert("iceberg_rest_uri".to_string(), "".to_string());
+        let result = super::start_publication_catalog_fixture(
+            &mut config,
+            &["lake-publication".to_string()],
+        );
         let error = match result {
-            Ok(_) => panic!("enabled fixture must fail closed without a suite allowlist"),
+            Ok(_) => panic!("publication fixture must fail closed without a REST endpoint"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("requires an explicit"));
+        assert!(error.to_string().contains("requires iceberg_rest_uri"));
     }
 }

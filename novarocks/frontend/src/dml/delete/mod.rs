@@ -27,14 +27,15 @@ use crate::query_execution::dml::delete::{
     PreparedDelete,
 };
 use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_spi::connector::LakePublicationId;
 
-use crate::dml::coordination::DmlExternalFenceProposal;
 use crate::dml::error::{AdmitError, DmlError};
 use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
 use crate::dml::runner::{
     ActiveWriteTransactionRunner, CoordinatedWriteReport, WriteExecutor, preparing_request,
 };
 use crate::dml::service::DmlService;
+use novarocks_spi::connector::LakePublicationFamily;
 
 struct DeleteWriteExecutor<'a> {
     engine: &'a dyn DeleteEngine,
@@ -44,30 +45,6 @@ struct DeleteWriteExecutor<'a> {
 impl WriteExecutor for DeleteWriteExecutor<'_> {
     type CommitHandle = Arc<dyn DeleteCommit>;
     type AbortHandle = Infallible;
-
-    /// Predicate and equality DELETE both fence through the exact write
-    /// authority the DELETE preparation retained.
-    ///
-    /// The reverse port does not expose that authority yet, so this route fails
-    /// closed: no writer and no commit may run without a fence the provider can
-    /// compare at its external linearization point.
-    /// Predicate and equality DELETE both activate their write generation during
-    /// preparation, so the authority already exists here — before anything is
-    /// dispatched. The route only supplies the sealing closure; the resource
-    /// identity comes from the activated template.
-    fn establish_external_fence(
-        &self,
-        _spec: &WriteTransactionSpec,
-        proposal: &DmlExternalFenceProposal,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorEstablishedWriteFence,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        self.engine.establish_delete_external_fence(
-            self.prepared.handle.as_ref(),
-            &|operation_id, table, target_ref| proposal.seal(operation_id, table, target_ref),
-        )
-    }
 
     fn run_coordinated_write(
         &self,
@@ -129,6 +106,7 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
 fn write_transaction_spec(prepared: &PreparedDelete) -> WriteTransactionSpec {
     let operation = &prepared.operation;
     WriteTransactionSpec {
+        publication_id: operation.publication_id,
         target: OperationTarget {
             catalog: operation.catalog.clone(),
             namespace: operation.namespace.clone(),
@@ -169,9 +147,11 @@ impl DmlService {
         }
 
         self.require_journal()?;
+        let publication_id = LakePublicationId::new_v7();
         let session = context.session();
         let prepared = engine
             .prepare_delete(PrepareDeleteRequest {
+                publication_id,
                 statement,
                 source,
                 current_catalog: session.current_catalog().map(ToOwned::to_owned),
@@ -186,7 +166,18 @@ impl DmlService {
         };
         let spec = write_transaction_spec(&prepared);
         let operation = self.begin_write_operation(preparing_request(&spec))?;
-        ActiveWriteTransactionRunner::new(operation, &executor).run(spec)?;
+        let target = spec.target.clone();
+        ActiveWriteTransactionRunner::new(operation, &executor)
+            .run(spec)
+            .map_err(|error| {
+                error.with_publication_context(
+                    LakePublicationFamily::DataMutation,
+                    target.catalog,
+                    target.namespace,
+                    target.table,
+                    target.ref_name,
+                )
+            })?;
         Ok(())
     }
 }

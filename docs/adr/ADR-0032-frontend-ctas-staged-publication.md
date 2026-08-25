@@ -2,9 +2,9 @@
 id: ADR-0032
 title: "Frontend CTAS uses provider-owned staged publication"
 domain: [frontend-dml, provider-spi]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0104
 date: 2026-08-02
 provenance:
   - "discussion: 2026-08-02 CTAS staged publication and destructive compensation"

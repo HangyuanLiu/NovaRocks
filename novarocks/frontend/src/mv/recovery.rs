@@ -262,9 +262,7 @@ fn recover_one(
             refresh.refresh_id,
             "provider could not prove MV publication disposition",
         ),
-        ConnectorStagedPublicationDisposition::Published
-        | ConnectorStagedPublicationDisposition::Superseded
-        | ConnectorStagedPublicationDisposition::CleanupPending => {
+        ConnectorStagedPublicationDisposition::Published => {
             let committed_partitioning = observation.committed_partitioning.clone();
             finalize_published(
                 repository,
@@ -274,60 +272,16 @@ fn recover_one(
                 committed_partitioning.as_ref(),
                 &context,
             )?;
-            if observation.cleanup_required {
-                match cleanup(
-                    repository,
-                    recovery.as_ref(),
-                    &descriptor,
-                    observation,
-                    &recovered,
-                    context.clone(),
-                )? {
-                    RecoveryResult::Resolved => {
-                        // Cleanup persists its terminal evidence after the first
-                        // publication finalize. Reload that state before the
-                        // second finalize so the stale cycle-start value cannot
-                        // overwrite KnownCommitted back to CleanupPending.
-                        let recovered = repository
-                            .load_refresh(refresh.refresh_id)
-                            .map_err(|_| ())?
-                            .ok_or(())?;
-                        finalize_published(
-                            repository,
-                            dependencies,
-                            &recovered,
-                            frontend_observation,
-                            committed_partitioning.as_ref(),
-                            &context,
-                        )?;
-                        Ok(RecoveryResult::Resolved)
-                    }
-                    pending => Ok(pending),
-                }
-            } else {
-                Ok(RecoveryResult::Resolved)
-            }
-        }
-        ConnectorStagedPublicationDisposition::KnownUncommitted
-        | ConnectorStagedPublicationDisposition::Staged => {
-            if observation.cleanup_required {
-                match cleanup(
-                    repository,
-                    recovery.as_ref(),
-                    &descriptor,
-                    observation,
-                    &recovered,
-                    context,
-                )? {
-                    RecoveryResult::Resolved => {}
-                    pending => return Ok(pending),
-                }
-            }
-            repository
-                .abort_recovered_uncommitted_refresh(refresh.refresh_id)
-                .map_err(|_| ())?;
             Ok(RecoveryResult::Resolved)
         }
+        ConnectorStagedPublicationDisposition::Superseded
+        | ConnectorStagedPublicationDisposition::CleanupPending
+        | ConnectorStagedPublicationDisposition::KnownUncommitted
+        | ConnectorStagedPublicationDisposition::Staged => unresolved(
+            repository,
+            refresh.refresh_id,
+            "MV recovery only projects an exact published lake frontier; all other dispositions remain manual",
+        ),
     }
 }
 
@@ -353,29 +307,14 @@ fn recover_legacy_one(
         .map_err(|_| ())?;
     match observation.disposition {
         ConnectorStagedPublicationDisposition::Ambiguous => Err(()),
-        ConnectorStagedPublicationDisposition::Published
-        | ConnectorStagedPublicationDisposition::Superseded
-        | ConnectorStagedPublicationDisposition::CleanupPending => {
+        ConnectorStagedPublicationDisposition::Published => {
             finalize_legacy_published(repository, &refresh, &observation)?;
-            if observation.cleanup_required {
-                legacy_cleanup(recovery.as_ref(), &descriptor, observation, context)
-            } else {
-                Ok(RecoveryResult::Resolved)
-            }
-        }
-        ConnectorStagedPublicationDisposition::KnownUncommitted
-        | ConnectorStagedPublicationDisposition::Staged => {
-            if observation.cleanup_required {
-                match legacy_cleanup(recovery.as_ref(), &descriptor, observation, context)? {
-                    RecoveryResult::Resolved => {}
-                    pending => return Ok(pending),
-                }
-            }
-            repository
-                .clear_refresh_progress(refresh.mv_id)
-                .map_err(|_| ())?;
             Ok(RecoveryResult::Resolved)
         }
+        ConnectorStagedPublicationDisposition::Superseded
+        | ConnectorStagedPublicationDisposition::CleanupPending
+        | ConnectorStagedPublicationDisposition::KnownUncommitted
+        | ConnectorStagedPublicationDisposition::Staged => Err(()),
     }
 }
 
@@ -567,6 +506,11 @@ fn finalize_published(
 ) -> Result<(), ()> {
     let mut recovery = refresh.frontend_recovery.clone().ok_or(())?;
     recovery.observation = Some(observation.clone());
+    // Staging cleanup is no longer a recovery action. A previously persisted
+    // cleanup-pending projection must not prevent an exact published frontier
+    // from finalizing; the owned branch is now retired by age-gated GC.
+    recovery.cleanup_state = None;
+    recovery.cleanup_evidence = None;
     let rows = observation.resulting_row_count.ok_or(())?;
     // The current target head may have advanced beyond this publication after
     // the marker commit. Durable MV refresh facts must retain the exact marker
@@ -1510,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn known_uncommitted_cleanup_then_abort_resolves() {
+    fn known_uncommitted_remains_manual_without_cleanup_or_abort() {
         let environment = TestEnvironment::open();
         let key = current_binding_key();
         let refresh = environment.begin_refresh("known_uncommitted", &key);
@@ -1530,31 +1474,24 @@ mod tests {
             summary,
             FrontendMvRecoverySummary {
                 candidates: 1,
-                resolved: 1,
-                unresolved: 0,
+                resolved: 0,
+                unresolved: 1,
                 cleanup_backlog: 0,
             }
         );
-        assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 0);
         let recovered = environment
             .repository
             .load_refresh(refresh.refresh_id)
             .expect("load refresh")
             .expect("refresh exists");
-        assert_eq!(recovered.state, MvRefreshState::Aborted);
+        assert_ne!(recovered.state, MvRefreshState::Aborted);
         let ledger = recovered.frontend_recovery.expect("recovery ledger");
-        assert_eq!(
-            ledger.status,
-            FrontendMvRefreshRecoveryStatus::ResolvedAborted
-        );
-        assert_eq!(
-            ledger.cleanup_state,
-            Some(FrontendMvRefreshActionState::KnownCommitted)
-        );
+        assert_eq!(ledger.status, FrontendMvRefreshRecoveryStatus::Unresolved);
     }
 
     #[test]
-    fn proof_only_staging_create_then_uncommitted_write_aborts_without_cleanup() {
+    fn proof_only_staging_create_then_uncommitted_write_remains_manual() {
         let environment = TestEnvironment::open();
         let key = current_binding_key();
         let refresh = environment.begin_refresh("atomic_uncommitted", &key);
@@ -1586,7 +1523,7 @@ mod tests {
 
         let summary = recover_once(environment.repository.as_ref(), &dependencies);
 
-        assert_eq!(summary.resolved, 1);
+        assert_eq!(summary.unresolved, 1);
         assert_eq!(summary.cleanup_backlog, 0);
         assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 0);
         let recovered = environment
@@ -1594,15 +1531,15 @@ mod tests {
             .load_refresh(refresh.refresh_id)
             .expect("load refresh")
             .expect("refresh exists");
-        assert_eq!(recovered.state, MvRefreshState::Aborted);
+        assert_ne!(recovered.state, MvRefreshState::Aborted);
         assert_eq!(
             recovered.frontend_recovery.expect("recovery ledger").status,
-            FrontendMvRefreshRecoveryStatus::ResolvedAborted
+            FrontendMvRefreshRecoveryStatus::Unresolved
         );
     }
 
     #[test]
-    fn published_finalize_and_cleanup_resolves() {
+    fn published_finalize_projects_without_cleanup() {
         let environment = TestEnvironment::open();
         let key = current_binding_key();
         let refresh = environment.begin_refresh("published", &key);
@@ -1617,7 +1554,7 @@ mod tests {
 
         assert_eq!(summary.resolved, 1);
         assert_eq!(summary.cleanup_backlog, 0);
-        assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 0);
         let recovered = environment
             .repository
             .load_refresh(refresh.refresh_id)
@@ -1629,10 +1566,7 @@ mod tests {
             ledger.status,
             FrontendMvRefreshRecoveryStatus::ResolvedPublished
         );
-        assert_eq!(
-            ledger.cleanup_state,
-            Some(FrontendMvRefreshActionState::KnownCommitted)
-        );
+        assert_eq!(ledger.cleanup_state, None);
     }
 
     #[test]
@@ -1888,34 +1822,27 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_commit_unknown_reinspects_evolved_truth_and_converges() {
+    fn published_recovery_never_mutates_cleanup_state() {
         let environment = TestEnvironment::open();
         let key = current_binding_key();
         let refresh = environment.begin_refresh("cleanup_unknown", &key);
         let recovery = Arc::new(TestRecovery::with_observations(
             key,
-            vec![
-                observation_with_proof(
-                    ConnectorStagedPublicationDisposition::Published,
-                    true,
-                    b"lake-proof-before-cleanup",
-                ),
-                observation_with_proof(
-                    ConnectorStagedPublicationDisposition::Superseded,
-                    false,
-                    b"lake-proof-after-cleanup",
-                ),
-            ],
+            vec![observation_with_proof(
+                ConnectorStagedPublicationDisposition::Published,
+                true,
+                b"lake-proof-published",
+            )],
             CleanupMode::CommitUnknown,
         ));
         let (dependencies, _host, _projection) = dependencies(recovery.clone());
 
         let summary = recover_once(environment.repository.as_ref(), &dependencies);
 
-        assert_eq!(summary.cleanup_backlog, 1);
-        assert_eq!(summary.resolved, 0);
-        assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(recovery.reconcile_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(summary.cleanup_backlog, 0);
+        assert_eq!(summary.resolved, 1);
+        assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(recovery.reconcile_calls.load(Ordering::SeqCst), 0);
         let recovered = environment
             .repository
             .load_refresh(refresh.refresh_id)
@@ -1925,41 +1852,8 @@ mod tests {
         let ledger = recovered.frontend_recovery.expect("recovery ledger");
         assert_eq!(
             ledger.status,
-            FrontendMvRefreshRecoveryStatus::CleanupPending
-        );
-        assert_eq!(
-            ledger.cleanup_state,
-            Some(FrontendMvRefreshActionState::CommitUnknown)
-        );
-        let first_operation_id = ledger.cleanup_operation_id.clone();
-        let first_evidence = ledger.cleanup_evidence.clone().expect("cleanup evidence");
-        let first_observation = ledger.observation.clone().expect("first observation");
-
-        let second = recover_once(environment.repository.as_ref(), &dependencies);
-        assert_eq!(second.candidates, 1);
-        assert_eq!(second.cleanup_backlog, 0);
-        assert_eq!(second.resolved, 1);
-        assert_eq!(recovery.inspect_calls.load(Ordering::SeqCst), 2);
-        assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(recovery.reconcile_calls.load(Ordering::SeqCst), 1);
-        let recovered = environment
-            .repository
-            .load_refresh(refresh.refresh_id)
-            .expect("load refresh after second cycle")
-            .expect("refresh exists after second cycle");
-        let ledger = recovered.frontend_recovery.expect("recovery ledger");
-        assert_eq!(
-            ledger.status,
             FrontendMvRefreshRecoveryStatus::ResolvedPublished
         );
-        assert_eq!(ledger.cleanup_operation_id, first_operation_id);
-        assert_eq!(ledger.cleanup_evidence.as_ref(), Some(&first_evidence));
-        let second_observation = ledger.observation.expect("second observation");
-        assert_eq!(
-            second_observation.disposition,
-            crate::mv::domain::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Superseded
-        );
-        assert!(!second_observation.cleanup_required);
-        assert_ne!(second_observation.digest, first_observation.digest);
+        assert_eq!(ledger.cleanup_state, None);
     }
 }

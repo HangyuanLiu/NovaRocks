@@ -26,18 +26,15 @@ use crate::PROVIDER_ID;
 use crate::catalog_config::parse_catalog_configuration_with_object_store_binding;
 use crate::catalog_control::IcebergCatalogControlState;
 use crate::catalog_control::cleanup_maintenance::IcebergCleanupMaintenanceAdapter;
-use crate::catalog_control::ctas_fenced_publication::IcebergCtasFencedPublication;
 use crate::catalog_control::data_mutation::IcebergDataMutationAdapter;
-use crate::catalog_control::historical_ctas_recovery::IcebergHistoricalCtasRecovery;
 use crate::catalog_control::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use crate::catalog_control::staged_create::IcebergStagedCreateAdapter;
+use crate::catalog_control::unanchored_ctas_cleanup::IcebergUnanchoredCtasCleanupAdapter;
 use crate::commit::IcebergWriteControl;
 use crate::control_provider::IcebergControlProvider;
 use crate::control_runtime::IcebergControlRuntime;
 use crate::distributed_rewrite::IcebergDistributedRewriteControl;
 use crate::execution_declaration::IcebergInstanceDistribution;
-use crate::historical_data_mutation_recovery::IcebergHistoricalDataMutationRecovery;
-use crate::historical_write_recovery::IcebergHistoricalWriteRecovery;
 use crate::resources::IcebergControlResources;
 use novarocks_spi::connector::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
@@ -159,28 +156,6 @@ impl ConnectorControlFactory for IcebergControlFactory {
             key.clone(),
             Arc::clone(&unpublished.runtime),
         )?);
-        // Historical distributed-write recovery is a narrow capability of its
-        // own, deliberately not reachable from `write_control`: an ordinary
-        // execution path must never be able to fall back into cross-generation
-        // inspection, and this facet must never call an ordinary old-owner
-        // write method.
-        let historical_write_recovery = Arc::new(IcebergHistoricalWriteRecovery::new(
-            descriptor.clone(),
-            incarnation,
-            Arc::clone(&unpublished.runtime),
-        ));
-        // Historical direct-mutation recovery is a third, independent
-        // capability: it is not reachable from `data_mutation` and it does not
-        // share an owner with the distributed-write facet. TRUNCATE and ADD
-        // FILES are executed exactly once by one exact generation, so an
-        // ordinary path that could fall back into cross-generation inspection
-        // is exactly how a destructive mutation would be replayed.
-        let historical_data_mutation_recovery =
-            Arc::new(IcebergHistoricalDataMutationRecovery::new(
-                descriptor.clone(),
-                incarnation,
-                Arc::clone(&unpublished.runtime),
-            ));
         let staged_create = if unpublished.runtime.rest_catalog().is_some() {
             Some(Arc::new(IcebergStagedCreateAdapter::try_new(
                 Arc::clone(&provider),
@@ -189,27 +164,24 @@ impl ConnectorControlFactory for IcebergControlFactory {
         } else {
             None
         };
-        let ctas_staged_publication = if unpublished.runtime.has_ctas_fenced_publication() {
-            Some(Arc::new(IcebergCtasFencedPublication::try_new(
-                Arc::clone(&provider),
-                Arc::clone(&write_control),
-            )?))
+        let unanchored_ctas_cleanup = if unpublished.runtime.rest_catalog().is_some() {
+            match IcebergUnanchoredCtasCleanupAdapter::try_new(
+                descriptor.clone(),
+                incarnation,
+                Arc::clone(&unpublished.runtime),
+            ) {
+                Ok(capability) => Some(Arc::new(capability)),
+                // This is an optional CTAS-only capability. A REST catalog
+                // without a warehouse that can safely enumerate/delete the
+                // unanchored namespace must still attach for reads and normal
+                // table operations; CTAS fails typed Unsupported before its
+                // first source or catalog-write side effect.
+                Err(error) if error.kind() == ConnectorErrorKind::Unsupported => None,
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
-        let historical_ctas_recovery = if unpublished.runtime.has_ctas_fenced_publication() {
-            Some(Arc::new(IcebergHistoricalCtasRecovery::try_new(
-                Arc::clone(&provider),
-            )?))
-        } else {
-            None
-        };
-        // One owner implements both MV control facets: fencing and attempt
-        // discovery share the provider, the stable resource vocabulary, and the
-        // same freshness requirement.
-        let mv_fencing = Arc::new(
-            crate::mv_publication_fencing::IcebergMvPublicationFencing::new(provider.clone()),
-        );
         let binding = ConnectorControlBinding::try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
                 descriptor.clone(),
                 incarnation,
@@ -225,16 +197,9 @@ impl ConnectorControlFactory for IcebergControlFactory {
                 Some(write_control),
                 Some(provider.clone()),
             )?
-            .try_with_ctas_staged_publication(ctas_staged_publication.map(|capability| {
-                capability
-                    as Arc<dyn novarocks_spi::connector::ConnectorCtasStagedPublication>
+            .try_with_unanchored_ctas_cleanup(unanchored_ctas_cleanup.map(|capability| {
+                capability as Arc<dyn novarocks_spi::connector::ConnectorUnanchoredCtasCleanup>
             }))?
-            .try_with_historical_ctas_staged_publication_recovery(
-                historical_ctas_recovery.map(|capability| {
-                    capability
-                        as Arc<dyn novarocks_spi::connector::ConnectorHistoricalCtasStagedPublicationRecovery>
-                }),
-            )?
             .try_with_staged_publication_recovery(Some(provider.clone()))?
             .try_with_historical_maintenance_recovery(Some(Arc::new(
                 crate::catalog_control::historical_maintenance_recovery::IcebergHistoricalMaintenanceRecovery::new(
@@ -242,10 +207,6 @@ impl ConnectorControlFactory for IcebergControlFactory {
                     Arc::clone(&unpublished.runtime),
                 )?,
             )))?
-            .try_with_mv_publication_fencing(Some(mv_fencing.clone()))?
-            .try_with_mv_attempt_discovery(Some(mv_fencing))?
-            .try_with_historical_write_recovery(Some(historical_write_recovery))?
-            .try_with_historical_data_mutation_recovery(Some(historical_data_mutation_recovery))?
             .try_with_view_metadata(Some(provider))?;
         ConnectorControlCreation::try_new(&request, binding, unpublished.durable_properties)
     }
@@ -305,10 +266,7 @@ fn unavailable(error: String) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
     use std::sync::Arc;
-    use std::thread;
 
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::ConnectorInstanceId;
@@ -331,39 +289,6 @@ mod tests {
         }
     }
 
-    fn config_server(server_properties: serde_json::Value) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind config server");
-        let address = listener.local_addr().expect("config server address");
-        let body = serde_json::json!({
-            "defaults": server_properties,
-            "overrides": {},
-        })
-        .to_string();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept config request");
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .expect("config request timeout");
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = stream.read(&mut chunk).expect("read config request");
-                assert_ne!(read, 0, "config request ended before headers");
-                request.extend_from_slice(&chunk[..read]);
-            }
-            let request = String::from_utf8(request).expect("UTF-8 config request");
-            assert!(request.starts_with("GET /v1/config "));
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .expect("write config response");
-        });
-        (format!("http://{address}"), server)
-    }
-
     fn rest_factory_request(
         factory: &IcebergControlFactory,
         uri: String,
@@ -372,6 +297,10 @@ mod tests {
         let mut properties = vec![
             ("iceberg.catalog.type".to_string(), "rest".to_string()),
             ("uri".to_string(), uri),
+            (
+                "iceberg.catalog.warehouse".to_string(),
+                "file:///tmp/novarocks-rest-factory-warehouse".to_string(),
+            ),
         ];
         properties.extend(extra);
         ConnectorControlFactoryRequest::try_new(
@@ -652,17 +581,6 @@ mod tests {
             creation.binding().staged_create().is_none(),
             "Hadoop generations must not expose REST-only staged create"
         );
-        assert!(
-            creation.binding().ctas_staged_publication().is_none(),
-            "Hadoop generations must not expose catalog-native fenced CTAS"
-        );
-        assert!(
-            creation
-                .binding()
-                .historical_ctas_staged_publication_recovery()
-                .is_none(),
-            "Hadoop generations must not expose historical fenced CTAS"
-        );
         let recovery = creation
             .binding()
             .staged_publication_recovery()
@@ -670,33 +588,6 @@ mod tests {
         assert_eq!(
             recovery.binding_key().incarnation,
             creation.binding().incarnation()
-        );
-        let historical = creation
-            .binding()
-            .historical_write_recovery()
-            .expect("historical write recovery");
-        assert_eq!(
-            historical.binding_key().incarnation,
-            creation.binding().incarnation()
-        );
-        assert_eq!(
-            historical.binding_key().instance_id,
-            creation.binding().descriptor().instance_id
-        );
-        // The direct-mutation historical facet is installed independently of
-        // the ordinary data-mutation capability and of the distributed-write
-        // facet, so an ordinary path can never reach it as a fallback.
-        let historical_data_mutation = creation
-            .binding()
-            .historical_data_mutation_recovery()
-            .expect("historical data mutation recovery");
-        assert_eq!(
-            historical_data_mutation.binding_key().incarnation,
-            creation.binding().incarnation()
-        );
-        assert_eq!(
-            historical_data_mutation.binding_key().instance_id,
-            creation.binding().descriptor().instance_id
         );
         let views = creation.binding().view_metadata().expect("view metadata");
         assert_eq!(views.descriptor(), creation.binding().descriptor());
@@ -708,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn rest_factory_installs_fenced_ctas_only_for_exact_server_advertisement() {
+    fn rest_factory_exposes_standard_staged_create() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let binding = crate::access_binding::IcebergReadBinding::new(
             None,
@@ -720,27 +611,21 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ));
-        let (uri, server) = config_server(serde_json::json!({
-            crate::iceberg_catalog_rest::CTAS_FENCED_PUBLICATION_CAPABILITY:
-                crate::iceberg_catalog_rest::CTAS_FENCED_PUBLICATION_VERSION,
-        }));
-
         let creation = factory
-            .create_control(rest_factory_request(&factory, uri, Vec::new()))
-            .expect("advertised REST control");
-        server.join().expect("config server");
-
-        assert!(creation.binding().ctas_staged_publication().is_some());
+            .create_control(rest_factory_request(
+                &factory,
+                "http://127.0.0.1:1".to_string(),
+                Vec::new(),
+            ))
+            .expect("standard REST control");
         assert!(
-            creation
-                .binding()
-                .historical_ctas_staged_publication_recovery()
-                .is_some()
+            creation.binding().staged_create().is_some(),
+            "standard REST staged create must not depend on a private capability"
         );
     }
 
     #[test]
-    fn rest_factory_does_not_trust_user_fenced_ctas_property() {
+    fn rest_factory_without_unanchored_cleanup_still_attaches_for_non_ctas_work() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let binding = crate::access_binding::IcebergReadBinding::new(
             None,
@@ -752,32 +637,28 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ));
-        let (uri, server) = config_server(serde_json::json!({}));
-        let request = rest_factory_request(
-            &factory,
-            uri,
-            vec![(
-                crate::iceberg_catalog_rest::CTAS_FENCED_PUBLICATION_CAPABILITY.to_string(),
-                crate::iceberg_catalog_rest::CTAS_FENCED_PUBLICATION_VERSION.to_string(),
-            )],
-        );
+        let request = ConnectorControlFactoryRequest::try_new(
+            factory.provider_id().clone(),
+            ConnectorInstanceId::parse("ice").expect("instance ID"),
+            vec![
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), "http://127.0.0.1:1".to_string()),
+            ],
+        )
+        .expect("REST request");
 
         let creation = factory
             .create_control(request)
-            .expect("vanilla REST control");
-        server.join().expect("config server");
-
-        assert!(creation.binding().ctas_staged_publication().is_none());
+            .expect("REST control without a GC-capable warehouse");
+        assert!(creation.binding().staged_create().is_some());
         assert!(
-            creation
-                .binding()
-                .historical_ctas_staged_publication_recovery()
-                .is_none()
+            creation.binding().unanchored_ctas_cleanup().is_none(),
+            "missing cleanup capability belongs to CTAS preflight, not catalog attachment"
         );
     }
 
     #[test]
-    fn hive_factory_never_installs_fenced_ctas_capabilities() {
+    fn hive_factory_does_not_expose_rest_staged_create() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let binding = crate::access_binding::IcebergReadBinding::new(
@@ -808,12 +689,9 @@ mod tests {
         .expect("Hive factory request");
 
         let creation = factory.create_control(request).expect("Hive control");
-        assert!(creation.binding().ctas_staged_publication().is_none());
         assert!(
-            creation
-                .binding()
-                .historical_ctas_staged_publication_recovery()
-                .is_none()
+            creation.binding().staged_create().is_none(),
+            "Hadoop/Hive catalogs must not expose REST-only staged create"
         );
     }
 }

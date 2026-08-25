@@ -450,7 +450,7 @@ async fn a_finished_statement_releases_the_table_for_the_next_statement() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn legacy_alter_statements_require_durable_engine_ports_and_optimize_only_enqueues() {
+async fn legacy_alter_statements_require_engine_or_gc_policy() {
     let (_temp, _host, _store, service) = durable_service().await;
     let engine = FakeMaintenanceEngine::default();
 
@@ -458,13 +458,22 @@ async fn legacy_alter_statements_require_durable_engine_ports_and_optimize_only_
         "ALTER TABLE ice.db.orders REWRITE MANIFESTS",
         "ALTER TABLE ice.db.orders EXPIRE SNAPSHOTS \
          OLDER THAN '2026-01-01 00:00:00' RETAIN LAST 2",
-        "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN 1767225600000",
     ] {
         assert_eq!(
             execute_typed(&service, &engine, sql, context()).unwrap_err(),
             "table maintenance service is not injected"
         );
     }
+    assert_eq!(
+        execute_typed(
+            &service,
+            &engine,
+            "ALTER TABLE ice.db.orders REMOVE ORPHAN FILES OLDER THAN 1767225600000",
+            context(),
+        )
+        .unwrap_err(),
+        "orphan cleanup is unsupported until the lake publication runtime policy is installed"
+    );
     expect_ok(
         execute_typed(
             &service,
@@ -740,7 +749,7 @@ async fn spark_procedures_route_to_their_durable_frontend_owners() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn remove_orphan_files_requires_frontend_state_store_before_dispatch() {
+async fn remove_orphan_files_requires_lake_publication_policy_before_state_store() {
     let service = FrontendTableMaintenanceService::open(None, tokio::runtime::Handle::current())
         .await
         .unwrap();
@@ -757,7 +766,7 @@ async fn remove_orphan_files_requires_frontend_state_store_before_dispatch() {
 
     assert_eq!(
         error,
-        "connector orphan cleanup requires frontend StateStore"
+        "orphan cleanup is unsupported until the lake publication runtime policy is installed"
     );
     assert!(engine.requests().is_empty());
 }

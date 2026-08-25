@@ -459,6 +459,7 @@ impl NovaRocksConfig {
             toml::from_str(&s).with_context(|| format!("parse toml: {}", path.display()))?;
         validate_state_store_configuration(&cfg)?;
         validate_query_control_config(&cfg.runtime)?;
+        validate_lake_publication_runtime_policy(&cfg.runtime)?;
         #[cfg(not(debug_assertions))]
         reject_fault_injection_environment()?;
         Ok(cfg)
@@ -824,6 +825,16 @@ pub struct RuntimeConfig {
     pub write_commit_evidence_max_bytes: usize,
     #[serde(default = "default_write_commit_evidence_max_entries")]
     pub write_commit_evidence_max_entries: usize,
+    #[serde(default = "default_lake_publication_max_attempt_duration_ms")]
+    pub lake_publication_max_attempt_duration_ms: u64,
+    #[serde(default = "default_lake_publication_safe_gc_age_ms")]
+    pub lake_publication_safe_gc_age_ms: u64,
+    #[serde(default = "default_lake_publication_max_clock_skew_ms")]
+    pub lake_publication_max_clock_skew_ms: u64,
+    #[serde(default = "default_lake_publication_listing_visibility_delay_ms")]
+    pub lake_publication_listing_visibility_delay_ms: u64,
+    #[serde(default = "default_lake_publication_scheduler_margin_ms")]
+    pub lake_publication_scheduler_margin_ms: u64,
     #[serde(default = "default_mem_limit")]
     pub mem_limit: String,
     #[serde(default = "default_be_mem_limit_bytes")]
@@ -1234,6 +1245,50 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_lake_publication_runtime_policy(runtime: &RuntimeConfig) -> Result<()> {
+    let fields = [
+        (
+            "runtime.lake_publication_max_attempt_duration_ms",
+            runtime.lake_publication_max_attempt_duration_ms,
+        ),
+        (
+            "runtime.lake_publication_safe_gc_age_ms",
+            runtime.lake_publication_safe_gc_age_ms,
+        ),
+        (
+            "runtime.lake_publication_max_clock_skew_ms",
+            runtime.lake_publication_max_clock_skew_ms,
+        ),
+        (
+            "runtime.lake_publication_listing_visibility_delay_ms",
+            runtime.lake_publication_listing_visibility_delay_ms,
+        ),
+        (
+            "runtime.lake_publication_scheduler_margin_ms",
+            runtime.lake_publication_scheduler_margin_ms,
+        ),
+    ];
+    for (field, value) in fields {
+        if value == 0 {
+            bail!("{field} must be greater than 0");
+        }
+    }
+    let required_safe_age = runtime
+        .lake_publication_max_attempt_duration_ms
+        .checked_add(runtime.lake_publication_max_clock_skew_ms)
+        .and_then(|value| value.checked_add(runtime.lake_publication_listing_visibility_delay_ms))
+        .and_then(|value| value.checked_add(runtime.lake_publication_scheduler_margin_ms))
+        .ok_or_else(|| {
+            anyhow::anyhow!("runtime lake publication safe GC age calculation overflows")
+        })?;
+    if runtime.lake_publication_safe_gc_age_ms <= required_safe_age {
+        bail!(
+            "runtime.lake_publication_safe_gc_age_ms must exceed max attempt duration plus clock skew, listing visibility delay, and scheduler margin"
+        );
+    }
+    Ok(())
+}
+
 fn default_mem_limit() -> String {
     DEFAULT_MEM_LIMIT_SPEC.to_string()
 }
@@ -1276,6 +1331,26 @@ fn default_write_commit_evidence_max_bytes() -> usize {
 
 fn default_write_commit_evidence_max_entries() -> usize {
     novarocks_spi::connector::DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES
+}
+
+fn default_lake_publication_max_attempt_duration_ms() -> u64 {
+    30 * 60 * 1_000
+}
+
+fn default_lake_publication_safe_gc_age_ms() -> u64 {
+    45 * 60 * 1_000
+}
+
+fn default_lake_publication_max_clock_skew_ms() -> u64 {
+    60 * 1_000
+}
+
+fn default_lake_publication_listing_visibility_delay_ms() -> u64 {
+    5 * 60 * 1_000
+}
+
+fn default_lake_publication_scheduler_margin_ms() -> u64 {
+    60 * 1_000
 }
 
 fn default_pipeline_exec_thread_pool_thread_num() -> usize {
@@ -1398,6 +1473,13 @@ impl Default for RuntimeConfig {
                 default_query_control_stage_max_dormant_workers(),
             write_commit_evidence_max_bytes: default_write_commit_evidence_max_bytes(),
             write_commit_evidence_max_entries: default_write_commit_evidence_max_entries(),
+            lake_publication_max_attempt_duration_ms:
+                default_lake_publication_max_attempt_duration_ms(),
+            lake_publication_safe_gc_age_ms: default_lake_publication_safe_gc_age_ms(),
+            lake_publication_max_clock_skew_ms: default_lake_publication_max_clock_skew_ms(),
+            lake_publication_listing_visibility_delay_ms:
+                default_lake_publication_listing_visibility_delay_ms(),
+            lake_publication_scheduler_margin_ms: default_lake_publication_scheduler_margin_ms(),
             mem_limit: default_mem_limit(),
             be_mem_limit_bytes: default_be_mem_limit_bytes(),
             optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),

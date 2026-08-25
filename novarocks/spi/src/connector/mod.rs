@@ -18,7 +18,6 @@
 mod cleanup_maintenance;
 mod context;
 mod control;
-mod ctas_staged_publication;
 mod data_mutation;
 mod distributed_rewrite;
 mod distribution;
@@ -26,19 +25,15 @@ mod domain_facts;
 mod error;
 mod execution;
 mod execution_declaration;
-mod external_write_fence;
 mod handle;
-mod historical_data_mutation_recovery;
 mod historical_maintenance_recovery;
-mod historical_write_recovery;
 mod identity;
 mod metadata;
 mod metadata_maintenance;
 mod mutation;
-mod mv_attempt_discovery;
-mod mv_publication_fencing;
 mod mv_storage_observation;
 mod predicate;
+mod publication;
 mod read;
 mod read_session;
 mod row_mutation;
@@ -53,13 +48,15 @@ pub mod conformance;
 
 pub use cleanup_maintenance::{
     BatchReceipt, BatchReceiptSummary, CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION,
-    CandidatePage, ConnectorCleanupCandidatePageRequest, ConnectorCleanupExecuteRequest,
-    ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance, ConnectorCleanupMaintenanceLease,
-    ConnectorCleanupMaintenanceResolver, ConnectorCleanupOperation, ConnectorCleanupOperationId,
-    ConnectorCleanupPlan, ConnectorCleanupPlanSummary, ConnectorCleanupPlanningRequest,
-    ConnectorCleanupPrepareRequest, ConnectorCleanupReconcileRequest,
-    MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS, MAX_CONNECTOR_CLEANUP_BATCHES,
-    MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS,
+    CandidatePage, ConnectorCleanupCandidate, ConnectorCleanupCandidatePageRequest,
+    ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
+    ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver,
+    ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefIdentity,
+    ConnectorCleanupOwnedRefSelection, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
+    ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
+    ConnectorCleanupReconcileRequest, MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS,
+    MAX_CONNECTOR_CLEANUP_BATCHES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES,
+    MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS, MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS,
     MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES, PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
 };
 pub use context::{ConnectorCancellation, ConnectorRequestContext};
@@ -69,38 +66,16 @@ pub use control::{
     ConnectorControlRegistry, ConnectorControlResolver, ConnectorExecutionDistribution,
     ConnectorScanPlanning,
 };
-pub use ctas_staged_publication::{
-    CONNECTOR_CTAS_STAGED_PUBLICATION_CONTRACT_VERSION, ConnectorCtasAbortDisposition,
-    ConnectorCtasAbortRequest, ConnectorCtasAbortResult, ConnectorCtasActionId,
-    ConnectorCtasAdvanceFenceRequest, ConnectorCtasConflictKind, ConnectorCtasFailure,
-    ConnectorCtasOperationId, ConnectorCtasProofPurpose, ConnectorCtasPublicationFence,
-    ConnectorCtasPublicationFenceReceipt, ConnectorCtasPublicationProof,
-    ConnectorCtasPublicationReceipt, ConnectorCtasPublishDisposition, ConnectorCtasPublishRequest,
-    ConnectorCtasPublishResult, ConnectorCtasStageRequest, ConnectorCtasStageResult,
-    ConnectorCtasStagedLocator, ConnectorCtasStagedPublication,
-    ConnectorCtasStagedPublicationCapability, ConnectorCtasStagedPublicationLease,
-    ConnectorCtasStagedTableDefinition, ConnectorHistoricalCtasAction,
-    ConnectorHistoricalCtasCheckpoint, ConnectorHistoricalCtasCleanupReceipt,
-    ConnectorHistoricalCtasCleanupRequest, ConnectorHistoricalCtasDescriptor,
-    ConnectorHistoricalCtasDispatchState, ConnectorHistoricalCtasDisposition,
-    ConnectorHistoricalCtasObservation, ConnectorHistoricalCtasObservationDigestInput,
-    ConnectorHistoricalCtasStagedPublicationRecovery, MAX_CONNECTOR_CTAS_DURABLE_WIRE_BYTES,
-    MAX_CONNECTOR_CTAS_PUBLICATION_CHECKPOINTS, MAX_CONNECTOR_CTAS_PUBLICATION_PAYLOAD_BYTES,
-    connector_ctas_abort_request_digest, connector_ctas_advance_fence_request_digest,
-    connector_ctas_publish_request_digest, connector_ctas_stage_request_digest,
-    connector_ctas_staged_table_definition_digest, connector_historical_ctas_descriptor_digest,
-    connector_historical_ctas_observation_digest, validate_ctas_staged_publication_owner,
-    validate_historical_ctas_staged_publication_owner,
-};
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,
-    ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationLease,
+    ConnectorDataMutation, ConnectorDataMutationAddFilesDomain,
+    ConnectorDataMutationExecuteRequest, ConnectorDataMutationLease,
     ConnectorDataMutationOperation, ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
-    ConnectorDataMutationSourceScope, ConnectorDataMutationSourceScopeKind,
-    MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES, MAX_CONNECTOR_DATA_MUTATION_FILES,
-    MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
+    ConnectorDataMutationSourceDomain, ConnectorDataMutationSourceScope,
+    ConnectorDataMutationSourceScopeKind, MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES,
+    MAX_CONNECTOR_DATA_MUTATION_FILES, MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_SOURCE_LOCATION_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES, MAX_CONNECTOR_DATA_MUTATION_TOTAL_FOOTER_BYTES,
@@ -125,10 +100,7 @@ pub use domain_facts::{
     MAX_CONNECTOR_SCAN_UNIT_FACT_COLUMNS, MAX_CONNECTOR_SCAN_UNIT_FACT_PAYLOAD_BYTES,
     MAX_CONNECTOR_SCAN_UNIT_FACT_VARIABLE_VALUE_BYTES,
 };
-pub use error::{
-    ConnectorError, ConnectorErrorKind, ConnectorExternalFenceFailure,
-    ConnectorTableObjectBindingFailure,
-};
+pub use error::{ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure};
 pub use execution::{
     ConnectorExecutionBinding, ConnectorExecutionInstaller, ConnectorExecutionResolver,
     ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
@@ -139,30 +111,9 @@ pub use execution_declaration::{
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
     ConnectorExecutionDeclarationProvider, ConnectorExecutionProviderKind,
 };
-pub use external_write_fence::{
-    ConnectorClusterIdentity, ConnectorExternalFenceGeneration, ConnectorExternalFenceReceipt,
-    ConnectorExternalFenceRequest, ConnectorExternalOperationFence, ConnectorWriteFencing,
-    MAX_CONNECTOR_EXTERNAL_FENCE_CLUSTER_ID_BYTES, MAX_CONNECTOR_EXTERNAL_FENCE_IDENTITY_BYTES,
-    MAX_CONNECTOR_EXTERNAL_FENCE_RECEIPT_BYTES,
-};
 pub use handle::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-};
-pub use historical_data_mutation_recovery::{
-    ConnectorHistoricalDataMutationApplication, ConnectorHistoricalDataMutationCheckpoint,
-    ConnectorHistoricalDataMutationCleanupReceipt, ConnectorHistoricalDataMutationCleanupRequest,
-    ConnectorHistoricalDataMutationContinuation, ConnectorHistoricalDataMutationDescriptor,
-    ConnectorHistoricalDataMutationDispatchState, ConnectorHistoricalDataMutationDisposition,
-    ConnectorHistoricalDataMutationFamily, ConnectorHistoricalDataMutationFence,
-    ConnectorHistoricalDataMutationFenceFacts, ConnectorHistoricalDataMutationFenceRaiseRequest,
-    ConnectorHistoricalDataMutationIdentity, ConnectorHistoricalDataMutationObservation,
-    ConnectorHistoricalDataMutationOutcomeFacts, ConnectorHistoricalDataMutationPhase,
-    ConnectorHistoricalDataMutationProof, ConnectorHistoricalDataMutationRecovery,
-    MAX_CONNECTOR_HISTORICAL_DATA_MUTATION_CHECKPOINTS,
-    MAX_CONNECTOR_HISTORICAL_DATA_MUTATION_CONTINUATION_BYTES,
-    MAX_CONNECTOR_HISTORICAL_DATA_MUTATION_PROOF_BYTES,
-    validate_historical_data_mutation_recovery_owner,
 };
 pub use historical_maintenance_recovery::{
     ConnectorHistoricalDispatchFacts, ConnectorHistoricalMaintenanceArtifact,
@@ -177,18 +128,6 @@ pub use historical_maintenance_recovery::{
     MAX_CONNECTOR_HISTORICAL_MAINTENANCE_CONTINUATION_BYTES,
     MAX_CONNECTOR_HISTORICAL_MAINTENANCE_PROOF_BYTES,
     validate_historical_maintenance_recovery_owner,
-};
-pub use historical_write_recovery::{
-    ConnectorHistoricalWriteApplication, ConnectorHistoricalWriteCheckpoint,
-    ConnectorHistoricalWriteCleanupReceipt, ConnectorHistoricalWriteCleanupRequest,
-    ConnectorHistoricalWriteContinuation, ConnectorHistoricalWriteDescriptor,
-    ConnectorHistoricalWriteDispatchState, ConnectorHistoricalWriteDisposition,
-    ConnectorHistoricalWriteFence, ConnectorHistoricalWriteFenceFacts,
-    ConnectorHistoricalWriteFenceRaiseRequest, ConnectorHistoricalWriteIdentity,
-    ConnectorHistoricalWriteObservation, ConnectorHistoricalWriteOutcomeFacts,
-    ConnectorHistoricalWritePhase, ConnectorHistoricalWriteProof, ConnectorHistoricalWriteRecovery,
-    MAX_CONNECTOR_HISTORICAL_WRITE_CHECKPOINTS, MAX_CONNECTOR_HISTORICAL_WRITE_CONTINUATION_BYTES,
-    MAX_CONNECTOR_HISTORICAL_WRITE_PROOF_BYTES, validate_historical_write_recovery_owner,
 };
 pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};
 pub use metadata::{
@@ -231,33 +170,14 @@ pub use mutation::{
     ConnectorColumnDefinition, ConnectorColumnPath, ConnectorColumnPosition,
     ConnectorCommittedVersion, ConnectorDataType, ConnectorDefaultValue,
     ConnectorDropTableDataDisposition, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorPartitionTransform, ConnectorPropertyAuthority,
+    ConnectorMutationOperationId, ConnectorMvMetadataOnlyBaseFact,
+    ConnectorMvMetadataOnlyProvenance, ConnectorPartitionTransform, ConnectorPropertyAuthority,
     ConnectorPropertyChange, ConnectorRefAction, ConnectorRefKind,
     ConnectorRefreshPublicationGuard, ConnectorSchemaChange, ConnectorStructField,
     ConnectorTableKey, ConnectorTableKeyKind, ConnectorViewDefinition, ConnectorViewDialect,
     ConnectorViewIdentity, ConnectorViewSourceFormat, CreateOrReplacePolicy, CreatePolicy,
     DropPolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
     ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
-};
-pub use mv_attempt_discovery::{
-    CONNECTOR_MV_ATTEMPT_DISCOVERY_CONTRACT_VERSION, ConnectorMvAttemptContinuation,
-    ConnectorMvAttemptDiscovery, ConnectorMvAttemptDiscoveryRequest,
-    ConnectorMvAttemptDiscoveryResolver, ConnectorMvAttemptPage, ConnectorMvAttemptScanLimit,
-    ConnectorMvAttemptSummary, MAX_CONNECTOR_MV_ATTEMPT_CONTINUATION_BYTES,
-    MAX_CONNECTOR_MV_ATTEMPT_PAGE_ITEMS,
-};
-pub use mv_publication_fencing::{
-    CONNECTOR_MV_PUBLICATION_FENCING_CONTRACT_VERSION, ConnectorMvPublicationDisposition,
-    ConnectorMvPublicationFenceGeneration, ConnectorMvPublicationFenceOrder,
-    ConnectorMvPublicationFenceReceipt, ConnectorMvPublicationFenceRequest,
-    ConnectorMvPublicationFencing, ConnectorMvPublicationFencingLease,
-    ConnectorMvPublicationFencingResolver, ConnectorMvPublicationInspectRequest,
-    ConnectorMvPublicationInspection, ConnectorMvPublicationOperation,
-    ConnectorMvPublicationPermit, ConnectorMvPublicationTargetObservation,
-    ConnectorMvPublicationTargetRequest, ConnectorMvRefreshAttemptId,
-    ConnectorMvRefreshPublicationReceipt, ConnectorMvRefreshPublicationRequest,
-    ConnectorMvRefreshResourceIdentity, ESTABLISH_MV_PUBLICATION_FENCE_KIND,
-    PUBLISH_MV_REFRESH_KIND,
 };
 pub use mv_storage_observation::{
     MAX_MV_LAKE_BASES, MAX_MV_LAKE_DESCRIPTOR_BYTES, MAX_MV_OBSERVATION_FIELDS,
@@ -277,6 +197,11 @@ pub use predicate::{
     MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES, MAX_CONNECTOR_STATIC_PREDICATES,
     MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES, normalize_predicate_dispositions,
     validate_static_predicates,
+};
+pub use publication::{
+    LakePublicationDisposition, LakePublicationFamily, LakePublicationId,
+    LakePublicationMarkerHeader, LakePublicationNextAction, LakePublicationStatementTag,
+    LakePublicationTarget, LakePublicationTerminal,
 };
 pub use read::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,
@@ -307,8 +232,10 @@ pub use row_mutation::{
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use staged_create::{
-    CONNECTOR_STAGED_CREATE_CONTRACT_VERSION, ConnectorStagedCreate,
-    ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
+    CONNECTOR_CTAS_UNANCHORED_CLEANUP_CONTRACT_VERSION, CONNECTOR_STAGED_CREATE_CONTRACT_VERSION,
+    ConnectorCtasUnanchoredCleanupOutcome, ConnectorCtasUnanchoredCleanupRequest,
+    ConnectorCtasUnanchoredDiscoveryRequest, ConnectorCtasUnanchoredProvenance,
+    ConnectorStagedCreate, ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
     ConnectorStagedCreateLease, ConnectorStagedCreateOperationId,
     ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
     ConnectorStagedCreatePublishOutcome, ConnectorStagedCreatePublishRequest,
@@ -316,6 +243,7 @@ pub use staged_create::{
     ConnectorStagedCreateReconcileOutcome, ConnectorStagedCreateReconcilePhase,
     ConnectorStagedCreateReconcileRequest, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
+    ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease,
 };
 pub use staged_publication_recovery::{
     ConnectorHistoricalPublicationAction, ConnectorStagedPublicationBaseFact,
@@ -347,31 +275,30 @@ pub use view_metadata::{
 pub use write::{
     CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorActivatedWriteCohort, ConnectorBatchWriter,
     ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
-    ConnectorEstablishedWriteFence, ConnectorManagedPartitionField,
-    ConnectorManagedPartitionSpecObservation, ConnectorManagedPartitionSpecReplacement,
-    ConnectorManagedPartitionSpecReplacementId, ConnectorManagedPartitionSpecReplacementTarget,
-    ConnectorManagedPartitionTransform, ConnectorManagedPublicationEmptyInputDisposition,
-    ConnectorManagedPublicationIntent, ConnectorManagedPublicationTechnique,
-    ConnectorOpenWriterRequest, ConnectorSealedWriteCohortSet, ConnectorStagedReport,
-    ConnectorStagedReportFrame, ConnectorStagedReportSummary, ConnectorWriteAbortOutcome,
-    ConnectorWriteAbortRequest, ConnectorWriteActivation, ConnectorWriteActivationIntent,
-    ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
-    ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
-    ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteExecution,
-    ConnectorWriteExecutionId, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
-    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
-    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationCompletion,
-    ConnectorWriteOperationId, ConnectorWritePlan, ConnectorWritePlanningRequest,
-    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
-    ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ConnectorWriteTargetRef,
-    ConnectorWriterHandle, ConnectorWriterIdentity, ConnectorWriterTerminalState,
-    DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES, DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES,
-    MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES, MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS,
-    MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES, MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES,
-    MAX_CONNECTOR_STAGED_REPORT_PARTS, MAX_CONNECTOR_STAGED_REPORT_PAYLOAD_BYTES,
-    MAX_CONNECTOR_WRITE_ACTIVATIONS, MAX_CONNECTOR_WRITE_COHORTS,
-    MAX_CONNECTOR_WRITE_OPERATION_PAYLOAD_BYTES, MAX_CONNECTOR_WRITE_OPERATION_WRITERS,
-    MAX_CONNECTOR_WRITE_RECEIPT_BYTES, WriteCommitEvidenceLedger, WriteCommitEvidenceLimits,
-    WriteCommitEvidenceUsage,
+    ConnectorManagedPartitionField, ConnectorManagedPartitionSpecObservation,
+    ConnectorManagedPartitionSpecReplacement, ConnectorManagedPartitionSpecReplacementId,
+    ConnectorManagedPartitionSpecReplacementTarget, ConnectorManagedPartitionTransform,
+    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationIntent,
+    ConnectorManagedPublicationTechnique, ConnectorOpenWriterRequest,
+    ConnectorSealedWriteCohortSet, ConnectorStagedReport, ConnectorStagedReportFrame,
+    ConnectorStagedReportSummary, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
+    ConnectorWriteActivation, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
+    ConnectorWriteActivationSource, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion, ConnectorWriteCohortCompletion,
+    ConnectorWriteCohortDescriptor, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
+    ConnectorWriteControl, ConnectorWriteExecution, ConnectorWriteExecutionId,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
+    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
+    ConnectorWriteLease, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
+    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
+    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ConnectorWriteReceipt,
+    ConnectorWriteReconcileRequest, ConnectorWriteTargetRef, ConnectorWriterHandle,
+    ConnectorWriterIdentity, ConnectorWriterTerminalState, DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES,
+    DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES, MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES,
+    MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS, MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES,
+    MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES, MAX_CONNECTOR_STAGED_REPORT_PARTS,
+    MAX_CONNECTOR_STAGED_REPORT_PAYLOAD_BYTES, MAX_CONNECTOR_WRITE_ACTIVATIONS,
+    MAX_CONNECTOR_WRITE_COHORTS, MAX_CONNECTOR_WRITE_OPERATION_PAYLOAD_BYTES,
+    MAX_CONNECTOR_WRITE_OPERATION_WRITERS, MAX_CONNECTOR_WRITE_RECEIPT_BYTES,
+    WriteCommitEvidenceLedger, WriteCommitEvidenceLimits, WriteCommitEvidenceUsage,
 };

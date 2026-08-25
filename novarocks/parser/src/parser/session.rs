@@ -21,7 +21,8 @@ use crate::{
     ParseError, Span, Token, TokenKind,
     ast::{
         Ident, KillKind, KillStatement, SessionStatement, SetAssignment, SetScope, SetStatement,
-        SetTarget, SetValue, SetWord, Statement, UseStatement, UserVariable,
+        SetTarget, SetValue, SetWord, Statement, TransactionControlKind,
+        TransactionControlStatement, UseStatement, UserVariable,
     },
     token::{Keyword, Symbol},
 };
@@ -35,12 +36,54 @@ pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<State
     if parser.current_is_word("USE") {
         return parse_use(parser).map(Some);
     }
+    if parser.current_is_word("BEGIN")
+        || parser.current_is_word("START")
+        || parser.current_is_word("COMMIT")
+        || parser.current_is_word("ROLLBACK")
+        || parser.current_is_word("SAVEPOINT")
+    {
+        return parse_transaction_control(parser).map(Some);
+    }
     // `KILL ANALYZE` is owned by the preceding statistics family. Preserve
     // that ownership even if this parser is ever reused in another order.
     if parser.current_is_word("KILL") && !parser.peek_word(1, "ANALYZE") {
         return parse_kill(parser).map(Some);
     }
     Ok(None)
+}
+
+fn parse_transaction_control(
+    parser: &mut StatementParser<'_, '_>,
+) -> Result<Statement, ParseError> {
+    let start = parser.current_span().start();
+    let kind = if parser.consume_if_word("BEGIN") {
+        TransactionControlKind::Begin
+    } else if parser.consume_if_word("START") {
+        parser.consume_word("TRANSACTION")?;
+        TransactionControlKind::StartTransaction
+    } else if parser.consume_if_word("COMMIT") {
+        TransactionControlKind::Commit
+    } else if parser.consume_if_word("ROLLBACK") {
+        TransactionControlKind::Rollback
+    } else {
+        parser.consume_word("SAVEPOINT")?;
+        TransactionControlKind::Savepoint
+    };
+    // Transaction modifiers do not acquire semantics here.  The closed AST
+    // tells admission that this is a cross-statement transaction request, and
+    // admission rejects it before a provider call; retaining the modifiers
+    // would only create a second, unusable transaction grammar.
+    while !parser.is_end() && !parser.current_is_symbol(Symbol::Semicolon) {
+        parser.advance();
+        parser.skip_trivia();
+    }
+    let end = parser.current_span().start();
+    Ok(Statement::Session(SessionStatement::TransactionControl(
+        TransactionControlStatement {
+            kind,
+            span: Span::new(start, end),
+        },
+    )))
 }
 
 fn parse_set(parser: &mut StatementParser<'_, '_>) -> Result<Statement, ParseError> {
@@ -339,7 +382,7 @@ mod tests {
     use crate::{
         ast::{
             KillKind, SessionStatement, SetScope, SetTarget, SetValue, SetWord, Statement,
-            StatisticsStatement,
+            StatisticsStatement, TransactionControlKind,
         },
         parser,
         printer::print_statement,
@@ -485,5 +528,34 @@ mod tests {
             parser::parse("SELECT * FROM session"),
             Ok(statements) if matches!(statements.as_slice(), [Statement::Query(_)])
         ));
+    }
+
+    #[test]
+    fn parses_transaction_control_as_a_closed_session_family() {
+        let statements = parser::parse(
+            "BEGIN WORK; START TRANSACTION READ WRITE; COMMIT AND CHAIN; \
+             ROLLBACK TO SAVEPOINT before_publish; SAVEPOINT before_publish",
+        )
+        .expect("transaction controls should remain typed through admission");
+        let kinds = statements
+            .iter()
+            .map(|statement| match statement {
+                Statement::Session(SessionStatement::TransactionControl(statement)) => {
+                    statement.kind
+                }
+                other => panic!("expected transaction control, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                TransactionControlKind::Begin,
+                TransactionControlKind::StartTransaction,
+                TransactionControlKind::Commit,
+                TransactionControlKind::Rollback,
+                TransactionControlKind::Savepoint,
+            ]
+        );
+        assert_eq!(print_statement(&statements[1]), "START TRANSACTION");
     }
 }

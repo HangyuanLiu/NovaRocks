@@ -870,6 +870,7 @@ pub fn walk_session_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Se
         }
         SessionStatement::Use(statement) => visitor.visit_ident(&statement.database),
         SessionStatement::Kill(statement) => visitor.visit_literal(&statement.connection_id),
+        SessionStatement::TransactionControl(_) => {}
     }
 }
 
@@ -916,6 +917,9 @@ pub fn fold_session_statement<F: Fold + ?Sized>(
         SessionStatement::Kill(mut statement) => {
             statement.connection_id = folder.fold_literal(statement.connection_id);
             SessionStatement::Kill(statement)
+        }
+        SessionStatement::TransactionControl(statement) => {
+            SessionStatement::TransactionControl(statement)
         }
     }
 }

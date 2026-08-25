@@ -41,7 +41,6 @@ use super::row_delta_dv_metadata::{
     group_written_dvs_by_partition_spec, partition_spec_by_id, write_added_dv_manifest,
     write_existing_delete_manifest,
 };
-use super::write_fence::IcebergFenceAssertion;
 use crate::commit::CommitOutcome;
 
 #[derive(Clone, Debug, Default)]
@@ -334,18 +333,13 @@ impl SelectedRewriteCommit {
         // A rewrite replaces a frozen file set and must therefore be rejected —
         // not re-staged — when the base moves, so this action deliberately keeps
         // its single conditional submission instead of taking
-        // `submit_fenced_action`'s re-stage loop. The fence assertion still
-        // travels in that same atomic update: `submit_action_commit` appends it
-        // to the requirements computed against the base this action observed.
-        let fence_requirements = ctx
-            .fence
-            .map(IcebergFenceAssertion::requirements)
-            .unwrap_or_default();
+        // the generic re-stage loop. The staged action keeps the exact
+        // target-ref requirement computed against its frozen base.
         let submitted = submit_action_commit(
             ctx.catalog,
             ctx.collector.table_ident.clone(),
             staged,
-            fence_requirements,
+            Vec::new(),
         )
         .await
         .map_err(|error| format!("selected position-delete rewrite commit failed: {error}"))?;

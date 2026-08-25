@@ -294,24 +294,6 @@ impl DataMutationSession {
         })
     }
 
-    /// Establish this attempt's external fence before anything is dispatched.
-    ///
-    /// TRUNCATE and ADD FILES destroy or extend table content, so a superseded
-    /// owner's late execute has to be refused at the catalog rather than
-    /// merely reported afterwards. The provider publishes the marker and
-    /// returns the receipt that acknowledges it; the receipt travels back out
-    /// so the frontend can journal proof of the fence before dispatch.
-    pub fn establish_external_fence(
-        &self,
-        fence: novarocks_spi::connector::ConnectorExternalOperationFence,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorExternalFenceReceipt,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        self.lease
-            .establish_external_fence(fence, self.context.clone())
-    }
-
     pub fn plan_ref(&self) -> &novarocks_spi::connector::ConnectorDataMutationPlan {
         &self.plan
     }
@@ -340,20 +322,6 @@ impl DataMutationSession {
         }
         let request = match ConnectorDataMutationExecuteRequest::try_new(
             self.plan.clone(),
-            // Whatever this authority established before dispatch. An
-            // operation that never established one says so; it never invents a
-            // fence at terminal time, which would look fenced while asserting
-            // nothing.
-            match self.lease.fencing() {
-                Ok(fencing) => fencing,
-                Err(error) => {
-                    self.phase = DataMutationSessionPhase::Terminal;
-                    return contract_failure(
-                        error,
-                        DataMutationDispatchState::ConfirmedNotDispatched,
-                    );
-                }
-            },
             self.context.clone(),
         ) {
             Ok(request) => request,
@@ -664,6 +632,14 @@ mod tests {
                     ConnectorDataMutationOperation::RegisterExistingFiles { .. } => Some(
                         novarocks_spi::connector::ConnectorDataMutationSourceScope::try_new_directory(
                             [4; 32],
+                        )?,
+                    ),
+                    ConnectorDataMutationOperation::Truncate { .. } => None,
+                },
+                match request.operation() {
+                    ConnectorDataMutationOperation::RegisterExistingFiles { .. } => Some(
+                        novarocks_spi::connector::ConnectorDataMutationAddFilesDomain::try_new_caller_managed_stable(
+                            [5; 32],
                         )?,
                     ),
                     ConnectorDataMutationOperation::Truncate { .. } => None,

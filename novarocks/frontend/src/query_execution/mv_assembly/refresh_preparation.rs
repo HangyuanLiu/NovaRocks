@@ -245,9 +245,24 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             } => *target_snapshot_id,
             RefreshStateBaseline::Pinless => None,
         };
+        let target_table_uuid = match &plan.contract.state_baseline {
+            RefreshStateBaseline::SnapshotBacked {
+                target_table_uuid, ..
+            } => target_table_uuid.clone(),
+            RefreshStateBaseline::Pinless => String::new(),
+        };
         let work = match plan.contract.decision {
             ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
-            ExecutableRefreshDecision::MetadataOnly => PreparedMvRefreshWork::MetadataOnly,
+            ExecutableRefreshDecision::MetadataOnly => PreparedMvRefreshWork::MetadataOnly {
+                intent: metadata_only_publication_intent(
+                    &plan.contract,
+                    &request.attempt,
+                    plan.contract.mv_id.ok_or_else(|| {
+                        "Iceberg MV refresh plan has no persisted materialized-view ID".to_string()
+                    })?,
+                    &base_table_object_ids,
+                )?,
+            },
             ExecutableRefreshDecision::FirstRefresh => PreparedMvRefreshWork::DataProducing {
                 write: PreparedMvRefreshWrite::first_refresh(prepare_frontend_first_refresh_write(
                     self.source,
@@ -281,7 +296,19 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                         write: PreparedMvRefreshWrite::first_refresh(rebuild),
                     }
                 }
-                PreparedIncrementalRefreshWork::MetadataOnly => PreparedMvRefreshWork::MetadataOnly,
+                PreparedIncrementalRefreshWork::MetadataOnly => {
+                    PreparedMvRefreshWork::MetadataOnly {
+                        intent: metadata_only_publication_intent(
+                            &plan.contract,
+                            &request.attempt,
+                            plan.contract.mv_id.ok_or_else(|| {
+                                "Iceberg MV refresh plan has no persisted materialized-view ID"
+                                    .to_string()
+                            })?,
+                            &base_table_object_ids,
+                        )?,
+                    }
+                }
             },
         };
         Ok(PreparedMvRefresh {
@@ -296,6 +323,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                 base_snapshots: plan.contract.snapshot_pins,
                 base_table_object_ids,
                 expected_target_snapshot_id,
+                target_table_uuid,
             },
             work,
         })
@@ -966,6 +994,53 @@ fn frontend_refresh_publication_intent(
             .catalog
             .clone()
             .ok_or_else(|| "MV refresh publication target has no connector catalog".to_string())?,
+        contract.target.database.clone(),
+        contract.target.name.clone(),
+        attempt.staging_branch.clone(),
+    )
+}
+
+fn metadata_only_publication_intent(
+    contract: &RefreshPlanContract,
+    attempt: &MvRefreshAttemptIdentity,
+    mv_id: i64,
+    base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
+) -> Result<MvRefreshPublicationIntent, String> {
+    let snapshots = contract
+        .snapshot_pins
+        .iter()
+        .map(|(base, snapshot)| {
+            snapshot
+                .map(|snapshot| (base.clone(), snapshot))
+                .ok_or_else(|| {
+                    format!("MV metadata-only provenance has no pinned snapshot for {base}")
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let RefreshStateBaseline::SnapshotBacked {
+        previous_snapshot_ids,
+        definition_fingerprint,
+        ..
+    } = &contract.state_baseline
+    else {
+        return Err(
+            "MV metadata-only refresh requires a snapshot-backed target baseline".to_string(),
+        );
+    };
+    mv_refresh_publication_intent(
+        attempt.refresh_id,
+        mv_id,
+        attempt.marker_token.clone(),
+        MvRefreshPublicationTechnique::MetadataOnly,
+        &snapshots,
+        base_table_object_ids,
+        previous_snapshot_ids,
+        definition_fingerprint.clone(),
+        contract
+            .target
+            .catalog
+            .clone()
+            .ok_or_else(|| "MV metadata-only target has no connector catalog".to_string())?,
         contract.target.database.clone(),
         contract.target.name.clone(),
         attempt.staging_branch.clone(),

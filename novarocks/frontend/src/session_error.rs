@@ -27,6 +27,11 @@ const ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDes
     phase: ErrorPhase::Admit,
     status: ErrorCodeStatus::Active,
 };
+const ADMIT_SESSION_TRANSACTION_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDescriptor {
+    code: ErrorCodeId::new("sql.admit.session_transaction_unsupported"),
+    phase: ErrorPhase::Admit,
+    status: ErrorCodeStatus::Active,
+};
 const ADMIT_KILL_CONNECTION_UNSUPPORTED: ErrorCodeDescriptor = ErrorCodeDescriptor {
     code: ErrorCodeId::new("sql.admit.kill_connection_unsupported"),
     phase: ErrorPhase::Admit,
@@ -41,6 +46,7 @@ const ADMIT_KILL_DENIED: ErrorCodeDescriptor = ErrorCodeDescriptor {
 /// Session capability descriptors, exported for aggregate manifest and wire-mapping checks.
 pub const SESSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED,
+    ADMIT_SESSION_TRANSACTION_UNSUPPORTED,
     ADMIT_KILL_CONNECTION_UNSUPPORTED,
     ADMIT_KILL_DENIED,
 ];
@@ -49,6 +55,7 @@ pub const SESSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionAdmitError {
     GlobalScopeUnsupported,
+    TransactionUnsupported,
     KillDenied,
 }
 
@@ -56,6 +63,7 @@ impl SessionAdmitError {
     const fn descriptor(self) -> ErrorCodeDescriptor {
         match self {
             Self::GlobalScopeUnsupported => ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED,
+            Self::TransactionUnsupported => ADMIT_SESSION_TRANSACTION_UNSUPPORTED,
             Self::KillDenied => ADMIT_KILL_DENIED,
         }
     }
@@ -119,6 +127,10 @@ mod tests {
             (
                 SessionAdmitError::GlobalScopeUnsupported,
                 "sql.admit.session_global_scope_unsupported",
+            ),
+            (
+                SessionAdmitError::TransactionUnsupported,
+                "sql.admit.session_transaction_unsupported",
             ),
             (SessionAdmitError::KillDenied, "sql.admit.kill_denied"),
         ] {

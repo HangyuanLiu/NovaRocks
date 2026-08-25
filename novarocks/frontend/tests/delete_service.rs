@@ -107,21 +107,6 @@ impl FakeDeleteEngine {
 }
 
 impl DeleteEngine for FakeDeleteEngine {
-    /// Distributed write fails closed until a fence is established, so the fake
-    /// engine must expose a real write authority to fence against.
-    fn establish_delete_external_fence(
-        &self,
-        _prepared: &dyn novarocks_frontend::query_execution::dml::delete::DeletePrepared,
-        proposal: &dyn novarocks_frontend::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorEstablishedWriteFence,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        common::fence_fixture::establish_from_proposal(|operation_id, table, target_ref| {
-            proposal.seal(operation_id, table, target_ref)
-        })
-    }
-
     fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String> {
         let sql_source = request.source.to_string();
         self.prepare_calls.lock().unwrap().push((
@@ -131,11 +116,12 @@ impl DeleteEngine for FakeDeleteEngine {
         ));
         Ok(PreparedDelete {
             operation: DeleteOperation {
+                publication_id: request.publication_id,
                 catalog: request.current_catalog.unwrap_or_else(|| "ice".to_string()),
                 namespace: request.current_database,
                 table: "orders".to_string(),
                 target_ref: "main".to_string(),
-                attempt_id: "delete-test-attempt".to_string(),
+                attempt_id: request.publication_id.to_string(),
                 base_snapshot_id: Some(7),
             },
             handle: Arc::new(FakePrepared),
@@ -225,7 +211,7 @@ impl OperationJournal for FakeJournal {
         &self,
         request: CreatePreparingRequest,
     ) -> Result<DmlOperationId, DmlError> {
-        let operation_id = DmlOperationId::new_v7();
+        let operation_id = request.publication_id;
         self.operations.lock().unwrap().insert(
             *operation_id.as_uuid(),
             StoredOperation {

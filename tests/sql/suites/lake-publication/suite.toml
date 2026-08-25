@@ -1,0 +1,3 @@
+# Publication faults alter a live external Catalog outcome and therefore run
+# only through the runner-owned 1FE+3BE topology.
+explicit_only = true

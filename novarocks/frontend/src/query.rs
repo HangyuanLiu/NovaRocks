@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
 use crate::common::admitted_query_context::{
-    RequestAdmission, RequestContext, SessionOptimizerSettings,
+    LakePublicationRuntimePolicy, RequestAdmission, RequestContext, SessionOptimizerSettings,
 };
 use crate::common::backend_topology::BackendTopologyService;
 use crate::common::engine_error::EngineError;
@@ -292,16 +292,28 @@ impl CoreCommandRoute for TypedCommandRoute {
 enum RoutedExecutionError {
     Engine(String),
     User(UserError),
+    Publication {
+        message: String,
+        terminal: novarocks_spi::connector::LakePublicationTerminal,
+    },
 }
 
 fn dml_statement_result(
     result: Result<(), crate::dml::DmlError>,
 ) -> Result<StatementResult, RoutedExecutionError> {
     result.map(|()| StatementResult::Ok).map_err(|error| {
-        error.user_error().cloned().map_or_else(
-            || RoutedExecutionError::Engine(error.to_string()),
-            RoutedExecutionError::User,
-        )
+        if let Some(user_error) = error.user_error().cloned() {
+            RoutedExecutionError::User(user_error)
+        } else if let Some(engine_error_code) = error.engine_error_code() {
+            RoutedExecutionError::Engine(format!("[{}] {error}", engine_error_code.as_str()))
+        } else if let Some(terminal) = error.publication_terminal().cloned() {
+            RoutedExecutionError::Publication {
+                message: error.to_string(),
+                terminal,
+            }
+        } else {
+            RoutedExecutionError::Engine(error.to_string())
+        }
     })
 }
 
@@ -427,6 +439,40 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
     })
 }
 
+fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
+    match statement {
+        ParsedStatement::Dml(_) | ParsedStatement::Table(_) | ParsedStatement::Iceberg(_) => true,
+        ParsedStatement::Catalog(statement) => {
+            !matches!(statement, ast::CatalogStatement::ShowCreateTable(_))
+        }
+        ParsedStatement::Maintenance(statement) => {
+            !matches!(statement, ast::MaintenanceStatement::ShowOptimize(_))
+        }
+        ParsedStatement::MaterializedView(statement) => !matches!(
+            statement,
+            ast::MaterializedViewStatement::Show(_)
+                | ast::MaterializedViewStatement::ExplainRefresh(_)
+        ),
+        ParsedStatement::View(statement) => !matches!(
+            statement,
+            ast::ViewStatement::Show(_) | ast::ViewStatement::ShowCreate(_)
+        ),
+        ParsedStatement::Statistics(statement) => matches!(
+            statement,
+            ast::StatisticsStatement::AnalyzeTable(_)
+                | ast::StatisticsStatement::DropStats(_)
+                | ast::StatisticsStatement::DropHistogram(_)
+                | ast::StatisticsStatement::DropMultipleColumnsStats(_)
+        ),
+        ParsedStatement::Backend(statement) => {
+            !matches!(statement, ast::BackendStatement::ShowBackends(_))
+        }
+        ParsedStatement::Session(_)
+        | ParsedStatement::Query(_)
+        | ParsedStatement::ExplainQuery(_) => false,
+    }
+}
+
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
 pub struct FrontendQueryService {
@@ -448,11 +494,12 @@ pub struct FrontendQueryService {
     /// Cost budget frozen from `[runtime]` and handed to statement admission
     /// whenever the session did not set one itself.
     optimizer_query_mem_limit_bytes: u64,
+    lake_publication_runtime_policy: LakePublicationRuntimePolicy,
 }
 
 impl FrontendQueryService {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_with_recovery_bound(
+    pub(crate) fn new(
         session_catalog_resolver: SessionCatalogResolver,
         query_compiler: FrontendQueryCompiler,
         catalog_command_executor: CatalogCommandExecutor,
@@ -476,6 +523,7 @@ impl FrontendQueryService {
         ctas_engine: Arc<dyn CtasEngine>,
         truncate_engine: Arc<dyn TruncateEngine>,
         optimizer_query_mem_limit_bytes: u64,
+        lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     ) -> Self {
         Self {
             session_catalog_resolver,
@@ -503,6 +551,7 @@ impl FrontendQueryService {
             ctas_engine,
             truncate_engine,
             optimizer_query_mem_limit_bytes,
+            lake_publication_runtime_policy,
         }
     }
 }
@@ -621,6 +670,9 @@ impl FrontendQuerySession {
         match statement {
             ast::SessionStatement::Set(statement) => {
                 for assignment in &statement.assignments {
+                    self.admit_session_set_assignment(source, assignment)?;
+                }
+                for assignment in &statement.assignments {
                     self.apply_session_set_assignment(source, assignment)
                         .await?;
                 }
@@ -635,6 +687,41 @@ impl FrontendQuerySession {
                 Ok(StatementResult::Ok)
             }
             ast::SessionStatement::Kill(statement) => self.execute_session_kill(source, statement),
+            ast::SessionStatement::TransactionControl(statement) => {
+                Err(QueryServiceError::from_user_error(
+                    crate::session_error::SessionAdmitError::TransactionUnsupported.to_user_error(
+                        source,
+                        statement.span,
+                        format!(
+                            "{} is not supported because NovaRocks only provides statement-level autocommit frontiers",
+                            statement.kind.sql()
+                        ),
+                    ),
+                ))
+            }
+        }
+    }
+
+    fn admit_session_set_assignment(
+        &self,
+        source: &str,
+        assignment: &ast::SetAssignment,
+    ) -> Result<(), QueryServiceError> {
+        let ast::SetTarget::SystemVariable(variable) = &assignment.target else {
+            return Ok(());
+        };
+        if !variable.value.eq_ignore_ascii_case("autocommit") {
+            return Ok(());
+        }
+        match lower_autocommit_setting(&assignment.value)? {
+            AutocommitSetting::Enabled => Ok(()),
+            AutocommitSetting::Disabled => Err(QueryServiceError::from_user_error(
+                crate::session_error::SessionAdmitError::TransactionUnsupported.to_user_error(
+                    source,
+                    assignment.span,
+                    "SET autocommit=0 is not supported because NovaRocks only provides statement-level autocommit frontiers",
+                ),
+            )),
         }
     }
 
@@ -726,6 +813,17 @@ impl FrontendQuerySession {
     ) -> Result<(), QueryServiceError> {
         if name == "catalog" {
             return self.apply_session_catalog(value);
+        }
+        if name == "autocommit" {
+            // `admit_session_set_assignment` has already lowered and accepted
+            // only the truthful enabled spelling. Do not turn this into a
+            // session state bit: the portable SQL profile has no transaction
+            // state to retain across statements.
+            debug_assert!(matches!(
+                lower_autocommit_value(value),
+                Ok(AutocommitSetting::Enabled)
+            ));
+            return Ok(());
         }
         let mut state = self.state.lock().map_err(poisoned_state)?;
         match name {
@@ -865,7 +963,7 @@ impl FrontendQuerySession {
             })?;
         let cancellation = active.cancellation().clone();
         let query_timeout_secs = state.execution_settings.query_timeout_secs();
-        let deadline = match query_timeout_secs {
+        let session_deadline = match query_timeout_secs {
             Some(seconds) => Instant::now()
                 .checked_add(Duration::from_secs(seconds))
                 .ok_or_else(|| {
@@ -876,7 +974,19 @@ impl FrontendQuerySession {
                 })?,
             None => Instant::now(),
         };
-        let deadline = query_timeout_secs.map(|_| deadline);
+        let session_deadline = query_timeout_secs.map(|_| session_deadline);
+        let deadline = if requires_lake_publication_deadline(&parsed_statement) {
+            Some(
+                self.service
+                    .lake_publication_runtime_policy
+                    .admit_deadline(Instant::now(), session_deadline)
+                    .map_err(internal_error)?,
+            )
+        } else {
+            session_deadline
+        };
+        let timeout_duration =
+            deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         let topology = match self.service.topology.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -1013,20 +1123,20 @@ impl FrontendQuerySession {
             let completion = active.finish();
             (result, completion)
         });
-        let result = if let Some(seconds) = query_timeout_secs {
-            match tokio::time::timeout(Duration::from_secs(seconds), &mut worker).await {
+        let result = if let Some(timeout_duration) = timeout_duration {
+            match tokio::time::timeout(timeout_duration, &mut worker).await {
                 Ok(result) => result.map_err(|error| internal_error(error.to_string()))?,
                 Err(_) => {
-                    self.cancel_current(QueryCancellationReason::DeadlineExceeded {
-                        timeout_ms: seconds.saturating_mul(1_000),
-                    });
+                    let timeout_ms =
+                        u64::try_from(timeout_duration.as_millis()).unwrap_or(u64::MAX);
+                    self.cancel_current(QueryCancellationReason::DeadlineExceeded { timeout_ms });
                     // A timeout is not complete until the worker releases the
                     // statement lease. Waiting here also fences Backend abort
                     // acknowledgement before this session admits its next SQL.
                     let _ = worker.await;
                     return Err(QueryServiceError::new(
                         QueryServiceErrorKind::Timeout,
-                        format!("query timed out after {} ms", seconds.saturating_mul(1_000)),
+                        format!("query timed out after {timeout_ms} ms"),
                     ));
                 }
             }
@@ -1045,6 +1155,9 @@ impl FrontendQuerySession {
                 result.map_err(|error| match error {
                     RoutedExecutionError::Engine(error) => internal_error(error),
                     RoutedExecutionError::User(error) => QueryServiceError::from_user_error(error),
+                    RoutedExecutionError::Publication { message, terminal } => {
+                        QueryServiceError::with_publication_terminal(message, terminal)
+                    }
                 })
             }
         }
@@ -1080,6 +1193,32 @@ fn session_setting_value(value: &ast::SetValue) -> Result<String, QueryServiceEr
     }
 }
 
+/// Closed lowering for the one session setting that would otherwise create a
+/// cross-statement publication boundary. Other boolean settings remain on the
+/// generic session-value path; autocommit must not silently inherit its
+/// permissive/no-op behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutocommitSetting {
+    Enabled,
+    Disabled,
+}
+
+fn lower_autocommit_setting(value: &ast::SetValue) -> Result<AutocommitSetting, QueryServiceError> {
+    let value = session_setting_value(value)?;
+    lower_autocommit_value(&value)
+}
+
+fn lower_autocommit_value(value: &str) -> Result<AutocommitSetting, QueryServiceError> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" => Ok(AutocommitSetting::Enabled),
+        "0" | "off" | "false" => Ok(AutocommitSetting::Disabled),
+        _ => Err(QueryServiceError::new(
+            QueryServiceErrorKind::InvalidValue,
+            format!("invalid autocommit value `{value}`; expected 1, ON, TRUE, 0, OFF, or FALSE"),
+        )),
+    }
+}
+
 fn session_catalog_value(value: &ast::SetValue) -> Result<String, QueryServiceError> {
     if let ast::SetValue::Expression(value) = value {
         return Ok(print_expr(value)
@@ -1105,7 +1244,8 @@ fn session_catalog_value(value: &ast::SetValue) -> Result<String, QueryServiceEr
 fn is_known_session_setting(name: &str) -> bool {
     matches!(
         name,
-        "catalog"
+        "autocommit"
+            | "catalog"
             | "query_timeout"
             | "group_concat_max_len"
             | "pipeline_dop"
@@ -2053,6 +2193,7 @@ mod tests {
                 .push(request.execution);
             Ok(PreparedDelete {
                 operation: DeleteOperation {
+                    publication_id: request.publication_id,
                     catalog: "ice".to_string(),
                     namespace: "db".to_string(),
                     table: "t".to_string(),
@@ -2456,6 +2597,52 @@ mod tests {
             session_setting_value(&statement.assignments[0].value).expect("boolean value"),
             "on"
         );
+    }
+
+    #[test]
+    fn autocommit_lowering_is_closed_over_truthful_boolean_spellings() {
+        for (source, expected) in [
+            ("SET autocommit = 1", AutocommitSetting::Enabled),
+            ("SET autocommit = ON", AutocommitSetting::Enabled),
+            ("SET autocommit = TRUE", AutocommitSetting::Enabled),
+            ("SET autocommit = 0", AutocommitSetting::Disabled),
+            ("SET autocommit = OFF", AutocommitSetting::Disabled),
+            ("SET autocommit = FALSE", AutocommitSetting::Disabled),
+        ] {
+            let statements = novarocks_parser::parse(source).expect("SET must parse");
+            let [ParsedStatement::Session(ast::SessionStatement::Set(statement))] =
+                statements.as_slice()
+            else {
+                panic!("expected one SET statement");
+            };
+            assert_eq!(
+                lower_autocommit_setting(&statement.assignments[0].value)
+                    .expect("autocommit spelling must lower"),
+                expected,
+                "source={source}"
+            );
+        }
+    }
+
+    #[test]
+    fn autocommit_lowering_rejects_values_outside_the_closed_boolean_surface() {
+        for source in ["SET autocommit = 2", "SET autocommit = inherited"] {
+            let statements = novarocks_parser::parse(source).expect("SET must parse");
+            let [ParsedStatement::Session(ast::SessionStatement::Set(statement))] =
+                statements.as_slice()
+            else {
+                panic!("expected one SET statement");
+            };
+            let error = lower_autocommit_setting(&statement.assignments[0].value)
+                .expect_err("unrecognized autocommit value must be rejected");
+            assert_eq!(error.kind(), QueryServiceErrorKind::InvalidValue);
+            assert!(error.message().contains("invalid autocommit value"));
+        }
+    }
+
+    #[test]
+    fn autocommit_is_not_an_unknown_global_no_op() {
+        assert!(is_known_session_setting("autocommit"));
     }
 
     #[test]

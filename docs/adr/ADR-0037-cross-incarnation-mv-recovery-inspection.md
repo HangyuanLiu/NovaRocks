@@ -2,9 +2,9 @@
 id: ADR-0037
 title: "Cross-incarnation MV recovery uses lake inspection"
 domain: [frontend-mv]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0104
 date: 2026-08-02
 provenance:
   - "discussion: 2026-08-02 historical materialized-view recovery"

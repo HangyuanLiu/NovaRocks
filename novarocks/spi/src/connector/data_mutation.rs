@@ -31,8 +31,8 @@ use super::{
     ExternalMutationEvidence, ExternalMutationOutcome,
 };
 
-pub const CONNECTOR_DATA_MUTATION_CONTRACT_VERSION: u16 = 2;
-pub const CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION: u16 = 1;
+pub const CONNECTOR_DATA_MUTATION_CONTRACT_VERSION: u16 = 3;
+pub const CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION: u16 = 2;
 pub const MAX_CONNECTOR_DATA_MUTATION_SOURCE_LOCATION_BYTES: usize = 8 * 1024;
 pub const MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES: usize = 256;
 pub const MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -125,6 +125,90 @@ impl ConnectorDataMutationSourceScope {
         hasher.update(self.version.to_be_bytes());
         hasher.update([self.kind.to_wire_tag()]);
         hasher.update(self.digest);
+    }
+}
+
+/// The source-side ownership contract for `register-existing-files`.
+///
+/// This is deliberately distinct from the source-scope digest. The digest is
+/// only a stable identity useful for best-effort de-duplication of concurrent
+/// work; this value records the provider's proof that source cleanup stays
+/// outside NovaRocks' authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorDataMutationSourceDomain {
+    CallerManagedStable,
+}
+
+impl ConnectorDataMutationSourceDomain {
+    const CALLER_MANAGED_STABLE_TAG: u8 = 1;
+
+    const fn to_wire_tag(self) -> u8 {
+        match self {
+            Self::CallerManagedStable => Self::CALLER_MANAGED_STABLE_TAG,
+        }
+    }
+
+    fn try_from_wire_tag(tag: u8) -> Result<Self, ConnectorError> {
+        match tag {
+            Self::CALLER_MANAGED_STABLE_TAG => Ok(Self::CallerManagedStable),
+            _ => Err(corrupt("unsupported connector data mutation source domain")),
+        }
+    }
+}
+
+/// Provider-attested ADD FILES domain facts.
+///
+/// `target_cleanup_root_digest` identifies the exact target cleanup root whose
+/// disjointness was proved during planning. It is not a source lease and never
+/// authorizes NovaRocks to mutate the source root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorDataMutationAddFilesDomain {
+    version: u16,
+    source_domain: ConnectorDataMutationSourceDomain,
+    target_cleanup_root_digest: [u8; 32],
+}
+
+impl ConnectorDataMutationAddFilesDomain {
+    pub const VERSION: u16 = 1;
+
+    pub fn try_new_caller_managed_stable(
+        target_cleanup_root_digest: [u8; 32],
+    ) -> Result<Self, ConnectorError> {
+        let domain = Self {
+            version: Self::VERSION,
+            source_domain: ConnectorDataMutationSourceDomain::CallerManagedStable,
+            target_cleanup_root_digest,
+        };
+        domain.validate()?;
+        Ok(domain)
+    }
+
+    pub const fn version(self) -> u16 {
+        self.version
+    }
+
+    pub const fn source_domain(self) -> ConnectorDataMutationSourceDomain {
+        self.source_domain
+    }
+
+    pub const fn target_cleanup_root_digest(self) -> [u8; 32] {
+        self.target_cleanup_root_digest
+    }
+
+    pub fn validate(self) -> Result<(), ConnectorError> {
+        if self.version != Self::VERSION || self.target_cleanup_root_digest == [0; 32] {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector data mutation ADD FILES source domain is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    fn digest_into(self, hasher: &mut Sha256) {
+        hasher.update(self.version.to_be_bytes());
+        hasher.update([self.source_domain.to_wire_tag()]);
+        hasher.update(self.target_cleanup_root_digest);
     }
 }
 
@@ -340,6 +424,7 @@ pub struct ConnectorDataMutationPlan {
     state_digest: [u8; 32],
     summary: ConnectorDataMutationPlanSummary,
     source_scope: Option<ConnectorDataMutationSourceScope>,
+    add_files_domain: Option<ConnectorDataMutationAddFilesDomain>,
     provider_payload: Bytes,
     plan_digest: [u8; 32],
 }
@@ -350,17 +435,19 @@ impl ConnectorDataMutationPlan {
         state_digest: [u8; 32],
         summary: ConnectorDataMutationPlanSummary,
         source_scope: Option<ConnectorDataMutationSourceScope>,
+        add_files_domain: Option<ConnectorDataMutationAddFilesDomain>,
         provider_payload: Bytes,
     ) -> Result<Self, ConnectorError> {
         request.validate()?;
         validate_provider_payload(&provider_payload, "plan")?;
-        validate_source_scope(request.operation().kind(), source_scope)?;
+        validate_add_files_facts(request.operation().kind(), source_scope, add_files_domain)?;
         let operation_kind: Arc<str> = request.operation.kind().into();
         let plan_digest = plan_digest(
             request.request_digest,
             state_digest,
             summary,
             source_scope,
+            add_files_domain,
             &provider_payload,
         );
         Ok(Self {
@@ -372,6 +459,7 @@ impl ConnectorDataMutationPlan {
             state_digest,
             summary,
             source_scope,
+            add_files_domain,
             provider_payload,
             plan_digest,
         })
@@ -409,6 +497,10 @@ impl ConnectorDataMutationPlan {
         self.source_scope
     }
 
+    pub const fn add_files_domain(&self) -> Option<ConnectorDataMutationAddFilesDomain> {
+        self.add_files_domain
+    }
+
     pub fn provider_payload(&self) -> &Bytes {
         &self.provider_payload
     }
@@ -420,13 +512,18 @@ impl ConnectorDataMutationPlan {
     pub fn validate(&self) -> Result<(), ConnectorError> {
         validate_operation_kind(&self.operation_kind)?;
         validate_provider_payload(&self.provider_payload, "plan")?;
-        validate_source_scope(&self.operation_kind, self.source_scope)?;
+        validate_add_files_facts(
+            &self.operation_kind,
+            self.source_scope,
+            self.add_files_domain,
+        )?;
         if self.schema_version != CONNECTOR_DATA_MUTATION_CONTRACT_VERSION
             || plan_digest(
                 self.request_digest,
                 self.state_digest,
                 self.summary,
                 self.source_scope,
+                self.add_files_domain,
                 &self.provider_payload,
             ) != self.plan_digest
         {
@@ -469,6 +566,15 @@ impl ConnectorDataMutationPlan {
                 encoded.extend_from_slice(&scope.digest);
             }
         }
+        match self.add_files_domain {
+            None => encoded.push(0),
+            Some(domain) => {
+                encoded.push(1);
+                encoded.extend_from_slice(&domain.version.to_be_bytes());
+                encoded.push(domain.source_domain.to_wire_tag());
+                encoded.extend_from_slice(&domain.target_cleanup_root_digest);
+            }
+        }
         write_u32_bytes(&mut encoded, payload, "plan provider payload")?;
         encoded.extend_from_slice(&self.plan_digest);
         Ok(Bytes::from(encoded))
@@ -508,6 +614,21 @@ impl ConnectorDataMutationPlan {
                 ));
             }
         };
+        let add_files_domain = match reader.read_u8()? {
+            0 => None,
+            1 => Some(ConnectorDataMutationAddFilesDomain {
+                version: reader.read_u16()?,
+                source_domain: ConnectorDataMutationSourceDomain::try_from_wire_tag(
+                    reader.read_u8()?,
+                )?,
+                target_cleanup_root_digest: reader.read_array()?,
+            }),
+            _ => {
+                return Err(corrupt(
+                    "invalid connector data mutation plan ADD FILES source domain tag",
+                ));
+            }
+        };
         let provider_payload = Bytes::copy_from_slice(reader.read_bytes_u32("provider payload")?);
         let plan_digest = reader.read_array()?;
         reader.finish()?;
@@ -523,6 +644,7 @@ impl ConnectorDataMutationPlan {
             state_digest,
             summary,
             source_scope,
+            add_files_domain,
             provider_payload,
             plan_digest,
         };
@@ -543,6 +665,7 @@ impl fmt::Debug for ConnectorDataMutationPlan {
             .field("state_digest", &self.state_digest)
             .field("summary", &self.summary)
             .field("source_scope", &self.source_scope)
+            .field("add_files_domain", &self.add_files_domain)
             .field("provider_payload_len", &self.provider_payload.len())
             .field("plan_digest", &self.plan_digest)
             .finish()
@@ -552,28 +675,16 @@ impl fmt::Debug for ConnectorDataMutationPlan {
 #[derive(Clone)]
 pub struct ConnectorDataMutationExecuteRequest {
     pub plan: ConnectorDataMutationPlan,
-    /// How this direct mutation is fenced.
-    ///
-    /// Direct mutation reuses the distributed-write fence value rather than
-    /// defining a second one: TRUNCATE and ADD FILES change the same external
-    /// table truth, so they need the same linearization point, not a parallel
-    /// mechanism with its own ordering rules.
-    pub fence: super::ConnectorWriteFencing,
     pub context: ConnectorRequestContext,
 }
 
 impl ConnectorDataMutationExecuteRequest {
     pub fn try_new(
         plan: ConnectorDataMutationPlan,
-        fence: super::ConnectorWriteFencing,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         plan.validate()?;
-        Ok(Self {
-            plan,
-            fence,
-            context,
-        })
+        Ok(Self { plan, context })
     }
 }
 
@@ -834,33 +945,6 @@ pub trait ConnectorDataMutation: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn binding_key(&self) -> &ConnectorExecutionBindingKey;
 
-    /// Atomically establish or raise the external operation fence for one
-    /// direct data mutation, before any execute that can change external truth.
-    ///
-    /// This mirrors `ConnectorWriteControl::establish_external_fence` on
-    /// purpose: TRUNCATE and ADD FILES need the same external linearization
-    /// point as a distributed write, so the provider must *publish* a marker
-    /// here rather than let the caller remember a fence locally. A later
-    /// `execute` derives its assertion from that published marker, so an
-    /// implementation that returns a receipt without publishing anything leaves
-    /// every fenced mutation unable to commit.
-    ///
-    /// Implementations must compare the fence generation at the same external
-    /// linearization point as the later execute: a lower generation must not be
-    /// able to mutate afterwards, an identical request must be idempotent, and
-    /// a foreign operation must never reuse another operation's marker. A
-    /// conflict must be reported with `ConnectorError::external_fence`, never
-    /// downgraded to an unknown or unsupported result.
-    fn establish_external_fence(
-        &self,
-        _request: super::ConnectorExternalFenceRequest,
-    ) -> Result<super::ConnectorExternalFenceReceipt, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "connector data mutation does not implement external operation fencing",
-        ))
-    }
-
     fn plan_mutation(
         &self,
         request: ConnectorDataMutationPlanningRequest,
@@ -895,82 +979,10 @@ pub struct ConnectorDataMutationLease {
     key: ConnectorExecutionBindingKey,
     metadata: Arc<dyn ConnectorMetadata>,
     mutation: Arc<dyn ConnectorDataMutation>,
-    /// The external fence this authority established, shared across clones so
-    /// every terminal call of one direct mutation carries the same fence.
-    fence: Arc<Mutex<Option<super::ConnectorExternalOperationFence>>>,
     _release: Arc<DataMutationLeaseRelease>,
 }
 
-impl ConnectorDataMutationLease {
-    /// Establish this attempt's external fence before anything is dispatched.
-    ///
-    /// Direct mutation changes external table truth exactly like a distributed
-    /// write, so it uses the same fence value and the same "establish before
-    /// dispatch" ordering; only the execution contract differs.
-    ///
-    /// The provider is what actually establishes the fence: it publishes the
-    /// marker its own `execute` will later assert against. The local cell only
-    /// records *what* this authority established, so that every terminal call
-    /// of one direct mutation carries the same fence value; it is never the
-    /// establishment itself. Remembering a fence the provider never published
-    /// would make the session look fenced while asserting nothing.
-    pub fn establish_external_fence(
-        &self,
-        fence: super::ConnectorExternalOperationFence,
-        context: ConnectorRequestContext,
-    ) -> Result<super::ConnectorExternalFenceReceipt, ConnectorError> {
-        fence.validate()?;
-        if let Some(established) = self.lock_fence()?.as_ref() {
-            fence.validate_monotonic_successor_of(established)?;
-        }
-        let receipt =
-            self.mutation
-                .establish_external_fence(super::ConnectorExternalFenceRequest {
-                    owner: self.key.clone(),
-                    fence: fence.clone(),
-                    context,
-                })?;
-        receipt.validate()?;
-        if !receipt.matches(&fence) {
-            return Err(ConnectorError::external_fence(
-                super::ConnectorExternalFenceFailure::ForeignOperation,
-                "connector provider returned an external fence receipt for another fence",
-            ));
-        }
-        let mut slot = self.lock_fence()?;
-        // Re-check under the write lock: a concurrent establishment may have
-        // raised this authority's fence while the provider call was in flight.
-        if let Some(established) = slot.as_ref() {
-            fence.validate_monotonic_successor_of(established)?;
-        }
-        *slot = Some(fence);
-        Ok(receipt)
-    }
-
-    /// The fencing decision every terminal call of this mutation must carry.
-    pub fn fencing(&self) -> Result<super::ConnectorWriteFencing, ConnectorError> {
-        Ok(match self.lock_fence()?.as_ref() {
-            Some(fence) => super::ConnectorWriteFencing::Fenced(fence.clone()),
-            None => super::ConnectorWriteFencing::NotFencedByThisPhase {
-                reason: "no external fence was established for this direct mutation",
-            },
-        })
-    }
-
-    fn lock_fence(
-        &self,
-    ) -> Result<
-        std::sync::MutexGuard<'_, Option<super::ConnectorExternalOperationFence>>,
-        ConnectorError,
-    > {
-        self.fence.lock().map_err(|_| {
-            ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "connector data mutation fence lock was poisoned",
-            )
-        })
-    }
-}
+impl ConnectorDataMutationLease {}
 
 struct DataMutationLeaseRelease {
     release: Mutex<Option<Box<dyn FnOnce() + Send + Sync>>>,
@@ -999,7 +1011,6 @@ impl ConnectorDataMutationLease {
             key,
             metadata,
             mutation,
-            fence: Arc::new(Mutex::new(None)),
             _release: Arc::new(DataMutationLeaseRelease {
                 release: Mutex::new(Some(Box::new(release))),
             }),
@@ -1242,6 +1253,7 @@ fn plan_digest(
     state_digest: [u8; 32],
     summary: ConnectorDataMutationPlanSummary,
     source_scope: Option<ConnectorDataMutationSourceScope>,
+    add_files_domain: Option<ConnectorDataMutationAddFilesDomain>,
     provider_payload: &Bytes,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -1257,24 +1269,39 @@ fn plan_digest(
         }
         None => hasher.update([0]),
     }
+    match add_files_domain {
+        Some(domain) => {
+            hasher.update([1]);
+            domain.digest_into(&mut hasher);
+        }
+        None => hasher.update([0]),
+    }
     digest_bytes(&mut hasher, provider_payload);
     hasher.finalize().into()
 }
 
-fn validate_source_scope(
+fn validate_add_files_facts(
     operation_kind: &str,
     source_scope: Option<ConnectorDataMutationSourceScope>,
+    add_files_domain: Option<ConnectorDataMutationAddFilesDomain>,
 ) -> Result<(), ConnectorError> {
-    match (operation_kind, source_scope) {
-        (REGISTER_EXISTING_FILES_KIND, Some(scope)) => scope.validate(),
-        (REGISTER_EXISTING_FILES_KIND, None) => Err(ConnectorError::new(
+    match (operation_kind, source_scope, add_files_domain) {
+        (REGISTER_EXISTING_FILES_KIND, Some(scope), Some(domain)) => {
+            scope.validate()?;
+            domain.validate()
+        }
+        (REGISTER_EXISTING_FILES_KIND, None, _) => Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
             "register-existing-files plan requires a source ownership scope",
         )),
-        (TRUNCATE_KIND, None) => Ok(()),
-        (TRUNCATE_KIND, Some(_)) => Err(ConnectorError::new(
+        (REGISTER_EXISTING_FILES_KIND, Some(_), None) => Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
-            "truncate plan must not carry a source ownership scope",
+            "register-existing-files plan requires caller-managed source domain proof",
+        )),
+        (TRUNCATE_KIND, None, None) => Ok(()),
+        (TRUNCATE_KIND, _, _) => Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "truncate plan must not carry ADD FILES source facts",
         )),
         _ => Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
@@ -1450,9 +1477,10 @@ mod tests {
     use bytes::Bytes;
 
     use super::{
-        ConnectorDataMutationOperation, ConnectorDataMutationPlan,
-        ConnectorDataMutationPlanSummary, ConnectorDataMutationPlanningRequest,
-        ConnectorDataMutationReceipt, ConnectorDataMutationSourceScope,
+        ConnectorDataMutationAddFilesDomain, ConnectorDataMutationOperation,
+        ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
+        ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
+        ConnectorDataMutationSourceScope,
     };
     use crate::connector::{
         ConnectorCancellation, ConnectorErrorKind, ConnectorExecutionBindingKey,
@@ -1498,6 +1526,10 @@ mod tests {
             ConnectorDataMutationPlanSummary::try_new(1, 2, 3).expect("summary"),
             Some(
                 ConnectorDataMutationSourceScope::try_new_directory([6; 32]).expect("source scope"),
+            ),
+            Some(
+                ConnectorDataMutationAddFilesDomain::try_new_caller_managed_stable([7; 32])
+                    .expect("source domain"),
             ),
             Bytes::from_static(b"opaque-plan"),
         )

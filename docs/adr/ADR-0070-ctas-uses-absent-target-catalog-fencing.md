@@ -2,9 +2,9 @@
 id: ADR-0070
 title: "CTAS takeover uses catalog-native absent-target fencing"
 domain: [provider-spi, frontend-dml]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0104
 date: 2026-08-13
 provenance:
   - "mechanism: catalog-native fenced CTAS staged publication and historical recovery (PR number to backfill after merge)"

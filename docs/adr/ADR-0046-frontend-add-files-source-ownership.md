@@ -2,9 +2,9 @@
 id: ADR-0046
 title: "Frontend ADD FILES source ownership uses provider scopes"
 domain: [frontend-dml, provider-spi]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0104
 date: 2026-08-03
 provenance:
   - "implementation: frontend ADD FILES durable source ownership"

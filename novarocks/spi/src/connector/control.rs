@@ -19,21 +19,19 @@ use std::sync::{Arc, Mutex};
 
 use super::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
-    ConnectorCleanupMaintenance, ConnectorCleanupMaintenanceResolver,
-    ConnectorCtasStagedPublication, ConnectorCtasStagedPublicationLease, ConnectorDataMutation,
+    ConnectorCleanupMaintenance, ConnectorCleanupMaintenanceResolver, ConnectorDataMutation,
     ConnectorDataMutationResolver, ConnectorDistributedRewrite,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorHistoricalCtasStagedPublicationRecovery, ConnectorHistoricalDataMutationRecovery,
     ConnectorHistoricalMaintenanceRecovery, ConnectorHistoricalMaintenanceResolver,
-    ConnectorHistoricalWriteRecovery, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorMetadataMaintenance,
-    ConnectorMetadataMaintenanceResolver, ConnectorMvAttemptDiscovery,
-    ConnectorMvPublicationFencing, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
-    ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
-    ConnectorStagedCreate, ConnectorStagedCreateLease, ConnectorStagedPublicationRecovery,
-    ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
-    ConnectorTableHandle, ConnectorViewMetadata, ConnectorWriteControl, ConnectorWriteLease,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStagedCreate,
+    ConnectorStagedCreateLease, ConnectorStagedPublicationRecovery, ConnectorStatistics,
+    ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorTableHandle,
+    ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata,
+    ConnectorWriteControl, ConnectorWriteLease,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -236,17 +234,11 @@ pub struct ConnectorControlBinding {
     distributed_rewrite: Option<Arc<dyn ConnectorDistributedRewrite>>,
     cleanup_maintenance: Option<Arc<dyn ConnectorCleanupMaintenance>>,
     staged_create: Option<Arc<dyn ConnectorStagedCreate>>,
-    ctas_staged_publication: Option<Arc<dyn ConnectorCtasStagedPublication>>,
+    unanchored_ctas_cleanup: Option<Arc<dyn ConnectorUnanchoredCtasCleanup>>,
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
     staged_publication_recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
     historical_maintenance_recovery: Option<Arc<dyn ConnectorHistoricalMaintenanceRecovery>>,
-    mv_publication_fencing: Option<Arc<dyn ConnectorMvPublicationFencing>>,
-    mv_attempt_discovery: Option<Arc<dyn ConnectorMvAttemptDiscovery>>,
-    historical_write_recovery: Option<Arc<dyn ConnectorHistoricalWriteRecovery>>,
-    historical_data_mutation_recovery: Option<Arc<dyn ConnectorHistoricalDataMutationRecovery>>,
-    historical_ctas_staged_publication_recovery:
-        Option<Arc<dyn ConnectorHistoricalCtasStagedPublicationRecovery>>,
     view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
 }
 
@@ -428,16 +420,11 @@ impl ConnectorControlBinding {
             distributed_rewrite: None,
             cleanup_maintenance: None,
             staged_create: None,
-            ctas_staged_publication: None,
+            unanchored_ctas_cleanup: None,
             write,
             statistics,
             staged_publication_recovery: None,
             historical_maintenance_recovery: None,
-            mv_publication_fencing: None,
-            mv_attempt_discovery: None,
-            historical_write_recovery: None,
-            historical_data_mutation_recovery: None,
-            historical_ctas_staged_publication_recovery: None,
             view_metadata: None,
         })
     }
@@ -671,8 +658,8 @@ impl ConnectorControlBinding {
         self.staged_create.as_ref()
     }
 
-    pub fn ctas_staged_publication(&self) -> Option<&Arc<dyn ConnectorCtasStagedPublication>> {
-        self.ctas_staged_publication.as_ref()
+    pub fn unanchored_ctas_cleanup(&self) -> Option<&Arc<dyn ConnectorUnanchoredCtasCleanup>> {
+        self.unanchored_ctas_cleanup.as_ref()
     }
 
     pub fn write(&self) -> Option<&Arc<dyn ConnectorWriteControl>> {
@@ -726,21 +713,24 @@ impl ConnectorControlBinding {
         Ok(self)
     }
 
-    /// Installs catalog-native fenced CTAS publication for this exact control
-    /// generation. Presence is the capability preflight; unsupported catalogs
-    /// leave this slot empty and may not use the unfenced staged-create path.
-    pub fn try_with_ctas_staged_publication(
+    /// Attaches the catalog-wide CTAS staging-root collector to this exact
+    /// generation. The capability is independent from table-owned cleanup:
+    /// before a CREATE publishes its target, no table location can anchor the
+    /// staged root.
+    pub fn try_with_unanchored_ctas_cleanup(
         mut self,
-        capability: Option<Arc<dyn ConnectorCtasStagedPublication>>,
+        capability: Option<Arc<dyn ConnectorUnanchoredCtasCleanup>>,
     ) -> Result<Self, ConnectorError> {
-        if let Some(capability) = &capability {
-            super::ctas_staged_publication::validate_ctas_staged_publication_owner(
-                &self.descriptor,
-                self.incarnation,
-                capability.as_ref(),
-            )?;
+        if let Some(capability) = &capability
+            && (capability.descriptor() != &self.descriptor
+                || capability.incarnation() != self.incarnation)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "unanchored CTAS cleanup capability owner does not match its control binding generation",
+            ));
         }
-        self.ctas_staged_publication = capability;
+        self.unanchored_ctas_cleanup = capability;
         Ok(self)
     }
 
@@ -777,134 +767,6 @@ impl ConnectorControlBinding {
         &self,
     ) -> Option<&Arc<dyn ConnectorHistoricalMaintenanceRecovery>> {
         self.historical_maintenance_recovery.as_ref()
-    }
-
-    /// Installs the provider-owned external MV publication fence.
-    ///
-    /// It is a builder for the same reason staged-publication recovery is: it
-    /// keeps the existing control-binding constructors intact. Establishing a
-    /// fence and publishing under it are control-plane external mutations, so
-    /// this facet deliberately never reaches a BE execution binding.
-    pub fn try_with_mv_publication_fencing(
-        mut self,
-        fencing: Option<Arc<dyn ConnectorMvPublicationFencing>>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(fencing) = &fencing {
-            super::mv_publication_fencing::validate_mv_publication_fencing_owner(
-                &self.descriptor,
-                self.incarnation,
-                fencing.as_ref(),
-            )?;
-        }
-        self.mv_publication_fencing = fencing;
-        Ok(self)
-    }
-
-    pub fn mv_publication_fencing(&self) -> Option<&Arc<dyn ConnectorMvPublicationFencing>> {
-        self.mv_publication_fencing.as_ref()
-    }
-
-    /// Installs the provider-owned, target-scoped attempt discovery.
-    ///
-    /// It is FE-only for the same reason fencing is: enumerating a target's
-    /// attempts is a recovery/control decision, never something a BE execution
-    /// binding needs.
-    pub fn try_with_mv_attempt_discovery(
-        mut self,
-        discovery: Option<Arc<dyn ConnectorMvAttemptDiscovery>>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(discovery) = &discovery {
-            super::mv_attempt_discovery::validate_mv_attempt_discovery_owner(
-                &self.descriptor,
-                self.incarnation,
-                discovery.as_ref(),
-            )?;
-        }
-        self.mv_attempt_discovery = discovery;
-        Ok(self)
-    }
-
-    pub fn mv_attempt_discovery(&self) -> Option<&Arc<dyn ConnectorMvAttemptDiscovery>> {
-        self.mv_attempt_discovery.as_ref()
-    }
-
-    /// Installs the provider-owned historical distributed-write inspector.
-    ///
-    /// It is installed separately from the ordinary write capability on
-    /// purpose: an ordinary execution path must never be able to reach this
-    /// facet as a fallback, and a provider may own ordinary writes without
-    /// owning historical recovery.
-    pub fn try_with_historical_write_recovery(
-        mut self,
-        recovery: Option<Arc<dyn ConnectorHistoricalWriteRecovery>>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(recovery) = &recovery {
-            super::historical_write_recovery::validate_historical_write_recovery_owner(
-                &self.descriptor,
-                self.incarnation,
-                recovery.as_ref(),
-            )?;
-        }
-        self.historical_write_recovery = recovery;
-        Ok(self)
-    }
-
-    pub fn historical_write_recovery(&self) -> Option<&Arc<dyn ConnectorHistoricalWriteRecovery>> {
-        self.historical_write_recovery.as_ref()
-    }
-
-    /// Installs the provider-owned historical direct-mutation inspector.
-    ///
-    /// It is installed separately from the ordinary data-mutation capability on
-    /// purpose. TRUNCATE and ADD FILES are executed exactly once by one exact
-    /// generation; letting an ordinary execution path fall back into
-    /// cross-generation inspection is precisely how a destructive mutation
-    /// would get replayed. A provider may own ordinary direct mutation without
-    /// owning historical recovery, and this facet is also independent from the
-    /// distributed-write historical facet.
-    pub fn try_with_historical_data_mutation_recovery(
-        mut self,
-        recovery: Option<Arc<dyn ConnectorHistoricalDataMutationRecovery>>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(recovery) = &recovery {
-            super::historical_data_mutation_recovery::validate_historical_data_mutation_recovery_owner(
-                &self.descriptor,
-                self.incarnation,
-                recovery.as_ref(),
-            )?;
-        }
-        self.historical_data_mutation_recovery = recovery;
-        Ok(self)
-    }
-
-    pub fn historical_data_mutation_recovery(
-        &self,
-    ) -> Option<&Arc<dyn ConnectorHistoricalDataMutationRecovery>> {
-        self.historical_data_mutation_recovery.as_ref()
-    }
-
-    /// Installs current-generation catalog inspection for a historical CTAS.
-    /// This slot is independent from both ordinary staged-create and ordinary
-    /// fenced CTAS publication, preventing a cross-generation fallback.
-    pub fn try_with_historical_ctas_staged_publication_recovery(
-        mut self,
-        recovery: Option<Arc<dyn ConnectorHistoricalCtasStagedPublicationRecovery>>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(recovery) = &recovery {
-            super::ctas_staged_publication::validate_historical_ctas_staged_publication_owner(
-                &self.descriptor,
-                self.incarnation,
-                recovery.as_ref(),
-            )?;
-        }
-        self.historical_ctas_staged_publication_recovery = recovery;
-        Ok(self)
-    }
-
-    pub fn historical_ctas_staged_publication_recovery(
-        &self,
-    ) -> Option<&Arc<dyn ConnectorHistoricalCtasStagedPublicationRecovery>> {
-        self.historical_ctas_staged_publication_recovery.as_ref()
     }
 
     pub fn execution_declaration(
@@ -1081,23 +943,28 @@ impl ConnectorControlPlanningLease {
         ConnectorStagedCreateLease::new(owner, capability, move || drop(retained_planning_lease))
     }
 
-    /// Derive the exact-generation fenced CTAS publication lease. This is the
-    /// mandatory CTAS capability preflight and must run before source work.
-    pub fn derive_ctas_staged_publication_lease(
+    /// Derive the catalog-wide unanchored CTAS cleanup capability from this
+    /// planning generation. It is retained alongside staged-create so a
+    /// retired connector generation cannot use a newer catalog's warehouse.
+    pub fn derive_unanchored_ctas_cleanup_lease(
         &self,
-    ) -> Result<ConnectorCtasStagedPublicationLease, ConnectorError> {
-        let capability = self.binding.ctas_staged_publication().cloned().ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "connector control generation has no catalog-native fenced CTAS staged-publication capability",
-            )
-        })?;
+    ) -> Result<ConnectorUnanchoredCtasCleanupLease, ConnectorError> {
+        let capability = self
+            .binding
+            .unanchored_ctas_cleanup()
+            .cloned()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "connector control generation has no unanchored CTAS cleanup capability",
+                )
+            })?;
         let owner = ConnectorExecutionBindingKey {
             instance_id: self.binding.descriptor().instance_id.clone(),
             incarnation: self.binding.incarnation(),
         };
         let retained_planning_lease = self.clone();
-        ConnectorCtasStagedPublicationLease::new(owner, capability, move || {
+        ConnectorUnanchoredCtasCleanupLease::new(owner, capability, move || {
             drop(retained_planning_lease)
         })
     }

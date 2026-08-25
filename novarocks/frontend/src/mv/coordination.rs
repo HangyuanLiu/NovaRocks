@@ -46,10 +46,9 @@ use crate::state_store::coordination::{
 };
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorControlBinding, ConnectorError, ConnectorErrorKind,
-    ConnectorMvPublicationTargetRequest, ConnectorMvRefreshResourceIdentity,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution,
+    ConnectorControlBinding, ConnectorError, ConnectorErrorKind, ConnectorProviderId,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
+    ConnectorTableObjectId, ConnectorTableObjectSelector, ConnectorTableResolution,
 };
 use novarocks_spi::state_store::StateStore;
 use uuid::Uuid;
@@ -67,15 +66,38 @@ const MV_REFRESH_RESOURCE_PREFIX: &[u8] = b"novarocks/mv/refresh/v1/";
 /// genuinely contended target from spinning.
 const ACQUIRE_CONFLICT_RETRIES: u8 = 3;
 
-/// Builds the per-target lease resource key from the stable target identity.
-///
-/// Only the provider ID and the immutable target table UUID contribute. A
-/// display name, a numeric `mv_id`, or a catalog attachment lifecycle ID must
-/// never appear here: the first two are reassigned by a rebuild and the third is
-/// reused across DROP/recreate, so any of them would break the invariant that
-/// one external table maps to exactly one refresh ownership domain.
+/// Provider-observed immutable target identity used solely for StateStore
+/// scheduling. It is deliberately distinct from lake publication requirements:
+/// main/staging OCC decides which refresh publishes.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct MvRefreshSchedulingResource {
+    provider_id: ConnectorProviderId,
+    object_id: ConnectorTableObjectId,
+}
+
+impl MvRefreshSchedulingResource {
+    fn new(provider_id: ConnectorProviderId, object_id: ConnectorTableObjectId) -> Self {
+        Self {
+            provider_id,
+            object_id,
+        }
+    }
+
+    fn canonical_encoding(&self) -> Vec<u8> {
+        let provider = self.provider_id.as_str().as_bytes();
+        let object = self.object_id.as_bytes();
+        let mut encoded = Vec::with_capacity(provider.len() + object.len() + 1);
+        encoded.extend_from_slice(provider);
+        encoded.push(0);
+        encoded.extend_from_slice(object);
+        encoded
+    }
+}
+
+/// Builds the per-target lease resource key from the provider-observed object
+/// binding. Logical display names and numeric MV IDs never enter this key.
 pub(crate) fn mv_refresh_resource_key(
-    resource: &ConnectorMvRefreshResourceIdentity,
+    resource: &MvRefreshSchedulingResource,
 ) -> Result<ResourceKey, CoordinationError> {
     let canonical = resource.canonical_encoding();
     let mut bytes = Vec::with_capacity(MV_REFRESH_RESOURCE_PREFIX.len() + canonical.len());
@@ -122,7 +144,7 @@ impl MvRefreshCoordination {
     /// another frontend owning the target, which it does not.
     pub(crate) async fn acquire(
         &self,
-        resource: &ConnectorMvRefreshResourceIdentity,
+        resource: &MvRefreshSchedulingResource,
     ) -> Result<AcquireOutcome, CoordinationError> {
         let key = mv_refresh_resource_key(resource)?;
         let mut remaining = ACQUIRE_CONFLICT_RETRIES;
@@ -185,31 +207,28 @@ impl MvRefreshCoordination {
 /// is keyed by, so it must be known first.
 pub(crate) fn resolve_target_resource(
     binding: &ConnectorControlBinding,
-    table: &ConnectorTableHandle,
+    table: ConnectorTableIdentity,
     context: &ConnectorRequestContext,
-) -> Result<ConnectorMvRefreshResourceIdentity, ConnectorError> {
-    let fencing = binding.mv_publication_fencing().ok_or_else(|| {
-        ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "connector does not support MV publication fencing, so its targets cannot be \
-             refreshed under cluster-wide ownership",
-        )
-    })?;
-    let observation = fencing.observe_target(ConnectorMvPublicationTargetRequest {
-        table: table.clone(),
-        context: context.clone(),
-    })?;
-    let resource = observation.resource().clone();
-    // The provider signs the identity; validating it here means a malformed
-    // observation cannot become a lease key.
-    resource.validate()?;
-    if resource.provider_id() != &binding.descriptor().provider_id {
+) -> Result<MvRefreshSchedulingResource, ConnectorError> {
+    let captured =
+        binding
+            .metadata()
+            .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+                table,
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                selector: ConnectorTableObjectSelector::Current,
+                context: context.clone(),
+            })?;
+    if captured.metadata.identity.instance_id != binding.descriptor().instance_id {
         return Err(ConnectorError::new(
             ConnectorErrorKind::CorruptData,
-            "MV target observation returned another provider's resource identity",
+            "MV target object binding returned another connector instance",
         ));
     }
-    Ok(resource)
+    Ok(MvRefreshSchedulingResource::new(
+        binding.descriptor().provider_id.clone(),
+        captured.object_id,
+    ))
 }
 
 /// What a refresh is about to do that the outside world would notice.
@@ -325,13 +344,8 @@ pub(crate) fn resolve_target_resource_for(
     binding: &ConnectorControlBinding,
     target: ConnectorTableIdentity,
     context: &ConnectorRequestContext,
-) -> Result<ConnectorMvRefreshResourceIdentity, ConnectorError> {
-    let metadata = binding.metadata().load_table(ConnectorTableRequest {
-        table: target,
-        resolution: ConnectorTableResolution::StrictBaseTable,
-        context: context.clone(),
-    })?;
-    resolve_target_resource(binding, &metadata.table, context)
+) -> Result<MvRefreshSchedulingResource, ConnectorError> {
+    resolve_target_resource(binding, target, context)
 }
 
 /// The refresh leases this process currently holds, keyed by MV.
@@ -357,7 +371,7 @@ pub struct MvRefreshOwnershipRegistry {
 }
 
 struct HeldRefreshLease {
-    resource: ConnectorMvRefreshResourceIdentity,
+    resource: MvRefreshSchedulingResource,
     fence: Arc<CurrentLeaseFence>,
     admission: WriteAdmission,
     /// The lease itself, kept alive for as long as this frontend owns the target.
@@ -384,7 +398,7 @@ impl MvRefreshOwnershipRegistry {
     pub(crate) fn register(
         &self,
         mv_id: i64,
-        resource: ConnectorMvRefreshResourceIdentity,
+        resource: MvRefreshSchedulingResource,
         fence: Arc<CurrentLeaseFence>,
         admission: WriteAdmission,
         guard: Arc<tokio::sync::Mutex<LeaseGuard>>,
@@ -468,7 +482,7 @@ impl MvRefreshOwnershipRegistry {
     }
 
     /// The stable resource this process holds for `mv_id`, if any.
-    pub(crate) fn resource_for(&self, mv_id: i64) -> Option<ConnectorMvRefreshResourceIdentity> {
+    pub(crate) fn resource_for(&self, mv_id: i64) -> Option<MvRefreshSchedulingResource> {
         self.held
             .read()
             .ok()?
@@ -573,10 +587,10 @@ pub enum OwnershipRefusal {
 /// Contention is not an error to surface to a user as a failure: manual refresh
 /// maps it to a retryable conflict, and the workers back off. Only genuine
 /// coordination unavailability is exceptional.
-pub async fn acquire_refresh_ownership(
+pub(crate) async fn acquire_refresh_ownership(
     context: &MvRefreshOwnershipContext,
     mv_id: i64,
-    resource: ConnectorMvRefreshResourceIdentity,
+    resource: MvRefreshSchedulingResource,
 ) -> Result<OwnedRefresh, OwnershipRefusal> {
     let coordination = &context.coordination;
     let registry = &context.registry;
@@ -713,12 +727,11 @@ mod tests {
     use super::*;
     use novarocks_spi::connector::ConnectorProviderId;
 
-    fn resource(uuid: u128) -> ConnectorMvRefreshResourceIdentity {
-        ConnectorMvRefreshResourceIdentity::try_new(
+    fn resource(value: u128) -> MvRefreshSchedulingResource {
+        MvRefreshSchedulingResource::new(
             ConnectorProviderId::parse("iceberg").unwrap(),
-            Uuid::from_u128(uuid),
+            ConnectorTableObjectId::try_new(Bytes::copy_from_slice(&value.to_be_bytes())).unwrap(),
         )
-        .unwrap()
     }
 
     /// Wraps a store and refuses the next `armed` commits with a definite
@@ -1208,7 +1221,7 @@ mod tests {
     /// pins the invariant that no numeric `mv_id`, display name, or attachment
     /// id can leak into the ownership domain — anything extra would change this
     /// byte sequence.
-    fn expected_key(identity: &ConnectorMvRefreshResourceIdentity) -> ResourceKey {
+    fn expected_key(identity: &MvRefreshSchedulingResource) -> ResourceKey {
         let canonical = identity.canonical_encoding();
         let mut bytes = Vec::with_capacity(MV_REFRESH_RESOURCE_PREFIX.len() + canonical.len());
         bytes.extend_from_slice(MV_REFRESH_RESOURCE_PREFIX);

@@ -37,11 +37,8 @@ pub(crate) mod recovery;
 pub mod runner;
 pub mod service;
 pub mod state_store_journal;
-pub mod statement_recovery;
 pub mod truncate;
-pub mod write_recovery;
 
-pub use coordination::DmlExternalFenceProposal;
 pub use error::{DmlError, DmlErrorKind};
 pub use insert::{InsertCommand, InsertCommandSource, convert_insert_command, reorder_insert_rows};
 pub use journal::{

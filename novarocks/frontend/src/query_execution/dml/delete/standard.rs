@@ -64,6 +64,7 @@ pub(crate) fn prepare_delete_statement(
     current_database: &str,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    publication_id: novarocks_spi::connector::LakePublicationId,
 ) -> Result<PreparedDelete, String> {
     // Detect branch/tag suffix in the target table name.
     let target_name = sql_object_name(&stmt.target);
@@ -139,7 +140,7 @@ pub(crate) fn prepare_delete_statement(
     //    frontend persists its operation intent -- unlike UPDATE and MERGE,
     //    which defer activation until after. Aligning the two is a lifecycle
     //    change and not part of this cutover.
-    let connector_operation_id = ConnectorWriteOperationId::new();
+    let connector_operation_id = publication_id.into();
     let (write_lease, row_mutation) = target_binding.prepare_row_mutation(
         &target_ref,
         connector_operation_id,
@@ -175,6 +176,7 @@ pub(crate) fn prepare_delete_statement(
         execution.clone(),
         connector_context,
         planning_lease,
+        publication_id,
     )
 }
 
@@ -195,26 +197,6 @@ struct DistributedDeleteWriteExecutor {
 }
 
 impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
-    /// DELETE activates its write generation during preparation, so the
-    /// authority already exists before anything is dispatched. The resource
-    /// identity comes from the activated template, never from a name the
-    /// frontend supplied.
-    fn external_fence_authority(
-        &self,
-    ) -> Result<
-        crate::query_execution::dml::external_write_fence::ExternalWriteFenceAuthority,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        crate::query_execution::dml::external_write_fence::ExternalWriteFenceAuthority::try_new(
-            self.connector_write.lease(),
-            self.connector_write.operation_id(),
-            &self.target.namespace,
-            &self.target.table,
-            self.connector_write.preparation().target_ref().clone(),
-            self.connector_context.clone(),
-        )
-    }
-
     fn native_encoding(
         &self,
     ) -> Result<
@@ -308,6 +290,7 @@ fn prepare_delete_write(
     execution: QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    publication_id: novarocks_spi::connector::LakePublicationId,
 ) -> Result<PreparedDelete, String> {
     let deletion_vectors = match strategy {
         ConnectorRowMutationStrategy::DeletionVector => true,
@@ -372,6 +355,7 @@ fn prepare_delete_write(
     };
     Ok(prepared_delete(
         DeleteOperation {
+            publication_id,
             catalog: target.catalog.clone(),
             namespace: target.namespace.clone(),
             table: target.table.clone(),

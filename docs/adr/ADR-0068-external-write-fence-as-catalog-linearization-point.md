@@ -2,9 +2,9 @@
 id: ADR-0068
 title: "External write fence as a catalog linearization point for distributed DML"
 domain: [provider-spi, frontend-dml]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0104
 date: 2026-08-13
 provenance:
   - "mechanism: provider-owned external write fence + historical write recovery facet for INSERT/DELETE/UPDATE/MERGE (PR number to backfill after merge)"

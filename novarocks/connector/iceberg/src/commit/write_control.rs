@@ -52,7 +52,8 @@ use novarocks_spi::connector::{
     ConnectorWritePlanningRequest, ConnectorWritePreparationOutcome,
     ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
     ConnectorWriterHandle, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationFamily,
+    LakePublicationId, LakePublicationMarkerHeader,
 };
 
 use crate::control_provider::IcebergControlProvider;
@@ -70,17 +71,10 @@ use crate::write_codec::{
 };
 use crate::write_payload::{IcebergFirstRefreshWritePlanPayloadV2, IcebergWritePlanPayloadV1};
 
-use super::write_fence::{
-    FenceError, IcebergFenceAssertion, IcebergWriteFenceFacts, derive_established_assertion,
-    establish_fence, fence_facts_from_spi,
-};
 use super::{
     CommitOpKind, CommitOutcome, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
     DeletionVector, EqualityDeleteColumn, IcebergCommitCollector, RecoveryEvidence, RunInput,
     WrittenFile, run_iceberg_commit,
-};
-use novarocks_spi::connector::{
-    ConnectorExternalFenceFailure, ConnectorExternalFenceReceipt, ConnectorExternalFenceRequest,
 };
 
 const ICEBERG_WRITE_CONTROL_EVIDENCE_VERSION: u16 = 2;
@@ -287,9 +281,11 @@ struct CommitUnknownOperation {
 #[serde(deny_unknown_fields)]
 pub(crate) struct IcebergWriteOperationMarkerV1 {
     pub(crate) version: u8,
+    /// Cross-family NovaRocks publication identity and the only operation ID
+    /// representation in the marker.
+    pub(crate) publication: LakePublicationMarkerHeader,
     pub(crate) instance_id: String,
     pub(crate) incarnation_base64: String,
-    pub(crate) operation_id_base64: String,
     pub(crate) target_ref: String,
     pub(crate) cohort_set_digest_base64: String,
     pub(crate) aggregate_digest_base64: String,
@@ -466,7 +462,8 @@ impl IcebergWriteControl {
                         prepare_partition_replacement(&metadata, replacement, request.operation_id)
                     })
                     .transpose()?,
-                ConnectorWriteActivationIntent::Ordinary => None,
+                ConnectorWriteActivationIntent::Ordinary
+                | ConnectorWriteActivationIntent::Publication(_) => None,
             };
             if let Some(replacement) = &partition_replacement {
                 if preparation.target_ref().as_str() != "main" {
@@ -1075,7 +1072,8 @@ impl IcebergWriteControl {
             );
         }
         match &request.intent {
-            ConnectorWriteActivationIntent::Ordinary => plan.encode(),
+            ConnectorWriteActivationIntent::Ordinary
+            | ConnectorWriteActivationIntent::Publication(_) => plan.encode(),
             ConnectorWriteActivationIntent::ManagedPublication(intent) => {
                 // A refresh publishes either a prepared staging write (full
                 // refresh) or the provider routes of a row-mutation apply
@@ -1116,29 +1114,6 @@ impl IcebergWriteControl {
                 .encode()
             }
         }
-    }
-
-    /// Load the fenced resource named by the fence itself.
-    ///
-    /// The fence carries its own resource identity, so establishing a fence does
-    /// not require an activated operation: a recovering owner must be able to
-    /// raise a fence for an operation whose runtime state it never had.
-    /// Deliberately does *not* go through `load_exact_commit_table`: that helper
-    /// asserts the table still matches an exact sealed preparation, which a
-    /// recovering owner does not have and must not need in order to fence.
-    fn load_fence_table(
-        &self,
-        facts: &IcebergWriteFenceFacts,
-    ) -> Result<crate::iceberg::table::Table, ConnectorError> {
-        self.runtime
-            .control_state()
-            .physical_table_cache()
-            .invalidate(&facts.namespace, &facts.table_name);
-        Ok(self
-            .runtime
-            .load_table(&facts.namespace, &facts.table_name)
-            .map_err(unavailable)?
-            .table)
     }
 
     fn load_exact_commit_table(
@@ -1249,7 +1224,6 @@ impl IcebergWriteControl {
         request: &ConnectorWriteCommitRequest,
         active: &ActiveOperation,
         table: crate::iceberg::table::Table,
-        fence: Option<IcebergFenceAssertion>,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, CommitServiceError> {
         let metadata = table.metadata().clone();
         let commit_metadata = active
@@ -1301,6 +1275,7 @@ impl IcebergWriteControl {
             && matches!(
                 active.activation_intent,
                 ConnectorWriteActivationIntent::Ordinary
+                    | ConnectorWriteActivationIntent::Publication(_)
             )
             && !replaces_every_live_row(&decoded)
         {
@@ -1417,7 +1392,6 @@ impl IcebergWriteControl {
                 })
                 .transpose()
                 .map_err(CommitServiceError::invalid_input)?,
-            fence,
         };
         let result = self
             .runtime
@@ -1492,11 +1466,21 @@ impl IcebergWriteControl {
         cohort_set_digest: [u8; 32],
         aggregate_digest: [u8; 32],
     ) -> IcebergWriteOperationMarkerV1 {
+        let family = match &active.activation_intent {
+            ConnectorWriteActivationIntent::Ordinary => LakePublicationFamily::Write,
+            ConnectorWriteActivationIntent::Publication(family) => *family,
+            ConnectorWriteActivationIntent::ManagedPublication(_) => {
+                LakePublicationFamily::MaterializedViewRefresh
+            }
+        };
         IcebergWriteOperationMarkerV1 {
             version: ICEBERG_WRITE_OPERATION_MARKER_VERSION,
+            publication: LakePublicationMarkerHeader::new(
+                LakePublicationId::from_bytes(operation_id.to_bytes()),
+                family,
+            ),
             instance_id: self.key.instance_id.as_str().to_string(),
             incarnation_base64: base64_encode(self.key.incarnation.to_bytes()),
-            operation_id_base64: base64_encode(operation_id.to_bytes()),
             target_ref: if active.partition_replacement.is_some() {
                 "main".to_string()
             } else {
@@ -1746,46 +1730,6 @@ impl ConnectorWriteControl for IcebergWriteControl {
         &self.key
     }
 
-    /// Publish this attempt's fence marker so that a later commit can assert it
-    /// atomically.
-    ///
-    /// The marker is published on a provider-private ref derived from the stable
-    /// write operation id, so establishing a fence never contends with an
-    /// unrelated concurrent operation on the same table. Replaying the identical
-    /// fence reuses the existing marker; a lower generation, another operation's
-    /// marker, or an uninterpretable marker all refuse.
-    ///
-    /// Design: ADR-0068 (docs/adr/ADR-0068-external-write-fence-as-catalog-linearization-point.md)
-    fn establish_external_fence(
-        &self,
-        request: ConnectorExternalFenceRequest,
-    ) -> Result<ConnectorExternalFenceReceipt, ConnectorError> {
-        validate_context(&request.context)?;
-        self.ensure_owner(&request.owner)?;
-        request.validate(&self.key)?;
-
-        let facts = fence_facts_from_spi(&request.fence);
-        let table = self
-            .load_fence_table(&facts)
-            .map_err(|error| invalid(error.to_string()))?;
-        let file_io = table.file_io().clone();
-        let catalog = Arc::clone(self.runtime.catalog());
-        let established = self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(
-                async move { establish_fence(catalog.as_ref(), &table, &file_io, &facts).await },
-            )
-            .map_err(|error| internal(format!("Iceberg fence establishment: {error}")))?
-            .map_err(fence_failure_to_connector_error)?;
-
-        ConnectorExternalFenceReceipt::try_new(
-            &request.fence,
-            encode_fence_receipt_payload(&established.assertion),
-        )
-    }
-
     fn prepare_write(
         &self,
         request: ConnectorWritePreparationRequest,
@@ -2028,10 +1972,6 @@ impl ConnectorWriteControl for IcebergWriteControl {
             Ok(())
         };
 
-        // The fence must already exist in external truth before this commit is
-        // allowed to touch the table. Deriving it here, at the SPI boundary,
-        // is what lets a lost fence surface as a typed stale failure instead of
-        // being laundered into an ambiguous commit-unknown outcome.
         let table = match self.load_exact_commit_table(&active.target) {
             Ok(table) => table,
             Err(error) => {
@@ -2039,103 +1979,84 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 return Err(invalid(error.to_string()));
             }
         };
-        // A fenced family derives its assertion from external truth here; a
-        // family this phase does not fence carries none, and `run` refuses any
-        // op kind that cannot actually assert one, so an exemption can never
-        // silently become a dropped fence.
-        let fence_assertion = match request.fence.fence() {
-            Some(spi_fence) => {
-                let fence_facts = fence_facts_from_spi(spi_fence);
-                match derive_established_assertion(table.metadata(), &fence_facts) {
-                    Ok(assertion) => Some(assertion),
-                    Err(error) => {
-                        restore_active()?;
-                        return Err(fence_failure_to_connector_error(error));
-                    }
+        let (outcome, known_uncommitted_finalization) = match self
+            .execute_commit(&request, &active, table)
+        {
+            Ok(outcome) => (outcome, None),
+            Err(CommitServiceError::InvalidInput { message }) => {
+                let mut operations = self.operations.lock().map_err(operation_lock_error)?;
+                if matches!(
+                    operations.get(&operation_id),
+                    Some(OperationState::Committing(record))
+                        if record.cohort_set_digest == request.sealed().digest()
+                            && record.aggregate_digest == request.aggregate_digest()
+                ) {
+                    operations.insert(operation_id, OperationState::Active(active.clone()));
                 }
+                return Err(invalid(message));
             }
-            None => None,
-        };
-
-        let (outcome, known_uncommitted_finalization) =
-            match self.execute_commit(&request, &active, table, fence_assertion) {
-                Ok(outcome) => (outcome, None),
-                Err(CommitServiceError::InvalidInput { message }) => {
-                    let mut operations = self.operations.lock().map_err(operation_lock_error)?;
-                    if matches!(
-                        operations.get(&operation_id),
-                        Some(OperationState::Committing(record))
-                            if record.cohort_set_digest == request.sealed().digest()
-                                && record.aggregate_digest == request.aggregate_digest()
-                    ) {
-                        operations.insert(operation_id, OperationState::Active(active.clone()));
-                    }
-                    return Err(invalid(message));
-                }
-                Err(CommitServiceError::KnownUncommitted { message, cleanup }) => (
-                    ExternalMutationOutcome::KnownUncommitted {
-                        failure: ConnectorMutationFailure::new(
-                            ConnectorMutationFailureKind::Conflict,
-                            format!(
-                                "{message}; staged cleanup attempted={}, errors={}",
-                                cleanup.attempted, cleanup.error_count
-                            ),
+            Err(CommitServiceError::KnownUncommitted { message, cleanup }) => (
+                ExternalMutationOutcome::KnownUncommitted {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Conflict,
+                        format!(
+                            "{message}; staged cleanup attempted={}, errors={}",
+                            cleanup.attempted, cleanup.error_count
                         ),
-                    },
-                    Some(cleanup_finalization(&cleanup)),
-                ),
-                Err(CommitServiceError::Unknown { message, evidence }) => (
-                    ExternalMutationOutcome::CommitUnknown {
-                        failure: ConnectorMutationFailure::new(
-                            ConnectorMutationFailureKind::Unavailable,
-                            message,
-                        ),
-                        evidence: self
-                            .encode_commit_unknown_evidence(&request, &active, evidence)?,
-                    },
-                    None,
-                ),
-                Err(CommitServiceError::FinalizeFailedKnownCommitted {
-                    outcome: Some(committed),
-                    finalize_error,
-                    ..
-                }) => (
-                    ExternalMutationOutcome::KnownCommitted {
-                        effect: ExternalMutationEffect::Applied,
-                        receipt: crate::write_codec::connector_write_receipt_with_partitioning(
-                            committed.new_snapshot_id,
-                            None,
-                            active
-                                .partition_replacement
-                                .as_ref()
-                                .map(|replacement| replacement.committed.clone()),
-                        )
-                        .map_err(internal)?,
-                        finalization: ExternalMutationFinalization::Failed(
-                            ConnectorMutationFailure::new(
-                                ConnectorMutationFailureKind::Internal,
-                                finalize_error,
-                            ),
-                        ),
-                    },
-                    None,
-                ),
-                Err(CommitServiceError::FinalizeFailedKnownCommitted {
-                    outcome: None,
-                    finalize_error,
-                    evidence,
-                }) => (
-                    ExternalMutationOutcome::CommitUnknown {
-                        failure: ConnectorMutationFailure::new(
+                    ),
+                },
+                Some(cleanup_finalization(&cleanup)),
+            ),
+            Err(CommitServiceError::Unknown { message, evidence }) => (
+                ExternalMutationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        message,
+                    ),
+                    evidence: self.encode_commit_unknown_evidence(&request, &active, evidence)?,
+                },
+                None,
+            ),
+            Err(CommitServiceError::FinalizeFailedKnownCommitted {
+                outcome: Some(committed),
+                finalize_error,
+                ..
+            }) => (
+                ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt: crate::write_codec::connector_write_receipt_with_partitioning(
+                        committed.new_snapshot_id,
+                        None,
+                        active
+                            .partition_replacement
+                            .as_ref()
+                            .map(|replacement| replacement.committed.clone()),
+                    )
+                    .map_err(internal)?,
+                    finalization: ExternalMutationFinalization::Failed(
+                        ConnectorMutationFailure::new(
                             ConnectorMutationFailureKind::Internal,
                             finalize_error,
                         ),
-                        evidence: self
-                            .encode_commit_unknown_evidence(&request, &active, evidence)?,
-                    },
-                    None,
-                ),
-            };
+                    ),
+                },
+                None,
+            ),
+            Err(CommitServiceError::FinalizeFailedKnownCommitted {
+                outcome: None,
+                finalize_error,
+                evidence,
+            }) => (
+                ExternalMutationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Internal,
+                        finalize_error,
+                    ),
+                    evidence: self.encode_commit_unknown_evidence(&request, &active, evidence)?,
+                },
+                None,
+            ),
+        };
         self.invalidate_target_caches(&active.target);
         let mut operations = self.operations.lock().map_err(operation_lock_error)?;
         let state = match &outcome {
@@ -2479,7 +2400,8 @@ impl ConnectorWriteControl for IcebergWriteControl {
                         corrupt("Iceberg managed publication snapshot has a negative row count")
                     })?)
                 }
-                ConnectorWriteActivationIntent::Ordinary => None,
+                ConnectorWriteActivationIntent::Ordinary
+                | ConnectorWriteActivationIntent::Publication(_) => None,
             };
             let committed_partitioning = unknown
                 .active
@@ -3185,10 +3107,8 @@ pub(crate) fn operation_marker_partitioning(
             ),
         ));
     }
-    let operation_id = ConnectorWriteOperationId::from_bytes(decode_marker_fixed::<16>(
-        &marker.operation_id_base64,
-        "operation id",
-    )?);
+    let operation_id =
+        ConnectorWriteOperationId::from_bytes(marker.publication.publication_id().to_bytes());
     let replacement_id = marker
         .partition_replacement_id_base64
         .as_deref()
@@ -3266,17 +3186,26 @@ pub(crate) fn operation_marker_from_snapshot(
     }
     novarocks_spi::connector::ConnectorInstanceId::parse(&marker.instance_id)
         .map_err(|error| corrupt(format!("invalid Iceberg marker instance ID: {error}")))?;
+    marker.publication.validate().map_err(|error| {
+        corrupt(format!(
+            "invalid Iceberg marker publication header: {error}"
+        ))
+    })?;
     if marker.target_ref.trim().is_empty() {
         return Err(corrupt(
             "Iceberg write operation marker has an empty target ref",
         ));
     }
     decode_marker_fixed::<16>(&marker.incarnation_base64, "incarnation")?;
-    decode_marker_fixed::<16>(&marker.operation_id_base64, "operation id")?;
+    if marker.publication.family() != LakePublicationFamily::Write {
+        return Err(corrupt(
+            "Iceberg write operation marker has a non-write publication family",
+        ));
+    }
     decode_marker_fixed::<32>(&marker.cohort_set_digest_base64, "cohort set digest")?;
     decode_marker_fixed::<32>(&marker.aggregate_digest_base64, "aggregate digest")?;
     validate_partition_reconcile_facts(
-        &marker.operation_id_base64,
+        &base64_encode(marker.publication.publication_id().to_bytes()),
         marker.partition_replacement_id_base64.as_deref(),
         marker.expected_prior_partition_spec_id,
         marker
@@ -3884,51 +3813,6 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unavailable, message).with_retryable_before_progress()
 }
 
-const ICEBERG_FENCE_RECEIPT_VERSION: u8 = 1;
-
-/// Encode the provider-private half of a fence receipt.
-///
-/// The frontend stores these bytes opaquely and never decodes them; only a later
-/// generation of this provider reads them back, to name the marker an earlier
-/// attempt published without having to re-derive the ref naming rules.
-pub(crate) fn encode_fence_receipt_payload(assertion: &IcebergFenceAssertion) -> Bytes {
-    let mut payload = Vec::new();
-    payload.push(ICEBERG_FENCE_RECEIPT_VERSION);
-    payload.extend_from_slice(&assertion.fence_snapshot_id().to_be_bytes());
-    let fence_ref = assertion.fence_ref().as_bytes();
-    payload.extend_from_slice(&(fence_ref.len() as u32).to_be_bytes());
-    payload.extend_from_slice(fence_ref);
-    Bytes::from(payload)
-}
-
-/// Map a fence failure onto the typed SPI failure.
-///
-/// Every arm that represents "another owner holds this operation" must reach
-/// `ConnectorError::external_fence`. Mapping any of them to `Unavailable` would
-/// invite a retry under an authority we no longer hold, and mapping them to
-/// `Unsupported` would invite an unfenced fallback — the two failure modes the
-/// external fence exists to prevent.
-///
-/// `Ambiguous` and `Failed` are deliberately *not* fence failures: they mean we
-/// could not determine the fence state, which must stay a plain error so the
-/// caller keeps the operation unresolved instead of concluding anything.
-pub(crate) fn fence_failure_to_connector_error(error: FenceError) -> ConnectorError {
-    let message = error.to_string();
-    match error {
-        FenceError::Superseded { .. } => {
-            ConnectorError::external_fence(ConnectorExternalFenceFailure::Superseded, message)
-        }
-        FenceError::NotEstablished { .. } => {
-            ConnectorError::external_fence(ConnectorExternalFenceFailure::NotEstablished, message)
-        }
-        FenceError::MarkerConflict { .. } => {
-            ConnectorError::external_fence(ConnectorExternalFenceFailure::ForeignOperation, message)
-        }
-        FenceError::Ambiguous { .. } => corrupt(message),
-        FenceError::Failed { .. } => internal(message),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
@@ -3979,28 +3863,6 @@ mod tests {
         .expect("context")
     }
 
-    fn fence(
-        operation_id: ConnectorWriteOperationId,
-    ) -> novarocks_spi::connector::ConnectorExternalOperationFence {
-        novarocks_spi::connector::ConnectorExternalOperationFence::try_new(
-            novarocks_spi::connector::ConnectorClusterIdentity::derive(
-                "iceberg-write-test-cluster",
-            )
-            .expect("cluster identity"),
-            novarocks_spi::connector::ConnectorExternalFenceGeneration::try_new(1, 1, 1)
-                .expect("fence generation"),
-            operation_id,
-            [8; 16],
-            novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
-                namespace: Arc::from("db"),
-                table: Arc::from("t"),
-            },
-            ConnectorWriteTargetRef::main(),
-        )
-        .expect("external operation fence")
-    }
-
     fn control() -> (tokio::runtime::Runtime, IcebergWriteControl) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
@@ -4036,335 +3898,6 @@ mod tests {
             runtime,
         );
         (executor, control)
-    }
-
-    /// Same fence as `fence`, but at an explicit generation.
-    fn fence_at(
-        operation_id: ConnectorWriteOperationId,
-        incarnation: u64,
-        epoch: u64,
-        attempt: u64,
-    ) -> novarocks_spi::connector::ConnectorExternalOperationFence {
-        novarocks_spi::connector::ConnectorExternalOperationFence::try_new(
-            novarocks_spi::connector::ConnectorClusterIdentity::derive(
-                "iceberg-write-test-cluster",
-            )
-            .expect("cluster identity"),
-            novarocks_spi::connector::ConnectorExternalFenceGeneration::try_new(
-                incarnation,
-                epoch,
-                attempt,
-            )
-            .expect("fence generation"),
-            operation_id,
-            [8; 16],
-            novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
-                namespace: Arc::from("db"),
-                table: Arc::from("t"),
-            },
-            ConnectorWriteTargetRef::main(),
-        )
-        .expect("external operation fence")
-    }
-
-    // ---------------------------------------------------------------------
-    // External write fence race matrix
-    //
-    // These assert the property the whole design exists for: once a later
-    // owner raises the fence, an older attempt's commit fails *at the
-    // catalog*, and the table is left untouched. Proving only that the old
-    // holder cannot write control-plane state would prove nothing about the
-    // external effect it may still be holding.
-    // ---------------------------------------------------------------------
-
-    /// Count data snapshots, ignoring the provider-private fence markers.
-    fn data_snapshot_count(table: &crate::iceberg::table::Table) -> usize {
-        table
-            .metadata()
-            .snapshots()
-            .filter(|snapshot| {
-                !crate::commit::write_fence::is_fence_marker_snapshot(snapshot.summary())
-            })
-            .count()
-    }
-
-    /// Count the provider-private fence markers.
-    fn fence_marker_count(table: &crate::iceberg::table::Table) -> usize {
-        table
-            .metadata()
-            .snapshots()
-            .filter(|snapshot| {
-                crate::commit::write_fence::is_fence_marker_snapshot(snapshot.summary())
-            })
-            .count()
-    }
-
-    #[test]
-    fn establishing_a_fence_is_its_own_catalog_commit_and_publishes_no_data() {
-        // ADR-0068 makes the fence the catalog linearization point: it is
-        // raised as a separate commit *before* the data snapshot, never folded
-        // into it. That separation is why one connector write advances the
-        // Hadoop metadata version twice — once for the fence, once for the
-        // data. Assert the provider-level invariant rather than counting files
-        // on disk, so the check survives a catalog layout change.
-        let (executor, _warehouse, control, table) = control_with_empty_table();
-        let operation_id = ConnectorWriteOperationId::from_bytes([37; 16]);
-        let catalog = Arc::clone(control.runtime.catalog());
-        let file_io = table.file_io().clone();
-
-        assert_eq!(fence_marker_count(&table), 0, "a fresh table has no fence");
-        assert_eq!(data_snapshot_count(&table), 0, "a fresh table has no data");
-
-        let facts =
-            crate::commit::write_fence::fence_facts_from_spi(&fence_at(operation_id, 1, 1, 1));
-        let after_fence = executor.block_on(async {
-            crate::commit::write_fence::establish_fence(catalog.as_ref(), &table, &file_io, &facts)
-                .await
-                .expect("establish the fence");
-            catalog
-                .load_table(table.identifier())
-                .await
-                .expect("reload after establish")
-        });
-
-        assert_eq!(
-            fence_marker_count(&after_fence),
-            1,
-            "establishing the fence must publish exactly one fence marker"
-        );
-        assert_eq!(
-            data_snapshot_count(&after_fence),
-            0,
-            "the fence commit must not publish a data snapshot of its own"
-        );
-
-        // Raising the fence for a later attempt is likewise its own commit and
-        // still publishes nothing readable.
-        let newer =
-            crate::commit::write_fence::fence_facts_from_spi(&fence_at(operation_id, 1, 1, 2));
-        let after_raise = executor.block_on(async {
-            crate::commit::write_fence::raise_fence(
-                catalog.as_ref(),
-                &after_fence,
-                &file_io,
-                &newer,
-            )
-            .await
-            .expect("raise the fence");
-            catalog
-                .load_table(table.identifier())
-                .await
-                .expect("reload after raise")
-        });
-
-        assert!(
-            fence_marker_count(&after_raise) > fence_marker_count(&after_fence),
-            "raising the fence must advance the marker rather than rewrite it in place"
-        );
-        assert_eq!(
-            data_snapshot_count(&after_raise),
-            0,
-            "raising the fence must not publish a data snapshot either"
-        );
-    }
-
-    #[test]
-    fn a_raised_fence_makes_an_older_attempt_fail_at_the_catalog() {
-        let (executor, _warehouse, control, table) = control_with_empty_table();
-        let operation_id = ConnectorWriteOperationId::from_bytes([21; 16]);
-        let catalog = Arc::clone(control.runtime.catalog());
-        let file_io = table.file_io().clone();
-
-        let older =
-            crate::commit::write_fence::fence_facts_from_spi(&fence_at(operation_id, 1, 1, 1));
-        let newer =
-            crate::commit::write_fence::fence_facts_from_spi(&fence_at(operation_id, 1, 1, 2));
-
-        let (older_assertion, table_after_raise) = executor.block_on(async {
-            let established = crate::commit::write_fence::establish_fence(
-                catalog.as_ref(),
-                &table,
-                &file_io,
-                &older,
-            )
-            .await
-            .expect("establish the older fence");
-            let reloaded = catalog
-                .load_table(table.identifier())
-                .await
-                .expect("reload after establish");
-            crate::commit::write_fence::raise_fence(catalog.as_ref(), &reloaded, &file_io, &newer)
-                .await
-                .expect("raise the fence");
-            let reloaded = catalog
-                .load_table(table.identifier())
-                .await
-                .expect("reload after raise");
-            (established.assertion, reloaded)
-        });
-
-        // The older attempt still holds a perfectly well-formed assertion. It
-        // just no longer names the marker the fence ref points at.
-        let error = crate::commit::write_fence::derive_established_assertion(
-            table_after_raise.metadata(),
-            &older,
-        )
-        .expect_err("an older generation must not be able to derive an assertion");
-        assert!(
-            matches!(
-                error,
-                crate::commit::write_fence::FenceError::Superseded { .. }
-            ),
-            "a raised fence must report the older attempt as superseded, got {error:?}"
-        );
-
-        // And the catalog itself refuses the older attempt's conditional
-        // update, which is the property that actually stops a late commit.
-        let stale_commit = crate::iceberg::TableCommit::builder()
-            .ident(table.identifier().clone())
-            .requirements(older_assertion.requirements())
-            .updates(vec![crate::iceberg::TableUpdate::SetProperties {
-                updates: HashMap::from([("novarocks.race.probe".to_string(), "1".to_string())]),
-            }])
-            .build();
-        let outcome = executor.block_on(async { catalog.update_table(stale_commit).await });
-        assert!(
-            outcome.is_err(),
-            "the catalog must reject a commit pinned to a superseded fence marker"
-        );
-
-        let final_table = executor
-            .block_on(async { catalog.load_table(table.identifier()).await })
-            .expect("reload after the refused commit");
-        assert_eq!(
-            data_snapshot_count(&final_table),
-            0,
-            "a fenced-out attempt must leave zero data snapshots behind"
-        );
-        assert!(
-            !final_table
-                .metadata()
-                .properties()
-                .contains_key("novarocks.race.probe"),
-            "the refused commit must not have applied any part of its update"
-        );
-    }
-
-    #[test]
-    fn replaying_the_identical_fence_reuses_the_same_marker() {
-        let (executor, _warehouse, control, table) = control_with_empty_table();
-        let operation_id = ConnectorWriteOperationId::from_bytes([22; 16]);
-        let catalog = Arc::clone(control.runtime.catalog());
-        let file_io = table.file_io().clone();
-        let facts =
-            crate::commit::write_fence::fence_facts_from_spi(&fence_at(operation_id, 1, 1, 1));
-
-        let (first, second) = executor.block_on(async {
-            let first = crate::commit::write_fence::establish_fence(
-                catalog.as_ref(),
-                &table,
-                &file_io,
-                &facts,
-            )
-            .await
-            .expect("first establish");
-            let reloaded = catalog
-                .load_table(table.identifier())
-                .await
-                .expect("reload");
-            let second = crate::commit::write_fence::establish_fence(
-                catalog.as_ref(),
-                &reloaded,
-                &file_io,
-                &facts,
-            )
-            .await
-            .expect("replayed establish");
-            (first, second)
-        });
-        assert!(
-            second.reused,
-            "an identical replay must reuse the marker rather than publish a second one"
-        );
-        assert_eq!(
-            first.assertion.fence_snapshot_id(),
-            second.assertion.fence_snapshot_id(),
-            "a replay must yield the same assertion"
-        );
-    }
-
-    #[test]
-    fn a_foreign_operation_cannot_reuse_another_operations_marker() {
-        let (executor, _warehouse, control, table) = control_with_empty_table();
-        let catalog = Arc::clone(control.runtime.catalog());
-        let file_io = table.file_io().clone();
-        let mine = crate::commit::write_fence::fence_facts_from_spi(&fence_at(
-            ConnectorWriteOperationId::from_bytes([23; 16]),
-            1,
-            1,
-            1,
-        ));
-        // Same fence ref, different operation: only reachable by forging the
-        // ref name, which is exactly what the check must catch.
-        let mut foreign = crate::commit::write_fence::fence_facts_from_spi(&fence_at(
-            ConnectorWriteOperationId::from_bytes([24; 16]),
-            1,
-            1,
-            5,
-        ));
-        foreign.write_operation_id = mine.write_operation_id.clone();
-        foreign.fence_digest = "0".repeat(64);
-
-        let error = executor.block_on(async {
-            crate::commit::write_fence::establish_fence(catalog.as_ref(), &table, &file_io, &mine)
-                .await
-                .expect("establish mine");
-            let reloaded = catalog
-                .load_table(table.identifier())
-                .await
-                .expect("reload");
-            crate::commit::write_fence::derive_established_assertion(reloaded.metadata(), &foreign)
-                .expect_err("a foreign fence value must not derive an assertion")
-        });
-        assert!(
-            matches!(
-                error,
-                crate::commit::write_fence::FenceError::MarkerConflict { .. }
-                    | crate::commit::write_fence::FenceError::Superseded { .. }
-            ),
-            "a foreign fence value must be refused, got {error:?}"
-        );
-    }
-
-    #[test]
-    fn a_raise_that_does_not_strictly_supersede_is_refused() {
-        let (executor, _warehouse, control, table) = control_with_empty_table();
-        let operation_id = ConnectorWriteOperationId::from_bytes([25; 16]);
-        let catalog = Arc::clone(control.runtime.catalog());
-        let file_io = table.file_io().clone();
-        let facts =
-            crate::commit::write_fence::fence_facts_from_spi(&fence_at(operation_id, 1, 1, 1));
-
-        let error = executor.block_on(async {
-            crate::commit::write_fence::establish_fence(catalog.as_ref(), &table, &file_io, &facts)
-                .await
-                .expect("establish");
-            let reloaded = catalog
-                .load_table(table.identifier())
-                .await
-                .expect("reload");
-            crate::commit::write_fence::raise_fence(catalog.as_ref(), &reloaded, &file_io, &facts)
-                .await
-                .expect_err("an equal generation does not close the old authority")
-        });
-        assert!(
-            matches!(
-                error,
-                crate::commit::write_fence::FenceError::Superseded { .. }
-            ),
-            "an equal-generation raise must be refused, got {error:?}"
-        );
     }
 
     fn control_with_empty_table() -> (
@@ -4832,14 +4365,9 @@ mod tests {
             )],
         )
         .expect("sealed");
-        let request = ConnectorWriteAbortRequest::try_new(
-            owner.clone(),
-            sealed,
-            Vec::new(),
-            novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence(operation_id)),
-            context(),
-        )
-        .expect("abort request");
+        let request =
+            ConnectorWriteAbortRequest::try_new(owner.clone(), sealed, Vec::new(), context())
+                .expect("abort request");
         let first = control.abort(request.clone()).expect("abort");
         let replay = control.abort(request).expect("abort replay");
         assert_eq!(first, replay);
@@ -4882,6 +4410,34 @@ mod tests {
     }
 
     #[test]
+    fn operation_marker_preserves_the_activation_publication_family() {
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let operation_id = ConnectorWriteOperationId::from_bytes([31; 16]);
+        let mut request = activation_request(&owner, operation_id, 1);
+        request.intent =
+            ConnectorWriteActivationIntent::Publication(LakePublicationFamily::DataMutation);
+        control.activate_write(request).expect("activate");
+        let active = {
+            let operations = control.operations.lock().expect("operation table");
+            let OperationState::Active(active) =
+                operations.get(&operation_id).expect("active operation")
+            else {
+                panic!("expected active operation");
+            };
+            active.clone()
+        };
+
+        assert_eq!(
+            control
+                .operation_marker(operation_id, &active, [4; 32], [5; 32])
+                .publication
+                .family(),
+            LakePublicationFamily::DataMutation
+        );
+    }
+
+    #[test]
     fn malformed_operation_marker_is_corrupt_data() {
         let snapshot = snapshot_with_operation_marker(8, "{\"version\":1}".to_string());
         let error = operation_marker_from_snapshot(&snapshot).expect_err("corrupt marker");
@@ -4916,9 +4472,12 @@ mod tests {
         let marker =
             |replacement_id: [u8; 32], prior_digest: [u8; 32]| IcebergWriteOperationMarkerV1 {
                 version: ICEBERG_WRITE_OPERATION_MARKER_VERSION,
+                publication: LakePublicationMarkerHeader::new(
+                    LakePublicationId::from_bytes(operation_id.to_bytes()),
+                    LakePublicationFamily::Write,
+                ),
                 instance_id: "ice".to_string(),
                 incarnation_base64: base64_encode([7; 16]),
-                operation_id_base64: base64_encode(operation_id.to_bytes()),
                 target_ref: "main".to_string(),
                 cohort_set_digest_base64: base64_encode([8; 32]),
                 aggregate_digest_base64: base64_encode([9; 32]),
@@ -5155,7 +4714,6 @@ mod tests {
         .expect("operation completion");
         let request = ConnectorWriteCommitRequest {
             completion,
-            fence: novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence(operation_id)),
             context: context(),
         };
         let active = {
@@ -5255,7 +4813,6 @@ mod tests {
                 operation_id,
                 cohort_set_digest,
                 aggregate_digest,
-                fence: novarocks_spi::connector::ConnectorWriteFencing::Fenced(fence(operation_id)),
                 evidence,
                 context: context(),
             })
@@ -5441,21 +4998,9 @@ mod tests {
         )
         .expect("operation completion");
         let aggregate_digest = completion.aggregate_digest();
-        // Publish the fence marker first: a commit derives its assertion from
-        // external truth, so an attempt that never established a fence is
-        // refused before it reaches the table.
-        let commit_fence = fence(operation_id);
-        control
-            .establish_external_fence(ConnectorExternalFenceRequest {
-                owner: owner.clone(),
-                fence: commit_fence.clone(),
-                context: context(),
-            })
-            .expect("establish external fence");
         let outcome = control
             .commit(ConnectorWriteCommitRequest {
                 completion,
-                fence: novarocks_spi::connector::ConnectorWriteFencing::Fenced(commit_fence),
                 context: context(),
             })
             .expect("commit empty overwrite");
@@ -5488,26 +5033,22 @@ mod tests {
             loaded.table.metadata().default_partition_spec_id(),
             committed_partitioning.spec_id()
         );
-        // The fence marker is itself a snapshot on the provider-private fence
-        // ref, so count only data snapshots: this assertion is about the
-        // managed repartition committing exactly once, not about how many
-        // snapshots the metadata holds in total.
-        let data_snapshots = loaded
-            .table
-            .metadata()
-            .snapshots()
-            .filter(|snapshot| {
-                !crate::commit::write_fence::is_fence_marker_snapshot(snapshot.summary())
-            })
-            .count();
+        let data_snapshots = loaded.table.metadata().snapshots().count();
         assert_eq!(data_snapshots, 1);
-        let marker = operation_marker_from_snapshot(snapshot)
-            .expect("decode operation marker")
+        let raw_marker = snapshot
+            .summary()
+            .additional_properties
+            .get(ICEBERG_WRITE_OPERATION_MARKER_PROPERTY)
             .expect("operation marker");
+        let marker: IcebergWriteOperationMarkerV1 =
+            serde_json::from_str(raw_marker).expect("decode operation marker");
         assert_eq!(
-            decode_marker_fixed::<16>(&marker.operation_id_base64, "operation id")
-                .expect("operation id"),
+            marker.publication.publication_id().to_bytes(),
             operation_id.to_bytes()
+        );
+        assert_eq!(
+            marker.publication.family(),
+            LakePublicationFamily::MaterializedViewRefresh
         );
         assert_eq!(
             decode_marker_fixed::<32>(&marker.cohort_set_digest_base64, "cohort digest")

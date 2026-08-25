@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::durable::{DurableOpaqueBytes, DurableRecord, DurableRecordError};
+use novarocks_spi::connector::LakePublicationId;
 
 /// Provider object identity is the only table-private durable value. Handles,
 /// snapshots, and schemas remain attempt-local.
@@ -123,7 +124,7 @@ pub struct StatisticsJobError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsJob {
     pub job_id: Uuid,
-    pub operation_id: Uuid,
+    pub operation_id: LakePublicationId,
     pub target: StatisticsJobTarget,
     pub connector_instance_id: String,
     pub object_id: Vec<u8>,
@@ -152,7 +153,7 @@ pub struct StatisticsJob {
 pub(crate) struct StoredStatisticsJobV3 {
     pub schema_version: u8,
     pub job_id: Uuid,
-    pub operation_id: Uuid,
+    pub operation_id: LakePublicationId,
     pub target: StatisticsJobTarget,
     pub connector_instance_id: String,
     pub object_id: DurableOpaqueBytes<MAX_DURABLE_STATISTICS_TABLE_OBJECT_ID_BYTES>,
@@ -178,7 +179,7 @@ pub(crate) struct StoredStatisticsJobV3 {
 impl StoredStatisticsJobV3 {
     pub(crate) fn try_new(
         job_id: Uuid,
-        operation_id: Uuid,
+        operation_id: LakePublicationId,
         request: StatisticsJobCreate,
     ) -> Result<Self, DurableRecordError> {
         Ok(Self {
@@ -265,7 +266,7 @@ mod durable_record_budget_tests {
         let record = StoredStatisticsJobV3 {
             schema_version: STATISTICS_JOB_SCHEMA_VERSION,
             job_id: Uuid::nil(),
-            operation_id: Uuid::nil(),
+            operation_id: LakePublicationId::try_from(Uuid::nil()).unwrap(),
             target: StatisticsJobTarget {
                 catalog: "c".repeat(MAX_STATISTICS_TARGET_COMPONENT_BYTES),
                 namespace: "n".repeat(MAX_STATISTICS_TARGET_COMPONENT_BYTES),
@@ -301,7 +302,7 @@ mod durable_record_budget_tests {
 
         let same_target = StoredStatisticsJobV3 {
             job_id: Uuid::new_v4(),
-            operation_id: Uuid::new_v4(),
+            operation_id: LakePublicationId::try_from(Uuid::new_v4()).unwrap(),
             ..record.clone()
         };
         let same_target_encoded = standard

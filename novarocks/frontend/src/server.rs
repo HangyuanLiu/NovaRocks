@@ -44,11 +44,16 @@ type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 struct FrontendBackgroundMaintenanceAttemptFactory {
     role: novarocks_types::ClusterRole,
     topology: crate::common::backend_topology::BackendTopologyService,
+    runtime_policy: crate::common::admitted_query_context::LakePublicationRuntimePolicy,
 }
 
 impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {
     fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String> {
-        core_capabilities::background_maintenance_attempt(self.role, self.topology.clone())
+        core_capabilities::background_maintenance_attempt(
+            self.role,
+            self.topology.clone(),
+            self.runtime_policy.max_attempt_duration(),
+        )
     }
 }
 
@@ -179,6 +184,8 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&connector_control),
             topology.clone(),
             query_execution.clone(),
+            host.lake_publication_runtime_policy()
+                .max_attempt_duration(),
         ),
     )
     .map_err(FrontendApplicationError::server)?;
@@ -196,6 +203,7 @@ pub fn build_frontend_query_session_factory(
         Arc::new(FrontendBackgroundMaintenanceAttemptFactory {
             role,
             topology: topology.clone(),
+            runtime_policy: host.lake_publication_runtime_policy().clone(),
         }),
     );
     if let Err(error) = maintenance_service.start(Arc::clone(&maintenance_engine)) {
@@ -302,44 +310,37 @@ pub fn build_frontend_query_session_factory(
         unified_statistics,
         mv_storage_observation,
         query_execution.clone(),
+        host.lake_publication_runtime_policy(),
     ));
     host.dml_service()
         .install_local_catalog(Arc::clone(&catalog_service));
-    host.ctas_recovery_binding()
-        .install_ctas_engine(Arc::clone(&dml_engines.ctas))
-        .map_err(|error| {
-            FrontendApplicationError::server(format!(
-                "bind CTAS recovery before controller start: {error}"
-            ))
-        })?;
 
-    Ok(Arc::new(
-        crate::query::FrontendQueryService::new_with_recovery_bound(
-            session_catalog_resolver,
-            query_compiler,
-            catalog_command_executor,
-            statistics_command_executor,
-            backend_command_executor,
-            view_command_executor,
-            iceberg_ref_command_executor,
-            mv_command_executor,
-            maintenance_command_executor,
-            maintenance_read_command_executor,
-            host.query_control_service(),
-            client_connection_control,
-            query_execution,
-            role,
-            topology,
-            host.dml_service(),
-            dml_engines.insert,
-            dml_engines.delete,
-            dml_engines.mutation,
-            dml_engines.add_files,
-            dml_engines.ctas,
-            dml_engines.truncate,
-            host.optimizer_query_mem_limit_bytes(),
-        ),
-    ))
+    Ok(Arc::new(crate::query::FrontendQueryService::new(
+        session_catalog_resolver,
+        query_compiler,
+        catalog_command_executor,
+        statistics_command_executor,
+        backend_command_executor,
+        view_command_executor,
+        iceberg_ref_command_executor,
+        mv_command_executor,
+        maintenance_command_executor,
+        maintenance_read_command_executor,
+        host.query_control_service(),
+        client_connection_control,
+        query_execution,
+        role,
+        topology,
+        host.dml_service(),
+        dml_engines.insert,
+        dml_engines.delete,
+        dml_engines.mutation,
+        dml_engines.add_files,
+        dml_engines.ctas,
+        dml_engines.truncate,
+        host.optimizer_query_mem_limit_bytes(),
+        host.lake_publication_runtime_policy(),
+    )))
 }
 
 pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendApplicationError> {

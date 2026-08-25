@@ -38,8 +38,9 @@ use crate::fs_io;
 use crate::resources::IcebergCatalogRuntime;
 use novarocks_fs::ObjectStoreConfig;
 use novarocks_spi::connector::{
-    ConnectorDataMutationSourceScope, MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES,
-    MAX_CONNECTOR_DATA_MUTATION_FILES, MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
+    ConnectorDataMutationAddFilesDomain, ConnectorDataMutationSourceScope,
+    MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES, MAX_CONNECTOR_DATA_MUTATION_FILES,
+    MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_TOTAL_FOOTER_BYTES,
 };
 
@@ -247,16 +248,80 @@ pub(crate) fn canonical_directory_source_scope(
     source_directory: &str,
     object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<ConnectorDataMutationSourceScope, String> {
-    let access = fs_io::resolve_access_for_location(source_directory, object_store_config)
-        .map_err(|error| format!("resolve ADD FILES source scope {source_directory}: {error}"))?;
-    let handle = access.handle();
-    let relative_path = access.single_relative_path()?;
-
+    let identity = canonical_directory_identity(source_directory, object_store_config)?;
     let mut hasher = Sha256::new();
     hasher.update(SOURCE_SCOPE_DIGEST_DOMAIN);
+    digest_bytes(&mut hasher, identity.authority.as_bytes());
+    digest_bytes(&mut hasher, identity.path.as_bytes());
+    ConnectorDataMutationSourceScope::try_new_directory(hasher.finalize().into())
+        .map_err(|error| format!("build ADD FILES source scope: {error}"))
+}
+
+/// Prove, before source listing or footer reads, that the user-owned source is
+/// outside every current NovaRocks cleanup root. Both the configured warehouse
+/// and the loaded target table location are protected: a catalog may host an
+/// existing table outside its configured warehouse, and that table's live
+/// data/maintenance roots are no less protected than the warehouse namespace.
+pub(crate) fn preflight_caller_managed_source_domain(
+    source_directory: &str,
+    warehouse_uri: &str,
+    target_table_location: &str,
+    object_store_config: Option<&ObjectStoreConfig>,
+) -> Result<ConnectorDataMutationAddFilesDomain, String> {
+    if warehouse_uri.trim().is_empty() {
+        return Err(
+            "ADD FILES requires an explicit Iceberg warehouse to prove source cleanup disjointness"
+                .to_string(),
+        );
+    }
+    let source = canonical_directory_identity(source_directory, object_store_config)?;
+    let mut protected_roots = vec![
+        canonical_directory_identity(warehouse_uri, object_store_config)?,
+        canonical_directory_identity(target_table_location, object_store_config)?,
+    ];
+    protected_roots.sort_by(|left, right| {
+        left.authority
+            .cmp(&right.authority)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    protected_roots
+        .dedup_by(|left, right| left.authority == right.authority && left.path == right.path);
+    if protected_roots
+        .iter()
+        .any(|root| directories_overlap(&source, root))
+    {
+        return Err(
+            "ADD FILES source root overlaps the Iceberg warehouse, target table, or a NovaRocks cleanup namespace"
+                .to_string(),
+        );
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(SOURCE_SCOPE_DIGEST_DOMAIN);
+    hasher.update((protected_roots.len() as u32).to_be_bytes());
+    for root in protected_roots {
+        digest_bytes(&mut hasher, root.authority.as_bytes());
+        digest_bytes(&mut hasher, root.path.as_bytes());
+    }
+    ConnectorDataMutationAddFilesDomain::try_new_caller_managed_stable(hasher.finalize().into())
+        .map_err(|error| format!("build ADD FILES source domain: {error}"))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CanonicalDirectoryIdentity {
+    authority: String,
+    path: String,
+}
+
+fn canonical_directory_identity(
+    directory: &str,
+    object_store_config: Option<&ObjectStoreConfig>,
+) -> Result<CanonicalDirectoryIdentity, String> {
+    let access = fs_io::resolve_access_for_location(directory, object_store_config)
+        .map_err(|error| format!("resolve ADD FILES source scope {directory}: {error}"))?;
+    let handle = access.handle();
+    let relative_path = access.single_relative_path()?;
     match handle.scheme() {
         novarocks_fs::FsScheme::Local => {
-            hasher.update(b"local\0");
             let root = handle
                 .root()
                 .ok_or_else(|| "local ADD FILES source scope is missing root".to_string())?;
@@ -264,43 +329,55 @@ pub(crate) fn canonical_directory_source_scope(
                 std::fs::canonicalize(Path::new(root).join(relative_path)).map_err(|error| {
                     format!("canonicalize local ADD FILES source directory: {error}")
                 })?;
-            digest_bytes(&mut hasher, path.to_string_lossy().as_bytes());
+            Ok(CanonicalDirectoryIdentity {
+                authority: "local".to_string(),
+                path: path.to_string_lossy().into_owned(),
+            })
         }
         novarocks_fs::FsScheme::ObjectStore => {
-            hasher.update(b"object-store\0");
             let config = object_store_config.ok_or_else(|| {
                 "object-store ADD FILES source scope is missing object store config".to_string()
             })?;
-            digest_bytes(
-                &mut hasher,
-                normalized_object_store_endpoint(&config.endpoint)?.as_bytes(),
-            );
             let bucket = handle.authority().ok_or_else(|| {
                 "object-store ADD FILES source scope is missing bucket".to_string()
             })?;
-            digest_bytes(&mut hasher, bucket.trim().to_ascii_lowercase().as_bytes());
-            digest_bytes(
-                &mut hasher,
-                canonical_nonlocal_directory_path(relative_path)?.as_bytes(),
-            );
+            Ok(CanonicalDirectoryIdentity {
+                authority: format!(
+                    "object-store\\0{}\\0{}",
+                    normalized_object_store_endpoint(&config.endpoint)?,
+                    bucket.trim().to_ascii_lowercase(),
+                ),
+                path: canonical_nonlocal_directory_path(relative_path)?,
+            })
         }
         novarocks_fs::FsScheme::Hdfs => {
-            hasher.update(b"hdfs\0");
             let authority = handle
                 .authority()
                 .ok_or_else(|| "HDFS ADD FILES source scope is missing authority".to_string())?;
-            digest_bytes(
-                &mut hasher,
-                normalized_hdfs_authority(authority)?.as_bytes(),
-            );
-            digest_bytes(
-                &mut hasher,
-                canonical_nonlocal_directory_path(relative_path)?.as_bytes(),
-            );
+            Ok(CanonicalDirectoryIdentity {
+                authority: format!("hdfs\\0{}", normalized_hdfs_authority(authority)?),
+                path: canonical_nonlocal_directory_path(relative_path)?,
+            })
         }
     }
-    ConnectorDataMutationSourceScope::try_new_directory(hasher.finalize().into())
-        .map_err(|error| format!("build ADD FILES source scope: {error}"))
+}
+
+fn directories_overlap(
+    left: &CanonicalDirectoryIdentity,
+    right: &CanonicalDirectoryIdentity,
+) -> bool {
+    if left.authority != right.authority {
+        return false;
+    }
+    left.path == right.path
+        || left
+            .path
+            .strip_prefix(&right.path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .path
+            .strip_prefix(&left.path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn normalized_object_store_endpoint(raw_endpoint: &str) -> Result<String, String> {
@@ -815,8 +892,9 @@ mod tests {
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
     use super::{
-        canonical_directory_source_scope, list_direct_files, read_parquet_footer,
-        read_type_compatible, validate_name_mapping_for_target, validate_schema,
+        canonical_directory_source_scope, list_direct_files,
+        preflight_caller_managed_source_domain, read_parquet_footer, read_type_compatible,
+        validate_name_mapping_for_target, validate_schema,
     };
     use crate::resources::IcebergCatalogRuntime;
     use crate::schema_mapping::canonical_name_mapping;
@@ -918,6 +996,52 @@ mod tests {
                 .expect_err("endpoint credentials must not enter scope")
                 .contains("credentials")
         );
+    }
+
+    #[test]
+    fn caller_managed_source_must_be_disjoint_from_the_warehouse() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let source = warehouse.path().join("incoming");
+        std::fs::create_dir(&source).expect("source");
+        let error = preflight_caller_managed_source_domain(
+            &format!("file://{}", source.display()),
+            &format!("file://{}", warehouse.path().display()),
+            &format!("file://{}", warehouse.path().display()),
+            None,
+        )
+        .expect_err("warehouse-owned source must be rejected before listing");
+        assert!(error.contains("overlaps"));
+    }
+
+    #[test]
+    fn caller_managed_source_outside_warehouse_has_typed_domain_proof() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let source = tempfile::tempdir().expect("source");
+        let domain = preflight_caller_managed_source_domain(
+            &format!("file://{}", source.path().display()),
+            &format!("file://{}", warehouse.path().display()),
+            &format!("file://{}", warehouse.path().display()),
+            None,
+        )
+        .expect("caller-managed source proof");
+        assert_ne!(domain.target_cleanup_root_digest(), [0; 32]);
+    }
+
+    #[test]
+    fn caller_managed_source_must_be_disjoint_from_an_external_target_table_location() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let external_target = tempfile::tempdir().expect("external target");
+        let source = external_target.path().join("data");
+        std::fs::create_dir(&source).expect("source");
+
+        let error = preflight_caller_managed_source_domain(
+            &format!("file://{}", source.display()),
+            &format!("file://{}", warehouse.path().display()),
+            &format!("file://{}", external_target.path().display()),
+            None,
+        )
+        .expect_err("target-table-owned source must be rejected before listing");
+        assert!(error.contains("target table"));
     }
 
     #[test]
