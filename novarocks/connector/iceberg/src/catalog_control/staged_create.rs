@@ -88,7 +88,8 @@ impl From<ConnectorError> for RestStagedPrepareFailure {
 
 pub(crate) fn prepare_rest_staged_table(
     runtime: &IcebergControlRuntime,
-    operation_id: ConnectorStagedCreateOperationId,
+    _operation_id: ConnectorStagedCreateOperationId,
+    publication_id: novarocks_spi::connector::LakePublicationId,
     namespace_name: &str,
     table_name: &str,
     columns: &[ConnectorColumnDefinition],
@@ -105,7 +106,7 @@ pub(crate) fn prepare_rest_staged_table(
     let namespace = NamespaceIdent::new(namespace_name.clone());
     let location = ctas_staging_location(
         &runtime.control_state().configuration().warehouse_uri,
-        operation_id,
+        publication_id,
     )?;
     let namespace_catalog = Arc::clone(&catalog);
     let namespace_for_check = namespace.clone();
@@ -154,7 +155,7 @@ pub(crate) fn prepare_rest_staged_table(
     );
     properties.insert(
         CTAS_OPERATION_MARKER.to_string(),
-        operation_marker(operation_id),
+        publication_marker(publication_id),
     );
     properties.insert(
         CTAS_PROVENANCE_VERSION.to_string(),
@@ -268,6 +269,7 @@ enum OperationState {
 
 #[derive(Clone)]
 struct PreparedOperation {
+    publication_id: novarocks_spi::connector::LakePublicationId,
     handle_digest: [u8; 32],
     staged: RestStagedTableCreate,
     policy: CreatePolicy,
@@ -391,14 +393,14 @@ impl IcebergStagedCreateAdapter {
     fn publish_evidence(
         &self,
         dispatch_operation_id: ConnectorStagedCreateOperationId,
-        target_operation_id: ConnectorStagedCreateOperationId,
+        _target_operation_id: ConnectorStagedCreateOperationId,
         prepared: &PreparedOperation,
         expected_snapshot_id: Option<i64>,
     ) -> Result<ExternalMutationEvidence, ConnectorError> {
         let ident = prepared.staged.table.identifier();
         let payload = serde_json::to_vec(&PublishEvidenceV1 {
             version: EVIDENCE_VERSION,
-            operation_marker: operation_marker(target_operation_id),
+            operation_marker: publication_marker(prepared.publication_id),
             table_uuid: prepared.staged.table.metadata().uuid().to_string(),
             expected_snapshot_id,
             handle_digest: prepared.handle_digest,
@@ -705,6 +707,10 @@ impl IcebergStagedCreateAdapter {
         operations.insert(
             operation_id,
             OperationState::Prepared(PreparedOperation {
+                publication_id: novarocks_spi::connector::LakePublicationId::try_from_bytes(
+                    operation_id.to_bytes(),
+                )
+                .expect("fenced CTAS operation IDs are UUIDv7"),
                 handle_digest: handle.digest(),
                 staged,
                 policy,
@@ -958,12 +964,13 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         properties.retain(|key, _| !key.eq_ignore_ascii_case(CTAS_OPERATION_MARKER));
         properties.insert(
             Arc::from(CTAS_OPERATION_MARKER),
-            Arc::from(operation_marker(request.operation_id)),
+            Arc::from(publication_marker(request.publication_id)),
         );
         let properties = properties.into_iter().collect::<Vec<_>>();
         let result = prepare_rest_staged_table(
             &self.runtime,
             request.operation_id,
+            request.publication_id,
             &request.table.namespace,
             &request.table.table,
             &request.columns,
@@ -981,6 +988,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 self.record_terminal(
                     request.operation_id,
                     OperationState::Prepared(PreparedOperation {
+                        publication_id: request.publication_id,
                         handle_digest: handle.digest(),
                         staged,
                         policy: request.policy,
@@ -1462,7 +1470,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             })?;
         let ident = prepared.staged.table.identifier();
         if evidence.version != EVIDENCE_VERSION
-            || evidence.operation_marker != operation_marker(operation_id)
+            || evidence.operation_marker != publication_marker(prepared.publication_id)
             || evidence.handle_digest != prepared.handle_digest
             || evidence.table_uuid != prepared.staged.table.metadata().uuid().to_string()
             || evidence.namespace != ident.namespace.to_url_string()
@@ -1567,7 +1575,7 @@ fn take_prepared(
 
 fn publication_matches(
     table: &crate::iceberg::table::Table,
-    operation_id: ConnectorStagedCreateOperationId,
+    _operation_id: ConnectorStagedCreateOperationId,
     prepared: &PreparedOperation,
     expected_snapshot_id: Option<i64>,
 ) -> bool {
@@ -1576,7 +1584,7 @@ fn publication_matches(
         && metadata
             .properties()
             .get(CTAS_OPERATION_MARKER)
-            .is_some_and(|marker| marker == &operation_marker(operation_id))
+            .is_some_and(|marker| marker == &publication_marker(prepared.publication_id))
         && expected_snapshot_id
             .is_none_or(|snapshot_id| metadata.snapshot_by_id(snapshot_id).is_some())
 }
@@ -1640,13 +1648,17 @@ fn operation_marker(operation_id: ConnectorStagedCreateOperationId) -> String {
     uuid::Uuid::from_bytes(operation_id.to_bytes()).to_string()
 }
 
+fn publication_marker(publication_id: novarocks_spi::connector::LakePublicationId) -> String {
+    publication_id.to_string()
+}
+
 /// The CTAS root must be independent of the target table name: before the
 /// single `NotExist` commit succeeds there is no table location that cleanup
 /// can safely derive from catalog state.  A publication ID gives the staging
 /// root a stable, enumerable owner instead.
 pub(crate) fn ctas_staging_location(
     warehouse_uri: &str,
-    operation_id: ConnectorStagedCreateOperationId,
+    publication_id: novarocks_spi::connector::LakePublicationId,
 ) -> Result<String, RestStagedPrepareFailure> {
     let warehouse_uri = warehouse_uri.trim_end_matches('/');
     if warehouse_uri.is_empty() {
@@ -1657,7 +1669,7 @@ pub(crate) fn ctas_staging_location(
     }
     Ok(format!(
         "{warehouse_uri}/{CTAS_STAGING_NAMESPACE}/{}/table",
-        operation_marker(operation_id)
+        publication_marker(publication_id)
     ))
 }
 
@@ -1726,6 +1738,7 @@ mod tests {
         let failure = match prepare_rest_staged_table(
             &runtime,
             ConnectorMutationOperationId::new(),
+            novarocks_spi::connector::LakePublicationId::new_v7(),
             "db",
             "t",
             &[],
@@ -1777,19 +1790,21 @@ mod tests {
 
     #[test]
     fn ctas_staging_location_is_warehouse_rooted_and_operation_bound() {
-        let operation_id = ConnectorMutationOperationId::new();
+        let publication_id = novarocks_spi::connector::LakePublicationId::new_v7();
         assert_eq!(
-            ctas_staging_location("s3://warehouse/root/", operation_id).unwrap(),
+            ctas_staging_location("s3://warehouse/root/", publication_id).unwrap(),
             format!(
                 "s3://warehouse/root/_novarocks/ctas-staging/v1/{}/table",
-                operation_marker(operation_id)
+                publication_marker(publication_id)
             )
         );
     }
 
     #[test]
     fn ctas_staging_location_rejects_an_implicit_warehouse() {
-        let error = ctas_staging_location("", ConnectorMutationOperationId::new()).unwrap_err();
+        let error =
+            ctas_staging_location("", novarocks_spi::connector::LakePublicationId::new_v7())
+                .unwrap_err();
         assert!(matches!(
             error,
             RestStagedPrepareFailure::KnownUncommitted(message)

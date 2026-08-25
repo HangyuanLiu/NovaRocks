@@ -214,6 +214,10 @@ impl std::fmt::Debug for ConnectorStagedTableHandle {
 #[derive(Clone)]
 pub struct ConnectorStagedCreatePrepareRequest {
     pub owner: ConnectorExecutionBindingKey,
+    /// The statement-level identity shared by the staged root, Iceberg marker
+    /// and eventual unanchored-GC provenance.  `operation_id` remains the
+    /// lease-local dispatch key; it must not become a second durable owner.
+    pub publication_id: LakePublicationId,
     pub operation_id: ConnectorStagedCreateOperationId,
     pub table: ConnectorTableIdentity,
     pub columns: Vec<ConnectorColumnDefinition>,
@@ -1769,6 +1773,7 @@ mod tests {
                 table: Arc::from("t"),
             },
             owner,
+            publication_id: LakePublicationId::new_v7(),
             operation_id,
             columns: Vec::new(),
             partitioning: Vec::new(),
