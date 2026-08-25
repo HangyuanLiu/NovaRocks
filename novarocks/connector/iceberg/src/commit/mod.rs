@@ -28,7 +28,7 @@ pub mod data_writer;
 pub mod equality_delete_writer;
 mod fast_append;
 pub mod frozen_write;
-mod helpers;
+pub(crate) mod helpers;
 pub mod mv_attempt_scan;
 pub mod mv_provenance;
 pub mod mv_publication_fence;

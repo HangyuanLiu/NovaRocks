@@ -81,6 +81,9 @@ fn ensure_staging_ref_is_branch(
 pub struct MvRefreshPublishPlan {
     pub namespace: String,
     pub table: String,
+    /// Exact target identity observed with the staged result. The ref CASes
+    /// below are insufficient across DROP/recreate of the same logical name.
+    pub target_table_uuid: Uuid,
     pub staging_branch: String,
     pub expected_main_snapshot_id: Option<i64>,
     pub staging_snapshot_id: i64,
@@ -163,6 +166,9 @@ fn build_publish_commit(ident: TableIdent, plan: &MvRefreshPublishPlan) -> Table
             },
         }])
         .requirements(vec![
+            TableRequirement::UuidMatch {
+                uuid: plan.target_table_uuid,
+            },
             TableRequirement::RefSnapshotIdMatch {
                 r#ref: "main".to_string(),
                 snapshot_id: plan.expected_main_snapshot_id,
@@ -481,6 +487,7 @@ mod tests {
         let plan = MvRefreshPublishPlan {
             namespace: "db".to_string(),
             table: "tbl".to_string(),
+            target_table_uuid: Uuid::from_u128(0x1234),
             staging_branch: "mv_refresh_77".to_string(),
             expected_main_snapshot_id: Some(100),
             staging_snapshot_id: 300,
@@ -494,6 +501,9 @@ mod tests {
         let mut commit = build_publish_commit(ident, &plan);
         let requirements = commit.take_requirements();
 
+        assert!(requirements.contains(&TableRequirement::UuidMatch {
+            uuid: Uuid::from_u128(0x1234),
+        }));
         assert!(
             requirements.contains(&TableRequirement::RefSnapshotIdMatch {
                 r#ref: "main".to_string(),

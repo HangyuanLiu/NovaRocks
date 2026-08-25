@@ -233,6 +233,11 @@ pub(crate) fn managed_publication_activation_intent(
             MvRefreshPublicationTechnique::Incremental => {
                 ConnectorManagedPublicationTechnique::Incremental
             }
+            MvRefreshPublicationTechnique::MetadataOnly => {
+                return Err(
+                    "metadata-only MV refresh must use the catalog staging operation".to_string(),
+                );
+            }
         },
         publication
             .bases()

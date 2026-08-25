@@ -457,7 +457,7 @@ pub async fn read_base_manifest_list(
     read_snapshot_manifest_list(m, file_io, snapshot_id).await
 }
 
-pub(super) async fn read_snapshot_manifest_list(
+pub(crate) async fn read_snapshot_manifest_list(
     metadata: &TableMetadata,
     file_io: &FileIO,
     snapshot_id: Option<i64>,

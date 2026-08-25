@@ -29,7 +29,7 @@ use super::{
     ConnectorCommittedPartitioning, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorInstanceIncarnation, ConnectorNamespaceIdentity, ConnectorRequestContext,
-    ConnectorTableIdentity,
+    ConnectorTableIdentity, ConnectorTableObjectId,
 };
 
 /// Largest provider-owned reconciliation payload accepted by the control plane.
@@ -513,6 +513,10 @@ pub enum ConnectorRefAction {
         name: Arc<str>,
         snapshot_id: Option<i64>,
         policy: CreateOrReplacePolicy,
+        /// Optional immutable table identity captured at planning. Internal
+        /// staged publication supplies this so a DROP/recreate cannot receive
+        /// a branch created for the prior table incarnation.
+        expected_table_uuid: Option<Arc<str>>,
     },
     Drop {
         kind: ConnectorRefKind,
@@ -529,6 +533,9 @@ pub enum ConnectorRefAction {
         /// guarded CAS publication.
         committed_version: ConnectorCommittedVersion,
         expected_target_snapshot_id: Option<i64>,
+        /// Immutable target identity captured with the staged write. The
+        /// provider validates it before and within the publication commit.
+        expected_table_uuid: Arc<str>,
         guard: ConnectorRefreshPublicationGuard,
     },
 }
@@ -537,6 +544,58 @@ pub enum ConnectorRefAction {
 pub enum ConnectorDropTableDataDisposition {
     Purge,
     Retain,
+}
+
+/// One immutable base-watermark fact carried by a metadata-only MV snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorMvMetadataOnlyBaseFact {
+    pub table: Arc<str>,
+    pub object_id: ConnectorTableObjectId,
+    pub from_snapshot_id: Option<i64>,
+    pub to_snapshot_id: i64,
+}
+
+/// Complete provider-neutral provenance required to make an otherwise
+/// data-free MV refresh visible as a real lake frontier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorMvMetadataOnlyProvenance {
+    pub refresh_id: i64,
+    pub materialization_id: i64,
+    pub marker_token: Arc<str>,
+    pub bases: Vec<ConnectorMvMetadataOnlyBaseFact>,
+    pub definition_fingerprint: Arc<str>,
+}
+
+impl ConnectorMvMetadataOnlyProvenance {
+    pub fn validate(&self) -> Result<(), ConnectorError> {
+        if self.refresh_id <= 0
+            || self.materialization_id <= 0
+            || self.marker_token.is_empty()
+            || self.definition_fingerprint.is_empty()
+            || self.bases.is_empty()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "metadata-only MV provenance is incomplete",
+            ));
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut objects = std::collections::HashSet::new();
+        for base in &self.bases {
+            if base.table.is_empty()
+                || base.from_snapshot_id.is_some_and(|snapshot| snapshot < 0)
+                || base.to_snapshot_id < 0
+                || !names.insert(base.table.clone())
+                || !objects.insert(base.object_id.clone())
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "metadata-only MV provenance has invalid or duplicate base facts",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -571,6 +630,18 @@ pub enum ConnectorCatalogMutationOperation {
         /// provider-neutral request instead of an implicit provider default.
         expected_current_snapshot: Option<i64>,
         properties: Vec<(Arc<str>, Arc<str>)>,
+    },
+    /// Stage a data-free, provenance-bearing MV snapshot on an already-created
+    /// attempt branch.  This is a lake publication phase, not a frontend
+    /// bookkeeping shortcut: providers must atomically assert the frozen table
+    /// incarnation, `main`, and staging-ref heads while moving the staging ref.
+    StageMvMetadataOnlySnapshot {
+        table: ConnectorTableIdentity,
+        expected_table_uuid: Arc<str>,
+        expected_main_snapshot_id: Option<i64>,
+        staging_branch: Arc<str>,
+        expected_staging_snapshot_id: Option<i64>,
+        provenance: ConnectorMvMetadataOnlyProvenance,
     },
     DropTable {
         table: ConnectorTableIdentity,
@@ -630,6 +701,7 @@ impl ConnectorCatalogMutationOperation {
             Self::DropNamespace { .. } => "drop-namespace",
             Self::CreateTable { .. } => "create-table",
             Self::BootstrapEmptyTableSnapshot { .. } => "bootstrap-empty-table-snapshot",
+            Self::StageMvMetadataOnlySnapshot { .. } => "stage-mv-metadata-only-snapshot",
             Self::DropTable { .. } => "drop-table",
             Self::CreateView { .. } => "create-view",
             Self::DropView { .. } => "drop-view",
@@ -641,6 +713,26 @@ impl ConnectorCatalogMutationOperation {
     }
 
     fn validate(&self) -> Result<(), ConnectorError> {
+        if let Self::StageMvMetadataOnlySnapshot {
+            expected_table_uuid,
+            expected_main_snapshot_id,
+            staging_branch,
+            expected_staging_snapshot_id,
+            provenance,
+            ..
+        } = self
+        {
+            if expected_table_uuid.is_empty()
+                || staging_branch.is_empty()
+                || expected_staging_snapshot_id != expected_main_snapshot_id
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "metadata-only MV staging has invalid frozen branch preconditions",
+                ));
+            }
+            provenance.validate()?;
+        }
         if let Self::AlterProperties {
             expected_committed_partitioning: Some(expected),
             ..
@@ -668,6 +760,7 @@ pub struct ConnectorCatalogMutationReceipt {
     operation_kind: Arc<str>,
     provider_version: Option<Bytes>,
     committed_version: Option<ConnectorCommittedVersion>,
+    resulting_row_count: Option<u64>,
 }
 
 impl ConnectorCatalogMutationReceipt {
@@ -694,6 +787,7 @@ impl ConnectorCatalogMutationReceipt {
             operation_kind: operation_kind.into(),
             provider_version,
             committed_version: None,
+            resulting_row_count: None,
         })
     }
 
@@ -719,6 +813,27 @@ impl ConnectorCatalogMutationReceipt {
         Ok(receipt)
     }
 
+    pub fn try_new_with_committed_facts(
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ConnectorInstanceIncarnation,
+        operation_id: ConnectorMutationOperationId,
+        operation_kind: impl Into<Arc<str>>,
+        provider_version: Option<Bytes>,
+        committed_version: ConnectorCommittedVersion,
+        resulting_row_count: u64,
+    ) -> Result<Self, ConnectorError> {
+        let mut receipt = Self::try_new_with_committed_version(
+            descriptor,
+            incarnation,
+            operation_id,
+            operation_kind,
+            provider_version,
+            Some(committed_version),
+        )?;
+        receipt.resulting_row_count = Some(resulting_row_count);
+        Ok(receipt)
+    }
+
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
@@ -738,6 +853,9 @@ impl ConnectorCatalogMutationReceipt {
     pub fn committed_version(&self) -> Option<&ConnectorCommittedVersion> {
         self.committed_version.as_ref()
     }
+    pub const fn resulting_row_count(&self) -> Option<u64> {
+        self.resulting_row_count
+    }
 }
 
 impl fmt::Debug for ConnectorCatalogMutationReceipt {
@@ -753,6 +871,7 @@ impl fmt::Debug for ConnectorCatalogMutationReceipt {
                 &self.provider_version.as_ref().map(Bytes::len),
             )
             .field("committed_version", &self.committed_version)
+            .field("resulting_row_count", &self.resulting_row_count)
             .finish()
     }
 }

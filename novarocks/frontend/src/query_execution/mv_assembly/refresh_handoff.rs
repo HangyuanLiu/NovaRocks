@@ -75,7 +75,7 @@ impl MvRefreshPreparationRequest {
 )]
 pub enum PreparedMvRefreshWork {
     NoOp,
-    MetadataOnly,
+    MetadataOnly { intent: MvRefreshPublicationIntent },
     DataProducing { write: PreparedMvRefreshWrite },
 }
 

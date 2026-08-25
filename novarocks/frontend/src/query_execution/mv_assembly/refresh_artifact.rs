@@ -51,6 +51,7 @@ pub(crate) enum MvStagedRefreshWriteMode {
 pub enum MvRefreshPublicationTechnique {
     Full,
     Incremental,
+    MetadataOnly,
 }
 
 /// One complete base-table watermark that is known before a refresh write is

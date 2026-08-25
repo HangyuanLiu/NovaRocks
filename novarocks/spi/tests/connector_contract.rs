@@ -19,8 +19,9 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMutationOperationId,
-    ConnectorProviderId, ConnectorRefAction, ConnectorRefreshPublicationGuard,
-    ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,
+    ConnectorMvMetadataOnlyBaseFact, ConnectorMvMetadataOnlyProvenance, ConnectorProviderId,
+    ConnectorRefAction, ConnectorRefreshPublicationGuard, ConnectorRequestContext,
+    ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, ConnectorTableObjectId,
     ExternalMutationEvidence, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
     MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
     StatisticsDataVersion, StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest,
@@ -130,6 +131,7 @@ fn guarded_publication_carries_the_provider_committed_version() {
         target_branch: Arc::from("main"),
         committed_version: committed_version.clone(),
         expected_target_snapshot_id: Some(41),
+        expected_table_uuid: Arc::from("00000000-0000-0000-0000-000000000001"),
         guard,
     };
 
@@ -140,6 +142,36 @@ fn guarded_publication_carries_the_provider_committed_version() {
         } => assert_eq!(actual, committed_version),
         _ => panic!("guarded publication must retain the committed version"),
     }
+}
+
+#[test]
+fn metadata_only_mv_provenance_requires_complete_distinct_watermarks() {
+    let provenance = ConnectorMvMetadataOnlyProvenance {
+        refresh_id: 3,
+        materialization_id: 4,
+        marker_token: Arc::from("marker"),
+        bases: vec![ConnectorMvMetadataOnlyBaseFact {
+            table: Arc::from("rest.db.base"),
+            object_id: ConnectorTableObjectId::try_new(Bytes::from_static(
+                b"00000000-0000-0000-0000-000000000001",
+            ))
+            .expect("opaque object ID"),
+            from_snapshot_id: Some(7),
+            to_snapshot_id: 8,
+        }],
+        definition_fingerprint: Arc::from("definition"),
+    };
+    provenance.validate().expect("complete provenance");
+    assert_eq!(
+        ConnectorMvMetadataOnlyProvenance {
+            bases: vec![],
+            ..provenance
+        }
+        .validate()
+        .expect_err("an empty provenance cannot produce a lake frontier")
+        .kind(),
+        ConnectorErrorKind::InvalidRequest
+    );
 }
 
 #[test]
