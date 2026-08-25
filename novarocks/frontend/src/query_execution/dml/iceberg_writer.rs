@@ -250,7 +250,7 @@ fn prepare_iceberg_distributed_write(
         connector_context.clone(),
         &write_lease,
     )?;
-    let executor = PreparedIcebergWriteExecutor {
+    let semantic_binding = FrozenIcebergWriteSemanticBinding {
         state: state.clone(),
         target: target.clone(),
         query: query.clone(),
@@ -275,7 +275,7 @@ fn prepare_iceberg_distributed_write(
         source: IcebergWriteSource::CoordinatedPlan,
     };
     Ok(PreparedIcebergWrite {
-        executor,
+        semantic_binding,
         spec,
         native_assembly: Mutex::new(None),
     })
@@ -369,7 +369,7 @@ pub(crate) fn prepare_iceberg_connector_write_with_table(
 // Core only forwards the target identity; it never builds a handle payload.
 
 pub(crate) struct PreparedIcebergWrite {
-    executor: PreparedIcebergWriteExecutor,
+    semantic_binding: FrozenIcebergWriteSemanticBinding,
     spec: IcebergWriteTransactionSpec,
     native_assembly: Mutex<Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>>,
 }
@@ -433,7 +433,7 @@ impl PreparedIcebergWriteNativeEncoding<'_> {
 
 impl PreparedIcebergWrite {
     pub(crate) fn target(&self) -> &TargetBackend {
-        &self.executor.target
+        &self.semantic_binding.target
     }
 
     pub(crate) fn is_overwrite(&self) -> bool {
@@ -444,25 +444,55 @@ impl PreparedIcebergWrite {
         self.spec.commit.base_snapshot_id
     }
 
-    fn prepare_native_assembly(
+    fn prepare_native_assembly_for_execution(
         &self,
+        execution: Option<&QueryExecutionContext>,
     ) -> Result<
         crate::query_execution::compiler::PreparedDmlWriteAssembly,
         crate::dml::error::DmlExecutionError,
     > {
         crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_context(
-            &self.executor.state,
-            Some(&self.executor.target.catalog),
-            &self.executor.target.namespace,
-            &self.executor.query,
-            self.executor.sql_write_input.clone(),
-            Arc::clone(&self.executor.table_bindings),
+            &self.semantic_binding.state,
+            Some(&self.semantic_binding.target.catalog),
+            &self.semantic_binding.target.namespace,
+            &self.semantic_binding.query,
+            self.semantic_binding.sql_write_input.clone(),
+            Arc::clone(&self.semantic_binding.table_bindings),
             None,
             novarocks_sql::compiler::RootDistributionRequirement::Any,
-            self.executor.execution.as_ref(),
-            &self.executor.connector_context,
-            Some(self.executor.connector_write.clone()),
+            execution,
+            &self.semantic_binding.connector_context,
+            Some(self.semantic_binding.connector_write.clone()),
         )
+    }
+
+    /// Build an entirely new topology-dependent write assembly from the
+    /// immutable first-admission binding. This never reads a newer table
+    /// binding, clones an old assembly, or patches old split/writer/RF state.
+    /// A caller may use it only after the first assembly sealed the binding
+    /// store, and must still possess a provider-issued pre-ready effect proof.
+    #[allow(
+        dead_code,
+        reason = "Consumed by the pending INSERT whole-round retry factory."
+    )]
+    pub(crate) fn prepare_replanned_native_assembly(
+        &self,
+        topology: crate::common::backend_topology::BackendTopologySnapshot,
+    ) -> Result<
+        crate::query_execution::compiler::PreparedDmlWriteAssembly,
+        crate::dml::error::DmlExecutionError,
+    > {
+        if !self
+            .semantic_binding
+            .table_bindings
+            .is_sealed_for_topology_replan()
+        {
+            return Err(crate::dml::error::DmlExecutionError::from(
+                "Iceberg write topology replan requires a sealed first-round semantic binding store".to_string(),
+            ));
+        }
+        let execution = self.semantic_binding.execution_for_topology(topology)?;
+        self.prepare_native_assembly_for_execution(Some(&execution))
     }
 
     pub(crate) fn native_encoding(
@@ -473,7 +503,15 @@ impl PreparedIcebergWrite {
             .lock()
             .expect("prepared Iceberg write native assembly lock poisoned");
         if assembly.is_none() {
-            *assembly = Some(self.prepare_native_assembly()?);
+            *assembly =
+                Some(self.prepare_native_assembly_for_execution(
+                    self.semantic_binding.execution.as_ref(),
+                )?);
+            // The first assembly completed all semantic materialization. Any
+            // later topology round may only reuse these exact captured facts.
+            self.semantic_binding
+                .table_bindings
+                .seal_for_topology_replan();
         }
         Ok(PreparedIcebergWriteNativeEncoding {
             inner: PreparedIcebergWriteNativeEncodingInner::Assembly(assembly),
@@ -513,14 +551,14 @@ impl PreparedIcebergWrite {
     > {
         completion
             .session()
-            .commit(self.executor.connector_context.clone())
+            .commit(self.semantic_binding.connector_context.clone())
             .map_err(|error| error.to_string())
     }
 
     pub(crate) fn finalize(&self) -> Result<(), String> {
         crate::catalog_application::resolver::invalidate_iceberg_caches(
-            &self.executor.state,
-            &self.executor.target,
+            &self.semantic_binding.state,
+            &self.semantic_binding.target,
         )
     }
 }
@@ -529,7 +567,10 @@ impl PreparedIcebergWrite {
 ///
 /// This type owns no SQL routing or application transaction policy. The
 /// frontend DML services drive production statement lifecycles.
-struct PreparedIcebergWriteExecutor {
+/// First-admission write semantics retained across topology-only rounds. It
+/// intentionally contains no native fragments, splits, writer cohorts,
+/// runtime-filter layout, schedule, native bundle, or request.
+struct FrozenIcebergWriteSemanticBinding {
     state: DmlExecutionKernel,
     target: TargetBackend,
     query: Query,
@@ -538,6 +579,33 @@ struct PreparedIcebergWriteExecutor {
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+}
+
+impl FrozenIcebergWriteSemanticBinding {
+    fn execution_for_topology(
+        &self,
+        topology: crate::common::backend_topology::BackendTopologySnapshot,
+    ) -> Result<QueryExecutionContext, crate::dml::error::DmlExecutionError> {
+        let first = self.execution.as_ref().ok_or_else(|| {
+            crate::dml::error::DmlExecutionError::from(
+                "Iceberg write topology replan requires an admitted execution context".to_string(),
+            )
+        })?;
+        Ok(Self::execution_from_first_round(first, topology))
+    }
+
+    fn execution_from_first_round(
+        first: &QueryExecutionContext,
+        topology: crate::common::backend_topology::BackendTopologySnapshot,
+    ) -> QueryExecutionContext {
+        QueryExecutionContext::new(
+            first.role(),
+            topology,
+            first.deadline(),
+            first.cancellation().clone(),
+            first.optimizer_settings().clone(),
+        )
+    }
 }
 
 /// Build the `(query, Arrow write layout)` pair for an iceberg INSERT/OVERWRITE write
@@ -1126,7 +1194,10 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
     use novarocks_parser::{ast, printer};
+    use std::time::{Duration, Instant};
 
+    use crate::common::backend_topology::BackendTopologySnapshot;
+    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
     use novarocks_types::schema::ColumnDefault;
 
     fn test_column(
@@ -1149,6 +1220,37 @@ mod tests {
             panic!("expected exactly one query statement");
         };
         query.clone()
+    }
+
+    #[test]
+    fn replanned_execution_preserves_statement_stable_inputs() {
+        let cancellation = QueryCancellationSource::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let settings = novarocks_sql::compiler::SessionOptimizerSettings {
+            enable_global_runtime_filter: Some(false),
+            effective_backend_count: Some(3.0),
+            ..Default::default()
+        };
+        let first = QueryExecutionContext::new(
+            novarocks_types::ClusterRole::Fe,
+            BackendTopologySnapshot::empty(7),
+            Some(deadline),
+            cancellation.view(),
+            settings.clone(),
+        );
+
+        let replanned = FrozenIcebergWriteSemanticBinding::execution_from_first_round(
+            &first,
+            BackendTopologySnapshot::empty(8),
+        );
+
+        assert_eq!(replanned.role(), first.role());
+        assert_eq!(replanned.topology().revision(), 8);
+        assert_eq!(replanned.deadline(), Some(deadline));
+        assert_eq!(replanned.optimizer_settings(), &settings);
+        assert!(!replanned.cancellation().is_cancelled());
+        cancellation.request(QueryCancellationReason::DeadlineExceeded { timeout_ms: 30_000 });
+        assert!(replanned.cancellation().is_cancelled());
     }
 
     fn test_map_type(key: DataType, value: DataType) -> DataType {
