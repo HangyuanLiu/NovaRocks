@@ -27,8 +27,7 @@ use crate::dml::error::DmlError;
 use crate::dml::model::{
     AddFilesArtifact, AddFilesMutationRequest, CreatePreparingRequest,
     CreateStatementOperationRequest, DML_COORDINATION_RESOURCE_CODEC_VERSION,
-    DML_RECOVERY_SHARD_COUNT, DmlCoordinationClaimRequest, DmlCtasRecoveryMutationRequest,
-    DmlCtasRecoveryRecord, DmlDirectMutationFenceMutationRequest,
+    DML_RECOVERY_SHARD_COUNT, DmlCoordinationClaimRequest, DmlDirectMutationFenceMutationRequest,
     DmlDirectMutationFenceReceiptRecord, DmlExternalFenceMutationRequest,
     DmlExternalFenceReceiptRecord, DmlHistoricalDataMutationRecoveryMutationRequest,
     DmlHistoricalDataMutationRecoveryRecord, DmlHistoricalWriteRecoveryMutationRequest,
@@ -310,25 +309,6 @@ pub trait OperationJournal: Send + Sync {
         ))
     }
 
-    /// Persist provider-neutral CTAS catalog-fence, dispatch, historical,
-    /// supersession, and cleanup-retention facts beside the top-level saga.
-    /// The live lease authority, operation revision, and encoded bound are
-    /// validated in the same transaction that advances the operation.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
-    fn record_ctas_recovery_authorized(
-        &self,
-        _request: DmlCtasRecoveryMutationRequest,
-        _recovery_due_at_ms: Option<i64>,
-        _authority: DmlMutationAuthority,
-    ) -> Result<StoredOperation, DmlError> {
-        Err(DmlError::journal_unavailable(
-            "authorized CTAS recovery mutation is not supported by this journal",
-        ))
-    }
-
     #[allow(
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
@@ -404,19 +384,6 @@ pub trait OperationJournal: Send + Sync {
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
     )]
-    fn load_ctas_recovery(
-        &self,
-        _operation_id: DmlOperationId,
-    ) -> Result<Option<DmlCtasRecoveryRecord>, DmlError> {
-        Err(DmlError::journal_unavailable(
-            "CTAS recovery loading is not supported by this journal",
-        ))
-    }
-
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
     fn load_historical_data_mutation_recovery(
         &self,
         _operation_id: DmlOperationId,
@@ -455,19 +422,6 @@ pub trait OperationJournal: Send + Sync {
     ) -> Result<(), DmlError> {
         Err(DmlError::journal_unavailable(
             "DML historical data mutation recovery preflight is not supported by this journal",
-        ))
-    }
-
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
-    fn preflight_ctas_recovery(
-        &self,
-        _request: &DmlCtasRecoveryMutationRequest,
-    ) -> Result<(), DmlError> {
-        Err(DmlError::journal_unavailable(
-            "CTAS recovery preflight is not supported by this journal",
         ))
     }
 

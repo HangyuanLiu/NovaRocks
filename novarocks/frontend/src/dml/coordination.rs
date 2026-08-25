@@ -49,12 +49,11 @@ use crate::dml::journal::{
 use crate::dml::model::{
     AddFilesMutationRequest, DML_COORDINATION_RESOURCE_CODEC_VERSION,
     DML_FOREGROUND_RECOVERY_VISIBILITY_MS, DmlCoordinationClaimRequest, DmlCoordinationProvenance,
-    DmlCtasRecoveryMutationRequest, DmlCtasRecoveryRecord, DmlDirectMutationFenceMutationRequest,
-    DmlDirectMutationFenceReceiptRecord, DmlDirectMutationKind, DmlExternalFenceGeneration,
-    DmlExternalFenceMutationRequest, DmlExternalFenceReceiptRecord, DmlFencingTokenV1,
-    DmlHistoricalWriteRecoveryRecord, DmlOperationId, DmlRecoveryDueRescheduleRequest,
-    OperationFact, OperationMutationRequest, OperationPayload, OperationState, StoredOperation,
-    operation_requires_recovery_scan,
+    DmlDirectMutationFenceMutationRequest, DmlDirectMutationFenceReceiptRecord,
+    DmlDirectMutationKind, DmlExternalFenceGeneration, DmlExternalFenceMutationRequest,
+    DmlExternalFenceReceiptRecord, DmlFencingTokenV1, DmlHistoricalWriteRecoveryRecord,
+    DmlOperationId, DmlRecoveryDueRescheduleRequest, OperationFact, OperationMutationRequest,
+    OperationPayload, OperationState, StoredOperation, operation_requires_recovery_scan,
 };
 use crate::dml::now_unix_millis;
 
@@ -1107,42 +1106,6 @@ impl ActiveDmlOperation {
         Ok(())
     }
 
-    /// Validate and persist the provider-neutral CTAS recovery side record
-    /// under the same live operation authority as the top-level saga.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
-    pub(crate) fn record_ctas_recovery(
-        &mut self,
-        recovery: DmlCtasRecoveryRecord,
-        recovery_due_at_ms: Option<i64>,
-    ) -> Result<(), DmlError> {
-        let recovery_due_at_ms = self.effective_recovery_due(
-            self.stored.state,
-            &self.stored.payload,
-            recovery_due_at_ms,
-        )?;
-        let request = DmlCtasRecoveryMutationRequest {
-            operation_id: self.operation_id(),
-            expected_revision: self.stored.revision,
-            mutation_id: Uuid::now_v7(),
-            recovery,
-        };
-        self.journal
-            .preflight_ctas_recovery(&request)
-            .map_err(|error| error.with_operation_id(self.operation_id()))?;
-        self.stored = self
-            .journal
-            .record_ctas_recovery_authorized(
-                request,
-                recovery_due_at_ms,
-                self.external_fence_journal_authority()?,
-            )
-            .map_err(|error| error.with_operation_id(self.operation_id()))?;
-        Ok(())
-    }
-
     #[allow(
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
@@ -1394,12 +1357,7 @@ impl ActiveDmlOperation {
         }
         if state.is_finished() {
             let historical = self.open_historical_write_recovery()?;
-            let ctas = self.open_ctas_recovery()?;
-            if !operation_requires_recovery_scan(state, payload, historical.as_ref())
-                && ctas
-                    .as_ref()
-                    .is_none_or(|record| !record.requires_recovery_scan())
-            {
+            if !operation_requires_recovery_scan(state, payload, historical.as_ref()) {
                 return Ok(None);
             }
         }
@@ -1425,19 +1383,6 @@ impl ActiveDmlOperation {
             .journal
             .load_historical_write_recovery(self.operation_id())
         {
-            Ok(record) => Ok(record),
-            Err(error) if error.kind() == DmlErrorKind::JournalUnavailable => Ok(None),
-            Err(error) => Err(error.with_operation_id(self.operation_id())),
-        }
-    }
-
-    /// The open CTAS recovery record, if this journal keeps one.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
-    fn open_ctas_recovery(&self) -> Result<Option<DmlCtasRecoveryRecord>, DmlError> {
-        match self.journal.load_ctas_recovery(self.operation_id()) {
             Ok(record) => Ok(record),
             Err(error) if error.kind() == DmlErrorKind::JournalUnavailable => Ok(None),
             Err(error) => Err(error.with_operation_id(self.operation_id())),
