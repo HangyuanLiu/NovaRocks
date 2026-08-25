@@ -42,6 +42,7 @@ use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use crate::query_execution::lifecycle_plan::{QueryInitOptions, QueryLifecycleLease};
 use crate::query_execution::write::WriteTerminalBuilder;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
+use crate::runtime::statement_result::StatementResult;
 use novarocks_proto::lifecycle::QueryOptions as ProtocolQueryOptions;
 use novarocks_spi::connector::ConnectorWriteLease;
 use novarocks_types::{
@@ -915,16 +916,7 @@ impl FrontendDistributedQueryCoordinator {
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         let query_id = self.query_ids.next_query_id()?;
-        let execution_id = QueryExecutionId::new(
-            query_id,
-            AttemptId::new(1).expect("the initial query attempt is nonzero"),
-        )
-        .map_err(|error| {
-            DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                error.to_string(),
-            )
-        })?;
+        let execution_id = execution_id_for_round(query_id, 1)?;
         self.execute_round(query_id, execution_id, request)
     }
 
@@ -1348,10 +1340,74 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.execute_request(request)
     }
+
+    fn execute_prepared(
+        &self,
+        operation: crate::query_execution::completion::PreparedDistributedQuery,
+    ) -> Result<StatementResult, DistributedQueryError> {
+        let query_id = self.query_ids.next_query_id()?;
+        let (first_request, first_completion, mut round_factory) = operation.into_parts();
+        let first_revision = first_request.topology().revision();
+        let first_execution_id = execution_id_for_round(query_id, 1)?;
+        match self.execute_round(query_id, first_execution_id, first_request) {
+            Ok(outcome) => first_completion.complete(outcome).map_err(failed),
+            Err(first_error) => {
+                // Never classify ordinary failure text as a topology retry.
+                // The lifecycle barrier and pre-Init validation are the sole
+                // typed evidence sources.
+                if first_error.pre_ready_topology_outcome().is_none() {
+                    return Err(first_error);
+                }
+                let Some(factory) = round_factory.as_deref_mut() else {
+                    return Err(first_error);
+                };
+                factory.permit_pre_ready_retry()?;
+                let fresh_topology = self.backend_topology.snapshot().map_err(|error| {
+                    DistributedQueryError::new(DistributedQueryErrorKind::Failed, error.to_string())
+                })?;
+                if fresh_topology.revision() <= first_revision {
+                    return Err(first_error);
+                }
+                let replacement = factory.replan(fresh_topology)?;
+                let (replacement_request, replacement_completion, replacement_factory) =
+                    replacement.into_parts();
+                if replacement_factory.is_some() {
+                    return Err(DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "replacement distributed round must not retain another automatic retry factory",
+                    ));
+                }
+                let replacement_execution_id = execution_id_for_round(query_id, 2)?;
+                self.execute_round(query_id, replacement_execution_id, replacement_request)
+                    .and_then(|outcome| replacement_completion.complete(outcome).map_err(failed))
+            }
+        }
+    }
 }
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
+}
+
+fn execution_id_for_round(
+    query_id: QueryId,
+    attempt: u32,
+) -> Result<QueryExecutionId, DistributedQueryError> {
+    QueryExecutionId::new(
+        query_id,
+        AttemptId::new(u64::from(attempt)).map_err(|error| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                error.to_string(),
+            )
+        })?,
+    )
+    .map_err(|error| {
+        DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            error.to_string(),
+        )
+    })
 }
 
 /// Snapshot validation runs before the Init + ControlReady boundary.  Only a

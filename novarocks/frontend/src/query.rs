@@ -1342,13 +1342,9 @@ fn execute_prepared_query(
 ) -> Result<StatementResult, String> {
     match operation {
         PreparedQueryOperation::Immediate(operation) => Ok(operation.into_result()),
-        PreparedQueryOperation::Distributed(operation) => {
-            let (request, completion) = operation.into_parts();
-            let outcome = query_execution
-                .execute(request)
-                .map_err(|error| error.to_string())?;
-            completion.complete(outcome)
-        }
+        PreparedQueryOperation::Distributed(operation) => query_execution
+            .execute_prepared(operation)
+            .map_err(|error| error.to_string()),
     }
 }
 

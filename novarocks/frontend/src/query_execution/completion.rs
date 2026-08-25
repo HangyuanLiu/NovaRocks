@@ -24,6 +24,24 @@
 use crate::runtime::query_result::build_string_query_result;
 use crate::runtime::statement_result::StatementResult;
 
+/// Frontend-owned factory for a replacement *whole* distributed round.  It
+/// receives a fresh topology snapshot and must return newly planned request
+/// artifacts and their matching completion formatter; no existing fragment,
+/// split, writer, RF, schedule, manifest, or profile artifact may be reused.
+pub(crate) trait PreparedDistributedRoundFactory: Send {
+    fn replan(
+        &mut self,
+        topology: crate::common::backend_topology::BackendTopologySnapshot,
+    ) -> Result<PreparedDistributedQuery, crate::query_execution::contract::DistributedQueryError>;
+
+    /// Proves that a pre-ready topology retry still crosses no external
+    /// effect boundary. DML factories must reject after any writer/staging/
+    /// publication dispatch; read-only factories use the same closed gate.
+    fn permit_pre_ready_retry(
+        &self,
+    ) -> Result<(), crate::query_execution::contract::DistributedQueryError>;
+}
+
 #[expect(
     clippy::large_enum_variant,
     reason = "Prepared query operations preserve their direct immediate and distributed boundary payloads."
@@ -65,6 +83,7 @@ impl PreparedImmediateQuery {
 pub struct PreparedDistributedQuery {
     request: crate::query_execution::contract::DistributedQueryRequest,
     completion: PreparedQueryCompletion,
+    round_factory: Option<Box<dyn PreparedDistributedRoundFactory>>,
 }
 
 impl PreparedDistributedQuery {
@@ -78,16 +97,26 @@ impl PreparedDistributedQuery {
         Self {
             request,
             completion,
+            round_factory: None,
         }
     }
 
-    pub fn into_parts(
+    pub(crate) fn with_round_factory(
+        mut self,
+        round_factory: Box<dyn PreparedDistributedRoundFactory>,
+    ) -> Self {
+        self.round_factory = Some(round_factory);
+        self
+    }
+
+    pub(crate) fn into_parts(
         self,
     ) -> (
         crate::query_execution::contract::DistributedQueryRequest,
         PreparedQueryCompletion,
+        Option<Box<dyn PreparedDistributedRoundFactory>>,
     ) {
-        (self.request, self.completion)
+        (self.request, self.completion, self.round_factory)
     }
 }
 

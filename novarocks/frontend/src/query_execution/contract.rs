@@ -935,6 +935,22 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         &self,
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError>;
+
+    /// Execute a statement operation whose replacement rounds must carry a
+    /// newly derived completion formatter as well as a newly derived request.
+    /// The default retains legacy single-round behavior for narrow test
+    /// coordinators; the production coordinator overrides it with the
+    /// statement-level pre-ready controller.
+    fn execute_prepared(
+        &self,
+        operation: crate::query_execution::completion::PreparedDistributedQuery,
+    ) -> Result<crate::runtime::statement_result::StatementResult, DistributedQueryError> {
+        let (request, completion, _round_factory) = operation.into_parts();
+        let outcome = self.execute(request)?;
+        completion
+            .complete(outcome)
+            .map_err(|error| DistributedQueryError::new(DistributedQueryErrorKind::Failed, error))
+    }
 }
 
 #[cfg(test)]
