@@ -52,7 +52,8 @@ use novarocks_spi::connector::{
     ConnectorWritePlanningRequest, ConnectorWritePreparationOutcome,
     ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
     ConnectorWriterHandle, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationFamily,
+    LakePublicationId, LakePublicationMarkerHeader,
 };
 
 use crate::control_provider::IcebergControlProvider;
@@ -287,9 +288,11 @@ struct CommitUnknownOperation {
 #[serde(deny_unknown_fields)]
 pub(crate) struct IcebergWriteOperationMarkerV1 {
     pub(crate) version: u8,
+    /// Cross-family NovaRocks publication identity and the only operation ID
+    /// representation in the marker.
+    pub(crate) publication: LakePublicationMarkerHeader,
     pub(crate) instance_id: String,
     pub(crate) incarnation_base64: String,
-    pub(crate) operation_id_base64: String,
     pub(crate) target_ref: String,
     pub(crate) cohort_set_digest_base64: String,
     pub(crate) aggregate_digest_base64: String,
@@ -466,7 +469,8 @@ impl IcebergWriteControl {
                         prepare_partition_replacement(&metadata, replacement, request.operation_id)
                     })
                     .transpose()?,
-                ConnectorWriteActivationIntent::Ordinary => None,
+                ConnectorWriteActivationIntent::Ordinary
+                | ConnectorWriteActivationIntent::Publication(_) => None,
             };
             if let Some(replacement) = &partition_replacement {
                 if preparation.target_ref().as_str() != "main" {
@@ -1075,7 +1079,8 @@ impl IcebergWriteControl {
             );
         }
         match &request.intent {
-            ConnectorWriteActivationIntent::Ordinary => plan.encode(),
+            ConnectorWriteActivationIntent::Ordinary
+            | ConnectorWriteActivationIntent::Publication(_) => plan.encode(),
             ConnectorWriteActivationIntent::ManagedPublication(intent) => {
                 // A refresh publishes either a prepared staging write (full
                 // refresh) or the provider routes of a row-mutation apply
@@ -1301,6 +1306,7 @@ impl IcebergWriteControl {
             && matches!(
                 active.activation_intent,
                 ConnectorWriteActivationIntent::Ordinary
+                    | ConnectorWriteActivationIntent::Publication(_)
             )
             && !replaces_every_live_row(&decoded)
         {
@@ -1492,11 +1498,21 @@ impl IcebergWriteControl {
         cohort_set_digest: [u8; 32],
         aggregate_digest: [u8; 32],
     ) -> IcebergWriteOperationMarkerV1 {
+        let family = match &active.activation_intent {
+            ConnectorWriteActivationIntent::Ordinary => LakePublicationFamily::Write,
+            ConnectorWriteActivationIntent::Publication(family) => *family,
+            ConnectorWriteActivationIntent::ManagedPublication(_) => {
+                LakePublicationFamily::MaterializedViewRefresh
+            }
+        };
         IcebergWriteOperationMarkerV1 {
             version: ICEBERG_WRITE_OPERATION_MARKER_VERSION,
+            publication: LakePublicationMarkerHeader::new(
+                LakePublicationId::from_bytes(operation_id.to_bytes()),
+                family,
+            ),
             instance_id: self.key.instance_id.as_str().to_string(),
             incarnation_base64: base64_encode(self.key.incarnation.to_bytes()),
-            operation_id_base64: base64_encode(operation_id.to_bytes()),
             target_ref: if active.partition_replacement.is_some() {
                 "main".to_string()
             } else {
@@ -2479,7 +2495,8 @@ impl ConnectorWriteControl for IcebergWriteControl {
                         corrupt("Iceberg managed publication snapshot has a negative row count")
                     })?)
                 }
-                ConnectorWriteActivationIntent::Ordinary => None,
+                ConnectorWriteActivationIntent::Ordinary
+                | ConnectorWriteActivationIntent::Publication(_) => None,
             };
             let committed_partitioning = unknown
                 .active
@@ -3185,10 +3202,8 @@ pub(crate) fn operation_marker_partitioning(
             ),
         ));
     }
-    let operation_id = ConnectorWriteOperationId::from_bytes(decode_marker_fixed::<16>(
-        &marker.operation_id_base64,
-        "operation id",
-    )?);
+    let operation_id =
+        ConnectorWriteOperationId::from_bytes(marker.publication.publication_id().to_bytes());
     let replacement_id = marker
         .partition_replacement_id_base64
         .as_deref()
@@ -3266,17 +3281,26 @@ pub(crate) fn operation_marker_from_snapshot(
     }
     novarocks_spi::connector::ConnectorInstanceId::parse(&marker.instance_id)
         .map_err(|error| corrupt(format!("invalid Iceberg marker instance ID: {error}")))?;
+    marker.publication.validate().map_err(|error| {
+        corrupt(format!(
+            "invalid Iceberg marker publication header: {error}"
+        ))
+    })?;
     if marker.target_ref.trim().is_empty() {
         return Err(corrupt(
             "Iceberg write operation marker has an empty target ref",
         ));
     }
     decode_marker_fixed::<16>(&marker.incarnation_base64, "incarnation")?;
-    decode_marker_fixed::<16>(&marker.operation_id_base64, "operation id")?;
+    if marker.publication.family() != LakePublicationFamily::Write {
+        return Err(corrupt(
+            "Iceberg write operation marker has a non-write publication family",
+        ));
+    }
     decode_marker_fixed::<32>(&marker.cohort_set_digest_base64, "cohort set digest")?;
     decode_marker_fixed::<32>(&marker.aggregate_digest_base64, "aggregate digest")?;
     validate_partition_reconcile_facts(
-        &marker.operation_id_base64,
+        &base64_encode(marker.publication.publication_id().to_bytes()),
         marker.partition_replacement_id_base64.as_deref(),
         marker.expected_prior_partition_spec_id,
         marker
@@ -4882,6 +4906,34 @@ mod tests {
     }
 
     #[test]
+    fn operation_marker_preserves_the_activation_publication_family() {
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let operation_id = ConnectorWriteOperationId::from_bytes([31; 16]);
+        let mut request = activation_request(&owner, operation_id, 1);
+        request.intent =
+            ConnectorWriteActivationIntent::Publication(LakePublicationFamily::DataMutation);
+        control.activate_write(request).expect("activate");
+        let active = {
+            let operations = control.operations.lock().expect("operation table");
+            let OperationState::Active(active) =
+                operations.get(&operation_id).expect("active operation")
+            else {
+                panic!("expected active operation");
+            };
+            active.clone()
+        };
+
+        assert_eq!(
+            control
+                .operation_marker(operation_id, &active, [4; 32], [5; 32])
+                .publication
+                .family(),
+            LakePublicationFamily::DataMutation
+        );
+    }
+
+    #[test]
     fn malformed_operation_marker_is_corrupt_data() {
         let snapshot = snapshot_with_operation_marker(8, "{\"version\":1}".to_string());
         let error = operation_marker_from_snapshot(&snapshot).expect_err("corrupt marker");
@@ -4916,9 +4968,12 @@ mod tests {
         let marker =
             |replacement_id: [u8; 32], prior_digest: [u8; 32]| IcebergWriteOperationMarkerV1 {
                 version: ICEBERG_WRITE_OPERATION_MARKER_VERSION,
+                publication: LakePublicationMarkerHeader::new(
+                    LakePublicationId::from_bytes(operation_id.to_bytes()),
+                    LakePublicationFamily::Write,
+                ),
                 instance_id: "ice".to_string(),
                 incarnation_base64: base64_encode([7; 16]),
-                operation_id_base64: base64_encode(operation_id.to_bytes()),
                 target_ref: "main".to_string(),
                 cohort_set_digest_base64: base64_encode([8; 32]),
                 aggregate_digest_base64: base64_encode([9; 32]),
@@ -5505,10 +5560,10 @@ mod tests {
             .expect("decode operation marker")
             .expect("operation marker");
         assert_eq!(
-            decode_marker_fixed::<16>(&marker.operation_id_base64, "operation id")
-                .expect("operation id"),
+            marker.publication.publication_id().to_bytes(),
             operation_id.to_bytes()
         );
+        assert_eq!(marker.publication.family(), LakePublicationFamily::Write);
         assert_eq!(
             decode_marker_fixed::<32>(&marker.cohort_set_digest_base64, "cohort digest")
                 .expect("cohort digest"),

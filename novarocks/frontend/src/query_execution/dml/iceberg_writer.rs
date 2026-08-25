@@ -104,37 +104,6 @@ impl IcebergWritePreparationOptions {
     }
 }
 
-/// Core Iceberg write preparation shared by the frontend INSERT adapter,
-/// CTAS, and mutation flows. Construction validates and plans the write but
-/// never starts a distributed writer or external metadata commit.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_iceberg_write(
-    state: &DmlExecutionKernel,
-    target: &TargetBackend,
-    resolved: &ResolvedTable,
-    insert_columns: &[String],
-    source: &IcebergWriteInput,
-    overwrite_mode: IcebergWriteMode,
-    target_ref: &str,
-    execution: Option<QueryExecutionContext>,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> Result<PreparedIcebergWrite, String> {
-    prepare_iceberg_write_with_options(
-        state,
-        target,
-        resolved,
-        insert_columns,
-        source,
-        overwrite_mode,
-        target_ref,
-        execution,
-        connector_context,
-        IcebergWritePreparationOptions::new(ConnectorWriteOperationId::new()),
-        planning_lease,
-    )
-}
-
 /// Prepare an Iceberg write with an application-preallocated operation
 /// identity. This still performs no writer execution or catalog mutation.
 #[allow(clippy::too_many_arguments)]
@@ -465,10 +434,6 @@ impl PreparedIcebergWriteNativeEncoding<'_> {
 impl PreparedIcebergWrite {
     pub(crate) fn target(&self) -> &TargetBackend {
         &self.executor.target
-    }
-
-    pub(crate) fn attempt_id(&self) -> &str {
-        &self.spec.attempt_id
     }
 
     pub(crate) fn is_overwrite(&self) -> bool {

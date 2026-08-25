@@ -46,7 +46,7 @@ use novarocks_execution::runtime::execution_runtime::{
 };
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendExecutionConfig, FrontendQueryControlTimeouts,
-    FrontendServerConfig,
+    FrontendServerConfig, LakePublicationRuntimePolicy,
     common::backend_topology::BackendTopologyPort,
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
@@ -472,6 +472,16 @@ pub fn compose_frontend_server_config(
         advertised.host,
         advertised.port,
         runtime_filter_worker_count,
+    )
+    .with_lake_publication_runtime_policy(
+        LakePublicationRuntimePolicy::try_new(
+            Duration::from_millis(runtime_config.lake_publication_max_attempt_duration_ms),
+            Duration::from_millis(runtime_config.lake_publication_safe_gc_age_ms),
+            Duration::from_millis(runtime_config.lake_publication_max_clock_skew_ms),
+            Duration::from_millis(runtime_config.lake_publication_listing_visibility_delay_ms),
+            Duration::from_millis(runtime_config.lake_publication_scheduler_margin_ms),
+        )
+        .map_err(|error| anyhow::anyhow!("construct lake publication runtime policy: {error}"))?,
     )
     .with_optimizer_query_mem_limit_bytes(runtime_config.optimizer_query_mem_limit_bytes)
     .with_query_control_timeouts(FrontendQueryControlTimeouts {

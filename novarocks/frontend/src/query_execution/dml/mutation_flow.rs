@@ -186,8 +186,9 @@ impl DmlChangeStreamPreparations {
         target_ref: &str,
         effect_set: DmlRowMutationEffectSet,
         context: novarocks_spi::connector::ConnectorRequestContext,
+        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
     ) -> Result<Self, String> {
-        use novarocks_spi::connector::{ConnectorRowMutationIntent, ConnectorWriteOperationId};
+        use novarocks_spi::connector::ConnectorRowMutationIntent;
 
         let intent = match effect_set {
             DmlRowMutationEffectSet::UpdateMor => ConnectorRowMutationIntent::Update,
@@ -195,7 +196,6 @@ impl DmlChangeStreamPreparations {
                 effects: effect_set.effects(),
             },
         };
-        let operation_id = ConnectorWriteOperationId::new();
         let (lease, preparation) =
             target.prepare_row_mutation(target_ref, operation_id, intent, context.clone())?;
         Ok(Self {
@@ -263,7 +263,9 @@ impl ActivatedDmlChangeStreamPreparations {
                 source: novarocks_spi::connector::ConnectorWriteActivationSource::RowMutation(
                     self.plan.clone(),
                 ),
-                intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Ordinary,
+                intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Publication(
+                    novarocks_spi::connector::LakePublicationFamily::DataMutation,
+                ),
                 context: context.clone(),
             })
             .map_err(|error| format!("activate exact MOR row-mutation plan: {error}"))?;
@@ -816,6 +818,7 @@ pub(crate) fn prepare_update_mutation(
     current_database: &str,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    publication_id: novarocks_spi::connector::LakePublicationId,
 ) -> Result<PreparedUpdateMutation, String> {
     // Detect branch/tag suffix in the target table name.
     let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
@@ -877,7 +880,7 @@ pub(crate) fn prepare_update_mutation(
     // assignment validation never decodes an Iceberg schema. The branch/format
     // gate now lives in row-mutation admission below.
     // The physical strategy is whatever the provider signs for this table state.
-    let strategy_operation_id = novarocks_spi::connector::ConnectorWriteOperationId::new();
+    let strategy_operation_id = publication_id.into();
     let (strategy_lease, strategy_preparation) = target_binding.prepare_row_mutation(
         &target_ref,
         strategy_operation_id,
@@ -977,6 +980,7 @@ pub(crate) fn prepare_merge_mutation(
     current_database: &str,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    publication_id: novarocks_spi::connector::LakePublicationId,
 ) -> Result<PreparedMergeMutation, String> {
     let (stripped_parts, ref_suffix) = split_ref_suffix(&stmt.table.parts);
     let effective_name;
@@ -1047,6 +1051,7 @@ pub(crate) fn prepare_merge_mutation(
         &target_ref,
         effect_set,
         connector_context.clone(),
+        publication_id.into(),
     )?;
     // Same two-route restriction as UPDATE; see `prepare_update_mutation`.
     let table_write_mode = match preparations.preparation.strategy() {
@@ -2629,7 +2634,9 @@ fn build_cow_update_distributed_execution(
             source: novarocks_spi::connector::ConnectorWriteActivationSource::RowMutation(
                 write.provider_plan.clone(),
             ),
-            intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Ordinary,
+            intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Publication(
+                novarocks_spi::connector::LakePublicationFamily::DataMutation,
+            ),
             context: connector_context.clone(),
         })
         .map_err(|error| format!("activate exact COW generation: {error}"))?;

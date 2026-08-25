@@ -608,6 +608,7 @@ mod tests {
 
     fn spec() -> WriteTransactionSpec {
         WriteTransactionSpec {
+            publication_id: crate::dml::DmlOperationId::new_v7(),
             target: OperationTarget {
                 catalog: "c".to_string(),
                 namespace: "n".to_string(),

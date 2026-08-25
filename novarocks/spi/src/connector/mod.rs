@@ -39,6 +39,7 @@ mod mv_attempt_discovery;
 mod mv_publication_fencing;
 mod mv_storage_observation;
 mod predicate;
+mod publication;
 mod read;
 mod read_session;
 mod row_mutation;
@@ -277,6 +278,11 @@ pub use predicate::{
     MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES, MAX_CONNECTOR_STATIC_PREDICATES,
     MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES, normalize_predicate_dispositions,
     validate_static_predicates,
+};
+pub use publication::{
+    LakePublicationDisposition, LakePublicationFamily, LakePublicationId,
+    LakePublicationMarkerHeader, LakePublicationNextAction, LakePublicationStatementTag,
+    LakePublicationTarget, LakePublicationTerminal,
 };
 pub use read::{
     ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest,

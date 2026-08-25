@@ -32,6 +32,7 @@ use crate::common::query_cancellation::QueryCancellationReason;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_proto_models::novarocks;
+use novarocks_spi::connector::LakePublicationTerminal;
 use novarocks_user_error::UserError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -177,6 +178,7 @@ pub struct QueryServiceError {
     kind: QueryServiceErrorKind,
     message: String,
     user_error: Option<UserError>,
+    publication_terminal: Option<LakePublicationTerminal>,
 }
 
 impl QueryServiceError {
@@ -185,6 +187,7 @@ impl QueryServiceError {
             kind,
             message: message.into(),
             user_error: None,
+            publication_terminal: None,
         }
     }
 
@@ -194,6 +197,19 @@ impl QueryServiceError {
             kind: QueryServiceErrorKind::Parse,
             message: error.to_string(),
             user_error: Some(error),
+            publication_terminal: None,
+        }
+    }
+
+    pub fn with_publication_terminal(
+        message: impl Into<String>,
+        terminal: LakePublicationTerminal,
+    ) -> Self {
+        Self {
+            kind: QueryServiceErrorKind::Internal,
+            message: message.into(),
+            user_error: None,
+            publication_terminal: Some(terminal),
         }
     }
 
@@ -207,6 +223,10 @@ impl QueryServiceError {
 
     pub fn user_error(&self) -> Option<&UserError> {
         self.user_error.as_ref()
+    }
+
+    pub fn publication_terminal(&self) -> Option<&LakePublicationTerminal> {
+        self.publication_terminal.as_ref()
     }
 }
 

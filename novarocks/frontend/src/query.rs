@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
 use crate::common::admitted_query_context::{
-    RequestAdmission, RequestContext, SessionOptimizerSettings,
+    LakePublicationRuntimePolicy, RequestAdmission, RequestContext, SessionOptimizerSettings,
 };
 use crate::common::backend_topology::BackendTopologyService;
 use crate::common::engine_error::EngineError;
@@ -292,16 +292,26 @@ impl CoreCommandRoute for TypedCommandRoute {
 enum RoutedExecutionError {
     Engine(String),
     User(UserError),
+    Publication {
+        message: String,
+        terminal: novarocks_spi::connector::LakePublicationTerminal,
+    },
 }
 
 fn dml_statement_result(
     result: Result<(), crate::dml::DmlError>,
 ) -> Result<StatementResult, RoutedExecutionError> {
     result.map(|()| StatementResult::Ok).map_err(|error| {
-        error.user_error().cloned().map_or_else(
-            || RoutedExecutionError::Engine(error.to_string()),
-            RoutedExecutionError::User,
-        )
+        if let Some(user_error) = error.user_error().cloned() {
+            RoutedExecutionError::User(user_error)
+        } else if let Some(terminal) = error.publication_terminal().cloned() {
+            RoutedExecutionError::Publication {
+                message: error.to_string(),
+                terminal,
+            }
+        } else {
+            RoutedExecutionError::Engine(error.to_string())
+        }
     })
 }
 
@@ -427,6 +437,40 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
     })
 }
 
+fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
+    match statement {
+        ParsedStatement::Dml(_) | ParsedStatement::Table(_) | ParsedStatement::Iceberg(_) => true,
+        ParsedStatement::Catalog(statement) => {
+            !matches!(statement, ast::CatalogStatement::ShowCreateTable(_))
+        }
+        ParsedStatement::Maintenance(statement) => {
+            !matches!(statement, ast::MaintenanceStatement::ShowOptimize(_))
+        }
+        ParsedStatement::MaterializedView(statement) => !matches!(
+            statement,
+            ast::MaterializedViewStatement::Show(_)
+                | ast::MaterializedViewStatement::ExplainRefresh(_)
+        ),
+        ParsedStatement::View(statement) => !matches!(
+            statement,
+            ast::ViewStatement::Show(_) | ast::ViewStatement::ShowCreate(_)
+        ),
+        ParsedStatement::Statistics(statement) => matches!(
+            statement,
+            ast::StatisticsStatement::AnalyzeTable(_)
+                | ast::StatisticsStatement::DropStats(_)
+                | ast::StatisticsStatement::DropHistogram(_)
+                | ast::StatisticsStatement::DropMultipleColumnsStats(_)
+        ),
+        ParsedStatement::Backend(statement) => {
+            !matches!(statement, ast::BackendStatement::ShowBackends(_))
+        }
+        ParsedStatement::Session(_)
+        | ParsedStatement::Query(_)
+        | ParsedStatement::ExplainQuery(_) => false,
+    }
+}
+
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
 pub struct FrontendQueryService {
@@ -448,6 +492,7 @@ pub struct FrontendQueryService {
     /// Cost budget frozen from `[runtime]` and handed to statement admission
     /// whenever the session did not set one itself.
     optimizer_query_mem_limit_bytes: u64,
+    lake_publication_runtime_policy: LakePublicationRuntimePolicy,
 }
 
 impl FrontendQueryService {
@@ -476,6 +521,7 @@ impl FrontendQueryService {
         ctas_engine: Arc<dyn CtasEngine>,
         truncate_engine: Arc<dyn TruncateEngine>,
         optimizer_query_mem_limit_bytes: u64,
+        lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     ) -> Self {
         Self {
             session_catalog_resolver,
@@ -503,6 +549,7 @@ impl FrontendQueryService {
             ctas_engine,
             truncate_engine,
             optimizer_query_mem_limit_bytes,
+            lake_publication_runtime_policy,
         }
     }
 }
@@ -865,7 +912,7 @@ impl FrontendQuerySession {
             })?;
         let cancellation = active.cancellation().clone();
         let query_timeout_secs = state.execution_settings.query_timeout_secs();
-        let deadline = match query_timeout_secs {
+        let session_deadline = match query_timeout_secs {
             Some(seconds) => Instant::now()
                 .checked_add(Duration::from_secs(seconds))
                 .ok_or_else(|| {
@@ -876,7 +923,19 @@ impl FrontendQuerySession {
                 })?,
             None => Instant::now(),
         };
-        let deadline = query_timeout_secs.map(|_| deadline);
+        let session_deadline = query_timeout_secs.map(|_| session_deadline);
+        let deadline = if requires_lake_publication_deadline(&parsed_statement) {
+            Some(
+                self.service
+                    .lake_publication_runtime_policy
+                    .admit_deadline(Instant::now(), session_deadline)
+                    .map_err(internal_error)?,
+            )
+        } else {
+            session_deadline
+        };
+        let timeout_duration =
+            deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         let topology = match self.service.topology.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -1013,20 +1072,20 @@ impl FrontendQuerySession {
             let completion = active.finish();
             (result, completion)
         });
-        let result = if let Some(seconds) = query_timeout_secs {
-            match tokio::time::timeout(Duration::from_secs(seconds), &mut worker).await {
+        let result = if let Some(timeout_duration) = timeout_duration {
+            match tokio::time::timeout(timeout_duration, &mut worker).await {
                 Ok(result) => result.map_err(|error| internal_error(error.to_string()))?,
                 Err(_) => {
-                    self.cancel_current(QueryCancellationReason::DeadlineExceeded {
-                        timeout_ms: seconds.saturating_mul(1_000),
-                    });
+                    let timeout_ms =
+                        u64::try_from(timeout_duration.as_millis()).unwrap_or(u64::MAX);
+                    self.cancel_current(QueryCancellationReason::DeadlineExceeded { timeout_ms });
                     // A timeout is not complete until the worker releases the
                     // statement lease. Waiting here also fences Backend abort
                     // acknowledgement before this session admits its next SQL.
                     let _ = worker.await;
                     return Err(QueryServiceError::new(
                         QueryServiceErrorKind::Timeout,
-                        format!("query timed out after {} ms", seconds.saturating_mul(1_000)),
+                        format!("query timed out after {timeout_ms} ms"),
                     ));
                 }
             }
@@ -1045,6 +1104,9 @@ impl FrontendQuerySession {
                 result.map_err(|error| match error {
                     RoutedExecutionError::Engine(error) => internal_error(error),
                     RoutedExecutionError::User(error) => QueryServiceError::from_user_error(error),
+                    RoutedExecutionError::Publication { message, terminal } => {
+                        QueryServiceError::with_publication_terminal(message, terminal)
+                    }
                 })
             }
         }
@@ -2053,6 +2115,7 @@ mod tests {
                 .push(request.execution);
             Ok(PreparedDelete {
                 operation: DeleteOperation {
+                    publication_id: request.publication_id,
                     catalog: "ice".to_string(),
                     namespace: "db".to_string(),
                     table: "t".to_string(),

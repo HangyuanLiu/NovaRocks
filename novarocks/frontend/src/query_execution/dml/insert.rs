@@ -37,6 +37,7 @@ use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_parser::ast::{Insert, Query};
 use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_spi::connector::{ConnectorWriteOperationId, LakePublicationId};
 use novarocks_sql::semantic::{Literal, ObjectName};
 
 pub use crate::query_execution::dml::iceberg_writer::PreparedIcebergWriteNativeEncoding;
@@ -128,6 +129,7 @@ pub enum IcebergInsertSource {
 
 /// Prepare an Iceberg INSERT without starting writers or external commit.
 pub struct PrepareIcebergInsert {
+    pub publication_id: LakePublicationId,
     pub target: ResolvedInsertTarget,
     pub insert_columns: Vec<String>,
     pub source: IcebergInsertSource,
@@ -153,6 +155,7 @@ pub trait IcebergInsertCommit: Send + Sync {
 /// Stable operation facts required by the frontend transaction runner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergInsertOperation {
+    pub publication_id: LakePublicationId,
     pub catalog: String,
     pub namespace: String,
     pub table: String,
@@ -348,7 +351,7 @@ impl InsertEngine for DmlExecutionKernel {
             &request.execution,
         )?;
         crate::connector::validate_request_context(&connector_context)?;
-        let prepared = iceberg_writer::prepare_iceberg_write(
+        let prepared = iceberg_writer::prepare_iceberg_write_with_options(
             self,
             &target,
             &resolved,
@@ -358,14 +361,18 @@ impl InsertEngine for DmlExecutionKernel {
             &request.target_ref,
             Some(request.execution),
             &connector_context,
+            iceberg_writer::IcebergWritePreparationOptions::new(ConnectorWriteOperationId::from(
+                request.publication_id,
+            )),
             request.target.planning_lease.clone(),
         )?;
         let operation = IcebergInsertOperation {
+            publication_id: request.publication_id,
             catalog: prepared.target().catalog.clone(),
             namespace: prepared.target().namespace.clone(),
             table: prepared.target().table.clone(),
             target_ref: request.target_ref,
-            attempt_id: prepared.attempt_id().to_string(),
+            attempt_id: request.publication_id.to_string(),
             is_overwrite: prepared.is_overwrite(),
             base_snapshot_id: prepared.base_snapshot_id(),
         };

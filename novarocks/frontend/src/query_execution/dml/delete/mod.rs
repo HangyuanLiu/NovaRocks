@@ -57,6 +57,7 @@ impl DeleteStatement<'_> {
 /// slices selected by a parser-owned AST span; it must not be reparsed or used
 /// to rediscover the statement family.
 pub struct PrepareDeleteRequest<'a> {
+    pub publication_id: novarocks_spi::connector::LakePublicationId,
     pub statement: DeleteStatement<'a>,
     pub source: &'a str,
     pub current_catalog: Option<String>,
@@ -81,6 +82,7 @@ pub trait DeleteCommit: Send + Sync {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeleteOperation {
+    pub publication_id: novarocks_spi::connector::LakePublicationId,
     pub catalog: String,
     pub namespace: String,
     pub table: String,
@@ -283,6 +285,7 @@ impl DeleteEngine for DmlExecutionKernel {
                 &request.current_database,
                 &request.execution,
                 &connector_context,
+                request.publication_id,
             ),
             DeleteStatement::Equality(statement) => equality::prepare_equality_delete_statement(
                 self,
@@ -291,6 +294,7 @@ impl DeleteEngine for DmlExecutionKernel {
                 &request.current_database,
                 &request.execution,
                 &connector_context,
+                request.publication_id,
             ),
         }?;
         prepared.sql_source = request.source.to_string();

@@ -30,6 +30,7 @@ use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
 use crate::catalog_application::FrontendCatalogApplicationPort;
 use crate::catalog_attachment::CatalogAttachmentRepository;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
+use crate::common::admitted_query_context::LakePublicationRuntimePolicy;
 use crate::connector::ConnectorControlHost;
 use crate::coordination::FrontendCoordinationRuntime;
 use crate::coordinator::{
@@ -140,6 +141,7 @@ pub struct FrontendApplicationHost {
     data_runtime: FrontendDataRuntime,
     topology: Option<Arc<ClusterBackendService>>,
     optimizer_query_mem_limit_bytes: u64,
+    lake_publication_runtime_policy: LakePublicationRuntimePolicy,
 }
 
 /// The one ordered handoff from Frontend composition to the CTAS recovery
@@ -250,6 +252,7 @@ pub struct FrontendExecutionConfig {
     /// Query-control timeouts frozen from `[runtime]` and handed to the
     /// coordinator, which validates them once at startup instead of per query.
     query_control_timeouts: FrontendQueryControlTimeouts,
+    lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     catalog_projection: CatalogProjectionConfig,
 }
 
@@ -267,6 +270,14 @@ impl FrontendExecutionConfig {
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             query_control_timeouts: FrontendQueryControlTimeouts::default(),
+            lake_publication_runtime_policy: LakePublicationRuntimePolicy::try_new(
+                Duration::from_secs(30 * 60),
+                Duration::from_secs(45 * 60),
+                Duration::from_secs(60),
+                Duration::from_secs(5 * 60),
+                Duration::from_secs(60),
+            )
+            .expect("default lake publication policy is safe"),
             catalog_projection: CatalogProjectionConfig::default(),
         }
     }
@@ -274,6 +285,18 @@ impl FrontendExecutionConfig {
     pub fn with_query_control_timeouts(mut self, timeouts: FrontendQueryControlTimeouts) -> Self {
         self.query_control_timeouts = timeouts;
         self
+    }
+
+    pub fn with_lake_publication_runtime_policy(
+        mut self,
+        policy: LakePublicationRuntimePolicy,
+    ) -> Self {
+        self.lake_publication_runtime_policy = policy;
+        self
+    }
+
+    pub(crate) const fn lake_publication_runtime_policy(&self) -> LakePublicationRuntimePolicy {
+        self.lake_publication_runtime_policy
     }
 
     pub fn with_optimizer_query_mem_limit_bytes(mut self, bytes: u64) -> Self {
@@ -381,6 +404,7 @@ impl FrontendApplicationHost {
             data_runtime: data_runtime.clone(),
             topology: None,
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
+            lake_publication_runtime_policy: execution.lake_publication_runtime_policy(),
         };
 
         if let Some(state_store) = state_store
@@ -580,6 +604,7 @@ impl FrontendApplicationHost {
         // constructing those services so MV refresh never observes an
         // all-in-one-only direct execution fallback.
         host.optimizer_query_mem_limit_bytes = execution.optimizer_query_mem_limit_bytes();
+        host.lake_publication_runtime_policy = execution.lake_publication_runtime_policy();
         if let Err(error) = host.open_coordinator(execution.clone()) {
             return Err(host.cleanup_open_error(error).await);
         }
@@ -646,6 +671,9 @@ impl FrontendApplicationHost {
                             execution.mv_maintenance.clone(),
                             host.table_maintenance_service(),
                             execution.optimizer_query_mem_limit_bytes(),
+                            execution
+                                .lake_publication_runtime_policy()
+                                .max_attempt_duration(),
                             ownership,
                         ));
                         host.mv_background_engine_sink = Some(
@@ -866,6 +894,10 @@ impl FrontendApplicationHost {
     /// Cost budget frozen from `[runtime]`, handed to statement admission.
     pub fn optimizer_query_mem_limit_bytes(&self) -> u64 {
         self.optimizer_query_mem_limit_bytes
+    }
+
+    pub fn lake_publication_runtime_policy(&self) -> LakePublicationRuntimePolicy {
+        self.lake_publication_runtime_policy
     }
 
     pub fn connector_control_registry(

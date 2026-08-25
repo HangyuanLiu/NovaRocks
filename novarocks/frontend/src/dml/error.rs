@@ -18,7 +18,11 @@
 use std::fmt;
 
 use novarocks_parser::Span;
-use novarocks_spi::connector::ConnectorWriteReceipt;
+use novarocks_spi::connector::{
+    ConnectorWriteReceipt, LakePublicationDisposition, LakePublicationFamily,
+    LakePublicationMarkerHeader, LakePublicationNextAction, LakePublicationTarget,
+    LakePublicationTerminal,
+};
 use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_user_error::{
     ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserError,
@@ -130,6 +134,7 @@ pub struct DmlError {
     operation_id: Option<DmlOperationId>,
     next_action: Option<StatementNextAction>,
     committed_receipt: Option<Box<ConnectorWriteReceipt>>,
+    publication_terminal: Option<LakePublicationTerminal>,
     user_error: Option<UserError>,
 }
 
@@ -206,6 +211,7 @@ impl DmlError {
             operation_id: None,
             next_action: None,
             committed_receipt: None,
+            publication_terminal: None,
             user_error: None,
         }
     }
@@ -240,6 +246,40 @@ impl DmlError {
         self
     }
 
+    pub(crate) fn with_publication_context(
+        mut self,
+        family: LakePublicationFamily,
+        catalog: String,
+        namespace: String,
+        table: String,
+        reference: Option<String>,
+    ) -> Self {
+        let Some(publication_id) = self.operation_id else {
+            return self;
+        };
+        let Ok(target) = LakePublicationTarget::try_new(catalog, namespace, Some(table), reference)
+        else {
+            return self;
+        };
+        let disposition = match self.kind {
+            DmlErrorKind::CommittedButUnfinalized => LakePublicationDisposition::KnownCommitted,
+            DmlErrorKind::CoordinationUnresolved => LakePublicationDisposition::CommitUnknown,
+            _ => LakePublicationDisposition::KnownUncommitted,
+        };
+        self.publication_terminal = Some(LakePublicationTerminal::new(
+            LakePublicationMarkerHeader::new(publication_id, family),
+            target,
+            disposition,
+            if disposition.do_not_retry() {
+                LakePublicationNextAction::InspectPublishedState
+            } else {
+                LakePublicationNextAction::RetryStatement
+            },
+            None,
+        ));
+        self
+    }
+
     pub(crate) fn committed_but_unfinalized(
         operation_id: DmlOperationId,
         committed_receipt: Option<ConnectorWriteReceipt>,
@@ -251,6 +291,7 @@ impl DmlError {
             operation_id: Some(operation_id),
             next_action: Some(StatementNextAction::RetryFinalize),
             committed_receipt: committed_receipt.map(Box::new),
+            publication_terminal: None,
             user_error: None,
         }
     }
@@ -268,6 +309,7 @@ impl DmlError {
             operation_id: Some(operation_id),
             next_action: Some(StatementNextAction::ManualInspect),
             committed_receipt: Some(Box::new(committed_receipt)),
+            publication_terminal: None,
             user_error: None,
         }
     }
@@ -284,6 +326,7 @@ impl DmlError {
             operation_id: Some(operation_id),
             next_action: Some(StatementNextAction::ManualInspect),
             committed_receipt: None,
+            publication_terminal: None,
             user_error: None,
         }
     }
@@ -301,6 +344,7 @@ impl DmlError {
             operation_id: None,
             next_action: None,
             committed_receipt: None,
+            publication_terminal: None,
             user_error: Some(error),
         }
     }
@@ -336,6 +380,10 @@ impl DmlError {
     pub fn user_error(&self) -> Option<&UserError> {
         self.user_error.as_ref()
     }
+
+    pub fn publication_terminal(&self) -> Option<&LakePublicationTerminal> {
+        self.publication_terminal.as_ref()
+    }
 }
 
 impl fmt::Display for DmlError {
@@ -349,6 +397,28 @@ impl fmt::Display for DmlError {
         }
         if self.committed_receipt.is_some() {
             write!(formatter, " (known committed connector write)")?;
+        }
+        if let Some(terminal) = &self.publication_terminal {
+            let target = terminal.target();
+            write!(
+                formatter,
+                " (lake publication id={} family={} target={}.{}{}{} disposition={:?} next_action={:?} do_not_retry={})",
+                terminal.header().publication_id(),
+                terminal.header().family(),
+                target.catalog(),
+                target.namespace(),
+                target
+                    .table()
+                    .map(|table| format!(".{table}"))
+                    .unwrap_or_default(),
+                target
+                    .reference()
+                    .map(|reference| format!("@{reference}"))
+                    .unwrap_or_default(),
+                terminal.disposition(),
+                terminal.next_action(),
+                terminal.do_not_retry(),
+            )?;
         }
         Ok(())
     }
@@ -411,5 +481,36 @@ mod tests {
         assert_eq!(error.code().as_str(), "sql.admit.delete_requires_where");
         assert_eq!(error.phase(), ErrorPhase::Admit);
         assert_eq!(error.location().map(|location| location.column()), Some(1));
+    }
+
+    #[test]
+    fn publication_context_projects_unknown_without_granting_retry() {
+        let publication_id = DmlOperationId::new_v7();
+        let error = DmlError::coordination_unresolved("commit response was lost")
+            .with_operation_id(publication_id)
+            .with_publication_context(
+                LakePublicationFamily::DataMutation,
+                "ice".to_string(),
+                "db".to_string(),
+                "t".to_string(),
+                Some("audit".to_string()),
+            );
+
+        let terminal = error.publication_terminal().expect("terminal projection");
+        assert_eq!(terminal.header().publication_id(), publication_id);
+        assert_eq!(
+            terminal.header().family(),
+            LakePublicationFamily::DataMutation
+        );
+        assert_eq!(terminal.target().catalog(), "ice");
+        assert_eq!(terminal.target().namespace(), "db");
+        assert_eq!(terminal.target().table(), Some("t"));
+        assert_eq!(terminal.target().reference(), Some("audit"));
+        assert_eq!(
+            terminal.disposition(),
+            LakePublicationDisposition::CommitUnknown
+        );
+        assert!(terminal.do_not_retry());
+        assert!(error.to_string().contains(&publication_id.to_string()));
     }
 }

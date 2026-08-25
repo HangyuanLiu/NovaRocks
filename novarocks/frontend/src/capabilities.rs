@@ -23,6 +23,7 @@
 //! composition must therefore make every authority edge visible at startup.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use novarocks_spi::connector::ConnectorControlRegistry;
 
@@ -637,6 +638,7 @@ pub struct StatisticsAttemptExecutorPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     backend_topology: BackendTopologyService,
     query_execution: QueryExecutionService,
+    attempt_timeout: Duration,
 }
 
 impl StatisticsAttemptExecutorPorts {
@@ -645,12 +647,14 @@ impl StatisticsAttemptExecutorPorts {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         backend_topology: BackendTopologyService,
         query_execution: QueryExecutionService,
+        attempt_timeout: Duration,
     ) -> Self {
         Self {
             execution_role,
             connector_control,
             backend_topology,
             query_execution,
+            attempt_timeout,
         }
     }
 }
@@ -666,6 +670,7 @@ pub fn statistics_attempt_executor(
                 ports.connector_control,
                 ports.backend_topology,
                 ports.query_execution,
+                ports.attempt_timeout,
             ),
         ),
     )
@@ -700,13 +705,17 @@ pub fn background_maintenance_engine(
 pub fn background_maintenance_attempt(
     role: novarocks_types::ClusterRole,
     topology: BackendTopologyService,
+    max_attempt_duration: std::time::Duration,
 ) -> Result<BackgroundMaintenanceAttempt, String> {
     let topology = topology.snapshot().map_err(|error| error.to_string())?;
+    let deadline = std::time::Instant::now()
+        .checked_add(max_attempt_duration)
+        .ok_or_else(|| "automatic maintenance deadline overflow".to_string())?;
     let cancellation = crate::common::query_cancellation::QueryCancellationSource::new();
     let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
         role,
         topology,
-        None,
+        Some(deadline),
         cancellation.view(),
         crate::common::admitted_query_context::SessionOptimizerSettings::default(),
     );

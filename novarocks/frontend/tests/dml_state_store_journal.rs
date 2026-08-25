@@ -135,6 +135,7 @@ async fn open_store_with_max_value_bytes(
 
 fn request() -> CreatePreparingRequest {
     CreatePreparingRequest {
+        publication_id: DmlOperationId::new_v7(),
         operation_kind: OperationKind::InsertAppend,
         operation_subkind: None,
         target: OperationTarget {

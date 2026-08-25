@@ -31,6 +31,7 @@ use novarocks_parser::ast::{
     DmlStatement, MergeClause, MergeMatchedAction, MutationSource, ObjectName as ParsedObjectName,
 };
 use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_spi::connector::LakePublicationId;
 use novarocks_sql::semantic::ObjectName;
 
 const PREPARED: u8 = 0;
@@ -48,6 +49,7 @@ pub enum MutationStatementKind {
 /// One admitted frontend mutation request. The typed statement establishes the
 /// command family; `source` may only be read through spans carried by it.
 pub struct PrepareMutationRequest<'a> {
+    pub publication_id: LakePublicationId,
     pub statement: &'a DmlStatement,
     pub source: &'a str,
     pub current_catalog: Option<String>,
@@ -72,6 +74,7 @@ pub trait MutationAbort: Send + Sync {
 /// The concrete COW/MOR provider action remains inside opaque handles/evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MutationOperation {
+    pub publication_id: LakePublicationId,
     pub kind: MutationStatementKind,
     pub catalog: String,
     pub namespace: String,
@@ -506,6 +509,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                     &request.current_database,
                     &request.execution,
                     &connector_context,
+                    request.publication_id,
                 )?;
                 // The provider signed this during admission for the exact
                 // target ref; the journal records that value rather than
@@ -527,6 +531,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                     &request.current_database,
                     &request.execution,
                     &connector_context,
+                    request.publication_id,
                 )?;
                 let base_snapshot_id = prepared.admitted_base_snapshot_id;
                 (
@@ -557,12 +562,13 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
             ),
         };
         let operation = MutationOperation {
+            publication_id: request.publication_id,
             kind,
             catalog,
             namespace,
             table,
             target_ref,
-            attempt_id: uuid::Uuid::new_v4().to_string(),
+            attempt_id: request.publication_id.to_string(),
             base_snapshot_id,
         };
         let handle: Arc<dyn MutationPrepared> = Arc::new(CoreMutationPrepared {
@@ -822,6 +828,7 @@ mod tests {
     fn prepared(kind: MutationStatementKind, attempt_id: &str) -> CoreMutationPrepared {
         CoreMutationPrepared {
             operation: MutationOperation {
+                publication_id: novarocks_spi::connector::LakePublicationId::new_v7(),
                 kind,
                 catalog: "iceberg".to_string(),
                 namespace: "db".to_string(),

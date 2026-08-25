@@ -55,10 +55,6 @@ use crate::query_execution::preparation::scan::{
 };
 use sha2::{Digest, Sha256};
 
-/// The longest independently owned durable ANALYZE attempt. A client wait
-/// deadline is intentionally not an attempt deadline.
-pub const MAX_STATISTICS_ATTEMPT_DURATION: Duration = Duration::from_secs(30 * 60);
-
 /// Bound the in-memory, mergeable Theta state produced by one statistics
 /// collection. This is independent of the SPI's wire-payload bound.
 /// The SPI's complete opaque result is capped at 64 KiB.  Keep one Theta
@@ -88,10 +84,6 @@ impl StatisticsExecutionMode {
     pub const fn statement_cancellation_terminates_execution(self) -> bool {
         matches!(self, Self::SynchronousWait)
     }
-
-    pub const fn maximum_attempt_duration(self) -> Duration {
-        MAX_STATISTICS_ATTEMPT_DURATION
-    }
 }
 
 /// Validated execution policy handed from the application service to Core.
@@ -108,11 +100,10 @@ impl StatisticsExecutionPolicy {
         mode: StatisticsExecutionMode,
         attempt_timeout: Duration,
     ) -> Result<Self, DistributedQueryError> {
-        if attempt_timeout.is_zero() || attempt_timeout > MAX_STATISTICS_ATTEMPT_DURATION {
-            return Err(contract_violation(format!(
-                "statistics attempt timeout must be between 1ns and {} seconds",
-                MAX_STATISTICS_ATTEMPT_DURATION.as_secs()
-            )));
+        if attempt_timeout.is_zero() {
+            return Err(contract_violation(
+                "statistics attempt timeout must be greater than zero",
+            ));
         }
         Ok(Self {
             mode,

@@ -36,6 +36,7 @@ use super::{
     ConnectorExternalFenceRequest, ConnectorExternalOperationFence, ConnectorMutationFailure,
     ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ConnectorWriteFencing,
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    LakePublicationFamily,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
@@ -217,6 +218,12 @@ impl ConnectorWriteOperationId {
 
     pub fn to_bytes(self) -> [u8; 16] {
         *self.0.as_bytes()
+    }
+}
+
+impl From<super::LakePublicationId> for ConnectorWriteOperationId {
+    fn from(publication_id: super::LakePublicationId) -> Self {
+        Self::from_bytes(publication_id.to_bytes())
     }
 }
 
@@ -1493,6 +1500,7 @@ impl ConnectorManagedPublicationIntent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorWriteActivationIntent {
     Ordinary,
+    Publication(LakePublicationFamily),
     ManagedPublication(ConnectorManagedPublicationIntent),
 }
 
@@ -1502,7 +1510,7 @@ impl ConnectorWriteActivationIntent {
         operation_id: ConnectorWriteOperationId,
     ) -> Result<(), ConnectorError> {
         match self {
-            Self::Ordinary => Ok(()),
+            Self::Ordinary | Self::Publication(_) => Ok(()),
             Self::ManagedPublication(intent) => intent.validate_for_operation(operation_id),
         }
     }
@@ -1511,6 +1519,12 @@ impl ConnectorWriteActivationIntent {
         match self {
             Self::Ordinary => {
                 Sha256::digest(b"novarocks.connector-write-activation-ordinary.v1\0").into()
+            }
+            Self::Publication(family) => {
+                let mut hasher = Sha256::new();
+                hasher.update(b"novarocks.connector-write-activation-publication.v1\0");
+                hasher.update(family.as_str().as_bytes());
+                hasher.finalize().into()
             }
             Self::ManagedPublication(intent) => intent.digest(),
         }

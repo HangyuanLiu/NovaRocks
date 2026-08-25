@@ -27,6 +27,7 @@ use crate::query_execution::dml::delete::{
     PreparedDelete,
 };
 use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_spi::connector::LakePublicationId;
 
 use crate::dml::coordination::DmlExternalFenceProposal;
 use crate::dml::error::{AdmitError, DmlError};
@@ -35,6 +36,7 @@ use crate::dml::runner::{
     ActiveWriteTransactionRunner, CoordinatedWriteReport, WriteExecutor, preparing_request,
 };
 use crate::dml::service::DmlService;
+use novarocks_spi::connector::LakePublicationFamily;
 
 struct DeleteWriteExecutor<'a> {
     engine: &'a dyn DeleteEngine,
@@ -129,6 +131,7 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
 fn write_transaction_spec(prepared: &PreparedDelete) -> WriteTransactionSpec {
     let operation = &prepared.operation;
     WriteTransactionSpec {
+        publication_id: operation.publication_id,
         target: OperationTarget {
             catalog: operation.catalog.clone(),
             namespace: operation.namespace.clone(),
@@ -169,9 +172,11 @@ impl DmlService {
         }
 
         self.require_journal()?;
+        let publication_id = LakePublicationId::new_v7();
         let session = context.session();
         let prepared = engine
             .prepare_delete(PrepareDeleteRequest {
+                publication_id,
                 statement,
                 source,
                 current_catalog: session.current_catalog().map(ToOwned::to_owned),
@@ -186,7 +191,18 @@ impl DmlService {
         };
         let spec = write_transaction_spec(&prepared);
         let operation = self.begin_write_operation(preparing_request(&spec))?;
-        ActiveWriteTransactionRunner::new(operation, &executor).run(spec)?;
+        let target = spec.target.clone();
+        ActiveWriteTransactionRunner::new(operation, &executor)
+            .run(spec)
+            .map_err(|error| {
+                error.with_publication_context(
+                    LakePublicationFamily::DataMutation,
+                    target.catalog,
+                    target.namespace,
+                    target.table,
+                    target.ref_name,
+                )
+            })?;
         Ok(())
     }
 }

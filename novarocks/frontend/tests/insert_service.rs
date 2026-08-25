@@ -63,6 +63,7 @@ enum Call {
         deadline: Option<Instant>,
     },
     Prepare {
+        publication_id: DmlOperationId,
         target_ref: String,
         overwrite_mode: InsertOverwriteMode,
         topology_revision: u64,
@@ -171,6 +172,7 @@ impl InsertEngine for FakeInsertEngine {
         request: PrepareIcebergInsert,
     ) -> Result<PreparedIcebergInsert, String> {
         self.calls.lock().unwrap().push(Call::Prepare {
+            publication_id: request.publication_id,
             target_ref: request.target_ref.clone(),
             overwrite_mode: request.overwrite_mode,
             topology_revision: request.execution.topology().revision(),
@@ -183,11 +185,12 @@ impl InsertEngine for FakeInsertEngine {
         let is_overwrite = !matches!(request.overwrite_mode, InsertOverwriteMode::Append);
         Ok(PreparedIcebergInsert {
             operation: IcebergInsertOperation {
+                publication_id: request.publication_id,
                 catalog: request.target.catalog,
                 namespace: request.target.namespace,
                 table: request.target.table,
                 target_ref: request.target_ref,
-                attempt_id: "fake-attempt".to_string(),
+                attempt_id: request.publication_id.to_string(),
                 is_overwrite,
                 base_snapshot_id: Some(10),
             },
@@ -299,7 +302,7 @@ impl OperationJournal for FakeJournal {
         &self,
         request: CreatePreparingRequest,
     ) -> Result<DmlOperationId, DmlError> {
-        let operation_id = DmlOperationId::new_v7();
+        let operation_id = request.publication_id;
         self.operations.lock().unwrap().insert(
             *operation_id.as_uuid(),
             StoredOperation {
@@ -701,6 +704,16 @@ fn branch_insert_journals_the_prepared_branch_base_snapshot() {
     .expect("branch INSERT");
 
     let operation = journal.only_operation();
+    let publication_id = engine
+        .calls()
+        .into_iter()
+        .find_map(|call| match call {
+            Call::Prepare { publication_id, .. } => Some(publication_id),
+            _ => None,
+        })
+        .expect("one admitted publication ID");
+    assert_eq!(operation.operation_id, publication_id);
+    assert_eq!(operation.attempt_id, publication_id.to_string());
     assert_eq!(operation.target.ref_name.as_deref(), Some("dev"));
     assert_eq!(operation.base_snapshot_id, Some(10));
     assert_eq!(operation.state, OperationState::Finalized);

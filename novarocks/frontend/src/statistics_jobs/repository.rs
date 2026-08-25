@@ -185,7 +185,7 @@ impl StatisticsJobRepository {
     ) -> RepositoryResult<StatisticsJob> {
         validate_create(&request)?;
         let job_id = Uuid::now_v7();
-        let operation_id = Uuid::now_v7();
+        let operation_id = novarocks_spi::connector::LakePublicationId::new_v7();
         let stored = StoredStatisticsJobV3::try_new(job_id, operation_id, request)
             .map_err(StatisticsJobRepositoryError::durable)?;
         for retry in 0..=CREATE_CONFLICT_RETRY_LIMIT {
@@ -896,7 +896,7 @@ fn validate_stored(stored: &StoredStatisticsJobV3) -> RepositoryResult<()> {
                     "statistics job publication evidence is invalid: {error}"
                 ))
             })?;
-        if evidence.operation_id().to_bytes() != *stored.operation_id.as_bytes() {
+        if evidence.operation_id().to_bytes() != stored.operation_id.to_bytes() {
             return Err(StatisticsJobRepositoryError::corruption(
                 "statistics job publication evidence operation ID does not match its job",
             ));

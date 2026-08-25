@@ -35,6 +35,7 @@ use crate::dml::runner::{
     ActiveWriteTransactionRunner, CoordinatedWriteReport, WriteExecutor, preparing_request,
 };
 use crate::dml::service::DmlService;
+use novarocks_spi::connector::{LakePublicationFamily, LakePublicationId};
 
 struct MutationWriteExecutor<'a> {
     engine: &'a dyn MutationEngine,
@@ -137,6 +138,7 @@ impl WriteExecutor for MutationWriteExecutor<'_> {
 fn write_transaction_spec(prepared: &PreparedMutation, subkind: &str) -> WriteTransactionSpec {
     let operation = &prepared.operation;
     WriteTransactionSpec {
+        publication_id: operation.publication_id,
         target: OperationTarget {
             catalog: operation.catalog.clone(),
             namespace: operation.namespace.clone(),
@@ -167,10 +169,12 @@ impl DmlService {
         query_options: Option<&QueryOptions>,
     ) -> Result<(), DmlError> {
         let (_kind, subkind) = admit_mutation(statement, source)?;
+        let publication_id = LakePublicationId::new_v7();
 
         let session = context.session();
         let prepared = engine
             .prepare_mutation(PrepareMutationRequest {
+                publication_id,
                 statement,
                 source,
                 current_catalog: session.current_catalog().map(ToOwned::to_owned),
@@ -189,7 +193,18 @@ impl DmlService {
         };
         let spec = write_transaction_spec(&prepared, subkind);
         let operation = self.begin_write_operation(preparing_request(&spec))?;
-        ActiveWriteTransactionRunner::new(operation, &executor).run(spec)?;
+        let target = spec.target.clone();
+        ActiveWriteTransactionRunner::new(operation, &executor)
+            .run(spec)
+            .map_err(|error| {
+                error.with_publication_context(
+                    LakePublicationFamily::DataMutation,
+                    target.catalog,
+                    target.namespace,
+                    target.table,
+                    target.ref_name,
+                )
+            })?;
         Ok(())
     }
 }
@@ -363,6 +378,7 @@ mod tests {
             self.events.lock().expect("events").push("prepare");
             Ok(PreparedMutation {
                 operation: crate::query_execution::dml::mutation::MutationOperation {
+                    publication_id: request.publication_id,
                     kind: match request.statement {
                         DmlStatement::Update(_) => MutationStatementKind::Update,
                         DmlStatement::Merge(_) => MutationStatementKind::Merge,
@@ -372,7 +388,7 @@ mod tests {
                     namespace: "db".to_string(),
                     table: "t".to_string(),
                     target_ref: "main".to_string(),
-                    attempt_id: "mutation-test".to_string(),
+                    attempt_id: request.publication_id.to_string(),
                     base_snapshot_id: Some(7),
                 },
                 handle: Arc::new(TestPrepared),

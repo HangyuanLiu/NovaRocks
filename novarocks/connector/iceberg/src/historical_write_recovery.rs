@@ -961,8 +961,7 @@ fn provenance_match(
     if marker.version != ICEBERG_WRITE_OPERATION_MARKER_VERSION {
         return ProvenanceMatch::UnknownLayout;
     }
-    if decode_base64(&marker.operation_id_base64) != Some(descriptor.operation_id.to_bytes().into())
-    {
+    if marker.publication.publication_id().to_bytes() != descriptor.operation_id.to_bytes() {
         return ProvenanceMatch::None;
     }
     // From here the marker names this operation, so any disagreement is a

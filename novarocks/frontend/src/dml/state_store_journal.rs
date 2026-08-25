@@ -158,7 +158,7 @@ impl StateStoreOperationJournal {
         request: CreatePreparingRequest,
         admission: Option<Arc<dyn DmlIntentAdmissionValidator>>,
     ) -> Result<DmlOperationId, DmlError> {
-        let operation_id = DmlOperationId::new_v7();
+        let operation_id = request.publication_id;
         let mutation_id = Uuid::now_v7();
         let now_ms = request.created_at_ms;
         let recovery_due_at_ms = now_ms.saturating_add(DML_FOREGROUND_RECOVERY_VISIBILITY_MS);

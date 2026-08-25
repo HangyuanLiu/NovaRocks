@@ -128,6 +128,7 @@ impl WriteExecutor for IcebergInsertWriteExecutor<'_> {
 pub(super) fn write_transaction_spec(prepared: &PreparedIcebergInsert) -> WriteTransactionSpec {
     let operation = &prepared.operation;
     WriteTransactionSpec {
+        publication_id: operation.publication_id,
         target: OperationTarget {
             catalog: operation.catalog.clone(),
             namespace: operation.namespace.clone(),

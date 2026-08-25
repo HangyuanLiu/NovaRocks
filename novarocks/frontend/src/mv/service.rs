@@ -76,6 +76,7 @@ pub struct FrontendMvService {
     /// Cost budget frozen from `[runtime]`; the MV worker has no session, so it
     /// carries the value that statement admission would otherwise have to guess.
     optimizer_query_mem_limit_bytes: u64,
+    attempt_timeout: Duration,
 }
 
 impl FrontendMvService {
@@ -92,6 +93,7 @@ impl FrontendMvService {
             execution_role: novarocks_types::ClusterRole::AllInOne,
             topology: None,
             optimizer_query_mem_limit_bytes: 2 * 1024 * 1024 * 1024,
+            attempt_timeout: MV_WORKER_ATTEMPT_TIMEOUT,
         }
     }
 
@@ -110,6 +112,7 @@ impl FrontendMvService {
         maintenance_config: MaintenanceCoordinatorConfig,
         table_maintenance_service: Arc<dyn TableMaintenanceService>,
         optimizer_query_mem_limit_bytes: u64,
+        attempt_timeout: Duration,
         ownership: Option<super::coordination::MvRefreshOwnershipContext>,
     ) -> Self {
         Self {
@@ -137,6 +140,7 @@ impl FrontendMvService {
             execution_role,
             topology: Some(topology),
             optimizer_query_mem_limit_bytes,
+            attempt_timeout,
         }
     }
 
@@ -233,6 +237,7 @@ impl FrontendMvService {
                 activity_gate: self.activity_gate.clone(),
                 maintenance_wakeup_tx: None,
                 optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
+                attempt_timeout: self.attempt_timeout,
             },
         )?);
         Ok(())
@@ -402,6 +407,7 @@ struct RefreshWorkerDependencies {
     activity_gate: MvActivityGate,
     maintenance_wakeup_tx: Option<mpsc::SyncSender<()>>,
     optimizer_query_mem_limit_bytes: u64,
+    attempt_timeout: Duration,
 }
 
 struct FrontendMvBackgroundRuntime {
@@ -432,6 +438,7 @@ impl FrontendMvBackgroundRuntime {
                 table_maintenance_service: Arc::clone(&dependencies.table_maintenance_service),
                 activity_gate: dependencies.activity_gate.clone(),
                 coordinator_config: dependencies.maintenance_config.clone(),
+                attempt_timeout: dependencies.attempt_timeout,
             },
         ));
         let mut refresh_dependencies = dependencies;
@@ -608,7 +615,7 @@ fn execute_scheduled_refresh(
         Ok(snapshot) => snapshot,
         Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error.to_string()),
     };
-    let deadline = match Instant::now().checked_add(MV_WORKER_ATTEMPT_TIMEOUT) {
+    let deadline = match Instant::now().checked_add(dependencies.attempt_timeout) {
         Some(deadline) => deadline,
         None => {
             return ScheduledRefreshDisposition::InvariantViolation(

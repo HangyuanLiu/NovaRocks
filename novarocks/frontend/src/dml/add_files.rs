@@ -71,7 +71,7 @@ impl DmlService {
         }
 
         let operation_id = DmlOperationId::new_v7();
-        let connector_operation_id = Uuid::now_v7();
+        let connector_operation_id = *operation_id.as_uuid();
         let session = context.session();
         let initial = AddFilesLifecycleRecord {
             phase: AddFilesLifecyclePhase::Preparing,
@@ -1676,6 +1676,10 @@ mod tests {
             panic!("ADD FILES payload")
         };
         assert_eq!(operation.state, OperationState::Finalized);
+        assert_eq!(
+            record.connector_operation_id,
+            *operation.operation_id.as_uuid()
+        );
         assert_eq!(record.source_ownership, SourceScopeOwnership::TableOwned);
         assert!(record.plan_artifact.is_some());
         assert!(record.receipt_artifact.is_some());

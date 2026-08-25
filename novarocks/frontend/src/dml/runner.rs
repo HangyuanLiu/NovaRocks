@@ -354,6 +354,7 @@ impl<'a, E: WriteExecutor> WriteTransactionRunner<'a, E> {
 /// code is allowed to observe the write transaction.
 pub(crate) fn preparing_request(spec: &WriteTransactionSpec) -> CreatePreparingRequest {
     CreatePreparingRequest {
+        publication_id: spec.publication_id,
         operation_kind: spec.operation_kind,
         operation_subkind: spec.operation_subkind.clone(),
         target: spec.target.clone(),
@@ -1331,6 +1332,7 @@ mod tests {
 
     fn spec() -> WriteTransactionSpec {
         WriteTransactionSpec {
+            publication_id: DmlOperationId::new_v7(),
             target: crate::dml::model::OperationTarget {
                 catalog: "ice".to_string(),
                 namespace: "db".to_string(),

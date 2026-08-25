@@ -22,7 +22,7 @@ use crate::state_store::coordination::FencingToken;
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteReceipt,
-    ExternalMutationEvidence,
+    ExternalMutationEvidence, LakePublicationId,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
@@ -86,31 +86,8 @@ pub const DML_CTAS_TOTAL_FACT_ENCODED_LIMIT: usize = 4 * DML_CTAS_FACT_ENCODED_L
 pub const CTAS_CREATE_POLICY_FAIL_IF_EXISTS: &str = "FAIL_IF_EXISTS";
 pub const CTAS_CREATE_POLICY_NO_OP_IF_EXISTS: &str = "NO_OP_IF_EXISTS";
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct DmlOperationId(Uuid);
-
-impl DmlOperationId {
-    pub fn new_v7() -> Self {
-        Self(Uuid::now_v7())
-    }
-
-    pub const fn as_uuid(&self) -> &Uuid {
-        &self.0
-    }
-}
-
-impl From<Uuid> for DmlOperationId {
-    fn from(value: Uuid) -> Self {
-        Self(value)
-    }
-}
-
-impl fmt::Display for DmlOperationId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
+/// Historical DML naming for the single statement publication identity.
+pub type DmlOperationId = LakePublicationId;
 
 /// Canonical CP-1 fencing-token v1 bytes retained for durable audit and
 /// recovery identity. This is deliberately not a serialized `LeaseFence`:
@@ -3135,6 +3112,9 @@ pub struct AddFilesMutationRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreatePreparingRequest {
+    /// The one UUIDv7 publication identity allocated during typed statement
+    /// admission. It is also the durable operation key.
+    pub publication_id: DmlOperationId,
     pub operation_kind: OperationKind,
     pub operation_subkind: Option<String>,
     pub target: OperationTarget,
@@ -3190,6 +3170,9 @@ pub struct OperationMutationRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WriteTransactionSpec {
+    /// The one UUIDv7 publication identity allocated during typed statement
+    /// admission. It is reused by the connector request and durable journal.
+    pub publication_id: DmlOperationId,
     pub target: OperationTarget,
     pub operation_kind: OperationKind,
     /// Stable statement refinement retained by the frontend lifecycle.

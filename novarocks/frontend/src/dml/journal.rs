@@ -660,7 +660,7 @@ pub(crate) mod testing {
             &self,
             request: CreatePreparingRequest,
         ) -> Result<DmlOperationId, DmlError> {
-            let operation_id = DmlOperationId::new_v7();
+            let operation_id = request.publication_id;
             let mutation_id = Uuid::now_v7();
             let stored = StoredOperation {
                 schema_version: DML_OPERATION_SCHEMA_VERSION,
@@ -684,10 +684,13 @@ pub(crate) mod testing {
                 updated_at_ms: request.created_at_ms,
                 finished_at_ms: None,
             };
-            self.inner
-                .lock()
-                .unwrap()
-                .insert(*operation_id.as_uuid(), stored);
+            let mut guard = self.inner.lock().unwrap();
+            if guard.contains_key(operation_id.as_uuid()) {
+                return Err(DmlError::journal_corruption(format!(
+                    "duplicate DML operation id {operation_id}"
+                )));
+            }
+            guard.insert(*operation_id.as_uuid(), stored);
             Ok(operation_id)
         }
 

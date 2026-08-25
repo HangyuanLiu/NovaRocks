@@ -44,11 +44,16 @@ type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
 struct FrontendBackgroundMaintenanceAttemptFactory {
     role: novarocks_types::ClusterRole,
     topology: crate::common::backend_topology::BackendTopologyService,
+    runtime_policy: crate::common::admitted_query_context::LakePublicationRuntimePolicy,
 }
 
 impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {
     fn begin_automatic_maintenance_attempt(&self) -> Result<BackgroundMaintenanceAttempt, String> {
-        core_capabilities::background_maintenance_attempt(self.role, self.topology.clone())
+        core_capabilities::background_maintenance_attempt(
+            self.role,
+            self.topology.clone(),
+            self.runtime_policy.max_attempt_duration(),
+        )
     }
 }
 
@@ -179,6 +184,8 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&connector_control),
             topology.clone(),
             query_execution.clone(),
+            host.lake_publication_runtime_policy()
+                .max_attempt_duration(),
         ),
     )
     .map_err(FrontendApplicationError::server)?;
@@ -196,6 +203,7 @@ pub fn build_frontend_query_session_factory(
         Arc::new(FrontendBackgroundMaintenanceAttemptFactory {
             role,
             topology: topology.clone(),
+            runtime_policy: host.lake_publication_runtime_policy().clone(),
         }),
     );
     if let Err(error) = maintenance_service.start(Arc::clone(&maintenance_engine)) {
@@ -338,6 +346,7 @@ pub fn build_frontend_query_session_factory(
             dml_engines.ctas,
             dml_engines.truncate,
             host.optimizer_query_mem_limit_bytes(),
+            host.lake_publication_runtime_policy(),
         ),
     ))
 }

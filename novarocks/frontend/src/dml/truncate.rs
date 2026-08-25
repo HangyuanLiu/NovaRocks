@@ -94,7 +94,7 @@ impl DmlService {
         query_options: Option<&QueryOptions>,
     ) -> Result<(), DmlError> {
         let operation_id = DmlOperationId::new_v7();
-        let connector_operation_id = Uuid::now_v7();
+        let connector_operation_id = *operation_id.as_uuid();
         let session = context.session();
         let initial_record = TruncateLifecycleRecord {
             phase: TruncateLifecyclePhase::Preparing,

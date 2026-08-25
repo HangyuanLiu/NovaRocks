@@ -21,8 +21,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use novarocks_frontend::StateStoreHost;
 use novarocks_frontend::dml::{
-    CoordinatedWriteReport, DmlError, DmlErrorKind, DmlService, OperationKind, OperationState,
-    OperationTarget, StateStoreOperationJournal, WriteExecutor, WriteTransactionSpec,
+    CoordinatedWriteReport, DmlError, DmlErrorKind, DmlOperationId, DmlService, OperationKind,
+    OperationState, OperationTarget, StateStoreOperationJournal, WriteExecutor,
+    WriteTransactionSpec,
 };
 use novarocks_spi::connector::{
     ConnectorWriteAbortOutcome, ConnectorWriteReceipt, ExternalMutationEffect,
@@ -136,6 +137,7 @@ async fn dml_service_commits_over_real_state_store() {
     let service = DmlService::new(Arc::new(journal));
 
     let spec = WriteTransactionSpec {
+        publication_id: DmlOperationId::new_v7(),
         target: OperationTarget {
             catalog: "cat".to_string(),
             namespace: "ns".to_string(),
@@ -170,6 +172,7 @@ async fn known_committed_commit_error_persists_retry_finalize_fact_over_real_sta
     let service = DmlService::new(Arc::new(journal));
 
     let spec = WriteTransactionSpec {
+        publication_id: DmlOperationId::new_v7(),
         target: OperationTarget {
             catalog: "cat".to_string(),
             namespace: "ns".to_string(),
