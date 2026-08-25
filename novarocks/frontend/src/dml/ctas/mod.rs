@@ -38,6 +38,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::common::engine_error::EngineError;
 use crate::dml::coordination::ActiveDmlOperation;
 use crate::dml::error::{AdmitError, DmlError, DmlErrorKind};
 use crate::dml::model::{
@@ -783,7 +784,13 @@ fn finish_standard_known_uncommitted(
         OperationPayload::CtasSaga(saga),
         None,
     )?;
-    Err(source_failure_error(active.operation_id(), source, failure))
+    // This path is reached only after the standard staged-create publication
+    // lifecycle has recorded a terminal known-uncommitted fact. Preserve that
+    // semantic outcome at the SQL boundary rather than degrading it to the
+    // generic executor error used for source preparation failures.
+    let error = source_failure_error(active.operation_id(), source, failure);
+    let engine_error = EngineError::commit_known_uncommitted(error.to_string());
+    Err(error.with_engine_error(engine_error))
 }
 
 fn finish_standard_unknown(
@@ -813,7 +820,9 @@ fn finish_standard_unknown(
         OperationPayload::CtasSaga(saga),
         Some(crate::dml::now_unix_millis()),
     )?;
-    Err(unknown_error(active.operation_id(), label, &failure))
+    let error = unknown_error(active.operation_id(), label, &failure);
+    let engine_error = EngineError::commit_unknown(error.to_string());
+    Err(error.with_engine_error(engine_error))
 }
 
 fn failure_fact(failure: &CtasFailure) -> DurableExternalFact {

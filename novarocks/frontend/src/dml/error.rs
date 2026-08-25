@@ -17,6 +17,7 @@
 
 use std::fmt;
 
+use crate::common::engine_error::EngineError;
 use novarocks_parser::Span;
 use novarocks_spi::connector::{
     ConnectorWriteReceipt, LakePublicationDisposition, LakePublicationFamily,
@@ -136,6 +137,7 @@ pub struct DmlError {
     committed_receipt: Option<Box<ConnectorWriteReceipt>>,
     publication_terminal: Option<LakePublicationTerminal>,
     user_error: Option<UserError>,
+    engine_error: Option<EngineError>,
 }
 
 /// DML-local carrier for a SQL analysis error before the frontend client
@@ -213,6 +215,7 @@ impl DmlError {
             committed_receipt: None,
             publication_terminal: None,
             user_error: None,
+            engine_error: None,
         }
     }
 
@@ -293,6 +296,7 @@ impl DmlError {
             committed_receipt: committed_receipt.map(Box::new),
             publication_terminal: None,
             user_error: None,
+            engine_error: None,
         }
     }
 
@@ -311,6 +315,7 @@ impl DmlError {
             committed_receipt: Some(Box::new(committed_receipt)),
             publication_terminal: None,
             user_error: None,
+            engine_error: None,
         }
     }
 
@@ -328,6 +333,7 @@ impl DmlError {
             committed_receipt: None,
             publication_terminal: None,
             user_error: None,
+            engine_error: None,
         }
     }
 
@@ -346,6 +352,7 @@ impl DmlError {
             committed_receipt: None,
             publication_terminal: None,
             user_error: Some(error),
+            engine_error: None,
         }
     }
 
@@ -359,6 +366,13 @@ impl DmlError {
 
     pub(crate) fn coordination_unresolved(error: impl fmt::Display) -> Self {
         Self::new(DmlErrorKind::CoordinationUnresolved, error)
+    }
+
+    /// Carries an explicit engine-level outcome to the SQL boundary.  DML
+    /// must never reconstruct these codes by parsing its own display text.
+    pub(crate) fn with_engine_error(mut self, error: EngineError) -> Self {
+        self.engine_error = Some(error);
+        self
     }
 
     pub const fn kind(&self) -> DmlErrorKind {
@@ -379,6 +393,10 @@ impl DmlError {
 
     pub fn user_error(&self) -> Option<&UserError> {
         self.user_error.as_ref()
+    }
+
+    pub(crate) fn engine_error(&self) -> Option<&EngineError> {
+        self.engine_error.as_ref()
     }
 
     pub fn publication_terminal(&self) -> Option<&LakePublicationTerminal> {

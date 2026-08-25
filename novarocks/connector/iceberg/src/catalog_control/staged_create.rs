@@ -913,7 +913,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     .remove(&request.operation_id);
                 Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted {
                     failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Internal,
+                        ConnectorMutationFailureKind::Unavailable,
                         message,
                     ),
                 })

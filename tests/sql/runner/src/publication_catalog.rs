@@ -373,7 +373,11 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     let action = standard_publication_action(&parts.method, parts.uri.path(), &bytes);
     let fault = action.and_then(|action| take_matching_fault(&state, action));
     if let Some((_, PublicationFault::BeforeDispatch)) = fault {
-        return temporary_failure("publication REST request rejected before dispatch");
+        // The fixture proves it did not forward this request. Use a typed
+        // non-5xx REST response so the standard client can truthfully classify
+        // the operation as known-not-dispatched rather than a transport
+        // ambiguity; no private catalog protocol participates.
+        return known_not_dispatched("publication REST request rejected before dispatch");
     }
     let response = proxy_request(&state, parts.method, parts.uri, parts.headers, bytes).await;
     if let Some((_, PublicationFault::AfterCommitBeforeResponse)) = fault
@@ -491,6 +495,10 @@ fn wire_error(status: StatusCode, kind: &str, message: impl Into<String>) -> Res
 
 fn temporary_failure(message: impl Into<String>) -> Response {
     wire_error(StatusCode::SERVICE_UNAVAILABLE, "ambiguous", message)
+}
+
+fn known_not_dispatched(message: impl Into<String>) -> Response {
+    wire_error(StatusCode::BAD_REQUEST, "known-not-dispatched", message)
 }
 
 #[cfg(test)]
