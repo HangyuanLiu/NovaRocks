@@ -117,7 +117,16 @@ impl IcebergCommitAction for RowDeltaDvCommit {
                 .clone()
         };
 
-        match submit_fenced_action(ctx.catalog, ctx.table, action, ctx.fence, "RowDeltaDv").await {
+        match submit_fenced_action(
+            ctx.catalog,
+            ctx.table,
+            action,
+            ctx.fence,
+            "RowDeltaDv",
+            None,
+        )
+        .await
+        {
             Ok(FencedSubmit::Committed(table_after)) => {
                 let new_snapshot_id = required_target_ref_snapshot_id(
                     table_after.metadata(),

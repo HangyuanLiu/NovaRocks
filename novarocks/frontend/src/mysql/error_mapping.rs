@@ -71,6 +71,10 @@ const ERROR_KIND_MAPPINGS: &[(&str, ErrorKind)] = &[
         "sql.admit.session_global_scope_unsupported",
         ErrorKind::ER_NOT_SUPPORTED_YET,
     ),
+    (
+        "sql.admit.session_transaction_unsupported",
+        ErrorKind::ER_NOT_SUPPORTED_YET,
+    ),
     ("sql.admit.kill_denied", ErrorKind::ER_KILL_DENIED_ERROR),
     (
         "sql.analyze.unsupported_expression",
@@ -130,7 +134,7 @@ mod tests {
             .iter()
             .map(|(code, _)| *code)
             .collect::<BTreeSet<_>>();
-        assert_eq!(descriptor_codes.len(), 28);
+        assert_eq!(descriptor_codes.len(), 29);
         assert_eq!(mapping_codes.len(), ERROR_KIND_MAPPINGS.len());
         assert_eq!(mapping_codes, descriptor_codes);
         assert!(error_kind_for_code(ErrorCodeId::new("sql.analyze.unregistered")).is_none());

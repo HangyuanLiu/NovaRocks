@@ -96,7 +96,8 @@ pub use puffin_dv::{
     write_single_deletion_vector_puffin,
 };
 pub use ref_action::{
-    RefAction, RefActionOutcome, RefActionPlan, execute_ref_action, lower_ref_action,
+    ExactBranchDropOutcome, RefAction, RefActionOutcome, RefActionPlan, drop_branch_if_exact,
+    execute_ref_action, lower_ref_action,
 };
 pub use retry::{
     COMMIT_RETRY_BACKOFF_MS, COMMIT_RETRY_MAX_ATTEMPTS, commit_with_retry,

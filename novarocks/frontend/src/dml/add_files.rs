@@ -41,10 +41,9 @@ use crate::dml::journal::OperationJournal;
 use crate::dml::model::{
     AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesArtifactKind, AddFilesDispatchCertainty,
     AddFilesLifecyclePhase, AddFilesLifecycleRecord, AddFilesMutationRequest, AddFilesSourceAction,
-    CreateStatementOperationRequest, DmlDirectMutationKind, DmlOperationId, DurableExternalFact,
-    DurableMutationSummary, ExternalFactOutcome, OperationKind, OperationMutationRequest,
-    OperationPayload, OperationState, OperationTarget, SourceScopeOwnership, StatementNextAction,
-    StoredOperation,
+    CreateStatementOperationRequest, DmlOperationId, DurableExternalFact, DurableMutationSummary,
+    ExternalFactOutcome, OperationKind, OperationMutationRequest, OperationPayload, OperationState,
+    OperationTarget, SourceScopeOwnership, StatementNextAction, StoredOperation,
 };
 use crate::dml::service::DmlService;
 
@@ -204,13 +203,6 @@ fn execute_add_files_operation(
 
     active.check_before_dispatch()?;
 
-    // Establish the external fence before registering any file. ADD FILES
-    // brings external files under the table's ownership, so a superseded
-    // owner's late execute has to be refused at the catalog rather than
-    // reported once the files are already claimed. ADD FILES always targets
-    // main; it has no branch-qualified form.
-    stored = establish_and_record_fence(engine, active, stored, &prepared)?;
-
     finish_outcome(
         engine,
         active,
@@ -219,66 +211,6 @@ fn execute_add_files_operation(
         engine.execute_add_files(prepared.handle.as_ref()),
         true,
     )
-}
-
-/// Establish this attempt's external fence and durably journal its receipt,
-/// before any file is registered.
-///
-/// Ordering, in full: mint the proposal from the *live* lease guard, refuse a
-/// receipt this journal could never hold, ask the provider to publish the
-/// marker, double-check that it acknowledged exactly the fence that was sealed,
-/// then persist the receipt through the fenced journal. The record binds this
-/// statement's immutable source scope, so a later owner can prove the fence was
-/// minted for the very source set it is reasoning about.
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-fn establish_and_record_fence(
-    engine: &dyn AddFilesEngine,
-    active: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    prepared: &PreparedAddFiles,
-) -> Result<StoredOperation, DmlError> {
-    let proposal = active.external_fence()?;
-    let source_scope_digest = scope_digest(&prepared.facts);
-    active.preflight_direct_mutation_fence(
-        &proposal,
-        DmlDirectMutationKind::AddFiles,
-        Some(source_scope_digest.clone()),
-    )?;
-    let fence = proposal
-        .seal(
-            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(
-                prepared.facts.mutation_operation_id,
-            ),
-            novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(
-                    prepared.facts.instance_id.as_str(),
-                )
-                .map_err(DmlError::executor)?,
-                namespace: std::sync::Arc::from(prepared.facts.namespace.as_str()),
-                table: std::sync::Arc::from(prepared.facts.table.as_str()),
-            },
-            novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-        )
-        .map_err(DmlError::executor)?;
-    let receipt = engine
-        .establish_add_files_external_fence(prepared.handle.as_ref(), fence.clone())
-        .map_err(DmlError::executor)?;
-    proposal.validate_established_receipt(&fence, &receipt)?;
-    let record = crate::dml::reconcile::direct_mutation_fence_receipt_record(
-        DmlDirectMutationKind::AddFiles,
-        &fence,
-        &receipt,
-        Some(source_scope_digest),
-    )
-    .map_err(DmlError::journal_corruption)?;
-    let recovery_due_at_ms = stored.recovery_due_at_ms;
-    active
-        .record_direct_mutation_fence(record, recovery_due_at_ms)
-        .map_err(|error| journal_error(error, stored.operation_id))?;
-    Ok(active.stored.clone())
 }
 
 #[allow(
@@ -348,13 +280,13 @@ fn finish_outcome(
     reason = "Preserves the frozen DML error contract without a broad ABI migration."
 )]
 fn persist_unknown_then_reconcile(
-    engine: &dyn AddFilesEngine,
+    _engine: &dyn AddFilesEngine,
     journal: &mut ActiveDmlOperation,
     stored: StoredOperation,
     prepared: &PreparedAddFiles,
     failure: AddFilesFailure,
     evidence: AddFilesEvidence,
-    allow_reconcile: bool,
+    _allow_reconcile: bool,
 ) -> Result<u32, DmlError> {
     if let Err(error) = validate_evidence(stored.operation_id, &prepared.facts, &evidence) {
         return persist_frozen_manual(
@@ -406,11 +338,7 @@ fn persist_unknown_then_reconcile(
     );
     record.dispatch_certainty = AddFilesDispatchCertainty::PossiblyDispatched;
     record.source_ownership = SourceScopeOwnership::Frozen;
-    record.next_action = if allow_reconcile {
-        StatementNextAction::Reconcile
-    } else {
-        StatementNextAction::ManualInspect
-    };
+    record.next_action = StatementNextAction::ManualInspect;
     record.outcome = Some(DurableExternalFact {
         outcome: ExternalFactOutcome::CommitUnknown,
         receipt: None,
@@ -442,30 +370,15 @@ fn persist_unknown_then_reconcile(
             source_action,
         ),
     )?;
-    if !allow_reconcile {
-        return Err(operation_error(
-            DmlErrorKind::Commit,
-            stored.operation_id,
-            StatementNextAction::ManualInspect,
-            format_failure("ADD FILES remains commit-unknown after reconcile", &failure),
-        ));
-    }
-    let mut reconciling = add_files_record(&stored)?;
-    reconciling.phase = AddFilesLifecyclePhase::Reconciling;
-    reconciling.next_action = StatementNextAction::Reconcile;
-    let stored = apply(
-        journal,
-        mutation(
-            stored,
-            OperationState::CommitUnknown,
-            reconciling,
-            Vec::new(),
-            None,
+    Err(operation_error(
+        DmlErrorKind::Commit,
+        stored.operation_id,
+        StatementNextAction::ManualInspect,
+        format_failure(
+            "ADD FILES commit outcome is unknown; inspect the published snapshot",
+            &failure,
         ),
-    )?;
-    journal.check_before_dispatch()?;
-    let reconciled = engine.reconcile_add_files(prepared.handle.as_ref(), &evidence);
-    finish_outcome(engine, journal, stored, prepared, reconciled, false)
+    ))
 }
 
 #[allow(
@@ -1156,24 +1069,6 @@ mod tests {
     }
 
     impl AddFilesEngine for FakeEngine {
-        /// Acknowledge the sealed fence the way a provider does: with a receipt
-        /// that names exactly this fence. What these tests exercise is the
-        /// establish-before-dispatch ordering, the frontend double check, and
-        /// the journalled receipt around it.
-        fn establish_add_files_external_fence(
-            &self,
-            _prepared: &dyn crate::query_execution::dml::add_files::AddFilesPrepared,
-            fence: novarocks_spi::connector::ConnectorExternalOperationFence,
-        ) -> Result<
-            novarocks_spi::connector::ConnectorExternalFenceReceipt,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            novarocks_spi::connector::ConnectorExternalFenceReceipt::try_new(
-                &fence,
-                Bytes::from_static(b"add-files-fence-marker"),
-            )
-        }
-
         fn plan_add_files(
             &self,
             request: PlanAddFilesRequest,
@@ -1684,36 +1579,31 @@ mod tests {
         assert!(record.plan_artifact.is_some());
         assert!(record.receipt_artifact.is_some());
 
-        // The fence the provider acknowledged must be durable before any file
-        // is registered, and an ADD FILES fence must bind the immutable source
-        // scope it was minted for.
-        let fences = journal.recorded_direct_mutation_fences();
-        assert_eq!(fences.len(), 1, "one fence receipt per ADD FILES attempt");
-        assert_eq!(fences[0].operation_kind, DmlDirectMutationKind::AddFiles);
-        assert_eq!(
-            fences[0].source_scope_digest.as_deref(),
-            record.source_scope_digest.as_deref()
+        assert!(
+            journal.recorded_direct_mutation_fences().is_empty(),
+            "ordinary ADD FILES must not create a connector external fence"
         );
     }
 
     #[test]
-    fn unknown_evidence_is_durable_before_one_reconcile() {
+    fn unknown_evidence_is_durable_and_requires_manual_inspection() {
         let mut engine = FakeEngine::new(Behavior::Unknown, Behavior::Committed);
         let (service, journal) = harness(&mut engine);
+        let error = service
+            .execute_add_files(&engine, command(), &context(), None)
+            .unwrap_err();
         assert_eq!(
-            service
-                .execute_add_files(&engine, command(), &context(), None)
-                .unwrap(),
-            3
+            error.next_action(),
+            Some(StatementNextAction::ManualInspect)
         );
-        assert_eq!(engine.counts(), (1, 1, 1));
+        assert_eq!(engine.counts(), (1, 1, 0));
         let operation = journal.only_operation();
         let OperationPayload::AddFilesLifecycle(record) = operation.payload else {
             panic!("ADD FILES payload")
         };
-        assert_eq!(operation.state, OperationState::Finalized);
+        assert_eq!(operation.state, OperationState::CommitUnknown);
         assert!(record.evidence_artifact.is_some());
-        assert_eq!(record.source_ownership, SourceScopeOwnership::TableOwned);
+        assert_eq!(record.source_ownership, SourceScopeOwnership::Frozen);
     }
 
     #[test]
@@ -1727,7 +1617,7 @@ mod tests {
             error.next_action(),
             Some(StatementNextAction::ManualInspect)
         );
-        assert_eq!(engine.counts(), (1, 1, 1));
+        assert_eq!(engine.counts(), (1, 1, 0));
         let operation = journal.only_operation();
         let OperationPayload::AddFilesLifecycle(record) = operation.payload else {
             panic!("ADD FILES payload")

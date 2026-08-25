@@ -47,3 +47,56 @@ USE db extra;
 -- @expect_sql_phase=Admit
 -- @expect_error_at=1:5
 SET GLOBAL query_timeout = 1;
+
+-- Every external publication is one statement-level frontier. Transaction
+-- controls are therefore admitted as a typed unsupported session family before
+-- a catalog or data mutation can start.
+-- @expect_error_tier=target
+-- @expect_sql_code=sql.admit.session_transaction_unsupported
+-- @expect_sql_phase=Admit
+-- @expect_error_at=1:1
+BEGIN;
+
+-- @expect_error_tier=target
+-- @expect_sql_code=sql.admit.session_transaction_unsupported
+-- @expect_sql_phase=Admit
+-- @expect_error_at=1:1
+START TRANSACTION;
+
+-- @expect_error_tier=target
+-- @expect_sql_code=sql.admit.session_transaction_unsupported
+-- @expect_sql_phase=Admit
+-- @expect_error_at=1:1
+COMMIT;
+
+-- @expect_error_tier=target
+-- @expect_sql_code=sql.admit.session_transaction_unsupported
+-- @expect_sql_phase=Admit
+-- @expect_error_at=1:1
+ROLLBACK;
+
+-- @expect_error_tier=target
+-- @expect_sql_code=sql.admit.session_transaction_unsupported
+-- @expect_sql_phase=Admit
+-- @expect_error_at=1:1
+SAVEPOINT before_publish;
+
+-- Rejecting autocommit-off is an admission decision and the preceding SET
+-- assignment in the same command must not be applied first.
+-- @expect_error_tier=target
+-- @expect_sql_code=sql.admit.session_transaction_unsupported
+-- @expect_sql_phase=Admit
+-- @expect_error_at=1:5
+SET query_timeout = 1, autocommit = OFF;
+
+-- @expect_error_tier=target
+-- @expect_sql_code=sql.admit.session_transaction_unsupported
+-- @expect_sql_phase=Admit
+-- @expect_error_at=1:5
+SET autocommit = FALSE;
+
+-- @expect_error_tier=target
+-- @expect_sql_code=sql.admit.session_transaction_unsupported
+-- @expect_sql_phase=Admit
+-- @expect_error_at=1:5
+SET @@session.autocommit = 0;

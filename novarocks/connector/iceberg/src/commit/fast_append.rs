@@ -338,7 +338,17 @@ async fn commit_self_assembled_append(
 
     let sketch_sets = ctx.collector.take_sketch_sets();
 
-    match submit_fenced_action(ctx.catalog, ctx.table, action, ctx.fence, label).await {
+    let guard = ctx.collector.fast_append_attempt_guard();
+    match submit_fenced_action(
+        ctx.catalog,
+        ctx.table,
+        action,
+        ctx.fence,
+        label,
+        guard.as_deref(),
+    )
+    .await
+    {
         Ok(FencedSubmit::Committed(table_after)) => {
             let new_snapshot_id =
                 required_target_ref_snapshot_id(table_after.metadata(), ctx.target_ref, label)?;

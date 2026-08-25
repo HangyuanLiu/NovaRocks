@@ -31,7 +31,7 @@ use super::{
     ConnectorTableHandle,
 };
 
-pub const CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION: u16 = 1;
+pub const CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION: u16 = 2;
 pub const MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS: usize = 1024;
 pub const MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES: usize = 64 * 1024;
@@ -39,6 +39,64 @@ pub const MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS: u32 = 1024;
 pub const MAX_CONNECTOR_CLEANUP_BATCHES: u32 = 256;
 
 pub const REMOVE_UNREFERENCED_OBJECTS_KIND: &str = "remove-unreferenced-objects";
+
+/// A provider-neutral, read-only projection of one cleanup candidate.
+///
+/// Object identity remains provider-private in the immutable cleanup manifest;
+/// an owned ref instead exposes the exact Catalog compare-and-swap input so
+/// callers can distinguish a ref-retirement pass from an object-sweep pass.
+/// The closed form is deliberate: callers must not infer delete authority from
+/// an arbitrary location or ref name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorCleanupCandidate {
+    Object {
+        location: Arc<str>,
+    },
+    OwnedRef {
+        name: Arc<str>,
+        head_snapshot_id: i64,
+        provenance_version: u16,
+        created_at_ms: i64,
+    },
+}
+
+impl ConnectorCleanupCandidate {
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Object { .. } => "object",
+            Self::OwnedRef { .. } => "owned_ref",
+        }
+    }
+
+    pub fn display_key(&self) -> Arc<str> {
+        match self {
+            Self::Object { location } => Arc::clone(location),
+            Self::OwnedRef { name, .. } => Arc::from(format!("ref:{name}")),
+        }
+    }
+
+    fn validate(&self) -> Result<(), ConnectorError> {
+        match self {
+            Self::Object { location } if !location.is_empty() => Ok(()),
+            Self::OwnedRef {
+                name,
+                head_snapshot_id,
+                provenance_version,
+                created_at_ms,
+            } if !name.is_empty()
+                && *head_snapshot_id > 0
+                && *provenance_version > 0
+                && *created_at_ms > 0 =>
+            {
+                Ok(())
+            }
+            _ => Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "cleanup candidate has an invalid exact identity",
+            )),
+        }
+    }
+}
 
 const REQUEST_DOMAIN: &[u8] = b"novarocks.connector-cleanup-maintenance.request.v1\0";
 const PLAN_DOMAIN: &[u8] = b"novarocks.connector-cleanup-maintenance.plan.v1\0";
@@ -812,7 +870,7 @@ pub struct CandidatePage {
     operation_id: ConnectorCleanupOperationId,
     manifest_digest: [u8; 32],
     offset: u64,
-    locations: Vec<Arc<str>>,
+    candidates: Vec<ConnectorCleanupCandidate>,
     complete: bool,
 }
 
@@ -822,7 +880,7 @@ impl CandidatePage {
         operation_id: ConnectorCleanupOperationId,
         manifest_digest: [u8; 32],
         offset: u64,
-        locations: Vec<Arc<str>>,
+        candidates: Vec<ConnectorCleanupCandidate>,
         complete: bool,
     ) -> Result<Self, ConnectorError> {
         let page = Self {
@@ -830,7 +888,7 @@ impl CandidatePage {
             operation_id,
             manifest_digest,
             offset,
-            locations,
+            candidates,
             complete,
         };
         page.validate()?;
@@ -848,20 +906,35 @@ impl CandidatePage {
     pub const fn offset(&self) -> u64 {
         self.offset
     }
-    pub fn locations(&self) -> &[Arc<str>] {
-        &self.locations
+    pub fn candidates(&self) -> &[ConnectorCleanupCandidate] {
+        &self.candidates
+    }
+    /// Backward-compatible read-only display projection. It never carries
+    /// delete authority and is intentionally unsuitable for dispatch.
+    pub fn display_keys(&self) -> Vec<Arc<str>> {
+        self.candidates
+            .iter()
+            .map(ConnectorCleanupCandidate::display_key)
+            .collect()
     }
     pub const fn complete(&self) -> bool {
         self.complete
     }
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        if self.locations.len() > MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS
-            || self.locations.iter().any(|location| location.is_empty())
-            || self.locations.windows(2).any(|pair| pair[0] >= pair[1])
+        let display_keys = self.display_keys();
+        if self.candidates.len() > MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS
             || self
-                .locations
+                .candidates
                 .iter()
-                .map(|location| location.len())
+                .any(|candidate| candidate.validate().is_err())
+            || display_keys.windows(2).any(|pair| pair[0] >= pair[1])
+            || self
+                .candidates
+                .iter()
+                .map(|candidate| match candidate {
+                    ConnectorCleanupCandidate::Object { location } => location.len(),
+                    ConnectorCleanupCandidate::OwnedRef { name, .. } => name.len() + 8 + 8 + 2 + 8,
+                })
                 .sum::<usize>()
                 > MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES
         {
@@ -1153,7 +1226,7 @@ impl ConnectorCleanupMaintenanceLease {
             || page.operation_id != request.plan.operation_id
             || page.manifest_digest != request.plan.manifest_digest
             || page.offset != request.offset
-            || page.locations.len() > request.limit as usize
+            || page.candidates.len() > request.limit as usize
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -1382,7 +1455,14 @@ mod tests {
             ConnectorCleanupOperationId::new(),
             [0; 32],
             0,
-            vec![Arc::from("s3://bucket/a"), Arc::from("s3://bucket/b")],
+            vec![
+                ConnectorCleanupCandidate::Object {
+                    location: Arc::from("s3://bucket/a"),
+                },
+                ConnectorCleanupCandidate::Object {
+                    location: Arc::from("s3://bucket/b"),
+                },
+            ],
             true,
         );
         assert!(page.is_ok());
@@ -1391,10 +1471,40 @@ mod tests {
             ConnectorCleanupOperationId::new(),
             [0; 32],
             0,
-            vec![Arc::from("b"), Arc::from("a")],
+            vec![
+                ConnectorCleanupCandidate::Object {
+                    location: Arc::from("b"),
+                },
+                ConnectorCleanupCandidate::Object {
+                    location: Arc::from("a"),
+                },
+            ],
             true,
         );
         assert!(noncanonical.is_err());
+    }
+
+    #[test]
+    fn owned_ref_candidate_keeps_exact_retirement_identity() {
+        let page = CandidatePage::try_new(
+            owner(),
+            ConnectorCleanupOperationId::new(),
+            [9; 32],
+            0,
+            vec![ConnectorCleanupCandidate::OwnedRef {
+                name: Arc::from("__novarocks_mv_refresh_7"),
+                head_snapshot_id: 41,
+                provenance_version: 1,
+                created_at_ms: 1_700_000_000_000,
+            }],
+            true,
+        )
+        .expect("owned ref candidate");
+        assert_eq!(page.candidates()[0].kind(), "owned_ref");
+        assert_eq!(
+            page.display_keys(),
+            vec![Arc::from("ref:__novarocks_mv_refresh_7")]
+        );
     }
 
     #[test]

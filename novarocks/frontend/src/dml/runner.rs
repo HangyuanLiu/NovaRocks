@@ -366,9 +366,8 @@ pub(crate) fn preparing_request(spec: &WriteTransactionSpec) -> CreatePreparingR
     }
 }
 
-/// Fenced production write runner. The active operation owns the current
-/// expected revision and dynamically validates the live lease fence for every
-/// journal mutation.
+/// Production write runner. The active operation owns the current expected
+/// revision and records only the catalog publication outcome.
 pub(crate) struct ActiveWriteTransactionRunner<'a, E: WriteExecutor> {
     operation: ActiveDmlOperation,
     executor: &'a E,
@@ -408,12 +407,6 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
     ) -> Result<WriteTransactionOutcome, DmlError> {
         self.transition_recoverable(OperationState::Writing)?;
         self.operation.check_before_dispatch()?;
-        // CP-3B fence invariant 4: establish, verify and durably record this
-        // attempt's external operation fence before anything can produce an
-        // irreversible external effect. `run_coordinated_write` is the first
-        // call that can reach a writer, so the fence step sits immediately
-        // above it and fails closed.
-        self.establish_external_fence(spec)?;
         let report = match self.executor.run_coordinated_write(spec) {
             Ok(report) => report,
             Err(error) => return self.known_uncommitted_error(error),
@@ -464,34 +457,6 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
                 }
             }
         }
-    }
-
-    /// Establish and durably record this attempt's external operation fence.
-    ///
-    /// Ordering, in full: mint the proposal from the *live* lease guard, ask
-    /// the executor's write authority to establish it, double-check that the
-    /// provider acknowledged exactly the proposed fence, then persist the
-    /// receipt through the fenced journal. Only a completely successful run
-    /// licenses dispatch; every failure returns before any writer is reached
-    /// and leaves the operation recoverable in `Writing` for historical write
-    /// recovery to classify.
-    #[allow(
-        clippy::result_large_err,
-        reason = "Preserves the frozen DML error contract without a broad ABI migration."
-    )]
-    fn establish_external_fence(&mut self, spec: &WriteTransactionSpec) -> Result<(), DmlError> {
-        let proposal = self.operation.external_fence()?;
-        self.operation.preflight_external_fence(&proposal)?;
-        let established = self
-            .executor
-            .establish_external_fence(spec, &proposal)
-            .map_err(|error| fence_establishment_error(self.operation.operation_id(), &error))?;
-        proposal.validate_established(&established)?;
-        let record = reconcile::external_fence_receipt_record(&established)
-            .map_err(DmlError::journal_corruption)?;
-        let recovery_due_at_ms = self.recovery_due();
-        self.operation
-            .record_external_fence(record, recovery_due_at_ms)
     }
 
     #[allow(
@@ -715,31 +680,6 @@ impl<'a, E: WriteExecutor> ActiveWriteTransactionRunner<'a, E> {
 fn empty_receipt() -> Result<ConnectorWriteReceipt, DmlError> {
     ConnectorWriteReceipt::try_new(bytes::Bytes::from_static(b"connector-write-noop"))
         .map_err(DmlError::journal_corruption)
-}
-
-/// Map a failed fence establishment onto a typed DML error.
-///
-/// A stale, superseded or foreign fence is a proven authority conflict, so it
-/// surfaces as a lost coordination authority rather than an unknown external
-/// effect. Everything else could not fence at all; nothing was dispatched, and
-/// the operation stays recoverable so historical write recovery can classify
-/// it. In neither case is the failure downgraded to an ambiguous commit.
-fn fence_establishment_error(operation_id: DmlOperationId, error: &ConnectorError) -> DmlError {
-    match error.external_fence_failure() {
-        Some(
-            failure @ (ConnectorExternalFenceFailure::Stale
-            | ConnectorExternalFenceFailure::Superseded
-            | ConnectorExternalFenceFailure::ForeignOperation),
-        ) => DmlError::coordination_lost(format!(
-            "external operation fence conflict ({failure:?}) before dispatch: {error}"
-        )),
-        Some(ConnectorExternalFenceFailure::NotEstablished) | None => {
-            DmlError::coordination_unresolved(format!(
-                "external operation fence could not be established before dispatch: {error}"
-            ))
-        }
-    }
-    .with_operation_id(operation_id)
 }
 
 #[cfg(test)]
@@ -1161,12 +1101,6 @@ mod tests {
             _spec: &WriteTransactionSpec,
         ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, DmlError>
         {
-            // This is where core begins the connector write operation and
-            // where the three `mutation_flow.rs` abort sites read the fence
-            // off the lease. Both must already see an established fence.
-            self.lease.require_external_fence().map_err(|error| {
-                DmlError::executor(format!("write operation began without a fence: {error}"))
-            })?;
             self.push("begin-write-operation");
             Ok(CoordinatedWriteReport::NoOp)
         }
@@ -1443,12 +1377,8 @@ mod tests {
         assert!(stored.recovery_due_at_ms.is_some());
     }
 
-    // -----------------------------------------------------------------
-    // CP-3B: fence before dispatch.
-    // -----------------------------------------------------------------
-
     #[test]
-    fn fence_is_established_and_recorded_before_the_write_operation_begins() {
+    fn ordinary_active_runner_dispatches_without_an_external_fence() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let journal = Arc::new(FenceRecordingJournal::with_events(Arc::clone(&events)));
         let (_, operation) = begin_fenced(&journal);
@@ -1456,194 +1386,18 @@ mod tests {
 
         ActiveWriteTransactionRunner::new(operation, &executor)
             .run(spec())
-            .expect("a fenced no-op write completes");
+            .expect("ordinary no-op write completes");
 
-        assert_eq!(
-            *events.lock().expect("events"),
-            [
-                "preflight-fence",
-                "establish-fence",
-                "preflight-fence",
-                "record-fence",
-                "begin-write-operation",
-            ],
-            "the fence must be established and durably recorded before the connector write \
-             operation begins"
-        );
-        // The three mutation_flow.rs abort sites read the fence off this same
-        // lease; `run_coordinated_write` above already proved it resolves.
+        assert_eq!(*events.lock().expect("events"), ["begin-write-operation"]);
         assert!(
             executor
                 .lease
                 .established_external_fence()
                 .expect("fence slot")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn persisted_receipt_digest_matches_the_established_fence() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let journal = Arc::new(FenceRecordingJournal::with_events(Arc::clone(&events)));
-        let (_, operation) = begin_fenced(&journal);
-        let executor = LeaseBoundFenceExecutor::new(Arc::clone(&events));
-
-        ActiveWriteTransactionRunner::new(operation, &executor)
-            .run(spec())
-            .expect("a fenced no-op write completes");
-
-        let established = executor
-            .lease
-            .established_external_fence()
-            .expect("fence slot")
-            .expect("an established fence");
-        let recorded = journal.recorded_fences();
-        assert_eq!(recorded.len(), 1, "exactly one fence receipt is recorded");
-        let record = &recorded[0];
-        assert_eq!(
-            record.fence_digest,
-            hex::encode(established.fence().digest())
-        );
-        assert_eq!(
-            record.receipt_digest,
-            hex::encode(established.receipt().digest())
-        );
-        assert_eq!(record.generation(), test_generation());
-        assert_eq!(
-            record.receipt_payload.as_bytes(),
-            established.receipt().payload().as_ref(),
-            "the opaque provider receipt is stored verbatim and never decoded"
-        );
-    }
-
-    #[test]
-    fn a_refused_fence_dispatches_nothing_and_stays_recoverable() {
-        for (failure, expected_kind) in [
-            (
-                ConnectorExternalFenceFailure::Superseded,
-                crate::dml::error::DmlErrorKind::CoordinationLost,
-            ),
-            (
-                ConnectorExternalFenceFailure::Stale,
-                crate::dml::error::DmlErrorKind::CoordinationLost,
-            ),
-            (
-                ConnectorExternalFenceFailure::ForeignOperation,
-                crate::dml::error::DmlErrorKind::CoordinationLost,
-            ),
-            (
-                ConnectorExternalFenceFailure::NotEstablished,
-                crate::dml::error::DmlErrorKind::CoordinationUnresolved,
-            ),
-        ] {
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let journal = Arc::new(FenceRecordingJournal::with_events(Arc::clone(&events)));
-            let (operation_id, operation) = begin_fenced(&journal);
-            let executor = LeaseBoundFenceExecutor::failing(Arc::clone(&events), failure);
-
-            let error = ActiveWriteTransactionRunner::new(operation, &executor)
-                .run(spec())
-                .expect_err("a refused fence must not dispatch");
-
-            assert_eq!(error.kind(), expected_kind, "for {failure:?}");
-            assert_eq!(error.operation_id(), Some(operation_id));
-            assert_eq!(
-                *events.lock().expect("events"),
-                ["preflight-fence", "establish-fence"],
-                "no writer, commit or journal receipt may follow a refused fence"
-            );
-            assert!(journal.recorded_fences().is_empty());
-            let stored = journal.only_operation();
-            assert_eq!(
-                stored.state,
-                OperationState::Writing,
-                "a refused fence leaves the operation to historical write recovery"
-            );
-            assert!(stored.recovery_due_at_ms.is_some());
-        }
-    }
-
-    #[test]
-    fn an_operation_without_coordination_authority_cannot_dispatch() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let journal = Arc::new(FenceRecordingJournal::with_events(Arc::clone(&events)));
-        let operation_id = journal
-            .create_preparing(preparing_request(&spec()))
-            .expect("intent");
-        let stored = journal.load(operation_id).unwrap().unwrap();
-        let operation = ActiveDmlOperation::legacy(journal.clone(), stored);
-        let executor = LeaseBoundFenceExecutor::new(Arc::clone(&events));
-
-        let error = ActiveWriteTransactionRunner::new(operation, &executor)
-            .run(spec())
-            .expect_err("an unfenced operation must not dispatch");
-
-        assert_eq!(
-            error.kind(),
-            crate::dml::error::DmlErrorKind::CoordinationUnresolved
-        );
-        assert!(
-            events.lock().expect("events").is_empty(),
-            "the executor is never asked to fence or write without an authority"
-        );
-        assert_eq!(journal.only_operation().state, OperationState::Writing);
-    }
-
-    #[test]
-    fn a_fence_for_another_coordination_attempt_is_rejected_before_dispatch() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let journal = Arc::new(FenceRecordingJournal::with_events(Arc::clone(&events)));
-        let (_, operation) = begin_fenced(&journal);
-        let executor = LeaseBoundFenceExecutor::foreign(Arc::clone(&events));
-
-        let error = ActiveWriteTransactionRunner::new(operation, &executor)
-            .run(spec())
-            .expect_err("a fence minted for another attempt must not license dispatch");
-
-        assert_eq!(
-            error.kind(),
-            crate::dml::error::DmlErrorKind::JournalCorruption
-        );
-        assert!(
-            error.to_string().contains("another coordination attempt"),
-            "unexpected error: {error}"
-        );
-        assert_eq!(
-            *events.lock().expect("events"),
-            ["preflight-fence", "establish-fence"]
+                .is_none(),
+            "ordinary writes must not create a connector external fence"
         );
         assert!(journal.recorded_fences().is_empty());
-    }
-
-    #[test]
-    fn a_receipt_the_journal_could_never_hold_is_refused_before_any_marker_exists() {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let journal = Arc::new(FenceRecordingJournal::refusing_preflight(Arc::clone(
-            &events,
-        )));
-        let (_, operation) = begin_fenced(&journal);
-        let executor = LeaseBoundFenceExecutor::new(Arc::clone(&events));
-
-        let error = ActiveWriteTransactionRunner::new(operation, &executor)
-            .run(spec())
-            .expect_err("a receipt that could never be recorded must not be created");
-
-        assert_eq!(
-            error.kind(),
-            crate::dml::error::DmlErrorKind::JournalCorruption
-        );
-        assert_eq!(
-            *events.lock().expect("events"),
-            ["preflight-fence"],
-            "the provider is never asked to establish an unrecordable fence"
-        );
-        assert!(
-            executor
-                .lease
-                .established_external_fence()
-                .expect("fence slot")
-                .is_none()
-        );
     }
 
     #[test]

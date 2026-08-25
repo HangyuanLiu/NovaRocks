@@ -40,7 +40,10 @@ use novarocks_spi::connector::{
     ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
-use super::add_files::{AddFilesManifest, plan_manifest_for_table, revalidate_manifest_for_table};
+use super::add_files::{
+    AddFilesManifest, plan_manifest_for_table, preflight_caller_managed_source_domain,
+    revalidate_manifest_for_table,
+};
 use crate::commit::write_control::{
     encode_fence_receipt_payload, fence_failure_to_connector_error,
 };
@@ -133,6 +136,7 @@ enum PlannedIcebergMutation {
     RegisterExistingFiles {
         payload: IcebergDataMutationPlanPayloadV1,
         manifest: AddFilesManifest,
+        domain: novarocks_spi::connector::ConnectorDataMutationAddFilesDomain,
     },
     Truncate {
         payload: IcebergDataMutationPlanPayloadV1,
@@ -303,6 +307,12 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             ConnectorDataMutationOperation::RegisterExistingFiles {
                 source_location, ..
             } => {
+                let domain = preflight_caller_managed_source_domain(
+                    source_location,
+                    &self.runtime.control_state().configuration().warehouse_uri,
+                    self.runtime.control_state().object_store_config(),
+                )
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unsupported, error))?;
                 let manifest = plan_manifest_for_table(
                     &table,
                     source_location,
@@ -341,6 +351,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     PlannedIcebergMutation::RegisterExistingFiles {
                         payload,
                         manifest: manifest.clone(),
+                        domain,
                     },
                     manifest.digest,
                     summary,
@@ -410,8 +421,16 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             }
             None => None,
         };
-        validate_frozen_table(&table, payload, fence_assertion.is_some())
-            .map_err(connector_error_as_pre_dispatch)?;
+        match planned {
+            PlannedIcebergMutation::RegisterExistingFiles { .. } => {
+                validate_add_files_target_shape(&table, payload)
+                    .map_err(connector_error_as_pre_dispatch)?;
+            }
+            PlannedIcebergMutation::Truncate { .. } => {
+                validate_frozen_table(&table, payload, fence_assertion.is_some())
+                    .map_err(connector_error_as_pre_dispatch)?;
+            }
+        }
         match self.lookup_marker(
             &payload.namespace,
             &payload.table,
@@ -440,23 +459,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             payload.table.clone(),
         );
         let op_kind = match planned {
-            PlannedIcebergMutation::RegisterExistingFiles { manifest, .. } => {
-                let object_store = self.runtime.control_state().object_store_config();
-                revalidate_manifest_for_table(
-                    &table,
-                    payload
-                        .source_location
-                        .as_deref()
-                        .expect("ADD FILES plan has source location"),
-                    object_store,
-                    manifest,
-                    self.runtime.resources().catalog_runtime(),
-                )
-                .map_err(|error| connector_error_as_pre_dispatch(map_provider_error(error)))?;
-                validate_no_duplicate_data_files(&self.runtime, &table, manifest)
-                    .map_err(connector_error_as_pre_dispatch)?;
-                CommitOpKind::FastAppend
-            }
+            PlannedIcebergMutation::RegisterExistingFiles { .. } => CommitOpKind::FastAppend,
             PlannedIcebergMutation::Truncate { .. } => CommitOpKind::Truncate,
         };
         let metadata = table.metadata();
@@ -477,6 +480,29 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             )
             .with_table_metadata(metadata.clone()),
         );
+        if let PlannedIcebergMutation::RegisterExistingFiles { manifest, .. } = planned {
+            let runtime = Arc::clone(&self.runtime);
+            let source_location = payload
+                .source_location
+                .clone()
+                .expect("ADD FILES plan has source location");
+            let expected_payload = payload.clone();
+            let expected_manifest = manifest.clone();
+            collector.set_fast_append_attempt_guard(Arc::new(move |current| {
+                validate_add_files_target_shape(current, &expected_payload)
+                    .map_err(|error| error.to_string())?;
+                revalidate_manifest_for_table(
+                    current,
+                    &source_location,
+                    runtime.control_state().object_store_config(),
+                    &expected_manifest,
+                    runtime.resources().catalog_runtime(),
+                )
+                .map_err(|error| format!("ADD FILES frozen manifest changed: {error}"))?;
+                validate_no_duplicate_data_files(&runtime, current, &expected_manifest)
+                    .map_err(|error| error.to_string())
+            }));
+        }
         if let PlannedIcebergMutation::RegisterExistingFiles { manifest, .. } = planned {
             for data_file in manifest
                 .to_data_files()
@@ -863,11 +889,16 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
             }
             PlannedIcebergMutation::Truncate { .. } => None,
         };
+        let add_files_domain = match &private {
+            PlannedIcebergMutation::RegisterExistingFiles { domain, .. } => Some(*domain),
+            PlannedIcebergMutation::Truncate { .. } => None,
+        };
         let plan = ConnectorDataMutationPlan::try_new(
             &request,
             state_digest,
             summary,
             source_scope,
+            add_files_domain,
             provider_payload,
         )?;
         self.preflight_durable_truncate_evidence(&plan, private.payload())?;
@@ -1106,6 +1137,25 @@ fn validate_frozen_table(
     {
         return Err(conflict(
             "Iceberg data mutation table state advanced after planning",
+        ));
+    }
+    Ok(())
+}
+
+/// ADD FILES intentionally permits a data-ref OCC refresh. Its immutable
+/// contract is table identity/schema/spec plus the complete frozen manifest;
+/// the attempt guard re-runs the latter on every refreshed base.
+fn validate_add_files_target_shape(
+    table: &crate::iceberg::table::Table,
+    payload: &IcebergDataMutationPlanPayloadV1,
+) -> Result<(), ConnectorError> {
+    let metadata = table.metadata();
+    if metadata.uuid().to_string() != payload.table_uuid
+        || metadata.current_schema_id() != payload.schema_id
+        || metadata.default_partition_spec_id() != payload.default_spec_id
+    {
+        return Err(conflict(
+            "Iceberg ADD FILES target identity, schema, or partition spec changed after planning",
         ));
     }
     Ok(())

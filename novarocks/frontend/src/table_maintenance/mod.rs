@@ -130,6 +130,10 @@ pub struct FrontendTableMaintenanceService {
     coordination: Option<MaintenanceCoordination>,
     worker: Mutex<WorkerLifecycle>,
     runtime: Handle,
+    /// Installed by host composition from the single LNP-1 runtime policy.
+    /// A missing policy deliberately disables destructive cleanup admission.
+    lake_publication_runtime_policy:
+        Option<crate::common::admitted_query_context::LakePublicationRuntimePolicy>,
 }
 
 impl FrontendTableMaintenanceService {
@@ -199,7 +203,43 @@ impl FrontendTableMaintenanceService {
             coordination,
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime,
+            lake_publication_runtime_policy: None,
         })
+    }
+
+    /// Bind the startup-frozen policy owned by frontend/server composition.
+    /// This service never manufactures a second GC-age authority.
+    pub fn with_lake_publication_runtime_policy(
+        mut self,
+        policy: crate::common::admitted_query_context::LakePublicationRuntimePolicy,
+    ) -> Self {
+        self.lake_publication_runtime_policy = Some(policy);
+        self
+    }
+
+    fn validate_cleanup_cutoff(&self, older_than_ms: i64) -> Result<(), String> {
+        let policy = self.lake_publication_runtime_policy.ok_or_else(|| {
+            "orphan cleanup is unsupported until the lake publication runtime policy is installed"
+                .to_string()
+        })?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+            "orphan cleanup is unsupported because wall clock is unsafe".to_string()
+        })?;
+        let now_ms = i64::try_from(now.as_millis()).map_err(|_| {
+            "orphan cleanup is unsupported because wall clock exceeds i64".to_string()
+        })?;
+        let safe_age_ms = i64::try_from(policy.safe_gc_age().as_millis()).map_err(|_| {
+            "orphan cleanup is unsupported because safe GC age exceeds i64".to_string()
+        })?;
+        let latest_safe_cutoff = now_ms.checked_sub(safe_age_ms).ok_or_else(|| {
+            "orphan cleanup is unsupported because safe GC cutoff underflows".to_string()
+        })?;
+        if older_than_ms <= 0 || older_than_ms > latest_safe_cutoff {
+            return Err(format!(
+                "orphan cleanup cutoff {older_than_ms} is newer than the shared safe GC boundary {latest_safe_cutoff}"
+            ));
+        }
+        Ok(())
     }
 
     /// Executes one parser-owned maintenance statement without accepting raw
@@ -474,6 +514,7 @@ impl FrontendTableMaintenanceService {
         target: MaintenanceTarget,
         older_than_ms: i64,
     ) -> Result<MaintenanceActionOutcome, String> {
+        self.validate_cleanup_cutoff(older_than_ms)?;
         let repository = self
             .cleanup_repository
             .as_ref()
@@ -1109,6 +1150,7 @@ impl FrontendTableMaintenanceService {
             coordination: None,
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime: runtime.clone(),
+            lake_publication_runtime_policy: None,
         };
         service.execute_durable_distributed_rewrite(
             engine,
@@ -2682,12 +2724,12 @@ fn cleanup_candidate_locations(
     let mut locations = Vec::new();
     loop {
         let page = engine.read_cleanup_candidate_page(session, offset, 1024)?;
-        locations.extend(page.locations().iter().map(|location| location.to_string()));
+        locations.extend(page.display_keys().iter().map(ToString::to_string));
         if page.complete() {
             return Ok(locations);
         }
         offset = offset
-            .checked_add(page.locations().len() as u64)
+            .checked_add(page.candidates().len() as u64)
             .ok_or_else(|| "orphan cleanup candidate page offset overflow".to_string())?;
     }
 }

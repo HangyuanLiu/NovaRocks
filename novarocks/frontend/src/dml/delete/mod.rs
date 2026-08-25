@@ -29,7 +29,6 @@ use crate::query_execution::dml::delete::{
 use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::LakePublicationId;
 
-use crate::dml::coordination::DmlExternalFenceProposal;
 use crate::dml::error::{AdmitError, DmlError};
 use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
 use crate::dml::runner::{
@@ -46,30 +45,6 @@ struct DeleteWriteExecutor<'a> {
 impl WriteExecutor for DeleteWriteExecutor<'_> {
     type CommitHandle = Arc<dyn DeleteCommit>;
     type AbortHandle = Infallible;
-
-    /// Predicate and equality DELETE both fence through the exact write
-    /// authority the DELETE preparation retained.
-    ///
-    /// The reverse port does not expose that authority yet, so this route fails
-    /// closed: no writer and no commit may run without a fence the provider can
-    /// compare at its external linearization point.
-    /// Predicate and equality DELETE both activate their write generation during
-    /// preparation, so the authority already exists here — before anything is
-    /// dispatched. The route only supplies the sealing closure; the resource
-    /// identity comes from the activated template.
-    fn establish_external_fence(
-        &self,
-        _spec: &WriteTransactionSpec,
-        proposal: &DmlExternalFenceProposal,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorEstablishedWriteFence,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        self.engine.establish_delete_external_fence(
-            self.prepared.handle.as_ref(),
-            &|operation_id, table, target_ref| proposal.seal(operation_id, table, target_ref),
-        )
-    }
 
     fn run_coordinated_write(
         &self,

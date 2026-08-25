@@ -134,6 +134,7 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
             action,
             ctx.fence,
             "RowDeltaDvFromFiles",
+            None,
         )
         .await
         {

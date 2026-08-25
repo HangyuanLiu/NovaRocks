@@ -668,6 +668,14 @@ mod tests {
                     ),
                     ConnectorDataMutationOperation::Truncate { .. } => None,
                 },
+                match request.operation() {
+                    ConnectorDataMutationOperation::RegisterExistingFiles { .. } => Some(
+                        novarocks_spi::connector::ConnectorDataMutationAddFilesDomain::try_new_caller_managed_stable(
+                            [5; 32],
+                        )?,
+                    ),
+                    ConnectorDataMutationOperation::Truncate { .. } => None,
+                },
                 Bytes::from_static(b"plan"),
             )
         }

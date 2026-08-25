@@ -76,6 +76,7 @@ impl IcebergCommitAction for OverwriteCommit {
             Arc::clone(&staged.action),
             ctx.fence,
             "Overwrite",
+            None,
         )
         .await
         {

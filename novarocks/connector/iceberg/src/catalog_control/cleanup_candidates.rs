@@ -22,7 +22,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::commit::{FileSet, enumerate_files_for_snapshots, puffin_half_reference_protection};
+use crate::commit::{
+    FileSet, compute_live_snapshot_set, enumerate_files_for_snapshots,
+    puffin_half_reference_protection,
+};
 use crate::fs_io;
 use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::TableMetadata;
@@ -46,10 +49,12 @@ pub(super) async fn collect_orphan_candidates(
     let metadata = table.metadata();
     let file_io = table.file_io();
     let location = metadata.location().trim_end_matches('/');
-    let snapshot_ids = metadata
-        .snapshots()
-        .map(|snapshot| snapshot.snapshot_id())
-        .collect::<HashSet<_>>();
+    // Only snapshots reachable from the current Catalog refs are live. A
+    // retired NovaRocks staging ref must therefore be followed by a fresh
+    // metadata reload before the next object pass can see its files as
+    // candidates; retaining every historical metadata snapshot would pin them
+    // forever and defeat owned-ref GC.
+    let snapshot_ids = compute_live_snapshot_set(metadata);
     let mut live: FileSet = enumerate_files_for_snapshots(file_io, metadata, &snapshot_ids)
         .await
         .map_err(|error| error.to_string())?;

@@ -54,14 +54,15 @@ pub mod conformance;
 
 pub use cleanup_maintenance::{
     BatchReceipt, BatchReceiptSummary, CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION,
-    CandidatePage, ConnectorCleanupCandidatePageRequest, ConnectorCleanupExecuteRequest,
-    ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance, ConnectorCleanupMaintenanceLease,
-    ConnectorCleanupMaintenanceResolver, ConnectorCleanupOperation, ConnectorCleanupOperationId,
-    ConnectorCleanupPlan, ConnectorCleanupPlanSummary, ConnectorCleanupPlanningRequest,
-    ConnectorCleanupPrepareRequest, ConnectorCleanupReconcileRequest,
-    MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS, MAX_CONNECTOR_CLEANUP_BATCHES,
-    MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS,
-    MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES, PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
+    CandidatePage, ConnectorCleanupCandidate, ConnectorCleanupCandidatePageRequest,
+    ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
+    ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver,
+    ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupPlan,
+    ConnectorCleanupPlanSummary, ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
+    ConnectorCleanupReconcileRequest, MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS,
+    MAX_CONNECTOR_CLEANUP_BATCHES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES,
+    MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS, MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES,
+    PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
 };
 pub use context::{ConnectorCancellation, ConnectorRequestContext};
 pub use control::{
@@ -95,13 +96,14 @@ pub use ctas_staged_publication::{
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,
-    ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationLease,
+    ConnectorDataMutation, ConnectorDataMutationAddFilesDomain,
+    ConnectorDataMutationExecuteRequest, ConnectorDataMutationLease,
     ConnectorDataMutationOperation, ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
-    ConnectorDataMutationSourceScope, ConnectorDataMutationSourceScopeKind,
-    MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES, MAX_CONNECTOR_DATA_MUTATION_FILES,
-    MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
+    ConnectorDataMutationSourceDomain, ConnectorDataMutationSourceScope,
+    ConnectorDataMutationSourceScopeKind, MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES,
+    MAX_CONNECTOR_DATA_MUTATION_FILES, MAX_CONNECTOR_DATA_MUTATION_PARQUET_FOOTER_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_SOURCE_LOCATION_BYTES,
     MAX_CONNECTOR_DATA_MUTATION_TARGET_REF_BYTES, MAX_CONNECTOR_DATA_MUTATION_TOTAL_FOOTER_BYTES,
@@ -313,15 +315,17 @@ pub use row_mutation::{
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use staged_create::{
-    CONNECTOR_STAGED_CREATE_CONTRACT_VERSION, ConnectorStagedCreate,
-    ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
-    ConnectorStagedCreateLease, ConnectorStagedCreateOperationId,
-    ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
-    ConnectorStagedCreatePublishOutcome, ConnectorStagedCreatePublishRequest,
-    ConnectorStagedCreateReceipt, ConnectorStagedCreateReceiptPhase,
-    ConnectorStagedCreateReconcileOutcome, ConnectorStagedCreateReconcilePhase,
-    ConnectorStagedCreateReconcileRequest, ConnectorStagedTableHandle,
-    ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
+    CONNECTOR_CTAS_UNANCHORED_CLEANUP_CONTRACT_VERSION, CONNECTOR_STAGED_CREATE_CONTRACT_VERSION,
+    ConnectorCtasUnanchoredCleanupOutcome, ConnectorCtasUnanchoredCleanupRequest,
+    ConnectorCtasUnanchoredProvenance, ConnectorStagedCreate, ConnectorStagedCreateAbortOutcome,
+    ConnectorStagedCreateAbortRequest, ConnectorStagedCreateLease,
+    ConnectorStagedCreateOperationId, ConnectorStagedCreatePrepareOutcome,
+    ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublishOutcome,
+    ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
+    ConnectorStagedCreateReceiptPhase, ConnectorStagedCreateReconcileOutcome,
+    ConnectorStagedCreateReconcilePhase, ConnectorStagedCreateReconcileRequest,
+    ConnectorStagedTableHandle, ConnectorStagedWritePlanningBinding,
+    ConnectorStagedWritePlanningRequest, ConnectorUnanchoredCtasCleanup,
 };
 pub use staged_publication_recovery::{
     ConnectorHistoricalPublicationAction, ConnectorStagedPublicationBaseFact,

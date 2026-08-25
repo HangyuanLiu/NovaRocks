@@ -243,6 +243,10 @@ impl ConnectorDataMutation for FakeDataMutation {
             [7; 32],
             ConnectorDataMutationPlanSummary::try_new(2, 11, 101).expect("summary"),
             Some(source_scope()),
+            Some(
+                novarocks_spi::connector::ConnectorDataMutationAddFilesDomain::try_new_caller_managed_stable([9; 32])
+                    .expect("domain"),
+            ),
             Bytes::from_static(b"secret-plan"),
         )?;
         plans.insert(
@@ -544,6 +548,10 @@ fn bounds_and_exact_generation_fail_closed() {
             [0; 32],
             ConnectorDataMutationPlanSummary::default(),
             Some(source_scope()),
+            Some(
+                novarocks_spi::connector::ConnectorDataMutationAddFilesDomain::try_new_caller_managed_stable([9; 32])
+                    .expect("domain"),
+            ),
             Bytes::from(vec![
                 0;
                 MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES + 1

@@ -54,6 +54,11 @@ use crate::iceberg::{
 
 const EVIDENCE_VERSION: u16 = 1;
 const CTAS_OPERATION_MARKER: &str = "novarocks.ctas.operation-id";
+const CTAS_PROVENANCE_VERSION: &str = "novarocks.ctas.provenance-version";
+const CTAS_PROVENANCE_TARGET: &str = "novarocks.ctas.target";
+const CTAS_PROVENANCE_EXPECTED_ABSENT: &str = "novarocks.ctas.expected-absent";
+const CTAS_PROVENANCE_TABLE_UUID: &str = "novarocks.ctas.table-uuid";
+const CTAS_STAGING_NAMESPACE: &str = "_novarocks/ctas-staging/v1";
 
 #[derive(Clone)]
 pub(crate) struct RestStagedTableCreate {
@@ -83,6 +88,7 @@ impl From<ConnectorError> for RestStagedPrepareFailure {
 
 pub(crate) fn prepare_rest_staged_table(
     runtime: &IcebergControlRuntime,
+    operation_id: ConnectorStagedCreateOperationId,
     namespace_name: &str,
     table_name: &str,
     columns: &[ConnectorColumnDefinition],
@@ -97,6 +103,10 @@ pub(crate) fn prepare_rest_staged_table(
     let namespace_name = normalize_identifier(namespace_name)?;
     let table_name = normalize_identifier(table_name)?;
     let namespace = NamespaceIdent::new(namespace_name.clone());
+    let location = ctas_staging_location(
+        &runtime.control_state().configuration().warehouse_uri,
+        operation_id,
+    )?;
     let namespace_catalog = Arc::clone(&catalog);
     let namespace_for_check = namespace.clone();
     let exists = runtime
@@ -142,6 +152,22 @@ pub(crate) fn prepare_rest_staged_table(
         "format-version".to_string(),
         (format_version as u8).to_string(),
     );
+    properties.insert(
+        CTAS_OPERATION_MARKER.to_string(),
+        operation_marker(operation_id),
+    );
+    properties.insert(
+        CTAS_PROVENANCE_VERSION.to_string(),
+        EVIDENCE_VERSION.to_string(),
+    );
+    properties.insert(
+        CTAS_PROVENANCE_TARGET.to_string(),
+        format!("{namespace_name}.{table_name}"),
+    );
+    properties.insert(
+        CTAS_PROVENANCE_EXPECTED_ABSENT.to_string(),
+        "true".to_string(),
+    );
     let publication_properties = properties
         .iter()
         .filter(|(key, _)| !key.eq_ignore_ascii_case("format-version"))
@@ -150,6 +176,7 @@ pub(crate) fn prepare_rest_staged_table(
     let creation = TableCreation::builder()
         .name(table_name)
         .schema(schema)
+        .location(location.clone())
         .properties(properties)
         .format_version(format_version);
     let creation = if let Some(spec) = partition_spec {
@@ -187,6 +214,20 @@ pub(crate) fn prepare_rest_staged_table(
             }
         })?;
     let (table, mut initialization_updates) = staged.into_parts();
+    if table.metadata().location() != location {
+        return Err(RestStagedPrepareFailure::CommitUnknown(
+            "REST stage-create returned a table at a location other than the requested CTAS staging location"
+                .to_string(),
+        ));
+    }
+    let mut response_provenance = HashMap::new();
+    response_provenance.insert(
+        CTAS_PROVENANCE_TABLE_UUID.to_string(),
+        table.metadata().uuid().to_string(),
+    );
+    initialization_updates.push(TableUpdate::SetProperties {
+        updates: response_provenance,
+    });
     if !publication_properties.is_empty() {
         initialization_updates.push(TableUpdate::SetProperties {
             updates: publication_properties,
@@ -922,6 +963,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         let properties = properties.into_iter().collect::<Vec<_>>();
         let result = prepare_rest_staged_table(
             &self.runtime,
+            request.operation_id,
             &request.table.namespace,
             &request.table.table,
             &request.columns,
@@ -1598,6 +1640,27 @@ fn operation_marker(operation_id: ConnectorStagedCreateOperationId) -> String {
     uuid::Uuid::from_bytes(operation_id.to_bytes()).to_string()
 }
 
+/// The CTAS root must be independent of the target table name: before the
+/// single `NotExist` commit succeeds there is no table location that cleanup
+/// can safely derive from catalog state.  A publication ID gives the staging
+/// root a stable, enumerable owner instead.
+pub(crate) fn ctas_staging_location(
+    warehouse_uri: &str,
+    operation_id: ConnectorStagedCreateOperationId,
+) -> Result<String, RestStagedPrepareFailure> {
+    let warehouse_uri = warehouse_uri.trim_end_matches('/');
+    if warehouse_uri.is_empty() {
+        return Err(RestStagedPrepareFailure::KnownUncommitted(
+            "standard REST CTAS requires an explicit warehouse URI for its staging namespace"
+                .to_string(),
+        ));
+    }
+    Ok(format!(
+        "{warehouse_uri}/{CTAS_STAGING_NAMESPACE}/{}/table",
+        operation_marker(operation_id)
+    ))
+}
+
 pub(crate) fn fenced_staging_data_prefix(
     table_location: &str,
     operation_id: ConnectorStagedCreateOperationId,
@@ -1660,7 +1723,15 @@ mod tests {
     fn hadoop_generation_fails_closed_without_constructing_a_rest_client() {
         let runtime = hadoop_runtime();
         assert!(runtime.rest_catalog().is_none());
-        let failure = match prepare_rest_staged_table(&runtime, "db", "t", &[], &[], &[]) {
+        let failure = match prepare_rest_staged_table(
+            &runtime,
+            ConnectorMutationOperationId::new(),
+            "db",
+            "t",
+            &[],
+            &[],
+            &[],
+        ) {
             Ok(_) => panic!("Hadoop must not expose a REST staged-create surface"),
             Err(failure) => failure,
         };
@@ -1702,6 +1773,28 @@ mod tests {
             operation_marker(operation_id),
             uuid::Uuid::from_bytes(operation_id.to_bytes()).to_string()
         );
+    }
+
+    #[test]
+    fn ctas_staging_location_is_warehouse_rooted_and_operation_bound() {
+        let operation_id = ConnectorMutationOperationId::new();
+        assert_eq!(
+            ctas_staging_location("s3://warehouse/root/", operation_id).unwrap(),
+            format!(
+                "s3://warehouse/root/_novarocks/ctas-staging/v1/{}/table",
+                operation_marker(operation_id)
+            )
+        );
+    }
+
+    #[test]
+    fn ctas_staging_location_rejects_an_implicit_warehouse() {
+        let error = ctas_staging_location("", ConnectorMutationOperationId::new()).unwrap_err();
+        assert!(matches!(
+            error,
+            RestStagedPrepareFailure::KnownUncommitted(message)
+                if message.contains("explicit warehouse URI")
+        ));
     }
 
     #[test]

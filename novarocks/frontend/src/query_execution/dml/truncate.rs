@@ -207,26 +207,6 @@ pub trait TruncateEngine: Send + Sync {
         request: PlanTruncateRequest,
     ) -> Result<PreparedTruncate, TruncatePlanError>;
 
-    /// Establish this attempt's external fence before dispatch and return the
-    /// provider receipt that acknowledges the published marker.
-    ///
-    /// The default fails closed: an engine that cannot expose its mutation
-    /// authority must not run a destructive execute.
-    fn establish_truncate_external_fence(
-        &self,
-        _prepared: &dyn TruncatePrepared,
-        _fence: novarocks_spi::connector::ConnectorExternalOperationFence,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorExternalFenceReceipt,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        Err(
-            crate::query_execution::dml::external_write_fence::external_fence_authority_unavailable(
-                "TRUNCATE engine does not expose an external operation fence authority",
-            ),
-        )
-    }
-
     fn execute_truncate(&self, prepared: &dyn TruncatePrepared) -> TruncateOutcome;
 
     fn reconcile_truncate(
@@ -247,30 +227,6 @@ impl TruncatePrepared for CorePreparedTruncate {
 }
 
 impl TruncateEngine for DmlExecutionKernel {
-    fn establish_truncate_external_fence(
-        &self,
-        prepared: &dyn TruncatePrepared,
-        fence: novarocks_spi::connector::ConnectorExternalOperationFence,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorExternalFenceReceipt,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        // The frontend seals the fence because only it holds the resource
-        // identity: the plan carries the operation id, but the table and target
-        // ref live inside the provider's opaque payload.
-        let prepared = downcast_prepared(prepared).map_err(|_| {
-            crate::query_execution::dml::external_write_fence::invalid_fence_request(
-                "foreign TRUNCATE prepared handle".to_string(),
-            )
-        })?;
-        let session = prepared.session.lock().map_err(|error| {
-            crate::query_execution::dml::external_write_fence::invalid_fence_request(format!(
-                "TRUNCATE prepared session lock: {error}"
-            ))
-        })?;
-        session.establish_external_fence(fence)
-    }
-
     fn plan_truncate(
         &self,
         request: PlanTruncateRequest,

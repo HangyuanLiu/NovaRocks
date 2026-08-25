@@ -570,24 +570,26 @@ impl FrontendApplicationHost {
         // authority for them. `coordination` is present whenever a StateStore
         // is, so this never installs an unfenced durable owner.
         let table_maintenance_open = match host.coordination() {
-            Some(coordination) => {
-                FrontendTableMaintenanceService::open_with_coordination(
-                    host.state_store(),
+            Some(coordination) => FrontendTableMaintenanceService::open_with_coordination(
+                host.state_store(),
+                tokio::runtime::Handle::current(),
+                MaintenanceCoordination::from_frontend(
+                    coordination.as_ref(),
                     tokio::runtime::Handle::current(),
-                    MaintenanceCoordination::from_frontend(
-                        coordination.as_ref(),
-                        tokio::runtime::Handle::current(),
-                    ),
-                )
-                .await
-            }
-            None => {
-                FrontendTableMaintenanceService::open(
-                    host.state_store(),
-                    tokio::runtime::Handle::current(),
-                )
-                .await
-            }
+                ),
+            )
+            .await
+            .map(|service| {
+                service.with_lake_publication_runtime_policy(host.lake_publication_runtime_policy())
+            }),
+            None => FrontendTableMaintenanceService::open(
+                host.state_store(),
+                tokio::runtime::Handle::current(),
+            )
+            .await
+            .map(|service| {
+                service.with_lake_publication_runtime_policy(host.lake_publication_runtime_policy())
+            }),
         };
         match table_maintenance_open {
             Ok(service) => host.table_maintenance_service = Some(Arc::new(service)),

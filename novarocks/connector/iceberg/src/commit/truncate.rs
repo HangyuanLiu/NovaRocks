@@ -88,6 +88,7 @@ impl IcebergCommitAction for TruncateCommit {
             Arc::new(action),
             ctx.fence,
             "Truncate",
+            None,
         )
         .await
         .map_err(crate::commit::helpers::FencedSubmitError::into_detail)?;

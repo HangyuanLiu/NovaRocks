@@ -112,3 +112,13 @@ SET GLOBAL sqlp9_unknown_scope_probe=1, query_timeout=1;
 -- query 21
 -- @skip_result_check=true
 SET query_timeout = 0;
+
+-- query 22
+-- The only supported autocommit mode is the truthful default: each statement
+-- publishes at its own frontier. These spellings must not open a transaction.
+-- @skip_result_check=true
+SET autocommit = ON;
+
+-- query 23
+-- @skip_result_check=true
+SET @@session.autocommit = TRUE;

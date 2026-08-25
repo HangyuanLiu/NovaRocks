@@ -184,6 +184,69 @@ pub enum RefActionOutcome {
     NoOp,
 }
 
+/// Result of an internal cleanup-only ref retirement attempt.
+///
+/// `Abandoned` is deliberately non-error: every mismatch means the proof
+/// observed during candidate discovery has gone stale, so this GC pass leaks
+/// rather than guessing whether the ref is still NovaRocks-owned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExactBranchDropOutcome {
+    Retired,
+    Abandoned,
+}
+
+/// Drop one provider-owned branch only if its table incarnation and observed
+/// head are unchanged. This is intentionally separate from SQL `DROP BRANCH`:
+/// it has no `IF EXISTS` mode and never converts a missing or changed ref into
+/// a successful cleanup result.
+pub async fn drop_branch_if_exact(
+    catalog: &dyn Catalog,
+    namespace: &str,
+    table: &str,
+    expected_table_uuid: &str,
+    name: &str,
+    expected_head_snapshot_id: i64,
+) -> Result<ExactBranchDropOutcome, String> {
+    let ident = TableIdent::from_strs([namespace, table])
+        .map_err(|error| format!("iceberg cleanup ref: invalid table identifier: {error}"))?;
+    let loaded = catalog
+        .load_table(&ident)
+        .await
+        .map_err(|error| format!("iceberg cleanup ref: load table failed: {error}"))?;
+    let metadata = loaded.metadata();
+    if metadata.uuid().to_string() != expected_table_uuid {
+        return Ok(ExactBranchDropOutcome::Abandoned);
+    }
+    let Some(reference) = metadata.refs().get(name) else {
+        return Ok(ExactBranchDropOutcome::Abandoned);
+    };
+    if !reference.is_branch()
+        || reference.snapshot_id != expected_head_snapshot_id
+        || metadata.snapshot_by_id(expected_head_snapshot_id).is_none()
+    {
+        return Ok(ExactBranchDropOutcome::Abandoned);
+    }
+    let commit = TableCommit::builder()
+        .ident(ident)
+        .updates(vec![TableUpdate::RemoveSnapshotRef {
+            ref_name: name.to_string(),
+        }])
+        .requirements(vec![TableRequirement::RefSnapshotIdMatch {
+            r#ref: name.to_string(),
+            snapshot_id: Some(expected_head_snapshot_id),
+        }])
+        .build();
+    match catalog.update_table(commit).await {
+        Ok(_) => Ok(ExactBranchDropOutcome::Retired),
+        // A concurrently moved/deleted ref is a failed compare-and-swap proof,
+        // not a reason to retry a destructive action in this GC pass.
+        Err(error) if error.to_string().contains("Requirement") => {
+            Ok(ExactBranchDropOutcome::Abandoned)
+        }
+        Err(error) => Err(format!("iceberg cleanup ref: exact drop failed: {error}")),
+    }
+}
+
 pub async fn execute_ref_action(
     catalog: &dyn Catalog,
     plan: &RefActionPlan,

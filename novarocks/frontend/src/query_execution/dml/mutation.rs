@@ -153,30 +153,6 @@ pub trait MutationEngine: Send + Sync {
         Err("mutation engine does not expose a connector terminal commit outcome".to_string())
     }
 
-    /// Establish this attempt's external write fence before anything is
-    /// dispatched.
-    ///
-    /// UPDATE and MERGE derive their write lease at preparation precisely so
-    /// this can happen before staging: `derive_write_lease` mints a fresh fence
-    /// cell on every call, so a fence established on a lease derived later would
-    /// not be the one the commit travels through.
-    ///
-    /// The default fails closed. There is deliberately no unfenced dispatch.
-    fn establish_mutation_external_fence(
-        &self,
-        _prepared: &dyn MutationPrepared,
-        _proposal: &dyn crate::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorEstablishedWriteFence,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        Err(
-            crate::query_execution::dml::external_write_fence::external_fence_authority_unavailable(
-                "mutation engine does not expose an external operation fence authority",
-            ),
-        )
-    }
-
     fn finalize_mutation(&self, prepared: &dyn MutationPrepared) -> Result<(), String>;
 }
 
@@ -464,33 +440,6 @@ fn abort_handle(abort: &dyn MutationAbort) -> Result<&CoreMutationAbort, String>
 }
 
 impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
-    fn establish_mutation_external_fence(
-        &self,
-        prepared: &dyn MutationPrepared,
-        proposal: &dyn crate::query_execution::dml::external_write_fence::ExternalWriteFenceProposal,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorEstablishedWriteFence,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        let handle = prepared_handle(prepared)
-            .map_err(crate::query_execution::dml::external_write_fence::invalid_fence_request)?;
-        let kernel = handle.kernel.lock().map_err(|error| {
-            crate::query_execution::dml::external_write_fence::invalid_fence_request(format!(
-                "mutation prepared kernel lock: {error}"
-            ))
-        })?;
-        let kernel = kernel.as_ref().ok_or_else(|| {
-            crate::query_execution::dml::external_write_fence::invalid_fence_request(
-                "mutation prepared kernel was already consumed".to_string(),
-            )
-        })?;
-        match kernel {
-            PreparedKernel::Update(update) => update.external_fence_authority()?,
-            PreparedKernel::Merge(merge) => merge.external_fence_authority()?,
-        }
-        .establish(proposal)
-    }
-
     fn prepare_mutation(
         &self,
         request: PrepareMutationRequest<'_>,

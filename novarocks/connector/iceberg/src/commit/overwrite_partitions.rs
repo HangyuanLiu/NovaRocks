@@ -142,6 +142,7 @@ impl IcebergCommitAction for OverwritePartitionsCommit {
             action,
             ctx.fence,
             "OverwritePartitions",
+            None,
         )
         .await
         {

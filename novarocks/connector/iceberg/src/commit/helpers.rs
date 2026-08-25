@@ -135,6 +135,7 @@ pub(super) async fn submit_fenced_action<A>(
     action: Arc<A>,
     fence: Option<&IcebergFenceAssertion>,
     label: &str,
+    before_attempt: Option<&(dyn Fn(&Table) -> Result<(), String> + Send + Sync)>,
 ) -> Result<FencedSubmit, FencedSubmitError>
 where
     A: TransactionAction + 'static,
@@ -169,6 +170,9 @@ where
         .enumerate()
         .take(COMMIT_RETRY_MAX_ATTEMPTS)
     {
+        if let Some(before_attempt) = before_attempt {
+            before_attempt(&current).map_err(|detail| FencedSubmitError::Failed { detail })?;
+        }
         let staged = Arc::clone(&action)
             .commit(&current)
             .await

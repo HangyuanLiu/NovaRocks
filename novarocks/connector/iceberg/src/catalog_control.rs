@@ -45,6 +45,8 @@ pub mod historical_ctas_recovery;
 pub(crate) mod historical_maintenance_recovery;
 #[path = "catalog_control/metadata_maintenance.rs"]
 pub(crate) mod metadata_maintenance;
+#[path = "catalog_control/owned_ref_cleanup.rs"]
+mod owned_ref_cleanup;
 #[path = "catalog_control/staged_create.rs"]
 pub mod staged_create;
 #[path = "catalog_control/statistics.rs"]

@@ -27,6 +27,7 @@ pub enum SessionStatement {
     Set(SetStatement),
     Use(UseStatement),
     Kill(KillStatement),
+    TransactionControl(TransactionControlStatement),
 }
 
 impl SessionStatement {
@@ -35,6 +36,40 @@ impl SessionStatement {
             Self::Set(statement) => statement.span,
             Self::Use(statement) => statement.span,
             Self::Kill(statement) => statement.span,
+            Self::TransactionControl(statement) => statement.span,
+        }
+    }
+}
+
+/// A transaction-control statement recognized at the session boundary.
+///
+/// NovaRocks does not implement a cross-statement transaction.  These nodes
+/// retain the syntactic intent so admission can reject it before any catalog
+/// or data mutation is dispatched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransactionControlStatement {
+    pub kind: TransactionControlKind,
+    pub span: Span,
+}
+
+/// The closed transaction-control forms owned by the parser.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionControlKind {
+    Begin,
+    StartTransaction,
+    Commit,
+    Rollback,
+    Savepoint,
+}
+
+impl TransactionControlKind {
+    pub const fn sql(self) -> &'static str {
+        match self {
+            Self::Begin => "BEGIN",
+            Self::StartTransaction => "START TRANSACTION",
+            Self::Commit => "COMMIT",
+            Self::Rollback => "ROLLBACK",
+            Self::Savepoint => "SAVEPOINT",
         }
     }
 }

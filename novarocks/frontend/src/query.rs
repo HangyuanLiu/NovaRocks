@@ -668,6 +668,9 @@ impl FrontendQuerySession {
         match statement {
             ast::SessionStatement::Set(statement) => {
                 for assignment in &statement.assignments {
+                    self.admit_session_set_assignment(source, assignment)?;
+                }
+                for assignment in &statement.assignments {
                     self.apply_session_set_assignment(source, assignment)
                         .await?;
                 }
@@ -682,7 +685,43 @@ impl FrontendQuerySession {
                 Ok(StatementResult::Ok)
             }
             ast::SessionStatement::Kill(statement) => self.execute_session_kill(source, statement),
+            ast::SessionStatement::TransactionControl(statement) => {
+                Err(QueryServiceError::from_user_error(
+                    crate::session_error::SessionAdmitError::TransactionUnsupported.to_user_error(
+                        source,
+                        statement.span,
+                        format!(
+                            "{} is not supported because NovaRocks only provides statement-level autocommit frontiers",
+                            statement.kind.sql()
+                        ),
+                    ),
+                ))
+            }
         }
+    }
+
+    fn admit_session_set_assignment(
+        &self,
+        source: &str,
+        assignment: &ast::SetAssignment,
+    ) -> Result<(), QueryServiceError> {
+        let ast::SetTarget::SystemVariable(variable) = &assignment.target else {
+            return Ok(());
+        };
+        if !variable.value.eq_ignore_ascii_case("autocommit") {
+            return Ok(());
+        }
+        let value = session_setting_value(&assignment.value)?;
+        if parse_bool(&value)? {
+            return Ok(());
+        }
+        Err(QueryServiceError::from_user_error(
+            crate::session_error::SessionAdmitError::TransactionUnsupported.to_user_error(
+                source,
+                assignment.span,
+                "SET autocommit=0 is not supported because NovaRocks only provides statement-level autocommit frontiers",
+            ),
+        ))
     }
 
     async fn apply_session_set_assignment(
@@ -773,6 +812,10 @@ impl FrontendQuerySession {
     ) -> Result<(), QueryServiceError> {
         if name == "catalog" {
             return self.apply_session_catalog(value);
+        }
+        if name == "autocommit" {
+            debug_assert!(parse_bool(value).unwrap_or(false));
+            return Ok(());
         }
         let mut state = self.state.lock().map_err(poisoned_state)?;
         match name {

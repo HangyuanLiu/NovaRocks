@@ -32,6 +32,7 @@ use crate::iceberg::TableIdent;
 use crate::iceberg::spec::{
     Datum, PartitionSpecRef, PrimitiveType, SchemaRef, TableMetadata, Type,
 };
+use crate::iceberg::table::Table;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::commit::PositionDeleteGroup;
@@ -98,7 +99,10 @@ pub struct IcebergCommitCollector {
     preserve_row_lineage: AtomicBool,
     committed: AtomicBool,
     manifest_cleanup_token: Mutex<Option<String>>,
+    fast_append_attempt_guard: Mutex<Option<FastAppendAttemptGuard>>,
 }
+
+pub(crate) type FastAppendAttemptGuard = Arc<dyn Fn(&Table) -> Result<(), String> + Send + Sync>;
 
 impl crate::commit::service::CommitRecoverySource for IcebergCommitCollector {
     fn recovery_table_ident(&self) -> String {
@@ -159,6 +163,7 @@ impl IcebergCommitCollector {
             preserve_row_lineage: AtomicBool::new(false),
             committed: AtomicBool::new(false),
             manifest_cleanup_token: Mutex::new(None),
+            fast_append_attempt_guard: Mutex::new(None),
         }
     }
 
@@ -167,6 +172,22 @@ impl IcebergCommitCollector {
             .manifest_cleanup_token
             .lock()
             .expect("manifest cleanup token poisoned") = Some(token);
+    }
+
+    /// ADD FILES installs this provider-private guard so every refreshed OCC
+    /// base is checked against the complete frozen manifest before staging.
+    pub(crate) fn set_fast_append_attempt_guard(&self, guard: FastAppendAttemptGuard) {
+        *self
+            .fast_append_attempt_guard
+            .lock()
+            .expect("fast append attempt guard poisoned") = Some(guard);
+    }
+
+    pub(crate) fn fast_append_attempt_guard(&self) -> Option<FastAppendAttemptGuard> {
+        self.fast_append_attempt_guard
+            .lock()
+            .expect("fast append attempt guard poisoned")
+            .clone()
     }
 
     pub(crate) fn with_table_metadata(mut self, metadata: TableMetadata) -> Self {

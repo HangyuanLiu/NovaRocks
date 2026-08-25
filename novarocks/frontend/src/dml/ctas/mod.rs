@@ -107,7 +107,10 @@ impl DmlService {
         })?;
         let session = context.session();
         let operation_id = DmlOperationId::new_v7();
-        let prepare_operation_id = Uuid::now_v7();
+        // The standard staged-create adapter uses this exact ID to derive the
+        // warehouse-owned, unanchored CTAS root.  It must therefore be the
+        // admission publication ID, not a second child UUID.
+        let prepare_operation_id = *operation_id.as_uuid();
         let write_operation_id = Uuid::now_v7();
         let publish_operation_id = Uuid::now_v7();
         let abort_staging_operation_id = Uuid::now_v7();

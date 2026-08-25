@@ -27,12 +27,12 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    BatchReceipt, BatchReceiptSummary, CandidatePage, ConnectorCleanupCandidatePageRequest,
-    ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
-    ConnectorCleanupOperationId, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
-    ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
-    ConnectorCleanupReconcileRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, PreparedBatch,
+    BatchReceipt, BatchReceiptSummary, CandidatePage, ConnectorCleanupCandidate,
+    ConnectorCleanupCandidatePageRequest, ConnectorCleanupExecuteRequest,
+    ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance, ConnectorCleanupOperationId,
+    ConnectorCleanupPlan, ConnectorCleanupPlanSummary, ConnectorCleanupPlanningRequest,
+    ConnectorCleanupPrepareRequest, ConnectorCleanupReconcileRequest, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, PreparedBatch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,11 +41,14 @@ use sha2::{Digest, Sha256};
 use super::cleanup_candidates::{
     ScannedFile, canonical_object_mtime_ms, collect_orphan_candidates,
 };
+use super::owned_ref_cleanup::{
+    OwnedRefCandidate, collect_owned_ref_candidates, matches_owned_ref_candidate,
+};
 use crate::control_provider::IcebergTablePayload;
 use crate::control_runtime::IcebergControlRuntime;
 use crate::iceberg::io::FileIO;
 
-const ARTIFACT_VERSION: u16 = 1;
+const ARTIFACT_VERSION: u16 = 2;
 const MAX_RECORDS: usize = 262_144;
 const MAX_PARTS: usize = 64;
 const MAX_PART_BYTES: usize = 1024 * 1024;
@@ -75,7 +78,15 @@ struct LogicalManifest {
     table: String,
     table_uuid: String,
     older_than_ms: i64,
+    phase: CleanupPhase,
     records: Vec<ManifestRecord>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum CleanupPhase {
+    OwnedRefRetire,
+    ObjectSweep,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -87,6 +98,7 @@ struct ManifestRoot {
     table: String,
     table_uuid: String,
     older_than_ms: i64,
+    phase: CleanupPhase,
     record_count: u32,
     total_bytes: u64,
     parts: Vec<PartReference>,
@@ -110,8 +122,22 @@ struct ManifestPart {
 #[serde(deny_unknown_fields)]
 struct ManifestRecord {
     ordinal: u32,
-    location: String,
-    identity: ObjectIdentity,
+    candidate: ManifestCandidate,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ManifestCandidate {
+    Object {
+        location: String,
+        identity: ObjectIdentity,
+    },
+    OwnedRef {
+        name: String,
+        head_snapshot_id: i64,
+        provenance_version: u16,
+        created_at_ms: i64,
+    },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -271,7 +297,7 @@ impl IcebergCleanupMaintenanceAdapter {
     ) -> Result<Vec<ManifestRecord>, ConnectorError> {
         let (file_io, table_location) = self.table_file_io(payload)?;
         let expected_prefix = format!(
-            "{table_location}/_novarocks/maintenance/v3/orphan-cleanup/{}/",
+            "{table_location}/_novarocks/maintenance/v4/orphan-cleanup/{}/",
             hex_encode(plan.operation_id().to_bytes())
         );
         if !payload.artifact_root.starts_with(&expected_prefix) {
@@ -429,21 +455,51 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             .load_table(&target.namespace, &target.table)
             .map_err(unavailable)?;
         let table = physical.table;
-        let table_for_scan = table.clone();
         let older_than_ms = request.operation().older_than_ms();
-        let object_store = physical.object_store_config.clone();
-        let scanned = self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                collect_orphan_candidates(&table_for_scan, older_than_ms, object_store.as_ref())
-                    .await
-            })
-            .map_err(unavailable)?
-            .map_err(unavailable)?;
-        let records =
-            records_from_candidates(&scanned, &table, physical.object_store_config.as_ref())?;
+        // A ref retirement is a separate GC phase. Once a Catalog ref is
+        // removed, the live set used by object discovery is stale by
+        // definition; a later operation must reload metadata before sweeping.
+        let owned_refs = collect_owned_ref_candidates(
+            table.metadata(),
+            &target.namespace,
+            &target.table,
+            older_than_ms,
+        );
+        let (phase, records) = if owned_refs.is_empty() {
+            let table_for_scan = table.clone();
+            let object_store = physical.object_store_config.clone();
+            let scanned = self
+                .runtime
+                .resources()
+                .catalog_runtime()
+                .block_on(async move {
+                    collect_orphan_candidates(&table_for_scan, older_than_ms, object_store.as_ref())
+                        .await
+                })
+                .map_err(unavailable)?
+                .map_err(unavailable)?;
+            (
+                CleanupPhase::ObjectSweep,
+                records_from_candidates(&scanned, &table, physical.object_store_config.as_ref())?,
+            )
+        } else {
+            (
+                CleanupPhase::OwnedRefRetire,
+                owned_refs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ordinal, candidate)| ManifestRecord {
+                        ordinal: ordinal as u32,
+                        candidate: ManifestCandidate::OwnedRef {
+                            name: candidate.name,
+                            head_snapshot_id: candidate.head_snapshot_id,
+                            provenance_version: candidate.provenance_version,
+                            created_at_ms: candidate.created_at_ms,
+                        },
+                    })
+                    .collect(),
+            )
+        };
         if records.len() > MAX_RECORDS {
             return Err(exhausted("Iceberg cleanup manifest exceeds 262144 records"));
         }
@@ -453,6 +509,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             table: target.table.clone(),
             table_uuid: table.metadata().uuid().to_string(),
             older_than_ms,
+            phase,
             records,
         };
         let logical_bytes = canonical(&logical)?;
@@ -461,7 +518,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         }
         let manifest_digest = domain_digest(MANIFEST_DOMAIN, &logical_bytes);
         let artifact_root = format!(
-            "{}/_novarocks/maintenance/v3/orphan-cleanup/{}/{}",
+            "{}/_novarocks/maintenance/v4/orphan-cleanup/{}/{}",
             table.metadata().location().trim_end_matches('/'),
             hex_encode(request.operation_id().to_bytes()),
             hex_encode(manifest_digest)
@@ -475,11 +532,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         )?;
         let summary = ConnectorCleanupPlanSummary::try_new(
             logical.records.len() as u64,
-            logical
-                .records
-                .iter()
-                .map(|record| identity_size(&record.identity))
-                .sum(),
+            logical.records.iter().map(manifest_record_size).sum(),
             part_count,
             logical.records.len().div_ceil(MAX_BATCH_OBJECTS) as u32,
         )?;
@@ -563,7 +616,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             return Ok(receipt);
         }
         let config = self.runtime.control_state().object_store_config();
-        let outcomes = execute_frozen_batch(&self.runtime, &batch, config)?;
+        let outcomes = execute_frozen_batch(&self.runtime, &payload, &batch, config)?;
         self.persist_receipt(&request.plan, &request.prepared, &payload, outcomes)
     }
 
@@ -579,7 +632,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             return Ok(receipt);
         }
         let config = self.runtime.control_state().object_store_config();
-        let outcomes = reconcile_frozen_batch(&self.runtime, &batch, config)?;
+        let outcomes = reconcile_frozen_batch(&self.runtime, &payload, &batch, config)?;
         self.persist_receipt(&request.plan, &request.prepared, &payload, outcomes)
     }
 
@@ -604,7 +657,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             request.offset,
             records[start..end]
                 .iter()
-                .map(|record| Arc::from(record.location.as_str()))
+                .map(manifest_candidate_projection)
                 .collect(),
             end == records.len(),
         )
@@ -662,64 +715,103 @@ fn records_from_candidates(
             };
             Ok(ManifestRecord {
                 ordinal: ordinal as u32,
-                location: file.path.clone(),
-                identity,
+                candidate: ManifestCandidate::Object {
+                    location: file.path.clone(),
+                    identity,
+                },
             })
         })
         .collect()
 }
 
+fn manifest_candidate_projection(record: &ManifestRecord) -> ConnectorCleanupCandidate {
+    match &record.candidate {
+        ManifestCandidate::Object { location, .. } => ConnectorCleanupCandidate::Object {
+            location: Arc::from(location.as_str()),
+        },
+        ManifestCandidate::OwnedRef {
+            name,
+            head_snapshot_id,
+            provenance_version,
+            created_at_ms,
+        } => ConnectorCleanupCandidate::OwnedRef {
+            name: Arc::from(name.as_str()),
+            head_snapshot_id: *head_snapshot_id,
+            provenance_version: *provenance_version,
+            created_at_ms: *created_at_ms,
+        },
+    }
+}
+
 fn execute_frozen_batch(
     runtime: &IcebergControlRuntime,
+    payload: &PlanPayload,
     batch: &[ManifestRecord],
     config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<ReceiptRecord>, ConnectorError> {
     batch
         .iter()
-        .map(|record| {
-            let access = crate::fs_io::resolve_access_for_location(&record.location, config)
-                .map_err(unavailable)?;
-            let path = access.single_relative_path().map_err(invalid)?.to_string();
-            let operator = access.operator();
-            let matches = runtime
-                .resources()
-                .catalog_runtime()
-                .block_on(stat_matches(
-                    operator.clone(),
-                    path.clone(),
-                    record.identity.clone(),
-                ))
-                .map_err(unavailable)?;
-            match matches {
-                Err(error) if error.kind() == crate::opendal::ErrorKind::NotFound => {
-                    receipt(record.ordinal, ObjectOutcome::AlreadyAbsent, None)
-                }
-                Err(error) => receipt(
-                    record.ordinal,
-                    error_outcome(error.kind()),
-                    Some(error.to_string()),
-                ),
-                Ok(false) => receipt(
-                    record.ordinal,
-                    ObjectOutcome::Failed,
-                    Some("object identity changed before delete".to_string()),
-                ),
-                Ok(true) => {
-                    let deleted = runtime
-                        .resources()
-                        .catalog_runtime()
-                        .block_on(delete_exact(operator, path, record.identity.clone()))
-                        .map_err(unavailable)?;
-                    match deleted {
-                        Ok(()) => receipt(record.ordinal, ObjectOutcome::Deleted, None),
-                        Err(error) if error.kind() == crate::opendal::ErrorKind::NotFound => {
-                            receipt(record.ordinal, ObjectOutcome::AlreadyAbsent, None)
+        .map(|record| match &record.candidate {
+            ManifestCandidate::OwnedRef {
+                name,
+                head_snapshot_id,
+                provenance_version,
+                created_at_ms,
+                ..
+            } => execute_owned_ref(
+                runtime,
+                payload,
+                record.ordinal,
+                name,
+                *head_snapshot_id,
+                *provenance_version,
+                *created_at_ms,
+            ),
+            ManifestCandidate::Object { location, identity } => {
+                let access = crate::fs_io::resolve_access_for_location(location, config)
+                    .map_err(unavailable)?;
+                let path = access.single_relative_path().map_err(invalid)?.to_string();
+                let operator = access.operator();
+                let matches = runtime
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(stat_matches(
+                        operator.clone(),
+                        path.clone(),
+                        identity.clone(),
+                    ))
+                    .map_err(unavailable)?;
+                match matches {
+                    Err(error) if error.kind() == crate::opendal::ErrorKind::NotFound => {
+                        receipt(record.ordinal, ObjectOutcome::AlreadyAbsent, None)
+                    }
+                    Err(error) => receipt(
+                        record.ordinal,
+                        error_outcome(error.kind()),
+                        Some(error.to_string()),
+                    ),
+                    Ok(false) => receipt(
+                        record.ordinal,
+                        ObjectOutcome::Failed,
+                        Some("object identity changed before delete".to_string()),
+                    ),
+                    Ok(true) => {
+                        let deleted = runtime
+                            .resources()
+                            .catalog_runtime()
+                            .block_on(delete_exact(operator, path, identity.clone()))
+                            .map_err(unavailable)?;
+                        match deleted {
+                            Ok(()) => receipt(record.ordinal, ObjectOutcome::Deleted, None),
+                            Err(error) if error.kind() == crate::opendal::ErrorKind::NotFound => {
+                                receipt(record.ordinal, ObjectOutcome::AlreadyAbsent, None)
+                            }
+                            Err(error) => receipt(
+                                record.ordinal,
+                                error_outcome(error.kind()),
+                                Some(error.to_string()),
+                            ),
                         }
-                        Err(error) => receipt(
-                            record.ordinal,
-                            error_outcome(error.kind()),
-                            Some(error.to_string()),
-                        ),
                     }
                 }
             }
@@ -729,46 +821,188 @@ fn execute_frozen_batch(
 
 fn reconcile_frozen_batch(
     runtime: &IcebergControlRuntime,
+    payload: &PlanPayload,
     batch: &[ManifestRecord],
     config: Option<&novarocks_fs::ObjectStoreConfig>,
 ) -> Result<Vec<ReceiptRecord>, ConnectorError> {
     batch
         .iter()
-        .map(|record| {
-            let access = crate::fs_io::resolve_access_for_location(&record.location, config)
-                .map_err(unavailable)?;
-            let path = access.single_relative_path().map_err(invalid)?.to_string();
-            let outcome = runtime
-                .resources()
-                .catalog_runtime()
-                .block_on(stat_matches(
-                    access.operator(),
-                    path,
-                    record.identity.clone(),
-                ))
-                .map_err(unavailable)?;
-            match outcome {
-                Err(error) if error.kind() == crate::opendal::ErrorKind::NotFound => {
-                    receipt(record.ordinal, ObjectOutcome::Deleted, None)
+        .map(|record| match &record.candidate {
+            ManifestCandidate::OwnedRef {
+                name,
+                head_snapshot_id,
+                provenance_version,
+                created_at_ms,
+                ..
+            } => reconcile_owned_ref(
+                runtime,
+                payload,
+                record.ordinal,
+                name,
+                *head_snapshot_id,
+                *provenance_version,
+                *created_at_ms,
+            ),
+            ManifestCandidate::Object { location, identity } => {
+                let access = crate::fs_io::resolve_access_for_location(location, config)
+                    .map_err(unavailable)?;
+                let path = access.single_relative_path().map_err(invalid)?.to_string();
+                let outcome = runtime
+                    .resources()
+                    .catalog_runtime()
+                    .block_on(stat_matches(access.operator(), path, identity.clone()))
+                    .map_err(unavailable)?;
+                match outcome {
+                    Err(error) if error.kind() == crate::opendal::ErrorKind::NotFound => {
+                        receipt(record.ordinal, ObjectOutcome::Deleted, None)
+                    }
+                    Err(error) => receipt(
+                        record.ordinal,
+                        ObjectOutcome::Unknown,
+                        Some(error.to_string()),
+                    ),
+                    Ok(true) => receipt(
+                        record.ordinal,
+                        ObjectOutcome::Failed,
+                        Some("object remains after uncertain delete".to_string()),
+                    ),
+                    Ok(false) => receipt(
+                        record.ordinal,
+                        ObjectOutcome::Failed,
+                        Some("object identity changed after uncertain delete".to_string()),
+                    ),
                 }
-                Err(error) => receipt(
-                    record.ordinal,
-                    ObjectOutcome::Unknown,
-                    Some(error.to_string()),
-                ),
-                Ok(true) => receipt(
-                    record.ordinal,
-                    ObjectOutcome::Failed,
-                    Some("object remains after uncertain delete".to_string()),
-                ),
-                Ok(false) => receipt(
-                    record.ordinal,
-                    ObjectOutcome::Failed,
-                    Some("object identity changed after uncertain delete".to_string()),
-                ),
             }
         })
         .collect()
+}
+
+fn execute_owned_ref(
+    runtime: &IcebergControlRuntime,
+    payload: &PlanPayload,
+    ordinal: u32,
+    name: &str,
+    expected_head_snapshot_id: i64,
+    provenance_version: u16,
+    created_at_ms: i64,
+) -> Result<ReceiptRecord, ConnectorError> {
+    runtime
+        .control_state()
+        .invalidate_table(&payload.namespace, &payload.table);
+    let physical = runtime
+        .load_table(&payload.namespace, &payload.table)
+        .map_err(unavailable)?;
+    let expected = OwnedRefCandidate {
+        name: name.to_string(),
+        head_snapshot_id: expected_head_snapshot_id,
+        provenance_version,
+        created_at_ms,
+    };
+    if physical.table.metadata().uuid().to_string() != payload.table_uuid
+        || !matches_owned_ref_candidate(
+            physical.table.metadata(),
+            &payload.namespace,
+            &payload.table,
+            &expected,
+        )
+    {
+        return receipt(
+            ordinal,
+            ObjectOutcome::Failed,
+            Some("owned ref provenance changed before exact retirement".to_string()),
+        );
+    }
+    let catalog = Arc::clone(runtime.catalog());
+    let namespace = payload.namespace.clone();
+    let table = payload.table.clone();
+    let table_uuid = payload.table_uuid.clone();
+    let name = name.to_string();
+    let outcome = runtime.resources().catalog_runtime().block_on(async move {
+        crate::commit::drop_branch_if_exact(
+            catalog.as_ref(),
+            &namespace,
+            &table,
+            &table_uuid,
+            &name,
+            expected_head_snapshot_id,
+        )
+        .await
+    });
+    match outcome {
+        Ok(Ok(crate::commit::ExactBranchDropOutcome::Retired)) => {
+            receipt(ordinal, ObjectOutcome::Deleted, None)
+        }
+        Ok(Ok(crate::commit::ExactBranchDropOutcome::Abandoned)) => receipt(
+            ordinal,
+            ObjectOutcome::Failed,
+            Some("owned ref changed before exact retirement".to_string()),
+        ),
+        Ok(Err(error)) | Err(error) => receipt(ordinal, ObjectOutcome::Unknown, Some(error)),
+    }
+}
+
+fn reconcile_owned_ref(
+    runtime: &IcebergControlRuntime,
+    payload: &PlanPayload,
+    ordinal: u32,
+    name: &str,
+    expected_head_snapshot_id: i64,
+    provenance_version: u16,
+    created_at_ms: i64,
+) -> Result<ReceiptRecord, ConnectorError> {
+    runtime
+        .control_state()
+        .invalidate_table(&payload.namespace, &payload.table);
+    let physical = runtime
+        .load_table(&payload.namespace, &payload.table)
+        .map_err(unavailable)?;
+    let metadata = physical.table.metadata();
+    if metadata.uuid().to_string() != payload.table_uuid {
+        return receipt(
+            ordinal,
+            ObjectOutcome::Failed,
+            Some("cleanup table incarnation changed after uncertain ref retirement".to_string()),
+        );
+    }
+    let expected = OwnedRefCandidate {
+        name: name.to_string(),
+        head_snapshot_id: expected_head_snapshot_id,
+        provenance_version,
+        created_at_ms,
+    };
+    match metadata.refs().get(name) {
+        None => receipt(ordinal, ObjectOutcome::Deleted, None),
+        Some(_)
+            if !matches_owned_ref_candidate(
+                metadata,
+                &payload.namespace,
+                &payload.table,
+                &expected,
+            ) =>
+        {
+            receipt(
+                ordinal,
+                ObjectOutcome::Failed,
+                Some("owned ref provenance changed after uncertain retirement".to_string()),
+            )
+        }
+        Some(reference)
+            if reference.is_branch() && reference.snapshot_id == expected_head_snapshot_id =>
+        {
+            receipt(
+                ordinal,
+                ObjectOutcome::Failed,
+                Some(
+                    "owned ref remains at the observed head after uncertain retirement".to_string(),
+                ),
+            )
+        }
+        Some(_) => receipt(
+            ordinal,
+            ObjectOutcome::Failed,
+            Some("owned ref changed after uncertain retirement".to_string()),
+        ),
+    }
 }
 
 async fn stat_matches(
@@ -850,12 +1084,9 @@ fn write_manifest(
             table: logical.table.clone(),
             table_uuid: logical.table_uuid.clone(),
             older_than_ms: logical.older_than_ms,
+            phase: logical.phase,
             record_count: logical.records.len() as u32,
-            total_bytes: logical
-                .records
-                .iter()
-                .map(|record| identity_size(&record.identity))
-                .sum(),
+            total_bytes: logical.records.iter().map(manifest_record_size).sum(),
             parts: references,
         })?,
     )?;
@@ -904,7 +1135,8 @@ fn read_manifest(
     if records.len() != manifest.record_count as usize
         || records.len() > MAX_RECORDS
         || records.windows(2).any(|pair| {
-            pair[0].ordinal + 1 != pair[1].ordinal || pair[0].location >= pair[1].location
+            pair[0].ordinal + 1 != pair[1].ordinal
+                || manifest_record_sort_key(&pair[0]) >= manifest_record_sort_key(&pair[1])
         })
     {
         return Err(corrupt("Iceberg cleanup manifest records are invalid"));
@@ -915,6 +1147,7 @@ fn read_manifest(
         table: manifest.table,
         table_uuid: manifest.table_uuid,
         older_than_ms: manifest.older_than_ms,
+        phase: manifest.phase,
         records: records.clone(),
     };
     if domain_digest(MANIFEST_DOMAIN, &canonical(&logical)?) != expected_digest {
@@ -1108,6 +1341,22 @@ fn identity_size(identity: &ObjectIdentity) -> u64 {
         ObjectIdentity::Version { size, .. }
         | ObjectIdentity::Etag { size, .. }
         | ObjectIdentity::SizeMtime { size, .. } => *size,
+    }
+}
+
+fn manifest_record_size(record: &ManifestRecord) -> u64 {
+    match &record.candidate {
+        ManifestCandidate::Object { identity, .. } => identity_size(identity),
+        // Catalog refs are metadata, not object-store bytes. Keeping this at
+        // zero makes the summary an honest object-sweep byte estimate.
+        ManifestCandidate::OwnedRef { .. } => 0,
+    }
+}
+
+fn manifest_record_sort_key(record: &ManifestRecord) -> String {
+    match &record.candidate {
+        ManifestCandidate::Object { location, .. } => format!("object:{location}"),
+        ManifestCandidate::OwnedRef { name, .. } => format!("owned_ref:{name}"),
     }
 }
 
@@ -1319,7 +1568,7 @@ pub(crate) fn classify_historical_cleanup_batch(
     }
     let table_location = physical.table.metadata().location().to_string();
     let expected_prefix = format!(
-        "{table_location}/_novarocks/maintenance/v3/orphan-cleanup/{}/",
+        "{table_location}/_novarocks/maintenance/v4/orphan-cleanup/{}/",
         hex_encode(operation_id)
     );
     if !payload.artifact_root.starts_with(&expected_prefix) {
@@ -1343,7 +1592,7 @@ pub(crate) fn classify_historical_cleanup_batch(
     let batch = &records[start..end];
 
     let config = runtime.control_state().object_store_config();
-    let outcomes = reconcile_frozen_batch(runtime, batch, config)?;
+    let outcomes = reconcile_frozen_batch(runtime, &payload, batch, config)?;
     let mut counts = HistoricalCleanupCounts {
         deleted: 0,
         already_absent: 0,
@@ -1499,26 +1748,50 @@ mod tests {
         }
     }
 
+    fn object_record(
+        ordinal: u32,
+        location: impl Into<String>,
+        identity: ObjectIdentity,
+    ) -> ManifestRecord {
+        ManifestRecord {
+            ordinal,
+            candidate: ManifestCandidate::Object {
+                location: location.into(),
+                identity,
+            },
+        }
+    }
+
+    fn test_payload() -> PlanPayload {
+        PlanPayload {
+            version: ARTIFACT_VERSION,
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            table_uuid: "00000000-0000-0000-0000-000000000000".to_string(),
+            artifact_root: "file:///tmp/cleanup".to_string(),
+        }
+    }
+
     #[test]
     fn manifest_and_receipt_codecs_are_canonical_and_bounded() {
         let records = vec![
-            ManifestRecord {
-                ordinal: 0,
-                location: "file:///tmp/a.parquet".to_string(),
-                identity: ObjectIdentity::SizeMtime {
+            object_record(
+                0,
+                "file:///tmp/a.parquet",
+                ObjectIdentity::SizeMtime {
                     size: 10,
                     mtime_ms: 20,
                 },
-            },
-            ManifestRecord {
-                ordinal: 1,
-                location: "file:///tmp/b.parquet".to_string(),
-                identity: ObjectIdentity::Etag {
+            ),
+            object_record(
+                1,
+                "file:///tmp/b.parquet",
+                ObjectIdentity::Etag {
                     etag: "etag-b".to_string(),
                     size: 20,
                     mtime_ms: 30,
                 },
-            },
+            ),
         ];
         let parts = split_manifest_parts(&records).expect("manifest parts");
         assert_eq!(parts.len(), 1);
@@ -1536,14 +1809,14 @@ mod tests {
         };
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
 
-        let oversized = ManifestRecord {
-            ordinal: 0,
-            location: "x".repeat(MAX_PART_BYTES + 1),
-            identity: ObjectIdentity::SizeMtime {
+        let oversized = object_record(
+            0,
+            "x".repeat(MAX_PART_BYTES + 1),
+            ObjectIdentity::SizeMtime {
                 size: 1,
                 mtime_ms: 1,
             },
-        };
+        );
         let error = match split_manifest_parts(&[oversized]) {
             Ok(_) => panic!("one record must not exceed a manifest part"),
             Err(error) => error,
@@ -1682,31 +1955,29 @@ mod tests {
         std::fs::write(&path, b"candidate").expect("write candidate");
         let location = format!("file://{}", path.display());
         let identity = size_mtime_identity(&executor, &location);
-        let record = ManifestRecord {
-            ordinal: 0,
-            location: location.clone(),
-            identity: identity.clone(),
-        };
+        let record = object_record(0, location.clone(), identity.clone());
 
-        let remains = reconcile_frozen_batch(&runtime, std::slice::from_ref(&record), None)
-            .expect("reconcile remaining object");
+        let payload = test_payload();
+        let remains =
+            reconcile_frozen_batch(&runtime, &payload, std::slice::from_ref(&record), None)
+                .expect("reconcile remaining object");
         let remains_summary = receipt_summary(&remains).expect("remaining summary");
         assert_eq!(remains_summary.failed(), 1);
         assert_eq!(remains_summary.deleted(), 0);
         assert!(path.exists());
 
-        let mismatched = ManifestRecord {
-            ordinal: 0,
-            location: location.clone(),
-            identity: match identity {
+        let mismatched = object_record(
+            0,
+            location.clone(),
+            match identity {
                 ObjectIdentity::SizeMtime { size, mtime_ms } => ObjectIdentity::SizeMtime {
                     size: size + 1,
                     mtime_ms,
                 },
                 _ => unreachable!("local fixture uses size and mtime"),
             },
-        };
-        let failed = execute_frozen_batch(&runtime, &[mismatched], None)
+        );
+        let failed = execute_frozen_batch(&runtime, &payload, &[mismatched], None)
             .expect("execute mismatched identity");
         let failed_summary = receipt_summary(&failed).expect("failure summary");
         assert_eq!(failed_summary.failed(), 1);
@@ -1721,10 +1992,11 @@ mod tests {
         assert!(path.exists(), "failed cleanup must not delete the object");
 
         std::fs::remove_file(&path).expect("remove candidate");
-        let absent_once = reconcile_frozen_batch(&runtime, std::slice::from_ref(&record), None)
-            .expect("first absent reconcile");
-        let absent_replay =
-            reconcile_frozen_batch(&runtime, &[record], None).expect("replayed absent reconcile");
+        let absent_once =
+            reconcile_frozen_batch(&runtime, &payload, std::slice::from_ref(&record), None)
+                .expect("first absent reconcile");
+        let absent_replay = reconcile_frozen_batch(&runtime, &payload, &[record], None)
+            .expect("replayed absent reconcile");
         assert_eq!(
             receipt_summary(&absent_once).expect("first absent summary"),
             BatchReceiptSummary::new(1, 0, 0, 0)

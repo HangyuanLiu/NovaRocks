@@ -23,7 +23,6 @@ use crate::query_execution::dml::insert::{
     IcebergInsertCommit, IcebergWriteReport, InsertEngine, PreparedIcebergInsert,
 };
 
-use crate::dml::coordination::DmlExternalFenceProposal;
 use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
 use crate::dml::runner::{CoordinatedWriteReport, WriteExecutor};
 
@@ -41,28 +40,6 @@ impl<'a> IcebergInsertWriteExecutor<'a> {
 impl WriteExecutor for IcebergInsertWriteExecutor<'_> {
     type CommitHandle = Arc<dyn IcebergInsertCommit>;
     type AbortHandle = Infallible;
-
-    /// INSERT APPEND and INSERT OVERWRITE both fence through the exact write
-    /// authority the Iceberg INSERT preparation retained.
-    ///
-    /// Both intents activate their write generation during preparation, so the
-    /// authority already exists here — before anything is dispatched. The route
-    /// only supplies the sealing closure; the resource identity comes from the
-    /// activated template, so the frontend never names a table the provider did
-    /// not itself resolve.
-    fn establish_external_fence(
-        &self,
-        _spec: &WriteTransactionSpec,
-        proposal: &DmlExternalFenceProposal,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorEstablishedWriteFence,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        self.engine.establish_iceberg_write_external_fence(
-            self.prepared.handle.as_ref(),
-            &|operation_id, table, target_ref| proposal.seal(operation_id, table, target_ref),
-        )
-    }
 
     fn run_coordinated_write(
         &self,

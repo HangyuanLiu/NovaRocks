@@ -28,7 +28,6 @@ use crate::query_execution::dml::mutation::{
 use novarocks_parser::ast::{DmlStatement, MergeClause, MutationSource};
 use novarocks_proto::lifecycle::QueryOptions;
 
-use crate::dml::coordination::DmlExternalFenceProposal;
 use crate::dml::error::{AdmitError, DmlError};
 use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
 use crate::dml::runner::{
@@ -59,33 +58,6 @@ impl MutationNativeFragmentEncoder for FrontendMutationNativeFragmentEncoder {
 impl WriteExecutor for MutationWriteExecutor<'_> {
     type CommitHandle = Arc<dyn MutationCommit>;
     type AbortHandle = Arc<dyn MutationAbort>;
-
-    /// UPDATE and MERGE both fence through the exact write authority the
-    /// mutation preparation retained, and the same fence must cover the
-    /// terminal abort of an already activated authority.
-    ///
-    /// The reverse port does not expose that authority yet, so this route fails
-    /// closed: no writer and no commit may run without a fence the provider can
-    /// compare at its external linearization point.
-    /// UPDATE and MERGE derive their write lease at preparation precisely so the
-    /// fence can be established here, before staging dispatches anything.
-    ///
-    /// `derive_write_lease` mints a fresh fence cell on every call, so a lease
-    /// derived later inside staging would carry no fence at all — which is why
-    /// the derivation was hoisted rather than the fence pushed later.
-    fn establish_external_fence(
-        &self,
-        _spec: &WriteTransactionSpec,
-        proposal: &DmlExternalFenceProposal,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorEstablishedWriteFence,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        self.engine.establish_mutation_external_fence(
-            self.prepared.handle.as_ref(),
-            &|operation_id, table, target_ref| proposal.seal(operation_id, table, target_ref),
-        )
-    }
 
     fn run_coordinated_write(
         &self,
@@ -434,12 +406,11 @@ mod tests {
     }
 
     /// The durable intent is still published before anything reaches the
-    /// mutation engine, and the statement subkind is still recorded. What
-    /// changed with CP-3B is that staging no longer follows: a route whose
-    /// write authority cannot establish an external operation fence must not
-    /// dispatch a writer at all.
+    /// mutation engine, and the statement subkind is still recorded. Ordinary
+    /// data mutations stage without an external fence and rely on the exact
+    /// base-state catalog commit for publication.
     #[test]
-    fn update_intent_is_durable_and_no_stage_runs_without_an_external_fence() {
+    fn update_intent_is_durable_and_stages_without_an_external_fence() {
         let journal = Arc::new(InMemoryOperationJournal::default());
         let service = DmlService::new(journal.clone());
         let engine = RecordingMutationEngine {
@@ -447,7 +418,7 @@ mod tests {
             events: Mutex::new(Vec::new()),
         };
 
-        let error = service
+        service
             .try_execute_typed_mutation(
                 &engine,
                 &typed_mutation("UPDATE t SET k = 1"),
@@ -455,17 +426,16 @@ mod tests {
                 &context(),
                 None,
             )
-            .expect_err("an unfenced UPDATE must not stage");
+            .expect("ordinary UPDATE stages without an external fence");
 
-        assert_eq!(*engine.events.lock().unwrap(), ["prepare"]);
+        assert_eq!(*engine.events.lock().unwrap(), ["prepare", "stage"]);
         let record = journal.list_operations().unwrap().pop().unwrap();
         assert_eq!(record.operation_subkind.as_deref(), Some("UPDATE"));
-        assert_eq!(record.state, OperationState::Writing);
-        assert_eq!(error.operation_id(), Some(record.operation_id));
+        assert_eq!(record.state, OperationState::Finalized);
     }
 
     #[test]
-    fn merge_intent_is_durable_and_no_stage_runs_without_an_external_fence() {
+    fn merge_intent_is_durable_and_stages_without_an_external_fence() {
         let journal = Arc::new(InMemoryOperationJournal::default());
         let service = DmlService::new(journal.clone());
         let engine = RecordingMutationEngine {
@@ -473,7 +443,7 @@ mod tests {
             events: Mutex::new(Vec::new()),
         };
 
-        let error = service
+        service
             .try_execute_typed_mutation(
                 &engine,
                 &typed_mutation(
@@ -483,12 +453,11 @@ mod tests {
                 &context(),
                 None,
             )
-            .expect_err("an unfenced MERGE must not stage");
+            .expect("ordinary MERGE stages without an external fence");
 
-        assert_eq!(*engine.events.lock().unwrap(), ["prepare"]);
+        assert_eq!(*engine.events.lock().unwrap(), ["prepare", "stage"]);
         let record = journal.list_operations().unwrap().pop().unwrap();
         assert_eq!(record.operation_subkind.as_deref(), Some("MERGE"));
-        assert_eq!(record.state, OperationState::Writing);
-        assert_eq!(error.operation_id(), Some(record.operation_id));
+        assert_eq!(record.state, OperationState::Finalized);
     }
 }
