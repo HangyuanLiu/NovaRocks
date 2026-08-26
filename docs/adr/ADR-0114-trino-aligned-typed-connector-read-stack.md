@@ -97,6 +97,18 @@ split variants，无法证明 endpoint visibility 或 disjointness 时 fail clos
 dynamic-filter binding，通过 Iceberg field ID 的 column handle 解析，不再有 provider `field_ordinal` 上 wire。FE 侧
 今天没有实时反馈，因此如实报告 complete、non-awaitable、`TupleDomain::all()`，不伪造等待。
 
+剪枝的判据是 **oracle 而不是 domain**。NovaRocks 的 runtime-filter artifact 按 ADR-0043 只暴露谓词 oracle
+（能回答「这段范围可能匹配吗」），不能枚举值、也不能给出边界。若强行把 artifact 转成 `TupleDomain`，在「无法精确
+表达就必须放宽」的规则下每一列都会变成 all，得到一个自称 live、行为却与无反馈过滤器完全相同的东西。因此
+`DynamicFilter` 保持 Trino 形状（`columnsCovered` / `isComplete` / `isAwaitable`）并如实报告不约束，另外提供
+`boundsMayMatch(column, bounds) -> Possible | Impossible | Unknown` 作为剪枝提问；`Unknown` 是默认值且永不剪枝。
+现有的 prepared-unit 剪枝本来就是这样问 oracle 的，本裁决只把提问粒度从 prepared unit 换成 row group。
+ADR-0043 因此保持完整，不需要给 codec 增加值枚举 API。
+
+page source 持有的是 dynamic filter 的**共享句柄**而非借用，并随 split 收到 task-attempt-scoped 的
+`scheduledSplitSequenceId`。前者让「每个未读 row group 前重新取」成为可能，后者让一次 row-group 判定能在不引入
+membership digest 的前提下被归属。
+
 **边界与非目标。** Parquet 是唯一完整 reader；ORC、Avro、Parquet modular encryption 与加密 manifest 保留同名扩展点并
 在 producer/consumer 两端稳定 `NOT_SUPPORTED`，绝不从路径后缀推断格式。StarRocks 只保持编译并在 read 入口稳定
 `NOT_SUPPORTED`，不为其发明 typed wire variant。ADR-0111 的 ControlReady 前一次性 replan 保持有效：split source、
@@ -122,6 +134,13 @@ mutation effect owner 与 publication 语义不因表示变化而改变，因此
   语义。接受这个空缺，而不是让一个尚未成熟的 connector 反向塑造通用模型。
 - **切换面积很大。** 一个 spec、一个 PR、一次原子切换，没有 feature flag、fallback decoder 或可合并的半状态。可合并性
   完全由内部 checkpoint 与文件 ownership 保证，而不是由中间兼容态保证。
+- **`ConnectorSplitManager` 这个名字没有落在 SPI。** Trino 的对应接口在 NovaRocks 是 Protocol 的
+  `TypedConnectorSplitManager`：SPI 是 transport leaf，方法签名里不能命名 validated carrier（会与 Protocol 成环），
+  所以真正的入口只能在 Protocol。SPI 保留 `ConnectorSplitSource`（provider 真实实现它），不保留一个没有实现者的
+  同名 manager trait。名字对齐让位于 crate DAG，这是刻意的取舍。
+- **overloaded `ConnectorTableHandle` 的 non-read 迁移体量与 read 切换相当。** 它穿过 11 个 SPI capability 模块、
+  约 230 处调用点。本裁决只规定它必须迁到各自 typed/provider-local domain 且不得改写 durable 语义，
+  不假装那是 read 切换的附带清理。
 
 ## 何时重新评估
 
