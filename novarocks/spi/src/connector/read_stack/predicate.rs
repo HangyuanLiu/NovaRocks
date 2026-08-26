@@ -103,10 +103,9 @@ impl Range {
         low: Bound,
         high: Bound,
     ) -> Result<Self, ConnectorError> {
-        if !value_type.is_orderable()
-            && (!low.is_unbounded() || !high.is_unbounded())
-            && !(low.is_inclusive() && high.is_inclusive() && low == high)
-        {
+        let is_single_equal_value = low.is_inclusive() && high.is_inclusive() && low == high;
+        let is_whole_domain = low.is_unbounded() && high.is_unbounded();
+        if !value_type.is_orderable() && !is_whole_domain && !is_single_equal_value {
             return Err(invalid(
                 "connector range requires an orderable type or a single equal value",
             ));

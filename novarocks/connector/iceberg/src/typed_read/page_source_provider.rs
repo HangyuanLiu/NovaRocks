@@ -42,8 +42,7 @@ use crate::access_binding::IcebergReadBinding;
 use super::column_handle::{IcebergColumnHandle, invalid};
 use super::delete_manager::DeleteManager;
 use super::page_source::{
-    DynamicFilterObservation, IcebergPageSourceRequest, ParquetFooterCache,
-    create_iceberg_page_source,
+    IcebergPageSourceRequest, ParquetFooterCache, create_iceberg_page_source,
 };
 use super::split::IcebergSplit;
 use super::table_handle::IcebergTableHandle;
@@ -78,6 +77,9 @@ pub struct IcebergPageSourceProvider {
     options: IcebergPageSourceProviderOptions,
     footers: Arc<ParquetFooterCache>,
     delete_manager: Arc<DeleteManager>,
+    /// The `$files` relation is distributed, so its reader shares this
+    /// provider's lifetime with the data reader.
+    system_tables: Arc<super::system_page_source::IcebergSystemTableProvider>,
 }
 
 impl IcebergPageSourceProvider {
@@ -87,12 +89,18 @@ impl IcebergPageSourceProvider {
         options: IcebergPageSourceProviderOptions,
     ) -> Self {
         let delete_manager = Arc::new(DeleteManager::new(access_binding.clone(), context.clone()));
+        let system_tables = Arc::new(super::system_page_source::IcebergSystemTableProvider::new(
+            access_binding.clone(),
+            context.clone(),
+            options.budget.max_rows,
+        ));
         Self {
             access_binding,
             context,
             options,
             footers: Arc::new(ParquetFooterCache::new()),
             delete_manager,
+            system_tables,
         }
     }
 
@@ -117,9 +125,21 @@ impl TypedConnectorPageSourceProvider for IcebergPageSourceProvider {
         columns: &[ScanAssignment],
         dynamic_filter: &Arc<WireDynamicFilter>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+        let columns = iceberg_scan_columns(columns)?;
+
+        // `$files` is the one system relation that is distributed, so its
+        // split arrives on the same data path. Everything else about it is
+        // different: it reads manifests, never a data file, and needs no
+        // delete manager or dynamic filter.
+        if split.category() == SplitCategory::SystemFiles {
+            let files_split = iceberg_files_table_split(split)?;
+            return self
+                .system_tables
+                .create_files_page_source(&files_split, &columns);
+        }
+
         let table_handle = iceberg_table_handle(table)?;
         let split = iceberg_data_split(split)?;
-        let columns = iceberg_scan_columns(columns)?;
 
         create_iceberg_page_source(IcebergPageSourceRequest {
             table_handle: &table_handle,
@@ -176,10 +196,42 @@ pub fn iceberg_data_split(split: &ValidatedConnectorSplit) -> Result<IcebergSpli
             "an iceberg page source reads a data split, not a change-window split",
         )),
         SplitCategory::SystemFiles => Err(invalid(
-            "an iceberg page source reads a data split, not a system-files split",
+            "a system-files split is routed to the system relation reader, not here",
         )),
         SplitCategory::RewritePositionDeleteFiles => Err(invalid(
             "an iceberg page source reads a data split, not a rewrite-position-delete split",
+        )),
+    }
+}
+
+/// Turn a protocol-validated split into the `$files` manifest split.
+pub fn iceberg_files_table_split(
+    split: &ValidatedConnectorSplit,
+) -> Result<super::system_table::FilesTableSplit, ConnectorError> {
+    match split.category() {
+        SplitCategory::SystemFiles => {
+            let raw = match split.as_proto().category.as_ref() {
+                Some(novarocks_proto_models::connector_read::connector_split::Category::SystemFiles(
+                    category,
+                )) => match category.provider.as_ref() {
+                    Some(
+                        novarocks_proto_models::connector_read::system_files_split_category::Provider::Iceberg(
+                            files,
+                        ),
+                    ) => files,
+                    None => {
+                        return Err(invalid("a system-files split carries no provider variant"));
+                    }
+                },
+                _ => return Err(invalid("split category disagrees with its validated category")),
+            };
+            super::system_table::FilesTableSplit::from_proto(raw)
+        }
+        SplitCategory::Data
+        | SplitCategory::TableChanges
+        | SplitCategory::ChangeWindow
+        | SplitCategory::RewritePositionDeleteFiles => Err(invalid(
+            "the system relation reader reads a system-files split, nothing else",
         )),
     }
 }

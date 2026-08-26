@@ -71,7 +71,7 @@ impl TypedConnectorProviderFactory for IcebergTypedProviderFactory {
         Ok(Arc::new(IcebergPageSourceProvider::new(
             self.binding.clone(),
             context,
-            self.options.clone(),
+            self.options,
         )))
     }
 
