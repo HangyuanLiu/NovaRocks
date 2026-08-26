@@ -96,7 +96,7 @@ async fn configured_sqlite_opens_and_reopens_mv_repository() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn absent_state_store_rejects_frontend_before_mv_services_open() {
+async fn absent_state_store_rejects_mv_services_open() {
     let error = match open_host(None).await {
         Ok(host) => {
             host.shutdown().await.expect("shutdown unexpected host");
@@ -104,8 +104,5 @@ async fn absent_state_store_rejects_frontend_before_mv_services_open() {
         }
         Err(error) => error,
     };
-    assert_eq!(
-        error.kind(),
-        FrontendApplicationErrorKind::ClusterBackendOpen
-    );
+    assert_eq!(error.kind(), FrontendApplicationErrorKind::MvServiceOpen);
 }
