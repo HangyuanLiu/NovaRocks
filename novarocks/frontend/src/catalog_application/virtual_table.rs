@@ -234,7 +234,7 @@ fn rewrite_table_factor(
                                     table_names: &table_names,
                                 };
                             let Some(data) =
-                                system_catalog.resolve(INFORMATION_SCHEMA_DB, &tbl, &inputs)?
+                                system_catalog.resolve(INFORMATION_SCHEMA_DB, tbl, &inputs)?
                             else {
                                 return Ok(());
                             };
