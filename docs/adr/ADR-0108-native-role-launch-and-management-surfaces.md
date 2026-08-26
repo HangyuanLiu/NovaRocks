@@ -7,7 +7,7 @@ supersedes: [ADR-0013, ADR-0026, ADR-0072, ADR-0099]
 superseded-by: null
 date: 2026-08-26
 provenance:
-  - "implementation: native FE/BE dual-config launch and role-local management surfaces; PR number pending"
+  - "implementation: native FE/BE dual-config launch and role-local management surfaces; PR #971"
   - "discussion: 2026-08-25 native listener separation and all-in-one role equivalence"
 code-anchors:
   - "novarocks-server/src/launch.rs (resolve_server_launch)"
