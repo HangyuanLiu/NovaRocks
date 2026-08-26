@@ -758,6 +758,28 @@ pub(crate) mod test_support {
         }
     }
 
+    impl novarocks_proto::connector_read::TypedConnectorProviderFactory for UnusedProvider {
+        fn create_page_source_provider(
+            &self,
+            _request: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<
+            std::sync::Arc<dyn novarocks_proto::connector_read::TypedConnectorPageSourceProvider>,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            Ok(std::sync::Arc::new(UnusedProvider))
+        }
+
+        fn create_system_table_provider(
+            &self,
+            _request: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<
+            std::sync::Arc<dyn novarocks_proto::connector_read::TypedConnectorSystemTableProvider>,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            Ok(std::sync::Arc::new(UnusedProvider))
+        }
+    }
+
     impl novarocks_proto::connector_read::TypedConnectorSystemTableProvider for UnusedProvider {
         fn create_system_page_source(
             &self,
@@ -793,10 +815,7 @@ pub(crate) mod test_support {
             std::sync::Arc::new(crate::connector::TypedConnectorProviderRegistry::new());
         let unused = std::sync::Arc::new(UnusedProvider);
         providers
-            .install(
-                &key,
-                crate::connector::TypedConnectorProviders::new(unused.clone(), unused),
-            )
+            .install(&key, crate::connector::TypedConnectorProviders::new(unused))
             .expect("fixture install");
 
         let execution_id = novarocks_proto::lifecycle::QueryExecutionId::new(

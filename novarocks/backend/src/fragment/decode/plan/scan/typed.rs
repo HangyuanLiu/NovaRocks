@@ -97,9 +97,19 @@ pub(super) fn lower_typed_connector_scan(
     let layout = output_columns.layout();
     let output_schema = output_columns.output_schema();
     let predicate = lower_scan_predicate(scan, arena, &layout, ctx)?;
+    // The provider is built per fragment instance so its footer cache and
+    // delete manager cannot outlive the request that opened them.
+    let page_source_provider = providers.page_source(&inputs.request).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "table",
+            error.to_string(),
+        )
+        .append_field("catalog_name")
+    })?;
     let scan_source = TypedConnectorScanSource::new(
         scan_source,
-        providers.page_source(),
+        page_source_provider,
         inputs.session,
         inputs.request,
         inputs.queues,

@@ -21,9 +21,9 @@ pub use control::{
     TypedRelationVersion, TypedSplitBatch, TypedSystemTablePlan,
 };
 pub use execution::{
-    TypedConnectorPageSourceProvider, TypedConnectorSplitManager, TypedConnectorSplitSource,
-    TypedConnectorSystemTableProvider, WireConstraint, WireDynamicFilter,
-    WireDynamicFilterSnapshot,
+    TypedConnectorPageSourceProvider, TypedConnectorProviderFactory, TypedConnectorSplitManager,
+    TypedConnectorSplitSource, TypedConnectorSystemTableProvider, WireConstraint,
+    WireDynamicFilter, WireDynamicFilterSnapshot,
 };
 pub use handle::{
     CatalogTableHandle, ConnectorRelation, ConnectorRelationKind, TableExecuteProcedure,

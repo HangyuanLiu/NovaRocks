@@ -44,46 +44,54 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use novarocks_proto::connector_read::TypedConnectorProviderFactory;
 use novarocks_proto::connector_read::{
     TypedConnectorPageSourceProvider, TypedConnectorSystemTableProvider,
 };
-use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorInstanceIncarnation};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorExecutionBindingKey, ConnectorInstanceIncarnation,
+    ConnectorRequestContext,
+};
 
-/// The worker-side providers of exactly one connector binding generation.
+/// The worker-side provider factory of exactly one connector binding
+/// generation.
 ///
-/// Both providers are installed together because they belong to the same
-/// generation: a system relation and a data relation of one catalog must never
-/// resolve to different incarnations of that catalog.
+/// A factory rather than an instance: the provider owns a footer cache and a
+/// delete manager that must not outlive the query that opened them, and it
+/// needs that request's deadline and cancellation. Both worker entry points
+/// come from one factory because a system relation and a data relation of one
+/// catalog must never resolve to different incarnations of it.
 #[derive(Clone)]
 pub struct TypedConnectorProviders {
-    page_source: Arc<dyn TypedConnectorPageSourceProvider>,
-    system_table: Arc<dyn TypedConnectorSystemTableProvider>,
+    factory: Arc<dyn TypedConnectorProviderFactory>,
 }
 
 impl TypedConnectorProviders {
-    pub fn new(
-        page_source: Arc<dyn TypedConnectorPageSourceProvider>,
-        system_table: Arc<dyn TypedConnectorSystemTableProvider>,
-    ) -> Self {
-        Self {
-            page_source,
-            system_table,
-        }
+    pub fn new(factory: Arc<dyn TypedConnectorProviderFactory>) -> Self {
+        Self { factory }
     }
 
-    pub fn page_source(&self) -> Arc<dyn TypedConnectorPageSourceProvider> {
-        Arc::clone(&self.page_source)
+    /// Build the data-relation reader factory for one fragment instance.
+    pub fn page_source(
+        &self,
+        request: &ConnectorRequestContext,
+    ) -> Result<Arc<dyn TypedConnectorPageSourceProvider>, ConnectorError> {
+        self.factory.create_page_source_provider(request)
     }
 
-    pub fn system_table(&self) -> Arc<dyn TypedConnectorSystemTableProvider> {
-        Arc::clone(&self.system_table)
+    /// Build the system-relation reader for one fragment instance.
+    pub fn system_table(
+        &self,
+        request: &ConnectorRequestContext,
+    ) -> Result<Arc<dyn TypedConnectorSystemTableProvider>, ConnectorError> {
+        self.factory.create_system_table_provider(request)
     }
 }
 
 impl fmt::Debug for TypedConnectorProviders {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The provider itself is opaque here on purpose: printing anything
-        // about it would be the first step toward branching on it.
+        // The factory itself is opaque here on purpose: printing anything about
+        // it would be the first step toward branching on it.
         formatter.debug_struct("TypedConnectorProviders").finish()
     }
 }
@@ -317,6 +325,26 @@ mod tests {
 
     /// A provider that never produces anything. Provider identity is irrelevant
     /// to the registry, so the fake carries none.
+    /// A factory that hands back inert providers. The registry only ever moves
+    /// this value around, so the providers never have to do anything.
+    struct InertProviderFactory;
+
+    impl TypedConnectorProviderFactory for InertProviderFactory {
+        fn create_page_source_provider(
+            &self,
+            _request: &ConnectorRequestContext,
+        ) -> Result<Arc<dyn TypedConnectorPageSourceProvider>, ConnectorError> {
+            Ok(Arc::new(InertPageSourceProvider))
+        }
+
+        fn create_system_table_provider(
+            &self,
+            _request: &ConnectorRequestContext,
+        ) -> Result<Arc<dyn TypedConnectorSystemTableProvider>, ConnectorError> {
+            Ok(Arc::new(InertSystemTableProvider))
+        }
+    }
+
     struct InertPageSourceProvider;
 
     impl TypedConnectorPageSourceProvider for InertPageSourceProvider {
@@ -352,10 +380,7 @@ mod tests {
     }
 
     fn providers() -> TypedConnectorProviders {
-        TypedConnectorProviders::new(
-            Arc::new(InertPageSourceProvider),
-            Arc::new(InertSystemTableProvider),
-        )
+        TypedConnectorProviders::new(Arc::new(InertProviderFactory))
     }
 
     fn key(instance: &str, incarnation: u8) -> ConnectorExecutionBindingKey {

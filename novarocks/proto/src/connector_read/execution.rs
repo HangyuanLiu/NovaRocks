@@ -8,11 +8,13 @@
 
 use std::collections::BTreeSet;
 
-use novarocks_spi::connector::ConnectorError;
+use std::sync::Arc;
+
 use novarocks_spi::connector::read_stack::{
     ConnectorPageSource, ConnectorSession, ConnectorSplitBatch, Constraint, DynamicFilter,
     DynamicFilterSnapshot,
 };
+use novarocks_spi::connector::{ConnectorError, ConnectorRequestContext};
 
 use super::handle::CatalogTableHandle;
 use super::predicate::ValidatedColumnHandle;
@@ -73,6 +75,24 @@ pub trait TypedConnectorPageSourceProvider: Send + Sync {
         columns: &[ScanAssignment],
         dynamic_filter: &WireDynamicFilter,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
+}
+
+/// Builds the worker-side providers for one fragment instance and scan node.
+///
+/// The provider itself is deliberately not process-wide: it owns a footer cache
+/// and a delete manager that must not outlive the query that opened them, and
+/// it needs that request's deadline and cancellation. The registry therefore
+/// holds this factory, which is generation-scoped and stateless.
+pub trait TypedConnectorProviderFactory: Send + Sync {
+    fn create_page_source_provider(
+        &self,
+        request: &ConnectorRequestContext,
+    ) -> Result<Arc<dyn TypedConnectorPageSourceProvider>, ConnectorError>;
+
+    fn create_system_table_provider(
+        &self,
+        request: &ConnectorRequestContext,
+    ) -> Result<Arc<dyn TypedConnectorSystemTableProvider>, ConnectorError>;
 }
 
 /// A system relation the coordinator resolves to exactly one backend.
