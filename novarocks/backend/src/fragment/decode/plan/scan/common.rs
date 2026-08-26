@@ -25,9 +25,13 @@ use arrow::datatypes::DataType;
 use super::super::context::NativePlanDecodeContext;
 use super::super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use super::super::layout::Layout;
+use crate::connector::runtime::ConnectorBatchTransform;
 use crate::fragment::decode::type_decode::{decode_field_type, decode_type};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
+use novarocks_execution::exec::variant_read::{
+    ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
+};
 use novarocks_proto::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{common, plan};
 use novarocks_types::SlotId;
@@ -230,6 +234,99 @@ pub(super) fn decode_scan_output_columns(
         layout,
         output_schema,
     })
+}
+
+/// Turn one scan's read columns into the columns its plan node outputs.
+///
+/// A scan that projects a VARIANT path reads the physical LargeBinary column
+/// and derives the synthetic column from it after the read. Both carriers need
+/// exactly this, so it lives here: the opaque one attaches it as its reader's
+/// batch transform, the typed one as its output materialization.
+#[derive(Clone)]
+pub(super) struct ConnectorVariantPathTransform {
+    read_slot_ids: Vec<SlotId>,
+    output_slot_ids: Vec<SlotId>,
+    specs: Vec<VariantPathSpec>,
+    output_slot_kinds: Vec<ParquetSlotKind>,
+}
+
+impl ConnectorVariantPathTransform {
+    /// Build the transform from the read layout and the node's output schema.
+    ///
+    /// An output slot that is a VARIANT path source stays visible as a variant
+    /// column, so it is converted rather than passed through as raw bytes.
+    pub(super) fn new(
+        read_slot_ids: Vec<SlotId>,
+        output_schema: &ChunkSchema,
+        specs: Vec<VariantPathSpec>,
+    ) -> Self {
+        let output_slot_kinds = output_schema
+            .slot_ids()
+            .iter()
+            .map(|slot_id| {
+                if specs.iter().any(|spec| spec.source_slot_id == *slot_id) {
+                    ParquetSlotKind::Variant
+                } else {
+                    ParquetSlotKind::Regular
+                }
+            })
+            .collect();
+        Self {
+            read_slot_ids,
+            output_slot_ids: output_schema.slot_ids().to_vec(),
+            specs,
+            output_slot_kinds,
+        }
+    }
+
+    fn apply(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> Result<arrow::record_batch::RecordBatch, String> {
+        materialize_variant_path_columns(
+            batch,
+            &self.read_slot_ids,
+            &self.output_slot_ids,
+            &self.specs,
+        )
+        .and_then(|batch| convert_variant_columns(&self.output_slot_kinds, batch))
+    }
+}
+
+impl ConnectorBatchTransform for ConnectorVariantPathTransform {
+    fn transform(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> Result<arrow::record_batch::RecordBatch, String> {
+        self.apply(batch)
+    }
+}
+
+/// Refuse a plan whose read columns omit a VARIANT path's source column.
+///
+/// The source column is what the synthetic column is extracted from, so a read
+/// layout without it describes a derivation with nothing to derive from.
+/// `field` names the wire field that decided the read layout, which differs per
+/// carrier: the opaque one publishes it as an Arrow schema, the typed one as
+/// its ordered assignments.
+pub(super) fn validate_variant_path_read_slots(
+    specs: &[VariantPathSpec],
+    read_slot_ids: &[SlotId],
+    field: &'static str,
+) -> Result<(), NativeFragmentLeafDecodeError> {
+    for spec in specs {
+        if !read_slot_ids.contains(&spec.source_read_slot_id) {
+            return Err(NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InconsistentFields,
+                field,
+                format!(
+                    "scan read columns omit VARIANT source `{}` for output `{}`",
+                    spec.source_name, spec.output_name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn column_def_data_type(

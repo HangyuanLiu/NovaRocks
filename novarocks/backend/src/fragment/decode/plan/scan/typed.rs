@@ -22,12 +22,13 @@
 //! [`ConnectorTableScanSource::parse`] and never re-checks what that parse
 //! already proved. What is left here is the fragment-local work the protocol
 //! layer cannot do: deciding which relation kinds this backend slice reads,
-//! agreeing the scan's ordered assignments with the plan node's declared
-//! output, resolving the installed typed provider for exactly this binding
-//! generation, and assembling the execution scan node.
+//! agreeing the scan's ordered assignments with the columns the connector
+//! actually reads, resolving the installed typed provider for exactly this
+//! binding generation, and assembling the execution scan node.
 
 use std::sync::Arc;
 
+use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
@@ -37,14 +38,20 @@ use novarocks_proto_models::{connector_read as dto, plan};
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
 };
+use novarocks_types::SlotId;
 
+use crate::connector::runtime::ConnectorBatchTransform;
 use crate::connector::typed_registry::TypedConnectorProviderRegistry;
 use crate::connector::typed_runtime::TypedConnectorScanSource;
 
 use super::super::context::NativePlanDecodeContext;
 use super::super::error::NativeFragmentLeafDecodeError;
 use super::super::node::DecodedNode;
-use super::common::{DecodedScanOutputColumns, lower_scan_predicate, parse_scan_limit};
+use super::common::{
+    ConnectorVariantPathTransform, DecodedScanOutputColumns, lower_scan_predicate,
+    parse_scan_limit, validate_variant_path_read_slots,
+};
+use super::variant_path::NativeVariantPathPlan;
 
 /// Bytes of a connector instance incarnation, mirrored from the wire contract.
 const INSTANCE_INCARNATION_BYTES: usize = 16;
@@ -55,6 +62,7 @@ pub(super) fn lower_typed_connector_scan(
     scan: &plan::ScanNode,
     source: &dto::ConnectorTableScanSource,
     output_columns: &DecodedScanOutputColumns,
+    variant_path_plan: &NativeVariantPathPlan,
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
 ) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
@@ -81,7 +89,18 @@ pub(super) fn lower_typed_connector_scan(
         }
     }
 
-    check_assignments_match_output(&scan_source, output_columns)?;
+    // Order matters, and this block must stay above the runtime resolution
+    // below. Everything the carrier and the plan node must agree on is decided
+    // here, from the wire alone: a plan this backend cannot execute is then
+    // refused on its own terms rather than as a side effect of which providers
+    // happen to be installed. Moving any of it below `typed_scan_runtime_inputs`
+    // would let "no provider is installed" mask "this plan is not executable".
+    let read_slot_ids = connector_read_slot_ids(scan, variant_path_plan);
+    check_assignments_match_read_columns(&scan_source, &read_slot_ids)?;
+    let layout = output_columns.layout();
+    let output_schema = output_columns.output_schema();
+    let output_materialization =
+        output_materialization(&read_slot_ids, &output_schema, variant_path_plan)?;
 
     let binding_key = binding_key(table)?;
     let inputs = typed_scan_runtime_inputs(ctx)?;
@@ -94,8 +113,6 @@ pub(super) fn lower_typed_connector_scan(
         .append_field("catalog_name")
     })?;
 
-    let layout = output_columns.layout();
-    let output_schema = output_columns.output_schema();
     let predicate = lower_scan_predicate(scan, arena, &layout, ctx)?;
     // The provider is built per fragment instance so its footer cache and
     // delete manager cannot outlive the request that opened them.
@@ -114,9 +131,19 @@ pub(super) fn lower_typed_connector_scan(
         inputs.request,
         inputs.queues,
         node.node_id,
-        output_schema.slot_ids().to_vec(),
+        // `slot_ids[i]` names page channel `i`, and a page channel exists for
+        // each assignment, so this is the connector's read column list rather
+        // than the node's output schema. Whatever separates the two is the
+        // materialization's job, not this list's.
+        read_slot_ids,
         inputs.runtime_filter,
     );
+    let scan_source = match output_materialization {
+        Some(transform) => {
+            scan_source.with_output_materialization(transform, Arc::clone(&output_schema))
+        }
+        None => scan_source,
+    };
 
     // A typed scan carries no frozen range: its work arrives as splits on the
     // task-update queue, so the range binding is empty by construction.
@@ -191,43 +218,84 @@ fn typed_scan_runtime_inputs(
     })
 }
 
-/// Agree the carrier's ordered assignments with the plan node's output.
+/// The slots the typed connector actually reads, in page-channel order.
+///
+/// `ScanNode.columns` carries two kinds of column: the connector's physical
+/// columns, and the synthetic VARIANT path columns derived from one of them
+/// after the read. Only the physical ones have an assignment, so only they name
+/// a page channel; the synthetic ones are dropped here and would have to be
+/// materialized on top of the read.
+fn connector_read_slot_ids(
+    scan: &plan::ScanNode,
+    variant_path_plan: &NativeVariantPathPlan,
+) -> Vec<SlotId> {
+    scan.columns
+        .iter()
+        .map(|column| SlotId::new(column.column_id))
+        .filter(|slot_id| !variant_path_plan.output_slot_ids.contains(slot_id))
+        .collect()
+}
+
+/// Agree the carrier's ordered assignments with the columns it reads.
 ///
 /// The two orders are one contract: `assignments[i]` produces page channel `i`,
-/// and the decoded output binds slot `i` to that channel. A disagreement would
-/// silently read one column into another column's slot.
-fn check_assignments_match_output(
+/// and read column `i` binds that channel. Count is the only part of that
+/// contract this side can check: an assignment's variable is an opaque
+/// expression identifier minted by the producer, deliberately not the column's
+/// name, so comparing the two would reject every real scan.
+fn check_assignments_match_read_columns(
     scan_source: &novarocks_proto::connector_read::ConnectorTableScanSource,
-    output_columns: &DecodedScanOutputColumns,
+    read_slot_ids: &[SlotId],
 ) -> Result<(), NativeFragmentLeafDecodeError> {
     let assignments = scan_source.assignments();
-    let columns = output_columns.columns();
-    if assignments.len() != columns.len() {
+    if assignments.len() != read_slot_ids.len() {
         return Err(NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InconsistentFields,
             "assignments",
             format!(
-                "typed connector scan assigns {} columns but the plan node declares {} output columns",
+                "typed connector scan assigns {} columns but the plan node declares {} connector read columns",
                 assignments.len(),
-                columns.len()
+                read_slot_ids.len()
             ),
         ));
     }
-    for (index, (assignment, column)) in assignments.iter().zip(columns).enumerate() {
-        if !assignment.variable().eq_ignore_ascii_case(&column.name) {
+    Ok(())
+}
+
+/// How this scan turns its read columns into the node's output columns.
+///
+/// `None` is the ordinary scan, whose page channels already are the output.
+/// A scan that projects a VARIANT path reads only the physical source column
+/// and derives the synthetic one after the read, which is the same derivation
+/// the opaque carrier attaches to its reader.
+fn output_materialization(
+    read_slot_ids: &[SlotId],
+    output_schema: &ChunkSchemaRef,
+    variant_path_plan: &NativeVariantPathPlan,
+) -> Result<Option<Arc<dyn ConnectorBatchTransform>>, NativeFragmentLeafDecodeError> {
+    if variant_path_plan.specs.is_empty() {
+        // No derived column exists, so nothing can rebuild one column list into
+        // the other: the connector must already read exactly the output.
+        let output_slot_ids = output_schema.slot_ids();
+        if read_slot_ids != output_slot_ids {
             return Err(NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InconsistentFields,
+                ProtocolErrorKind::Unsupported,
                 "assignments",
                 format!(
-                    "typed connector scan assignment `{}` does not name output column `{}`",
-                    assignment.variable(),
-                    column.name
+                    "typed connector scan reads slots {read_slot_ids:?} but the plan node declares \
+                     output slots {output_slot_ids:?} and derives no column, so nothing can \
+                     produce the difference"
                 ),
-            )
-            .append_index(index));
+            ));
         }
+        return Ok(None);
     }
-    Ok(())
+    validate_variant_path_read_slots(&variant_path_plan.specs, read_slot_ids, "assignments")?;
+    Ok(Some(Arc::new(ConnectorVariantPathTransform::new(
+        read_slot_ids.to_vec(),
+        output_schema,
+        variant_path_plan.specs.clone(),
+    ))))
 }
 
 /// The exact connector binding generation this relation belongs to.
@@ -296,11 +364,46 @@ mod tests {
     use super::super::super::node::decode_node;
     use super::*;
 
+    /// A live attempt, so a decode reaches the binding instead of failing on a
+    /// cancellation it was never given.
+    struct NeverCancelled;
+
+    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    /// Borrow the scan out of a fixture node.
+    fn scan_of(node: &plan::DistributedNode) -> &plan::ScanNode {
+        let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_ref()
+        else {
+            panic!("fixture node carries a physical payload");
+        };
+        let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
+            panic!("fixture node carries a scan");
+        };
+        scan
+    }
+
     /// Build a distributed scan node whose source is the typed carrier.
     fn typed_scan_node(
         source: dto::ConnectorTableScanSource,
         columns: Vec<common::OutputColumn>,
     ) -> plan::DistributedNode {
+        typed_scan_node_with_required(source, columns, Vec::new())
+    }
+
+    /// The same node, with `required_columns` narrowing the decoded output.
+    fn typed_scan_node_with_required(
+        source: dto::ConnectorTableScanSource,
+        columns: Vec<common::OutputColumn>,
+        required_columns: Vec<String>,
+    ) -> plan::DistributedNode {
+        let table_columns = columns
+            .iter()
+            .map(|column| typed_column_def(&column.name, &DataType::Int64))
+            .collect();
         plan::DistributedNode {
             node_id: 10,
             fragment_id: 0,
@@ -315,16 +418,7 @@ mod tests {
                     database: "db".to_string(),
                     table: Some(plan::TableDef {
                         name: "t".to_string(),
-                        columns: vec![plan::ColumnDef {
-                            name: "id".to_string(),
-                            data_type: Some(
-                                crate::fragment::decode::type_decode::encode_type(&DataType::Int64)
-                                    .expect("encode type"),
-                            ),
-                            nullable: true,
-                            write_default_json: None,
-                            logical_type: None,
-                        }],
+                        columns: table_columns,
                         iceberg_row_lineage_metadata_columns: Vec::new(),
                         source: Some(plan::ScanSource {
                             kind: Some(plan::scan_source::Kind::TypedConnectorRead(source)),
@@ -333,7 +427,7 @@ mod tests {
                     alias: None,
                     columns,
                     predicates: Vec::new(),
-                    required_columns: Vec::new(),
+                    required_columns,
                     dict_columns: Vec::new(),
                     variant_columns: Vec::new(),
                     mv_rewritten_from: None,
@@ -343,16 +437,112 @@ mod tests {
     }
 
     fn output_column(column_id: u32, name: &str) -> common::OutputColumn {
+        typed_output_column(column_id, name, &DataType::Int64)
+    }
+
+    fn typed_output_column(
+        column_id: u32,
+        name: &str,
+        data_type: &DataType,
+    ) -> common::OutputColumn {
         common::OutputColumn {
             column_id,
             name: name.to_string(),
             r#type: Some(
-                crate::fragment::decode::type_decode::encode_type(&DataType::Int64)
-                    .expect("encode type"),
+                crate::fragment::decode::type_decode::encode_type(data_type).expect("encode type"),
             ),
             nullable: true,
             is_internal: false,
         }
+    }
+
+    fn typed_column_def(name: &str, data_type: &DataType) -> plan::ColumnDef {
+        plan::ColumnDef {
+            name: name.to_string(),
+            data_type: Some(
+                crate::fragment::decode::type_decode::encode_type(data_type).expect("encode type"),
+            ),
+            nullable: true,
+            write_default_json: None,
+            logical_type: None,
+        }
+    }
+
+    /// A typed scan whose wire columns mix physical columns with one synthetic
+    /// VARIANT path column derived from the LargeBinary column `v`.
+    ///
+    /// `extra_physical` adds further physical columns after `v`, which is how a
+    /// test moves the connector read column count without touching the carrier.
+    fn typed_variant_scan_node(
+        source: dto::ConnectorTableScanSource,
+        extra_physical: &[&str],
+    ) -> plan::DistributedNode {
+        let mut table_columns = vec![
+            typed_column_def("v", &DataType::LargeBinary),
+            typed_column_def("__nr_var_v_0", &DataType::Int64),
+        ];
+        let mut columns = vec![
+            typed_output_column(1, "v", &DataType::LargeBinary),
+            typed_output_column(2, "__nr_var_v_0", &DataType::Int64),
+        ];
+        let mut required_columns = vec!["v".to_string(), "__nr_var_v_0".to_string()];
+        for (index, name) in extra_physical.iter().enumerate() {
+            let column_id = u32::try_from(index).expect("column index") + 3;
+            table_columns.push(typed_column_def(name, &DataType::Int64));
+            columns.push(typed_output_column(column_id, name, &DataType::Int64));
+            required_columns.push((*name).to_string());
+        }
+        plan::DistributedNode {
+            node_id: 10,
+            fragment_id: 0,
+            tuple_ids: Vec::new(),
+            nullable_tuple_ids: Vec::new(),
+            limit: -1,
+            runtime_filter_binding_ids: Vec::new(),
+            children: Vec::new(),
+            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                output_columns: columns.clone(),
+                kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
+                    database: "db".to_string(),
+                    table: Some(plan::TableDef {
+                        name: "t".to_string(),
+                        columns: table_columns,
+                        iceberg_row_lineage_metadata_columns: Vec::new(),
+                        source: Some(plan::ScanSource {
+                            kind: Some(plan::scan_source::Kind::TypedConnectorRead(source)),
+                        }),
+                    }),
+                    alias: None,
+                    columns,
+                    predicates: Vec::new(),
+                    required_columns,
+                    dict_columns: Vec::new(),
+                    variant_columns: vec![plan::ScanVariantColumn {
+                        source_column_id: 1,
+                        source_column: "v".to_string(),
+                        synthetic_column_id: 2,
+                        synthetic_column: "__nr_var_v_0".to_string(),
+                        canonical_path: "$.a.b".to_string(),
+                        requested_type: Some(
+                            crate::fragment::decode::type_decode::encode_type(&DataType::Int64)
+                                .expect("encode type"),
+                        ),
+                        strict: true,
+                    }],
+                    mv_rewritten_from: None,
+                })),
+            })),
+        }
+    }
+
+    fn decode_node_error(node: &plan::DistributedNode) -> novarocks_proto::ProtocolError {
+        let error = decode_node(
+            node,
+            &mut ExprArena::default(),
+            &NativePlanDecodeContext::default(),
+        )
+        .expect_err("typed connector decoding must refuse");
+        error.protocol().expect("protocol error").clone()
     }
 
     fn decode_error(
@@ -367,6 +557,19 @@ mod tests {
         )
         .expect_err("typed connector decoding must refuse");
         error.protocol().expect("protocol error").clone()
+    }
+
+    /// The fixture carrier with a second ordered assignment appended.
+    fn scan_source_with_two_assignments() -> dto::ConnectorTableScanSource {
+        let mut source = test_support::scan_source_proto();
+        source.assignments.push(dto::ScanAssignment {
+            variable: "v1".to_owned(),
+            column: Some(test_support::column_handle(2)),
+            value_type: Some(novarocks_proto::connector_read::encode_value_type(
+                novarocks_spi::connector::read_stack::ConnectorValueType::BigInt,
+            )),
+        });
+        source
     }
 
     /// Replace the carrier's relation while keeping everything else valid.
@@ -404,12 +607,6 @@ mod tests {
             test_support::scan_source_proto(),
             vec![output_column(1, "id")],
         );
-        struct NeverCancelled;
-        impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-            fn is_cancelled(&self) -> bool {
-                false
-            }
-        }
         let ctx = NativePlanDecodeContext::default()
             .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
             .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
@@ -425,24 +622,114 @@ mod tests {
         );
         assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
         assert!(
-            error.detail().contains("assigns 1 columns"),
+            error
+                .detail()
+                .contains("assigns 1 columns but the plan node declares 2 connector read columns"),
             "unexpected detail: {}",
             error.detail()
         );
     }
 
+    /// A synthetic VARIANT path column is derived from a physical column after
+    /// the read, so it has no assignment and no page channel. Counting it as a
+    /// connector read column would make every real variant scan look like an
+    /// assignment count mismatch.
     #[test]
-    fn typed_scan_decode_rejects_an_assignment_order_mismatch() {
-        let error = decode_error(
+    fn typed_scan_decode_counts_assignments_against_physical_columns_not_synthetic_ones() {
+        // Two physical columns (`v`, `extra`) and one synthetic column against
+        // one assignment: the reported read count must be 2, not 3.
+        let error = decode_node_error(&typed_variant_scan_node(
             test_support::scan_source_proto(),
-            vec![output_column(1, "other")],
-        );
+            &["extra"],
+        ));
         assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
         assert!(
-            error.path().to_string().ends_with("assignments[0]"),
-            "unexpected path: {}",
-            error.path()
+            error
+                .detail()
+                .contains("assigns 1 columns but the plan node declares 2 connector read columns"),
+            "unexpected detail: {}",
+            error.detail()
         );
+    }
+
+    /// `required_columns` narrows the decoded output but never the columns the
+    /// connector reads, so the assignment count is agreed against the wire
+    /// column list. Agreeing it against the narrowed output instead — which is
+    /// what this decoder used to do — would call a correctly-assigned scan a
+    /// count mismatch and hide the projection it actually cannot perform.
+    #[test]
+    fn typed_scan_decode_counts_assignments_before_required_columns_narrow_the_output() {
+        let node = typed_scan_node_with_required(
+            scan_source_with_two_assignments(),
+            vec![output_column(1, "id"), output_column(2, "flag")],
+            vec!["id".to_string()],
+        );
+        let error = decode_node_error(&node);
+        assert_eq!(error.kind(), ProtocolErrorKind::Unsupported);
+        assert!(
+            error.detail().contains("derives no column"),
+            "unexpected detail: {}",
+            error.detail()
+        );
+    }
+
+    /// A scan that projects a VARIANT path reads only the physical source
+    /// column — the synthetic column has no assignment and so no page channel —
+    /// while the node keeps declaring both, because the synthetic one is
+    /// materialized on top of the read rather than fetched by the connector.
+    #[test]
+    fn typed_scan_decode_reads_only_physical_slots_and_still_outputs_the_synthetic_column() {
+        let node = typed_variant_scan_node(test_support::scan_source_proto(), &[]);
+        let scan = scan_of(&node);
+        let table = scan.table.as_ref().expect("fixture table");
+        let output_columns =
+            super::super::common::decode_scan_output_columns(scan, FieldPath::root("scan"))
+                .expect("decode scan output columns");
+        let variant_path_plan = super::super::variant_path::parse_native_scan_variant_path_columns(
+            scan,
+            table,
+            output_columns.columns(),
+        )
+        .expect("parse variant path columns");
+
+        // One assignment, one page channel, one read slot: the synthetic column
+        // is not among them.
+        assert_eq!(test_support::scan_source_proto().assignments.len(), 1);
+        assert_eq!(
+            connector_read_slot_ids(scan, &variant_path_plan),
+            vec![SlotId::new(1)]
+        );
+
+        let ctx = NativePlanDecodeContext::default()
+            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
+            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+        let decoded = decode_node(&node, &mut ExprArena::default(), &ctx)
+            .expect("a VARIANT path scan lowers once its runtime is supplied");
+        assert_eq!(
+            decoded.output_schema.slot_ids(),
+            [SlotId::new(1), SlotId::new(2)],
+            "the node must still declare the synthetic column it materializes"
+        );
+    }
+
+    /// The producer mints opaque positional variables, never column names, so
+    /// a decoder that compared the two would reject every real scan.
+    #[test]
+    fn typed_scan_decode_binds_an_assignment_whose_variable_is_not_the_column_name() {
+        let node = typed_scan_node(
+            test_support::scan_source_proto(),
+            vec![output_column(1, "id")],
+        );
+        let ctx = NativePlanDecodeContext::default()
+            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
+            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+        assert_ne!(
+            test_support::scan_source_proto().assignments[0].variable,
+            "id",
+            "the fixture must not accidentally name the output column"
+        );
+        decode_node(&node, &mut ExprArena::default(), &ctx)
+            .expect("an opaque assignment variable binds the typed scan");
     }
 
     #[test]

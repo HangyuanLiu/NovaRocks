@@ -36,9 +36,6 @@ use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_execution::exec::variant_read::{
-    ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
-};
 use novarocks_execution::runtime::query_options::query_expire_durations;
 use novarocks_proto::ProtocolErrorKind;
 use novarocks_proto_models::plan;
@@ -47,7 +44,10 @@ use novarocks_types::SlotId;
 use super::super::context::NativePlanDecodeContext;
 use super::super::error::NativeFragmentLeafDecodeError;
 use super::super::node::DecodedNode;
-use super::common::{DecodedScanOutputColumns, lower_scan_predicate, parse_scan_limit};
+use super::common::{
+    ConnectorVariantPathTransform, DecodedScanOutputColumns, lower_scan_predicate,
+    parse_scan_limit, validate_variant_path_read_slots,
+};
 use super::variant_path::NativeVariantPathPlan;
 
 pub(super) fn lower_connector_read_scan(
@@ -196,32 +196,17 @@ pub(super) fn lower_connector_read_scan(
         )
     } else {
         let read_slot_ids = connector_read_slot_ids(scan, expected_schema.as_ref())?;
-        validate_variant_path_read_slots(&variant_path_plan.specs, &read_slot_ids)?;
-        let variant_slot_kinds = output_schema
-            .slot_ids()
-            .iter()
-            .map(|slot_id| {
-                if variant_path_plan
-                    .specs
-                    .iter()
-                    .any(|spec| spec.source_slot_id == *slot_id)
-                {
-                    ParquetSlotKind::Variant
-                } else {
-                    ParquetSlotKind::Regular
-                }
-            })
-            .collect();
-        let output_slot_ids = output_schema.slot_ids().to_vec();
-        (
-            output_schema,
-            Some(ConnectorVariantPathTransform {
-                read_slot_ids,
-                output_slot_ids,
-                specs: variant_path_plan.specs,
-                output_slot_kinds: variant_slot_kinds,
-            }),
-        )
+        validate_variant_path_read_slots(
+            &variant_path_plan.specs,
+            &read_slot_ids,
+            "expected_schema_ipc",
+        )?;
+        let transform = ConnectorVariantPathTransform::new(
+            read_slot_ids,
+            &output_schema,
+            variant_path_plan.specs,
+        );
+        (output_schema, Some(transform))
     };
     let reader_schema = if batch_transform.is_none() {
         output_schema.arrow_schema_ref()
@@ -290,38 +275,6 @@ pub(super) fn lower_connector_read_scan(
     })
 }
 
-#[derive(Clone)]
-struct ConnectorVariantPathTransform {
-    read_slot_ids: Vec<SlotId>,
-    output_slot_ids: Vec<SlotId>,
-    specs: Vec<VariantPathSpec>,
-    output_slot_kinds: Vec<ParquetSlotKind>,
-}
-
-impl ConnectorVariantPathTransform {
-    fn apply(
-        &self,
-        batch: arrow::record_batch::RecordBatch,
-    ) -> Result<arrow::record_batch::RecordBatch, String> {
-        materialize_variant_path_columns(
-            batch,
-            &self.read_slot_ids,
-            &self.output_slot_ids,
-            &self.specs,
-        )
-        .and_then(|batch| convert_variant_columns(&self.output_slot_kinds, batch))
-    }
-}
-
-impl ConnectorBatchTransform for ConnectorVariantPathTransform {
-    fn transform(
-        &self,
-        batch: arrow::record_batch::RecordBatch,
-    ) -> Result<arrow::record_batch::RecordBatch, String> {
-        self.apply(batch)
-    }
-}
-
 fn connector_read_slot_ids(
     scan: &plan::ScanNode,
     schema: &arrow::datatypes::Schema,
@@ -346,25 +299,6 @@ fn connector_read_slot_ids(
                 })
         })
         .collect()
-}
-
-fn validate_variant_path_read_slots(
-    specs: &[VariantPathSpec],
-    read_slot_ids: &[SlotId],
-) -> Result<(), NativeFragmentLeafDecodeError> {
-    for spec in specs {
-        if !read_slot_ids.contains(&spec.source_read_slot_id) {
-            return Err(NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InconsistentFields,
-                "expected_schema_ipc",
-                format!(
-                    "ConnectorReadSource expected Arrow schema omits VARIANT source `{}` for output `{}`",
-                    spec.source_name, spec.output_name
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn decode_expected_schema_ipc(
