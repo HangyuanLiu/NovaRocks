@@ -15,66 +15,42 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend-owned durable CTAS application saga.
+//! Statement-local CTAS publication orchestration.
 //!
-//! Core retains the admitted source artifact and provider-private staged
-//! handles. The frontend owns only bounded neutral facts, stable child
-//! operation IDs and the durable ordering barriers around every external
-//! effect.
+//! The staged-create provider owns every external effect, including cleanup
+//! and no-op decisions. Frontend retains one attempt only for the admitted
+//! statement and may perform one read-only adjudication after its exact
+//! publication evidence reports `CommitUnknown`.
 
 use crate::common::admitted_query_context::RequestContext;
+use crate::common::engine_error::EngineErrorCode;
+use crate::dml::attempt::{
+    DmlPublicationAdjudicationOutcome, DmlPublicationAttempt, DmlPublicationAttemptError,
+    DmlPublicationFinalization,
+};
+use crate::dml::error::{AdmitError, DmlError};
+use crate::dml::service::DmlService;
 use crate::query_execution::dml::ctas::{
-    CtasCommand, CtasEngine, CtasFailure, CtasFailureKind, CtasTargetPreflightOutcome,
-    PrepareCtasSourceRequest, PreparedCtasSource, PreparedStandardCtasTarget,
-    PreparedStandardCtasWrite, StandardCtasPublishOutcome, StandardCtasStageOutcome,
-    StandardCtasTargetFacts, StandardCtasWriteOutcome,
+    CtasCommand, CtasEngine, CtasFailure, CtasFailureKind, CtasTargetPreflightFacts,
+    CtasTargetPreflightOutcome, PrepareCtasSourceRequest, PreparedCtasSource,
+    PreparedStandardCtasTarget, PreparedStandardCtasWrite,
+    StandardCtasPublicationAdjudicationOutcome, StandardCtasPublishOutcome,
+    StandardCtasStageOutcome, StandardCtasTargetFacts, StandardCtasWriteOutcome,
 };
 use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorWriteOperationCompletion, ConnectorWriteOperationId, CreatePolicy,
-    ExternalMutationEvidence,
+    ExternalMutationFinalization, LakePublicationFamily, LakePublicationId,
+    LakePublicationStatementTag, LakePublicationTarget,
 };
-use serde::Serialize;
-use sha2::{Digest, Sha256};
-use uuid::Uuid;
-
-use crate::common::engine_error::EngineErrorCode;
-use crate::dml::coordination::ActiveDmlOperation;
-use crate::dml::error::{AdmitError, DmlError, DmlErrorKind};
-use crate::dml::model::{
-    CTAS_CREATE_POLICY_FAIL_IF_EXISTS, CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
-    CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DML_CTAS_FACT_ENCODED_LIMIT,
-    DmlOperationId, DurableExternalFact, ExternalFactOutcome, OperationKind, OperationPayload,
-    OperationState, OperationTarget, StatementNextAction, StoredOperation,
-};
-use crate::dml::service::DmlService;
-
-const DURABLE_CTAS_FACT_VERSION: u8 = 1;
-const DURABLE_FAILURE_PREFIX_BYTES: usize = 2 * 1024;
-
-#[derive(Serialize)]
-struct DurableCtasWriteCompletionV1 {
-    version: u8,
-    instance_id: String,
-    incarnation: String,
-    operation_id: String,
-    cohort_id: String,
-    cohort_set_digest: String,
-    aggregate_digest: String,
-}
-
-#[derive(Serialize)]
-struct DurableCtasFailureV1<'a> {
-    version: u8,
-    kind: &'static str,
-    message_prefix: &'a str,
-    message_truncated: bool,
-    original_message_bytes: usize,
-    original_message_sha256: String,
-}
 
 impl DmlService {
-    /// Execute an already-admitted CTAS through the frontend durable saga owner.
+    /// Execute CTAS as one statement-local staged-create attempt.
+    ///
+    /// This intentionally does not create a DML journal operation: a retained
+    /// frontend record cannot safely replay, abort, clean up, or adjudicate a
+    /// provider-owned staged-create publication after the originating process
+    /// has gone away.
     #[allow(
         clippy::result_large_err,
         reason = "Preserves the frozen DML error contract without a broad ABI migration."
@@ -87,6 +63,7 @@ impl DmlService {
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
     ) -> Result<(), DmlError> {
+        let _ = self;
         let command = CtasCommand::from_typed(statement, source).map_err(|error| {
             DmlError::admit(AdmitError::CreateTableUnsupportedForm.to_user_error(
                 source,
@@ -95,587 +72,411 @@ impl DmlService {
             ))
         })?;
         let session = context.session();
-        let operation_id = DmlOperationId::new_v7();
-        // The standard staged-create adapter uses this exact ID to derive the
-        // warehouse-owned, unanchored CTAS root.  It must therefore be the
-        // admission publication ID, not a second child UUID.
-        let prepare_operation_id = *operation_id.as_uuid();
-        // These fields retain their phase names for durable-payload
-        // compatibility, but they are not child attempts. A CTAS statement
-        // has exactly one publication identity across prepare, write,
-        // publication and any diagnostic record.
-        let write_operation_id = prepare_operation_id;
-        let publish_operation_id = prepare_operation_id;
-        let abort_staging_operation_id = prepare_operation_id;
         let policy = if command.if_not_exists {
             CreatePolicy::NoOpIfExists
         } else {
             CreatePolicy::FailIfExists
         };
-        let initial = CtasSagaRecord {
-            phase: CtasSagaPhase::PreparingSource,
-            prepare_operation_id,
-            write_operation_id,
-            publish_operation_id,
-            abort_staging_operation_id,
-            create_policy: policy_name(policy).to_string(),
-            provider_id: None,
-            connector_instance_id: None,
-            connector_incarnation: None,
-            source_plan_digest: None,
-            source_schema_digest: None,
-            source_execution_identity: None,
-            write_cohort_id: None,
-            staged_handle_digest: None,
-            write_cohort_set_digest: None,
-            aggregate_write_digest: None,
-            prepare_fact: None,
-            write_fact: None,
-            publish_fact: None,
-            abort_staging_fact: None,
-            next_action: StatementNextAction::None,
-        };
-        let mut active = self
-            .begin_statement_operation(CreateStatementOperationRequest {
-                operation_id,
-                mutation_id: Uuid::now_v7(),
-                operation_kind: OperationKind::CreateTableAsSelect,
-                target: syntactic_target(
-                    &command.target_parts,
-                    session.current_catalog(),
-                    session.current_database(),
-                ),
-                attempt_id: operation_id.to_string(),
-                payload: OperationPayload::CtasSaga(initial),
-                created_at_ms: crate::dml::now_unix_millis(),
-            })
-            .map_err(|error| journal_error(error, operation_id))?;
-
-        let result = execute_standard_ctas_operation(
+        execute_standard_ctas_operation(
             engine,
             statement,
             source,
             context,
             query_options,
             command,
-            prepare_operation_id,
             policy,
-            &mut active,
-        );
-        let _ = active.release();
-        result
+            session.current_catalog(),
+            session.current_database(),
+        )
     }
 }
 
-/// Execute CTAS through the crash-only staged-create contract.  The only
-/// externally visible frontier is standard staged-create publication; frontend
-/// neither reconstructs catalog authority nor cleans up a possibly-live staged
-/// target.  Definite failures are terminal and all ambiguous outcomes remain
-/// explicitly inspectable until age-based GC retires their owned roots.
 #[allow(
     clippy::result_large_err,
     reason = "Preserves the frozen DML error contract without a broad ABI migration."
 )]
 #[expect(
     clippy::too_many_arguments,
-    reason = "The statement boundary keeps its source, session, and durable owner explicit."
+    reason = "The statement boundary keeps its source and session inputs explicit."
 )]
 fn execute_standard_ctas_operation(
     engine: &dyn CtasEngine,
     statement: &novarocks_parser::ast::CreateTableAsSelect,
-    source: &str,
+    source_text: &str,
     context: &RequestContext,
     query_options: Option<&QueryOptions>,
     command: CtasCommand,
-    prepare_operation_id: Uuid,
     policy: CreatePolicy,
-    active: &mut ActiveDmlOperation,
+    current_catalog: Option<&str>,
+    current_database: &str,
 ) -> Result<(), DmlError> {
-    let session = context.session();
-    let statement_source = source;
-    let publication_id =
-        novarocks_spi::connector::LakePublicationId::from_bytes(*prepare_operation_id.as_bytes());
-
-    active.check_before_dispatch()?;
     let preflight = match engine.preflight_standard_ctas_target(
         statement,
-        source,
+        source_text,
         &command,
-        session.current_catalog(),
-        session.current_database(),
+        current_catalog,
+        current_database,
     ) {
-        Ok(CtasTargetPreflightOutcome::ExistsNoOp) => {
-            return finalize_standard_ctas_noop(active);
-        }
         Ok(CtasTargetPreflightOutcome::Ready(preflight)) => preflight,
-        Err(failure) => {
-            return finish_source_failure(active, active.stored.clone(), source, failure);
-        }
+        Err(failure) => return Err(ctas_failure(source_text, failure)),
     };
-    validate_preflight_facts(&active.stored, &preflight.facts)?;
+    let publication_id = LakePublicationId::new_v7();
+    let mut attempt = new_attempt(publication_id, &preflight.facts)?;
 
-    let source = match engine.prepare_standard_ctas_source(
+    let prepared_source = match engine.prepare_standard_ctas_source(
         preflight.handle.as_ref(),
         PrepareCtasSourceRequest {
             command,
-            current_catalog: session.current_catalog().map(ToOwned::to_owned),
-            current_database: session.current_database().to_string(),
+            current_catalog: current_catalog.map(ToOwned::to_owned),
+            current_database: current_database.to_string(),
             query_options: query_options.cloned(),
             execution: context.execution().clone(),
         },
     ) {
         Ok(source) => source,
-        Err(failure) => {
-            return finish_source_failure(active, active.stored.clone(), source, failure);
-        }
+        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
     };
-    validate_source_facts(
-        &active.stored,
-        &source,
-        session.current_catalog(),
-        session.current_database(),
-    )?;
-    let mut saga = ctas_record(&active.stored)?;
-    saga.phase = CtasSagaPhase::PreparingStagedTable;
-    saga.provider_id = Some(preflight.facts.provider_id.clone());
-    saga.connector_instance_id = Some(preflight.facts.instance_id.clone());
-    saga.connector_incarnation = Some(hex::encode(preflight.facts.incarnation));
-    saga.source_plan_digest = Some(hex::encode(source.facts.plan_digest));
-    saga.source_schema_digest = Some(hex::encode(source.facts.schema_digest));
-    saga.source_execution_identity = Some(hex::encode(source.facts.execution_identity));
-    saga.next_action = StatementNextAction::None;
-    active.mutate_statement(
-        OperationState::Preparing,
-        OperationPayload::CtasSaga(saga),
-        None,
-    )?;
+    if let Err(error) = validate_source_facts(
+        &prepared_source,
+        &preflight.facts,
+        current_catalog,
+        current_database,
+    ) {
+        return Err(pre_dispatch_failure(&mut attempt, source_text, error));
+    }
 
-    let stage =
-        match engine.prepare_standard_ctas_target(source.handle.as_ref(), publication_id, policy) {
-            Ok(action) => {
-                active.check_before_dispatch()?;
-                engine.stage_standard_ctas_target(action.handle.as_ref())
-            }
-            Err(failure) => {
-                return finish_standard_known_uncommitted(
-                    active,
-                    CtasSagaPhase::Failed,
-                    FactSlot::Prepare,
-                    failure,
-                    Some(statement_source),
-                );
-            }
-        };
-    let target = match stage {
-        Ok(StandardCtasStageOutcome::Prepared { target, receipt }) => {
-            validate_standard_target_facts(&active.stored, &preflight.facts, &target.facts)?;
-            let mut saga = ctas_record(&active.stored)?;
-            saga.phase = CtasSagaPhase::Staged;
-            saga.staged_handle_digest = Some(hex::encode(target.facts.target_handle_digest));
-            saga.prepare_fact = Some(staged_create_fact(
-                ExternalFactOutcome::KnownCommitted,
-                &receipt,
-            ));
-            saga.next_action = StatementNextAction::None;
-            active.mutate_statement(
-                OperationState::Writing,
-                OperationPayload::CtasSaga(saga),
-                None,
-            )?;
-            target
-        }
-        Ok(StandardCtasStageOutcome::KnownUncommitted { failure }) => {
-            return finish_standard_known_uncommitted(
-                active,
-                CtasSagaPhase::Failed,
-                FactSlot::Prepare,
-                failure,
-                Some(statement_source),
-            );
-        }
-        Ok(StandardCtasStageOutcome::CommitUnknown { failure, evidence }) => {
-            return finish_standard_unknown(
-                active,
-                CtasSagaPhase::PrepareUnknown,
-                FactSlot::Prepare,
-                failure,
-                evidence,
-                "CTAS staged-create",
-            );
-        }
-        Err(failure) => {
-            return finish_standard_known_uncommitted(
-                active,
-                CtasSagaPhase::Failed,
-                FactSlot::Prepare,
-                failure,
-                Some(statement_source),
-            );
-        }
+    let target = match engine.prepare_standard_ctas_target(
+        prepared_source.handle.as_ref(),
+        publication_id,
+        policy,
+    ) {
+        Ok(action) => match engine.stage_standard_ctas_target(action.handle.as_ref()) {
+            Ok(StandardCtasStageOutcome::Prepared { target, .. }) => target,
+            Ok(StandardCtasStageOutcome::KnownUncommitted { failure })
+            | Ok(StandardCtasStageOutcome::CommitUnknown { failure, .. })
+            | Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
+        },
+        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
     };
+    if let Err(error) = validate_target_facts(&preflight.facts, &target.facts, publication_id) {
+        return Err(pre_dispatch_failure(&mut attempt, source_text, error));
+    }
 
-    execute_standard_foreground_write(engine, active, source, target, publication_id)
-}
-
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-fn execute_standard_foreground_write(
-    engine: &dyn CtasEngine,
-    active: &mut ActiveDmlOperation,
-    source: PreparedCtasSource,
-    target: PreparedStandardCtasTarget,
-    publication_id: novarocks_spi::connector::LakePublicationId,
-) -> Result<(), DmlError> {
-    let prepared = match engine.prepare_standard_ctas_write(
-        source.handle.as_ref(),
+    let prepared_write = match engine.prepare_standard_ctas_write(
+        prepared_source.handle.as_ref(),
         target.handle.as_ref(),
         ConnectorWriteOperationId::from(publication_id),
     ) {
-        Ok(prepared) => prepared,
-        Err(failure) => {
-            return finish_standard_known_uncommitted(
-                active,
-                CtasSagaPhase::Failed,
-                FactSlot::Write,
-                failure,
-                None,
-            );
-        }
+        Ok(write) => write,
+        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
     };
-    let native_bundle = match standard_native_bundle(&prepared) {
+    if let Err(error) =
+        validate_prepared_write(&prepared_source, &target, &prepared_write, publication_id)
+    {
+        return Err(pre_dispatch_failure(&mut attempt, source_text, error));
+    }
+    let native_bundle = match standard_native_bundle(&prepared_write) {
         Ok(bundle) => bundle,
-        Err(failure) => {
-            return finish_standard_known_uncommitted(
-                active,
-                CtasSagaPhase::Failed,
-                FactSlot::Write,
-                failure,
-                None,
-            );
-        }
+        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
     };
     if let Err(failure) =
-        engine.bind_standard_ctas_write_native_bundle(prepared.handle.as_ref(), native_bundle)
+        engine.bind_standard_ctas_write_native_bundle(prepared_write.handle.as_ref(), native_bundle)
     {
-        return finish_standard_known_uncommitted(
-            active,
-            CtasSagaPhase::Failed,
-            FactSlot::Write,
-            failure,
-            None,
-        );
+        return Err(pre_dispatch_failure(&mut attempt, source_text, failure));
     }
-    validate_standard_prepared_write(&active.stored, &source, &target, &prepared)?;
-    let mut saga = ctas_record(&active.stored)?;
-    saga.phase = CtasSagaPhase::Writing;
-    saga.write_cohort_set_digest = Some(hex::encode(prepared.cohort_set_digest));
-    active.mutate_statement(
-        OperationState::Writing,
-        OperationPayload::CtasSaga(saga),
-        None,
-    )?;
-    active.check_before_dispatch()?;
-    match engine.execute_standard_ctas_write(prepared.handle.as_ref()) {
+
+    let completion = match engine.execute_standard_ctas_write(prepared_write.handle.as_ref()) {
         StandardCtasWriteOutcome::Completed {
             completion,
             execution_identity,
         } => {
-            validate_standard_completion(
-                &active.stored,
-                &source,
+            if let Err(error) = validate_completion(
+                &prepared_source,
                 &target,
-                &prepared,
+                &prepared_write,
                 &completion,
                 execution_identity,
-            )?;
-            let (encoded, cohort) = encode_write_completion(&completion)?;
-            let mut saga = ctas_record(&active.stored)?;
-            saga.phase = CtasSagaPhase::Publishing;
-            saga.write_cohort_id = Some(cohort);
-            saga.aggregate_write_digest = Some(hex::encode(completion.aggregate_digest()));
-            saga.write_fact = Some(DurableExternalFact {
-                outcome: ExternalFactOutcome::KnownCommitted,
-                receipt: Some(encoded),
-                evidence: None,
-                finalization_failure: None,
-                failure: None,
-            });
-            active.mutate_statement(
-                OperationState::Committing,
-                OperationPayload::CtasSaga(saga),
-                None,
-            )?;
-            execute_standard_publish(engine, active, target, publication_id, completion)
+                publication_id,
+            ) {
+                return Err(pre_dispatch_failure(&mut attempt, source_text, error));
+            }
+            completion
         }
-        StandardCtasWriteOutcome::KnownUncommitted { failure } => {
-            finish_standard_known_uncommitted(
-                active,
-                CtasSagaPhase::Failed,
-                FactSlot::Write,
-                failure,
-                None,
-            )
+        StandardCtasWriteOutcome::KnownUncommitted { failure }
+        | StandardCtasWriteOutcome::CommitUnknown { failure, .. } => {
+            return Err(pre_dispatch_failure(&mut attempt, source_text, failure));
         }
-        StandardCtasWriteOutcome::CommitUnknown { failure, evidence } => finish_standard_unknown(
-            active,
-            CtasSagaPhase::WriteUnknown,
-            FactSlot::Write,
-            failure,
-            evidence,
-            "CTAS writer",
-        ),
-    }
-}
+    };
 
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-fn execute_standard_publish(
-    engine: &dyn CtasEngine,
-    active: &mut ActiveDmlOperation,
-    target: PreparedStandardCtasTarget,
-    publication_id: novarocks_spi::connector::LakePublicationId,
-    completion: ConnectorWriteOperationCompletion,
-) -> Result<(), DmlError> {
-    let action = match engine.prepare_standard_publish_ctas(
+    let publish = match engine.prepare_standard_publish_ctas(
         target.handle.as_ref(),
         publication_id,
         completion,
     ) {
-        Ok(action) => action,
-        Err(failure) => {
-            return finish_standard_known_uncommitted(
-                active,
-                CtasSagaPhase::Failed,
-                FactSlot::Publish,
-                failure,
-                None,
-            );
-        }
+        Ok(publish) => publish,
+        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
     };
-    active.check_before_dispatch()?;
-    match engine.publish_standard_ctas(action.handle.as_ref()) {
-        Ok(StandardCtasPublishOutcome::Applied { receipt }) => {
-            finalize_standard_ctas_publication(active, CtasSagaPhase::Committed, receipt)
-        }
-        Ok(StandardCtasPublishOutcome::NoOp { receipt }) => {
-            finalize_standard_ctas_publication(active, CtasSagaPhase::NoOp, receipt)
-        }
+    finish_standard_publication(engine, &mut attempt, target, publish)
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "Preserves the frozen DML error contract without a broad ABI migration."
+)]
+fn finish_standard_publication(
+    engine: &dyn CtasEngine,
+    attempt: &mut DmlPublicationAttempt,
+    target: PreparedStandardCtasTarget,
+    publish: crate::query_execution::dml::ctas::PreparedStandardCtasCatalogAction,
+) -> Result<(), DmlError> {
+    match engine.publish_standard_ctas(publish.handle.as_ref()) {
         Ok(StandardCtasPublishOutcome::KnownUncommitted { failure }) => {
-            finish_standard_known_uncommitted(
-                active,
-                CtasSagaPhase::Failed,
-                FactSlot::Publish,
-                failure,
-                None,
-            )
+            Err(pre_dispatch_failure(attempt, "", failure))
         }
-        Ok(StandardCtasPublishOutcome::CommitUnknown { failure, evidence }) => {
-            finish_standard_unknown(
-                active,
-                CtasSagaPhase::PublishUnknown,
-                FactSlot::Publish,
-                failure,
-                evidence,
-                "CTAS publication",
-            )
+        Ok(StandardCtasPublishOutcome::Applied { finalization, .. })
+        | Ok(StandardCtasPublishOutcome::NoOp { finalization, .. }) => {
+            mark_dispatch_possible(attempt)?;
+            finish_known_committed(attempt, finalization)
         }
-        Err(failure) => finish_standard_known_uncommitted(
-            active,
-            CtasSagaPhase::Failed,
-            FactSlot::Publish,
-            failure,
-            None,
+        Ok(StandardCtasPublishOutcome::CommitUnknown {
+            failure: _,
+            evidence,
+        }) => {
+            mark_dispatch_possible(attempt)?;
+            let adjudication = attempt.begin_adjudication().map_err(attempt_error)?;
+            match engine.adjudicate_standard_ctas_publication(target.handle.as_ref(), evidence) {
+                Ok(StandardCtasPublicationAdjudicationOutcome::Published {
+                    finalization, ..
+                }) => {
+                    let terminal = attempt
+                        .finish_adjudication(
+                            adjudication,
+                            DmlPublicationAdjudicationOutcome::KnownCommitted,
+                            finalization_state(&finalization),
+                        )
+                        .map_err(attempt_error)?
+                        .clone();
+                    finalization_error_or_ok(terminal, finalization)
+                }
+                Ok(StandardCtasPublicationAdjudicationOutcome::CommitUnknown { failure }) => {
+                    let terminal = attempt
+                        .finish_adjudication(
+                            adjudication,
+                            DmlPublicationAdjudicationOutcome::CommitUnknown,
+                            DmlPublicationFinalization::NotApplicable,
+                        )
+                        .map_err(attempt_error)?
+                        .clone();
+                    Err(unknown_failure(
+                        terminal,
+                        "CTAS publication adjudication",
+                        failure,
+                    ))
+                }
+                Err(error) => {
+                    let terminal = attempt
+                        .finish_adjudication(
+                            adjudication,
+                            DmlPublicationAdjudicationOutcome::CommitUnknown,
+                            DmlPublicationFinalization::NotApplicable,
+                        )
+                        .map_err(attempt_error)?
+                        .clone();
+                    Err(DmlError::commit(format!(
+                        "CTAS publication adjudication remains unresolved: {}",
+                        error.message
+                    ))
+                    .with_engine_error_code(EngineErrorCode::CommitUnknown)
+                    .with_publication_terminal(terminal))
+                }
+            }
+        }
+        Err(error) => {
+            mark_dispatch_possible(attempt)?;
+            let terminal = attempt
+                .terminal_after_outer_failure()
+                .map_err(attempt_error)?
+                .clone();
+            Err(DmlError::commit(format!(
+                "CTAS publication dispatch remains unresolved: {}",
+                error.message
+            ))
+            .with_engine_error_code(EngineErrorCode::CommitUnknown)
+            .with_publication_terminal(terminal))
+        }
+    }
+}
+
+fn new_attempt(
+    publication_id: LakePublicationId,
+    facts: &CtasTargetPreflightFacts,
+) -> Result<DmlPublicationAttempt, DmlError> {
+    let target = LakePublicationTarget::try_new(
+        facts.instance_id.clone(),
+        facts.target_namespace.clone(),
+        Some(facts.target_table.clone()),
+        None,
+    )
+    .map_err(DmlError::executor)?;
+    let tag =
+        LakePublicationStatementTag::try_new("ctas".to_string()).map_err(DmlError::executor)?;
+    Ok(DmlPublicationAttempt::new(
+        publication_id,
+        LakePublicationFamily::Ctas,
+        target,
+        Some(tag),
+    ))
+}
+
+fn mark_dispatch_possible(attempt: &mut DmlPublicationAttempt) -> Result<(), DmlError> {
+    attempt.mark_dispatch_possible().map_err(attempt_error)
+}
+
+fn finish_known_committed(
+    attempt: &mut DmlPublicationAttempt,
+    finalization: ExternalMutationFinalization,
+) -> Result<(), DmlError> {
+    let terminal = attempt
+        .terminal_known_committed(finalization_state(&finalization))
+        .map_err(attempt_error)?
+        .clone();
+    finalization_error_or_ok(terminal, finalization)
+}
+
+fn finalization_error_or_ok(
+    terminal: novarocks_spi::connector::LakePublicationTerminal,
+    finalization: ExternalMutationFinalization,
+) -> Result<(), DmlError> {
+    match finalization {
+        ExternalMutationFinalization::Complete => Ok(()),
+        ExternalMutationFinalization::Failed(failure) => Err(
+            DmlError::known_committed_finalization_failed(terminal, failure.to_string())
+                .with_engine_error_code(EngineErrorCode::CommitKnownCommittedFinalizeFailed),
         ),
     }
 }
 
-#[derive(Clone, Copy)]
-enum FactSlot {
-    Prepare,
-    Write,
-    Publish,
-    Abort,
-}
-
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-fn validate_preflight_facts(
-    stored: &StoredOperation,
-    facts: &crate::query_execution::dml::ctas::CtasTargetPreflightFacts,
-) -> Result<(), DmlError> {
-    if facts.capability_version == 1
-        && facts.instance_id == stored.target.catalog
-        && facts.target_namespace == stored.target.namespace
-        && facts.target_table == stored.target.table
-        && !facts.provider_id.is_empty()
-    {
-        Ok(())
-    } else {
-        Err(operation_error(
-            DmlErrorKind::Executor,
-            stored.operation_id,
-            StatementNextAction::ManualInspect,
-            "CTAS preflight facts conflict with the durable statement target",
-        ))
+fn finalization_state(finalization: &ExternalMutationFinalization) -> DmlPublicationFinalization {
+    match finalization {
+        ExternalMutationFinalization::Complete => DmlPublicationFinalization::Succeeded,
+        ExternalMutationFinalization::Failed(_) => DmlPublicationFinalization::Failed,
     }
 }
 
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-fn finish_source_failure(
-    active: &mut ActiveDmlOperation,
-    stored: StoredOperation,
-    source: &str,
+fn pre_dispatch_failure(
+    attempt: &mut DmlPublicationAttempt,
+    source_text: &str,
     failure: CtasFailure,
-) -> Result<(), DmlError> {
-    let mut record = ctas_record(&stored)?;
-    record.phase = if failure.kind == CtasFailureKind::Unsupported {
-        CtasSagaPhase::Unsupported
-    } else {
-        CtasSagaPhase::Failed
-    };
-    record.prepare_fact = Some(failure_fact(&failure));
-    record.next_action = StatementNextAction::None;
-    active.mutate_statement(
-        OperationState::FailedKnownUncommitted,
-        OperationPayload::CtasSaga(record),
-        None,
-    )?;
-    Err(source_failure_error(
-        active.operation_id(),
-        Some(source),
-        failure,
+) -> DmlError {
+    let terminal = attempt
+        .terminal_pre_dispatch_uncommitted()
+        .expect("CTAS pre-publication path assigns one terminal")
+        .clone();
+    ctas_failure(source_text, failure).with_publication_terminal(terminal)
+}
+
+fn unknown_failure(
+    terminal: novarocks_spi::connector::LakePublicationTerminal,
+    label: &str,
+    failure: CtasFailure,
+) -> DmlError {
+    DmlError::commit(format!("{label} remains unresolved: {}", failure.message))
+        .with_engine_error_code(EngineErrorCode::CommitUnknown)
+        .with_publication_terminal(terminal)
+}
+
+fn ctas_failure(source_text: &str, failure: CtasFailure) -> DmlError {
+    if let Some(error) = failure.user_error(Some(source_text)) {
+        return DmlError::admit(error);
+    }
+    DmlError::executor(format!("CTAS request failed: {}", failure.message))
+        .with_engine_error_code(EngineErrorCode::CommitKnownUncommitted)
+}
+
+fn attempt_error(error: DmlPublicationAttemptError) -> DmlError {
+    DmlError::executor(format!(
+        "invalid CTAS publication attempt transition: {error}"
     ))
 }
 
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
 fn validate_source_facts(
-    stored: &StoredOperation,
     source: &PreparedCtasSource,
+    preflight: &CtasTargetPreflightFacts,
     current_catalog: Option<&str>,
     current_database: &str,
-) -> Result<(), DmlError> {
-    let matches = source.handle.execution_identity() == source.facts.execution_identity
-        && source.facts.target_catalog == stored.target.catalog
-        && source.facts.target_namespace == stored.target.namespace
-        && source.facts.target_table == stored.target.table
+) -> Result<(), CtasFailure> {
+    let matching = source.handle.execution_identity() == source.facts.execution_identity
+        && source.facts.target_catalog == preflight.instance_id
+        && source.facts.target_namespace == preflight.target_namespace
+        && source.facts.target_table == preflight.target_table
         && source.facts.source_catalog.as_deref() == current_catalog
         && source.facts.source_database == current_database
         && !source.facts.output_columns.is_empty();
-    if matches {
+    if matching {
         Ok(())
     } else {
-        Err(operation_error(
-            DmlErrorKind::Executor,
-            stored.operation_id,
-            StatementNextAction::ManualInspect,
-            "CTAS prepared source facts conflict with the durable statement identity",
+        Err(internal_failure(
+            "CTAS prepared source facts conflict with its exact preflight target",
         ))
     }
 }
 
-fn source_failure_error(
-    operation_id: DmlOperationId,
-    source: Option<&str>,
-    failure: CtasFailure,
-) -> DmlError {
-    if let Some(error) = failure.user_error(source) {
-        return DmlError::admit(error);
-    }
-    operation_error(
-        DmlErrorKind::Executor,
-        operation_id,
-        StatementNextAction::None,
-        format_failure("CTAS request preparation failed", &failure),
-    )
-}
-
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The CTAS execution boundary keeps each fenced lifecycle dependency explicit."
-)]
-fn validate_standard_target_facts(
-    stored: &StoredOperation,
-    preflight: &crate::query_execution::dml::ctas::CtasTargetPreflightFacts,
-    facts: &StandardCtasTargetFacts,
-) -> Result<(), DmlError> {
-    if facts.publication_id.to_bytes() == *stored.operation_id.as_uuid().as_bytes()
-        && facts.provider_id == preflight.provider_id
-        && facts.instance_id == preflight.instance_id
-        && facts.incarnation == preflight.incarnation
+fn validate_target_facts(
+    preflight: &CtasTargetPreflightFacts,
+    target: &StandardCtasTargetFacts,
+    publication_id: LakePublicationId,
+) -> Result<(), CtasFailure> {
+    if target.publication_id == publication_id
+        && target.provider_id == preflight.provider_id
+        && target.instance_id == preflight.instance_id
+        && target.incarnation == preflight.incarnation
     {
         Ok(())
     } else {
-        Err(operation_error(
-            DmlErrorKind::Commit,
-            stored.operation_id,
-            StatementNextAction::ManualInspect,
-            "standard CTAS staged target facts conflict with its publication identity",
+        Err(internal_failure(
+            "standard CTAS staged target facts conflict with the statement publication identity",
         ))
     }
 }
 
-fn validate_standard_prepared_write(
-    stored: &StoredOperation,
+fn validate_prepared_write(
     source: &PreparedCtasSource,
     target: &PreparedStandardCtasTarget,
     write: &PreparedStandardCtasWrite,
-) -> Result<(), DmlError> {
-    let expected = ctas_record(stored)?.write_operation_id;
-    if write.write_operation_id.to_bytes() == *expected.as_bytes()
+    publication_id: LakePublicationId,
+) -> Result<(), CtasFailure> {
+    if write.write_operation_id.to_bytes() == publication_id.to_bytes()
         && write.execution_identity == source.facts.execution_identity
         && write.handle.execution_identity() == source.facts.execution_identity
         && write.target_facts == target.facts
     {
         Ok(())
     } else {
-        Err(operation_error(
-            DmlErrorKind::Executor,
-            stored.operation_id,
-            StatementNextAction::ManualInspect,
-            "standard CTAS prepared write facts drifted from the source or staged target",
+        Err(internal_failure(
+            "standard CTAS prepared write facts drifted from source or staged target",
         ))
     }
 }
 
-fn validate_standard_completion(
-    stored: &StoredOperation,
+fn validate_completion(
     source: &PreparedCtasSource,
     target: &PreparedStandardCtasTarget,
     prepared: &PreparedStandardCtasWrite,
     completion: &ConnectorWriteOperationCompletion,
     execution_identity: [u8; 32],
-) -> Result<(), DmlError> {
-    let expected_write = ctas_record(stored)?.write_operation_id;
+    publication_id: LakePublicationId,
+) -> Result<(), CtasFailure> {
     let matching = execution_identity == source.facts.execution_identity
         && execution_identity == prepared.execution_identity
         && completion.owner().instance_id.as_str() == target.facts.instance_id
         && completion.owner().incarnation.to_bytes() == target.facts.incarnation
-        && completion.sealed().operation_id().to_bytes() == *expected_write.as_bytes()
+        && completion.sealed().operation_id().to_bytes() == publication_id.to_bytes()
         && completion.sealed().cohorts().len() == 1;
     if matching {
         Ok(())
     } else {
-        Err(operation_error(
-            DmlErrorKind::Commit,
-            stored.operation_id,
-            StatementNextAction::ManualInspect,
-            "standard CTAS writer completion conflicts with durable source/target identity",
+        Err(internal_failure(
+            "standard CTAS writer completion conflicts with source or staged target identity",
         ))
     }
 }
@@ -694,333 +495,164 @@ fn standard_native_bundle(
     )
 }
 
-fn finalize_standard_ctas_noop(active: &mut ActiveDmlOperation) -> Result<(), DmlError> {
-    let mut record = ctas_record(&active.stored)?;
-    record.phase = CtasSagaPhase::NoOp;
-    record.next_action = StatementNextAction::None;
-    active.mutate_statement(
-        OperationState::Committing,
-        OperationPayload::CtasSaga(record.clone()),
-        None,
-    )?;
-    active.mutate_statement(
-        OperationState::Committed,
-        OperationPayload::CtasSaga(record.clone()),
-        None,
-    )?;
-    active.mutate_statement(
-        OperationState::Finalized,
-        OperationPayload::CtasSaga(record),
-        None,
-    )
+fn internal_failure(message: impl Into<String>) -> CtasFailure {
+    CtasFailure {
+        kind: CtasFailureKind::Internal,
+        message: message.into(),
+        user_error: None,
+    }
 }
 
-fn finalize_standard_ctas_publication(
-    active: &mut ActiveDmlOperation,
-    phase: CtasSagaPhase,
-    receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
-) -> Result<(), DmlError> {
-    let outcome = if phase == CtasSagaPhase::NoOp {
-        ExternalFactOutcome::NoOp
-    } else {
-        ExternalFactOutcome::KnownCommitted
+#[cfg(test)]
+mod tests {
+    use std::any::Any;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        ConnectorMutationOperationId, ConnectorProviderId, ExternalMutationEvidence,
+        LakePublicationDisposition,
     };
-    let mut saga = ctas_record(&active.stored)?;
-    saga.phase = phase;
-    saga.publish_fact = Some(staged_create_fact(outcome, &receipt));
-    saga.next_action = StatementNextAction::None;
-    active.mutate_statement(
-        OperationState::Committed,
-        OperationPayload::CtasSaga(saga.clone()),
-        None,
-    )?;
-    active.mutate_statement(
-        OperationState::Finalized,
-        OperationPayload::CtasSaga(saga),
-        None,
-    )
-}
 
-fn staged_create_fact(
-    outcome: ExternalFactOutcome,
-    receipt: &novarocks_spi::connector::ConnectorStagedCreateReceipt,
-) -> DurableExternalFact {
-    let mut digest = Sha256::new();
-    digest.update(b"novarocks.staged-create-receipt-observation.v1");
-    digest.update(receipt.owner().instance_id.as_str().as_bytes());
-    digest.update(receipt.owner().incarnation.to_bytes());
-    digest.update(receipt.operation_id().to_bytes());
-    digest.update(format!("{:?}", receipt.phase()).as_bytes());
-    digest.update(format!("{:?}", receipt.effect()).as_bytes());
-    digest.update(receipt.provider_payload());
-    DurableExternalFact {
-        outcome,
-        // This bounded observation digest is diagnostic only; publication
-        // truth is the catalog's atomic staged-create frontier.
-        receipt: Some(hex::encode(digest.finalize())),
-        evidence: None,
-        finalization_failure: None,
-        failure: None,
+    use super::*;
+
+    struct TestTarget;
+
+    impl crate::query_execution::dml::ctas::CtasPreparedTarget for TestTarget {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
     }
-}
 
-fn finish_standard_known_uncommitted(
-    active: &mut ActiveDmlOperation,
-    phase: CtasSagaPhase,
-    slot: FactSlot,
-    failure: CtasFailure,
-    source: Option<&str>,
-) -> Result<(), DmlError> {
-    let mut saga = ctas_record(&active.stored)?;
-    saga.phase = if failure.kind == CtasFailureKind::Unsupported {
-        CtasSagaPhase::Unsupported
-    } else {
-        phase
-    };
-    install_fact(&mut saga, slot, failure_fact(&failure));
-    saga.next_action = StatementNextAction::None;
-    active.mutate_statement(
-        OperationState::FailedKnownUncommitted,
-        OperationPayload::CtasSaga(saga),
-        None,
-    )?;
-    // This path is reached only after the standard staged-create publication
-    // lifecycle has recorded a terminal known-uncommitted fact. Preserve that
-    // semantic outcome at the SQL boundary rather than degrading it to the
-    // generic executor error used for source preparation failures.
-    let error = source_failure_error(active.operation_id(), source, failure);
-    Err(error.with_engine_error_code(EngineErrorCode::CommitKnownUncommitted))
-}
+    struct TestAction;
 
-fn finish_standard_unknown(
-    active: &mut ActiveDmlOperation,
-    phase: CtasSagaPhase,
-    slot: FactSlot,
-    failure: CtasFailure,
-    evidence: ExternalMutationEvidence,
-    label: &str,
-) -> Result<(), DmlError> {
-    let mut saga = ctas_record(&active.stored)?;
-    saga.phase = phase;
-    install_fact(
-        &mut saga,
-        slot,
-        DurableExternalFact {
-            outcome: ExternalFactOutcome::CommitUnknown,
-            receipt: None,
-            evidence: encode_evidence(&evidence).ok(),
-            finalization_failure: None,
-            failure: Some(encode_failure(&failure)),
-        },
-    );
-    saga.next_action = StatementNextAction::ManualInspect;
-    active.mutate_statement(
-        OperationState::CommitUnknown,
-        OperationPayload::CtasSaga(saga),
-        Some(crate::dml::now_unix_millis()),
-    )?;
-    let error = unknown_error(active.operation_id(), label, &failure);
-    Err(error.with_engine_error_code(EngineErrorCode::CommitUnknown))
-}
-
-fn failure_fact(failure: &CtasFailure) -> DurableExternalFact {
-    DurableExternalFact {
-        outcome: match failure.kind {
-            CtasFailureKind::Unsupported => ExternalFactOutcome::Unsupported,
-            CtasFailureKind::AlreadyExists | CtasFailureKind::Conflict => {
-                ExternalFactOutcome::Conflict
-            }
-            _ => ExternalFactOutcome::KnownUncommitted,
-        },
-        receipt: None,
-        evidence: None,
-        finalization_failure: None,
-        failure: Some(encode_failure(failure)),
+    impl crate::query_execution::dml::ctas::CtasPreparedCatalogAction for TestAction {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
     }
-}
 
-fn install_fact(record: &mut CtasSagaRecord, slot: FactSlot, fact: DurableExternalFact) {
-    match slot {
-        FactSlot::Prepare => record.prepare_fact = Some(fact),
-        FactSlot::Write => record.write_fact = Some(fact),
-        FactSlot::Publish => record.publish_fact = Some(fact),
-        FactSlot::Abort => record.abort_staging_fact = Some(fact),
+    struct PublishUnknownEngine {
+        publishes: AtomicUsize,
+        adjudications: AtomicUsize,
     }
-}
 
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-fn encode_write_completion(
-    completion: &ConnectorWriteOperationCompletion,
-) -> Result<(String, String), DmlError> {
-    let cohort = completion
-        .sealed()
-        .cohorts()
-        .first()
-        .ok_or_else(|| DmlError::commit("CTAS completion has no write cohort"))?;
-    let cohort_id = hex::encode(cohort.cohort_id().to_bytes());
-    let encoded = serde_json::to_string(&DurableCtasWriteCompletionV1 {
-        version: DURABLE_CTAS_FACT_VERSION,
-        instance_id: completion.owner().instance_id.as_str().to_string(),
-        incarnation: hex::encode(completion.owner().incarnation.to_bytes()),
-        operation_id: hex::encode(completion.sealed().operation_id().to_bytes()),
-        cohort_id: cohort_id.clone(),
-        cohort_set_digest: hex::encode(completion.sealed().digest()),
-        aggregate_digest: hex::encode(completion.aggregate_digest()),
-    })
-    .map_err(DmlError::journal_corruption)?;
-    ensure_fact_bound("CTAS writer completion", &encoded)?;
-    Ok((encoded, cohort_id))
-}
-
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-fn encode_evidence(evidence: &ExternalMutationEvidence) -> Result<String, DmlError> {
-    let wire = evidence.try_to_wire_v1().map_err(DmlError::commit)?;
-    let encoded = hex::encode(wire);
-    ensure_fact_bound("CTAS evidence", &encoded)?;
-    Ok(encoded)
-}
-
-fn encode_failure(failure: &CtasFailure) -> String {
-    let original_message_bytes = failure.message.len();
-    let mut prefix_end = original_message_bytes.min(DURABLE_FAILURE_PREFIX_BYTES);
-    while !failure.message.is_char_boundary(prefix_end) {
-        prefix_end -= 1;
+    impl PublishUnknownEngine {
+        fn evidence() -> ExternalMutationEvidence {
+            ExternalMutationEvidence::try_new(
+                1,
+                ConnectorInstanceDescriptor {
+                    provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+                    instance_id: ConnectorInstanceId::parse("iceberg").expect("instance"),
+                },
+                ConnectorInstanceIncarnation::new(),
+                ConnectorMutationOperationId::from_bytes([7; 16]),
+                "staged-create-publish",
+                Bytes::from_static(b"opaque"),
+            )
+            .expect("evidence")
+        }
     }
-    serde_json::to_string(&DurableCtasFailureV1 {
-        version: DURABLE_CTAS_FACT_VERSION,
-        kind: failure_kind(failure.kind),
-        message_prefix: &failure.message[..prefix_end],
-        message_truncated: prefix_end < original_message_bytes,
-        original_message_bytes,
-        original_message_sha256: hex::encode(Sha256::digest(failure.message.as_bytes())),
-    })
-    .unwrap_or_else(|_| {
-        r#"{"version":1,"kind":"INTERNAL","message_prefix":"failure encoding failed","message_truncated":true,"original_message_bytes":0,"original_message_sha256":""}"#.to_string()
-    })
-}
 
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-fn ensure_fact_bound(label: &str, value: &str) -> Result<(), DmlError> {
-    if value.len() <= DML_CTAS_FACT_ENCODED_LIMIT {
-        Ok(())
-    } else {
-        Err(DmlError::journal_unavailable(format!(
-            "{label} encoded size {} exceeds CTAS fact limit {DML_CTAS_FACT_ENCODED_LIMIT}",
-            value.len()
-        )))
+    impl CtasEngine for PublishUnknownEngine {
+        fn publish_standard_ctas(
+            &self,
+            _action: &dyn crate::query_execution::dml::ctas::CtasPreparedCatalogAction,
+        ) -> Result<StandardCtasPublishOutcome, CtasFailure> {
+            self.publishes.fetch_add(1, Ordering::SeqCst);
+            Ok(StandardCtasPublishOutcome::CommitUnknown {
+                failure: internal_failure("publish response lost"),
+                evidence: Self::evidence(),
+            })
+        }
+
+        fn adjudicate_standard_ctas_publication(
+            &self,
+            _target: &dyn crate::query_execution::dml::ctas::CtasPreparedTarget,
+            _evidence: ExternalMutationEvidence,
+        ) -> Result<StandardCtasPublicationAdjudicationOutcome, CtasFailure> {
+            self.adjudications.fetch_add(1, Ordering::SeqCst);
+            Ok(StandardCtasPublicationAdjudicationOutcome::CommitUnknown {
+                failure: internal_failure("exact publication remains unproven"),
+            })
+        }
     }
-}
 
-#[allow(
-    clippy::result_large_err,
-    reason = "Preserves the frozen DML error contract without a broad ABI migration."
-)]
-fn ctas_record(stored: &StoredOperation) -> Result<CtasSagaRecord, DmlError> {
-    match &stored.payload {
-        OperationPayload::CtasSaga(record) => Ok(record.clone()),
-        _ => Err(operation_error(
-            DmlErrorKind::JournalCorruption,
-            stored.operation_id,
-            StatementNextAction::ManualInspect,
-            "durable CTAS operation has the wrong payload kind",
-        )),
+    fn attempt() -> DmlPublicationAttempt {
+        new_attempt(
+            LakePublicationId::new_v7(),
+            &CtasTargetPreflightFacts {
+                provider_id: "iceberg".to_string(),
+                instance_id: "iceberg".to_string(),
+                incarnation: [1; 16],
+                capability_version: 1,
+                target_namespace: "db".to_string(),
+                target_table: "target".to_string(),
+            },
+        )
+        .expect("attempt")
     }
-}
 
-fn syntactic_target(
-    parts: &[String],
-    current_catalog: Option<&str>,
-    current_database: &str,
-) -> OperationTarget {
-    let (catalog, namespace, table) = match parts {
-        [table] => (
-            current_catalog.unwrap_or_default().to_string(),
-            current_database.to_string(),
-            table.clone(),
-        ),
-        [namespace, table] => (
-            current_catalog.unwrap_or_default().to_string(),
-            namespace.clone(),
-            table.clone(),
-        ),
-        [catalog, namespace, table] => (catalog.clone(), namespace.clone(), table.clone()),
-        _ => (
-            current_catalog.unwrap_or_default().to_string(),
-            current_database.to_string(),
-            parts.join("."),
-        ),
-    };
-    OperationTarget {
-        catalog,
-        namespace,
-        table,
-        ref_name: None,
+    #[test]
+    fn unknown_publication_adjudicates_once_without_a_follow_up_mutation() {
+        let engine = PublishUnknownEngine {
+            publishes: AtomicUsize::new(0),
+            adjudications: AtomicUsize::new(0),
+        };
+        let mut attempt = attempt();
+        let target = PreparedStandardCtasTarget {
+            facts: StandardCtasTargetFacts {
+                provider_id: "iceberg".to_string(),
+                instance_id: "iceberg".to_string(),
+                incarnation: [1; 16],
+                publication_id: attempt.header().publication_id(),
+                target_handle_digest: [2; 32],
+            },
+            handle: Arc::new(TestTarget),
+        };
+        let publish = crate::query_execution::dml::ctas::PreparedStandardCtasCatalogAction {
+            input_digest: [3; 32],
+            handle: Arc::new(TestAction),
+        };
+
+        let error = finish_standard_publication(&engine, &mut attempt, target, publish)
+            .expect_err("unproven publication remains unknown");
+
+        assert_eq!(engine.publishes.load(Ordering::SeqCst), 1);
+        assert_eq!(engine.adjudications.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            error
+                .publication_terminal()
+                .expect("terminal")
+                .disposition(),
+            LakePublicationDisposition::CommitUnknown
+        );
     }
-}
 
-fn policy_name(policy: CreatePolicy) -> &'static str {
-    match policy {
-        CreatePolicy::FailIfExists => CTAS_CREATE_POLICY_FAIL_IF_EXISTS,
-        CreatePolicy::NoOpIfExists => CTAS_CREATE_POLICY_NO_OP_IF_EXISTS,
-    }
-}
+    #[test]
+    fn finalization_failure_keeps_known_committed_terminal() {
+        let mut attempt = attempt();
+        attempt.mark_dispatch_possible().expect("dispatch possible");
 
-fn journal_error(error: DmlError, operation_id: DmlOperationId) -> DmlError {
-    operation_error(
-        error.kind(),
-        operation_id,
-        StatementNextAction::ManualInspect,
-        error,
-    )
-}
+        let error = finish_known_committed(
+            &mut attempt,
+            ExternalMutationFinalization::Failed(
+                novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                    "local finalization failed",
+                ),
+            ),
+        )
+        .expect_err("finalization failure is reported");
 
-fn unknown_error(operation_id: DmlOperationId, phase: &str, failure: &CtasFailure) -> DmlError {
-    operation_error(
-        DmlErrorKind::Commit,
-        operation_id,
-        StatementNextAction::ManualInspect,
-        format_failure(&format!("{phase} remains unresolved"), failure),
-    )
-}
-
-fn operation_error(
-    kind: DmlErrorKind,
-    operation_id: DmlOperationId,
-    next_action: StatementNextAction,
-    message: impl std::fmt::Display,
-) -> DmlError {
-    DmlError::new(kind, message)
-        .with_operation_id(operation_id)
-        .with_next_action(next_action)
-}
-
-fn format_failure(prefix: &str, failure: &CtasFailure) -> String {
-    format!(
-        "{prefix}: {}: {}",
-        failure_kind(failure.kind),
-        failure.message
-    )
-}
-
-fn failure_kind(kind: CtasFailureKind) -> &'static str {
-    match kind {
-        CtasFailureKind::InvalidRequest => "INVALID_REQUEST",
-        CtasFailureKind::NotFound => "NOT_FOUND",
-        CtasFailureKind::AlreadyExists => "ALREADY_EXISTS",
-        CtasFailureKind::Conflict => "CONFLICT",
-        CtasFailureKind::Unsupported => "UNSUPPORTED",
-        CtasFailureKind::Cancelled => "CANCELLED",
-        CtasFailureKind::DeadlineExceeded => "DEADLINE_EXCEEDED",
-        CtasFailureKind::Unavailable => "UNAVAILABLE",
-        CtasFailureKind::Internal => "INTERNAL",
+        assert_eq!(
+            error
+                .publication_terminal()
+                .expect("terminal")
+                .disposition(),
+            LakePublicationDisposition::KnownCommitted
+        );
     }
 }

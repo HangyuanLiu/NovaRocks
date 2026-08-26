@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Statement-specific reverse port for frontend-owned CTAS orchestration.
+//! Statement-specific reverse port for frontend-local CTAS orchestration.
 //!
-//! The frontend owns the durable saga. Core owns pure SQL preparation, the
-//! exact admitted execution context, source execution, and connector calls.
+//! The frontend owns one non-durable statement attempt. Core owns pure SQL
+//! preparation, the exact admitted execution context, source execution, and connector calls.
 //! Opaque handles ensure the frontend cannot inspect or reconstruct compiler,
 //! writer, or provider-private staged-table state.
 
@@ -33,13 +33,14 @@ use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorCtasUnanchoredCleanupRequest,
     ConnectorCtasUnanchoredDiscoveryRequest, ConnectorMutationFailure, ConnectorPartitionTransform,
     ConnectorStagedCreateLease, ConnectorStagedCreatePrepareOutcome,
-    ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublishOutcome,
+    ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublicationAdjudicationOutcome,
+    ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublishOutcome,
     ConnectorStagedCreatePublishRequest, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningRequest, ConnectorUnanchoredCtasCleanupLease,
     ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
     ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationCompletion,
     ConnectorWriteOperationId, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
-    CreatePolicy, ExternalMutationEvidence, LakePublicationId,
+    CreatePolicy, ExternalMutationEvidence, ExternalMutationFinalization, LakePublicationId,
 };
 use novarocks_user_error::UserError;
 
@@ -243,7 +244,6 @@ fn lower_partition_transform(
 
 pub enum CtasTargetPreflightOutcome {
     Ready(PreparedCtasTargetPreflight),
-    ExistsNoOp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -429,9 +429,11 @@ pub struct PreparedStandardCtasWrite {
 pub enum StandardCtasPublishOutcome {
     Applied {
         receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
+        finalization: ExternalMutationFinalization,
     },
     NoOp {
         receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
+        finalization: ExternalMutationFinalization,
     },
     KnownUncommitted {
         failure: CtasFailure,
@@ -439,6 +441,19 @@ pub enum StandardCtasPublishOutcome {
     CommitUnknown {
         failure: CtasFailure,
         evidence: ExternalMutationEvidence,
+    },
+}
+
+/// The only same-statement observation permitted after the standard CTAS
+/// publication call returned an exact `CommitUnknown` evidence carrier.
+/// It cannot represent a negative result as cleanup or another publication.
+pub enum StandardCtasPublicationAdjudicationOutcome {
+    Published {
+        receipt: novarocks_spi::connector::ConnectorStagedCreateReceipt,
+        finalization: ExternalMutationFinalization,
+    },
+    CommitUnknown {
+        failure: CtasFailure,
     },
 }
 
@@ -540,6 +555,16 @@ pub trait CtasEngine: Send + Sync {
         &self,
         _action: &dyn CtasPreparedCatalogAction,
     ) -> Result<StandardCtasPublishOutcome, CtasFailure> {
+        Err(standard_ctas_unsupported())
+    }
+
+    /// Read-only, exact-evidence publication adjudication. Callers receive
+    /// this permission only after one publish outcome reported `CommitUnknown`.
+    fn adjudicate_standard_ctas_publication(
+        &self,
+        _target: &dyn CtasPreparedTarget,
+        _evidence: ExternalMutationEvidence,
+    ) -> Result<StandardCtasPublicationAdjudicationOutcome, CtasFailure> {
         Err(standard_ctas_unsupported())
     }
 }
@@ -1395,44 +1420,31 @@ impl CtasEngine for DmlExecutionKernel {
             ));
         }
         sweep_unanchored_ctas_roots(self, &unanchored_ctas_cleanup_lease, context.clone())?;
-        let exists = crate::connector::metadata_table_exists_with_planning_lease(
-            planning.clone(),
-            context.clone(),
-            &target.namespace,
-            &target.table,
-        )
-        .map_err(internal_failure)?;
-        match exists {
-            true if command.if_not_exists => Ok(CtasTargetPreflightOutcome::ExistsNoOp),
-            true => Err(CtasFailure {
-                kind: CtasFailureKind::AlreadyExists,
-                message: format!("table {}.{} already exists", target.namespace, target.table),
-                user_error: None,
-            }),
-            false => {
-                let binding = planning.binding();
-                Ok(CtasTargetPreflightOutcome::Ready(
-                    PreparedCtasTargetPreflight {
-                        facts: CtasTargetPreflightFacts {
-                            provider_id: binding.descriptor().provider_id.as_str().to_string(),
-                            instance_id: binding.descriptor().instance_id.as_str().to_string(),
-                            incarnation: binding.incarnation().to_bytes(),
-                            capability_version:
-                                novarocks_spi::connector::CONNECTOR_STAGED_CREATE_CONTRACT_VERSION,
-                            target_namespace: target.namespace.clone(),
-                            target_table: target.table.clone(),
-                        },
-                        handle: Arc::new(CoreStandardCtasTargetPreflight {
-                            target,
-                            lease,
-                            _unanchored_ctas_cleanup_lease: unanchored_ctas_cleanup_lease,
-                            write_lease,
-                            context,
-                        }),
-                    },
-                ))
-            }
-        }
+        // The provider's staged-create publication contract is the only
+        // authority allowed to decide whether IF NOT EXISTS is a no-op. A
+        // frontend metadata read is not a substitute for its exact commit
+        // result and would race the publication frontier.
+        let binding = planning.binding();
+        Ok(CtasTargetPreflightOutcome::Ready(
+            PreparedCtasTargetPreflight {
+                facts: CtasTargetPreflightFacts {
+                    provider_id: binding.descriptor().provider_id.as_str().to_string(),
+                    instance_id: binding.descriptor().instance_id.as_str().to_string(),
+                    incarnation: binding.incarnation().to_bytes(),
+                    capability_version:
+                        novarocks_spi::connector::CONNECTOR_STAGED_CREATE_CONTRACT_VERSION,
+                    target_namespace: target.namespace.clone(),
+                    target_table: target.table.clone(),
+                },
+                handle: Arc::new(CoreStandardCtasTargetPreflight {
+                    target,
+                    lease,
+                    _unanchored_ctas_cleanup_lease: unanchored_ctas_cleanup_lease,
+                    write_lease,
+                    context,
+                }),
+            },
+        ))
     }
 
     fn prepare_standard_ctas_source(
@@ -1926,12 +1938,20 @@ impl CtasEngine for DmlExecutionKernel {
             .publish(request.clone())
             .map_err(connector_failure)?
         {
-            ConnectorStagedCreatePublishOutcome::Applied { receipt, .. } => {
-                Ok(StandardCtasPublishOutcome::Applied { receipt })
-            }
-            ConnectorStagedCreatePublishOutcome::NoOp { receipt, .. } => {
-                Ok(StandardCtasPublishOutcome::NoOp { receipt })
-            }
+            ConnectorStagedCreatePublishOutcome::Applied {
+                receipt,
+                finalization,
+            } => Ok(StandardCtasPublishOutcome::Applied {
+                receipt,
+                finalization,
+            }),
+            ConnectorStagedCreatePublishOutcome::NoOp {
+                receipt,
+                finalization,
+            } => Ok(StandardCtasPublishOutcome::NoOp {
+                receipt,
+                finalization,
+            }),
             ConnectorStagedCreatePublishOutcome::Conflict { failure }
             | ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure } => {
                 Ok(StandardCtasPublishOutcome::KnownUncommitted {
@@ -1944,6 +1964,39 @@ impl CtasEngine for DmlExecutionKernel {
                     evidence,
                 })
             }
+        }
+    }
+
+    fn adjudicate_standard_ctas_publication(
+        &self,
+        target: &dyn CtasPreparedTarget,
+        evidence: ExternalMutationEvidence,
+    ) -> Result<StandardCtasPublicationAdjudicationOutcome, CtasFailure> {
+        let target = downcast_standard_target(target)?;
+        let outcome = target
+            .lease
+            .adjudicate_publication(ConnectorStagedCreatePublicationAdjudicationRequest {
+                target_operation_id:
+                    novarocks_spi::connector::ConnectorStagedCreateOperationId::from_bytes(
+                        target.publication_id.to_bytes(),
+                    ),
+                evidence,
+                context: target.context.clone(),
+            })
+            .map_err(connector_failure)?;
+        match outcome {
+            ConnectorStagedCreatePublicationAdjudicationOutcome::Published {
+                receipt,
+                finalization,
+            } => Ok(StandardCtasPublicationAdjudicationOutcome::Published {
+                receipt,
+                finalization,
+            }),
+            ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
+                failure, ..
+            } => Ok(StandardCtasPublicationAdjudicationOutcome::CommitUnknown {
+                failure: mutation_failure(failure),
+            }),
         }
     }
 }
