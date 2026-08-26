@@ -2,9 +2,9 @@
 id: ADR-0106
 title: "Native wire layering and terminal content identity"
 domain: [crate-boundary, distributed-query-lifecycle, runtime-filter, provider-spi]
-status: active
+status: superseded
 supersedes: [ADR-0078, ADR-0079, ADR-0098, ADR-0105]
-superseded-by: null
+superseded-by: ADR-0113
 date: 2026-08-25
 provenance:
   - "mechanism: native wire generated-model split, shared codecs, and retained terminal content identity"

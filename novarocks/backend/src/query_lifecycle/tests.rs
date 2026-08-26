@@ -34,7 +34,6 @@ use novarocks_proto_models::{common, filter, novarocks as proto_novarocks, plan}
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 use prost::Message;
-use sha2::Digest;
 
 use super::entry::QueryLifecyclePhase;
 use super::registry::{
@@ -475,7 +474,11 @@ fn terminal_fallback_conflict_releases_bounded_delivery_record() {
         .abort_query(
             QueryAbortRequest::new(
                 execution_id,
-                request.digest().expect("validated init digest"),
+                request
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "terminal conflict",
             )
             .expect("valid abort"),
@@ -531,7 +534,11 @@ fn terminal_fallback_gone_releases_bounded_delivery_record() {
         .abort_query(
             QueryAbortRequest::new(
                 execution_id,
-                request.digest().expect("validated init digest"),
+                request
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "stale terminal ingress",
             )
             .expect("valid abort"),
@@ -658,7 +665,11 @@ fn attach_reserves_p0_before_control_ready_and_releases_on_terminal_cleanup() {
     let error = match registry.attach_control(
         QueryControlAttach::new(
             second.manifest().execution_id(),
-            second.digest().expect("validated init digest"),
+            second
+                .manifest()
+                .expect("validated init manifest")
+                .digest()
+                .expect("validated init digest"),
             1,
         )
         .expect("valid control attach"),
@@ -672,7 +683,11 @@ fn attach_reserves_p0_before_control_ready_and_releases_on_terminal_cleanup() {
         .abort_query(
             QueryAbortRequest::new(
                 first.manifest().execution_id(),
-                first.digest().expect("validated init digest"),
+                first
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "release P0 reservation",
             )
             .expect("valid abort"),
@@ -710,7 +725,11 @@ fn injected_p0_faults_reject_before_control_ready_and_leave_entry_retryable() {
         let error = match registry.attach_control(
             QueryControlAttach::new(
                 execution_id,
-                request.digest().expect("validated init digest"),
+                request
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 1,
             )
             .expect("valid control attach"),
@@ -779,7 +798,11 @@ fn restoration_status_counts_all_retained_execution_indexes_without_clearing_the
         .abort_query(
             QueryAbortRequest::new(
                 lifecycle_tombstone.manifest().execution_id(),
-                lifecycle_tombstone.digest().expect("validated init digest"),
+                lifecycle_tombstone
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "retain lifecycle tombstone",
             )
             .expect("valid lifecycle tombstone abort"),
@@ -789,7 +812,11 @@ fn restoration_status_counts_all_retained_execution_indexes_without_clearing_the
         .abort_query(
             QueryAbortRequest::new(
                 pre_init_tombstone.manifest().execution_id(),
-                pre_init_tombstone.digest().expect("validated init digest"),
+                pre_init_tombstone
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "retain pre-init tombstone",
             )
             .expect("valid pre-init tombstone abort"),
@@ -829,10 +856,7 @@ fn protocol_unique_id(id: UniqueId) -> common::UniqueId {
     }
 }
 
-fn runtime_filter_contribution(
-    execution_id: QueryExecutionId,
-    participant_id: u32,
-) -> RuntimeFilterContribution {
+fn runtime_filter_contribution(participant_id: u32) -> RuntimeFilterContribution {
     let lifecycle = filter::RuntimeFilterQueryLifecycleOptions {
         delivery_expire_ms: 1,
         query_expire_ms: 1,
@@ -842,25 +866,10 @@ fn runtime_filter_contribution(
         transport_max_pending_entries: 1,
         transport_max_pending_bytes: 1,
     };
-    let install = filter::RuntimeFilterParticipantInstall::default();
-    let envelope = filter::InstallRuntimeFilterDeploymentRequest {
-        query_id: Some(common::UniqueId {
-            hi: execution_id.query_id().high(),
-            lo: execution_id.query_id().low(),
-        }),
-        deployment_epoch: execution_id.attempt_id().get(),
-        participant_id,
-        lifecycle: Some(lifecycle),
-        install: Some(install.clone()),
-    };
-    let mut digest = sha2::Sha256::new();
-    digest.update(b"novarocks.query-lifecycle.runtime-filter-contribution.v1\0");
-    digest.update(envelope.encode_to_vec());
     RuntimeFilterContribution::parse(proto_novarocks::RuntimeFilterContribution {
         participant_id,
         lifecycle: Some(lifecycle),
-        install: Some(install),
-        contribution_digest: digest.finalize().to_vec(),
+        install: Some(filter::RuntimeFilterParticipantInstall::default()),
     })
     .expect("valid runtime-filter contribution")
 }
@@ -872,7 +881,7 @@ fn init_request_fixture(
     query_deadline_unix_ms: u64,
 ) -> QueryInitRequest {
     let execution_id = execution_id(query_low, attempt);
-    let runtime_filter = runtime_filter_contribution(execution_id, 3);
+    let runtime_filter = runtime_filter_contribution(3);
     let manifest = ParticipantManifest::new(
         execution_id,
         ParticipantBackendIdentity::new(
@@ -938,7 +947,7 @@ fn fragment_runtime_filter_init_request_fixture(
         default_query_options(),
         10_000,
         [],
-        Some(runtime_filter_contribution(execution_id, 3)),
+        Some(runtime_filter_contribution(3)),
         Duration::from_secs(30),
         QueryControlEndpoint::new("127.0.0.1", 9031).expect("valid report endpoint"),
     )
@@ -954,7 +963,11 @@ fn attach_control(
         .attach_control(
             QueryControlAttach::new(
                 request.manifest().execution_id(),
-                request.digest().expect("validated init digest"),
+                request
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 1,
             )
             .expect("valid control attach"),
@@ -1045,22 +1058,20 @@ fn stage_request(
     instances: &[UniqueId],
 ) -> QueryStageRequest {
     let execution_id = protocol_execution_id(request.manifest().execution_id());
-    let init_digest = protocol_manifest_digest(request.digest().expect("validated init digest"));
+    let init_digest = protocol_manifest_digest(
+        request
+            .manifest()
+            .expect("validated init manifest")
+            .digest()
+            .expect("validated init digest"),
+    );
     let fragments = instances
         .iter()
         .copied()
         .map(|instance| stage_fragment(instance, digest_byte))
         .collect::<Vec<_>>();
-    let digest = StageDigest::compute_v1(execution_id, init_digest, &fragments)
-        .expect("valid test Stage digest");
-    QueryStageRequest::new(
-        execution_id,
-        init_digest,
-        StageDigestVersion::V1,
-        digest,
-        fragments,
-    )
-    .expect("valid stage request")
+    QueryStageRequest::new(execution_id, init_digest, StageDigestVersion::V1, fragments)
+        .expect("valid stage request")
 }
 
 fn protocol_execution_id(execution_id: QueryExecutionId) -> QueryExecutionId {
@@ -1073,11 +1084,20 @@ fn protocol_manifest_digest(
     digest
 }
 
+fn stage_digest(stage: &QueryStageRequest) -> StageDigest {
+    StageDigest::compute_v1(
+        stage.execution_id(),
+        stage.init_digest(),
+        &stage.fragments(),
+    )
+    .expect("valid test Stage digest")
+}
+
 fn start_request(request: &QueryInitRequest, stage: &QueryStageRequest) -> QueryStartRequest {
     QueryStartRequest::new(
         protocol_execution_id(request.manifest().execution_id()),
         StageDigestVersion::V1,
-        stage.digest(),
+        stage_digest(stage),
     )
     .expect("valid test Start request")
 }
@@ -1162,16 +1182,6 @@ fn stage_requires_matching_manifest_exact_set_and_control_attachment() {
         protocol_execution_id(request.manifest().execution_id()),
         novarocks_proto::lifecycle::ParticipantManifestDigest::new([7; 32]),
         StageDigestVersion::V1,
-        StageDigest::compute_v1(
-            protocol_execution_id(request.manifest().execution_id()),
-            novarocks_proto::lifecycle::ParticipantManifestDigest::new([7; 32]),
-            &expected
-                .iter()
-                .copied()
-                .map(|instance| stage_fragment(instance, 1))
-                .collect::<Vec<_>>(),
-        )
-        .expect("well formed mismatched stage digest"),
         expected
             .iter()
             .copied()
@@ -1206,7 +1216,11 @@ fn service_only_empty_stage_starts_and_abort_prevents_late_start() {
         .abort_query(
             QueryAbortRequest::new(
                 request.manifest().execution_id(),
-                request.digest().expect("validated init digest"),
+                request
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "abort staged service participant",
             )
             .expect("valid abort"),
@@ -1349,7 +1363,11 @@ fn query_lifecycle_abort_digest_mismatch_keeps_live_entry_attachable() {
             .abort_query(
                 QueryAbortRequest::new(
                     request.manifest().execution_id(),
-                    different.digest().expect("validated init digest"),
+                    different
+                        .manifest()
+                        .expect("validated init manifest")
+                        .digest()
+                        .expect("validated init digest"),
                     "mismatched digest must not terminate",
                 )
                 .expect("valid mismatched abort request"),
@@ -1363,7 +1381,11 @@ fn query_lifecycle_abort_digest_mismatch_keeps_live_entry_attachable() {
         .attach_control(
             QueryControlAttach::new(
                 request.manifest().execution_id(),
-                request.digest().expect("validated init digest"),
+                request
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 1,
             )
             .expect("valid control attach"),
@@ -1650,7 +1672,11 @@ fn query_lifecycle_init_abort_race_never_publishes_initialized_and_rolls_back_on
     let registry = registry_with(runtime.clone(), 8);
     let request = init_request_fixture(6, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let execution_id = request.manifest().execution_id();
-    let digest = request.digest().expect("validated init digest");
+    let digest = request
+        .manifest()
+        .expect("validated init manifest")
+        .digest()
+        .expect("validated init digest");
 
     let init_registry = Arc::clone(&registry);
     let init_thread = std::thread::spawn(move || init_registry.init_query(request));
@@ -1704,7 +1730,11 @@ fn query_lifecycle_initializing_to_terminating_publishes_metrics_immediately() {
         );
     let request = init_request_fixture(7, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let execution_id = request.manifest().execution_id();
-    let digest = request.digest().expect("validated init digest");
+    let digest = request
+        .manifest()
+        .expect("validated init manifest")
+        .digest()
+        .expect("validated init digest");
 
     let init_registry = Arc::clone(&registry);
     let init_thread = std::thread::spawn(move || init_registry.init_query(request));
@@ -1920,7 +1950,11 @@ fn query_lifecycle_registry_abort_rejects_late_permit_commit() {
         .abort_query(
             QueryAbortRequest::new(
                 execution_id,
-                request.digest().expect("validated init digest"),
+                request
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "abort before permit commit",
             )
             .expect("valid abort"),
@@ -2658,7 +2692,11 @@ fn query_lifecycle_attach_distinguishes_duplicate_active_from_terminated() {
     let _control = attach_control(&registry, &request);
     let attach = QueryControlAttach::new(
         execution_id,
-        request.digest().expect("validated init digest"),
+        request
+            .manifest()
+            .expect("validated init manifest")
+            .digest()
+            .expect("validated init digest"),
         1,
     )
     .expect("valid control attach");
@@ -2671,7 +2709,11 @@ fn query_lifecycle_attach_distinguishes_duplicate_active_from_terminated() {
         .abort_query(
             QueryAbortRequest::new(
                 execution_id,
-                request.digest().expect("validated init digest"),
+                request
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "terminate before attach",
             )
             .expect("valid abort"),
@@ -2718,7 +2760,11 @@ fn query_lifecycle_tombstone_capacity_evicts_only_oldest_tombstone() {
             .abort_query(
                 QueryAbortRequest::new(
                     execution_id,
-                    request.digest().expect("validated init digest"),
+                    request
+                        .manifest()
+                        .expect("validated init manifest")
+                        .digest()
+                        .expect("validated init digest"),
                     "bounded tombstone",
                 )
                 .expect("valid abort"),
@@ -2768,7 +2814,11 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
         .abort_query(
             QueryAbortRequest::new(
                 first_execution,
-                first.digest().expect("validated init digest"),
+                first
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "first tombstone",
             )
             .expect("valid abort"),
@@ -2791,7 +2841,11 @@ fn query_lifecycle_tombstone_capacity_evicts_committed_fragment_mapping() {
         .abort_query(
             QueryAbortRequest::new(
                 second_execution,
-                second.digest().expect("validated init digest"),
+                second
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "evict first tombstone",
             )
             .expect("valid abort"),
@@ -2869,7 +2923,11 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
         .abort_query(
             QueryAbortRequest::new(
                 first_execution,
-                first.digest().expect("validated init digest"),
+                first
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "first tombstone",
             )
             .expect("valid abort"),
@@ -2892,7 +2950,11 @@ fn late_terminal_from_evicted_execution_cannot_target_reused_fragment_instance()
         .abort_query(
             QueryAbortRequest::new(
                 eviction_execution,
-                eviction.digest().expect("validated init digest"),
+                eviction
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "evict first tombstone",
             )
             .expect("valid abort"),
@@ -2962,7 +3024,11 @@ fn query_lifecycle_tombstone_releases_active_capacity() {
         .abort_query(
             QueryAbortRequest::new(
                 first.manifest().execution_id(),
-                first.digest().expect("validated init digest"),
+                first
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "release capacity",
             )
             .expect("valid abort"),
@@ -3008,7 +3074,11 @@ fn query_lifecycle_tombstone_retention_reclaims_expired_tombstone_incrementally(
         .abort_query(
             QueryAbortRequest::new(
                 terminated_id,
-                terminated.digest().expect("validated init digest"),
+                terminated
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "retention",
             )
             .expect("valid abort"),
@@ -3061,7 +3131,11 @@ fn query_lifecycle_tombstone_retention_evicts_committed_fragment_mapping() {
         .abort_query(
             QueryAbortRequest::new(
                 first_execution,
-                first.digest().expect("validated init digest"),
+                first
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "retention cleanup",
             )
             .expect("valid abort"),
@@ -3253,7 +3327,11 @@ fn query_lifecycle_registry_metrics_follow_state_rejection_and_termination() {
         .abort_query(
             QueryAbortRequest::new(
                 execution_id,
-                request.digest().expect("validated init digest"),
+                request
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "metrics termination",
             )
             .expect("valid abort"),
@@ -3397,7 +3475,11 @@ fn query_lifecycle_runtime_filter_abort_failure_retains_capacity_until_sweep_ret
         .abort_query(
             QueryAbortRequest::new(
                 execution_id,
-                request.digest().expect("validated init digest"),
+                request
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "abort with cleanup failure",
             )
             .expect("valid abort"),
@@ -3444,7 +3526,11 @@ fn query_lifecycle_install_failure_racing_abort_preserves_first_reason_without_p
     let registry = registry_with(runtime.clone(), 8);
     let request = init_request_fixture(97, ATTEMPT_1, LOCAL_START_EPOCH, 10_000);
     let execution_id = request.manifest().execution_id();
-    let digest = request.digest().expect("validated init digest");
+    let digest = request
+        .manifest()
+        .expect("validated init manifest")
+        .digest()
+        .expect("validated init digest");
 
     let init_registry = Arc::clone(&registry);
     let init_thread = std::thread::spawn(move || init_registry.init_query(request));
@@ -3500,7 +3586,11 @@ fn query_lifecycle_registry_abort_before_init_leaves_fail_closed_tombstone() {
         .abort_query(
             QueryAbortRequest::new(
                 execution_id,
-                request.digest().expect("validated init digest"),
+                request
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
                 "abort before init",
             )
             .expect("valid abort"),

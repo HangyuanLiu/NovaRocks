@@ -656,7 +656,6 @@ mod tests {
         let participant_id = u32::try_from(backend_idx + 1).expect("participant");
         let contribution = RuntimeFilterContribution::parse(novarocks::RuntimeFilterContribution {
             participant_id,
-            contribution_digest: vec![0; 32],
             ..Default::default()
         })
         .expect("valid opaque contribution");
@@ -754,7 +753,7 @@ mod tests {
             .expect("runtime filter contribution");
 
         assert_eq!(contribution.participant_id(), 3);
-        assert_eq!(contribution.digest(), &[0; 32]);
+        assert_eq!(contribution.as_proto(), runtime_filter(2).1.as_proto());
     }
 
     #[test]

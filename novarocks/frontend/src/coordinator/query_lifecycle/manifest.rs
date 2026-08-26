@@ -72,7 +72,6 @@ pub(super) fn materialize(
             .contains(&ParticipantRole::FragmentExecutor);
         let request = QueryInitRequest::parse(protocol_wire::InitQueryRequest {
             manifest: Some(manifest.as_proto().clone()),
-            init_digest: digest.as_bytes().to_vec(),
         })
         .map_err(|error| {
             contract_error(format!(

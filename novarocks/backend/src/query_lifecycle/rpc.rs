@@ -770,9 +770,7 @@ pub(crate) fn status_from_contract_error(error: ProtocolError) -> tonic::Status 
         | ProtocolErrorKind::InconsistentFields
         | ProtocolErrorKind::Unsupported
         | ProtocolErrorKind::VersionMismatch => tonic::Status::invalid_argument(detail),
-        ProtocolErrorKind::Conflict | ProtocolErrorKind::DigestMismatch => {
-            tonic::Status::already_exists(detail)
-        }
+        ProtocolErrorKind::Conflict => tonic::Status::already_exists(detail),
         ProtocolErrorKind::Capacity => tonic::Status::resource_exhausted(detail),
     }
 }

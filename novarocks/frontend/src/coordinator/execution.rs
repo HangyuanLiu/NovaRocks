@@ -80,7 +80,7 @@ use novarocks_proto::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
     QueryInitOutcome, QueryInitRequest, QueryStageAck, QueryStageOutcome, QueryStageRequest,
     QueryStartAck, QueryStartOutcome, QueryStartRequest, QueryTerminationAck,
-    QueryTerminationReason,
+    QueryTerminationReason, StageDigest,
 };
 #[cfg(test)]
 use novarocks_proto_models::novarocks as protocol;
@@ -487,11 +487,9 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         request: QueryInitRequest,
         _timeout: Duration,
     ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
-        let execution_id = request
-            .manifest()
-            .and_then(|manifest| manifest.execution_id())
-            .map_err(protocol_contract_error)?;
-        let digest = request.digest().map_err(protocol_contract_error)?;
+        let manifest = request.manifest().map_err(protocol_contract_error)?;
+        let execution_id = manifest.execution_id().map_err(protocol_contract_error)?;
+        let digest = manifest.digest().map_err(protocol_contract_error)?;
         QueryInitAck::parse(protocol::InitQueryResponse {
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
                 execution_id,
@@ -529,7 +527,12 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         QueryStageAck::new(
             request.execution_id(),
             request.digest_version(),
-            request.digest(),
+            StageDigest::compute_v1(
+                request.execution_id(),
+                request.init_digest(),
+                &request.fragments(),
+            )
+            .map_err(protocol_contract_error)?,
             QueryStageOutcome::Applied,
             "test participant staged",
         )

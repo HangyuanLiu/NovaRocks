@@ -28,6 +28,7 @@ use novarocks_proto::lifecycle::{
     QueryControlEndpoint, QueryControlEvent, QueryInitAck, QueryInitRequest, QueryStageAck,
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
     QueryTerminalAck, QueryTerminalReportAck, QueryTerminationAck, QueryTerminationReason,
+    StageDigest,
 };
 
 /// Backend-local lifecycle failure categories.
@@ -125,6 +126,18 @@ pub(crate) struct QueryControlAttachment {
     pub(crate) observations: tokio::sync::watch::Receiver<Option<FragmentLiveObservation>>,
 }
 
+/// Derives the stage identity for ingress implementations that reject the
+/// request outright. The request carries the fragments, so the identity is
+/// recoverable without the sender restating it.
+fn stage_digest_of(request: &QueryStageRequest) -> StageDigest {
+    StageDigest::compute_v1(
+        request.execution_id(),
+        request.init_digest(),
+        &request.fragments(),
+    )
+    .expect("validated QueryStageRequest always derives a stage digest")
+}
+
 pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
     fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError>;
 
@@ -137,7 +150,7 @@ pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
         QueryStageAck::new(
             request.execution_id(),
             request.digest_version(),
-            request.digest(),
+            stage_digest_of(&request),
             QueryStageOutcome::RejectedInvalidState,
             "StageFragments is not supported by this lifecycle ingress",
         )

@@ -1371,7 +1371,9 @@ impl QueryLifecycleRegistry {
     pub(crate) fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         let manifest = validated(request.manifest());
         let execution_id = validated(manifest.execution_id());
-        let digest = validated(request.digest());
+        // The admission boundary derives the manifest identity exactly once and
+        // retains it on the entry; later comparisons read the retained value.
+        let digest = validated(manifest.digest());
         if validated(manifest.roles()).contains(&ParticipantRole::FragmentExecutor)
             && manifest.expected_fragment_instance_ids().is_empty()
         {
@@ -1845,8 +1847,14 @@ impl QueryLifecycleRegistry {
     pub(crate) fn begin_stage(&self, request: QueryStageRequest) -> StageBuildDecision {
         let execution_id = request.execution_id();
         let digest_version = request.digest_version();
-        let stage_digest = request.digest();
-        let fragment_count = request.fragments().len();
+        // Derive the stage identity exactly once. Every acknowledgement echoes
+        // it, including the capacity rejection below, so this must precede the
+        // backend-local fragment budget check. Protocol already bounded the
+        // fragment count and encoded size before this carrier was validated.
+        let fragments = request.fragments();
+        let stage_digest = StageDigest::compute_v1(execution_id, request.init_digest(), &fragments)
+            .expect("validated QueryStageRequest always derives a stage digest");
+        let fragment_count = fragments.len();
         if fragment_count > self.config.stage_max_fragments {
             return StageBuildDecision::Complete(
                 QueryStageAck::new(
@@ -4346,6 +4354,12 @@ impl InitWorkspace {
 impl StageBuildPermit {
     pub(crate) fn gate(&self) -> Arc<super::stage::StartGate> {
         Arc::clone(&self.gate)
+    }
+
+    /// The stage identity derived once when the build was reserved. Callers
+    /// acknowledge with this value instead of deriving it again.
+    pub(crate) const fn digest(&self) -> StageDigest {
+        self.digest
     }
 
     pub(crate) fn commit(mut self) -> QueryStageAck {

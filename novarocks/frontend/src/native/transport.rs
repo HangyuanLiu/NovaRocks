@@ -514,7 +514,6 @@ impl QueryLifecycleTransport for LifecycleTransport {
             .manifest()
             .and_then(|manifest| manifest.execution_id())
             .map_err(invalid)?;
-        let digest = request.digest().map_err(invalid)?;
         let response = unary(
             self.client(target)?,
             "InitQuery",
@@ -523,13 +522,12 @@ impl QueryLifecycleTransport for LifecycleTransport {
             request.as_proto().clone(),
         )?;
         let ack = QueryInitAck::parse(response).map_err(invalid)?;
-        if ack.execution_id().map_err(invalid)? != identity
-            || ack.digest().map_err(invalid)? != digest
-        {
-            return Err(invalid(
-                "InitQuery acknowledgement identity or digest mismatch",
-            ));
+        if ack.execution_id().map_err(invalid)? != identity {
+            return Err(invalid("InitQuery acknowledgement identity mismatch"));
         }
+        // The acknowledged manifest identity is compared by the coordinator
+        // against the value it retained when it materialized the participant.
+        // Re-deriving it here would hash the manifest a second time per attempt.
         Ok(ack)
     }
     fn attach_control(
@@ -600,12 +598,11 @@ impl QueryLifecycleTransport for LifecycleTransport {
         let ack = QueryStageAck::parse(response).map_err(invalid)?;
         if ack.execution_id() != request.execution_id()
             || ack.digest_version() != request.digest_version()
-            || ack.digest() != request.digest()
         {
-            return Err(invalid(
-                "StageFragments acknowledgement identity or digest mismatch",
-            ));
+            return Err(invalid("StageFragments acknowledgement identity mismatch"));
         }
+        // The acknowledged stage identity is compared by the coordinator
+        // against the value its StageBatch retained when the batch was frozen.
         Ok(ack)
     }
     fn start_prepared_query(

@@ -98,6 +98,10 @@ impl StageParticipantBinding {
 pub struct StageBatch {
     binding: StageParticipantBinding,
     request: QueryStageRequest,
+    /// Derived once when the batch is frozen. The request no longer carries the
+    /// stage identity, so the Start fence and acknowledgement comparison read
+    /// this retained value instead of re-deriving it per attempt.
+    digest: StageDigest,
 }
 
 impl StageBatch {
@@ -137,10 +141,13 @@ impl StageBatch {
             execution_id,
             binding.init_digest(),
             StageDigestVersion::V1,
-            digest,
             fragments,
         )?;
-        Ok(Self { binding, request })
+        Ok(Self {
+            binding,
+            request,
+            digest,
+        })
     }
 
     pub const fn binding(&self) -> &StageParticipantBinding {
@@ -151,11 +158,15 @@ impl StageBatch {
         &self.request
     }
 
+    pub const fn digest(&self) -> StageDigest {
+        self.digest
+    }
+
     pub fn start_request(&self) -> QueryStartRequest {
         QueryStartRequest::new(
             self.request.execution_id(),
             self.request.digest_version(),
-            self.request.digest(),
+            self.digest,
         )
         .expect("validated Stage request contains a valid Start fence")
     }

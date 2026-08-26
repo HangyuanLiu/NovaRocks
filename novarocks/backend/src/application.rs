@@ -153,6 +153,7 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
             crate::query_lifecycle::StageBuildDecision::Build(permit) => {
                 let execution_id = request.execution_id();
                 let fragments = request.fragments();
+                let stage_digest = permit.digest();
                 let build = self
                     .fragments
                     .stage_fragments(execution_id, &fragments, permit.gate());
@@ -161,7 +162,7 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
                     Err(error) => QueryStageAck::new(
                         request.execution_id(),
                         request.digest_version(),
-                        request.digest(),
+                        stage_digest,
                         QueryStageOutcome::RejectedLocalFailure,
                         error.to_string(),
                     )
@@ -907,6 +908,8 @@ mod tests {
                 ProtoQueryControlAttach {
                     execution_id: manifest.as_proto().execution_id,
                     init_digest: init
+                        .manifest()
+                        .expect("validated init manifest")
                         .digest()
                         .expect("validated InitQuery has digest")
                         .as_bytes()
@@ -1154,6 +1157,8 @@ mod tests {
             .abort_query(protocol_abort_request(
                 &protocol_init,
                 protocol_init
+                    .manifest()
+                    .expect("validated init manifest")
                     .digest()
                     .expect("validated InitQuery has digest")
                     .as_bytes(),
@@ -1255,6 +1260,8 @@ mod tests {
                     .expect("validated manifest execution id"),
                 ParticipantManifestDigest::new(
                     *protocol_init
+                        .manifest()
+                        .expect("validated init manifest")
                         .digest()
                         .expect("validated InitQuery has digest")
                         .as_bytes(),
@@ -1425,6 +1432,8 @@ mod tests {
             .abort_query(protocol_abort_request(
                 &protocol_init,
                 protocol_different
+                    .manifest()
+                    .expect("validated init manifest")
                     .digest()
                     .expect("validated InitQuery has digest")
                     .as_bytes(),
