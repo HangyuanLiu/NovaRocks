@@ -283,6 +283,38 @@ impl DmlError {
         self
     }
 
+    /// Attaches a terminal produced by the statement-local publication state
+    /// machine. This additive API deliberately does not infer a disposition
+    /// from the broad DML error kind.
+    pub(crate) fn with_publication_terminal(mut self, terminal: LakePublicationTerminal) -> Self {
+        self.publication_terminal = Some(terminal);
+        self
+    }
+
+    /// Reports a local finalization failure after the Catalog publication is
+    /// already known committed. The explicit terminal remains authoritative
+    /// and keeps retry disabled.
+    pub(crate) fn known_committed_finalization_failed(
+        terminal: LakePublicationTerminal,
+        error: impl fmt::Display,
+    ) -> Self {
+        debug_assert_eq!(
+            terminal.disposition(),
+            LakePublicationDisposition::KnownCommitted,
+            "known-committed finalization errors require a committed terminal"
+        );
+        Self {
+            kind: DmlErrorKind::CommittedButUnfinalized,
+            message: format!("{error}; publication is known committed; do not retry statement"),
+            operation_id: None,
+            next_action: None,
+            committed_receipt: None,
+            publication_terminal: Some(terminal),
+            user_error: None,
+            engine_error_code: None,
+        }
+    }
+
     pub(crate) fn committed_but_unfinalized(
         operation_id: DmlOperationId,
         committed_receipt: Option<ConnectorWriteReceipt>,
@@ -530,5 +562,67 @@ mod tests {
         );
         assert!(terminal.do_not_retry());
         assert!(error.to_string().contains(&publication_id.to_string()));
+    }
+
+    #[test]
+    fn explicit_terminal_never_uses_error_kind_as_a_disposition_proxy() {
+        let terminal = LakePublicationTerminal::new(
+            LakePublicationMarkerHeader::new(
+                DmlOperationId::new_v7(),
+                LakePublicationFamily::Write,
+            ),
+            LakePublicationTarget::try_new(
+                "ice".to_string(),
+                "db".to_string(),
+                Some("t".to_string()),
+                None,
+            )
+            .expect("target"),
+            LakePublicationDisposition::CommitUnknown,
+            LakePublicationNextAction::InspectPublishedState,
+            None,
+        );
+        let error = DmlError::executor("adapter lost response").with_publication_terminal(terminal);
+
+        assert_eq!(error.kind(), DmlErrorKind::Executor);
+        assert_eq!(
+            error
+                .publication_terminal()
+                .expect("explicit terminal")
+                .disposition(),
+            LakePublicationDisposition::CommitUnknown
+        );
+    }
+
+    #[test]
+    fn committed_finalization_failure_preserves_explicit_committed_terminal() {
+        let terminal = LakePublicationTerminal::new(
+            LakePublicationMarkerHeader::new(
+                DmlOperationId::new_v7(),
+                LakePublicationFamily::Write,
+            ),
+            LakePublicationTarget::try_new(
+                "ice".to_string(),
+                "db".to_string(),
+                Some("t".to_string()),
+                None,
+            )
+            .expect("target"),
+            LakePublicationDisposition::KnownCommitted,
+            LakePublicationNextAction::InspectPublishedState,
+            None,
+        );
+        let error =
+            DmlError::known_committed_finalization_failed(terminal, "cache invalidation failed");
+
+        assert_eq!(error.kind(), DmlErrorKind::CommittedButUnfinalized);
+        assert_eq!(
+            error
+                .publication_terminal()
+                .expect("committed terminal")
+                .disposition(),
+            LakePublicationDisposition::KnownCommitted
+        );
+        assert!(error.to_string().contains("do not retry statement"));
     }
 }

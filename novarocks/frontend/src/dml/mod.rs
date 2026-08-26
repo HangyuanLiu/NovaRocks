@@ -24,6 +24,7 @@
 //! SQL routing land in DML-2.
 
 pub mod add_files;
+pub(crate) mod attempt;
 mod coordination;
 pub mod ctas;
 mod delete;
@@ -32,6 +33,7 @@ pub mod insert;
 pub mod journal;
 pub mod model;
 pub mod mutation;
+pub(crate) mod observability;
 pub mod reconcile;
 pub(crate) mod recovery;
 pub mod runner;
