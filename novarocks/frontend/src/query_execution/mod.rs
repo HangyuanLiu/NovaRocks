@@ -22,6 +22,7 @@ pub mod assembly;
 pub mod backend_command;
 pub mod completion;
 pub(crate) mod connector_binding;
+pub(crate) mod connector_domain;
 pub(crate) mod connector_write_transaction;
 pub mod constant_eval;
 pub mod contract;

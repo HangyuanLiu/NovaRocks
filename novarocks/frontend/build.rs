@@ -23,7 +23,7 @@ const IDL_DIR: &str = "../../idl/novarocks";
 fn main() {
     for file in [
         "common.proto",
-    "connector_read.proto",
+        "connector_read.proto",
         "expr.proto",
         "filter.proto",
         "plan.proto",
