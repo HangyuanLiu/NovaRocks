@@ -310,7 +310,7 @@ pub enum MvApplicationErrorKind {
     AlreadyActive,
     TargetGone,
     Corruption,
-    RecoveryRequired,
+    TerminalFailure,
     ShutdownCancelled,
     CommitUnknown,
     KnownCommittedFinalizeFailed,

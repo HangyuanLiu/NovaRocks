@@ -193,7 +193,7 @@ pub(crate) enum ScheduledRefreshDisposition {
     TargetGone,
     TransientUnavailable(String),
     InvalidDefinition(String),
-    RecoveryRequired(String),
+    TerminalFailure(String),
     Corruption(String),
     InvariantViolation(String),
     ShutdownCancelled,
@@ -209,8 +209,8 @@ impl ScheduledRefreshDisposition {
             MvBackgroundEngineErrorKind::InvalidDefinition => {
                 Self::InvalidDefinition(error.message().to_owned())
             }
-            MvBackgroundEngineErrorKind::RecoveryRequired => {
-                Self::RecoveryRequired(error.message().to_owned())
+            MvBackgroundEngineErrorKind::TerminalFailure => {
+                Self::TerminalFailure(error.message().to_owned())
             }
             MvBackgroundEngineErrorKind::Corruption => Self::Corruption(error.message().to_owned()),
             MvBackgroundEngineErrorKind::InvariantViolation => {
@@ -474,7 +474,7 @@ impl FrontendMvScheduler {
                 }
             }
             ScheduledRefreshDisposition::InvalidDefinition(error)
-            | ScheduledRefreshDisposition::RecoveryRequired(error)
+            | ScheduledRefreshDisposition::TerminalFailure(error)
             | ScheduledRefreshDisposition::Corruption(error)
             | ScheduledRefreshDisposition::InvariantViolation(error) => {
                 ScheduledRefreshRuntimeDecision::Blocked {
@@ -851,7 +851,7 @@ mod tests {
         );
         for disposition in [
             ScheduledRefreshDisposition::InvalidDefinition("bad".to_string()),
-            ScheduledRefreshDisposition::RecoveryRequired("recover".to_string()),
+            ScheduledRefreshDisposition::TerminalFailure("terminal".to_string()),
             ScheduledRefreshDisposition::Corruption("corrupt".to_string()),
             ScheduledRefreshDisposition::InvariantViolation("invariant".to_string()),
         ] {

@@ -683,7 +683,7 @@ fn repository_disposition(
             ScheduledRefreshDisposition::Corruption(error.to_string())
         }
         MvRepositoryErrorKind::CommitUnknown => {
-            ScheduledRefreshDisposition::RecoveryRequired(error.to_string())
+            ScheduledRefreshDisposition::TerminalFailure(error.to_string())
         }
         MvRepositoryErrorKind::InvalidRequest => {
             ScheduledRefreshDisposition::InvariantViolation(error.to_string())
@@ -705,10 +705,10 @@ fn application_disposition(error: MvApplicationError) -> ScheduledRefreshDisposi
         MvApplicationErrorKind::Corruption => {
             ScheduledRefreshDisposition::Corruption(error.message().to_owned())
         }
-        MvApplicationErrorKind::RecoveryRequired
+        MvApplicationErrorKind::TerminalFailure
         | MvApplicationErrorKind::CommitUnknown
         | MvApplicationErrorKind::KnownCommittedFinalizeFailed => {
-            ScheduledRefreshDisposition::RecoveryRequired(error.message().to_owned())
+            ScheduledRefreshDisposition::TerminalFailure(error.message().to_owned())
         }
         MvApplicationErrorKind::ShutdownCancelled => ScheduledRefreshDisposition::ShutdownCancelled,
         MvApplicationErrorKind::Engine | MvApplicationErrorKind::Repository => {

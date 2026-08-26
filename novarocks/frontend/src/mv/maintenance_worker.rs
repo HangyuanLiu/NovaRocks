@@ -347,7 +347,7 @@ impl FrontendMaintenanceWorker {
 
 /// Narrow adapter from automatic policy actions to the existing frontend
 /// durable table-maintenance service.  Any opaque service error is treated as
-/// `RecoveryRequired`, not parsed as text and not retried as a guessed
+/// `TerminalFailure`, not parsed as text and not retried as a guessed
 /// transient failure, because a durable external mutation may be unknown.
 struct TableMaintenanceAutomaticRunner {
     engine: Arc<dyn TableMaintenanceEngine>,
@@ -398,7 +398,7 @@ fn canonical_target(definition: &StoredMvDefinition) -> Option<MaintenanceTarget
 
 fn durable_service_error(error: String) -> MvBackgroundEngineError {
     MvBackgroundEngineError::new(
-        MvBackgroundEngineErrorKind::RecoveryRequired,
+        MvBackgroundEngineErrorKind::TerminalFailure,
         format!("automatic maintenance durable lifecycle returned an opaque error: {error}"),
     )
 }

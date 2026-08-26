@@ -274,7 +274,7 @@ fn repository_error(
         MvRepositoryErrorKind::NotFound => MvBackgroundEngineErrorKind::TargetGone,
         MvRepositoryErrorKind::Unavailable => MvBackgroundEngineErrorKind::TransientUnavailable,
         MvRepositoryErrorKind::Corruption => MvBackgroundEngineErrorKind::Corruption,
-        MvRepositoryErrorKind::CommitUnknown => MvBackgroundEngineErrorKind::RecoveryRequired,
+        MvRepositoryErrorKind::CommitUnknown => MvBackgroundEngineErrorKind::TerminalFailure,
         MvRepositoryErrorKind::InvalidRequest | MvRepositoryErrorKind::Conflict => {
             MvBackgroundEngineErrorKind::InvariantViolation
         }
