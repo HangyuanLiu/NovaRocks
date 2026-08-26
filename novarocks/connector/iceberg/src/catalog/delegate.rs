@@ -269,11 +269,13 @@ impl CatalogDelegate {
                 table_uuid: Some(Arc::from(loaded.metadata().uuid().to_string())),
                 table_location: Some(Arc::from(loaded.metadata().location())),
                 metadata_location: loaded.metadata_location().map(Arc::from),
+                last_updated_ms: loaded.metadata().last_updated_ms(),
             },
             Err(_) => CatalogDropTableReceipt {
                 table_uuid: None,
                 table_location: None,
                 metadata_location: None,
+                last_updated_ms: 0,
             },
         };
         match self.client.drop_table(&ident).await {

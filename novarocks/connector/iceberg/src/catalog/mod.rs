@@ -185,6 +185,9 @@ pub(crate) struct CatalogDropTableReceipt {
     pub(crate) table_uuid: Option<Arc<str>>,
     pub(crate) table_location: Option<Arc<str>>,
     pub(crate) metadata_location: Option<Arc<str>>,
+    /// The table's own last-updated timestamp, in lake time, read before the
+    /// drop. Age evidence for later collection; this owner never compares it.
+    pub(crate) last_updated_ms: i64,
 }
 
 /// The single semantic owner of Iceberg catalog behavior.

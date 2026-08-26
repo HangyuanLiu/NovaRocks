@@ -37,6 +37,7 @@ mod cleanup_candidates;
 pub mod cleanup_maintenance;
 #[path = "catalog_control/data_mutation.rs"]
 pub mod data_mutation;
+pub mod drop_cleanup;
 #[path = "catalog_control/metadata_maintenance.rs"]
 pub(crate) mod metadata_maintenance;
 #[path = "catalog_control/owned_ref_cleanup.rs"]

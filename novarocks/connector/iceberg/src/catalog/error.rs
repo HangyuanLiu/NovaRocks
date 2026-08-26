@@ -152,6 +152,16 @@ pub(crate) enum CatalogOutcome<T> {
     },
 }
 
+/// Proof that a catalog mutation is known committed.
+///
+/// This exists so "delete objects only after the catalog drop committed" is a
+/// compile-time rule rather than a review comment. A witness cannot be
+/// constructed directly; the only source is
+/// [`CatalogOutcome::into_known_committed`], so an unknown or uncommitted
+/// outcome simply cannot produce the value that object deletion requires.
+#[derive(Debug)]
+pub(crate) struct KnownCommitted(());
+
 impl<T> CatalogOutcome<T> {
     pub(crate) fn committed(receipt: T, effect: ExternalMutationEffect) -> Self {
         Self::KnownCommitted {
@@ -181,6 +191,19 @@ impl<T> CatalogOutcome<T> {
                 message,
             ),
             evidence,
+        }
+    }
+
+    /// Consume a committed outcome, yielding its receipt and the witness that
+    /// authorizes post-commit object cleanup.
+    ///
+    /// Returns `None` for every other arm, which is the point: `CommitUnknown`
+    /// must leak rather than delete, and `Unsupported` / `KnownUncommitted`
+    /// have nothing published to clean up after.
+    pub(crate) fn into_known_committed(self) -> Option<(T, KnownCommitted)> {
+        match self {
+            Self::KnownCommitted { receipt, .. } => Some((receipt, KnownCommitted(()))),
+            _ => None,
         }
     }
 
@@ -414,6 +437,34 @@ mod tests {
         let outcome: CatalogOutcome<()> =
             classify_bridge_failure("panicked", CatalogCommitEvidence::for_target("db.t"));
         assert!(outcome.closes_mutation_authority());
+    }
+
+    #[test]
+    fn only_a_committed_outcome_yields_the_cleanup_witness() {
+        // Object deletion needs the witness, and only this arm hands one out.
+        // That is what stops a lost response from authorizing a delete.
+        let committed: CatalogOutcome<&str> =
+            CatalogOutcome::committed("receipt", ExternalMutationEffect::Applied);
+        let (receipt, _witness) = committed
+            .into_known_committed()
+            .expect("a committed outcome authorizes cleanup");
+        assert_eq!(receipt, "receipt");
+
+        let unknown: CatalogOutcome<&str> = CatalogOutcome::unknown(
+            "connection reset",
+            CatalogCommitEvidence::for_target("db.t"),
+        );
+        assert!(
+            unknown.into_known_committed().is_none(),
+            "an unknown outcome must leak, never delete"
+        );
+
+        let uncommitted: CatalogOutcome<&str> =
+            CatalogOutcome::uncommitted(ConnectorMutationFailureKind::Conflict, "rejected");
+        assert!(uncommitted.into_known_committed().is_none());
+
+        let unsupported: CatalogOutcome<&str> = CatalogOutcome::unsupported("no");
+        assert!(unsupported.into_known_committed().is_none());
     }
 
     #[test]
