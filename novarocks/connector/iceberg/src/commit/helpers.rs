@@ -51,7 +51,7 @@ use std::sync::Arc;
 /// `Ok(None)` means the staged action produced no updates at all: it is a
 /// proven no-op against the base state it observed, so there is nothing to
 /// submit and no external effect to linearize.
-pub(super) async fn submit_action_commit(
+pub(crate) async fn submit_action_commit(
     catalog: &dyn Catalog,
     ident: TableIdent,
     mut staged: ActionCommit,

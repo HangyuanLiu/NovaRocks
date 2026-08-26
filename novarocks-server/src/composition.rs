@@ -31,7 +31,7 @@ use novarocks_backend::{BackendServerConfig, QueryLifecycleRegistryConfig};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::connector_factory::IcebergConnectorFactory;
 use novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller;
-use novarocks_connector_iceberg::resources::{IcebergMetadataResources, IcebergExecutionResources};
+use novarocks_connector_iceberg::resources::{IcebergExecutionResources, IcebergMetadataResources};
 use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStorageLakePublication,
     IcebergStorageLakeTargetSnapshotObservation, IcebergStoragePartitionTransform,

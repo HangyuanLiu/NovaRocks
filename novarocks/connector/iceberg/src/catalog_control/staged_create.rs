@@ -84,8 +84,22 @@ pub(crate) struct RestStagedTableCreate {
     pub(crate) initialization_updates: Vec<TableUpdate>,
 }
 
+/// What a staged-create preparation failure proves about dispatch.
+///
+/// The arms deliberately mirror [`crate::catalog::error::CatalogOutcome`]:
+/// this path answers the same question every other publication family answers,
+/// so it must not answer it in a private vocabulary.
 #[derive(Debug)]
 pub(crate) enum RestStagedPrepareFailure {
+    /// Refused before any external side effect, because this catalog cannot
+    /// publish a staged CTAS target at all.
+    ///
+    /// This is the local twin of [`crate::catalog::error::CatalogUnsupported`]
+    /// and carries the same promise: nothing was attempted anywhere. Only
+    /// admission-shaped checks that run ahead of every request may build it —
+    /// once a request may have left this process, refusing it is no longer an
+    /// option and the only honest answers are the two below.
+    Unsupported(String),
     Conflict(String),
     KnownUncommitted(String),
     CommitUnknown(String),
@@ -117,8 +131,11 @@ pub(crate) fn prepare_rest_staged_table(
     partitioning: &[ConnectorPartitionTransform],
     properties: &[(Arc<str>, Arc<str>)],
 ) -> Result<RestStagedTableCreate, RestStagedPrepareFailure> {
+    // The generation-level twin of `admit_create(CreateTableAsSelect)`. Both
+    // gates decide the same thing from the same generation, and both must
+    // decide it before anything is attempted.
     let catalog = runtime.rest_catalog().cloned().ok_or_else(|| {
-        RestStagedPrepareFailure::KnownUncommitted(
+        RestStagedPrepareFailure::Unsupported(
             "atomic staged table publication is unsupported by this Iceberg catalog".to_string(),
         )
     })?;
@@ -216,7 +233,13 @@ pub(crate) fn prepare_rest_staged_table(
                 .await
         })
         .map_err(|error| {
-            RestStagedPrepareFailure::KnownUncommitted(format!(
+            // The runtime bridge fails *around* the request — a thread that
+            // could not spawn and a thread that panicked mid-poll arrive here
+            // as the same string — so it cannot say whether the staged create
+            // reached the server. Same rule as
+            // `catalog::error::classify_bridge_failure`: treat it as a lost
+            // response, never as proof that nothing happened.
+            RestStagedPrepareFailure::CommitUnknown(format!(
                 "prepare staged REST table runtime: {error}"
             ))
         })?
@@ -542,6 +565,31 @@ impl IcebergStagedCreateAdapter {
         );
     }
 
+    /// Report a prepare failure that may already have changed the catalog.
+    ///
+    /// Every caller is past the staged-create dispatch, so the slot is latched
+    /// *before* the report is assembled: a failure while assembling it must
+    /// still leave an operation that no later abort or re-prepare can reopen.
+    fn prepare_commit_unknown(
+        &self,
+        operation_id: ConnectorStagedCreateOperationId,
+        message: impl Into<Arc<str>>,
+    ) -> Result<ConnectorStagedCreatePrepareOutcome, ConnectorError> {
+        self.set_unknown(operation_id);
+        let evidence = self.evidence(
+            operation_id,
+            "staged-create-prepare",
+            Bytes::copy_from_slice(&operation_id.to_bytes()),
+        )?;
+        Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown {
+            failure: ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Unavailable,
+                message,
+            ),
+            evidence,
+        })
+    }
+
     fn build_action(
         &self,
         prepared: &PreparedOperation,
@@ -848,31 +896,37 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         match result {
             Ok(staged) => {
                 let table_location = staged.table.metadata().location().to_string();
-                let provenance = ConnectorCtasUnanchoredProvenance::try_new(
-                    request.publication_id,
-                    request.table.clone(),
-                    true,
-                    Some(*staged.table.metadata().uuid().as_bytes()),
-                    now_ms()?,
-                )?;
+                // Past this point the staged create has been dispatched and
+                // accepted, so no local failure may still be reported as
+                // "nothing happened". `?` would do exactly that: the frontend
+                // turns an `Err` here into an ordinary statement failure and
+                // loses the possibly-applied verdict.
+                let provenance = match now_ms().and_then(|created_at_ms| {
+                    ConnectorCtasUnanchoredProvenance::try_new(
+                        request.publication_id,
+                        request.table.clone(),
+                        true,
+                        Some(*staged.table.metadata().uuid().as_bytes()),
+                        created_at_ms,
+                    )
+                }) {
+                    Ok(provenance) => provenance,
+                    Err(error) => {
+                        return self.prepare_commit_unknown(
+                            request.operation_id,
+                            format!(
+                                "derive CTAS unanchored provenance after staged create: {error}"
+                            ),
+                        );
+                    }
+                };
                 if let Err(error) =
                     write_unanchored_ctas_provenance(&self.runtime, &table_location, &provenance)
                 {
-                    let evidence = self.evidence(
+                    return self.prepare_commit_unknown(
                         request.operation_id,
-                        "staged-create-prepare",
-                        Bytes::copy_from_slice(&request.operation_id.to_bytes()),
-                    )?;
-                    self.set_unknown(request.operation_id);
-                    return Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown {
-                        failure: ConnectorMutationFailure::new(
-                            ConnectorMutationFailureKind::Unavailable,
-                            format!(
-                                "persist CTAS unanchored provenance after staged create: {error}"
-                            ),
-                        ),
-                        evidence,
-                    });
+                        format!("persist CTAS unanchored provenance after staged create: {error}"),
+                    );
                 }
                 let payload = Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes());
                 let handle = ConnectorStagedTableHandle::try_new(
@@ -902,6 +956,24 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     finalization: ExternalMutationFinalization::Complete,
                 })
             }
+            Err(RestStagedPrepareFailure::Unsupported(message)) => {
+                self.operations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&request.operation_id);
+                // The neutral outcome has no `Unsupported` arm, and it should
+                // not grow one: its arms answer a dispatch question — did
+                // anything happen out there? — and a refusal answers "no",
+                // exactly like any other proven-uncommitted failure. The reason
+                // for the refusal rides in the failure kind, where callers that
+                // care about "cannot" versus "could not" already look.
+                Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unsupported,
+                        message,
+                    ),
+                })
+            }
             Err(RestStagedPrepareFailure::Conflict(message)) => {
                 self.operations
                     .lock()
@@ -927,19 +999,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 })
             }
             Err(RestStagedPrepareFailure::CommitUnknown(message)) => {
-                let evidence = self.evidence(
-                    request.operation_id,
-                    "staged-create-prepare",
-                    Bytes::copy_from_slice(&request.operation_id.to_bytes()),
-                )?;
-                self.set_unknown(request.operation_id);
-                Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Unavailable,
-                        message,
-                    ),
-                    evidence,
-                })
+                self.prepare_commit_unknown(request.operation_id, message)
             }
         }
     }
@@ -1232,12 +1292,24 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 })
             }
             Err(error) => {
-                self.record_terminal(operation_id, OperationState::Prepared(prepared));
-                Ok(ConnectorStagedCreatePublishOutcome::KnownUncommitted {
+                // The runtime bridge wraps the assert-create commit, so it
+                // cannot prove the request never left this process. Reporting
+                // it as uncommitted would hand the slot back as `Prepared`,
+                // which re-opens both a second publish and an abort that
+                // deletes the data files of a publication that may have landed.
+                let evidence = self.publish_evidence(
+                    request.operation_id,
+                    operation_id,
+                    &prepared,
+                    expected_snapshot_id,
+                )?;
+                self.set_publication_unknown(operation_id, &evidence, prepared);
+                Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Internal,
-                        error,
+                        ConnectorMutationFailureKind::Unavailable,
+                        format!("publish staged REST table runtime: {error}"),
                     ),
+                    evidence,
                 })
             }
         }
@@ -1416,6 +1488,18 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
     }
 }
 
+/// The single gate every driving operation passes through.
+///
+/// `plan_write`, `bind_write`, `publish` and `abort` all start here, and only
+/// `Prepared` — the one state in which nothing has been dispatched for this
+/// frontier — hands the aggregate out. Every other state, `Unknown` and
+/// `PublicationUnknown` among them, falls into the one catch-all arm below: it
+/// is put back untouched and the caller is refused. There is no per-state
+/// branch to get wrong, which is what makes "no abort, no cleanup, no second
+/// dispatch after a possibly-applied request" structural here rather than a
+/// rule each caller has to remember. It is the same rule
+/// [`crate::catalog::transaction::Transaction`] enforces for every other
+/// publication family.
 fn take_prepared(
     operations: &Mutex<HashMap<ConnectorStagedCreateOperationId, OperationState>>,
     operation_id: ConnectorStagedCreateOperationId,
@@ -1516,7 +1600,10 @@ pub(crate) fn ctas_staging_location(
 ) -> Result<String, RestStagedPrepareFailure> {
     let warehouse_uri = warehouse_uri.trim_end_matches('/');
     if warehouse_uri.is_empty() {
-        return Err(RestStagedPrepareFailure::KnownUncommitted(
+        // Same refusal `NovaRocksRestCatalog::admit_staged_create` reports, and
+        // for the same reason: a staging root that is not enumerable cannot be
+        // collected. Pure string work, so nothing has been attempted.
+        return Err(RestStagedPrepareFailure::Unsupported(
             "standard REST CTAS requires an explicit warehouse URI for its staging namespace"
                 .to_string(),
         ));
@@ -1561,8 +1648,146 @@ mod tests {
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::resources::IcebergMetadataResources;
     use novarocks_spi::connector::{
-        ConnectorInstanceId, ConnectorMutationOperationId, ConnectorProviderId,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorMutationOperationId,
+        ConnectorProviderId, ConnectorTableIdentity, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + std::time::Duration::from_secs(60),
+            Arc::new(NeverCancelled),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("valid request context")
+    }
+
+    /// A REST generation that never contacts its endpoint.
+    ///
+    /// `RestCatalogBuilder::load` only assembles config — the HTTP context is a
+    /// `OnceCell` filled on first use — so a REST control generation is
+    /// constructible offline. The warehouse is deliberately absent: that is the
+    /// configuration in which CTAS is refused.
+    fn rest_runtime() -> IcebergMetadataContext {
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let handle = executor.handle().clone();
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), "http://127.0.0.1:1".to_string()),
+            ],
+        )
+        .expect("configuration");
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
+        );
+        IcebergMetadataContext::try_new(
+            IcebergCatalogControlState::new(configuration),
+            IcebergMetadataResources::new(binding, handle),
+        )
+        .expect("control runtime")
+    }
+
+    fn adapter_for(runtime: Arc<IcebergMetadataContext>) -> IcebergStagedCreateAdapter {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+        };
+        let provider = Arc::new(IcebergMetadata::new(
+            descriptor.clone(),
+            ConnectorInstanceIncarnation::new(),
+            Arc::clone(&runtime),
+        ));
+        let write = Arc::new(IcebergWriteControl::new(
+            descriptor,
+            provider.incarnation(),
+            runtime,
+        ));
+        IcebergStagedCreateAdapter::try_new(provider, write).expect("staged-create adapter")
+    }
+
+    fn warehouseless_rest_adapter() -> (
+        IcebergStagedCreateAdapter,
+        ConnectorStagedCreatePrepareRequest,
+    ) {
+        let adapter = adapter_for(Arc::new(rest_runtime()));
+        let owner = adapter.owner();
+        let operation_id = ConnectorMutationOperationId::new();
+        let request = ConnectorStagedCreatePrepareRequest {
+            table: ConnectorTableIdentity {
+                instance_id: owner.instance_id.clone(),
+                namespace: Arc::from("db"),
+                table: Arc::from("t"),
+            },
+            owner,
+            publication_id: novarocks_spi::connector::LakePublicationId::from_bytes(
+                operation_id.to_bytes(),
+            ),
+            operation_id,
+            columns: Vec::new(),
+            partitioning: Vec::new(),
+            properties: BTreeMap::new(),
+            policy: CreatePolicy::FailIfExists,
+            context: context(),
+        };
+        (adapter, request)
+    }
+
+    /// A prepared aggregate with no writer bound, for state-machine tests.
+    fn prepared_operation(runtime: &IcebergMetadataContext) -> PreparedOperation {
+        let location = "file:///tmp/novarocks-staged-create/table";
+        let schema = crate::iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+                1,
+                "id",
+                crate::iceberg::spec::Type::Primitive(crate::iceberg::spec::PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            location.to_string(),
+            crate::iceberg::spec::FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let table = crate::iceberg::table::Table::builder()
+            .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).expect("identifier"))
+            .file_io(crate::fs_io::build_file_io_for_location(location, None))
+            .metadata(metadata)
+            .build()
+            .expect("table");
+        PreparedOperation {
+            publication_id: novarocks_spi::connector::LakePublicationId::new_v7(),
+            handle_digest: [7u8; 32],
+            staged: RestStagedTableCreate {
+                catalog: Arc::clone(runtime.rest_catalog().expect("REST generation")),
+                table,
+                initialization_updates: Vec::new(),
+            },
+            policy: CreatePolicy::FailIfExists,
+            planning: None,
+            write: None,
+        }
+    }
 
     fn hadoop_runtime() -> IcebergMetadataContext {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
@@ -1606,11 +1831,78 @@ mod tests {
             Ok(_) => panic!("Hadoop must not expose a REST staged-create surface"),
             Err(failure) => failure,
         };
+        // `Unsupported`, not `KnownUncommitted`: the two arms differ in what
+        // they promise. Both say nothing was published, but only this one says
+        // nothing was attempted, and a caller may act on that.
         assert!(matches!(
             failure,
-            RestStagedPrepareFailure::KnownUncommitted(message)
+            RestStagedPrepareFailure::Unsupported(message)
                 if message.contains("unsupported")
         ));
+    }
+
+    /// The second gate agrees with the first, for the same reason.
+    ///
+    /// A REST catalog without an explicit warehouse has nowhere enumerable to
+    /// stage, which is exactly what `NovaRocksRestCatalog::admit_staged_create`
+    /// refuses. Both gates read the same generation, so they must not be able
+    /// to disagree about whether CTAS is possible at all.
+    #[test]
+    fn rest_generation_without_a_warehouse_refuses_staged_create_as_unsupported() {
+        let runtime = rest_runtime();
+        assert!(
+            runtime.rest_catalog().is_some(),
+            "a REST generation retains its concrete client even without a warehouse"
+        );
+        runtime
+            .novarocks_catalog()
+            .admit_create(crate::catalog::CatalogCreateIntent::CreateTableAsSelect)
+            .expect_err("admission refuses CTAS without an enumerable staging root");
+        let failure = match prepare_rest_staged_table(
+            &runtime,
+            ConnectorMutationOperationId::new(),
+            novarocks_spi::connector::LakePublicationId::new_v7(),
+            "db",
+            "t",
+            &[],
+            &[],
+            &[],
+        ) {
+            Ok(_) => panic!("a warehouse-less REST generation cannot stage a CTAS target"),
+            Err(failure) => failure,
+        };
+        assert!(matches!(
+            failure,
+            RestStagedPrepareFailure::Unsupported(message)
+                if message.contains("explicit warehouse URI")
+        ));
+    }
+
+    /// How an `Unsupported` refusal crosses the SPI boundary.
+    ///
+    /// The neutral prepare outcome has three arms and deliberately no
+    /// `Unsupported` one: the arm answers whether anything happened out there,
+    /// and a refusal answers "no". So the refusal travels in `KnownUncommitted`
+    /// and carries its reason in the failure kind. This asserts that shape, and
+    /// that a refused prepare leaves no operation slot behind.
+    #[test]
+    fn an_unsupported_ctas_reaches_the_spi_as_uncommitted_with_an_unsupported_kind() {
+        let (adapter, request) = warehouseless_rest_adapter();
+        let operation_id = request.operation_id;
+        let outcome = adapter.prepare(request).expect("prepare answers typed");
+        let ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure } = outcome else {
+            panic!("a refusal must not claim an unknown or conflicting outcome");
+        };
+        assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unsupported);
+        assert!(
+            adapter
+                .operations
+                .lock()
+                .expect("operation lock")
+                .get(&operation_id)
+                .is_none(),
+            "a refusal that attempted nothing must not retain an operation slot"
+        );
     }
 
     /// The adapter attaches everywhere; the refusal moved to admission.
@@ -1729,7 +2021,7 @@ mod tests {
                 .unwrap_err();
         assert!(matches!(
             error,
-            RestStagedPrepareFailure::KnownUncommitted(message)
+            RestStagedPrepareFailure::Unsupported(message)
                 if message.contains("explicit warehouse URI")
         ));
     }
@@ -1743,6 +2035,60 @@ mod tests {
                 "s3://warehouse/db/table/data/_staging/{}",
                 operation_marker(operation_id)
             )
+        );
+    }
+
+    /// A possibly-applied publication can never be aborted or driven again.
+    ///
+    /// `take_prepared` is the single gate in front of `plan_write`,
+    /// `bind_write`, `publish` and `abort`, and `abort_prepared` — the only
+    /// code here that deletes objects — is reachable only after that gate
+    /// hands out the aggregate. So proving the gate refuses every
+    /// non-`Prepared` state, and puts it back untouched, proves that a
+    /// `PublicationUnknown` operation cannot be cleaned up, re-published, or
+    /// silently re-prepared under the same identity.
+    #[test]
+    fn an_unknown_publication_can_never_be_aborted_or_driven_again() {
+        let runtime = rest_runtime();
+        let operation_id = ConnectorMutationOperationId::new();
+        let closed = [
+            OperationState::PublicationUnknown(PublicationUnknownOperation {
+                evidence_digest: [5u8; 32],
+                prepared: prepared_operation(&runtime),
+            }),
+            OperationState::Unknown,
+            OperationState::Published,
+            OperationState::Aborted,
+            OperationState::Preparing,
+        ];
+        for state in closed {
+            let label = format!("{:?}", std::mem::discriminant(&state));
+            let operations = Mutex::new(HashMap::from([(operation_id, state)]));
+            take_prepared(&operations, operation_id)
+                .err()
+                .unwrap_or_else(|| panic!("{label} must not hand out an abortable aggregate"));
+            assert!(
+                operations
+                    .lock()
+                    .expect("operation lock")
+                    .contains_key(&operation_id),
+                "{label} must be put back, not consumed by a refused caller"
+            );
+        }
+
+        // The one state that does hand it out, so the assertions above are
+        // about the state and not about the gate being closed to everything.
+        let operations = Mutex::new(HashMap::from([(
+            operation_id,
+            OperationState::Prepared(prepared_operation(&runtime)),
+        )]));
+        take_prepared(&operations, operation_id).expect("a prepared target is still drivable");
+        assert!(
+            !operations
+                .lock()
+                .expect("operation lock")
+                .contains_key(&operation_id),
+            "a driven target leaves its slot to the caller's terminal record"
         );
     }
 

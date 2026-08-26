@@ -189,8 +189,11 @@ impl IcebergUnanchoredCtasCleanupAdapter {
         &self,
         publication: novarocks_spi::connector::LakePublicationId,
     ) -> Result<String, ConnectorError> {
+        // `try_new` already proved this generation has an explicit warehouse,
+        // so the only arm this can take is unreachable here. Report it as the
+        // refusal it is rather than as a transient failure a caller might retry.
         let table = ctas_staging_location(self.warehouse_root(), publication)
-            .map_err(|_| unavailable("derive unanchored CTAS staging location"))?;
+            .map_err(|_| unsupported("derive unanchored CTAS staging location"))?;
         table
             .strip_suffix("/table")
             .map(ToOwned::to_owned)
@@ -201,8 +204,10 @@ impl IcebergUnanchoredCtasCleanupAdapter {
         &self,
         publication: novarocks_spi::connector::LakePublicationId,
     ) -> Result<String, ConnectorError> {
+        // See `root_for`: unreachable, and a refusal rather than a retryable
+        // failure if it ever became reachable.
         let table = ctas_staging_location(self.warehouse_root(), publication)
-            .map_err(|_| unavailable("derive unanchored CTAS staging location"))?;
+            .map_err(|_| unsupported("derive unanchored CTAS staging location"))?;
         unanchored_ctas_provenance_location(&table)
     }
 
