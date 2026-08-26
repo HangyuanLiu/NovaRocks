@@ -41,6 +41,7 @@ pub mod runtime;
 pub mod runtime_filter;
 mod server;
 pub(crate) mod session_error;
+pub mod state_family;
 pub mod state_store;
 pub mod statistics;
 pub mod statistics_jobs;
