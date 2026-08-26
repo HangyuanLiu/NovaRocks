@@ -2245,6 +2245,18 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
         "advertise_host".to_string(),
         Value::String(native_trust_fixture.fixture.advertise_host().to_string()),
     );
+    if role == ClusterProcessRole::Be {
+        let frontend_endpoint = NativeEndpoint::from_host_port(
+            native_trust_fixture.fixture.advertise_host(),
+            runtime.fe_grpc_port,
+        )
+        .map_err(anyhow::Error::msg)
+        .context("render frontend endpoint with the exact native trust reference")?;
+        cluster.insert(
+            "frontend_endpoint".to_string(),
+            Value::String(frontend_endpoint.to_string()),
+        );
+    }
     // `role = fe` persists backend membership in StateStore. Every ephemeral
     // SQL-test FE needs its own store so it cannot restore membership rows
     // whose dynamically allocated BE endpoints belong to another launch.
@@ -5288,6 +5300,25 @@ enable_path_style_access = true
                 .get("private_key_path")
                 .is_none(),
             "automatic profile must not emit PEM paths"
+        );
+
+        let be = render_cross_process_launch_config(CrossProcessLaunchConfig {
+            base_config: BASE_CONFIG,
+            role: ClusterProcessRole::Be,
+            be_index: 0,
+            runtime: &runtime,
+            runtime_dir: Path::new("/tmp/novarocks-native-trust-reference"),
+            query_lifecycle_faults_enabled: false,
+            cleanup_faults_enabled: false,
+            overlay: None,
+            native_trust_fixture: &fixture,
+        })
+        .expect("render automatic BE config");
+        let be: Value = be.parse().expect("parse automatic BE config");
+        assert_eq!(
+            be["cluster"]["frontend_endpoint"].as_str(),
+            Some("localhost:29070"),
+            "BE announce must use the same DNS reference as the FE automatic TLS listener"
         );
     }
 
