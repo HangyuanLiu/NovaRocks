@@ -33,7 +33,7 @@ use novarocks_proto::lifecycle::QueryExecutionId;
 use crate::query_execution::artifact::ValidatedFragmentSchedule;
 use crate::query_execution::split_assignment::{
     AssignmentTarget, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitSource,
-    SplitAssignmentDriverError, TaskUpdateTransport,
+    SplitAssignmentDriverError, TaskUpdateTransport, emit_split_source_close_marker,
 };
 use novarocks_sql::plan_read::FragmentId;
 
@@ -124,6 +124,9 @@ impl Drop for RoundSplitAssignmentPlan {
                     "closing an unstarted split source failed"
                 );
             }
+            // The same evidence a started round emits: a source opened and
+            // closed without ever assigning is still a source that closed.
+            emit_split_source_close_marker(source.plan_node_id);
         }
     }
 }

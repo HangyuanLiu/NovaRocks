@@ -147,12 +147,7 @@ impl TypedConnectorScanShared {
     /// Without a materialization the connector already read the whole output,
     /// so the chunk passes through untouched and no schema is rebuilt.
     fn materialize_output(&self, chunk: Chunk) -> Result<Chunk, String> {
-        let Some(materialization) = self.output_materialization.as_ref() else {
-            return Ok(chunk);
-        };
-        let batch = materialization.transform.transform(chunk.batch)?;
-        Chunk::try_new_with_chunk_schema(batch, Arc::clone(&materialization.chunk_schema))
-            .map_err(|error| error.to_string())
+        materialize_output(self.output_materialization.as_ref(), chunk)
     }
 
     /// Fail fast on a cancelled or expired attempt, before any provider call.
@@ -165,6 +160,39 @@ impl TypedConnectorScanShared {
         }
         Ok(())
     }
+}
+
+/// Turn one read chunk into the node's output chunk.
+///
+/// Without a materialization the connector already read the whole output, so
+/// the chunk passes through untouched and no schema is rebuilt.
+fn materialize_output(
+    materialization: Option<&OutputMaterialization>,
+    chunk: Chunk,
+) -> Result<Chunk, String> {
+    let Some(materialization) = materialization else {
+        return Ok(chunk);
+    };
+    let batch = materialization.transform.transform(chunk.batch)?;
+    Chunk::try_new_with_chunk_schema(batch, Arc::clone(&materialization.chunk_schema))
+        .map_err(|error| error.to_string())
+}
+
+/// Emit one connector-reader evidence marker, behind the shared test gate.
+///
+/// It prints scheduling identity and nothing else: a marker must never carry a
+/// credential, a key metadata blob, or any part of a data value.
+fn emit_page_source_marker(marker: &str, plan_node_id: i32, sequence_id: Option<u64>) {
+    if !crate::config::debug_emit_connector_reader_marker() {
+        return;
+    }
+    match sequence_id {
+        Some(sequence_id) => {
+            println!("{marker} plan_node={plan_node_id} sequence={sequence_id}");
+        }
+        None => println!("{marker} plan_node={plan_node_id}"),
+    }
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 /// A physical source for one typed connector scan node of one task attempt.
@@ -458,6 +486,14 @@ impl TypedConnectorSplitIter {
             })?;
         let adapter = ConnectorPageAdapter::new(self.shared.slot_ids.clone(), page_source);
         self.current = Some(self.sources.register(adapter)?);
+        // Acceptance evidence: a distributed run proves a page source was
+        // opened on this backend for this exact scheduled split, which a
+        // result-only assertion cannot show.
+        emit_page_source_marker(
+            "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN",
+            self.shared.plan_node_id,
+            Some(split.sequence_id()),
+        );
         if let Some(profile) = self.profile.as_ref() {
             profile.counter_add("TypedConnectorPageSourcesOpened", ProfileUnit::Unit, 1);
         }
@@ -466,7 +502,15 @@ impl TypedConnectorSplitIter {
 
     fn close_current(&mut self) -> Result<(), String> {
         match self.current.take() {
-            Some(source) => source.close(),
+            Some(source) => {
+                let closed = source.close();
+                emit_page_source_marker(
+                    "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
+                    self.shared.plan_node_id,
+                    None,
+                );
+                closed
+            }
             None => Ok(()),
         }
     }
@@ -1308,6 +1352,7 @@ mod tests {
             provider,
             session(),
             request(Arc::new(NeverCancelled)),
+            NODE,
             vec![SlotId::new(1)],
         )
     }
@@ -1699,11 +1744,21 @@ struct TypedSystemTableScanShared {
     provider: Arc<dyn TypedConnectorSystemTableProvider>,
     session: ConnectorSession,
     request: ConnectorRequestContext,
-    /// Ordered output slot ids. `slot_ids[i]` names page channel `i`.
+    plan_node_id: i32,
+    /// Ordered read slot ids. `slot_ids[i]` names page channel `i`.
     slot_ids: Vec<SlotId>,
+    /// Builds the columns the connector does not read, exactly as an ordinary
+    /// typed scan does. A system relation is not exempt: its output can carry
+    /// derived columns too, and refusing them here rather than materializing
+    /// them would be a second policy for the same fact.
+    output_materialization: Option<OutputMaterialization>,
 }
 
 impl TypedSystemTableScanShared {
+    fn materialize_output(&self, chunk: Chunk) -> Result<Chunk, String> {
+        materialize_output(self.output_materialization.as_ref(), chunk)
+    }
+
     /// Fail fast on a cancelled or expired attempt, before any provider call.
     fn check_liveness(&self, action: &str) -> Result<(), String> {
         if self.request.cancellation().is_cancelled() {
@@ -1724,6 +1779,7 @@ impl TypedConnectorSystemTableScanSource {
         provider: Arc<dyn TypedConnectorSystemTableProvider>,
         session: ConnectorSession,
         request: ConnectorRequestContext,
+        plan_node_id: i32,
         slot_ids: Vec<SlotId>,
     ) -> Self {
         Self {
@@ -1732,9 +1788,29 @@ impl TypedConnectorSystemTableScanSource {
                 provider,
                 session,
                 request,
+                plan_node_id,
                 slot_ids,
+                output_materialization: None,
             }),
         }
+    }
+
+    /// Build the node's output columns from what the connector read.
+    ///
+    /// The same seam an ordinary typed scan has, for the same reason: exactly
+    /// one place produces the node's output schema.
+    pub fn with_output_materialization(
+        mut self,
+        transform: Arc<dyn ConnectorBatchTransform>,
+        chunk_schema: ChunkSchemaRef,
+    ) -> Self {
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("typed system relation scan source is not shared before it is bound");
+        shared.output_materialization = Some(OutputMaterialization {
+            transform,
+            chunk_schema,
+        });
+        self
     }
 }
 
@@ -1836,6 +1912,14 @@ impl TypedSystemTableIter {
             .map_err(|error| format!("create typed system relation page source: {error}"))?;
         let adapter = ConnectorPageAdapter::new(self.shared.slot_ids.clone(), page_source);
         self.current = Some(self.sources.register(adapter)?);
+        // No sequence: a system relation read has no split, and printing one
+        // would be the first step toward asserting scheduling identity it does
+        // not have.
+        emit_page_source_marker(
+            "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN",
+            self.shared.plan_node_id,
+            None,
+        );
         if let Some(profile) = self.profile.as_ref() {
             profile.counter_add("TypedSystemTablePageSourcesOpened", ProfileUnit::Unit, 1);
         }
@@ -1844,7 +1928,15 @@ impl TypedSystemTableIter {
 
     fn close_current(&mut self) -> Result<(), String> {
         match self.current.take() {
-            Some(source) => source.close(),
+            Some(source) => {
+                let closed = source.close();
+                emit_page_source_marker(
+                    "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
+                    self.shared.plan_node_id,
+                    None,
+                );
+                closed
+            }
             None => Ok(()),
         }
     }
@@ -1880,7 +1972,12 @@ impl Iterator for TypedSystemTableIter {
             };
             match source.pull() {
                 Err(error) => return Some(self.fail(error)),
-                Ok(PageConversion::Chunk(chunk)) => return Some(Ok(chunk)),
+                Ok(PageConversion::Chunk(chunk)) => {
+                    return Some(match self.shared.materialize_output(chunk) {
+                        Ok(chunk) => Ok(chunk),
+                        Err(error) => self.fail(error),
+                    });
+                }
                 Ok(PageConversion::Idle) => {
                     // A metadata reader that is waiting is still waiting on its
                     // own I/O, not on scheduling, so this yields rather than

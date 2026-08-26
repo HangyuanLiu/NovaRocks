@@ -31,6 +31,7 @@ pub(crate) use driver::{
 };
 pub(crate) use round::{
     DEFAULT_PUMP_BATCH_SIZE, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitSource,
+    emit_split_source_close_marker,
 };
 pub(crate) use transport::{
     AcceptedPlanNode, TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError,

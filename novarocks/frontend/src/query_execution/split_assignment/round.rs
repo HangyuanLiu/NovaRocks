@@ -142,6 +142,10 @@ impl RoundSplitAssignment {
             // contract makes it idempotent, and a batch that already completed
             // normally may still be returned to whoever asked for it.
             let _ = entry.source.close();
+            // Acceptance evidence: a pre-ControlReady replan must close the
+            // old round's sources rather than reuse them, and this is the only
+            // place that can show it happened exactly once.
+            emit_split_source_close_marker(entry.plan_node_id);
         }
     }
 }
@@ -150,6 +154,22 @@ impl Drop for RoundSplitAssignment {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// Emit the split-source close marker, behind the connector-reader test gate.
+///
+/// It prints scheduling identity only: never a relation name, a file path, or
+/// any part of a split's contents.
+pub(crate) fn emit_split_source_close_marker(plan_node_id: i32) {
+    // Debug-only, matching the backend's own reader-marker gate: a release
+    // build must not be able to print execution evidence at all.
+    if !cfg!(debug_assertions)
+        || std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER").is_none()
+    {
+        return;
+    }
+    println!("NOVAROCKS_CONNECTOR_SPLIT_SOURCE_CLOSE plan_node={plan_node_id}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 /// Closes a round's split assignment from another thread.
