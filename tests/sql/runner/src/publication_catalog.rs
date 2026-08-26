@@ -468,7 +468,10 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
                 );
             }
             PublicationFault::IncompleteDiscovery => {
-                return json_response(StatusCode::OK, json!({"namespaces": []}));
+                // A valid empty list means discovery completed with no
+                // namespaces. The MV contract needs an actual standard REST
+                // read failure so SPI classifies this catalog as Incomplete.
+                return temporary_failure("catalog discovery read failed");
             }
             PublicationFault::CorruptPackage => {
                 return response_with_headers(

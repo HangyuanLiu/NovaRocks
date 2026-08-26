@@ -453,7 +453,7 @@ pub enum PublicationCatalogFault {
     /// Hold the downstream-successful response until the runner has killed
     /// the frontend while the issuing statement is still in flight.
     AfterCommitHoldForFrontendKill,
-    /// Return a syntactically valid but incomplete standard namespace listing.
+    /// Fail exactly one standard namespace enumeration read.
     IncompleteDiscovery,
     /// Return malformed bytes for exactly one standard table package read.
     CorruptPackage,
