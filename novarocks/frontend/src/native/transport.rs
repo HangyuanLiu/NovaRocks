@@ -1065,6 +1065,10 @@ pub(crate) struct GrpcTaskUpdateTransport {
     clients: std::collections::BTreeMap<usize, Client>,
 }
 
+#[expect(
+    dead_code,
+    reason = "Constructed by the coordinator round driver in the same PR."
+)]
 impl GrpcTaskUpdateTransport {
     pub(crate) fn new(
         backends: &[(usize, RuntimeEndpoint)],

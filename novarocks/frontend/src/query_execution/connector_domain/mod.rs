@@ -26,24 +26,9 @@ mod handle;
 mod scheduling;
 mod table_scan;
 
-// MIGRATION: the semantic lowering that consumes these lands with the
-// frontend split-assignment driver. `expect` rather than `allow` so the
-// attribute itself fails once the consumers exist.
-#[expect(
-    unused_imports,
-    reason = "Consumed by the frontend typed-scan lowering in the same PR."
-)]
 pub(crate) use handle::{CatalogHandle, Split, TableHandle};
-#[expect(
-    unused_imports,
-    reason = "Consumed by the frontend split-assignment driver in the same PR."
-)]
 pub(crate) use scheduling::{
     PlanNodeAssignmentState, ScheduledSplit, SplitAssignment, SplitAssignmentError,
     SplitSequenceAllocator, TaskUpdateRequest,
 };
-#[expect(
-    unused_imports,
-    reason = "Consumed by the frontend typed-scan lowering in the same PR."
-)]
 pub(crate) use table_scan::{TableScanNode, TableScanNodeError};
