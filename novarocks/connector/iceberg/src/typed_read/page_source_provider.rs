@@ -56,6 +56,21 @@ pub struct IcebergPageSourceProviderOptions {
     pub reader_options: FileReaderOptions,
 }
 
+impl IcebergPageSourceProviderOptions {
+    /// The budget a fragment instance uses when it states no preference. The
+    /// values match the other native reader budgets rather than introducing a
+    /// third number for the same idea.
+    pub fn with_default_budget() -> Self {
+        Self {
+            budget: FileReadBudget {
+                max_rows: std::num::NonZeroUsize::new(4096).expect("nonzero"),
+                max_bytes: std::num::NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero"),
+            },
+            reader_options: FileReaderOptions::default(),
+        }
+    }
+}
+
 /// One BE fragment instance and scan node's Iceberg reader factory.
 pub struct IcebergPageSourceProvider {
     access_binding: IcebergReadBinding,

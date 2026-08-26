@@ -471,7 +471,8 @@ pub fn compose_backend_server_config(
         )
         .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
-        execution_installers: compose_backend_execution_installers(config, runtime)?,
+        execution_installers: compose_backend_execution_installers(config, runtime.clone())?,
+        typed_provider_factories: compose_backend_typed_provider_factories(config, runtime)?,
     })
 }
 
@@ -673,6 +674,35 @@ pub fn compose_frontend_control_factories(
         runtime,
     ));
     Ok(vec![std::sync::Arc::new(factory)])
+}
+
+/// The worker-side typed provider factory of every built-in provider.
+///
+/// StarRocks has no typed read contract yet, so it deliberately contributes no
+/// factory: a typed StarRocks scan must fail to resolve rather than reach a
+/// placeholder that would look like support.
+pub fn compose_backend_typed_provider_factories(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<
+    Vec<(
+        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        std::sync::Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+    )>,
+> {
+    let binding = IcebergReadBinding::from_resources(compose_connector_file_planning_resources(
+        config, runtime,
+    )?);
+    let factory = std::sync::Arc::new(
+        novarocks_connector_iceberg::typed_provider_factory::IcebergTypedProviderFactory::new(
+            binding,
+            novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::with_default_budget(),
+        ),
+    );
+    Ok(vec![(
+        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg,
+        factory,
+    )])
 }
 
 pub fn compose_iceberg_execution_resources(

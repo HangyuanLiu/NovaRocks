@@ -3465,6 +3465,7 @@ dependencies = [
  "novarocks-frontend",
  "novarocks-fs",
  "novarocks-native-trust",
+ "novarocks-proto",
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-state-store-foundationdb",
