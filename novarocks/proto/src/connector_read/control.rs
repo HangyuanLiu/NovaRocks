@@ -149,6 +149,36 @@ impl TypedSystemTablePlan {
     }
 }
 
+/// The two snapshots whose visible-row sets a change window differences.
+///
+/// The window is a set difference between two endpoints, not a replay of the
+/// manifests between them: a row that was written and deleted inside the
+/// window is invisible at both endpoints and must not appear.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TypedChangeWindow {
+    from_snapshot_id: i64,
+    to_snapshot_id: i64,
+}
+
+impl TypedChangeWindow {
+    pub const fn new(from_snapshot_id: i64, to_snapshot_id: i64) -> Self {
+        Self {
+            from_snapshot_id,
+            to_snapshot_id,
+        }
+    }
+
+    /// The exclusive start endpoint: rows visible here are the window's "before".
+    pub const fn from_snapshot_id(&self) -> i64 {
+        self.from_snapshot_id
+    }
+
+    /// The inclusive end endpoint: rows visible here are the window's "after".
+    pub const fn to_snapshot_id(&self) -> i64 {
+        self.to_snapshot_id
+    }
+}
+
 /// How a relation should be read at a point in time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypedRelationVersion {
@@ -210,6 +240,19 @@ pub trait TypedConnectorMetadata: Send + Sync {
         session: &ConnectorSession,
         name: &SchemaTableName,
     ) -> Result<Option<TypedSystemTablePlan>, ConnectorError>;
+
+    /// Freeze one change window over a relation.
+    ///
+    /// Both endpoints are pinned by the returned handle, exactly as
+    /// [`Self::get_table_handle`] pins one snapshot. `None` means this
+    /// connector does not expose change windows over that relation at all,
+    /// which is different from a window it cannot serve: that is an error.
+    fn get_change_window_plan(
+        &self,
+        session: &ConnectorSession,
+        name: &SchemaTableName,
+        window: TypedChangeWindow,
+    ) -> Result<Option<CatalogTableHandle>, ConnectorError>;
 }
 
 /// The engine-visible outcome of one split-enumeration batch.

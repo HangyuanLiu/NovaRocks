@@ -53,13 +53,27 @@ pub enum ConnectorValueType {
     Varbinary,
     Uuid,
     Fixed { length: u32 },
+    /// A column whose engine type has no comparable counterpart: ROW, ARRAY,
+    /// MAP, and the binary-carried variant types.
+    ///
+    /// It may only type an assignment or the expression variable that names
+    /// one. A [`ConnectorValue`] of this type does not exist, so a
+    /// [`super::predicate::Domain`] over it is unconstructible in the values it
+    /// would need; the wire decoder refuses one outright.
+    NonComparable,
 }
 
 impl ConnectorValueType {
     /// Whether this type orders its values, so a [`super::predicate::Range`]
     /// can be expressed over it.
     pub const fn is_orderable(self) -> bool {
-        !matches!(self, Self::Boolean)
+        !matches!(self, Self::Boolean | Self::NonComparable)
+    }
+
+    /// Whether values of this type can be compared at all, so a
+    /// [`super::predicate::Domain`] can be expressed over it.
+    pub const fn is_comparable(self) -> bool {
+        !matches!(self, Self::NonComparable)
     }
 }
 

@@ -30,8 +30,7 @@ use std::sync::Arc;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::lifecycle::QueryExecutionId;
 
-use crate::query_execution::connector_domain::CatalogHandle;
-use crate::query_execution::schedule::SchedulingPlan;
+use crate::query_execution::artifact::ValidatedFragmentSchedule;
 use crate::query_execution::split_assignment::{
     AssignmentTarget, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitSource,
     SplitAssignmentDriverError, TaskUpdateTransport,
@@ -48,12 +47,13 @@ const DEFAULT_MAX_QUEUED_SPLITS_PER_TASK: u64 = 4096;
 /// legitimate destination, and deriving from placement would silently exclude
 /// an instance that happened to receive nothing at planning time.
 pub(crate) fn assignment_targets(
-    schedule: &SchedulingPlan,
+    schedule: &ValidatedFragmentSchedule,
     scan_nodes: &[(FragmentId, i32)],
 ) -> BTreeMap<i32, Vec<AssignmentTarget>> {
+    let placements_by_fragment = schedule.fragment_placements();
     let mut targets: BTreeMap<i32, Vec<AssignmentTarget>> = BTreeMap::new();
     for &(fragment_id, plan_node_id) in scan_nodes {
-        let Some(placements) = schedule.by_fragment.get(&fragment_id) else {
+        let Some(placements) = placements_by_fragment.get(&fragment_id) else {
             continue;
         };
         let entry = targets.entry(plan_node_id).or_default();
@@ -68,9 +68,11 @@ pub(crate) fn assignment_targets(
 }
 
 /// Every backend this round may deliver a task update to.
-pub(crate) fn assignment_endpoints(schedule: &SchedulingPlan) -> Vec<(usize, RuntimeEndpoint)> {
+pub(crate) fn assignment_endpoints(
+    schedule: &ValidatedFragmentSchedule,
+) -> Vec<(usize, RuntimeEndpoint)> {
     let mut endpoints: BTreeMap<usize, RuntimeEndpoint> = BTreeMap::new();
-    for placements in schedule.by_fragment.values() {
+    for placements in schedule.fragment_placements().values() {
         for placement in placements {
             endpoints
                 .entry(placement.backend_idx)
@@ -78,6 +80,52 @@ pub(crate) fn assignment_endpoints(schedule: &SchedulingPlan) -> Vec<(usize, Run
         }
     }
     endpoints.into_iter().collect()
+}
+
+/// Everything one round needs to start assigning splits, built before the
+/// prepared artifacts are consumed by staging.
+///
+/// It already owns open connector split sources, so it closes them if the
+/// round never starts — staging or Start can still fail between here and
+/// there, and a source dropped without closing leaves the connector holding
+/// whatever the enumeration opened.
+pub(crate) struct RoundSplitAssignmentPlan {
+    transport: Arc<dyn TaskUpdateTransport>,
+    targets: BTreeMap<i32, Vec<AssignmentTarget>>,
+    sources: Vec<RoundSplitSource>,
+}
+
+impl RoundSplitAssignmentPlan {
+    pub(crate) fn new(
+        transport: Arc<dyn TaskUpdateTransport>,
+        targets: BTreeMap<i32, Vec<AssignmentTarget>>,
+        sources: Vec<RoundSplitSource>,
+    ) -> Self {
+        Self {
+            transport,
+            targets,
+            sources,
+        }
+    }
+
+    /// The scan nodes this plan opened a source for.
+    pub(crate) fn plan_node_ids(&self) -> impl Iterator<Item = i32> + '_ {
+        self.sources.iter().map(|source| source.plan_node_id)
+    }
+}
+
+impl Drop for RoundSplitAssignmentPlan {
+    fn drop(&mut self) {
+        for source in &mut self.sources {
+            if let Err(error) = source.source.close() {
+                tracing::warn!(
+                    plan_node_id = source.plan_node_id,
+                    error = %error,
+                    "closing an unstarted split source failed"
+                );
+            }
+        }
+    }
 }
 
 /// A running round's split-assignment worker.
@@ -94,17 +142,18 @@ impl SplitAssignmentRoundGuard {
     /// query that reads nothing through a connector starts no thread.
     pub(crate) fn start(
         execution_id: QueryExecutionId,
-        catalog: CatalogHandle,
-        transport: Arc<dyn TaskUpdateTransport>,
-        tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
-        sources: Vec<RoundSplitSource>,
+        mut plan: RoundSplitAssignmentPlan,
     ) -> Option<Self> {
+        // Taken, not borrowed: the sources move into the round, so the plan's
+        // own drop must not close what the round now owns.
+        let sources = std::mem::take(&mut plan.sources);
+        let transport = Arc::clone(&plan.transport);
+        let tasks = std::mem::take(&mut plan.targets);
         if sources.is_empty() {
             return None;
         }
         let mut assignment = RoundSplitAssignment::new(
             execution_id,
-            catalog,
             transport,
             tasks,
             DEFAULT_MAX_QUEUED_SPLITS_PER_TASK,
@@ -187,7 +236,6 @@ mod tests {
         assert!(
             SplitAssignmentRoundGuard::start(
                 execution_id(),
-                CatalogHandle::new("ice", [1; 16]),
                 Arc::new(NeverCalled),
                 BTreeMap::new(),
                 Vec::new(),

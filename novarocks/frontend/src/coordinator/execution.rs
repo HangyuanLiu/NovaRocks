@@ -33,7 +33,8 @@ use crate::native::fragment_transport::{FetchOutcome, FragmentDispatcher};
 use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::artifact::{
     ConnectorBindingDispatcher, ConnectorBindingInstallObserver,
-    DispatchingConnectorBindingBarrier, RunningNativeExecutionParts,
+    DispatchingConnectorBindingBarrier, PreparedDistributedQuery, RunningNativeExecutionParts,
+    ValidatedFragmentSchedule,
 };
 use crate::query_execution::completion::PreReadyRetryBoundary;
 use crate::query_execution::contract::{
@@ -44,6 +45,7 @@ use crate::query_execution::contract::{
 #[cfg(test)]
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use crate::query_execution::lifecycle_plan::{QueryInitOptions, QueryLifecycleLease};
+use crate::query_execution::split_assignment::RoundSplitSource;
 use crate::query_execution::write::WriteTerminalBuilder;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::runtime::statement_result::StatementResult;
@@ -65,6 +67,9 @@ use super::query_lifecycle::{
 use super::query_registry::{FrontendQueryRegistry, QueryLifecycleConvergenceReader};
 use super::report::FrontendCoordinatorTerminalIngress;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
+use super::split_assignment_round::{
+    RoundSplitAssignmentPlan, SplitAssignmentRoundGuard, assignment_endpoints, assignment_targets,
+};
 use crate::connector::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
 };
@@ -76,7 +81,8 @@ use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::transport::{
-    new_connector_binding_dispatcher, new_fragment_dispatcher, new_query_lifecycle_transport,
+    GrpcTaskUpdateTransport, new_connector_binding_dispatcher, new_fragment_dispatcher,
+    new_query_lifecycle_transport,
 };
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
@@ -1012,6 +1018,12 @@ impl FrontendDistributedQueryCoordinator {
             .map_err(pre_ready_topology_validation_error)?;
         self.registry
             .set_scheduled_backend_ownership(query_id, &scheduled_backend_ownership)?;
+        // Runtime split assignment is a round-owned resource: its sources, its
+        // task set and its transport are all derived from this schedule. They
+        // are built here, while the schedule and the prepared scans are both
+        // still in hand, and started only once the tasks can accept work.
+        let split_assignment_plan =
+            prepare_round_split_assignment(&parts.artifacts, &schedule, self.data_runtime.clone())?;
         let binding_attachment =
             encode_binding_attachment(parts.artifacts.runtime_filter_binding_view())?;
         let scheduled = parts
@@ -1148,6 +1160,11 @@ impl FrontendDistributedQueryCoordinator {
             );
         }
         let execution = staged.start(&lifecycle_barrier)?;
+        // Started only after Start: a backend admits a task update only while
+        // its attempt is staged or running. The guard owns the pump thread, so
+        // every exit path below closes the sources by dropping it.
+        let split_assignment = split_assignment_plan
+            .and_then(|plan| SplitAssignmentRoundGuard::start(execution_id, plan));
         let RunningNativeExecutionParts {
             root_fetch,
             writer_registrations,
@@ -1344,6 +1361,18 @@ impl FrontendDistributedQueryCoordinator {
                 .registry
                 .latch_failure_and_cancel(query_id, error.message().to_string());
             return Err(DistributedQueryError::new(error.kind(), error.message()));
+        }
+        // A split that never reached its task means this query returned fewer
+        // rows than it should, so an assignment failure fails the query even
+        // though the fetch loop already produced an outcome.
+        if let Some(split_assignment) = split_assignment
+            && let Err(error) = split_assignment.finish()
+        {
+            let message = self.fail_and_cancel(
+                query_id,
+                format!("runtime split assignment failed: {error}"),
+            );
+            return Err(message);
         }
         if !connector_read_sessions.is_empty()
             && let Err(error) = connector_read_sessions.finish_completed()
@@ -2435,4 +2464,73 @@ mod tests {
         assert_eq!(control_ready_closures.load(Ordering::SeqCst), 1);
         assert_eq!(stage_or_start_closures.load(Ordering::SeqCst), 1);
     }
+}
+
+/// Open one lazy split source per typed connector scan of this round.
+///
+/// Enumeration itself does not happen here: `get_splits` hands back a source
+/// the round pumps. Returning `None` means this query reads nothing through a
+/// connector, so no pump thread is started at all.
+///
+/// The session is minted per round rather than reused from preparation:
+/// preparation runs before the execution id exists, so there is no session to
+/// inherit, and enumeration must not borrow an identity that named a different
+/// attempt.
+fn prepare_round_split_assignment(
+    artifacts: &PreparedDistributedQuery,
+    schedule: &ValidatedFragmentSchedule,
+    data_runtime: FrontendDataRuntime,
+) -> Result<Option<RoundSplitAssignmentPlan>, DistributedQueryError> {
+    let scan_nodes = artifacts
+        .typed_scans()
+        .map(|(fragment_id, plan_node_id, _)| (fragment_id, plan_node_id))
+        .collect::<Vec<_>>();
+    if scan_nodes.is_empty() {
+        return Ok(None);
+    }
+    let session = crate::query_execution::compiler::typed_connector_session().map_err(failed)?;
+    let mut sources = Vec::with_capacity(scan_nodes.len());
+    for (_, plan_node_id, scan) in artifacts.typed_scans() {
+        let table_scan = &scan.prepared.table_scan;
+        let source = scan
+            .prepared
+            .split_manager
+            .get_splits(
+                &session,
+                table_scan.table().handle(),
+                table_scan.source().assignments(),
+                &table_scan.dynamic_filter_columns(),
+                &scan.prepared.constraint,
+            )
+            .map_err(|error| {
+                failed(format!(
+                    "typed connector scan node_id={plan_node_id} cannot open its split source: {error}"
+                ))
+            })?;
+        sources.push(RoundSplitSource {
+            plan_node_id,
+            catalog: table_scan.table().catalog().clone(),
+            source,
+        });
+    }
+    let targets = assignment_targets(schedule, &scan_nodes);
+    // Every scan node must have somewhere to send its work. An empty task set
+    // would silently drop every split of that scan.
+    for plan_node_id in sources.iter().map(|source| source.plan_node_id) {
+        if targets
+            .get(&plan_node_id)
+            .is_none_or(|targets| targets.is_empty())
+        {
+            return Err(failed(format!(
+                "typed connector scan node_id={plan_node_id} has no admitted task in this schedule"
+            )));
+        }
+    }
+    let transport = GrpcTaskUpdateTransport::new(&assignment_endpoints(schedule), data_runtime)
+        .map_err(|error| failed(format!("task update transport: {error}")))?;
+    Ok(Some(RoundSplitAssignmentPlan::new(
+        Arc::new(transport),
+        targets,
+        sources,
+    )))
 }

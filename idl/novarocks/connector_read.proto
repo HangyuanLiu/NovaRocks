@@ -54,6 +54,13 @@ enum ValueTypeKind {
   VALUE_TYPE_KIND_VARBINARY = 14;
   VALUE_TYPE_KIND_UUID = 15;
   VALUE_TYPE_KIND_FIXED = 16;
+  // A column whose engine type has no comparable counterpart: ROW, ARRAY, MAP
+  // and the binary-carried variant types. Such a column can be projected and
+  // read, and can never appear in a Value, a Domain, or a comparison, so no
+  // Value arm exists for it. It states only that no comparable counterpart
+  // exists; the column's actual shape is carried by the plan node's own output
+  // column, which the fragment decoder agrees with these assignments.
+  VALUE_TYPE_KIND_NON_COMPARABLE = 17;
 }
 
 // Decimal and fixed parameters are present exactly when the kind requires them.
@@ -673,7 +680,11 @@ message CatalogTableHandle {
 // One ordered output column of a scan: the plan variable, the connector
 // column it binds, and its exact type.
 message ScanAssignment {
-  string variable = 1;  // non-empty, unique within one scan.
+  // An opaque expression identifier, non-empty and unique within one scan. It
+  // is what a ConnectorExpression names this column by; it is deliberately not
+  // the output column's name, and carries no meaning of its own. The ordered
+  // position is the output contract: assignments[i] produces page channel i.
+  string variable = 1;
   ColumnHandle column = 2;
   ValueType value_type = 3;
 }

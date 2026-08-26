@@ -122,6 +122,7 @@ pub fn decode_value_type(
                 dto::ValueTypeKind::Varchar => ConnectorValueType::Varchar,
                 dto::ValueTypeKind::Varbinary => ConnectorValueType::Varbinary,
                 dto::ValueTypeKind::Uuid => ConnectorValueType::Uuid,
+                dto::ValueTypeKind::NonComparable => ConnectorValueType::NonComparable,
                 dto::ValueTypeKind::Unspecified
                 | dto::ValueTypeKind::Decimal
                 | dto::ValueTypeKind::Fixed => unreachable!("handled above"),
@@ -140,6 +141,7 @@ pub fn encode_value_type(value_type: ConnectorValueType) -> dto::ValueType {
         fixed_length: None,
     };
     encoded.kind = match value_type {
+        ConnectorValueType::NonComparable => dto::ValueTypeKind::NonComparable,
         ConnectorValueType::Boolean => dto::ValueTypeKind::Boolean,
         ConnectorValueType::Integer => dto::ValueTypeKind::Integer,
         ConnectorValueType::BigInt => dto::ValueTypeKind::BigInt,

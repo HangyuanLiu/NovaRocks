@@ -566,20 +566,21 @@ mod tests {
         .expect("a well-formed iceberg column handle")
     }
 
-    /// A scan that assigns `id` and `flag` and binds filter 7 to `id`.
+    /// A scan that assigns two columns and binds filter 7 to the first.
     ///
     /// The columns are identified by Iceberg field id inside the handle; there
-    /// is no provider field ordinal anywhere on this path.
+    /// is no provider field ordinal anywhere on this path, and the variables
+    /// are the producer's own opaque positional names.
     fn scan_source() -> ConnectorTableScanSource {
         let mut raw = test_support::scan_source_proto();
         raw.assignments.push(dto::ScanAssignment {
-            variable: "flag".to_owned(),
+            variable: "v1".to_owned(),
             column: Some(test_support::column_handle(2)),
             value_type: Some(encode_value_type(ConnectorValueType::BigInt)),
         });
         raw.dynamic_filters = vec![dto::DynamicFilterBinding {
             filter_id: 7,
-            variable: "id".to_owned(),
+            variable: "v0".to_owned(),
         }];
         ConnectorTableScanSource::parse(raw, FieldPath::root("typed_connector_read"))
             .expect("a well-formed typed scan carrier")

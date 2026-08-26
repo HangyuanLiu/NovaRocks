@@ -1559,6 +1559,14 @@ fn connector_value_at(
     }
 
     Ok(match value_type {
+        // No wire Value arm exists for it and the decoder refuses a domain
+        // typed this way, so reaching here means a predicate was built over a
+        // column the engine already proved has no comparable counterpart.
+        ConnectorValueType::NonComparable => {
+            return Err(corrupt(format!(
+                "iceberg predicate column of {path} is typed non-comparable, which has no value"
+            )));
+        }
         ConnectorValueType::Boolean => {
             ConnectorValue::Boolean(downcast::<BooleanArray>(column, path)?.value(row))
         }

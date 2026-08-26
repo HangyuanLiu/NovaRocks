@@ -148,6 +148,23 @@ impl PreparedDistributedQuery {
         RuntimeFilterArtifactId(self.handoff_id)
     }
 
+    /// Every typed connector scan this round must enumerate splits for.
+    ///
+    /// Preparation deliberately never calls a split manager: enumeration is
+    /// lazy and belongs to the execution round, which owns the sources it
+    /// opens and closes them when the round ends.
+    pub(crate) fn typed_scans(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            FragmentId,
+            i32,
+            &crate::query_execution::preparation::scan::PreparedTypedConnectorScan,
+        ),
+    > + '_ {
+        self.prepared.scan_bindings().typed_scans()
+    }
+
     /// Borrow-only identity and fragment-set view used by the Frontend RF
     /// encoder. SQL-private binding facts are intentionally added by the
     /// dedicated view in the next owner-local layer.
@@ -1052,6 +1069,18 @@ pub struct ValidatedFragmentSchedule {
 }
 
 impl ValidatedFragmentSchedule {
+    /// Where each fragment's instances were admitted.
+    ///
+    /// Deliberately narrower than the whole plan: split assignment needs only
+    /// the placements, and handing out the plan would let a caller re-derive
+    /// routing decisions this schedule already froze.
+    pub(crate) fn fragment_placements(
+        &self,
+    ) -> &BTreeMap<FragmentId, Vec<crate::query_execution::schedule::FragmentInstancePlacement>>
+    {
+        &self.inner.by_fragment
+    }
+
     pub fn validate(
         view: FragmentSchedulingView<'_>,
         execution_id: QueryExecutionId,

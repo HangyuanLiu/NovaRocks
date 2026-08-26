@@ -17,8 +17,8 @@ mod task_update;
 mod value;
 
 pub use control::{
-    TypedColumnBinding, TypedConnectorMetadata, TypedFilterApplication, TypedLimitApplication,
-    TypedRelationVersion, TypedSplitBatch, TypedSystemTablePlan,
+    TypedChangeWindow, TypedColumnBinding, TypedConnectorMetadata, TypedFilterApplication,
+    TypedLimitApplication, TypedRelationVersion, TypedSplitBatch, TypedSystemTablePlan,
 };
 pub use execution::{
     TypedConnectorPageSourceProvider, TypedConnectorProviderFactory, TypedConnectorSplitManager,

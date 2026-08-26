@@ -45,6 +45,10 @@ const IDLE_PUMP_BACKOFF: std::time::Duration = std::time::Duration::from_millis(
 /// One typed scan's split source, with the plan node it feeds.
 pub(crate) struct RoundSplitSource {
     pub(crate) plan_node_id: i32,
+    /// The catalog generation this scan was frozen against. It travels with
+    /// the source because one query may read two catalogs, and every split
+    /// this source produces must be stamped with its own generation.
+    pub(crate) catalog: CatalogHandle,
     pub(crate) source: Box<dyn TypedConnectorSplitSource>,
 }
 
@@ -58,16 +62,19 @@ pub(crate) struct RoundSplitAssignment {
 impl RoundSplitAssignment {
     pub(crate) fn new(
         execution_id: QueryExecutionId,
-        catalog: CatalogHandle,
         transport: Arc<dyn TaskUpdateTransport>,
         tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
         max_queued_splits_per_task: u64,
         sources: Vec<RoundSplitSource>,
     ) -> Self {
+        let catalogs = sources
+            .iter()
+            .map(|source| (source.plan_node_id, source.catalog.clone()))
+            .collect();
         Self {
             driver: SplitAssignmentDriver::new(
                 execution_id,
-                catalog,
+                catalogs,
                 transport,
                 tasks,
                 max_queued_splits_per_task,
@@ -307,14 +314,7 @@ mod tests {
                 }],
             );
         }
-        RoundSplitAssignment::new(
-            execution_id(),
-            CatalogHandle::new("ice", [1; 16]),
-            transport,
-            tasks,
-            1024,
-            sources,
-        )
+        RoundSplitAssignment::new(execution_id(), transport, tasks, 1024, sources)
     }
 
     fn scripted(
@@ -323,6 +323,7 @@ mod tests {
     ) -> RoundSplitSource {
         RoundSplitSource {
             plan_node_id,
+            catalog: CatalogHandle::new("ice", [1; 16]),
             source: Box::new(ScriptedSource {
                 batches: batches.into_iter().collect(),
                 closed: Arc::new(AtomicBool::new(false)),
@@ -434,6 +435,7 @@ mod tests {
         let closed = Arc::new(AtomicBool::new(false));
         let source = RoundSplitSource {
             plan_node_id: 1,
+            catalog: CatalogHandle::new("ice", [1; 16]),
             source: Box::new(ScriptedSource {
                 batches: std::collections::VecDeque::new(),
                 closed: Arc::clone(&closed),

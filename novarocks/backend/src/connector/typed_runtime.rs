@@ -912,7 +912,7 @@ pub(crate) mod test_support {
         dto::ConnectorTableScanSource {
             table: Some(catalog_table_handle()),
             assignments: vec![dto::ScanAssignment {
-                variable: "id".to_owned(),
+                variable: "v0".to_owned(),
                 column: Some(column_handle(1)),
                 value_type: Some(encode_value_type(ConnectorValueType::BigInt)),
             }],
@@ -1442,7 +1442,7 @@ mod tests {
         covered.insert(
             ScanAssignment::parse(
                 dto::ScanAssignment {
-                    variable: "id".to_owned(),
+                    variable: "v0".to_owned(),
                     column: Some(test_support::column_handle(1)),
                     value_type: Some(novarocks_proto::connector_read::encode_value_type(
                         novarocks_spi::connector::read_stack::ConnectorValueType::BigInt,
@@ -1488,7 +1488,7 @@ mod tests {
         let mut proto = test_support::scan_source_proto();
         proto.dynamic_filters = vec![dto::DynamicFilterBinding {
             filter_id: 3,
-            variable: "id".to_owned(),
+            variable: "v0".to_owned(),
         }];
         let scan = ConnectorTableScanSource::parse(proto, FieldPath::root("scan"))
             .expect("valid typed scan source");

@@ -109,6 +109,19 @@ page source 持有的是 dynamic filter 的**共享句柄**而非借用，并随
 `scheduledSplitSequenceId`。前者让「每个未读 row group 前重新取」成为可能，后者让一次 row-group 判定能在不引入
 membership digest 的前提下被归属。
 
+**列类型词汇分两层，但只有一个 enum。** Trino 有完整的 `Type` 系统，`Domain` 另外要求 orderable/comparable；
+NovaRocks 把两者压成了一个 `ValueType`，而 `ScanAssignment.value_type` 同时是**每一个输出列**的类型。后果是
+ROW/ARRAY/MAP/JSON/VARIANT 一列都表达不了——spec 6.8 的 `$files` 27 列因此在 typed 栈上不可读。裁决是不引入递归
+类型编码（那会让 `ConnectorValueType` 失去 `Copy`，波及整个 Domain/Value/predicate 层），而是加一个
+`NON_COMPARABLE` kind：它只声明「没有可比较对应物」这一个事实，不谎称形状。列的真实形状留在 plan node 的
+`OutputColumn` 上，fragment decoder 已经把两侧顺序对齐。`Value` oneof 不给它 arm，protocol 层直接拒绝这种类型的
+domain，所以它在**结构上**进不了谓词。*标量但不精确* 的类型（引擎无法转换的带时区 timestamp、越界 decimal）仍然
+拒绝：把它们叫作 non-comparable 会用一个关于「比较」的词掩盖一个「读不对」的列。
+
+**assignment 的 variable 是不透明标识符，位置才是契约。** `assignments[i]` 产出 page channel `i`，
+`variable` 只是 `ConnectorExpression` 用来称呼这一列的名字，故意不等于输出列名。消费侧因此只能核对数量，
+不能核对名字——一个比较名字的 decoder 会拒绝掉每一个真实 scan。
+
 **边界与非目标。** Parquet 是唯一完整 reader；ORC、Avro、Parquet modular encryption 与加密 manifest 保留同名扩展点并
 在 producer/consumer 两端稳定 `NOT_SUPPORTED`，绝不从路径后缀推断格式。StarRocks 只保持编译并在 read 入口稳定
 `NOT_SUPPORTED`，不为其发明 typed wire variant。ADR-0111 的 ControlReady 前一次性 replan 保持有效：split source、
@@ -132,6 +145,12 @@ mutation effect owner 与 publication 语义不因表示变化而改变，因此
   pruning。现有能力不回退，但新增能力明确留给后续 FE feedback 工作。
 - **StarRocks 短期功能真空。** 其 read 入口在本裁决后返回 `NOT_SUPPORTED`，直到有独立 accepted spec 定义它的 typed
   语义。接受这个空缺，而不是让一个尚未成熟的 connector 反向塑造通用模型。
+- **`NON_COMPARABLE` 让类型词汇不再是一个完整类型系统。** 它能说「这一列不可比较」，不能说它是 ROW 还是 MAP。
+  这对 read 栈够用（形状由 plan node 携带，连接器按自己的 handle 绑定），但意味着 pushdown 表达式无法对复杂列
+  做任何结构性推理。选它是为了不让 `ConnectorValueType` 失去 `Copy`，是成本考量而非它本身更好。
+- **位置化的 assignment variable 让「顺序错了」无法被结构性发现。** 数量之外没有任何检查能证明第 i 个 assignment
+  确实对应第 i 个输出列。安全性依赖 producer 在同一个循环里从同一份 `scan.columns` 同时构造两侧——
+  这是构造性保证，不是校验性保证。
 - **切换面积很大。** 一个 spec、一个 PR、一次原子切换，没有 feature flag、fallback decoder 或可合并的半状态。可合并性
   完全由内部 checkpoint 与文件 ownership 保证，而不是由中间兼容态保证。
 - **`ConnectorSplitManager` 这个名字没有落在 SPI。** Trino 的对应接口在 NovaRocks 是 Protocol 的

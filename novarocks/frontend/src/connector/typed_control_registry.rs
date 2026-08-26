@@ -245,6 +245,15 @@ mod tests {
         ) -> Result<Option<TypedSystemTablePlan>, ConnectorError> {
             Ok(None)
         }
+
+        fn get_change_window_plan(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+            _window: novarocks_proto::connector_read::TypedChangeWindow,
+        ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+            Ok(None)
+        }
     }
 
     impl TypedConnectorSplitManager for StubControl {

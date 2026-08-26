@@ -280,7 +280,13 @@ fn decode_domain(raw: &dto::Domain, path: FieldPath) -> Result<Domain, ProtocolE
         .values
         .as_ref()
         .ok_or_else(|| missing(path.clone().field("values"), "domain requires a value set"))?;
-    let values = decode_value_set(values, path.field("values"))?;
+    let values = decode_value_set(values, path.clone().field("values"))?;
+    if !values.value_type().is_comparable() {
+        return Err(invalid(
+            path.field("values"),
+            "a domain cannot be expressed over a non-comparable column type",
+        ));
+    }
     Ok(Domain::new(values, raw.null_allowed))
 }
 

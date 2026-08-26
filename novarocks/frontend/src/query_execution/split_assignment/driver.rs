@@ -65,6 +65,12 @@ pub(crate) enum SplitAssignmentDriverError {
         reason: String,
         detail: String,
     },
+    /// The round holds no catalog generation for this scan node, so its
+    /// splits cannot be stamped. Guessing another node's generation would send
+    /// a split to a provider binding it does not belong to.
+    UnknownPlanNode {
+        plan_node_id: i32,
+    },
     /// The connector's own enumeration failed. It is never retried blindly:
     /// re-enumerating could produce a different split set for the same pinned
     /// snapshot only if something is wrong, and silently continuing would drop
@@ -82,6 +88,10 @@ impl fmt::Display for SplitAssignmentDriverError {
             Self::NoAdmittedTask { plan_node_id } => write!(
                 formatter,
                 "plan node {plan_node_id} has no admitted task to receive splits"
+            ),
+            Self::UnknownPlanNode { plan_node_id } => write!(
+                formatter,
+                "plan node {plan_node_id} has no frozen catalog generation in this round"
             ),
             Self::Assignment(error) => write!(formatter, "{error}"),
             Self::Transport { target, detail } => write!(
@@ -153,8 +163,12 @@ struct TaskState {
 /// The coordinator-side driver for one execution round.
 pub(crate) struct SplitAssignmentDriver {
     execution_id: QueryExecutionId,
-    /// The catalog generation every split of this round belongs to.
-    catalog: CatalogHandle,
+    /// The catalog generation each scan node's splits belong to.
+    ///
+    /// Per plan node, not per round: one query may read two catalogs, and a
+    /// split stamped with the wrong generation would resolve to another
+    /// provider's binding on the backend and silently read the wrong table.
+    catalogs: BTreeMap<i32, CatalogHandle>,
     transport: std::sync::Arc<dyn TaskUpdateTransport>,
     /// Admitted tasks per plan node, frozen before the Init barrier.
     ///
@@ -175,7 +189,7 @@ pub(crate) struct SplitAssignmentDriver {
 impl SplitAssignmentDriver {
     pub(crate) fn new(
         execution_id: QueryExecutionId,
-        catalog: CatalogHandle,
+        catalogs: BTreeMap<i32, CatalogHandle>,
         transport: std::sync::Arc<dyn TaskUpdateTransport>,
         tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
         max_queued_splits_per_task: u64,
@@ -200,7 +214,7 @@ impl SplitAssignmentDriver {
             .collect();
         Self {
             execution_id,
-            catalog,
+            catalogs,
             transport,
             tasks,
             sequences,
@@ -435,10 +449,11 @@ impl SplitAssignmentDriver {
                 detail: error.to_string(),
             })?;
         let no_more_splits = batch.no_more_splits();
+        let catalog = self.catalog_for(plan_node_id)?;
         let splits = batch
             .into_splits()
             .into_iter()
-            .map(|split| Split::new(self.catalog_for(plan_node_id), split))
+            .map(|split| Split::new(catalog.clone(), split))
             .collect::<Vec<_>>();
         let has_work = !splits.is_empty();
         if !has_work && !no_more_splits {
@@ -449,8 +464,15 @@ impl SplitAssignmentDriver {
         Ok(true)
     }
 
-    fn catalog_for(&self, _plan_node_id: i32) -> CatalogHandle {
-        self.catalog.clone()
+    /// The catalog generation this scan node was frozen against.
+    ///
+    /// Absent means the round was built without this node's scan, which is a
+    /// contract violation rather than a reason to reach for another node's
+    /// catalog.
+    fn catalog_for(&self, plan_node_id: i32) -> Result<&CatalogHandle, SplitAssignmentDriverError> {
+        self.catalogs
+            .get(&plan_node_id)
+            .ok_or_else(|| SplitAssignmentDriverError::UnknownPlanNode { plan_node_id })
     }
 
     /// Close the round.
@@ -617,11 +639,96 @@ mod tests {
         tasks.insert(7_i32, (0..backends).map(target).collect::<Vec<_>>());
         SplitAssignmentDriver::new(
             execution_id(),
-            CatalogHandle::new("ice", [1; 16]),
+            tasks
+                .keys()
+                .map(|plan_node_id| (*plan_node_id, CatalogHandle::new("ice", [1; 16])))
+                .collect(),
             transport,
             tasks,
             1024,
         )
+    }
+
+    /// One query may read two catalogs. A split stamped with the wrong
+    /// generation would resolve to another provider's binding on the backend
+    /// and silently read a different table, so the stamp follows the scan node.
+    #[test]
+    fn each_scan_nodes_splits_carry_that_nodes_own_catalog_generation() {
+        let transport = Arc::new(RecordingTransport::default());
+        let mut tasks = BTreeMap::new();
+        tasks.insert(7_i32, vec![target(0)]);
+        tasks.insert(8_i32, vec![target(1)]);
+        let mut catalogs = BTreeMap::new();
+        catalogs.insert(7_i32, CatalogHandle::new("ice", [1; 16]));
+        catalogs.insert(8_i32, CatalogHandle::new("lake", [2; 16]));
+        let mut driver = SplitAssignmentDriver::new(
+            execution_id(),
+            catalogs,
+            Arc::clone(&transport) as Arc<dyn TaskUpdateTransport>,
+            tasks,
+            1024,
+        );
+
+        for (plan_node_id, expected) in [(7_i32, "ice"), (8_i32, "lake")] {
+            let mut source = ScriptedSource {
+                batches: std::iter::once(ConnectorSplitBatch::new(
+                    vec![validated_split(100)],
+                    true,
+                ))
+                .collect(),
+                fail: false,
+                closed: 0,
+            };
+            assert!(
+                driver
+                    .pump(plan_node_id, &mut source, 8)
+                    .expect("pump one batch"),
+                "plan node {plan_node_id} had work to send"
+            );
+            let sent = transport.sent.lock().expect("transport lock");
+            let assignment = sent
+                .last()
+                .map(|(_, assignments)| assignments[0].clone())
+                .expect("one assignment reached a task");
+            assert_eq!(assignment.plan_node_id, plan_node_id);
+            assert_eq!(
+                assignment.splits[0]
+                    .split
+                    .as_ref()
+                    .expect("scheduled split carries a split")
+                    .catalog_name,
+                expected,
+                "plan node {plan_node_id} must be stamped with its own catalog"
+            );
+        }
+    }
+
+    /// A round built without a scan node's catalog cannot stamp its splits,
+    /// and borrowing another node's generation would send them to the wrong
+    /// provider binding.
+    #[test]
+    fn a_scan_node_with_no_frozen_catalog_fails_instead_of_borrowing_another() {
+        let transport = Arc::new(RecordingTransport::default());
+        let mut tasks = BTreeMap::new();
+        tasks.insert(7_i32, vec![target(0)]);
+        let mut driver =
+            SplitAssignmentDriver::new(execution_id(), BTreeMap::new(), transport, tasks, 1024);
+        let mut source = ScriptedSource {
+            batches: std::iter::once(ConnectorSplitBatch::new(vec![validated_split(100)], true))
+                .collect(),
+            fail: false,
+            closed: 0,
+        };
+        let error = driver
+            .pump(7, &mut source, 8)
+            .expect_err("an unstamped split must not be sent");
+        assert!(
+            matches!(
+                error,
+                SplitAssignmentDriverError::UnknownPlanNode { plan_node_id: 7 }
+            ),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
