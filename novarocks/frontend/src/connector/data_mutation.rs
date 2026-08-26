@@ -205,7 +205,7 @@ pub fn resolve_data_mutation(
     let ResolvedDataMutation::CommitUnknown { evidence, .. } = &executed else {
         return executed;
     };
-    session.reconcile_once(evidence.clone(), cache_finalizer)
+    session.adjudicate_once(evidence.clone(), cache_finalizer)
 }
 
 pub struct DataMutationSession {
@@ -218,7 +218,7 @@ pub struct DataMutationSession {
 
 enum DataMutationSessionPhase {
     Planned,
-    AwaitingReconcile(ExternalMutationEvidence),
+    AwaitingAdjudication(ExternalMutationEvidence),
     Terminal,
 }
 
@@ -304,9 +304,10 @@ impl DataMutationSession {
 
     /// Dispatch the retained plan exactly once.
     ///
-    /// A commit-unknown outcome is deliberately returned without reconciling.
-    /// The caller must first durably persist the evidence and then explicitly
-    /// pass that same evidence to [`Self::reconcile_once`].
+    /// A commit-unknown outcome is deliberately returned without adjudication.
+    /// The caller may make one same-statement, read-only adjudication with the
+    /// exact evidence returned here. This session never recreates its lease or
+    /// retries execution.
     pub fn execute_once(
         &mut self,
         cache_finalizer: &dyn DataMutationCacheFinalizer,
@@ -339,26 +340,26 @@ impl DataMutationSession {
         };
         self.phase = match &outcome {
             ExternalMutationOutcome::CommitUnknown { evidence, .. } => {
-                DataMutationSessionPhase::AwaitingReconcile(evidence.clone())
+                DataMutationSessionPhase::AwaitingAdjudication(evidence.clone())
             }
             _ => DataMutationSessionPhase::Terminal,
         };
         resolve_terminal_outcome(outcome, &self.table, cache_finalizer)
     }
 
-    /// Reconcile one previously returned unknown outcome on the retained exact
-    /// lease. Passing the evidence back explicitly is the durable-barrier seam:
-    /// core cannot silently reconcile before the frontend records it.
-    pub fn reconcile_once(
+    /// Adjudicate one previously returned unknown outcome on the retained exact
+    /// lease. The method is intentionally one-shot and has no mutation,
+    /// cleanup, or retry branch.
+    pub fn adjudicate_once(
         &mut self,
         evidence: ExternalMutationEvidence,
         cache_finalizer: &dyn DataMutationCacheFinalizer,
     ) -> ResolvedDataMutation {
-        let DataMutationSessionPhase::AwaitingReconcile(expected) = &self.phase else {
+        let DataMutationSessionPhase::AwaitingAdjudication(expected) = &self.phase else {
             return contract_failure(
                 ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
-                    "connector data mutation session is not awaiting reconciliation",
+                    "connector data mutation session is not awaiting adjudication",
                 ),
                 DataMutationDispatchState::ConfirmedNotDispatched,
             );
@@ -900,7 +901,7 @@ mod tests {
         assert_eq!(resolver.releases.load(Ordering::SeqCst), 0);
 
         assert!(matches!(
-            session.reconcile_once(evidence, &finalizer),
+            session.adjudicate_once(evidence, &finalizer),
             ResolvedDataMutation::KnownCommitted(_)
         ));
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
@@ -948,7 +949,7 @@ mod tests {
         .expect("mismatched evidence");
 
         assert!(matches!(
-            session.reconcile_once(mismatched, &finalizer),
+            session.adjudicate_once(mismatched, &finalizer),
             ResolvedDataMutation::ContractFailure {
                 dispatch: DataMutationDispatchState::ConfirmedNotDispatched,
                 ..
@@ -956,7 +957,7 @@ mod tests {
         ));
         assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 0);
         assert!(matches!(
-            session.reconcile_once(evidence, &finalizer),
+            session.adjudicate_once(evidence, &finalizer),
             ResolvedDataMutation::KnownCommitted(_)
         ));
         assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 1);
