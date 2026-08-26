@@ -197,17 +197,62 @@ impl CatalogAttachmentRepository {
         self.drop_with_operation(operation_id, expected).await
     }
 
-    /// Deletes the attachment only when the same StateStore transaction proves
-    /// that no MV target or dependency still refers to this exact catalog.
-    /// This is the DROP half of the CP-2 MV/catalog serializability fence.
-    pub(crate) async fn drop_exact_fenced_by_materialized_views(
+    /// Best-effort operational check: refuse the drop while the MV Accelerator
+    /// still names this catalog.
+    ///
+    /// This is the honest replacement for a scan that used to run inside the
+    /// attachment delete transaction. Two facts make a transaction the wrong
+    /// tool here, and the error text says so rather than letting a caller
+    /// inherit a guarantee that is not being provided:
+    ///
+    /// * The family read here is an `Accelerator`. It is rebuildable and may
+    ///   legitimately be wiped in whole, so a wiped, still-rebuilding or
+    ///   unreadable Accelerator lets a real reference slip straight past this
+    ///   check. An unreadable read is therefore *not* an error: it produced no
+    ///   observation, and this check refuses only on an observation.
+    /// * The concurrency it appeared to exclude was never excluded. MV DDL on
+    ///   another frontend and an external catalog desired-state controller are
+    ///   not participants in the attachment transaction, so a reference could
+    ///   always appear immediately after the scan.
+    ///
+    /// What escapes the check is bounded: an MV whose catalog is gone. The MV
+    /// side already reports that through its existing unavailable/fail-closed
+    /// paths, so the outcome is a refused refresh, never a wrong lake
+    /// publication.
+    pub(crate) async fn observe_materialized_view_references(
         &self,
-        expected: CatalogAttachmentVersioned,
+        instance_id: &ConnectorInstanceId,
         page_size: usize,
     ) -> Result<(), CatalogAttachmentError> {
-        let operation_id = OperationId::new_v7();
-        self.drop_fenced_with_operation(operation_id, expected, page_size)
-            .await
+        match crate::mv::repository::observe_catalog_references(
+            self.store.as_ref(),
+            instance_id.as_str(),
+            page_size,
+        )
+        .await
+        {
+            Ok(None) => Ok(()),
+            Ok(Some(reference)) => Err(CatalogAttachmentError::new(
+                CatalogAttachmentErrorKind::Conflict,
+                format!(
+                    "catalog {} still has {} in the materialized view accelerator; \
+                     this is a best-effort operational check, not a cross-system \
+                     serializability guarantee: drop the referencing materialized \
+                     views before dropping the catalog",
+                    instance_id.as_str(),
+                    reference.describe(),
+                ),
+            )),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    catalog = instance_id.as_str(),
+                    "materialized view reference check could not read the accelerator; \
+                     the catalog drop proceeds without an observation",
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn create_with_operation(
@@ -291,6 +336,14 @@ impl CatalogAttachmentRepository {
         }
     }
 
+    /// Deletes exactly the frozen attachment record, in a transaction that
+    /// touches the catalog attachment family and nothing else.
+    ///
+    /// The version precondition is the whole fence: it fails the delete if the
+    /// record changed — including a same-name drop/recreate — since the caller
+    /// read it. `CommitUnknown` is not folded into that: a lost commit response
+    /// leaves the outcome genuinely unknown, so it is resolved against the
+    /// store and only reported as unknown when the store cannot decide either.
     async fn drop_with_operation(
         &self,
         operation_id: OperationId,
@@ -317,16 +370,11 @@ impl CatalogAttachmentRepository {
         .await;
         match outcome {
             Ok(_) => Ok(()),
-            Err(RunFailure::Operation(error))
-                if error.kind() == StateStoreErrorKind::PreconditionFailed =>
-            {
-                Err(CatalogAttachmentError::new(
-                    CatalogAttachmentErrorKind::Conflict,
-                    "catalog attachment changed before drop",
-                ))
-            }
-            Err(RunFailure::RetryExhausted(error))
-                if error.kind() == StateStoreErrorKind::PreconditionFailed =>
+            Err(RunFailure::Operation(error) | RunFailure::RetryExhausted(error))
+                if matches!(
+                    error.kind(),
+                    StateStoreErrorKind::PreconditionFailed | StateStoreErrorKind::Conflict
+                ) =>
             {
                 Err(CatalogAttachmentError::new(
                     CatalogAttachmentErrorKind::Conflict,
@@ -366,101 +414,6 @@ impl CatalogAttachmentRepository {
                 }
             }
             Err(error) => Err(run_failure("drop catalog attachment", error)),
-        }
-    }
-
-    async fn drop_fenced_with_operation(
-        &self,
-        operation_id: OperationId,
-        expected: CatalogAttachmentVersioned,
-        page_size: usize,
-    ) -> Result<(), CatalogAttachmentError> {
-        let key = attachment_key(&expected.attachment.instance_id).map_err(invalid)?;
-        let version = expected.version.clone();
-        let catalog = expected.attachment.instance_id.as_str().to_string();
-        let outcome = run_side_effect_free(
-            self.store.as_ref(),
-            self.metrics.as_ref(),
-            operation_id,
-            "drop catalog attachment with materialized view fence",
-            |transaction| {
-                let key = key.clone();
-                let version = version.clone();
-                let catalog = catalog.clone();
-                Box::pin(async move {
-                    crate::mv::repository::ensure_no_catalog_references_transaction(
-                        transaction,
-                        &catalog,
-                        page_size,
-                    )
-                    .await?;
-                    transaction
-                        .delete(key, Precondition::Version(version))
-                        .await?;
-                    Ok(())
-                })
-            },
-        )
-        .await;
-        match outcome {
-            Ok(_) => Ok(()),
-            Err(RunFailure::Operation(error))
-                if matches!(
-                    error.kind(),
-                    StateStoreErrorKind::PreconditionFailed | StateStoreErrorKind::Conflict
-                ) =>
-            {
-                Err(CatalogAttachmentError::new(
-                    CatalogAttachmentErrorKind::Conflict,
-                    error.to_string(),
-                ))
-            }
-            Err(RunFailure::RetryExhausted(error))
-                if matches!(
-                    error.kind(),
-                    StateStoreErrorKind::PreconditionFailed | StateStoreErrorKind::Conflict
-                ) =>
-            {
-                Err(CatalogAttachmentError::new(
-                    CatalogAttachmentErrorKind::Conflict,
-                    error.to_string(),
-                ))
-            }
-            Err(RunFailure::CommitUnknown {
-                transaction_id,
-                error,
-            }) => match self
-                .store
-                .resolve_commit(&transaction_id)
-                .await
-                .map_err(store)?
-            {
-                CommitResolution::Committed(_) => Ok(()),
-                CommitResolution::NotCommitted => {
-                    Box::pin(self.drop_fenced_with_operation(operation_id, expected, page_size))
-                        .await
-                }
-                CommitResolution::Unresolved => {
-                    match self.get(&expected.attachment.instance_id).await? {
-                        Some(current)
-                            if current.attachment.attachment_id
-                                == expected.attachment.attachment_id =>
-                        {
-                            Err(CatalogAttachmentError::new(
-                                CatalogAttachmentErrorKind::CommitUnknown,
-                                format!(
-                                    "fenced catalog attachment drop commit outcome is unknown: {error}"
-                                ),
-                            ))
-                        }
-                        _ => Ok(()),
-                    }
-                }
-            },
-            Err(error) => Err(run_failure(
-                "drop catalog attachment with materialized view fence",
-                error,
-            )),
         }
     }
 
@@ -944,8 +897,12 @@ mod tests {
             .expect("shutdown SQLite StateStore");
     }
 
+    /// The refusal survives; only where it comes from changed. It is now an
+    /// observation taken before the delete, so the assertion is on the check
+    /// and on the untouched record — not on a transaction that read two
+    /// families at once.
     #[tokio::test]
-    async fn fenced_drop_rejects_a_materialized_view_dependency_and_keeps_attachment() {
+    async fn an_observed_materialized_view_dependency_refuses_the_drop_and_keeps_attachment() {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
         let registry =
             builtin_state_store_provider_registry().expect("builtin StateStore registry");
@@ -1013,13 +970,19 @@ mod tests {
             CommitOutcome::Committed(_)
         ));
 
-        assert_eq!(
-            repository
-                .drop_exact_fenced_by_materialized_views(created.clone(), 256)
-                .await
-                .expect_err("referenced catalog drop must conflict")
-                .kind(),
-            CatalogAttachmentErrorKind::Conflict
+        let refusal = repository
+            .observe_materialized_view_references(&created.attachment.instance_id, 256)
+            .await
+            .expect_err("referenced catalog drop must conflict");
+        assert_eq!(refusal.kind(), CatalogAttachmentErrorKind::Conflict);
+        assert!(
+            refusal
+                .to_string()
+                .contains("best-effort operational check")
+                && refusal
+                    .to_string()
+                    .contains("not a cross-system serializability guarantee"),
+            "the refusal must not advertise a guarantee it no longer provides: {refusal}"
         );
         assert_eq!(
             repository

@@ -640,7 +640,20 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
                 ))
             };
         };
-        self.block_on(repository.drop_exact_fenced_by_materialized_views(existing, 256))?;
+        // Ordering, not atomicity: the reference check runs here, before the
+        // delete and outside it, and the delete below is a single-family
+        // transaction on the catalog attachment record alone.
+        //
+        // The check used to be a scan inside that transaction, which read as a
+        // cross-family serializability fence against MV DDL. It is now an
+        // operational check that can miss — a wiped or unreadable MV
+        // Accelerator observes nothing, and MV DDL elsewhere can land right
+        // after the observation. What escapes it is bounded to an MV whose
+        // catalog is gone, which the MV side already refuses through its
+        // unavailable/fail-closed paths rather than publishing anything wrong
+        // to the lake.
+        self.block_on(repository.observe_materialized_view_references(&command.instance_id, 256))?;
+        self.block_on(repository.drop_exact(existing))?;
         self.retire_projection(&command.instance_id);
         // Durable deletion is authoritative. A local generation can be absent
         // or already retiring; either case converges through reconciliation.
