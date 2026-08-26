@@ -922,14 +922,16 @@ impl<'a> SchedulingFragmentView<'a> {
             .map(<[_]>::len)
     }
 
-    /// Number of provider-neutral opaque splits available to schedule for a
-    /// connector read.  The frontend uses this only as placement cardinality;
-    /// split payloads remain opaque until artifact assembly patches the
-    /// already-encoded carrier for each BE.
-    pub fn connector_split_count(self, node_id: PlanNodeId) -> Option<usize> {
+    /// Whether this scan node reads through a connector.
+    ///
+    /// It deliberately reports presence, not a count. A typed connector scan
+    /// has no frozen split set: its work arrives at runtime, so planning
+    /// cannot count it, and a count taken here would pin the query's
+    /// parallelism to whatever enumeration happened to produce first.
+    pub fn reads_through_connector(self, node_id: PlanNodeId) -> bool {
         self.view
             .connector_read(self.fragment.fragment_id(), node_id)
-            .map(|read| read.splits.len())
+            .is_some()
     }
 
     pub fn is_terminal_write(self) -> bool {
