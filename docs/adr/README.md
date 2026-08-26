@@ -237,8 +237,9 @@ StateStore 的全局单值限制保持公共契约，record owner 负责自己�
 
 ### frontend-dml
 
-领域哲学：frontend 拥有 DML 的 statement application flow、durable operation lifecycle 与 production routing；
-core 只通过一对一 typed engine port 保留 query、connector 和 external commit truth。native persistent INSERT 当前只支持
+领域哲学：frontend 拥有 DML 的 statement application flow 与 production routing；每个 publication attempt 仅存活于
+当前 request stack，StateStore 不再保存 DML operation、recovery 或 coordination authority。core 只通过一对一 typed
+engine port 保留 query、connector 和 external commit truth。native persistent INSERT 当前只支持
 Iceberg；StarRocks 只作为 read-only external connector，不能恢复内部 StarRocks 表或 server runtime。每次写入必须复用 admission 冻结的 immutable request identity；跨 crate 只传中立 DTO 与 opaque
 handles，不以 service locator、core callback、metadata fallback 或公共 SPI 模糊 owner。
 
