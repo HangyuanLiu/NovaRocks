@@ -1518,7 +1518,7 @@ fn validate_live_backend_topology(
     rows: &[BackendTopologyRow],
 ) -> Result<()> {
     let expected = expected_ports.len();
-    let live = rows
+    let live_rows = rows
         .iter()
         .filter(|row| {
             row.state == "Live"
@@ -1526,18 +1526,20 @@ fn validate_live_backend_topology(
                 && !row.build_identity.is_empty()
                 && row.status_detail.is_empty()
         })
-        .count();
-    let identities = rows
+        .collect::<Vec<_>>();
+    let live = live_rows.len();
+    let identities = live_rows
         .iter()
-        .filter(|row| row.state == "Live" && row.alive)
         .map(|row| row.build_identity.as_str())
         .collect::<BTreeSet<_>>();
     let mut configured_ports = expected_ports.to_vec();
     configured_ports.sort_unstable();
-    let mut observed_ports = rows.iter().map(|row| row.grpc_port).collect::<Vec<_>>();
+    let mut observed_ports = live_rows
+        .iter()
+        .map(|row| row.grpc_port)
+        .collect::<Vec<_>>();
     observed_ports.sort_unstable();
-    if rows.len() == expected
-        && live == expected
+    if live == expected
         && observed_ports == configured_ports
         && (expected == 0 || identities.len() == 1)
     {
@@ -4781,6 +4783,23 @@ mod tests {
             },
         ];
         assert!(validate_live_backend_topology(&expected, &incompatible).is_err());
+
+        let retained_replacement = vec![
+            backend_row(19070, "Live", true),
+            backend_row(19071, "Live", true),
+            BackendTopologyRow {
+                process_id: "01900000-0000-7000-8000-000000000099".to_string(),
+                grpc_port: 19071,
+                state: "Stale|Lost|Replaced".to_string(),
+                alive: false,
+                scheduled_fragments: 0,
+                build_identity: "test-build-identity".to_string(),
+                status_detail: "heartbeat expected backend process id does not match this backend"
+                    .to_string(),
+            },
+        ];
+        validate_live_backend_topology(&expected, &retained_replacement)
+            .expect("a retained replaced process must not alter the live topology");
     }
 
     #[test]
