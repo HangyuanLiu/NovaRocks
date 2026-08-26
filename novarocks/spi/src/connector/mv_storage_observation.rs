@@ -431,6 +431,7 @@ impl MvPublishedRefreshObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvLakePackageObservation {
     table: ConnectorTableIdentity,
+    target_object_id: ConnectorTableObjectId,
     descriptor: MvLakeDescriptorProjection,
     current_target_snapshot: Option<MvLakeTargetSnapshotObservation>,
     publication: MvLakePublicationObservation,
@@ -468,6 +469,7 @@ impl MvLakeTargetSnapshotObservation {
 impl MvLakePackageObservation {
     pub fn try_new(
         table: ConnectorTableIdentity,
+        target_object_id: ConnectorTableObjectId,
         descriptor: MvLakeDescriptorProjection,
         current_target_snapshot: Option<MvLakeTargetSnapshotObservation>,
         publication: MvLakePublicationObservation,
@@ -475,6 +477,7 @@ impl MvLakePackageObservation {
         validate_table(&table, "MV lake package")?;
         Ok(Self {
             table,
+            target_object_id,
             descriptor,
             current_target_snapshot,
             publication,
@@ -482,6 +485,9 @@ impl MvLakePackageObservation {
     }
     pub const fn table(&self) -> &ConnectorTableIdentity {
         &self.table
+    }
+    pub const fn target_object_id(&self) -> &ConnectorTableObjectId {
+        &self.target_object_id
     }
     pub const fn descriptor(&self) -> &MvLakeDescriptorProjection {
         &self.descriptor
@@ -491,6 +497,67 @@ impl MvLakePackageObservation {
     }
     pub const fn publication(&self) -> &MvLakePublicationObservation {
         &self.publication
+    }
+}
+
+/// A catalog discovery result is either complete or explicitly incomplete.
+/// An implementation must never represent an unreadable candidate as an
+/// absent MV package in a complete catalog result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvLakeCatalogDiscovery {
+    Complete(Vec<MvLakePackageOutcome>),
+    Incomplete(MvLakeCatalogIncompleteReason),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvLakeCatalogIncompleteReason {
+    PaginationGap,
+    GenerationDrift,
+    DeadlineExceeded,
+    BudgetExceeded,
+    EnumerationFailed(ConnectorError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvLakePackageOutcome {
+    Observed(MvLakePackageObservation),
+    Failed(MvLakePackageFailure),
+}
+
+/// A package failure keeps its logical target and, when it was observed before
+/// decoding failed, its opaque immutable identity so consumers can quarantine
+/// exactly that target without treating the entire catalog as complete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvLakePackageFailure {
+    table: ConnectorTableIdentity,
+    target_object_id: Option<ConnectorTableObjectId>,
+    error: ConnectorError,
+}
+
+impl MvLakePackageFailure {
+    pub fn try_new(
+        table: ConnectorTableIdentity,
+        target_object_id: Option<ConnectorTableObjectId>,
+        error: ConnectorError,
+    ) -> Result<Self, ConnectorError> {
+        validate_table(&table, "MV lake package failure")?;
+        Ok(Self {
+            table,
+            target_object_id,
+            error,
+        })
+    }
+
+    pub const fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
+    }
+
+    pub const fn target_object_id(&self) -> Option<&ConnectorTableObjectId> {
+        self.target_object_id.as_ref()
+    }
+
+    pub const fn error(&self) -> &ConnectorError {
+        &self.error
     }
 }
 
@@ -1015,6 +1082,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use bytes::Bytes;
+
     use super::*;
     use crate::connector::{ConnectorCancellation, ConnectorInstanceId};
 
@@ -1045,6 +1114,10 @@ mod tests {
             namespace: Arc::from("db"),
             table: Arc::from("mv"),
         }
+    }
+    fn target_object_id() -> ConnectorTableObjectId {
+        ConnectorTableObjectId::try_new(Bytes::from_static(b"target-uuid"))
+            .expect("bounded target object ID")
     }
     fn fields() -> Vec<MvObservedField> {
         vec![MvObservedField::new(1, "id".into(), "bigint".into(), false)]
@@ -1134,6 +1207,7 @@ mod tests {
         let snapshot = MvLakeTargetSnapshotObservation::try_new(42, 1_700_000_042_000).unwrap();
         let package = MvLakePackageObservation::try_new(
             table(),
+            target_object_id(),
             descriptor,
             Some(snapshot),
             MvLakePublicationObservation::NeverPublished,
@@ -1141,6 +1215,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(package.current_target_snapshot(), Some(snapshot));
+        assert_eq!(package.target_object_id(), &target_object_id());
         assert_eq!(snapshot.snapshot_id(), 42);
         assert_eq!(snapshot.timestamp_ms(), 1_700_000_042_000);
         assert_eq!(
@@ -1155,6 +1230,26 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::CorruptData
         );
+    }
+
+    #[test]
+    fn discovery_keeps_catalog_incomplete_distinct_from_one_package_failure() {
+        let failure = MvLakePackageFailure::try_new(
+            table(),
+            Some(target_object_id()),
+            ConnectorError::new(ConnectorErrorKind::CorruptData, "bad descriptor"),
+        )
+        .expect("stable package failure");
+        let complete =
+            MvLakeCatalogDiscovery::Complete(vec![MvLakePackageOutcome::Failed(failure.clone())]);
+        assert!(matches!(complete, MvLakeCatalogDiscovery::Complete(_)));
+        assert_eq!(failure.target_object_id(), Some(&target_object_id()));
+        let incomplete =
+            MvLakeCatalogDiscovery::Incomplete(MvLakeCatalogIncompleteReason::GenerationDrift);
+        assert!(matches!(
+            incomplete,
+            MvLakeCatalogDiscovery::Incomplete(MvLakeCatalogIncompleteReason::GenerationDrift)
+        ));
     }
 
     #[test]

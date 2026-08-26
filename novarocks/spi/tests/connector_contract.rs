@@ -22,9 +22,10 @@ use novarocks_spi::connector::{
     ConnectorMvMetadataOnlyBaseFact, ConnectorMvMetadataOnlyProvenance, ConnectorProviderId,
     ConnectorRefAction, ConnectorRefreshPublicationGuard, ConnectorRequestContext,
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, ConnectorTableObjectId,
-    ExternalMutationEvidence, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
-    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
-    StatisticsDataVersion, StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest,
+    ExternalMutationEvidence, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
+    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, StatisticsDataVersion, StatisticsEvidenceRevision,
+    StatisticsMetric, StatisticsMetricRequest,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -124,8 +125,7 @@ fn guarded_publication_carries_the_provider_committed_version() {
     let committed_version =
         ConnectorCommittedVersion::try_new(Bytes::from_static(b"provider-private"), Some(42))
             .expect("committed version");
-    let guard =
-        ConnectorRefreshPublicationGuard::try_new(3, 4, "token").expect("publication guard");
+    let guard = ConnectorRefreshPublicationGuard::new(LakePublicationId::new_v7());
     let action = ConnectorRefAction::FastForwardBranch {
         source_branch: Arc::from("mv-refresh-3"),
         target_branch: Arc::from("main"),
@@ -147,9 +147,7 @@ fn guarded_publication_carries_the_provider_committed_version() {
 #[test]
 fn metadata_only_mv_provenance_requires_complete_distinct_watermarks() {
     let provenance = ConnectorMvMetadataOnlyProvenance {
-        refresh_id: 3,
-        materialization_id: 4,
-        marker_token: Arc::from("marker"),
+        publication_id: LakePublicationId::new_v7(),
         bases: vec![ConnectorMvMetadataOnlyBaseFact {
             table: Arc::from("rest.db.base"),
             object_id: ConnectorTableObjectId::try_new(Bytes::from_static(
@@ -289,38 +287,14 @@ fn external_mutation_evidence_is_bounded_and_redacted() {
 }
 
 #[test]
-fn refresh_publication_guard_is_bounded_stable_and_redacted() {
-    for (refresh_id, materialized_view_id, token) in [(0, 4, "token"), (3, 0, "token"), (3, 4, "")]
-    {
-        assert_eq!(
-            ConnectorRefreshPublicationGuard::try_new(refresh_id, materialized_view_id, token)
-                .expect_err("invalid guard identity must fail")
-                .kind(),
-            ConnectorErrorKind::InvalidRequest
-        );
-    }
-    assert_eq!(
-        ConnectorRefreshPublicationGuard::try_new(
-            3,
-            4,
-            "x".repeat(ConnectorRefreshPublicationGuard::MAX_TOKEN_BYTES + 1),
-        )
-        .expect_err("oversized guard token must fail")
-        .kind(),
-        ConnectorErrorKind::InvalidRequest
-    );
-
-    let guard = ConnectorRefreshPublicationGuard::try_new(3, 4, "secret-refresh-token")
-        .expect("bounded guard");
-    let same = ConnectorRefreshPublicationGuard::try_new(3, 4, "secret-refresh-token")
-        .expect("same guard");
-    let different = ConnectorRefreshPublicationGuard::try_new(3, 4, "different-token")
-        .expect("different guard");
+fn refresh_publication_guard_is_a_single_publication_identity() {
+    let publication_id = LakePublicationId::new_v7();
+    let guard = ConnectorRefreshPublicationGuard::new(publication_id);
+    let same = ConnectorRefreshPublicationGuard::new(publication_id);
+    let different = ConnectorRefreshPublicationGuard::new(LakePublicationId::new_v7());
     assert_eq!(guard.digest(), same.digest());
     assert_ne!(guard.digest(), different.digest());
-    let debug = format!("{guard:?}");
-    assert!(debug.contains("token_len"));
-    assert!(!debug.contains("secret-refresh-token"));
+    assert_eq!(guard.publication_id(), publication_id);
 }
 
 #[test]

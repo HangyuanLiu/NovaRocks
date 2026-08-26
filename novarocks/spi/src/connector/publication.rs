@@ -29,8 +29,8 @@ use super::{ConnectorError, ConnectorErrorKind};
 /// The canonical 128-bit identity frozen before a mutating statement can
 /// dispatch an external request.
 ///
-/// A value decoded from a legacy durable payload is intentionally preserved as
-/// bytes. New statement admission must use [`LakePublicationId::new_v7`].
+/// All construction paths validate UUIDv7. A publication identity is never a
+/// compatibility carrier for a legacy operation identifier.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct LakePublicationId(Uuid);
@@ -48,10 +48,6 @@ impl LakePublicationId {
             ));
         }
         Ok(Self(value))
-    }
-
-    pub fn from_bytes(bytes: [u8; 16]) -> Self {
-        Self(Uuid::from_bytes(bytes))
     }
 
     pub fn try_from_bytes(bytes: [u8; 16]) -> Result<Self, ConnectorError> {
@@ -73,12 +69,6 @@ impl Default for LakePublicationId {
     }
 }
 
-impl From<Uuid> for LakePublicationId {
-    fn from(value: Uuid) -> Self {
-        Self(value)
-    }
-}
-
 impl fmt::Display for LakePublicationId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
@@ -86,10 +76,16 @@ impl fmt::Display for LakePublicationId {
 }
 
 impl FromStr for LakePublicationId {
-    type Err = uuid::Error;
+    type Err = ConnectorError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Uuid::parse_str(value).map(Self)
+        let parsed = Uuid::parse_str(value).map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!("parse lake publication ID: {error}"),
+            )
+        })?;
+        Self::try_from_uuid(parsed)
     }
 }
 
@@ -344,6 +340,7 @@ mod tests {
     #[test]
     fn new_publication_id_rejects_non_v7_input() {
         assert!(LakePublicationId::try_from_bytes([7; 16]).is_err());
+        assert!(LakePublicationId::from_str("00000000-0000-4000-8000-000000000000").is_err());
     }
 
     #[test]
