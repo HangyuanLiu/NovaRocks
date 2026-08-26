@@ -506,6 +506,16 @@ pub fn drop_case_database(
     db_name: &str,
     label: &str,
 ) -> Result<()> {
+    // Without a catalog there is nothing to enumerate against, so the explicit
+    // path cannot see the children it would need to drop first. Fall back to
+    // FORCE, which is what the local catalog still supports and what this did
+    // everywhere before enumeration existed.
+    if conn.catalog.is_none() {
+        let sql = format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;");
+        run_mysql_sql(conn, query_timeout, &sql)
+            .with_context(|| format!("{} case database cleanup failed: {}", label, db_name))?;
+        return Ok(());
+    }
     let mut sql = String::new();
     for table in case_table_names(conn, query_timeout, db_name)? {
         sql.push_str(&format!("DROP TABLE IF EXISTS `{db_name}`.`{table}`;\n"));
