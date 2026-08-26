@@ -107,6 +107,11 @@ exception、backend-specific stage-create fallback 与未闭合的 rollback clea
   `DROP TABLE ... PURGE` 因此固定为：先冻结 exact object identity → Catalog drop 拿三态 →
   只有 `KnownCommitted` 才把旧 object/ref 交给 ADR-0104 的年龄窗 cleanup → `CommitUnknown` 禁止任何
   文件删除 → cleanup 失败只是 finalization/GC 状态，不把已知 committed 回写成 uncommitted。
+- **文件系统 Catalog 的边界细节**：对 Hadoop 这类 filesystem catalog，「catalog 条目」本身就是存储对象——
+  表是否存在通过 `version-hint.text`、其次通过规范的 `v1.metadata.json` 解析。因此删除这两个指针**是**
+  catalog 操作，与 ADR-0077「写 `v1.metadata.json` 使表存在」对称；数据文件与被取代的历史 metadata 才是
+  对象，走年龄窗 handoff。顺序固定为先删 hint 再删 `v1.metadata.json`：两步之间失败时表仍可经 v1 解析、
+  hint 下次读取自我修复，即「drop 未提交」，重试安全；移除 `v1.metadata.json` 是提交点。
 - 读取结果保留 typed `NotFound` / `Unsupported` / `Unavailable` 的区别。**不能回答 view 枚举的
   concrete Catalog 必须返回 `Unsupported`，不得返回 `false` 或空集合伪装事实**；调用方不得把该结果
   在上层翻译回「无 view」。
@@ -131,6 +136,12 @@ exception、backend-specific stage-create fallback 与未闭合的 rollback clea
   选择这样做不是因为大 PR 更好，而是因为长期双命名的认知税和后续对照 Trino 的迁移税更贵。
 - **Catalog 与 FileSystem 不是原子事务，purge 与 GC 可能延迟或泄漏。** 面对 unknown 选择不删是
   ADR-0104 已接受的安全取舍，本 ADR 只是把它落到 owner 边界上，没有改善它。
+- **本裁决收紧了 Hadoop DROP TABLE 的既有行为，代价是它不再立即回收空间。** 此前 Hadoop catalog 的
+  `drop_table` 会对整个表目录做递归前缀删除。那个行为同时错了四处：忽略 caller 的 data disposition
+  （要求保留数据的 drop 照样销毁数据）、不给并发读者任何窗口（刚解析完该表的读者在扫描中途丢文件）、
+  按词法前缀而非表的精确对象身份匹配、并且吞掉自身失败（部分删除仍报成功）。改为只删 catalog 指针后，
+  空间回收要等到年龄窗到期的清理 pass，磁盘占用因此会在一段时间内高于从前。这是用回收延迟换正确性，
+  我们认为值得；但它确实是可观测的行为退化，不应被描述为纯粹的改进。
 
 ## 何时重新评估
 
