@@ -28,4 +28,6 @@ mod transport;
 pub(crate) use driver::{
     AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError, SplitSourceHandle,
 };
-pub(crate) use transport::{TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError};
+pub(crate) use transport::{
+    AcceptedPlanNode, TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError,
+};
