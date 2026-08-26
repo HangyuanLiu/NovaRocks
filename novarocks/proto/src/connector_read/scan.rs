@@ -13,11 +13,12 @@ use prost::Message;
 
 use crate::{FieldPath, ProtocolError};
 
-use super::handle::CatalogTableHandle;
+use super::handle::{CatalogTableHandle, ConnectorRelationKind};
 use super::predicate::{ValidatedColumnHandle, decode_connector_expression, decode_tuple_domain};
 use super::value::decode_value_type;
 use super::{
-    MAX_NAME_BYTES, MAX_SCAN_ASSIGNMENTS, bounded_text, inconsistent, missing, nest, out_of_range,
+    MAX_NAME_BYTES, MAX_SCAN_ASSIGNMENTS, bounded_text, inconsistent, invalid_enum, missing, nest,
+    out_of_range,
 };
 
 /// One ordered output column of a scan.
@@ -109,6 +110,17 @@ pub struct ConnectorTableScanSource {
     unenforced_predicate: TupleDomain<ValidatedColumnHandle>,
     remaining_expression: Option<ConnectorExpression>,
     dynamic_filters: Vec<DynamicFilterBinding>,
+    work_source: ScanWorkSource,
+}
+
+/// How one scan's work reaches the backend that runs it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScanWorkSource {
+    /// Splits arrive at runtime on the task-update queue.
+    RuntimeSplits,
+    /// No split at all: one backend reads the relation itself. Only a system
+    /// relation the coordinator resolved to a single task uses this.
+    WholeRelation,
 }
 
 impl ConnectorTableScanSource {
@@ -245,10 +257,41 @@ impl ConnectorTableScanSource {
         }
         if raw.max_batch_bytes == 0 {
             return Err(out_of_range(
-                path.field("max_batch_bytes"),
+                path.clone().field("max_batch_bytes"),
                 "reader batch byte budget must be nonzero",
             ));
         }
+
+        let work_source = dto::ScanWorkSource::try_from(raw.work_source).map_err(|_| {
+            invalid_enum(
+                path.clone().field("work_source"),
+                "unknown scan work source",
+            )
+        })?;
+        let work_source = match work_source {
+            // Fail closed: a producer that did not state how this scan's work
+            // arrives has not decided it, and picking a lane here would run the
+            // scan a way nobody asked for.
+            dto::ScanWorkSource::Unspecified => {
+                return Err(invalid_enum(
+                    path.field("work_source"),
+                    "scan source requires a work source",
+                ));
+            }
+            dto::ScanWorkSource::RuntimeSplits => ScanWorkSource::RuntimeSplits,
+            dto::ScanWorkSource::WholeRelation => {
+                // Only a system relation is read whole. Any other relation
+                // reaching a single task with no split would read nothing and
+                // report success.
+                if table.relation_kind() != ConnectorRelationKind::SystemTable {
+                    return Err(inconsistent(
+                        path.field("work_source"),
+                        "only a system relation may be read as a whole relation",
+                    ));
+                }
+                ScanWorkSource::WholeRelation
+            }
+        };
 
         Ok(Self {
             raw,
@@ -258,7 +301,13 @@ impl ConnectorTableScanSource {
             unenforced_predicate,
             remaining_expression,
             dynamic_filters,
+            work_source,
         })
+    }
+
+    /// How this scan's work reaches the backend that runs it.
+    pub const fn work_source(&self) -> ScanWorkSource {
+        self.work_source
     }
 
     pub const fn table(&self) -> &CatalogTableHandle {

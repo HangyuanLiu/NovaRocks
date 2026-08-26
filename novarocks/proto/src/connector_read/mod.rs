@@ -36,7 +36,7 @@ pub use predicate::{
     ValidatedColumnHandle, decode_connector_expression, decode_tuple_domain,
     encode_connector_expression, encode_tuple_domain,
 };
-pub use scan::{ConnectorTableScanSource, DynamicFilterBinding, ScanAssignment};
+pub use scan::{ConnectorTableScanSource, DynamicFilterBinding, ScanAssignment, ScanWorkSource};
 pub use split::{SplitCategory, ValidatedConnectorSplit};
 pub use task_update::{
     ScheduledSplit, SplitAssignment, canonical_scheduled_split_bytes, parse_task_update_assignments,

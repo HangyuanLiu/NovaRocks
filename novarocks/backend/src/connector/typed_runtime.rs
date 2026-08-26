@@ -1026,6 +1026,7 @@ pub(crate) mod test_support {
             dynamic_filters: Vec::new(),
             max_batch_rows: 1024,
             max_batch_bytes: 1 << 20,
+            work_source: dto::ScanWorkSource::RuntimeSplits as i32,
         }
     }
 

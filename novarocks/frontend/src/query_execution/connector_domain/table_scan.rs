@@ -225,6 +225,7 @@ mod tests {
                 dynamic_filters,
                 max_batch_rows: 4096,
                 max_batch_bytes: 1 << 20,
+                work_source: dto::ScanWorkSource::RuntimeSplits as i32,
             },
             FieldPath::root("connector_table_scan_source"),
         )
