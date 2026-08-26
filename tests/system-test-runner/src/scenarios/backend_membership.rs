@@ -57,6 +57,21 @@ impl Scenario for BackendSelfRegistration {
         let deadline = context.deadline();
         context
             .handle()
+            .drain_be_until(REQUIRED_BACKENDS - 1, deadline)
+            .context("gracefully drain one BE through SIGTERM")?;
+        query_one(context, "while one BE is draining")?;
+        context.action(
+            "proved SIGTERM removes a BE from future eligibility while the remaining BEs serve queries",
+        );
+        let deadline = context.deadline();
+        context
+            .handle()
+            .restart_be_until(REQUIRED_BACKENDS - 1, deadline)
+            .context("replace drained BE and wait for a new eligible process identity")?;
+
+        let deadline = context.deadline();
+        context
+            .handle()
             .restart_fe_until(deadline)
             .context("restart FE and wait for BE renew announce plus exact heartbeat")?;
         let after_fe_restart = (0..REQUIRED_BACKENDS)

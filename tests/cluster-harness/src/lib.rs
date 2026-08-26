@@ -1912,6 +1912,9 @@ pub trait ServerHandle: Send {
     fn restart_be_until(&mut self, index: usize, _deadline: Instant) -> Result<()> {
         self.restart_be(index)
     }
+    fn drain_be_until(&mut self, index: usize, _deadline: Instant) -> Result<()> {
+        bail!("BE drain is unsupported by this server mode (index={index})")
+    }
     fn kill_fe(&mut self) -> Result<()> {
         bail!("FE kill is unsupported by this server mode")
     }
@@ -3837,6 +3840,38 @@ impl ServerHandle for CrossProcessServerHandle {
             );
         }
         Ok(())
+    }
+
+    fn drain_be_until(&mut self, index: usize, deadline: Instant) -> Result<()> {
+        self.ensure_be_index(index)?;
+        self.be_processes[index]
+            .stop()
+            .with_context(|| format!("send SIGTERM to cross-process BE[{index}]"))?;
+        let expected_eligible = self.be_processes.len().saturating_sub(1);
+        loop {
+            let rows = query_frontend_backend_topology(
+                &self.mysql_user,
+                &self.target_host,
+                self.target_port,
+                topology_mysql_io_timeout(remaining_until(deadline, "drain topology query")?),
+            )?;
+            if rows.iter().filter(|row| row.alive).count() == expected_eligible {
+                println!(
+                    "cross-process BE[{index}] drain barrier PASS: eligible_backends={expected_eligible}"
+                );
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "timed out waiting for BE[{index}] drain to reduce eligible backends to {expected_eligible}; rows={rows:?}"
+                );
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100)),
+            );
+        }
     }
 
     fn kill_fe(&mut self) -> Result<()> {
