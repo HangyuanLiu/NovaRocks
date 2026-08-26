@@ -6,6 +6,7 @@
 //! not own connector semantics: a provider variant is carried and validated
 //! structurally, and only the provider that produced it interprets it.
 
+mod control;
 mod execution;
 mod handle;
 mod predicate;
@@ -14,6 +15,10 @@ mod split;
 mod task_update;
 mod value;
 
+pub use control::{
+    TypedColumnBinding, TypedConnectorMetadata, TypedFilterApplication, TypedLimitApplication,
+    TypedRelationVersion, TypedSplitBatch, TypedSystemTablePlan,
+};
 pub use execution::{
     TypedConnectorPageSourceProvider, TypedConnectorSplitManager, TypedConnectorSplitSource,
     TypedConnectorSystemTableProvider, WireConstraint, WireDynamicFilter,
