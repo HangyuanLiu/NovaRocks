@@ -673,26 +673,6 @@ impl ConnectorWriteOperationSession {
         Ok(())
     }
 
-    /// Restore the durable C1 aggregate decision for marker-only reconcile.
-    /// No report set is accepted and no new write execution can follow it.
-    pub(crate) fn restore_for_reconcile(
-        &self,
-        aggregate_digest: [u8; 32],
-    ) -> Result<(), ConnectorError> {
-        let mut state = self.lock_state()?;
-        match state.terminal {
-            Some(TerminalDecision::Commit(existing)) if existing == aggregate_digest => {}
-            Some(_) => {
-                return Err(invalid(
-                    "connector write recovery aggregate conflicts with terminal decision",
-                ));
-            }
-            None => state.terminal = Some(TerminalDecision::Commit(aggregate_digest)),
-        }
-        state.recovery_only = true;
-        Ok(())
-    }
-
     fn attempt_completion(
         &self,
         attachment: &ConnectorWritePlanAttachment,

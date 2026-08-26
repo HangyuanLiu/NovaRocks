@@ -201,12 +201,6 @@ impl ConnectorControlFactory for IcebergControlFactory {
                 capability as Arc<dyn novarocks_spi::connector::ConnectorUnanchoredCtasCleanup>
             }))?
             .try_with_staged_publication_recovery(Some(provider.clone()))?
-            .try_with_historical_maintenance_recovery(Some(Arc::new(
-                crate::catalog_control::historical_maintenance_recovery::IcebergHistoricalMaintenanceRecovery::new(
-                    key.clone(),
-                    Arc::clone(&unpublished.runtime),
-                )?,
-            )))?
             .try_with_view_metadata(Some(provider))?;
         ConnectorControlCreation::try_new(&request, binding, unpublished.durable_properties)
     }

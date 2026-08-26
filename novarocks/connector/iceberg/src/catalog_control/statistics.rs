@@ -32,16 +32,14 @@ use novarocks_spi::connector::{
     StatisticsMetricObservation, StatisticsMetricSource, StatisticsMetricState,
     StatisticsMetricValue, StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature,
     StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
-    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest, StatisticsRowCoverage,
-    StatisticsScanColumn,
+    StatisticsReader, StatisticsReceipt, StatisticsRowCoverage, StatisticsScanColumn,
 };
 use sha2::{Digest, Sha256};
 
 use crate::control_provider::{IcebergControlProvider, IcebergTablePayload};
 use crate::manifest::{DataFileWithStats, extract_data_files_with_stats_at};
 use crate::reconcile_payload::{
-    ICEBERG_STATISTICS_EVIDENCE_VERSION, IcebergStatisticsEvidenceV1, decode_statistics_evidence,
-    encode_statistics_evidence,
+    ICEBERG_STATISTICS_EVIDENCE_VERSION, IcebergStatisticsEvidenceV1, encode_statistics_evidence,
 };
 use crate::statistics_ancestry::{AncestorNdv, resolve_ancestor_ndv};
 use crate::statistics_basis::basis_relation;
@@ -587,65 +585,6 @@ impl StatisticsCollection for IcebergControlProvider {
                 evidence: request.evidence,
             }),
         }
-    }
-
-    fn reconcile_statistics(
-        &self,
-        request: StatisticsReconcileRequest,
-    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
-        validate_context(&request.context)?;
-        if request.evidence.descriptor() != self.descriptor()
-            || request.evidence.incarnation() != self.incarnation()
-            || request.evidence.schema_version() != ICEBERG_STATISTICS_EVIDENCE_VERSION
-            || request.evidence.operation_kind() != STATISTICS_OPERATION_KIND
-        {
-            return Err(invalid(
-                "Iceberg statistics evidence does not match this exact generation",
-            ));
-        }
-        let evidence = decode_statistics_evidence(request.evidence.provider_payload())
-            .map_err(|error| invalid(format!("decode Iceberg statistics evidence: {error}")))?;
-        let expected = StatisticsDataVersion::try_new(Bytes::from(evidence.data_version))?;
-        if !self
-            .runtime()
-            .table_exists(&evidence.namespace, &evidence.table)
-            .map_err(unavailable)?
-        {
-            return Ok(known_uncommitted(ConnectorError::new(
-                ConnectorErrorKind::NotFound,
-                "Iceberg table disappeared before statistics publication reconciled",
-            )));
-        }
-        self.runtime()
-            .control_state()
-            .invalidate_table(&evidence.namespace, &evidence.table);
-        let physical = self
-            .runtime()
-            .load_table(&evidence.namespace, &evidence.table)
-            .map_err(unavailable)?;
-        // Whether the artifact is registered is the authoritative answer, and it
-        // stays authoritative however far the table has moved since.
-        if physical
-            .table
-            .metadata()
-            .statistics_iter()
-            .any(|file| file.statistics_path == evidence.statistics_path)
-        {
-            return statistics_receipt(
-                self,
-                request.evidence.operation_id(),
-                expected,
-                StatisticsEvidenceRevision::try_new(Bytes::from(format!(
-                    "iceberg/statistics/v1/{}",
-                    evidence.statistics_path
-                )))?,
-                Bytes::from(evidence.statistics_path),
-                ExternalMutationEffect::Applied,
-            );
-        }
-        Ok(known_uncommitted(invalid(
-            "Iceberg statistics artifact is not registered in table metadata",
-        )))
     }
 }
 
@@ -1430,50 +1369,6 @@ mod tests {
         assert_eq!(
             decoded.statistics_path,
             "s3://warehouse/db/t/metadata/stats.puffin"
-        );
-
-        let foreign = ExternalMutationEvidence::try_new(
-            ICEBERG_STATISTICS_EVIDENCE_VERSION,
-            provider.descriptor().clone(),
-            ConnectorInstanceIncarnation::from_bytes([5; 16]),
-            operation_id,
-            STATISTICS_OPERATION_KIND,
-            first.provider_payload().clone(),
-        )
-        .expect("foreign evidence");
-        let error = provider
-            .reconcile_statistics(StatisticsReconcileRequest {
-                evidence: foreign,
-                context: context(),
-            })
-            .expect_err("foreign generation must be rejected before table access");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        assert!(error.to_string().contains("exact generation"));
-    }
-
-    #[test]
-    fn malformed_reconcile_evidence_fails_before_catalog_access() {
-        let (_executor, _warehouse, provider) = provider();
-        let evidence = ExternalMutationEvidence::try_new(
-            ICEBERG_STATISTICS_EVIDENCE_VERSION,
-            provider.descriptor().clone(),
-            provider.incarnation(),
-            ConnectorMutationOperationId::new(),
-            STATISTICS_OPERATION_KIND,
-            Bytes::from_static(b"not-json"),
-        )
-        .expect("evidence envelope");
-        let error = provider
-            .reconcile_statistics(StatisticsReconcileRequest {
-                evidence,
-                context: context(),
-            })
-            .expect_err("malformed evidence must fail closed");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        assert!(
-            error
-                .to_string()
-                .contains("decode Iceberg statistics evidence")
         );
     }
 }

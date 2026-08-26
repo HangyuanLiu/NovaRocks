@@ -40,14 +40,13 @@ use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
 use crate::runtime::query_result::QueryResult;
 use novarocks_spi::connector::{
-    BatchReceipt, CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
-    ConnectorCleanupPlan, ConnectorControlResolver, ConnectorDistributedRewriteAttemptCheckpoint,
-    ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorMetadataMaintenancePlan,
-    ConnectorMutationOperationId, ConnectorTableObjectBindingFailure,
-    ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
-    ConnectorTableObjectSelector, ConnectorTableResolution, ConnectorWriteAbortOutcome,
-    ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
-    ExternalMutationEvidence, ExternalMutationOutcome, PreparedBatch,
+    CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
+    ConnectorControlResolver, ConnectorDistributedRewriteAttemptCheckpoint,
+    ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorMutationOperationId,
+    ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
+    ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
+    ConnectorWriteAbortOutcome, ConnectorWriteCohortId, ConnectorWriteInputShape,
+    ConnectorWriteReceipt, ExternalMutationOutcome, PreparedBatch,
 };
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
@@ -210,18 +209,6 @@ impl MaintenanceAttemptCancellationSource {
     pub fn cancel(&self) -> bool {
         !self.cancelled.swap(true, Ordering::AcqRel)
     }
-}
-
-/// What the engine could get back when asking about a dead generation's work.
-///
-/// `Unsupported` is a first-class answer, not an error to be papered over: a
-/// provider without a historical inspector leaves the operation unresolved,
-/// and the caller must not fall back to the ordinary exact-generation
-/// reconcile — the exact generation is the thing that no longer exists.
-#[derive(Clone, Debug)]
-pub enum HistoricalMaintenanceInspection {
-    Unsupported(String),
-    Observed(Box<novarocks_spi::connector::ConnectorHistoricalMaintenanceObservation>),
 }
 
 /// Read-only cancellation view shared by all provider calls in one durable
@@ -460,23 +447,6 @@ pub trait TableMaintenanceEngine: Send + Sync {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
-    fn reconcile_metadata_maintenance(
-        &self,
-        _target: &MaintenanceTarget,
-        _plan: ConnectorMetadataMaintenancePlan,
-    ) -> Result<CompletedMetadataMaintenance, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn reconcile_metadata_maintenance_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        plan: ConnectorMetadataMaintenancePlan,
-        _attempt: &MaintenanceAttemptContext,
-    ) -> Result<CompletedMetadataMaintenance, String> {
-        self.reconcile_metadata_maintenance(target, plan)
-    }
-
     /// Plan a provider-neutral FE-only orphan cleanup operation. The returned
     /// session owns its exact connector generation for the durable frontend
     /// operation; no BE or generic action route participates.
@@ -528,25 +498,6 @@ pub trait TableMaintenanceEngine: Send + Sync {
         )
     }
 
-    fn recover_cleanup_for_reconcile(
-        &self,
-        _target: &MaintenanceTarget,
-        _plan: ConnectorCleanupPlan,
-        _prepared: PreparedBatch,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn recover_cleanup_for_reconcile_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        plan: ConnectorCleanupPlan,
-        prepared: PreparedBatch,
-        _attempt: &MaintenanceAttemptContext,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        self.recover_cleanup_for_reconcile(target, plan, prepared)
-    }
-
     fn prepare_cleanup_batch(
         &self,
         _session: &CleanupMaintenanceSession,
@@ -560,14 +511,6 @@ pub trait TableMaintenanceEngine: Send + Sync {
         _session: &CleanupMaintenanceSession,
         _prepared: PreparedBatch,
     ) -> Result<CleanupBatchExecution, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn reconcile_cleanup_batch(
-        &self,
-        _session: &CleanupMaintenanceSession,
-        _prepared: PreparedBatch,
-    ) -> Result<BatchReceipt, String> {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
@@ -606,24 +549,6 @@ pub trait TableMaintenanceEngine: Send + Sync {
         self.plan_distributed_rewrite(target, operation_id, intent)
     }
 
-    // Design: ADR-0067 (docs/adr/ADR-0067-historical-maintenance-recovery-is-a-separate-capability.md)
-    /// Ask the *live* connector generation what it can prove about work a dead
-    /// generation left behind.
-    ///
-    /// The descriptor names the dead binding as evidence only. Engines that do
-    /// not implement this report it as unsupported so the caller keeps the
-    /// operation unresolved.
-    fn inspect_historical_maintenance(
-        &self,
-        _target: &MaintenanceTarget,
-        _descriptor: novarocks_spi::connector::ConnectorHistoricalMaintenanceDescriptor,
-        _attempt: &MaintenanceAttemptContext,
-    ) -> Result<HistoricalMaintenanceInspection, String> {
-        Ok(HistoricalMaintenanceInspection::Unsupported(
-            TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string(),
-        ))
-    }
-
     fn prepare_distributed_rewrite_cohort(
         &self,
         _session: &DistributedRewriteMaintenanceSession,
@@ -651,14 +576,6 @@ pub trait TableMaintenanceEngine: Send + Sync {
         &self,
         _session: &DistributedRewriteMaintenanceSession,
     ) -> Result<ConnectorWriteAbortOutcome, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
-    }
-
-    fn reconcile_distributed_rewrite(
-        &self,
-        _session: &DistributedRewriteMaintenanceSession,
-        _evidence: ExternalMutationEvidence,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
@@ -1124,33 +1041,6 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         crate::connector::metadata_maintenance::execute_planned_metadata_maintenance(session, self)
     }
 
-    fn reconcile_metadata_maintenance(
-        &self,
-        target: &MaintenanceTarget,
-        plan: ConnectorMetadataMaintenancePlan,
-    ) -> Result<CompletedMetadataMaintenance, String> {
-        self.reconcile_metadata_maintenance_with_attempt_context(
-            target,
-            plan,
-            &MaintenanceAttemptContext::uncancelled(),
-        )
-    }
-
-    fn reconcile_metadata_maintenance_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        plan: ConnectorMetadataMaintenancePlan,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<CompletedMetadataMaintenance, String> {
-        crate::connector::metadata_maintenance::reconcile_metadata_maintenance_session(
-            self.kernel.connector_control().as_ref(),
-            self,
-            Self::target_identity(target)?,
-            plan,
-            self.connector_context_for_attempt(attempt)?,
-        )
-    }
-
     fn plan_cleanup_maintenance(
         &self,
         target: &MaintenanceTarget,
@@ -1221,72 +1111,6 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         .map_err(|error| format!("plan selected owned-ref cleanup operation: {error}"))
     }
 
-    fn recover_cleanup_for_reconcile(
-        &self,
-        target: &MaintenanceTarget,
-        plan: ConnectorCleanupPlan,
-        prepared: PreparedBatch,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        self.recover_cleanup_for_reconcile_with_attempt_context(
-            target,
-            plan,
-            prepared,
-            &MaintenanceAttemptContext::uncancelled(),
-        )
-    }
-
-    fn recover_cleanup_for_reconcile_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        plan: ConnectorCleanupPlan,
-        prepared: PreparedBatch,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        CleanupMaintenanceSession::recover_for_reconcile(
-            self.kernel.connector_control().as_ref(),
-            Self::target_identity(target)?,
-            plan,
-            prepared,
-            self.connector_context_for_attempt(attempt)?,
-        )
-        .map_err(|error| format!("recover orphan cleanup operation: {error}"))
-    }
-
-    fn inspect_historical_maintenance(
-        &self,
-        target: &MaintenanceTarget,
-        descriptor: novarocks_spi::connector::ConnectorHistoricalMaintenanceDescriptor,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<HistoricalMaintenanceInspection, String> {
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(|error| error.to_string())?;
-        let lease = match self
-            .kernel
-            .connector_control()
-            .acquire_current_historical_maintenance(&instance_id)
-        {
-            Ok(lease) => lease,
-            Err(error)
-                if error.kind() == novarocks_spi::connector::ConnectorErrorKind::Unsupported =>
-            {
-                return Ok(HistoricalMaintenanceInspection::Unsupported(
-                    error.to_string(),
-                ));
-            }
-            Err(error) => {
-                return Err(format!(
-                    "acquire historical maintenance recovery capability: {error}"
-                ));
-            }
-        };
-        let observation = lease
-            .inspect(descriptor, self.connector_context_for_attempt(attempt)?)
-            .map_err(|error| format!("inspect historical maintenance operation: {error}"))?;
-        Ok(HistoricalMaintenanceInspection::Observed(Box::new(
-            observation,
-        )))
-    }
-
     fn prepare_cleanup_batch(
         &self,
         session: &CleanupMaintenanceSession,
@@ -1305,16 +1129,6 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         session
             .execute_batch(prepared)
             .map_err(|error| format!("execute orphan cleanup batch: {error}"))
-    }
-
-    fn reconcile_cleanup_batch(
-        &self,
-        session: &CleanupMaintenanceSession,
-        prepared: PreparedBatch,
-    ) -> Result<BatchReceipt, String> {
-        session
-            .reconcile_batch(prepared)
-            .map_err(|error| format!("reconcile orphan cleanup batch: {error}"))
     }
 
     fn read_cleanup_candidate_page(
@@ -1407,17 +1221,6 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             .session()
             .abort(session.context().clone())
             .map_err(|error| format!("abort distributed rewrite operation: {error}"))
-    }
-
-    fn reconcile_distributed_rewrite(
-        &self,
-        session: &DistributedRewriteMaintenanceSession,
-        evidence: ExternalMutationEvidence,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
-        session
-            .session()
-            .reconcile(evidence, session.context().clone())
-            .map_err(|error| format!("reconcile distributed rewrite operation: {error}"))
     }
 
     fn finalize_distributed_rewrite(
@@ -1523,25 +1326,6 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
             .execute_planned_metadata_maintenance(session)
     }
 
-    fn reconcile_metadata_maintenance(
-        &self,
-        target: &MaintenanceTarget,
-        plan: ConnectorMetadataMaintenancePlan,
-    ) -> Result<CompletedMetadataMaintenance, String> {
-        self.request_engine()?
-            .reconcile_metadata_maintenance(target, plan)
-    }
-
-    fn reconcile_metadata_maintenance_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        plan: ConnectorMetadataMaintenancePlan,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<CompletedMetadataMaintenance, String> {
-        self.request_engine()?
-            .reconcile_metadata_maintenance_with_attempt_context(target, plan, attempt)
-    }
-
     fn plan_cleanup_maintenance(
         &self,
         target: &MaintenanceTarget,
@@ -1602,37 +1386,6 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
             )
     }
 
-    fn recover_cleanup_for_reconcile(
-        &self,
-        target: &MaintenanceTarget,
-        plan: ConnectorCleanupPlan,
-        prepared: PreparedBatch,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        self.request_engine()?
-            .recover_cleanup_for_reconcile(target, plan, prepared)
-    }
-
-    fn recover_cleanup_for_reconcile_with_attempt_context(
-        &self,
-        target: &MaintenanceTarget,
-        plan: ConnectorCleanupPlan,
-        prepared: PreparedBatch,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<CleanupMaintenanceSession, String> {
-        self.request_engine()?
-            .recover_cleanup_for_reconcile_with_attempt_context(target, plan, prepared, attempt)
-    }
-
-    fn inspect_historical_maintenance(
-        &self,
-        target: &MaintenanceTarget,
-        descriptor: novarocks_spi::connector::ConnectorHistoricalMaintenanceDescriptor,
-        attempt: &MaintenanceAttemptContext,
-    ) -> Result<HistoricalMaintenanceInspection, String> {
-        self.request_engine()?
-            .inspect_historical_maintenance(target, descriptor, attempt)
-    }
-
     fn prepare_cleanup_batch(
         &self,
         session: &CleanupMaintenanceSession,
@@ -1649,15 +1402,6 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
     ) -> Result<CleanupBatchExecution, String> {
         self.request_engine()?
             .execute_cleanup_batch(session, prepared)
-    }
-
-    fn reconcile_cleanup_batch(
-        &self,
-        session: &CleanupMaintenanceSession,
-        prepared: PreparedBatch,
-    ) -> Result<BatchReceipt, String> {
-        self.request_engine()?
-            .reconcile_cleanup_batch(session, prepared)
     }
 
     fn read_cleanup_candidate_page(
@@ -1725,15 +1469,6 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
         session: &DistributedRewriteMaintenanceSession,
     ) -> Result<ConnectorWriteAbortOutcome, String> {
         self.request_engine()?.abort_distributed_rewrite(session)
-    }
-
-    fn reconcile_distributed_rewrite(
-        &self,
-        session: &DistributedRewriteMaintenanceSession,
-        evidence: ExternalMutationEvidence,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
-        self.request_engine()?
-            .reconcile_distributed_rewrite(session, evidence)
     }
 
     fn finalize_distributed_rewrite(

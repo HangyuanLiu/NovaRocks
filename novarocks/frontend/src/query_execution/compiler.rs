@@ -703,31 +703,6 @@ fn test_distributed_rewrite_lease(
 }
 
 #[cfg(test)]
-impl novarocks_spi::connector::ConnectorHistoricalMaintenanceResolver
-    for TestConnectorControlRegistry
-{
-    fn acquire_current_historical_maintenance(
-        &self,
-        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorHistoricalMaintenanceLease,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        // The test registry installs no historical recovery capability. This
-        // is the production-shaped answer for a provider that does not offer
-        // one, and it is what keeps such an operation unresolved.
-        Err(novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-            format!(
-                "connector control instance `{}` has no historical maintenance recovery \
-                 capability",
-                instance_id.as_str()
-            ),
-        ))
-    }
-}
-
-#[cfg(test)]
 impl novarocks_spi::connector::ConnectorStatisticsResolver for TestConnectorControlRegistry {
     fn acquire_current_statistics(
         &self,

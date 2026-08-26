@@ -26,7 +26,6 @@ mod error;
 mod execution;
 mod execution_declaration;
 mod handle;
-mod historical_maintenance_recovery;
 mod identity;
 mod metadata;
 mod metadata_maintenance;
@@ -54,10 +53,10 @@ pub use cleanup_maintenance::{
     ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefIdentity,
     ConnectorCleanupOwnedRefSelection, ConnectorCleanupPlan, ConnectorCleanupPlanSummary,
     ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
-    ConnectorCleanupReconcileRequest, MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS,
-    MAX_CONNECTOR_CLEANUP_BATCHES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES,
-    MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS, MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS,
-    MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES, PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
+    MAX_CONNECTOR_CLEANUP_BATCH_OBJECTS, MAX_CONNECTOR_CLEANUP_BATCHES,
+    MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS,
+    MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS, MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES,
+    PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
 };
 pub use context::{ConnectorCancellation, ConnectorRequestContext};
 pub use control::{
@@ -115,20 +114,6 @@ pub use handle::{
     ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
-pub use historical_maintenance_recovery::{
-    ConnectorHistoricalDispatchFacts, ConnectorHistoricalMaintenanceArtifact,
-    ConnectorHistoricalMaintenanceCleanupReceipt, ConnectorHistoricalMaintenanceCleanupRequest,
-    ConnectorHistoricalMaintenanceContinuation, ConnectorHistoricalMaintenanceDescriptor,
-    ConnectorHistoricalMaintenanceDisposition, ConnectorHistoricalMaintenanceFamily,
-    ConnectorHistoricalMaintenanceLease, ConnectorHistoricalMaintenanceObservation,
-    ConnectorHistoricalMaintenanceOutcome, ConnectorHistoricalMaintenanceProof,
-    ConnectorHistoricalMaintenanceRecovery, ConnectorHistoricalMaintenanceResolver,
-    MAX_CONNECTOR_HISTORICAL_MAINTENANCE_ARTIFACT_BYTES,
-    MAX_CONNECTOR_HISTORICAL_MAINTENANCE_ARTIFACTS,
-    MAX_CONNECTOR_HISTORICAL_MAINTENANCE_CONTINUATION_BYTES,
-    MAX_CONNECTOR_HISTORICAL_MAINTENANCE_PROOF_BYTES,
-    validate_historical_maintenance_recovery_owner,
-};
 pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};
 pub use metadata::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY,
@@ -158,9 +143,8 @@ pub use metadata_maintenance::{
     ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
     ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReceiptSummary,
-    ConnectorMetadataMaintenanceReconcileRequest, ConnectorMetadataMaintenanceResolver,
-    EXPIRE_TABLE_VERSIONS_KIND, MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
-    MAX_CONNECTOR_METADATA_MAINTENANCE_PATH_BYTES,
+    ConnectorMetadataMaintenanceResolver, EXPIRE_TABLE_VERSIONS_KIND,
+    MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES, MAX_CONNECTOR_METADATA_MAINTENANCE_PATH_BYTES,
     MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES, REWRITE_METADATA_LAYOUT_KIND,
 };
 pub use mutation::{
@@ -266,8 +250,7 @@ pub use statistics::{
     StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
     StatisticsMissing, StatisticsMissingKind, StatisticsNumericNature,
     StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReadRequest,
-    StatisticsReader, StatisticsReceipt, StatisticsReconcileRequest, StatisticsRowCoverage,
-    StatisticsScanColumn,
+    StatisticsReader, StatisticsReceipt, StatisticsRowCoverage, StatisticsScanColumn,
 };
 pub use view_metadata::{
     ConnectorListViewsRequest, ConnectorViewMetadata, ConnectorViewMetadataValue,

@@ -28,12 +28,11 @@ use novarocks_spi::connector::{
     ConnectorMaxCompactableDataFilesRequest, ConnectorMetadataMaintenanceExecuteRequest,
     ConnectorMetadataMaintenanceLease, ConnectorMetadataMaintenanceOperation,
     ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanningRequest,
-    ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReconcileRequest,
-    ConnectorMetadataMaintenanceResolver, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceResolver,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use crate::common::engine_error::EngineError;
@@ -227,36 +226,6 @@ pub fn plan_metadata_maintenance_session(
         .map_err(resolved_error_message)
 }
 
-pub fn reconcile_metadata_maintenance_session(
-    resolver: &dyn ConnectorMetadataMaintenanceResolver,
-    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
-    table: ConnectorTableIdentity,
-    plan: ConnectorMetadataMaintenancePlan,
-    context: ConnectorRequestContext,
-) -> Result<CompletedMetadataMaintenance, String> {
-    let session = MetadataMaintenanceSession::recover(resolver, table, plan, None, context)
-        .map_err(resolved_error_message)?;
-    match session.reconcile(None, cache_finalizer) {
-        ResolvedMetadataMaintenance::KnownCommitted(completed) => {
-            if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
-                Err(
-                    EngineError::commit_known_committed_finalize_failed(failure.to_string())
-                        .to_string(),
-                )
-            } else {
-                Ok(completed)
-            }
-        }
-        ResolvedMetadataMaintenance::KnownUncommitted { failure } => {
-            Err(EngineError::commit_known_uncommitted(failure.to_string()).to_string())
-        }
-        ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
-            Err(EngineError::commit_unknown(failure.to_string()).to_string())
-        }
-        ResolvedMetadataMaintenance::ContractFailure { error, .. } => Err(error.to_string()),
-    }
-}
-
 fn resolved_error_message(value: ResolvedMetadataMaintenance) -> String {
     match value {
         ResolvedMetadataMaintenance::KnownUncommitted { failure } => failure.to_string(),
@@ -446,93 +415,6 @@ impl MetadataMaintenanceSession {
         };
         resolve_terminal_outcome(outcome, &self.table, cache_finalizer)
     }
-
-    /// Restore an already persisted plan on its recorded exact generation.
-    /// This intentionally never loads metadata, replans, or executes.
-    #[allow(clippy::result_large_err)]
-    pub(crate) fn recover(
-        resolver: &dyn ConnectorMetadataMaintenanceResolver,
-        table: ConnectorTableIdentity,
-        plan: ConnectorMetadataMaintenancePlan,
-        evidence: Option<ExternalMutationEvidence>,
-        context: ConnectorRequestContext,
-    ) -> Result<Self, ResolvedMetadataMaintenance> {
-        let key = plan.owner().clone();
-        plan.validate().map_err(|error| {
-            contract_failure(
-                error,
-                MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
-            )
-        })?;
-        if table.instance_id != key.instance_id {
-            return Err(contract_failure(
-                ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "metadata maintenance recovery table does not match plan owner",
-                ),
-                MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
-            ));
-        }
-        let lease = resolver
-            .acquire_exact_metadata_maintenance(&key)
-            .map_err(|error| {
-                contract_failure(
-                    error,
-                    MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
-                )
-            })?;
-        if let Some(evidence) = &evidence
-            && (evidence.operation_id() != plan.operation_id()
-                || evidence.operation_kind() != plan.operation_kind())
-        {
-            return Err(contract_failure(
-                ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "metadata maintenance recovery evidence does not match plan",
-                ),
-                MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
-            ));
-        }
-        Ok(Self {
-            lease,
-            table,
-            plan,
-            context,
-        })
-    }
-
-    /// Consume a recovered session by reconciling only. An unavailable exact
-    /// generation is propagated as a contract failure for the frontend to mark
-    /// unresolved; it must never be substituted with the current generation.
-    pub(crate) fn reconcile(
-        self,
-        evidence: Option<ExternalMutationEvidence>,
-        cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
-    ) -> ResolvedMetadataMaintenance {
-        let request = match ConnectorMetadataMaintenanceReconcileRequest::try_new(
-            self.plan.clone(),
-            evidence,
-            self.context,
-        ) {
-            Ok(request) => request,
-            Err(error) => {
-                return contract_failure(
-                    error,
-                    MetadataMaintenanceDispatchState::ConfirmedNotDispatched,
-                );
-            }
-        };
-        let outcome = match self.lease.reconcile(request) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return contract_failure(
-                    error,
-                    MetadataMaintenanceDispatchState::PossiblyDispatched,
-                );
-            }
-        };
-        resolve_terminal_outcome(outcome, &self.table, cache_finalizer)
-    }
 }
 
 fn resolve_terminal_outcome(
@@ -637,7 +519,6 @@ mod tests {
         metadata_calls: AtomicUsize,
         plan_calls: AtomicUsize,
         execute_calls: AtomicUsize,
-        reconcile_calls: AtomicUsize,
         events: Arc<Mutex<Vec<&'static str>>>,
     }
 
@@ -657,7 +538,6 @@ mod tests {
                 metadata_calls: AtomicUsize::new(0),
                 plan_calls: AtomicUsize::new(0),
                 execute_calls: AtomicUsize::new(0),
-                reconcile_calls: AtomicUsize::new(0),
                 events: Arc::new(Mutex::new(Vec::new())),
             })
         }
@@ -767,30 +647,6 @@ mod tests {
                         "response lost",
                     ),
                     evidence: self.evidence(&request.plan),
-                });
-            }
-            self.events.lock().unwrap().push("provider");
-            Ok(ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
-                receipt: self.receipt(&request.plan),
-                finalization: ExternalMutationFinalization::Complete,
-            })
-        }
-        fn reconcile(
-            &self,
-            request: ConnectorMetadataMaintenanceReconcileRequest,
-        ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>
-        {
-            self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
-            if matches!(self.mode, Mode::UnknownStaysUnknown) {
-                return Ok(ExternalMutationOutcome::CommitUnknown {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Unavailable,
-                        "marker absent",
-                    ),
-                    evidence: request
-                        .evidence
-                        .unwrap_or_else(|| self.evidence(&request.plan)),
                 });
             }
             self.events.lock().unwrap().push("provider");
@@ -913,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_execute_is_not_reexecuted_and_exact_recovery_only_reconciles() {
+    fn unknown_execute_is_not_reexecuted() {
         let provider = FakeProvider::new(Mode::UnknownStaysUnknown);
         let resolver = Resolver::new(provider.clone());
         let finalizer = Finalizer {
@@ -928,27 +784,14 @@ mod tests {
             context(),
         )
         .unwrap();
-        let plan = session.plan.clone();
         assert!(matches!(
             session.execute(&finalizer),
             ResolvedMetadataMaintenance::CommitUnknown { .. }
         ));
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 0);
-        assert!(
-            reconcile_metadata_maintenance_session(
-                &resolver,
-                &finalizer,
-                table(&provider.descriptor.instance_id),
-                plan,
-                context(),
-            )
-            .is_err()
-        );
         assert_eq!(provider.metadata_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.plan_calls.load(Ordering::SeqCst), 1);
         assert_eq!(provider.execute_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(provider.reconcile_calls.load(Ordering::SeqCst), 1);
     }
 
     /// A provider that only answers the read-only observation. Everything a
@@ -1006,13 +849,6 @@ mod tests {
         ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>
         {
             unreachable!("observation must not execute")
-        }
-        fn reconcile(
-            &self,
-            _: ConnectorMetadataMaintenanceReconcileRequest,
-        ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>
-        {
-            unreachable!("observation must not reconcile")
         }
         fn read_max_compactable_data_files(
             &self,

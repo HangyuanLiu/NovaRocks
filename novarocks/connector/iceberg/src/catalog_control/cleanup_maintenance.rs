@@ -32,8 +32,8 @@ use novarocks_spi::connector::{
     ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance, ConnectorCleanupOperationId,
     ConnectorCleanupOwnedRefIdentity, ConnectorCleanupOwnedRefSelection, ConnectorCleanupPlan,
     ConnectorCleanupPlanSummary, ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
-    ConnectorCleanupReconcileRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, PreparedBatch,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
+    PreparedBatch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -627,22 +627,6 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         self.persist_receipt(&request.plan, &request.prepared, &payload, outcomes)
     }
 
-    fn reconcile_batch(
-        &self,
-        request: ConnectorCleanupReconcileRequest,
-    ) -> Result<BatchReceipt, ConnectorError> {
-        request.plan.validate()?;
-        validate_context(&request.context)?;
-        self.ensure_owner(request.plan.owner())?;
-        let (payload, batch) = self.prepared_records(&request.plan, &request.prepared)?;
-        if let Some(receipt) = self.existing_receipt(&request.plan, &request.prepared, &payload)? {
-            return Ok(receipt);
-        }
-        let config = self.runtime.control_state().object_store_config();
-        let outcomes = reconcile_frozen_batch(&self.runtime, &payload, &batch, config)?;
-        self.persist_receipt(&request.plan, &request.prepared, &payload, outcomes)
-    }
-
     fn read_candidate_page(
         &self,
         request: ConnectorCleanupCandidatePageRequest,
@@ -894,66 +878,6 @@ fn execute_frozen_batch(
         .collect()
 }
 
-fn reconcile_frozen_batch(
-    runtime: &IcebergControlRuntime,
-    payload: &PlanPayload,
-    batch: &[ManifestRecord],
-    config: Option<&novarocks_fs::ObjectStoreConfig>,
-) -> Result<Vec<ReceiptRecord>, ConnectorError> {
-    batch
-        .iter()
-        .map(|record| match &record.candidate {
-            ManifestCandidate::OwnedRef {
-                name,
-                head_snapshot_id,
-                provenance_version,
-                provenance_digest_hex,
-                created_at_ms,
-                ..
-            } => reconcile_owned_ref(
-                runtime,
-                payload,
-                record.ordinal,
-                name,
-                *head_snapshot_id,
-                *provenance_version,
-                provenance_digest_hex.as_deref(),
-                *created_at_ms,
-            ),
-            ManifestCandidate::Object { location, identity } => {
-                let access = crate::fs_io::resolve_access_for_location(location, config)
-                    .map_err(unavailable)?;
-                let path = access.single_relative_path().map_err(invalid)?.to_string();
-                let outcome = runtime
-                    .resources()
-                    .catalog_runtime()
-                    .block_on(stat_matches(access.operator(), path, identity.clone()))
-                    .map_err(unavailable)?;
-                match outcome {
-                    Err(error) if error.kind() == crate::opendal::ErrorKind::NotFound => {
-                        receipt(record.ordinal, ObjectOutcome::Deleted, None)
-                    }
-                    Err(error) => receipt(
-                        record.ordinal,
-                        ObjectOutcome::Unknown,
-                        Some(error.to_string()),
-                    ),
-                    Ok(true) => receipt(
-                        record.ordinal,
-                        ObjectOutcome::Failed,
-                        Some("object remains after uncertain delete".to_string()),
-                    ),
-                    Ok(false) => receipt(
-                        record.ordinal,
-                        ObjectOutcome::Failed,
-                        Some("object identity changed after uncertain delete".to_string()),
-                    ),
-                }
-            }
-        })
-        .collect()
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "Exact ref retirement keeps every provenance field explicit at the destructive boundary."
@@ -1021,76 +945,6 @@ fn execute_owned_ref(
             Some("owned ref changed before exact retirement".to_string()),
         ),
         Ok(Err(error)) | Err(error) => receipt(ordinal, ObjectOutcome::Unknown, Some(error)),
-    }
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Exact ref observation revalidates the same immutable candidate fields as retirement."
-)]
-fn reconcile_owned_ref(
-    runtime: &IcebergControlRuntime,
-    payload: &PlanPayload,
-    ordinal: u32,
-    name: &str,
-    expected_head_snapshot_id: i64,
-    provenance_version: u16,
-    provenance_digest_hex: Option<&str>,
-    created_at_ms: i64,
-) -> Result<ReceiptRecord, ConnectorError> {
-    runtime
-        .control_state()
-        .invalidate_table(&payload.namespace, &payload.table);
-    let physical = runtime
-        .load_table(&payload.namespace, &payload.table)
-        .map_err(unavailable)?;
-    let metadata = physical.table.metadata();
-    if metadata.uuid().to_string() != payload.table_uuid {
-        return receipt(
-            ordinal,
-            ObjectOutcome::Failed,
-            Some("cleanup table incarnation changed after uncertain ref retirement".to_string()),
-        );
-    }
-    let expected = OwnedRefCandidate {
-        name: name.to_string(),
-        head_snapshot_id: expected_head_snapshot_id,
-        provenance_version,
-        provenance_digest: decode_owned_ref_provenance_digest(provenance_digest_hex)?,
-        created_at_ms,
-    };
-    match metadata.refs().get(name) {
-        None => receipt(ordinal, ObjectOutcome::Deleted, None),
-        Some(_)
-            if !matches_owned_ref_candidate(
-                metadata,
-                &payload.namespace,
-                &payload.table,
-                &expected,
-            ) =>
-        {
-            receipt(
-                ordinal,
-                ObjectOutcome::Failed,
-                Some("owned ref provenance changed after uncertain retirement".to_string()),
-            )
-        }
-        Some(reference)
-            if reference.is_branch() && reference.snapshot_id == expected_head_snapshot_id =>
-        {
-            receipt(
-                ordinal,
-                ObjectOutcome::Failed,
-                Some(
-                    "owned ref remains at the observed head after uncertain retirement".to_string(),
-                ),
-            )
-        }
-        Some(_) => receipt(
-            ordinal,
-            ObjectOutcome::Failed,
-            Some("owned ref changed after uncertain retirement".to_string()),
-        ),
     }
 }
 
@@ -1616,98 +1470,6 @@ fn exhausted(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message.into())
 }
 
-/// How one historical cleanup batch actually landed.
-pub(crate) struct HistoricalCleanupCounts {
-    pub deleted: u64,
-    pub already_absent: u64,
-    pub failed: u64,
-    pub unknown: u64,
-}
-
-/// Classify a batch a dead generation dispatched, without deleting anything.
-///
-/// This is a read: it stats each object in the frozen batch and reports what it
-/// finds. Nothing here plans, prepares or deletes, and the candidate set is
-/// exactly the one the old attempt froze -- the manifest digest is what proves
-/// the list read back is that same list, and the table UUID check is what stops
-/// a dropped-and-recreated table from being classified against an old manifest.
-pub(crate) fn classify_historical_cleanup_batch(
-    runtime: &IcebergControlRuntime,
-    operation_id: [u8; 16],
-    plan_payload: &[u8],
-    prepared_payload: &[u8],
-    manifest_digest: [u8; 32],
-) -> Result<HistoricalCleanupCounts, ConnectorError> {
-    let payload: PlanPayload = decode_canonical(plan_payload, "cleanup plan")?;
-    let prepared =
-        PreparedBatch::try_from_wire_v1(bytes::Bytes::copy_from_slice(prepared_payload))?;
-    let evidence: PreparedPayload =
-        decode_canonical(prepared.evidence_payload(), "cleanup prepared evidence")?;
-    if evidence.version != ARTIFACT_VERSION
-        || evidence.artifact_root != payload.artifact_root
-        || evidence.batch_ordinal != prepared.batch_ordinal()
-        || evidence.record_count == 0
-        || evidence.record_count as usize > MAX_BATCH_OBJECTS
-        || evidence.batch_digest_hex != hex_encode(prepared.batch_digest())
-    {
-        return Err(corrupt("Iceberg cleanup prepared evidence is invalid"));
-    }
-
-    runtime
-        .control_state()
-        .invalidate_table(&payload.namespace, &payload.table);
-    let physical = runtime
-        .load_table(&payload.namespace, &payload.table)
-        .map_err(unavailable)?;
-    if physical.table.metadata().uuid().to_string() != payload.table_uuid {
-        return Err(corrupt(
-            "Iceberg cleanup table incarnation no longer matches its frozen manifest",
-        ));
-    }
-    let table_location = physical.table.metadata().location().to_string();
-    let expected_prefix = format!(
-        "{table_location}/_novarocks/maintenance/v4/orphan-cleanup/{}/",
-        hex_encode(operation_id)
-    );
-    if !payload.artifact_root.starts_with(&expected_prefix) {
-        return Err(corrupt(
-            "Iceberg cleanup artifact root does not match its frozen table",
-        ));
-    }
-    let records = read_manifest(
-        runtime,
-        &physical.table.file_io().clone(),
-        &payload.artifact_root,
-        manifest_digest,
-    )?;
-    let start = evidence.first_ordinal as usize;
-    let end = start
-        .checked_add(evidence.record_count as usize)
-        .ok_or_else(|| corrupt("Iceberg cleanup batch range overflows its manifest"))?;
-    if end > records.len() {
-        return Err(corrupt("Iceberg cleanup batch exceeds its frozen manifest"));
-    }
-    let batch = &records[start..end];
-
-    let config = runtime.control_state().object_store_config();
-    let outcomes = reconcile_frozen_batch(runtime, &payload, batch, config)?;
-    let mut counts = HistoricalCleanupCounts {
-        deleted: 0,
-        already_absent: 0,
-        failed: 0,
-        unknown: 0,
-    };
-    for outcome in &outcomes {
-        match outcome.outcome {
-            ObjectOutcome::Deleted => counts.deleted += 1,
-            ObjectOutcome::AlreadyAbsent => counts.already_absent += 1,
-            ObjectOutcome::Failed => counts.failed += 1,
-            ObjectOutcome::Unknown => counts.unknown += 1,
-        }
-    }
-    Ok(counts)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -2163,64 +1925,5 @@ mod tests {
                     .expect("replayed finalization"),
             )
             .expect("replayed terminal finalization");
-    }
-
-    #[test]
-    fn reconcile_is_stable_and_execute_preserves_failure_outcomes() {
-        let (executor, warehouse, runtime) = local_runtime();
-        let path = warehouse.path().join("candidate.parquet");
-        std::fs::write(&path, b"candidate").expect("write candidate");
-        let location = format!("file://{}", path.display());
-        let identity = size_mtime_identity(&executor, &location);
-        let record = object_record(0, location.clone(), identity.clone());
-
-        let payload = test_payload();
-        let remains =
-            reconcile_frozen_batch(&runtime, &payload, std::slice::from_ref(&record), None)
-                .expect("reconcile remaining object");
-        let remains_summary = receipt_summary(&remains).expect("remaining summary");
-        assert_eq!(remains_summary.failed(), 1);
-        assert_eq!(remains_summary.deleted(), 0);
-        assert!(path.exists());
-
-        let mismatched = object_record(
-            0,
-            location.clone(),
-            match identity {
-                ObjectIdentity::SizeMtime { size, mtime_ms } => ObjectIdentity::SizeMtime {
-                    size: size + 1,
-                    mtime_ms,
-                },
-                _ => unreachable!("local fixture uses size and mtime"),
-            },
-        );
-        let failed = execute_frozen_batch(&runtime, &payload, &[mismatched], None)
-            .expect("execute mismatched identity");
-        let failed_summary = receipt_summary(&failed).expect("failure summary");
-        assert_eq!(failed_summary.failed(), 1);
-        assert_eq!(failed_summary.deleted(), 0);
-        assert!(
-            failed[0]
-                .reason
-                .as_deref()
-                .expect("failure reason")
-                .contains("identity changed")
-        );
-        assert!(path.exists(), "failed cleanup must not delete the object");
-
-        std::fs::remove_file(&path).expect("remove candidate");
-        let absent_once =
-            reconcile_frozen_batch(&runtime, &payload, std::slice::from_ref(&record), None)
-                .expect("first absent reconcile");
-        let absent_replay = reconcile_frozen_batch(&runtime, &payload, &[record], None)
-            .expect("replayed absent reconcile");
-        assert_eq!(
-            receipt_summary(&absent_once).expect("first absent summary"),
-            BatchReceiptSummary::new(1, 0, 0, 0)
-        );
-        assert_eq!(
-            receipt_summary(&absent_replay).expect("replayed absent summary"),
-            BatchReceiptSummary::new(1, 0, 0, 0)
-        );
     }
 }
