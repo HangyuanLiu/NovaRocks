@@ -33,10 +33,9 @@ impl Scenario for WipeStartRebuild {
         "state-family/wipe-start-rebuild"
     }
 
-    // Deliberately no `launch_config` override: the default seeds every live BE
-    // into the FE config. Wiping the store destroys durable membership, so a
-    // launch that published backends only through `ADD BACKEND` could never
-    // satisfy the topology barrier the restart path waits on.
+    // No `launch_config` override is needed: backends self-register, so the
+    // restarted frontend rebuilds membership from their announcements and the
+    // destroyed store contributes nothing to the topology barrier.
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;

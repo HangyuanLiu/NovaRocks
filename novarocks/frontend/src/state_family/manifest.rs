@@ -36,7 +36,6 @@ use super::classification::{
 // key; MV has none because its owner joins with `/` itself.  Normalizing them
 // would rewrite live keys, so the manifest preserves each as frozen.
 const CATALOG_ATTACHMENT_PREFIX: &str = "novarocks/frontend/catalog/v1/attachment/by-instance/";
-const CLUSTER_BACKENDS_PREFIX: &str = "novarocks/frontend/cluster-backends/v1/state";
 const MV_ACCELERATOR_PREFIX: &str = "novarocks/frontend/mv/accelerator/v1";
 const GC_OWNED_REF_OBSERVATION_PREFIX: &str =
     "novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/";
@@ -53,7 +52,6 @@ pub enum StateFamily {
     CatalogDesiredState,
     /// Cluster backend membership as an operator declared it, through
     /// configuration seeds and SQL.
-    BackendDesiredState,
     /// MV definitions, target and dependency indexes, and the aggregate
     /// published waterline.
     MvAccelerator,
@@ -84,7 +82,7 @@ impl StateFamily {
     /// The number of registered families.
     ///
     /// Hand-written, and checked against the chain below at compile time.
-    pub const COUNT: usize = 12;
+    pub const COUNT: usize = 11;
 
     /// Every registered family, in manifest order.
     ///
@@ -114,19 +112,6 @@ impl StateFamily {
                     PersistentKeyPrefix::new(CATALOG_ATTACHMENT_PREFIX),
                     1,
                     ClonePolicy::SemanticRebind,
-                ))
-            }
-            Self::BackendDesiredState => {
-                StateFamilyClassification::ExternalProjection(ExternalProjectionContract::new(
-                    ExternalProjectionSource::ConfiguredSeedsAndSqlMembership,
-                    SnapshotIdentity::SingleVersionedRecord,
-                    BootstrapFailureScope::GlobalOnly,
-                    PersistentKeyPrefix::new(CLUSTER_BACKENDS_PREFIX),
-                    1,
-                    // Backend identity belongs to the source deployment's
-                    // machines, so a clone declares its own membership rather
-                    // than inheriting endpoints it cannot reach.
-                    ClonePolicy::NotCloned,
                 ))
             }
             Self::MvAccelerator => {
@@ -208,7 +193,6 @@ impl StateFamily {
     pub const fn family_id(self) -> &'static str {
         match self {
             Self::CatalogDesiredState => "frontend/catalog/desired-state",
-            Self::BackendDesiredState => "frontend/cluster-backends/desired-state",
             Self::MvAccelerator => "frontend/mv/accelerator",
             Self::GcOwnedRefObservation => "frontend/table-maintenance/gc-owned-ref-observation",
             Self::SchemaCache => "frontend/catalog/schema-cache",
@@ -279,8 +263,7 @@ impl StateFamily {
     /// and rejects a length that disagrees with [`StateFamily::COUNT`].
     const fn next_in_manifest(self) -> Option<Self> {
         match self {
-            Self::CatalogDesiredState => Some(Self::BackendDesiredState),
-            Self::BackendDesiredState => Some(Self::MvAccelerator),
+            Self::CatalogDesiredState => Some(Self::MvAccelerator),
             Self::MvAccelerator => Some(Self::GcOwnedRefObservation),
             Self::GcOwnedRefObservation => Some(Self::SchemaCache),
             Self::SchemaCache => Some(Self::StatisticsArtifactCache),
@@ -325,14 +308,20 @@ mod tests {
     use super::*;
     use crate::state_family::WipeEntry;
 
-    /// Spec §5.3 registers twelve families: two `ExternalProjection`, four
+    /// Eleven families: one `ExternalProjection` (catalog desired state), four
     /// `Accelerator` (two of them in-process) and six `ProcessRuntime`.
+    ///
+    /// Backend desired state is deliberately absent. It was registered while
+    /// the frontend still carried a durable membership record; backend
+    /// self-registration removed that record, and an orchestrator-owned
+    /// desired state the frontend never projects is not a frontend-local
+    /// state family at all.
     #[test]
     fn manifest_registers_exactly_the_spec_family_table() {
         assert_eq!(
             StateFamily::ALL.len(),
-            12,
-            "spec 5.3 registers twelve frontend state families"
+            11,
+            "the manifest registers eleven frontend state families"
         );
 
         let mut external_projection = 0;
@@ -348,7 +337,7 @@ mod tests {
             }
         }
 
-        assert_eq!(external_projection, 2, "catalog and backend desired state");
+        assert_eq!(external_projection, 1, "catalog desired state");
         assert_eq!(
             accelerator, 4,
             "MV, GC observation, schema cache, statistics artifact cache"
@@ -392,7 +381,7 @@ mod tests {
                     .map(|prefix| (family, prefix.as_str()))
             })
             .collect();
-        assert_eq!(prefixes.len(), 4, "four families are durable today");
+        assert_eq!(prefixes.len(), 3, "three families are durable today");
 
         let distinct: BTreeSet<&str> = prefixes.iter().map(|(_, prefix)| *prefix).collect();
         assert_eq!(
@@ -422,14 +411,10 @@ mod tests {
     /// prefix has to be made twice, deliberately.
     #[test]
     fn prefix_literals_are_byte_stable() {
-        let expected: [(StateFamily, &[u8]); 4] = [
+        let expected: [(StateFamily, &[u8]); 3] = [
             (
                 StateFamily::CatalogDesiredState,
                 b"novarocks/frontend/catalog/v1/attachment/by-instance/",
-            ),
-            (
-                StateFamily::BackendDesiredState,
-                b"novarocks/frontend/cluster-backends/v1/state",
             ),
             (
                 StateFamily::MvAccelerator,
@@ -600,24 +585,6 @@ mod tests {
             BootstrapFailureScope::GlobalEnumerationPerEntryMaterialization
         );
         assert_eq!(catalog.clone_policy(), ClonePolicy::SemanticRebind);
-
-        let backends = StateFamily::BackendDesiredState.classification();
-        let StateFamilyClassification::ExternalProjection(backends) = backends else {
-            panic!("backend desired state is an external projection");
-        };
-        assert_eq!(
-            backends.source(),
-            ExternalProjectionSource::ConfiguredSeedsAndSqlMembership
-        );
-        assert_eq!(
-            backends.snapshot_identity(),
-            SnapshotIdentity::SingleVersionedRecord
-        );
-        assert_eq!(
-            backends.bootstrap_failure_scope(),
-            BootstrapFailureScope::GlobalOnly
-        );
-        assert_eq!(backends.clone_policy(), ClonePolicy::NotCloned);
     }
 
     #[test]
@@ -677,17 +644,6 @@ mod tests {
             b"novarocks/frontend/catalog/v1/attachment/by-instance/77617265686f7573652e6d61696e"
         );
 
-        // topology: the prefix is the whole key; there is no suffix.
-        assert_eq!(
-            StateFamily::BackendDesiredState
-                .persistent_prefix()
-                .expect("durable family")
-                .key()
-                .expect("cluster backends key")
-                .as_bytes(),
-            b"novarocks/frontend/cluster-backends/v1/state"
-        );
-
         // mv: the prefix carries no trailing separator, so the owner joins with
         // its own `/`.
         assert_eq!(
@@ -723,10 +679,6 @@ mod tests {
                 b"novarocks/frontend/mv/accelerator/v1/projection/by-id/0000000000000001"
             ),
             Some(StateFamily::MvAccelerator)
-        );
-        assert_eq!(
-            StateFamily::for_key(b"novarocks/frontend/cluster-backends/v1/state"),
-            Some(StateFamily::BackendDesiredState)
         );
 
         // Retired families are unattributable by construction: they are absent

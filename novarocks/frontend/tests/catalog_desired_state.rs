@@ -564,7 +564,6 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
             .with_catalog_desired_state_source_mode(mode),
             ClusterBackendOpenConfig::new(
                 novarocks_types::ClusterRole::Fe,
-                Vec::new(),
                 Duration::from_secs(1),
                 1,
                 Duration::from_secs(1),

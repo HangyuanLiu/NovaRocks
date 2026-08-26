@@ -3011,11 +3011,10 @@ impl CrossProcessServerHandle {
     /// same `ServerHandle::kill_fe` / `ServerHandle::restart_fe_until` paths an
     /// ordinary FE restart uses; only the store destruction is new.
     ///
-    /// The reused restart path ends in the `SHOW BACKENDS` topology barrier, so
-    /// the FE must be able to rediscover every BE from its config seeds alone.
-    /// A launch that restricted `initial_backend_seeds` and published the
-    /// remaining backends through `ADD BACKEND` loses that membership with the
-    /// store and cannot satisfy the barrier.
+    /// The reused restart path ends in the `SHOW BACKENDS` topology barrier.
+    /// Backends self-register, so the restarted FE rebuilds membership from
+    /// their announcements rather than from anything the destroyed store held;
+    /// the barrier therefore converges without the store contributing to it.
     pub fn wipe_fe_state_store_and_restart_until(&mut self, deadline: Instant) -> Result<()> {
         ServerHandle::kill_fe(self)
             .context("stop cross-process FE before destroying its durable state store")?;

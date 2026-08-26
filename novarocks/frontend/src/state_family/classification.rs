@@ -247,8 +247,6 @@ pub enum ExternalProjectionSource {
     /// family has a StateStore prefix; a future file or controller mode moves
     /// the authority without changing the classification.
     SelectedCatalogSourceMode,
-    /// Configuration seeds plus SQL `ADD BACKEND` / `DROP BACKEND`.
-    ConfiguredSeedsAndSqlMembership,
 }
 
 /// How a reader decides it is looking at one coherent snapshot of the family
@@ -259,9 +257,6 @@ pub enum SnapshotIdentity {
     /// is "every record the enumeration returned", so a partial enumeration is
     /// not a smaller snapshot — it is a failure.
     CompleteEnumeration,
-    /// The snapshot is one record read at one version.  There is nothing to
-    /// enumerate and therefore no partially observed state.
-    SingleVersionedRecord,
 }
 
 /// The blast radius of a bootstrap failure for an `ExternalProjection`.
@@ -274,10 +269,6 @@ pub enum BootstrapFailureScope {
     /// remove.  Failing to materialize one *located* entry only marks that
     /// entry unavailable, so one broken catalog cannot take the frontend down.
     GlobalEnumerationPerEntryMaterialization,
-    /// The family is one indivisible record: any failure to read or trust it
-    /// fails the whole frontend bootstrap, because there is no per-entry
-    /// degradation to fall back to.
-    GlobalOnly,
 }
 
 /// What a `ProcessRuntime` family declares — and, more importantly, what it
