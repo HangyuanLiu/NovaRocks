@@ -74,12 +74,11 @@ impl CatalogCommitDispatch for UpdateTableDispatch {
             // rather than a commit, and it must not reach the catalog.
             return Ok(CommitProof::no_op());
         }
-        let mut commit = TableCommit::builder()
+        let commit = TableCommit::builder()
             .ident(self.ident.clone())
             .updates(staged.updates)
             .requirements(staged.requirements)
             .build();
-        let _ = &mut commit;
         let table = self.client.update_table(commit).await?;
         let snapshot_id = table
             .metadata()
