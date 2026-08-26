@@ -972,7 +972,7 @@ mod tests {
         let manifest = ParticipantManifest::new(
             execution_id,
             ParticipantBackendIdentity::new(
-                novarocks_types::BackendProcessId::new_v7(),
+                service.lifecycle.local_process_id(),
                 QueryControlEndpoint::new("127.0.0.1", 19030).expect("control endpoint"),
             )
             .expect("backend identity"),

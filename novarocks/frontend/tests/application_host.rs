@@ -78,7 +78,6 @@ async fn open_host(
 fn backend_config() -> ClusterBackendOpenConfig {
     ClusterBackendOpenConfig::new(
         novarocks_types::ClusterRole::Fe,
-        Vec::new(),
         Duration::from_secs(1),
         1,
         Duration::from_secs(1),
@@ -89,7 +88,6 @@ fn backend_config() -> ClusterBackendOpenConfig {
 fn fe_backend_config() -> ClusterBackendOpenConfig {
     ClusterBackendOpenConfig::new(
         novarocks_types::ClusterRole::Fe,
-        Vec::new(),
         Duration::from_secs(1),
         1,
         Duration::from_secs(1),

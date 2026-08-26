@@ -467,13 +467,8 @@ impl FrontendApplicationHost {
             }
             host.catalog_controller = Some(controller);
         }
-        match ClusterBackendService::open(
-            backend,
-            host.state_store(),
-            tokio::runtime::Handle::current(),
-            data_runtime,
-        )
-        .await
+        match ClusterBackendService::open(backend, tokio::runtime::Handle::current(), data_runtime)
+            .await
         {
             Ok(topology) => host.topology = Some(topology),
             Err(error) => {
@@ -1095,7 +1090,6 @@ mod tests {
         let registry = test_state_store_registry();
         let backend = crate::topology::ClusterBackendOpenConfig::new(
             novarocks_types::ClusterRole::Fe,
-            Vec::new(),
             Duration::from_secs(1),
             1,
             Duration::from_secs(1),

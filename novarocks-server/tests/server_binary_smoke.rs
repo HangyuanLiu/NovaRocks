@@ -27,10 +27,8 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use mysql::prelude::Queryable;
-use mysql::{Conn as MysqlConn, OptsBuilder};
 use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
 
@@ -251,42 +249,6 @@ fn spawn_all_in_one(pair: &ConfigPair, debug_env: &[(&str, &Path)]) -> ManagedPr
     .unwrap_or_else(|error| panic!("spawn novarocks role=all-in-one: {error:#}"))
 }
 
-fn connect_mysql(port: u16) -> MysqlConn {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let builder = OptsBuilder::new()
-            .ip_or_hostname(Some("127.0.0.1".to_string()))
-            .tcp_port(port)
-            .prefer_socket(false)
-            .user(Some("root".to_string()))
-            .read_timeout(Some(Duration::from_secs(10)))
-            .write_timeout(Some(Duration::from_secs(10)));
-        match MysqlConn::new(builder) {
-            Ok(conn) => return conn,
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
-            Err(error) => panic!("mysql connection failed: {error}"),
-        }
-    }
-}
-
-fn assert_select_one(port: u16) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let mut conn = connect_mysql(port);
-        match conn.query::<i64, _>("SELECT 1") {
-            Ok(rows) => {
-                assert_eq!(rows, vec![1]);
-                return;
-            }
-            Err(error) if Instant::now() < deadline => {
-                eprintln!("SELECT 1 waiting for FE/BE heartbeat: {error}");
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(error) => panic!("SELECT 1 failed after topology wait: {error}"),
-        }
-    }
-}
-
 fn http_request(port: u16, method: &str, path: &str) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect HTTP listener");
     stream
@@ -410,12 +372,13 @@ fn assert_rejected(args: &[&str], expected: &str) {
     );
 }
 
-/// The same normal FE/BE config pair must work first as independent roles and
-/// then, without rewrites, through the all-in-one supervisor. It also proves
-/// all five bound ports and the four listener surfaces have their role-local
-/// ownership in both forms.
+/// The same normal FE/BE config pair must bind its role-local listeners first
+/// as independent roles and then through the all-in-one supervisor. Dynamic
+/// backend admission is intentionally outside this NWT-2 smoke: LNP-5 refuses
+/// to restore static membership while the authenticated announce carrier is
+/// still owned by NWT-3.
 #[test]
-fn same_config_pair_has_cross_process_and_all_in_one_listener_parity() {
+fn same_config_pair_has_cross_process_and_all_in_one_listener_parity_without_static_membership() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
     if !binary.exists() {
         return;
@@ -437,7 +400,6 @@ fn same_config_pair_has_cross_process_and_all_in_one_listener_parity() {
         "NOVAROCKS_READY mysql_port=",
         &frontend_debug_env,
     );
-    assert_select_one(pair.fe_mysql_port);
     assert_role_scoped_surfaces(&pair, true);
     frontend
         .interrupt_and_wait(Duration::from_secs(10))
@@ -447,7 +409,6 @@ fn same_config_pair_has_cross_process_and_all_in_one_listener_parity() {
         .expect("shut down BE cleanly");
 
     let mut all_in_one = spawn_all_in_one(&pair, &[]);
-    assert_select_one(pair.fe_mysql_port);
     assert_role_scoped_surfaces(&pair, false);
     all_in_one
         .interrupt_and_wait(Duration::from_secs(10))
@@ -604,7 +565,6 @@ mysql_port = {}
 
 [cluster]
 role = "fe"
-backends = ["127.0.0.1:{}"]
 
 [state_store]
 provider = "sqlite"
@@ -616,7 +576,6 @@ deployment_owner = "preflight-fe"
             pair.fe_http_port,
             pair.fe_grpc_port,
             pair.fe_mysql_port,
-            pair.be_grpc_port,
             state_store.display(),
         ),
     );

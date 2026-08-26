@@ -226,7 +226,7 @@ impl ClusterBackendService {
     #[cfg(test)]
     pub(crate) fn new_transient_for_test(timeout_retries: u32) -> Self {
         let config = ClusterBackendOpenConfig::new(
-            ClusterRole::AllInOne,
+            ClusterRole::Fe,
             Duration::from_millis(1),
             timeout_retries.max(1),
             Duration::from_secs(1),

@@ -2085,7 +2085,7 @@ mod tests {
         .expect("native fragment fixture");
         let cancellation = QueryCancellationSource::new();
         let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
-            ClusterRole::AllInOne,
+            ClusterRole::Fe,
             topology,
             Some(Instant::now() + Duration::from_secs(5)),
             cancellation.view(),
