@@ -15,129 +15,61 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
+//! The backend-side StarRocks execution binding.
+//!
+//! A declared StarRocks binding still installs, because installation is what
+//! turns a malformed or foreign declaration into a clear error. What it
+//! installs can read nothing: both read entry points refuse. See the crate
+//! documentation for what the read cut removed.
+
 use std::sync::Arc;
 use std::time::Instant;
 
-use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
     ConnectorExecutionProviderKind, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
-    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
-    ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext,
-    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason, ConnectorSplit,
+    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitSet, ConnectorProviderId,
+    ConnectorReadExecution, ConnectorRequestContext, ConnectorSplit,
 };
 
-use crate::STARROCKS_PROVIDER_ID;
-use crate::codec::{encode_schema_ipc, schema_digest};
-use crate::control::{
-    StrategyPayload, decode_split, direct_outer_facts, split_output_schema_digest, split_strategy,
-    validate_split_generation,
-};
-use crate::direct::{StarRocksDirectSplit, decode_direct_split};
-use crate::domain::{
-    StarRocksLocalBindingRef, StarRocksRpcTransport, StarRocksSelectedStrategy, unavailable,
-};
-use crate::rpc::{StarRocksRpcSplit, decode_rpc_split};
-
-pub trait StarRocksRpcReaderFactory: Send + Sync {
-    fn open_rpc_reader(
-        &self,
-        transport: StarRocksRpcTransport,
-        split: StarRocksRpcSplit,
-        request: ConnectorOpenReaderRequest,
-    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError>;
-}
-
-pub trait StarRocksDirectReaderFactory: Send + Sync {
-    fn open_direct_reader(
-        &self,
-        split: StarRocksDirectSplit,
-        request: ConnectorOpenReaderRequest,
-    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError>;
-}
-
-#[derive(Default)]
-pub struct StarRocksLocalExecutionBinding {
-    pub rpc: Option<Arc<dyn StarRocksRpcReaderFactory>>,
-    pub direct: Option<Arc<dyn StarRocksDirectReaderFactory>>,
-}
-
-#[derive(Default)]
-pub struct StarRocksExecutionBindings {
-    entries: BTreeMap<StarRocksLocalBindingRef, StarRocksLocalExecutionBinding>,
-}
-
-impl StarRocksExecutionBindings {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn insert(
-        &mut self,
-        binding: StarRocksLocalBindingRef,
-        value: StarRocksLocalExecutionBinding,
-    ) -> Option<StarRocksLocalExecutionBinding> {
-        self.entries.insert(binding, value)
-    }
-    fn get(&self, binding: &StarRocksLocalBindingRef) -> Option<&StarRocksLocalExecutionBinding> {
-        self.entries.get(binding)
-    }
-}
+use crate::domain::StarRocksLocalBindingRef;
+use crate::{STARROCKS_PROVIDER_ID, starrocks_read_unsupported};
 
 pub struct StarRocksExecutionInstaller {
     provider_id: ConnectorProviderId,
-    bindings: StarRocksExecutionBindings,
-}
-
-/// Validated, credential-free installation facts. Preparing these facts must
-/// not resolve a local client or touch a process-local execution binding.
-struct PreparedStarRocksExecutionBinding {
-    key: ConnectorExecutionBindingKey,
-    local_binding: StarRocksLocalBindingRef,
 }
 
 impl StarRocksExecutionInstaller {
-    pub fn new(bindings: StarRocksExecutionBindings) -> Self {
+    pub fn new() -> Self {
         Self {
             provider_id: ConnectorProviderId::parse(STARROCKS_PROVIDER_ID)
                 .expect("valid StarRocks provider ID"),
-            bindings,
         }
     }
 
+    /// Validates a declaration before anything is installed from it.
+    ///
+    /// The declared local binding is still parsed even though no reader
+    /// consumes it: an ill-formed declaration must fail here rather than
+    /// survive as far as the read refusal and look like a supported binding.
     fn prepare(
         declaration: &ConnectorExecutionDeclaration,
-    ) -> Result<PreparedStarRocksExecutionBinding, ConnectorError> {
+    ) -> Result<ConnectorExecutionBindingKey, ConnectorError> {
         let local_binding = declaration.starrocks_local_binding().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "StarRocks installer received a declaration for another provider kind",
             )
         })?;
-        Ok(PreparedStarRocksExecutionBinding {
-            key: declaration.binding_key().clone(),
-            local_binding: StarRocksLocalBindingRef::parse(local_binding)?,
-        })
+        StarRocksLocalBindingRef::parse(local_binding)?;
+        Ok(declaration.binding_key().clone())
     }
+}
 
-    fn activate(
-        &self,
-        prepared: PreparedStarRocksExecutionBinding,
-    ) -> Result<ConnectorExecutionBinding, ConnectorError> {
-        let binding = self
-            .bindings
-            .get(&prepared.local_binding)
-            .ok_or_else(|| unavailable("StarRocks local execution binding is unavailable"))?;
-        ConnectorExecutionBinding::try_new(
-            self.provider_id.clone(),
-            prepared.key.clone(),
-            Arc::new(CompositeReadExecution {
-                key: prepared.key,
-                rpc: binding.rpc.clone(),
-                direct: binding.direct.clone(),
-            }),
-        )
+impl Default for StarRocksExecutionInstaller {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -151,135 +83,45 @@ impl ConnectorExecutionInstaller for StarRocksExecutionInstaller {
         declaration: &ConnectorExecutionDeclaration,
         context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionBinding, ConnectorError> {
-        let prepared = Self::prepare(declaration)?;
+        let key = Self::prepare(declaration)?;
         ensure_active(context)?;
-        self.activate(prepared)
+        ConnectorExecutionBinding::try_new(
+            self.provider_id.clone(),
+            key.clone(),
+            Arc::new(UnsupportedReadExecution { key }),
+        )
     }
 }
 
-struct CompositeReadExecution {
+/// The read capability of an installed StarRocks binding.
+///
+/// It exists because an execution binding must carry at least one capability
+/// and StarRocks has no write capability. Every entry point refuses before it
+/// looks at its argument, so no split payload is decoded and no reader is
+/// opened on the way to a refusal that is certain from the start.
+struct UnsupportedReadExecution {
     key: ConnectorExecutionBindingKey,
-    rpc: Option<Arc<dyn StarRocksRpcReaderFactory>>,
-    direct: Option<Arc<dyn StarRocksDirectReaderFactory>>,
 }
 
-impl ConnectorReadExecution for CompositeReadExecution {
+impl ConnectorReadExecution for UnsupportedReadExecution {
     fn binding_key(&self) -> &ConnectorExecutionBindingKey {
         &self.key
     }
 
     fn prepare_split(
         &self,
-        split: &ConnectorSplit,
-        request: ConnectorPrepareSplitRequest,
+        _split: &ConnectorSplit,
+        _request: ConnectorPrepareSplitRequest,
     ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
-        request.check_active()?;
-        if split.owner() != &self.key.instance_id {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "StarRocks split belongs to another connector instance",
-            ));
-        }
-        let decoded_split = decode_split(split.payload())?;
-        validate_split_generation(&decoded_split, &self.key)?;
-        let direct_outer = direct_outer_facts(&decoded_split)?;
-        let leaf_kind = match (
-            split_strategy(&decoded_split),
-            &decoded_split.strategy_payload,
-        ) {
-            (StarRocksSelectedStrategy::Rpc { .. }, StrategyPayload::Rpc { payload }) => {
-                // Decode during preparation so that a malformed remote leaf never
-                // reaches the Core morsel queue. The payload remains provider-private.
-                let _ = decode_rpc_split(&payload.0, &direct_outer)?;
-                "rpc"
-            }
-            (
-                StarRocksSelectedStrategy::SharedDataDirect,
-                StrategyPayload::SharedDataDirect { payload },
-            ) => {
-                // The direct descriptor is a frontend-frozen tablet membership.
-                // This validates it without consulting or re-planning live metadata.
-                let _ = decode_direct_split(&payload.0, &direct_outer)?;
-                // The current frozen direct carrier covers a complete tablet, so
-                // the correctness-safe unit is a tablet merge, not a fabricated
-                // segment subdivision.
-                "tablet_merge"
-            }
-            _ => {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "StarRocks split tag does not match its frozen strategy",
-                ));
-            }
-        };
-        request.check_active()?;
-        let prepared = ConnectorPreparedScanUnitSet::try_new_with_preparation_evidence(
-            self.key.clone(),
-            split,
-            Bytes::new(),
-            vec![ConnectorPreparedScanUnitDescriptor::try_new(
-                split.payload().clone(),
-                split.estimated_bytes(),
-                ConnectorScanUnitDomainFacts::missing(
-                    ConnectorScanUnitFactsMissingReason::NoPinnedStatistics,
-                ),
-            )?],
-            Some(leaf_kind),
-            &request,
-        )?;
-        Ok(prepared)
+        Err(starrocks_read_unsupported())
     }
 
     fn open_unit_reader(
         &self,
-        unit: &ConnectorPreparedScanUnit,
-        request: ConnectorOpenReaderRequest,
+        _unit: &ConnectorPreparedScanUnit,
+        _request: ConnectorOpenReaderRequest,
     ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-        ensure_active(&request.context)?;
-        if unit.binding_key() != &self.key {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "StarRocks prepared scan unit belongs to another execution binding",
-            ));
-        }
-        let split = decode_split(unit.payload())?;
-        validate_split_generation(&split, &self.key)?;
-        let encoded_schema = encode_schema_ipc(request.expected_schema.as_ref())?;
-        if schema_digest(&encoded_schema).as_slice() != split_output_schema_digest(&split) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::CorruptData,
-                "StarRocks split output schema does not match the requested schema",
-            ));
-        }
-        let direct_outer = direct_outer_facts(&split)?;
-        match (split_strategy(&split), split.strategy_payload) {
-            (StarRocksSelectedStrategy::Rpc { transport }, StrategyPayload::Rpc { payload }) => {
-                self.rpc
-                    .as_ref()
-                    .ok_or_else(|| unavailable("StarRocks RPC reader factory is unavailable"))?
-                    .open_rpc_reader(
-                        transport,
-                        decode_rpc_split(&payload.0, &direct_outer)?,
-                        request,
-                    )
-            }
-            (
-                StarRocksSelectedStrategy::SharedDataDirect,
-                StrategyPayload::SharedDataDirect { payload },
-            ) => {
-                let direct = decode_direct_split(&payload.0, &direct_outer)?;
-                self.direct
-                    .as_ref()
-                    .ok_or_else(|| {
-                        unavailable("StarRocks shared-data direct reader factory is unavailable")
-                    })?
-                    .open_direct_reader(direct, request)
-            }
-            _ => Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "StarRocks split tag does not match its frozen strategy",
-            )),
-        }
+        Err(starrocks_read_unsupported())
     }
 }
 
@@ -302,31 +144,18 @@ fn ensure_active(context: &ConnectorRequestContext) -> Result<(), ConnectorError
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorBatchBudget, ConnectorCancellation, ConnectorControlBinding, ConnectorInstanceId,
-        ConnectorPrepareSplitRequest, ConnectorReadSelector, ConnectorSplitPlanningRequest,
-        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+        ConnectorBatchBudget, ConnectorCancellation, ConnectorInstanceId,
+        ConnectorPreparedScanUnitDescriptor, ConnectorScanUnitDomainFacts,
+        ConnectorScanUnitFactsMissingReason,
     };
 
     use super::*;
-    use crate::{
-        StarRocksCapabilitySnapshot, StarRocksConnectorConfig, StarRocksControlGeneration,
-        StarRocksDirectColumnBinding, StarRocksDirectLocation, StarRocksDirectLocationSource,
-        StarRocksDirectMetadataLayout, StarRocksDirectSplitPlanner,
-        StarRocksDirectTabletDescriptor, StarRocksDirectTabletPlanningSource,
-        StarRocksMetadataSource, StarRocksReadPolicy, StarRocksRemoteEndpoint,
-        StarRocksResolvedTable, StarRocksRpcOutputBinding, StarRocksRpcSplit,
-        StarRocksRpcSplitPlanner, StarRocksSharedDataDirectPlanner, StarRocksSplitPlanningInput,
-        StarRocksStorageBindingRef, StarRocksStrategySplit, StarRocksStrategySplitPayload,
-        StarRocksTopology,
-    };
+    use crate::STARROCKS_READ_UNSUPPORTED;
 
     struct NeverCancelled;
     impl ConnectorCancellation for NeverCancelled {
@@ -342,307 +171,40 @@ mod tests {
             64 * 1024,
             128 * 1024,
         )
-        .expect("context")
+        .expect("request context")
     }
 
-    struct Source;
-    impl StarRocksMetadataSource for Source {
-        fn namespace_exists(
-            &self,
-            _: &str,
-            _: &ConnectorRequestContext,
-        ) -> Result<bool, ConnectorError> {
-            Ok(true)
-        }
-        fn table_exists(
-            &self,
-            _: &str,
-            _: &str,
-            _: &ConnectorRequestContext,
-        ) -> Result<bool, ConnectorError> {
-            Ok(true)
-        }
-        fn list_tables(
-            &self,
-            _: &str,
-            _: &ConnectorRequestContext,
-        ) -> Result<Vec<String>, ConnectorError> {
-            Ok(vec!["t".into()])
-        }
-        fn load_table(
-            &self,
-            namespace: &str,
-            table: &str,
-            _: &ConnectorRequestContext,
-        ) -> Result<StarRocksResolvedTable, ConnectorError> {
-            StarRocksResolvedTable::try_new(
-                namespace,
-                table,
-                Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
-                StarRocksTopology::SharedNothing,
-                Bytes::from_static(b"schema-v1"),
-                Bytes::from_static(b"data-v1"),
-                StarRocksCapabilitySnapshot {
-                    api_contract_version: 1,
-                    rpc_transports: [StarRocksRpcTransport::BrpcChunk].into(),
-                    rpc_ready: true,
-                    direct_contract_version: None,
-                    direct_ready: false,
-                },
+    fn installed() -> ConnectorExecutionBinding {
+        StarRocksExecutionInstaller::new()
+            .install(
+                &ConnectorExecutionDeclaration::starrocks("catalog.starrocks", [7; 16], "default")
+                    .expect("valid StarRocks declaration"),
+                &context(),
             )
-        }
+            .expect("a well-formed StarRocks declaration installs")
     }
 
-    struct RpcPlanner;
-    impl StarRocksRpcSplitPlanner for RpcPlanner {
-        fn plan_rpc_splits(
-            &self,
-            input: &StarRocksSplitPlanningInput,
-            request: &ConnectorSplitPlanningRequest,
-        ) -> Result<Vec<StarRocksStrategySplit>, ConnectorError> {
-            let facts = crate::control::rpc_outer_facts(input)?;
-            let split = StarRocksRpcSplit::try_new(
-                StarRocksRpcTransport::BrpcChunk,
-                StarRocksRemoteEndpoint::try_new("be.example", 8040)?,
-                Bytes::from_static(b"query-token"),
-                vec![StarRocksRpcOutputBinding {
-                    output_index: Some(0),
-                    remote_slot_id: 1,
-                    name: Arc::from("id"),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                    is_const: false,
-                    row_marker: false,
-                }],
-            )?;
-            Ok(vec![StarRocksStrategySplit {
-                split_id: Arc::from("rpc-1"),
-                payload: StarRocksStrategySplitPayload::Rpc(crate::rpc::encode_rpc_split(
-                    &facts,
-                    &split,
-                    request.context.max_handle_payload_bytes(),
-                )?),
-                estimated_bytes: Some(8),
-            }])
-        }
-    }
-    struct DirectPlanner;
-    impl StarRocksDirectSplitPlanner for DirectPlanner {
-        fn plan_direct_splits(
-            &self,
-            _: &StarRocksSplitPlanningInput,
-            _: &ConnectorSplitPlanningRequest,
-        ) -> Result<Vec<StarRocksStrategySplit>, ConnectorError> {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "direct planner must not be called",
-            ))
-        }
-    }
-
-    struct ReadyDirectSource;
-    impl StarRocksMetadataSource for ReadyDirectSource {
-        fn namespace_exists(
-            &self,
-            _: &str,
-            _: &ConnectorRequestContext,
-        ) -> Result<bool, ConnectorError> {
-            Ok(true)
-        }
-        fn table_exists(
-            &self,
-            _: &str,
-            _: &str,
-            _: &ConnectorRequestContext,
-        ) -> Result<bool, ConnectorError> {
-            Ok(true)
-        }
-        fn list_tables(
-            &self,
-            _: &str,
-            _: &ConnectorRequestContext,
-        ) -> Result<Vec<String>, ConnectorError> {
-            Ok(vec!["t".into()])
-        }
-        fn load_table(
-            &self,
-            namespace: &str,
-            table: &str,
-            _: &ConnectorRequestContext,
-        ) -> Result<StarRocksResolvedTable, ConnectorError> {
-            StarRocksResolvedTable::try_new(
-                namespace,
-                table,
-                Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
-                StarRocksTopology::SharedData,
-                Bytes::from_static(b"schema-v1"),
-                Bytes::from_static(b"data-v1"),
-                StarRocksCapabilitySnapshot {
-                    api_contract_version: 1,
-                    rpc_transports: Default::default(),
-                    rpc_ready: false,
-                    direct_contract_version: Some(1),
-                    direct_ready: true,
-                },
-            )
-        }
-    }
-
-    struct ReadyDirectTablets;
-    impl StarRocksDirectTabletPlanningSource for ReadyDirectTablets {
-        fn plan_tablets(
-            &self,
-            _: &StarRocksSplitPlanningInput,
-            _: &ConnectorSplitPlanningRequest,
-        ) -> Result<Vec<StarRocksDirectTabletDescriptor>, ConnectorError> {
-            Ok(vec![StarRocksDirectTabletDescriptor::try_new(
-                1,
-                2,
-                3,
-                StarRocksDirectMetadataLayout::Standalone,
-                "meta/0001.meta",
-                vec![StarRocksDirectColumnBinding::try_new(
-                    0, 1, "id", "BIGINT", false, None,
-                )?],
-                Some(11),
-            )?])
-        }
-    }
-    struct ReadyDirectLocations;
-    impl StarRocksDirectLocationSource for ReadyDirectLocations {
-        fn resolve_locations(
-            &self,
-            _: &[i64],
-            _: &ConnectorSplitPlanningRequest,
-        ) -> Result<Vec<StarRocksDirectLocation>, ConnectorError> {
-            Ok(vec![StarRocksDirectLocation::try_new(
-                1,
-                "s3://bucket/tablet",
-                StarRocksStorageBindingRef::parse("volume-a")?,
-                "fs-key",
-            )?])
-        }
-    }
-
-    fn control() -> ConnectorControlBinding {
-        StarRocksControlGeneration::try_new(
-            StarRocksConnectorConfig::new(
-                ConnectorInstanceId::parse("catalog.starrocks").unwrap(),
-                StarRocksReadPolicy::Rpc,
-                StarRocksRpcTransport::BrpcChunk,
-                StarRocksLocalBindingRef::parse("test").unwrap(),
-            ),
-            Arc::new(Source),
-            Arc::new(RpcPlanner),
-            Arc::new(DirectPlanner),
+    /// Fabricates the split a refusing entry point is called with. StarRocks
+    /// scan planning never produces one, so a test has to mint it through the
+    /// generic contract to reach the entry point at all.
+    fn split(binding: &ConnectorExecutionBinding) -> ConnectorSplit {
+        ConnectorSplit::try_new(
+            binding.key().instance_id.clone(),
+            "fabricated",
+            Bytes::from_static(b"not a StarRocks split"),
+            None,
         )
-        .unwrap()
-    }
-
-    fn direct_control() -> ConnectorControlBinding {
-        StarRocksControlGeneration::try_new(
-            StarRocksConnectorConfig::new(
-                ConnectorInstanceId::parse("catalog.starrocks").unwrap(),
-                StarRocksReadPolicy::Direct,
-                StarRocksRpcTransport::BrpcChunk,
-                StarRocksLocalBindingRef::parse("test").unwrap(),
-            ),
-            Arc::new(ReadyDirectSource),
-            Arc::new(RpcPlanner),
-            Arc::new(StarRocksSharedDataDirectPlanner::new(
-                Arc::new(ReadyDirectTablets),
-                Arc::new(ReadyDirectLocations),
-            )),
-        )
-        .unwrap()
-    }
-
-    fn planned_read(
-        binding: &ConnectorControlBinding,
-    ) -> (
-        ConnectorExecutionDeclaration,
-        ConnectorSplit,
-        arrow::datatypes::SchemaRef,
-    ) {
-        let context = context();
-        let table = binding
-            .metadata()
-            .load_table(ConnectorTableRequest {
-                table: ConnectorTableIdentity {
-                    instance_id: binding.descriptor().instance_id.clone(),
-                    namespace: Arc::from("db"),
-                    table: Arc::from("t"),
-                },
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                context: context.clone(),
-            })
-            .unwrap();
-        let scan = binding
-            .planning()
-            .begin_scan(
-                &table.table,
-                novarocks_spi::connector::ConnectorBeginScanRequest {
-                    projection: vec![0],
-                    static_predicates: vec![],
-                    selection: novarocks_spi::connector::ConnectorScanSelection::Snapshot(
-                        ConnectorReadSelector::Current,
-                    ),
-                    purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
-                    limit: None,
-                    batch: ConnectorBatchBudget {
-                        max_rows: NonZeroUsize::new(32).unwrap(),
-                        max_bytes: NonZeroUsize::new(4096).unwrap(),
-                    },
-                    context: context.clone(),
-                },
-            )
-            .unwrap();
-        let splits = binding
-            .planning()
-            .plan_splits(
-                scan.handle(),
-                ConnectorSplitPlanningRequest {
-                    target_parallelism: NonZeroUsize::new(1).unwrap(),
-                    max_split_bytes: None,
-                    context: context.clone(),
-                },
-            )
-            .unwrap();
-        (
-            binding.execution_declaration(&context).unwrap(),
-            splits.splits.into_iter().next().unwrap(),
-            Arc::clone(scan.output_schema()),
-        )
-    }
-
-    fn prepare_single_unit(
-        read: &Arc<dyn ConnectorReadExecution>,
-        split: &ConnectorSplit,
-    ) -> ConnectorPreparedScanUnit {
-        let prepared = read
-            .prepare_split(split, ConnectorPrepareSplitRequest { context: context() })
-            .unwrap();
-        assert_eq!(prepared.len(), 1);
-        prepared.units().next().unwrap()
-    }
-
-    fn assert_missing_pinned_statistics(unit: &ConnectorPreparedScanUnit) {
-        assert!(matches!(
-            unit.domain_facts(),
-            ConnectorScanUnitDomainFacts::Missing(
-                ConnectorScanUnitFactsMissingReason::NoPinnedStatistics
-            )
-        ));
+        .expect("fabricated split")
     }
 
     #[test]
-    fn foreign_typed_declaration_is_rejected_before_local_binding_activation() {
-        let installer = StarRocksExecutionInstaller::new(StarRocksExecutionBindings::new());
-        let declaration = ConnectorExecutionDeclaration::iceberg("catalog", [7; 16], "default")
-            .expect("valid foreign declaration");
-
-        let error = match installer.install(&declaration, &context()) {
-            Ok(_) => panic!("foreign declaration must not activate an empty local binding map"),
+    fn a_declaration_for_another_provider_kind_is_rejected() {
+        let error = match StarRocksExecutionInstaller::new().install(
+            &ConnectorExecutionDeclaration::iceberg("catalog", [7; 16], "default")
+                .expect("valid foreign declaration"),
+            &context(),
+        ) {
+            Ok(_) => panic!("a foreign declaration must not install a StarRocks binding"),
             Err(error) => error,
         };
 
@@ -651,331 +213,85 @@ mod tests {
     }
 
     #[test]
-    fn missing_typed_local_binding_is_an_unavailable_activation_failure() {
-        let installer = StarRocksExecutionInstaller::new(StarRocksExecutionBindings::new());
-        let declaration = ConnectorExecutionDeclaration::starrocks("catalog", [7; 16], "missing")
-            .expect("valid StarRocks declaration");
+    fn split_preparation_refuses_with_the_stable_message_without_decoding_the_split() {
+        let installed = installed();
+        let read = installed.read().expect("read capability");
 
-        let error = match installer.install(&declaration, &context()) {
-            Ok(_) => panic!("missing local binding must fail activation"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
-        assert!(
-            error
-                .to_string()
-                .contains("local execution binding is unavailable")
-        );
-    }
-
-    struct Reader {
-        batch: Option<RecordBatch>,
-    }
-    impl ConnectorBatchReader for Reader {
-        fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-            Ok(self.batch.take())
-        }
-        fn close(&mut self) -> Result<(), ConnectorError> {
-            Ok(())
-        }
-    }
-    struct RpcFactory(Arc<AtomicUsize>);
-    impl StarRocksRpcReaderFactory for RpcFactory {
-        fn open_rpc_reader(
-            &self,
-            _: StarRocksRpcTransport,
-            split: StarRocksRpcSplit,
-            request: ConnectorOpenReaderRequest,
-        ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-            assert_eq!(split.endpoint().host(), "be.example");
-            assert_eq!(split.token(), &Bytes::from_static(b"query-token"));
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(Reader {
-                batch: Some(
-                    RecordBatch::try_new(
-                        request.expected_schema,
-                        vec![Arc::new(Int64Array::from(vec![7_i64]))],
-                    )
-                    .unwrap(),
-                ),
-            }))
-        }
-    }
-    struct DirectFactory(Arc<AtomicUsize>);
-    impl StarRocksDirectReaderFactory for DirectFactory {
-        fn open_direct_reader(
-            &self,
-            _: StarRocksDirectSplit,
-            _: ConnectorOpenReaderRequest,
-        ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "direct factory must not be called",
-            ))
-        }
-    }
-
-    struct ReadyDirectFactory(Arc<AtomicUsize>);
-    impl StarRocksDirectReaderFactory for ReadyDirectFactory {
-        fn open_direct_reader(
-            &self,
-            payload: StarRocksDirectSplit,
-            request: ConnectorOpenReaderRequest,
-        ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-            assert_eq!(payload.tablet_id(), 1);
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(Reader {
-                batch: Some(
-                    RecordBatch::try_new(
-                        request.expected_schema,
-                        vec![Arc::new(Int64Array::from(vec![8_i64]))],
-                    )
-                    .unwrap(),
-                ),
-            }))
-        }
-    }
-
-    #[test]
-    fn composite_execution_dispatches_only_the_frozen_rpc_factory() {
-        let binding = control();
-        let (declaration, split, schema) = planned_read(&binding);
-        assert!(!format!("{declaration:?}").contains("query-token"));
-        let rpc_calls = Arc::new(AtomicUsize::new(0));
-        let direct_calls = Arc::new(AtomicUsize::new(0));
-        let mut bindings = StarRocksExecutionBindings::new();
-        bindings.insert(
-            StarRocksLocalBindingRef::parse("test").unwrap(),
-            StarRocksLocalExecutionBinding {
-                rpc: Some(Arc::new(RpcFactory(rpc_calls.clone()))),
-                direct: Some(Arc::new(DirectFactory(direct_calls.clone()))),
-            },
-        );
-        let installed = StarRocksExecutionInstaller::new(bindings)
-            .install(&declaration, &context())
-            .unwrap();
-        let read = installed.read().unwrap();
-        let unit = prepare_single_unit(read, &split);
-        assert_eq!(unit.ordinal(), 0);
-        assert_missing_pinned_statistics(&unit);
-        assert!(matches!(
-            decode_split(unit.payload()).unwrap().strategy_payload,
-            StrategyPayload::Rpc { .. }
-        ));
-        let mut reader = read
-            .open_unit_reader(
-                &unit,
-                ConnectorOpenReaderRequest {
-                    expected_schema: schema,
-                    batch: ConnectorBatchBudget {
-                        max_rows: NonZeroUsize::new(32).unwrap(),
-                        max_bytes: NonZeroUsize::new(4096).unwrap(),
-                    },
-                    options: Default::default(),
-                    context: context(),
-                },
+        // The payload below is not a StarRocks split. A decode-first
+        // implementation would answer CorruptData; the refusal must precede it.
+        let error = read
+            .prepare_split(
+                &split(&installed),
+                ConnectorPrepareSplitRequest { context: context() },
             )
-            .unwrap();
-        assert_eq!(reader.next_batch().unwrap().unwrap().num_rows(), 1);
-        assert_eq!(rpc_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(direct_calls.load(Ordering::SeqCst), 0);
+            .expect_err("StarRocks must not prepare a split");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(error.message(), STARROCKS_READ_UNSUPPORTED);
     }
 
     #[test]
-    fn missing_selected_factory_does_not_fall_back() {
-        let binding = control();
-        let (declaration, split, schema) = planned_read(&binding);
-        let direct_calls = Arc::new(AtomicUsize::new(0));
-        let mut bindings = StarRocksExecutionBindings::new();
-        bindings.insert(
-            StarRocksLocalBindingRef::parse("test").unwrap(),
-            StarRocksLocalExecutionBinding {
-                rpc: None,
-                direct: Some(Arc::new(DirectFactory(direct_calls.clone()))),
-            },
-        );
-        let installed = StarRocksExecutionInstaller::new(bindings)
-            .install(&declaration, &context())
-            .unwrap();
-        let read = installed.read().unwrap();
-        let unit = prepare_single_unit(read, &split);
-        assert_missing_pinned_statistics(&unit);
+    fn opening_a_unit_reader_refuses_with_the_stable_message_before_any_reader_is_opened() {
+        let installed = installed();
+        let read = installed.read().expect("read capability");
+        let split = split(&installed);
+        // The set is minted here for the same reason as the split: preparation
+        // refuses, so no unit of this binding can otherwise exist.
+        let prepared = ConnectorPreparedScanUnitSet::try_new(
+            installed.key().clone(),
+            &split,
+            Bytes::new(),
+            vec![
+                ConnectorPreparedScanUnitDescriptor::try_new(
+                    Bytes::from_static(b"not a StarRocks scan unit"),
+                    None,
+                    ConnectorScanUnitDomainFacts::missing(
+                        ConnectorScanUnitFactsMissingReason::NoPinnedStatistics,
+                    ),
+                )
+                .expect("fabricated unit descriptor"),
+            ],
+            &ConnectorPrepareSplitRequest { context: context() },
+        )
+        .expect("fabricated unit set");
+        let unit = prepared.units().next().expect("one fabricated unit");
+
         let error = match read.open_unit_reader(
             &unit,
             ConnectorOpenReaderRequest {
-                expected_schema: schema,
+                expected_schema: Arc::new(Schema::new(vec![Field::new(
+                    "id",
+                    DataType::Int64,
+                    false,
+                )])),
                 batch: ConnectorBatchBudget {
-                    max_rows: NonZeroUsize::new(32).unwrap(),
-                    max_bytes: NonZeroUsize::new(4096).unwrap(),
+                    max_rows: NonZeroUsize::new(32).expect("batch rows"),
+                    max_bytes: NonZeroUsize::new(4096).expect("batch bytes"),
                 },
                 options: Default::default(),
                 context: context(),
             },
         ) {
-            Ok(_) => panic!("missing RPC factory must fail"),
+            Ok(_) => panic!("StarRocks must not open a reader"),
             Err(error) => error,
         };
-        assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
-        assert_eq!(direct_calls.load(Ordering::SeqCst), 0);
+
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(error.message(), STARROCKS_READ_UNSUPPORTED);
     }
 
     #[test]
-    fn composite_execution_dispatches_the_frozen_shared_data_direct_factory() {
-        let binding = direct_control();
-        let (declaration, split, schema) = planned_read(&binding);
-        let direct_calls = Arc::new(AtomicUsize::new(0));
-        let mut bindings = StarRocksExecutionBindings::new();
-        bindings.insert(
-            StarRocksLocalBindingRef::parse("test").unwrap(),
-            StarRocksLocalExecutionBinding {
-                rpc: None,
-                direct: Some(Arc::new(ReadyDirectFactory(direct_calls.clone()))),
-            },
-        );
-        let installed = StarRocksExecutionInstaller::new(bindings)
-            .install(&declaration, &context())
-            .unwrap();
-        let read = installed.read().unwrap();
-        let unit = prepare_single_unit(read, &split);
-        assert_eq!(unit.ordinal(), 0);
-        assert_missing_pinned_statistics(&unit);
-        assert!(matches!(
-            decode_split(unit.payload()).unwrap().strategy_payload,
-            StrategyPayload::SharedDataDirect { .. }
-        ));
-        let mut reader = read
-            .open_unit_reader(
-                &unit,
-                ConnectorOpenReaderRequest {
-                    expected_schema: schema,
-                    batch: ConnectorBatchBudget {
-                        max_rows: NonZeroUsize::new(32).unwrap(),
-                        max_bytes: NonZeroUsize::new(4096).unwrap(),
-                    },
-                    options: Default::default(),
-                    context: context(),
-                },
-            )
-            .unwrap();
-        assert_eq!(reader.next_batch().unwrap().unwrap().num_rows(), 1);
-        assert_eq!(direct_calls.load(Ordering::SeqCst), 1);
-    }
+    fn an_installed_binding_owns_its_declared_generation() {
+        let installed = installed();
 
-    #[test]
-    fn separate_backend_local_bindings_do_not_share_direct_clients() {
-        let binding = direct_control();
-        let (declaration, split, schema) = planned_read(&binding);
-        let be_one_calls = Arc::new(AtomicUsize::new(0));
-        let be_two_calls = Arc::new(AtomicUsize::new(0));
-        let installer = |calls: Arc<AtomicUsize>| {
-            let mut bindings = StarRocksExecutionBindings::new();
-            bindings.insert(
-                StarRocksLocalBindingRef::parse("test").unwrap(),
-                StarRocksLocalExecutionBinding {
-                    rpc: None,
-                    direct: Some(Arc::new(ReadyDirectFactory(calls))),
-                },
-            );
-            StarRocksExecutionInstaller::new(bindings)
-        };
-        let open = |installer: StarRocksExecutionInstaller, schema: arrow::datatypes::SchemaRef| {
-            let installed = installer.install(&declaration, &context()).unwrap();
-            let read = installed.read().unwrap();
-            let unit = prepare_single_unit(read, &split);
-            read.open_unit_reader(
-                &unit,
-                ConnectorOpenReaderRequest {
-                    expected_schema: schema,
-                    batch: ConnectorBatchBudget {
-                        max_rows: NonZeroUsize::new(32).unwrap(),
-                        max_bytes: NonZeroUsize::new(4096).unwrap(),
-                    },
-                    options: Default::default(),
-                    context: context(),
-                },
-            )
-            .unwrap()
-        };
-        let _reader = open(installer(Arc::clone(&be_one_calls)), Arc::clone(&schema));
-        assert_eq!(be_one_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(be_two_calls.load(Ordering::SeqCst), 0);
-        let _reader = open(installer(Arc::clone(&be_two_calls)), schema);
-        assert_eq!(be_one_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(be_two_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn prepare_rejects_malformed_foreign_and_strategy_mismatched_splits_before_reader_open() {
-        let binding = control();
-        let (declaration, split, _) = planned_read(&binding);
-        let rpc_calls = Arc::new(AtomicUsize::new(0));
-        let direct_calls = Arc::new(AtomicUsize::new(0));
-        let mut bindings = StarRocksExecutionBindings::new();
-        bindings.insert(
-            StarRocksLocalBindingRef::parse("test").unwrap(),
-            StarRocksLocalExecutionBinding {
-                rpc: Some(Arc::new(RpcFactory(Arc::clone(&rpc_calls)))),
-                direct: Some(Arc::new(DirectFactory(Arc::clone(&direct_calls)))),
-            },
-        );
-        let installed = StarRocksExecutionInstaller::new(bindings)
-            .install(&declaration, &context())
-            .unwrap();
-        let read = installed.read().unwrap();
-
-        let malformed = ConnectorSplit::try_new(
-            split.owner().clone(),
-            "malformed",
-            Bytes::from_static(b"not a StarRocks split"),
-            split.estimated_bytes(),
-        )
-        .unwrap();
         assert_eq!(
-            read.prepare_split(
-                &malformed,
-                ConnectorPrepareSplitRequest { context: context() }
-            )
-            .unwrap_err()
-            .kind(),
-            ConnectorErrorKind::CorruptData
+            installed.key().instance_id,
+            ConnectorInstanceId::parse("catalog.starrocks").expect("instance ID")
         );
-
-        let foreign_binding = control();
-        let (_, foreign_generation, _) = planned_read(&foreign_binding);
         assert_eq!(
-            read.prepare_split(
-                &foreign_generation,
-                ConnectorPrepareSplitRequest { context: context() }
-            )
-            .unwrap_err()
-            .kind(),
-            ConnectorErrorKind::InvalidRequest
+            installed.read().expect("read capability").binding_key(),
+            installed.key()
         );
-
-        let mut strategy_mismatch: serde_json::Value =
-            serde_json::from_slice(split.payload()).unwrap();
-        strategy_mismatch["strategy_payload"]["kind"] =
-            serde_json::Value::String("shared_data_direct".to_string());
-        let strategy_mismatch = ConnectorSplit::try_new(
-            split.owner().clone(),
-            "strategy-mismatch",
-            Bytes::from(serde_json::to_vec(&strategy_mismatch).unwrap()),
-            split.estimated_bytes(),
-        )
-        .unwrap();
-        assert_eq!(
-            read.prepare_split(
-                &strategy_mismatch,
-                ConnectorPrepareSplitRequest { context: context() }
-            )
-            .unwrap_err()
-            .kind(),
-            ConnectorErrorKind::InvalidRequest
-        );
-
-        assert_eq!(rpc_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(direct_calls.load(Ordering::SeqCst), 0);
+        assert!(installed.write().is_none());
     }
 }

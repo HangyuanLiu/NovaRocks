@@ -33,7 +33,6 @@ use super::{QueryLifecycleError, QueryLifecycleErrorCode};
 /// Why one task update was refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskUpdateRejectionReason {
-    UnknownExecution,
     UnknownTask,
     NotAdmitted,
     Terminated,
@@ -47,7 +46,6 @@ pub(crate) enum TaskUpdateRejectionReason {
 impl TaskUpdateRejectionReason {
     const fn to_proto(self) -> proto::TaskUpdateRejectionReason {
         match self {
-            Self::UnknownExecution => proto::TaskUpdateRejectionReason::UnknownExecution,
             Self::UnknownTask => proto::TaskUpdateRejectionReason::UnknownTask,
             Self::NotAdmitted => proto::TaskUpdateRejectionReason::NotAdmitted,
             Self::Terminated => proto::TaskUpdateRejectionReason::Terminated,
@@ -248,20 +246,6 @@ pub(crate) fn rejection_from_lifecycle_error(error: &QueryLifecycleError) -> Tas
         TaskUpdateRejectionReason::from_lifecycle(error.code()),
         error.detail().to_owned(),
     )
-}
-
-/// The backend-local owner that actually enqueues admitted splits.
-///
-/// Admission and delivery are separate on purpose: the lifecycle owns whether
-/// an attempt may receive work, and the fragment runtime owns the per-plan-node
-/// queue that work lands in.
-pub(crate) trait TaskSplitDelivery: Send + Sync + 'static {
-    fn deliver(
-        &self,
-        execution_id: QueryExecutionId,
-        fragment_instance_id: UniqueId,
-        assignments: &[SplitAssignment],
-    ) -> TaskUpdateAck;
 }
 
 #[cfg(test)]

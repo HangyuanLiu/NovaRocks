@@ -34,8 +34,9 @@
 //!   `has_more` still true, which is exactly "this scan may still receive
 //!   work"; the queue-driven morsel that schedules that work is a later task.
 //! - The dynamic filter handed to the provider is the truthful unconstrained
-//!   one. [`TypedConnectorScanSource::with_backend_dynamic_filter`] is the one
-//!   seam a live, backend-driven filter is substituted through.
+//!   one until this fragment's runtime-filter consumer contracts are decoded.
+//!   `ScanSource::with_runtime_filter_contracts` is the one seam a live,
+//!   backend-driven filter is substituted through.
 //!
 //! Provider neutrality: this file holds protocol-validated carriers and trait
 //! objects only. It never matches a provider variant and never downcasts, so it
@@ -45,15 +46,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::runtime_filter::typed_dynamic_filter::scan_dynamic_filter;
 use novarocks_execution::connector::{
     ConnectorPageAdapter, PageConversion, SplitPoll, SplitQueue, TaskAttemptSplitQueues,
 };
+use novarocks_execution::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
 use novarocks_execution::exec::node::scan::{
     BoundScanRanges, IncrementalScanRange, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp,
     ScanSource,
 };
 use novarocks_execution::exec::node::{BoxedExecIter, ExecResult};
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
+use novarocks_execution::runtime_filter::{RuntimeFilterConsumerContract, RuntimeFilterSessionRef};
 use novarocks_proto::connector_read::{
     ConnectorTableScanSource, ScheduledSplit, TypedConnectorPageSourceProvider,
     ValidatedColumnHandle, WireDynamicFilter,
@@ -108,6 +112,10 @@ struct TypedConnectorScanShared {
     scan: ConnectorTableScanSource,
     provider: Arc<dyn TypedConnectorPageSourceProvider>,
     session: ConnectorSession,
+    /// The attempt's runtime-filter session, absent when this attempt installed
+    /// none. Retained because the consumer contracts that make a live filter
+    /// possible are decoded after this source is built.
+    runtime_filter: Option<RuntimeFilterSessionRef>,
     /// Deadline and cancellation, exactly as the opaque connector path uses
     /// them: checked before every open and on every driver turn.
     request: ConnectorRequestContext,
@@ -148,6 +156,7 @@ impl TypedConnectorScanSource {
         queues: Arc<TaskAttemptSplitQueues>,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
+        runtime_filter: Option<RuntimeFilterSessionRef>,
     ) -> Self {
         let dynamic_filter = complete_all_scan_dynamic_filter(&scan);
         Self {
@@ -155,6 +164,7 @@ impl TypedConnectorScanSource {
                 scan,
                 provider,
                 session,
+                runtime_filter,
                 request,
                 plan_node_id,
                 slot_ids,
@@ -175,6 +185,28 @@ impl TypedConnectorScanSource {
             .expect("typed connector scan source is not shared before it is bound");
         shared.dynamic_filter = dynamic_filter;
         self
+    }
+
+    /// Rebuild this source around one live dynamic filter.
+    ///
+    /// Every field but the filter is carried over: the scan carrier, the
+    /// installed provider, the session, and the request all belong to this
+    /// fragment instance and are unaffected by which filter the page sources
+    /// consult.
+    fn with_substituted_filter(&self, dynamic_filter: Arc<WireDynamicFilter>) -> Self {
+        Self {
+            shared: Arc::new(TypedConnectorScanShared {
+                scan: self.shared.scan.clone(),
+                provider: Arc::clone(&self.shared.provider),
+                session: self.shared.session.clone(),
+                runtime_filter: self.shared.runtime_filter.clone(),
+                request: self.shared.request.clone(),
+                plan_node_id: self.shared.plan_node_id,
+                slot_ids: self.shared.slot_ids.clone(),
+                dynamic_filter,
+            }),
+            queues: Arc::clone(&self.queues),
+        }
     }
 }
 
@@ -212,6 +244,37 @@ impl ScanSource for TypedConnectorScanSource {
 
     fn profile_name(&self) -> Option<String> {
         Some("TypedConnectorScan".to_string())
+    }
+
+    /// Subscribe to the live filter this fragment's consumer contracts describe.
+    ///
+    /// `DynamicFilterBinding.filter_id` on the scan carrier is the runtime
+    /// filter's binding id, so a contract is matched to a binding by that id
+    /// alone. With no session or no contract this scan keeps the truthful
+    /// unconstrained filter it was built with rather than claiming feedback it
+    /// never receives.
+    fn with_runtime_filter_contracts(
+        &self,
+        contracts: &[RuntimeFilterConsumerBinding],
+    ) -> Result<Option<Arc<dyn ScanSource>>, String> {
+        let Some(session) = self.shared.runtime_filter.as_ref() else {
+            return Ok(None);
+        };
+        let by_filter_id: BTreeMap<u32, RuntimeFilterConsumerContract> = contracts
+            .iter()
+            .map(|binding| {
+                (
+                    binding.contract.binding_id().get(),
+                    binding.contract.clone(),
+                )
+            })
+            .collect();
+        if by_filter_id.is_empty() {
+            return Ok(None);
+        }
+        let dynamic_filter = scan_dynamic_filter(&self.shared.scan, Some(session), &by_filter_id)
+            .map_err(|error| error.to_string())?;
+        Ok(Some(Arc::new(self.with_substituted_filter(dynamic_filter))))
     }
 }
 
@@ -1109,6 +1172,7 @@ mod tests {
             queues,
             NODE,
             vec![SlotId::new(1)],
+            None,
         )
     }
 
@@ -1398,6 +1462,7 @@ mod tests {
             Arc::clone(&queues),
             NODE,
             vec![SlotId::new(1)],
+            None,
         )
         .with_backend_dynamic_filter(Arc::new(CompleteAllDynamicFilter::new(covered)));
         let op = bind(&source);

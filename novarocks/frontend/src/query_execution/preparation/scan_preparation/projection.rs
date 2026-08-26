@@ -216,6 +216,11 @@ fn resolved_source_column<'a>(
         .map(|column| (column, ResolvedScanColumnKind::IcebergMetadataColumn))
 }
 
+/// The connector-schema column names one scan effectively reads.
+#[allow(
+    dead_code,
+    reason = "The eager projection-ordinal path that consumed this is gone; the typed stack resolves every output column through the connector's own column bindings."
+)]
 pub(super) fn effective_scan_column_names(scan: &PlanScanNode) -> Vec<String> {
     if let Some(projected) = refresh_scan_projected_names(scan) {
         return merge_required_columns_with_projected(scan.required_columns.clone(), &projected);

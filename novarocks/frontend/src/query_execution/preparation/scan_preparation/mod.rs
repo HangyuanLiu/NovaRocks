@@ -15,40 +15,96 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Frontend scan preparation for the typed connector read stack.
+//!
+//! Preparation freezes one relation per SQL scan and hands the connector's own
+//! split manager on to the execution round. It deliberately enumerates no
+//! split: the typed carrier has no split list, and a count taken here would
+//! pin the query's parallelism to whatever enumeration happened to produce
+//! first.
+// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
+
+use std::sync::Arc;
+
 use crate::catalog_application::query_bindings::{
     QueryScanMaterialization, QueryTableBindingStore,
 };
-use crate::query_execution::preparation::scan::{
-    ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
+use crate::connector::typed_control_registry::{
+    TypedConnectorControl, TypedConnectorControlRegistry,
 };
+use crate::query_execution::connector_domain::CatalogHandle;
+use crate::query_execution::preparation::scan::{
+    PreparedTypedConnectorScan, ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver,
+    ScanExecutionBindings,
+};
+use crate::query_execution::preparation::typed_scan::prepare_typed_scan;
+use novarocks_proto::connector_read::{ConnectorRelationKind, TypedRelationVersion};
+use novarocks_spi::connector::read_stack::{ConnectorSession, SchemaTableName};
+use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorReadSelector};
 use novarocks_sql::plan_read::PlanScanNode;
 use novarocks_sql::plan_read::{DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId};
 use novarocks_sql::planning::query_execution::{
     SqlScanPreparationCategory, SqlScanPreparationFacts, scan_preparation_facts,
 };
 
-mod iceberg;
 mod projection;
 mod pruning;
-mod static_predicate;
 
-use iceberg::{plan_connector_read, plan_sealed_connector_read};
 use projection::{resolve_effective_required_reads, resolve_physical_columns};
-use static_predicate::lower_static_connector_predicates;
+
+/// A `DistributedNode::limit` of this value means the node declares no limit.
+const NO_NODE_LIMIT: i64 = -1;
+
+/// The typed connector inputs one statement's scan preparation needs.
+///
+/// Both halves are frozen with the statement: the registry answers exactly the
+/// binding generation admission chose, and the session is the query's own
+/// identity. The session deliberately carries no credential — a connector
+/// authenticates through its installed control, never through a value the
+/// planner hands it.
+#[derive(Clone)]
+pub(crate) struct TypedScanPreparation {
+    control: Arc<TypedConnectorControlRegistry>,
+    session: ConnectorSession,
+}
+
+impl TypedScanPreparation {
+    pub(crate) fn new(
+        control: Arc<TypedConnectorControlRegistry>,
+        session: ConnectorSession,
+    ) -> Self {
+        Self { control, session }
+    }
+}
 
 /// Immutable scan-planning choices derived from the session before connector
-/// negotiation begins. Keeping this outside the native carrier makes an
-/// explicit disabled setting a safe FE-side rollback.
-#[derive(Clone, Copy, Debug)]
+/// negotiation begins.
+#[derive(Clone)]
 pub(crate) struct ScanPreparationOptions {
-    pub(crate) enable_connector_static_predicate_pushdown: bool,
-    /// Parallelism is frozen at statement admission from the live backend
-    /// topology. Providers use it only while producing opaque splits; it is
-    /// never rediscovered from mutable membership later in the request.
-    pub(crate) connector_target_parallelism: std::num::NonZeroUsize,
-    /// An internal/test-only hard cap. Production admission deliberately does
-    /// not expose this as a user setting.
-    pub(crate) connector_max_split_bytes: Option<std::num::NonZeroU64>,
+    #[allow(
+        dead_code,
+        reason = "The typed stack negotiates its own predicate pushdown inside prepare_typed_scan; the setting survives only for the callers that still construct these options."
+    )]
+    enable_connector_static_predicate_pushdown: bool,
+    /// Parallelism was frozen at statement admission only to size an eager
+    /// split set. The typed stack enumerates lazily, so instance counts are
+    /// read from the live backend topology by the scheduler instead.
+    #[allow(
+        dead_code,
+        reason = "No frozen split set remains to size; kept so the existing construction sites need no change while the field's last reader is gone."
+    )]
+    connector_target_parallelism: std::num::NonZeroUsize,
+    /// An internal/test-only hard cap on eager split size. Nothing splits
+    /// eagerly any more.
+    #[allow(
+        dead_code,
+        reason = "Split sizing moved to the connector's own lazy enumeration; kept so the existing construction sites need no change."
+    )]
+    connector_max_split_bytes: Option<std::num::NonZeroU64>,
+    /// The typed control registry and session. It is absent only while the
+    /// composition root has not threaded it through this call path; a scan
+    /// that needs it then fails closed rather than reaching a fallback.
+    typed: Option<TypedScanPreparation>,
 }
 
 impl ScanPreparationOptions {
@@ -61,7 +117,26 @@ impl ScanPreparationOptions {
             enable_connector_static_predicate_pushdown,
             connector_target_parallelism,
             connector_max_split_bytes,
+            typed: None,
         }
+    }
+
+    /// Attach the statement's typed connector control and session.
+    pub(crate) fn with_typed_connector_control(
+        mut self,
+        control: Arc<TypedConnectorControlRegistry>,
+        session: ConnectorSession,
+    ) -> Self {
+        self.typed = Some(TypedScanPreparation::new(control, session));
+        self
+    }
+
+    fn typed(&self) -> Result<&TypedScanPreparation, String> {
+        self.typed.as_ref().ok_or_else(|| {
+            "typed connector scan preparation requires the statement's typed control registry \
+             and connector session; neither has a default"
+                .to_string()
+        })
     }
 
     #[cfg(test)]
@@ -80,7 +155,7 @@ pub(super) fn prepare_scan_bindings(
     context: &novarocks_spi::connector::ConnectorRequestContext,
     query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn ScanBindingResolver>,
-    options: ScanPreparationOptions,
+    options: &ScanPreparationOptions,
 ) -> Result<ScanExecutionBindings, String> {
     let mut bindings = ScanExecutionBindings::default();
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
@@ -115,7 +190,7 @@ fn collect_scan_bindings(
     context: &novarocks_spi::connector::ConnectorRequestContext,
     query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn ScanBindingResolver>,
-    options: ScanPreparationOptions,
+    options: &ScanPreparationOptions,
     seen_scan_node_ids: &mut std::collections::BTreeSet<i32>,
     bindings: &mut ScanExecutionBindings,
 ) -> Result<(), String> {
@@ -126,6 +201,7 @@ fn collect_scan_bindings(
         prepare_scan_node(
             fragment_id,
             node.node_id,
+            node.limit,
             scan,
             context,
             query_table_bindings,
@@ -159,11 +235,12 @@ fn collect_scan_bindings(
 fn prepare_scan_node(
     fragment_id: FragmentId,
     node_id: i32,
+    node_limit: i64,
     scan: &PlanScanNode,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn ScanBindingResolver>,
-    options: ScanPreparationOptions,
+    options: &ScanPreparationOptions,
     bindings: &mut ScanExecutionBindings,
 ) -> Result<(), String> {
     let facts = scan_preparation_facts(scan);
@@ -208,125 +285,75 @@ fn prepare_scan_node(
                 "SQL frozen scan node_id={node_id} has timestamp selector {timestamp} without an admitted snapshot file set"
             ));
         }
+        // An Iceberg metadata table is a system relation. The typed stack has
+        // no system-table lane yet, so refusing here is what keeps a metadata
+        // scan from silently freezing the base table's DATA handle instead.
         SqlScanPreparationCategory::AdmittedMetadata => {
-            let query_table_bindings = query_table_bindings.ok_or_else(|| {
-                    format!(
-                        "SQL metadata scan node_id={node_id} has binding token but no query-local binding store"
-                    )
-                })?;
-            let materialization = query_table_bindings
-                .scan_materialization(facts.binding())?
-                .ok_or_else(|| {
-                    format!(
-                        "SQL metadata scan binding for '{}.{}.{}' has no scan materialization",
-                        facts.identity().catalog(),
-                        facts.identity().namespace(),
-                        facts.identity().table()
-                    )
-                })?;
-            ResolvedScanExecution::AdmittedConnectorRead(materialization)
+            return Err(unsupported_relation(
+                node_id,
+                &facts,
+                ConnectorRelationKind::SystemTable,
+            ));
         }
+        // A change-window read has its own relation family and its own
+        // enumerator; neither has a typed equivalent in this cut.
+        SqlScanPreparationCategory::Delta => {
+            return Err(unsupported_relation(
+                node_id,
+                &facts,
+                ConnectorRelationKind::ChangeWindow,
+            ));
+        }
+        // Both MV target lanes share one frozen materialization and lower to
+        // an ordinary pinned DATA scan; the lane itself carries no execution
+        // difference the typed stack can observe.
         SqlScanPreparationCategory::MvTargetState => {
             resolve_frozen_mv_target_scan(node_id, &facts, query_table_bindings, "target-state")?
         }
         SqlScanPreparationCategory::MvTargetLocator => {
             resolve_frozen_mv_target_scan(node_id, &facts, query_table_bindings, "target-locator")?
         }
-        SqlScanPreparationCategory::ConnectorRead | SqlScanPreparationCategory::Delta => {
-            let source_context = facts.source_context();
-            let resolver = resolver.ok_or_else(|| {
-                format!(
-                    "scan source {source_context} node_id={node_id} requires scan binding resolver"
-                )
-            })?;
-            resolver
-                    .resolve_scan(node_id, scan)
-                    .map_err(|err| {
-                        format!(
-                            "scan binding resolver failed for required source {source_context} node_id={node_id}: {err}"
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        format!(
-                            "scan binding resolver returned no binding for required source {source_context} node_id={node_id}"
-                        )
-                    })?
+        // A read whose provider handle was pinned before generic preparation
+        // is opaque by construction: there is no relation name or version left
+        // to freeze typed, so this lane must fail closed rather than reach the
+        // opaque carrier it used to emit.
+        SqlScanPreparationCategory::ConnectorRead => {
+            let _ = resolver;
+            return Err(format!(
+                "scan source {} node_id={node_id} is a pre-pinned opaque connector read, which the typed connector scan stack does not admit",
+                facts.source_kind_label()
+            ));
         }
     };
     validate_resolved_execution_kind(node_id, &facts, &execution)?;
-    reject_target_equality_deletes(node_id, &facts, &execution)?;
     let physical_columns = resolve_physical_columns(node_id, scan)?;
-    let (ranges, equality_required, connector_read) = match &execution {
+    let (ranges, equality_required, typed_scan) = match &execution {
+        // Both remaining variants are produced only by the lanes refused
+        // above; they are matched exhaustively so that adding a lane is a
+        // compile error here rather than a silent opaque read.
         ResolvedScanExecution::ConnectorRead => {
-            let resolver = resolver.ok_or_else(|| {
-                format!("connector-pinned scan node_id={node_id} requires a scan binding resolver")
-            })?;
-            let read = resolver
-                .resolve_connector_read(node_id, scan)
-                .map_err(|error| {
-                    format!(
-                        "scan binding resolver failed to provide connector read for node_id={node_id}: {error}"
-                    )
-                })?
-                .ok_or_else(|| {
-                    format!(
-                        "scan binding resolver returned no connector read for connector-pinned node_id={node_id}"
-                    )
-                })?;
-            (Vec::new(), Vec::new(), Some(read))
+            return Err(format!(
+                "scan preparation node_id={node_id}: a pre-pinned opaque connector read has no typed lowering"
+            ));
+        }
+        ResolvedScanExecution::SealedConnectorScan(_) => {
+            return Err(unsupported_relation(
+                node_id,
+                &facts,
+                ConnectorRelationKind::ChangeWindow,
+            ));
         }
         ResolvedScanExecution::AdmittedConnectorRead(materialization) => {
-            let static_predicates = if options.enable_connector_static_predicate_pushdown {
-                let QueryScanMaterialization { schema, .. } = materialization;
-                let connector_schema_fields = schema
-                    .fields()
-                    .iter()
-                    .map(|field| field.name().as_str())
-                    .collect::<Vec<_>>();
-                lower_static_connector_predicates(scan, &connector_schema_fields)
-            } else {
-                Vec::new()
-            };
-            let planned = plan_connector_read(
-                context.clone(),
+            let prepared = prepare_typed_connector_scan(
+                node_id,
+                node_limit,
                 scan,
+                &facts,
                 materialization,
-                facts.connector_read_purpose(),
-                static_predicates,
-                options.connector_target_parallelism,
-                options.connector_max_split_bytes,
-            )
-            .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
-            (Vec::new(), Vec::new(), Some(planned))
-        }
-        ResolvedScanExecution::SealedConnectorScan(connector_scan) => {
-            let Some(window) = facts.delta_window() else {
-                return Err(format!(
-                    "scan preparation node_id={node_id}: sealed change-window scan requires a SQL delta source"
-                ));
-            };
-            let query_table_bindings = query_table_bindings.ok_or_else(|| {
-                format!(
-                    "SQL delta scan node_id={node_id} has binding token but no query-local binding store"
-                )
-            })?;
-            let exact_lease = exact_query_binding_lease_for_facts(query_table_bindings, &facts)?;
-            let planned = plan_sealed_connector_read(
-                exact_lease,
-                context.clone(),
-                &scan.predicates,
-                connector_scan.clone(),
-                novarocks_spi::connector::ConnectorScanSelection::ChangeWindow(
-                    novarocks_spi::connector::ConnectorChangeWindow::new(
-                        window.from_snapshot_id(),
-                        window.to_snapshot_id(),
-                    ),
-                ),
-                options.connector_target_parallelism,
-                options.connector_max_split_bytes,
-            )
-            .map_err(|err| format!("scan preparation node_id={node_id}: {err}"))?;
-            (Vec::new(), Vec::new(), Some(planned))
+                context,
+                options,
+            )?;
+            (Vec::new(), Vec::new(), prepared)
         }
     };
     let required_reads = resolve_effective_required_reads(node_id, scan, &equality_required)?;
@@ -336,10 +363,155 @@ fn prepare_scan_node(
         physical_columns,
         required_reads,
     })?;
-    if let Some(connector_read) = connector_read {
-        bindings.insert_connector_read(fragment_id, node_id, connector_read)?;
-    }
+    bindings.insert_typed_scan(fragment_id, node_id, typed_scan)?;
     bindings.insert_scan_ranges(fragment_id, node_id, ranges)
+}
+
+/// Lower one admitted DATA relation onto the typed connector read stack.
+///
+/// The exact-generation rule is unchanged: the relation is frozen through the
+/// control installed for the binding generation the materialization's planning
+/// lease holds, never through a name-based or "current" lookup.
+fn prepare_typed_connector_scan(
+    node_id: i32,
+    node_limit: i64,
+    scan: &PlanScanNode,
+    facts: &SqlScanPreparationFacts,
+    materialization: &QueryScanMaterialization,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    options: &ScanPreparationOptions,
+) -> Result<PreparedTypedConnectorScan, String> {
+    let typed = options.typed()?;
+    let binding = materialization.planning_lease.binding();
+    if materialization.table.owner() != &binding.descriptor().instance_id {
+        return Err(format!(
+            "typed connector scan node_id={node_id} has a table handle owned by another instance than its planning lease"
+        ));
+    }
+    let binding_key = ConnectorExecutionBindingKey {
+        instance_id: binding.descriptor().instance_id.clone(),
+        incarnation: binding.incarnation(),
+    };
+    if binding_key.instance_id.as_str() != facts.identity().catalog() {
+        return Err(format!(
+            "typed connector scan node_id={node_id} resolves instance '{}' but the scan names catalog '{}'",
+            binding_key.instance_id.as_str(),
+            facts.identity().catalog()
+        ));
+    }
+    let control: TypedConnectorControl = typed
+        .control
+        .resolve(&binding_key)
+        .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
+    let declaration = binding
+        .execution_declaration(context)
+        .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
+    let relation = SchemaTableName::try_new(facts.identity().namespace(), facts.identity().table())
+        .map_err(|error| {
+            format!(
+                "typed connector scan node_id={node_id} cannot name relation '{}': {error}",
+                facts.identity().fqn()
+            )
+        })?;
+    let version = typed_relation_version(node_id, facts, materialization.selector)?;
+    let catalog = CatalogHandle::new(
+        binding_key.instance_id.as_str(),
+        binding_key.incarnation.to_bytes(),
+    );
+    // Runtime-filter bindings are resolved after every scan is prepared, so no
+    // dynamic filter is offered here yet. Offering none is exact: the carrier
+    // then declares none, and nothing waits on a consumer that never applies.
+    let prepared = prepare_typed_scan(
+        &typed.session,
+        catalog,
+        &control,
+        node_id,
+        scan,
+        &relation,
+        version,
+        None,
+        node_scan_limit(node_limit),
+        &[],
+    )
+    .map_err(|error| format!("scan preparation node_id={node_id}: {error}"))?;
+    // The relation family the connector actually froze decides whether this
+    // cut can read it. Every kind is named so a new one is a compile error
+    // here rather than a scan that reaches a reader with no contract for it.
+    match prepared.table_scan.table().relation_kind() {
+        ConnectorRelationKind::Table => {}
+        kind @ (ConnectorRelationKind::TableFunction
+        | ConnectorRelationKind::ChangeWindow
+        | ConnectorRelationKind::SystemTable
+        | ConnectorRelationKind::TableExecute
+        | ConnectorRelationKind::MergeTable) => {
+            return Err(unsupported_relation(node_id, facts, kind));
+        }
+    }
+    let residual_predicates = prepared
+        .residual_ordinals
+        .iter()
+        .map(|ordinal| {
+            scan.predicates.get(*ordinal).cloned().ok_or_else(|| {
+                format!(
+                    "typed connector scan node_id={node_id} reported residual conjunct {ordinal}, which the scan does not have"
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PreparedTypedConnectorScan {
+        declaration,
+        prepared,
+        residual_predicates,
+        planning_lease: materialization.planning_lease.clone(),
+    })
+}
+
+/// The typed relation version an admitted selector names.
+fn typed_relation_version(
+    node_id: i32,
+    facts: &SqlScanPreparationFacts,
+    selector: ConnectorReadSelector,
+) -> Result<TypedRelationVersion, String> {
+    match selector {
+        ConnectorReadSelector::Current => Ok(TypedRelationVersion::Current),
+        ConnectorReadSelector::SnapshotId(snapshot_id) => {
+            Ok(TypedRelationVersion::SnapshotId(snapshot_id))
+        }
+        // A timestamp is resolved to a snapshot at admission. Reaching the
+        // connector with one would ask it to re-resolve the pin this query
+        // already froze.
+        ConnectorReadSelector::TimestampMicros(timestamp) => Err(format!(
+            "typed connector scan node_id={node_id} on '{}' carries unresolved timestamp selector {timestamp}; admission must pin a snapshot first",
+            facts.identity().fqn()
+        )),
+    }
+}
+
+/// The limit a scan node offers the connector, if it declares one.
+fn node_scan_limit(node_limit: i64) -> Option<u64> {
+    (node_limit != NO_NODE_LIMIT)
+        .then(|| u64::try_from(node_limit).ok())
+        .flatten()
+}
+
+/// The stable refusal for a relation family this cut does not read.
+fn unsupported_relation(
+    node_id: i32,
+    facts: &SqlScanPreparationFacts,
+    kind: ConnectorRelationKind,
+) -> String {
+    let named = match kind {
+        ConnectorRelationKind::Table => "table",
+        ConnectorRelationKind::TableFunction => "table_function",
+        ConnectorRelationKind::ChangeWindow => "change_window",
+        ConnectorRelationKind::SystemTable => "system_table",
+        ConnectorRelationKind::TableExecute => "table_execute",
+        ConnectorRelationKind::MergeTable => "merge_table",
+    };
+    format!(
+        "typed connector scan node_id={node_id} on '{}' names relation kind `{named}`, which this read stack does not admit",
+        facts.identity().fqn()
+    )
 }
 
 /// Recover an IMV target scan only from its admitted query-local token.  The
@@ -385,29 +557,6 @@ fn resolve_frozen_mv_target_scan(
     ))
 }
 
-/// Once SQL catalog resolution selected a query binding, preparation must use
-/// that same connector generation.  A missing binding is a contract error,
-/// not permission to reacquire `current` and silently mix metadata versions.
-fn exact_query_binding_lease_for_facts(
-    bindings: &QueryTableBindingStore,
-    facts: &SqlScanPreparationFacts,
-) -> Result<novarocks_spi::connector::ConnectorControlPlanningLease, String> {
-    let binding_id = facts.binding();
-    let expected_catalog = facts.identity().catalog();
-    let source_name = format!("'{}'", facts.identity().fqn());
-    let lease = bindings
-        .exact_planning_lease(binding_id)
-        .map_err(|_| format!("query binding for {source_name} has no connector planning lease"))?;
-    if lease.binding().descriptor().instance_id.as_str() != expected_catalog {
-        return Err(format!(
-            "query binding lease owner '{:?}' does not match scan catalog '{}'",
-            lease.binding().descriptor().instance_id,
-            expected_catalog
-        ));
-    }
-    Ok(lease)
-}
-
 fn validate_resolved_execution_kind(
     node_id: i32,
     facts: &SqlScanPreparationFacts,
@@ -450,23 +599,6 @@ fn validate_resolved_execution_kind(
         "scan source {} node_id={node_id} requires {required} execution",
         facts.source_kind_label()
     ))
-}
-
-fn reject_target_equality_deletes(
-    node_id: i32,
-    facts: &SqlScanPreparationFacts,
-    execution: &ResolvedScanExecution,
-) -> Result<(), String> {
-    let target_kind = match facts.category() {
-        SqlScanPreparationCategory::MvTargetState => "target-state",
-        SqlScanPreparationCategory::MvTargetLocator => "target-locator",
-        _ => return Ok(()),
-    };
-    // Query-local neutral reads are deliberately opaque to Core. The provider
-    // validates delete visibility encoded in the admitted handle while
-    // planning its split set.
-    let _ = (node_id, target_kind, execution);
-    Ok(())
 }
 
 #[cfg(test)]

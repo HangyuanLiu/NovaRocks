@@ -362,7 +362,6 @@ mod tests {
             endpoint: RuntimeEndpoint::new("127.0.0.1", 19040 + backend_idx as i32)
                 .expect("valid endpoint"),
             scan_ranges: BTreeMap::new(),
-            connector_splits: BTreeMap::new(),
             destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         }

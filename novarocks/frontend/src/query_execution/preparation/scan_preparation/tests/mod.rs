@@ -54,14 +54,285 @@ fn prepare_scan_bindings_with_controls(
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
     let query_bindings = fixture_query_table_bindings(plan, controls);
+    let typed = fixture_typed_control_registry(plan, controls);
     super::prepare_scan_bindings(
         plan,
         controls,
         &crate::connector::test_request_context(),
         Some(&query_bindings),
         resolver,
-        super::ScanPreparationOptions::single_backend_fixture(),
+        &fixture_scan_preparation_options(typed),
     )
+}
+
+/// Fixture options carrying a typed control registry, mirroring how the
+/// composition root hands one to production preparation.
+fn fixture_scan_preparation_options(
+    typed: Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
+) -> super::ScanPreparationOptions {
+    super::ScanPreparationOptions::single_backend_fixture().with_typed_connector_control(
+        typed,
+        novarocks_spi::connector::read_stack::ConnectorSession::try_new(
+            "fixture-query",
+            "fixture-user",
+            "UTC",
+            "en_US",
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .expect("fixture connector session"),
+    )
+}
+
+/// Install one typed control per catalog instance the sealed plan scans.
+///
+/// The key is the exact generation the fixture lease already froze, so the
+/// registry answers precisely what production would answer.
+fn fixture_typed_control_registry(
+    plan: &DistributedPlan,
+    controls: &crate::connector::FixtureControlResolver,
+) -> Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry> {
+    use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
+
+    let registry =
+        Arc::new(crate::connector::typed_control_registry::TypedConnectorControlRegistry::new());
+    let mut facts = Vec::new();
+    for fragment in plan.fragments() {
+        fn collect(node: &DistributedNode, facts: &mut Vec<SqlScanPreparationFacts>) {
+            if let DistributedNodeKind::Scan(scan) = &node.payload {
+                facts.push(scan_preparation_facts(scan));
+            }
+            for child in &node.children {
+                collect(child, facts);
+            }
+        }
+        collect(&fragment.root, &mut facts);
+    }
+    let mut installed = std::collections::BTreeSet::new();
+    for facts in facts {
+        let catalog = facts.identity().catalog().to_string();
+        if !installed.insert(catalog.clone()) {
+            continue;
+        }
+        let Ok(instance_id) = ConnectorInstanceId::parse(&catalog) else {
+            continue;
+        };
+        let Ok(lease) = controls.acquire_current(&instance_id) else {
+            continue;
+        };
+        let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+            instance_id: lease.binding().descriptor().instance_id.clone(),
+            incarnation: lease.binding().incarnation(),
+        };
+        let control = Arc::new(FixtureTypedControl {
+            catalog: catalog.clone(),
+            incarnation: key.incarnation.to_bytes(),
+        });
+        registry
+            .install(
+                key,
+                crate::connector::typed_control_registry::TypedConnectorControl::new(
+                    control.clone(),
+                    control,
+                ),
+            )
+            .expect("fixture typed control install");
+    }
+    registry
+}
+
+/// A typed control that freezes any named relation as an Iceberg DATA table
+/// and binds every fixture column by name. It declines all pushdown and
+/// enumerates no split, so a test observes exactly what preparation itself
+/// decided.
+struct FixtureTypedControl {
+    catalog: String,
+    incarnation: [u8; 16],
+}
+
+impl FixtureTypedControl {
+    /// Every column the fixture tables expose, in a stable field-id order.
+    /// Preparation looks these up by output column name, so the set only has
+    /// to cover the names a fixture scan can project.
+    fn bindings() -> Vec<novarocks_proto::connector_read::TypedColumnBinding> {
+        use super::super::typed_predicate::test_support::column_handle;
+
+        [
+            "id",
+            "category",
+            "v",
+            "agg",
+            "extra",
+            "k",
+            "__branch_id__",
+            "__nova_join_row_key",
+            "__nova_base_row_id",
+            "_file",
+            "_pos",
+            "_row_id",
+            "_last_updated_sequence_number",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(ordinal, name)| {
+            novarocks_proto::connector_read::TypedColumnBinding::new(
+                *name,
+                column_handle(ordinal as i32 + 1, name),
+                false,
+            )
+        })
+        .collect()
+    }
+}
+
+impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedControl {
+    fn get_table_handle(
+        &self,
+        _session: &novarocks_spi::connector::read_stack::ConnectorSession,
+        name: &novarocks_spi::connector::read_stack::SchemaTableName,
+        version: novarocks_proto::connector_read::TypedRelationVersion,
+        _reference: Option<&str>,
+    ) -> Result<
+        Option<novarocks_proto::connector_read::CatalogTableHandle>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        use novarocks_proto_models::connector_read as dto;
+
+        let snapshot_id = match version {
+            novarocks_proto::connector_read::TypedRelationVersion::Current => 1,
+            novarocks_proto::connector_read::TypedRelationVersion::SnapshotId(snapshot_id) => {
+                snapshot_id
+            }
+            novarocks_proto::connector_read::TypedRelationVersion::Reference => 1,
+        };
+        let raw = dto::CatalogTableHandle {
+            catalog_name: self.catalog.clone(),
+            instance_incarnation: self.incarnation.to_vec(),
+            transaction: Some(dto::ConnectorTransactionHandle {
+                handle: Some(dto::connector_transaction_handle::Handle::Iceberg(
+                    dto::HiveTransactionHandle {
+                        auto_commit: true,
+                        uuid: vec![2_u8; 16],
+                    },
+                )),
+            }),
+            relation: Some(dto::catalog_table_handle::Relation::Table(
+                dto::ConnectorTableHandle {
+                    handle: Some(dto::connector_table_handle::Handle::Iceberg(
+                        dto::IcebergTableHandle {
+                            schema_table_name: Some(dto::SchemaTableName {
+                                schema_name: name.schema_name().to_owned(),
+                                table_name: name.table_name().to_owned(),
+                            }),
+                            snapshot_id: Some(snapshot_id),
+                            table_schema_json: "{}".to_owned(),
+                            spec_id: None,
+                            partition_spec_jsons: std::collections::BTreeMap::new(),
+                            format_version: 2,
+                            unenforced_predicate: Some(dto::TupleDomain {
+                                none: false,
+                                column_domains: Vec::new(),
+                            }),
+                            enforced_predicate: Some(dto::TupleDomain {
+                                none: false,
+                                column_domains: Vec::new(),
+                            }),
+                            limit: None,
+                            projected_columns: Vec::new(),
+                            name_mapping_json: None,
+                            table_location: "s3://bucket/table".to_owned(),
+                            storage_properties: std::collections::BTreeMap::new(),
+                        },
+                    )),
+                },
+            )),
+        };
+        Ok(Some(
+            novarocks_proto::connector_read::CatalogTableHandle::parse(
+                raw,
+                novarocks_proto::FieldPath::root("catalog_table_handle"),
+            )
+            .expect("fixture catalog table handle"),
+        ))
+    }
+
+    fn get_column_bindings(
+        &self,
+        _session: &novarocks_spi::connector::read_stack::ConnectorSession,
+        _table: &novarocks_proto::connector_read::CatalogTableHandle,
+    ) -> Result<
+        Vec<novarocks_proto::connector_read::TypedColumnBinding>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Ok(Self::bindings())
+    }
+
+    fn apply_filter(
+        &self,
+        _session: &novarocks_spi::connector::read_stack::ConnectorSession,
+        _table: &novarocks_proto::connector_read::CatalogTableHandle,
+        _constraint: &novarocks_proto::connector_read::WireConstraint,
+    ) -> Result<
+        Option<novarocks_proto::connector_read::TypedFilterApplication>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Ok(None)
+    }
+
+    fn apply_projection(
+        &self,
+        _session: &novarocks_spi::connector::read_stack::ConnectorSession,
+        _table: &novarocks_proto::connector_read::CatalogTableHandle,
+        _assignments: &[novarocks_proto::connector_read::ScanAssignment],
+    ) -> Result<
+        Option<novarocks_proto::connector_read::CatalogTableHandle>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Ok(None)
+    }
+
+    fn apply_limit(
+        &self,
+        _session: &novarocks_spi::connector::read_stack::ConnectorSession,
+        _table: &novarocks_proto::connector_read::CatalogTableHandle,
+        _limit: u64,
+    ) -> Result<
+        Option<novarocks_proto::connector_read::TypedLimitApplication>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Ok(None)
+    }
+
+    fn get_system_table_plan(
+        &self,
+        _session: &novarocks_spi::connector::read_stack::ConnectorSession,
+        _name: &novarocks_spi::connector::read_stack::SchemaTableName,
+    ) -> Result<
+        Option<novarocks_proto::connector_read::TypedSystemTablePlan>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Ok(None)
+    }
+}
+
+impl novarocks_proto::connector_read::TypedConnectorSplitManager for FixtureTypedControl {
+    fn get_splits(
+        &self,
+        _session: &novarocks_spi::connector::read_stack::ConnectorSession,
+        _table: &novarocks_proto::connector_read::CatalogTableHandle,
+        _columns: &[novarocks_proto::connector_read::ScanAssignment],
+        _dynamic_filter_columns: &std::collections::BTreeSet<
+            novarocks_proto::connector_read::ValidatedColumnHandle,
+        >,
+        _constraint: &novarocks_proto::connector_read::WireConstraint,
+    ) -> Result<
+        Box<dyn novarocks_proto::connector_read::TypedConnectorSplitSource>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "the fixture typed control enumerates no split",
+        ))
+    }
 }
 
 /// The shared fixture allocates the same token that the sealed SQL scan embeds.

@@ -68,6 +68,7 @@ async fn open_host(
         execution_config(),
         backend_config(),
         Vec::new(),
+        std::sync::Arc::new(novarocks_frontend::TypedConnectorControlRegistry::new()),
         tokio::runtime::Handle::current(),
         test_native_trust(),
         FrontendNativeTransport::plaintext(),

@@ -188,6 +188,7 @@ pub fn prepare_compiled_distributed_query(
         Some(analyzer_catalog.query_table_bindings().as_ref()),
         None,
         crate::query_execution::compiler::scan_preparation_options(
+            query_kernel.typed_connector_control(),
             execution.optimizer_settings(),
             execution,
         )?,

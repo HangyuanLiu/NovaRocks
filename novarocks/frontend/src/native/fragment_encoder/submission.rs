@@ -203,13 +203,6 @@ pub(crate) fn encode_native_submission(
                         &mut consumed_connector_writers,
                     )?;
                 }
-                for (&node_id, splits) in &placement.connector_splits {
-                    assembly::patch_native_connector_read_splits(
-                        &mut native_fragment,
-                        node_id,
-                        splits,
-                    )?;
-                }
                 if !is_root && !is_writer && stream_edge.is_none() {
                     if let Some((router_group_id, branch_edges)) = router_edges {
                         assembly::patch_native_change_stream_router_sink(

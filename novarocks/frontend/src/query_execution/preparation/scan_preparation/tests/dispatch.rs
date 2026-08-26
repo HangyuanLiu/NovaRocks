@@ -161,7 +161,7 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
         &crate::connector::test_request_context(),
         Some(&bindings),
         Some(&JoinRefreshDeltaResolver),
-        super::super::ScanPreparationOptions::single_backend_fixture(),
+        fixture_scan_preparation_options(fixture_typed_control_registry(&distributed, &controls)),
     )
     .expect("tokenized coalesce scans must prepare from exact bindings");
     for (node_id, _) in &scan_facts {
@@ -202,7 +202,7 @@ fn scan_preparation_propagates_caller_cancellation() {
         &context,
         Some(&query_bindings),
         None,
-        super::super::ScanPreparationOptions::single_backend_fixture(),
+        &fixture_scan_preparation_options(fixture_typed_control_registry(&plan, &controls)),
     ) {
         Ok(_) => panic!("caller cancellation must reach the connector provider"),
         Err(err) => err,
@@ -228,7 +228,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
         &crate::connector::test_request_context(),
         Some(&bindings),
         None,
-        super::super::ScanPreparationOptions::single_backend_fixture(),
+        &fixture_scan_preparation_options(fixture_typed_control_registry(&plan, &controls)),
     )
     .expect("exact query binding must plan the scan");
     assert!(
@@ -262,14 +262,15 @@ fn sqlx1_preparation_rejects_unbound_binding_instead_of_reacquiring_current() {
     let controls = crate::connector::FixtureControlResolver::new(registry);
     let bindings = crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
         .expect("binding store");
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed ordinary fixture");
     let error = match super::super::prepare_scan_bindings(
-        &native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
-            .expect("sealed ordinary fixture"),
+        &plan,
         &controls,
         &crate::connector::test_request_context(),
         Some(&bindings),
         None,
-        super::super::ScanPreparationOptions::single_backend_fixture(),
+        &fixture_scan_preparation_options(fixture_typed_control_registry(&plan, &controls)),
     ) {
         Ok(_) => panic!("unbound binding must fail before a current-generation acquire"),
         Err(error) => error,
@@ -352,7 +353,10 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
         &context,
         Some(&bindings),
         None,
-        super::super::ScanPreparationOptions::single_backend_fixture(),
+        &fixture_scan_preparation_options(fixture_typed_control_registry(
+            &plan,
+            &admission_controls,
+        )),
     )
     .expect("first preparation must use its admitted binding");
     let second = super::super::prepare_scan_bindings(
@@ -361,10 +365,21 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
         &context,
         Some(&bindings),
         None,
-        super::super::ScanPreparationOptions::new(
+        &super::super::ScanPreparationOptions::new(
             true,
             std::num::NonZeroUsize::new(3).expect("non-zero topology target"),
             None,
+        )
+        .with_typed_connector_control(
+            fixture_typed_control_registry(&plan, &admission_controls),
+            novarocks_spi::connector::read_stack::ConnectorSession::try_new(
+                "fixture-query",
+                "fixture-user",
+                "UTC",
+                "en_US",
+                std::time::SystemTime::UNIX_EPOCH,
+            )
+            .expect("fixture connector session"),
         ),
     )
     .expect("topology-only re-planning must reuse its admitted binding");
@@ -409,7 +424,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         &context,
         Some(&query_bindings),
         None,
-        super::super::ScanPreparationOptions::single_backend_fixture(),
+        &fixture_scan_preparation_options(fixture_typed_control_registry(&plan, &controls)),
         &mut seen_scan_node_ids,
         &mut bindings,
     )
@@ -421,7 +436,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         &context,
         Some(&query_bindings),
         None,
-        super::super::ScanPreparationOptions::single_backend_fixture(),
+        &fixture_scan_preparation_options(fixture_typed_control_registry(&plan, &controls)),
         &mut seen_scan_node_ids,
         &mut bindings,
     )

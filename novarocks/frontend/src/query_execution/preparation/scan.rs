@@ -24,6 +24,7 @@ use novarocks_spi::connector::{
 };
 
 use crate::catalog_application::query_bindings::QueryScanMaterialization;
+use crate::query_execution::preparation::typed_scan::PreparedTypedScan;
 use novarocks_proto::lifecycle::ScanRangeParams;
 use novarocks_sql::plan_read::ColumnId;
 use novarocks_sql::plan_read::FragmentId;
@@ -214,6 +215,44 @@ pub(crate) struct PlannedConnectorRead {
     pub(crate) read_session: Option<novarocks_spi::connector::ConnectorReadSessionLease>,
 }
 
+/// One SQL scan lowered onto the typed connector read stack.
+///
+/// It deliberately carries no split. Enumeration is lazy and owned by the
+/// execution round, which drives `PreparedTypedScan::split_manager`; anything
+/// that used to size itself from a frozen split count must ask the live
+/// backend topology instead.
+pub(crate) struct PreparedTypedConnectorScan {
+    /// The exact control generation this scan was frozen against. Every
+    /// backend that runs the fragment installs this declaration before a
+    /// runtime split can resolve its provider.
+    pub(crate) declaration: ConnectorExecutionDeclaration,
+    /// The typed scan node, its lazy split manager, and the constraint the
+    /// round driver must enumerate under.
+    pub(crate) prepared: PreparedTypedScan,
+    /// Ordered SQL conjuncts with no exact typed representation, so the engine
+    /// still evaluates them above the scan. A conjunct the connector merely
+    /// declined is not here: it travels as the carrier's unenforced predicate
+    /// and the backend reader applies it.
+    pub(crate) residual_predicates: Vec<TypedExpr>,
+    /// Keeps the exact FE control generation alive through the BE ensure
+    /// barrier. It is never encoded into a fragment carrier.
+    #[allow(
+        dead_code,
+        reason = "The lease is retained for its drop-time ownership release through BE admission."
+    )]
+    pub(crate) planning_lease: ConnectorControlPlanningLease,
+}
+
+impl std::fmt::Debug for PreparedTypedConnectorScan {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedTypedConnectorScan")
+            .field("declaration", &self.declaration)
+            .field("prepared", &self.prepared)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResolvedScanColumnKind {
     PhysicalTableColumn,
@@ -323,6 +362,7 @@ pub(crate) struct ScanExecutionBindings {
     by_node_id: BTreeMap<i32, ResolvedScanBinding>,
     scan_ranges: BTreeMap<FragmentId, BTreeMap<i32, Vec<ScanRangeParams>>>,
     connector_reads: BTreeMap<(FragmentId, i32), PlannedConnectorRead>,
+    typed_scans: BTreeMap<(FragmentId, i32), PreparedTypedConnectorScan>,
 }
 
 impl ScanExecutionBindings {
@@ -381,6 +421,96 @@ impl ScanExecutionBindings {
             })
     }
 
+    /// Record one typed connector scan.
+    ///
+    /// The owner check is the same rule the opaque carrier enforced: a scan
+    /// frozen against one control generation may never be installed under
+    /// another, so the relation's catalog identity must be exactly the
+    /// declaration's binding key.
+    pub(crate) fn insert_typed_scan(
+        &mut self,
+        fragment_id: FragmentId,
+        node_id: i32,
+        scan: PreparedTypedConnectorScan,
+    ) -> Result<(), String> {
+        if self.typed_scans.contains_key(&(fragment_id, node_id)) {
+            return Err(format!(
+                "duplicate typed connector scan fragment_id={fragment_id} node_id={node_id}"
+            ));
+        }
+        let binding_key = scan.declaration.binding_key();
+        let catalog = scan.prepared.table_scan.table().catalog();
+        if catalog.instance_id() != binding_key.instance_id.as_str() {
+            return Err(format!(
+                "typed connector scan fragment_id={fragment_id} node_id={node_id} names catalog '{}' but its declaration binds instance '{}'",
+                catalog.instance_id(),
+                binding_key.instance_id.as_str()
+            ));
+        }
+        if catalog.incarnation() != binding_key.incarnation.to_bytes() {
+            return Err(format!(
+                "typed connector scan fragment_id={fragment_id} node_id={node_id} names another incarnation of instance '{}' than its declaration",
+                binding_key.instance_id.as_str()
+            ));
+        }
+        if scan.prepared.table_scan.plan_node_id() != node_id {
+            return Err(format!(
+                "typed connector scan fragment_id={fragment_id} node_id={node_id} carries plan node {}",
+                scan.prepared.table_scan.plan_node_id()
+            ));
+        }
+        self.typed_scans.insert((fragment_id, node_id), scan);
+        Ok(())
+    }
+
+    pub(crate) fn typed_scan(
+        &self,
+        fragment_id: FragmentId,
+        node_id: i32,
+    ) -> Option<&PreparedTypedConnectorScan> {
+        self.typed_scans.get(&(fragment_id, node_id))
+    }
+
+    pub(crate) fn typed_scan_for_node(&self, node_id: i32) -> Option<&PreparedTypedConnectorScan> {
+        self.typed_scans
+            .iter()
+            .find_map(|(&(_, candidate), scan)| (candidate == node_id).then_some(scan))
+    }
+
+    /// Every typed connector scan of one fragment.
+    ///
+    /// Backend binding installation reads this: a fragment's scan nodes decide
+    /// which instances a backend must have installed, because any admitted
+    /// task may later receive a runtime split for any of them.
+    pub(crate) fn typed_scans_for_fragment(
+        &self,
+        fragment_id: FragmentId,
+    ) -> impl Iterator<Item = (i32, &PreparedTypedConnectorScan)> + '_ {
+        self.typed_scans
+            .iter()
+            .filter(move |((candidate, _), _)| *candidate == fragment_id)
+            .map(|(&(_, node_id), scan)| (node_id, scan))
+    }
+
+    pub(crate) fn typed_scan_keys(&self) -> impl Iterator<Item = (FragmentId, i32)> + '_ {
+        self.typed_scans.keys().copied()
+    }
+
+    /// Every typed connector scan of the query, keyed by fragment and plan
+    /// node. The execution round drives enumeration from these; preparation
+    /// itself never calls a split manager.
+    pub(crate) fn typed_scans(
+        &self,
+    ) -> impl Iterator<Item = (FragmentId, i32, &PreparedTypedConnectorScan)> + '_ {
+        self.typed_scans
+            .iter()
+            .map(|(&(fragment_id, node_id), scan)| (fragment_id, node_id, scan))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "The opaque connector carrier has no producer left in preparation; its readers (query_execution::read_session, query_execution::artifact) are outside this cut."
+    )]
     pub(crate) fn insert_connector_read(
         &mut self,
         fragment_id: FragmentId,
@@ -437,22 +567,8 @@ impl ScanExecutionBindings {
         self.connector_reads.get(&(fragment_id, node_id))
     }
 
-    pub(crate) fn connector_read_for_node(&self, node_id: i32) -> Option<&PlannedConnectorRead> {
-        self.connector_reads
-            .iter()
-            .find_map(|(&(fragment_id, candidate), read)| {
-                (candidate == node_id)
-                    .then_some((fragment_id, read))
-                    .map(|(_, read)| read)
-            })
-    }
-
     pub(crate) fn connector_reads(&self) -> impl Iterator<Item = &PlannedConnectorRead> {
         self.connector_reads.values()
-    }
-
-    pub(super) fn connector_read_keys(&self) -> impl Iterator<Item = (FragmentId, i32)> + '_ {
-        self.connector_reads.keys().copied()
     }
 }
 

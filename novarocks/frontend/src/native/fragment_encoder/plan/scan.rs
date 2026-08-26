@@ -17,9 +17,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use arrow::datatypes::{Field, Schema};
-use arrow::ipc::writer::StreamWriter;
-
 use super::super::expr::encode_sort_items;
 use super::output::{encode_output_column, encode_output_columns};
 use super::type_mapping::encode_type;
@@ -30,8 +27,8 @@ use crate::query_execution::preparation::{
 };
 use novarocks_proto_models::{common, plan};
 use novarocks_sql::plan_read::{
-    ColumnId, ExchangeFlavor, ExchangeReceiver, OutputColumn as AnalysisOutputColumn,
-    ScanVariantColumn, SqlPlanScanNodeRead, SqlScanSourceRead, SqlTableDefRead,
+    ExchangeFlavor, ExchangeReceiver, OutputColumn as AnalysisOutputColumn, SqlPlanScanNodeRead,
+    SqlScanSourceRead, SqlTableDefRead,
 };
 
 pub(super) fn encode_scan_node(
@@ -48,13 +45,14 @@ pub(super) fn encode_scan_node(
         || src.required_columns.clone().unwrap_or_default(),
         |binding| encode_bound_required_columns(src, binding),
     );
-    // Connector planning may remove only predicates explicitly negotiated as
-    // Exact. All other scan sources, and PruningOnly/Unsupported connector
-    // predicates, retain the original Core residuals.
+    // Typed pushdown removes only the conjuncts the connector could represent
+    // exactly. A conjunct with no typed representation stays a Core residual,
+    // and one the connector declined travels in the carrier's unenforced
+    // predicate, which the backend reader applies.
     let residual_predicates = ctx
         .scan_facts
         .and_then(|facts| facts.connector_read_for_node(node_id))
-        .map(|planned| planned.residual_predicates())
+        .map(|typed| typed.residual_predicates())
         .unwrap_or(&src.predicates);
     Ok(plan::ScanNode {
         database: src.database.clone(),
@@ -63,8 +61,6 @@ pub(super) fn encode_scan_node(
             Some(node_id),
             Some(&src.columns),
             Some(&columns),
-            Some(&required_columns),
-            Some(&src.variant_columns),
             binding,
             ctx,
         )?),
@@ -219,17 +215,11 @@ fn encode_exchange_flavor(src: &ExchangeFlavor) -> Result<plan::ExchangeFlavor, 
     })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The frozen frontend boundary keeps independently validated inputs explicit."
-)]
 pub(super) fn encode_table_def_with_context(
     src: &SqlTableDefRead,
     scan_node_id: Option<i32>,
     scan_columns: Option<&[AnalysisOutputColumn]>,
     scan_output_columns: Option<&[common::OutputColumn]>,
-    scan_required_columns: Option<&[String]>,
-    scan_variant_columns: Option<&[ScanVariantColumn]>,
     binding: Option<NativeScanBindingView<'_>>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::TableDef, String> {
@@ -256,11 +246,7 @@ pub(super) fn encode_table_def_with_context(
         source: Some(encode_scan_source(
             &src.source,
             scan_node_id,
-            scan_columns,
             scan_output_columns,
-            scan_required_columns,
-            scan_variant_columns.unwrap_or_default(),
-            binding,
             ctx,
         )?),
     })
@@ -463,167 +449,51 @@ fn resolved_execution_kind(execution: NativeScanExecutionKind) -> &'static str {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "The frozen frontend boundary keeps independently validated inputs explicit."
-)]
+/// Encode the one scan source this stack emits: the typed connector carrier.
+///
+/// The carrier has no split list, no opaque payload, and no Arrow IPC expected
+/// schema — its ordered assignments carry the output contract, and its splits
+/// arrive at runtime on the task-update queue.
 fn encode_scan_source(
     src: &SqlScanSourceRead,
     scan_node_id: Option<i32>,
-    scan_analysis_columns: Option<&[AnalysisOutputColumn]>,
     scan_output_columns: Option<&[common::OutputColumn]>,
-    scan_required_columns: Option<&[String]>,
-    scan_variant_columns: &[ScanVariantColumn],
-    binding: Option<NativeScanBindingView<'_>>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanSource, String> {
     use plan::scan_source::Kind;
 
-    if let Some(planned) = scan_node_id.and_then(|node_id| {
+    if let Some(typed) = scan_node_id.and_then(|node_id| {
         ctx.scan_facts
             .and_then(|facts| facts.connector_read_for_node(node_id))
     }) {
+        let source = typed.table_scan_source();
+        // The ordered assignments are the output-order authority: assignment
+        // `i` produces page channel `i`, which the decoder binds to output
+        // slot `i`. The encoder therefore copies them in place and only
+        // agrees the two lengths; sorting or deduplicating here would read one
+        // column into another column's slot.
+        let output_columns = scan_output_columns.unwrap_or_default();
+        if source.assignments().len() != output_columns.len() {
+            return Err(format!(
+                "typed connector scan node_id={} assigns {} columns but the encoded scan node declares {} output columns",
+                scan_node_id
+                    .map(|node_id| node_id.to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+                source.assignments().len(),
+                output_columns.len(),
+            ));
+        }
         return Ok(plan::ScanSource {
-            kind: Some(Kind::ConnectorRead(plan::ConnectorReadSource {
-                instance_id: planned
-                    .declaration()
-                    .binding_key()
-                    .instance_id()
-                    .to_string(),
-                instance_incarnation: planned.declaration().binding_key().incarnation().to_vec(),
-                scan_payload: planned.scan().handle().payload().to_vec(),
-                splits: Vec::new(),
-                max_batch_rows: u64::try_from(planned.batch().max_rows.get())
-                    .map_err(|_| "connector batch row budget does not fit u64".to_string())?,
-                max_batch_bytes: u64::try_from(planned.batch().max_bytes.get())
-                    .map_err(|_| "connector batch byte budget does not fit u64".to_string())?,
-                max_handle_payload_bytes: u64::try_from(
-                    novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-                )
-                .map_err(|_| "connector handle payload budget does not fit u64".to_string())?,
-                max_total_payload_bytes: u64::try_from(
-                    novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-                )
-                .map_err(|_| "connector total payload budget does not fit u64".to_string())?,
-                expected_schema_ipc: encode_connector_expected_schema_ipc(
-                    scan_output_columns.unwrap_or_default(),
-                    scan_analysis_columns.unwrap_or_default(),
-                    scan_required_columns.unwrap_or_default(),
-                    scan_variant_columns,
-                    binding,
-                    Some(planned.scan().output_schema()),
-                )?,
-            })),
+            kind: Some(Kind::TypedConnectorRead(source.as_proto().clone())),
         });
     }
 
     let source_kind = scan_source_kind(src);
     Err(format!(
-        "native SQL scan node_id={} source={} must be materialized as ConnectorReadSource before encoding",
+        "native SQL scan node_id={} source={} must be prepared as a typed connector scan before encoding",
         scan_node_id
             .map(|node_id| node_id.to_string())
             .unwrap_or_else(|| "<none>".to_string()),
         source_kind,
     ))
-}
-
-fn encode_connector_expected_schema_ipc(
-    output_columns: &[common::OutputColumn],
-    analysis_columns: &[AnalysisOutputColumn],
-    required_columns: &[String],
-    variant_columns: &[ScanVariantColumn],
-    binding: Option<NativeScanBindingView<'_>>,
-    provider_schema: Option<&arrow::datatypes::SchemaRef>,
-) -> Result<Vec<u8>, String> {
-    let required = (!required_columns.is_empty()).then(|| {
-        required_columns
-            .iter()
-            .map(|name| name.to_ascii_lowercase())
-            .collect::<HashSet<_>>()
-    });
-    let synthetic_ids = variant_columns
-        .iter()
-        .map(|column| column.synthetic_column_id)
-        .collect::<HashSet<_>>();
-    let required_variant_source_ids = variant_columns
-        .iter()
-        .filter(|column| {
-            required.as_ref().is_none_or(|required| {
-                required.contains(&column.synthetic_column.to_ascii_lowercase())
-            })
-        })
-        .map(|column| column.source_column_id)
-        .collect::<HashSet<_>>();
-    let selected = output_columns
-        .iter()
-        .filter(|column| {
-            !synthetic_ids.contains(&ColumnId(column.column_id))
-                && (required
-                    .as_ref()
-                    .is_none_or(|required| required.contains(&column.name.to_ascii_lowercase()))
-                    || required_variant_source_ids.contains(&ColumnId(column.column_id)))
-        })
-        .map(|column| {
-            let domain_column = binding
-                .and_then(|binding| {
-                    binding
-                        .physical_columns()
-                        .find(|bound| bound.planner().column_id.0 == column.column_id)
-                        .map(|bound| (bound.source().data_type.clone(), bound.source().nullable))
-                })
-                .or_else(|| {
-                    analysis_columns
-                        .iter()
-                        .find(|candidate| candidate.column_id.0 == column.column_id)
-                        .map(|candidate| (candidate.data_type.clone(), candidate.nullable))
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "ConnectorReadSource output column {} is missing its domain type",
-                        column.column_id
-                    )
-                })?;
-            Ok::<Field, String>(Field::new(&column.name, domain_column.0, domain_column.1))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let selected_schema = Schema::new(selected);
-    let schema = if let Some(provider_schema) = provider_schema {
-        // The read provider owns field metadata such as Iceberg field IDs and
-        // initial defaults. A physical scan can also carry execution-only
-        // columns (for example DML equality keys), so retain provider fields
-        // only where the native output actually consumes the same field.
-        Schema::new(
-            selected_schema
-                .fields()
-                .iter()
-                .map(|selected| {
-                    provider_schema
-                        .fields()
-                        .iter()
-                        .find(|provider| {
-                            provider.name() == selected.name()
-                                && provider.is_nullable() == selected.is_nullable()
-                                && provider.data_type() == selected.data_type()
-                        })
-                        .cloned()
-                        .unwrap_or_else(|| selected.clone())
-                })
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        selected_schema
-    };
-    let mut writer = StreamWriter::try_new(Vec::new(), &schema)
-        .map_err(|error| format!("encode ConnectorReadSource expected schema: {error}"))?;
-    writer
-        .finish()
-        .map_err(|error| format!("finish ConnectorReadSource expected schema: {error}"))?;
-    let bytes = writer.get_ref().clone();
-    if bytes.len() > novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES {
-        return Err(format!(
-            "ConnectorReadSource expected schema exceeds {} bytes",
-            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES
-        ));
-    }
-    Ok(bytes)
 }

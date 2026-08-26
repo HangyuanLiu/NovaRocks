@@ -115,6 +115,7 @@ pub(super) fn lower_typed_connector_scan(
         inputs.queues,
         node.node_id,
         output_schema.slot_ids().to_vec(),
+        inputs.runtime_filter,
     );
 
     // A typed scan carries no frozen range: its work arrives as splits on the
@@ -143,6 +144,8 @@ struct TypedScanRuntimeInputs {
     queues: Arc<novarocks_execution::connector::TaskAttemptSplitQueues>,
     session: novarocks_spi::connector::read_stack::ConnectorSession,
     request: novarocks_spi::connector::ConnectorRequestContext,
+    /// Absent when this attempt installed no runtime filter.
+    runtime_filter: Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>,
 }
 
 /// Resolve the typed scan's runtime inputs from the fragment decode context.
@@ -184,6 +187,7 @@ fn typed_scan_runtime_inputs(
         queues: runtime.queues(),
         session: runtime.session(),
         request,
+        runtime_filter: runtime.runtime_filter(),
     })
 }
 

@@ -910,7 +910,11 @@ message TaskUpdateAccepted {
 
 enum TaskUpdateRejectionReason {
   TASK_UPDATE_REJECTION_REASON_UNSPECIFIED = 0;
-  TASK_UPDATE_REJECTION_REASON_UNKNOWN_EXECUTION = 1;
+  // A backend cannot distinguish "never knew this execution" from "already
+  // reaped it": both leave no lifecycle entry, and both are reported as
+  // TERMINATED. Reserved rather than kept as a reason nothing can produce.
+  reserved 1;
+  reserved "TASK_UPDATE_REJECTION_REASON_UNKNOWN_EXECUTION";
   TASK_UPDATE_REJECTION_REASON_UNKNOWN_TASK = 2;
   TASK_UPDATE_REJECTION_REASON_NOT_ADMITTED = 3;
   TASK_UPDATE_REJECTION_REASON_TERMINATED = 4;

@@ -354,6 +354,21 @@ pub trait ScanSource: Send + Sync {
     fn profile_name(&self) -> Option<String> {
         None
     }
+
+    /// Rebuild this source around the fragment's runtime-filter consumer
+    /// contracts.
+    ///
+    /// The contracts are decoded after the source is lowered, so a source that
+    /// can consult a live filter learns of them here rather than at
+    /// construction. Returning `None` keeps the source exactly as it was built,
+    /// which is what every source that cannot consult a filter does.
+    fn with_runtime_filter_contracts(
+        &self,
+        contracts: &[crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding],
+    ) -> Result<Option<Arc<dyn ScanSource>>, String> {
+        let _ = contracts;
+        Ok(None)
+    }
 }
 
 // Compile-time object-safety assertion for `ScanSource`.
@@ -429,6 +444,21 @@ impl ScanNode {
     ) -> Self {
         self.native_runtime_filter_specs = specs;
         self
+    }
+
+    /// Hand this node's runtime-filter consumer contracts to its source.
+    ///
+    /// Call after [`Self::with_runtime_filter_consumers`]: a source that reads
+    /// through a typed connector uses the contracts to subscribe to the live
+    /// filter it will consult per row group.
+    pub fn install_runtime_filter_contracts(mut self) -> Result<Self, String> {
+        if let Some(source) = self
+            .source
+            .with_runtime_filter_contracts(&self.native_runtime_filter_specs)?
+        {
+            self.source = source;
+        }
+        Ok(self)
     }
 
     pub fn with_output_chunk_schema(mut self, output_chunk_schema: ChunkSchemaRef) -> Self {

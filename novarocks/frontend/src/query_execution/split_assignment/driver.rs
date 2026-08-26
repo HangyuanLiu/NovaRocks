@@ -257,12 +257,36 @@ impl SplitAssignmentDriver {
         if self.closed {
             return Err(SplitAssignmentDriverError::Closed);
         }
-        let targets = self
+        let all_targets = self
             .tasks
             .get(&plan_node_id)
             .filter(|targets| !targets.is_empty())
             .ok_or(SplitAssignmentDriverError::NoAdmittedTask { plan_node_id })?
             .clone();
+        // Prefer tasks that are not already at their queue ceiling. Weight
+        // balancing alone would keep feeding a saturated task simply because it
+        // has carried less weight so far, which is exactly the case where its
+        // queue depth, not its history, is what matters. If every task is
+        // saturated, fall back to all of them: the caller only reaches here
+        // when it has splits in hand, and holding them back here would strand
+        // work that `is_backpressured` already declined to pull.
+        let ceiling = self.max_queued_splits_per_task;
+        let targets = {
+            let available = all_targets
+                .iter()
+                .filter(|target| {
+                    self.task_state
+                        .get(*target)
+                        .is_none_or(|state| state.queued_splits < ceiling)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if available.is_empty() {
+                all_targets
+            } else {
+                available
+            }
+        };
 
         let mut placement: BTreeMap<AssignmentTarget, Vec<Split>> = BTreeMap::new();
         for split in splits {

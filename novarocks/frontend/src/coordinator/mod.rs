@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// MIGRATION: wired into the round once the typed producer lands.
 mod execution;
+#[allow(
+    dead_code,
+    reason = "Wired into execute_round by the typed producer cut in the same PR."
+)]
+pub(crate) mod split_assignment_round;
 // Task 5 deliberately lands the lifecycle client seam before Task 6 wires the
 // production transport and Task 7 cuts over coordinator submission.
 mod query_lifecycle;

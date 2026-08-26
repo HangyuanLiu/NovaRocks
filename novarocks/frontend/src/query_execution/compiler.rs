@@ -114,6 +114,11 @@ pub(crate) trait DmlQueryExecutionKernel:
     + crate::query_execution::planning::statistics::QueryStatisticsResolver
 {
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
+    /// The statement's typed connector control registry, supplied once when
+    /// the kernel was composed.
+    fn typed_connector_control(
+        &self,
+    ) -> &std::sync::Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>;
     fn catalog_application(
         &self,
     ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
@@ -126,6 +131,13 @@ pub(crate) trait DmlQueryExecutionKernel:
 impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
         self.connector_control().as_ref()
+    }
+
+    fn typed_connector_control(
+        &self,
+    ) -> &std::sync::Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>
+    {
+        self.typed_connector_control()
     }
 
     fn catalog_application(
@@ -151,6 +163,13 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
 impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver {
         self.connector_control().as_ref()
+    }
+
+    fn typed_connector_control(
+        &self,
+    ) -> &std::sync::Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>
+    {
+        self.typed_connector_control()
     }
 
     fn catalog_application(
@@ -1372,7 +1391,14 @@ fn optimizer_settings_for_execution(
     settings
 }
 
+/// Freeze one statement's scan-preparation inputs.
+///
+/// The typed control registry is the composition root's single instance, so
+/// planning resolves exactly the generation the control factory installed.
 pub(crate) fn scan_preparation_options(
+    typed_connector_control: &std::sync::Arc<
+        crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+    >,
     settings: &novarocks_sql::compiler::SessionOptimizerSettings,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
@@ -1391,8 +1417,31 @@ pub(crate) fn scan_preparation_options(
             settings.connector_static_predicate_pushdown_enabled(),
             target_parallelism,
             None,
+        )
+        .with_typed_connector_control(
+            std::sync::Arc::clone(typed_connector_control),
+            typed_connector_session()?,
         ),
     )
+}
+
+/// The connector session one statement's typed scans are prepared under.
+///
+/// Preparation runs before the coordinator mints a `QueryExecutionId`, so the
+/// statement has no execution identity yet: this session gets a fresh
+/// preparation identity instead of borrowing one that does not exist. It
+/// deliberately carries no credential — the connector authenticates through
+/// its installed control.
+pub(crate) fn typed_connector_session()
+-> Result<novarocks_spi::connector::read_stack::ConnectorSession, String> {
+    novarocks_spi::connector::read_stack::ConnectorSession::try_new(
+        uuid::Uuid::now_v7().to_string(),
+        "",
+        "UTC",
+        "en_US",
+        std::time::SystemTime::now(),
+    )
+    .map_err(|error| format!("typed connector scan session: {error}"))
 }
 
 pub(crate) fn connector_static_planning_metrics(
@@ -1803,7 +1852,11 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         connector_context,
         Some(table_bindings.as_ref()),
         scan_resolver,
-        scan_preparation_options(&optimizer_settings, execution)?,
+        scan_preparation_options(
+            state.typed_connector_control(),
+            &optimizer_settings,
+            execution,
+        )?,
     )?;
     Ok(PreparedDmlWriteAssembly::new(
         NativeFragmentEncodingInput::new(distributed_plan, prepared),
@@ -1948,6 +2001,9 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
 /// the resulting writer/cohort map for application-owned operation fencing.
 pub(crate) fn prepare_dml_change_stream_write_with_execution(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    typed_connector_control: &std::sync::Arc<
+        crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+    >,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     plan: novarocks_sql::planning::dml::DmlChangeStreamPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
@@ -1966,7 +2022,7 @@ pub(crate) fn prepare_dml_change_stream_write_with_execution(
         connector_context,
         Some(query_table_bindings),
         Some(&scan_resolver),
-        scan_preparation_options(&optimizer_settings, execution)?,
+        scan_preparation_options(typed_connector_control, &optimizer_settings, execution)?,
     )?;
     Ok(PlannedIcebergChangeStreamWrite {
         encoding: NativeFragmentEncodingInput::new(distributed_plan, prepared),
@@ -1979,6 +2035,9 @@ pub(crate) fn prepare_dml_change_stream_write_with_execution(
 /// sealed plan with the exact admitted bindings and connector write template.
 pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    typed_connector_control: &std::sync::Arc<
+        crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+    >,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     distributed_plan: novarocks_sql::plan_read::DistributedPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
@@ -1997,7 +2056,7 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
         connector_context,
         Some(query_table_bindings),
         Some(&scan_resolver),
-        scan_preparation_options(&settings, execution)?,
+        scan_preparation_options(typed_connector_control, &settings, execution)?,
     )?;
     let cohort_id = connector_write.cohort_id();
     let exact_lease = connector_write.lease();
@@ -2274,7 +2333,11 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         planning_inputs.post_compile.connector_context,
         Some(planning_inputs.post_compile.table_bindings.as_ref()),
         None,
-        scan_preparation_options(execution.optimizer_settings(), execution)?,
+        scan_preparation_options(
+            DmlQueryExecutionKernel::typed_connector_control(query_kernel),
+            execution.optimizer_settings(),
+            execution,
+        )?,
     )?;
     let connector_static_planning = connector_static_planning_metrics(&prepared)?;
     let assembly = PreparedDistributedQueryAssembly::new(

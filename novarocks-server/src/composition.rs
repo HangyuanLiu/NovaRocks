@@ -37,7 +37,7 @@ use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageLakeTargetSnapshotObservation, IcebergStoragePartitionTransform,
     IcebergStorageRefreshTechnique,
 };
-use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
+use novarocks_connector_starrocks::StarRocksExecutionInstaller;
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
@@ -385,9 +385,7 @@ pub fn compose_backend_execution_installers(
         ))];
     let expected = ConnectorExecutionProviderKind::Iceberg;
     let mut installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
-        vec![std::sync::Arc::new(StarRocksExecutionInstaller::new(
-            StarRocksExecutionBindings::new(),
-        ))];
+        vec![std::sync::Arc::new(StarRocksExecutionInstaller::new())];
     for installer in &iceberg_installers {
         if installer.provider_kind() != expected {
             anyhow::bail!(

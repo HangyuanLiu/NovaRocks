@@ -102,6 +102,9 @@ pub async fn open_frontend_application_for_server(
         config.execution.clone(),
         config.backend_open.clone(),
         config.connector_control_factories.clone(),
+        // The same registry the control factories above install into: one
+        // generation is reachable to installation and planning, or to neither.
+        Arc::clone(&config.typed_connector_control),
         data_runtime,
         Arc::clone(&config.native_trust),
         config.native_transport.clone(),
@@ -126,6 +129,9 @@ pub fn build_frontend_query_session_factory(
     let catalog_application = host.catalog_application_port();
     let catalog_projection = host.catalog_runtime_projection();
     let connector_control = host.connector_control_registry();
+    // Constructor-supplied, exactly once: query preparation receives the
+    // registry here and never resolves it from the host at request time.
+    let typed_connector_control = host.typed_connector_control();
     let query_execution = host.query_execution_service();
     let topology = host.backend_topology_port();
     let role = host.execution_role();
@@ -151,6 +157,7 @@ pub fn build_frontend_query_session_factory(
                 Arc::clone(&catalog_service),
                 Some(Arc::clone(&catalog_application)),
                 Arc::clone(&connector_control),
+                Arc::clone(&typed_connector_control),
                 Arc::clone(&unified_statistics),
                 query_execution.clone(),
                 topology.clone(),
@@ -200,6 +207,7 @@ pub fn build_frontend_query_session_factory(
         Arc::clone(&catalog_service),
         Some(Arc::clone(&catalog_application)),
         Arc::clone(&connector_control),
+        Arc::clone(&typed_connector_control),
         Arc::clone(&mv_storage_observation),
         query_execution.clone(),
         Arc::clone(&maintenance_service),
@@ -253,6 +261,7 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
+            Arc::clone(&typed_connector_control),
             Arc::clone(&unified_statistics),
             query_execution.clone(),
             topology.clone(),
@@ -314,6 +323,7 @@ pub fn build_frontend_query_session_factory(
         Arc::clone(&catalog_service),
         Some(catalog_application),
         connector_control,
+        typed_connector_control,
         unified_statistics,
         mv_storage_observation,
         query_execution.clone(),
@@ -861,6 +871,9 @@ mod tests {
             ),
             frontend_backend_open_config(),
             vec![Arc::new(EchoingControlFactory)],
+            Arc::new(
+                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
+            ),
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),
@@ -955,6 +968,9 @@ mod tests {
             FrontendExecutionConfig::new("127.0.0.1", 0, std::num::NonZeroUsize::new(1).unwrap()),
             frontend_backend_open_config(),
             Vec::new(),
+            Arc::new(
+                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
+            ),
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),
@@ -1004,6 +1020,9 @@ mod tests {
             ),
             frontend_backend_open_config(),
             Vec::new(),
+            Arc::new(
+                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
+            ),
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),

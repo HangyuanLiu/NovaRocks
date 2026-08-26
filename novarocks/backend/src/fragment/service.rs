@@ -322,22 +322,6 @@ impl NativeFragmentService {
         )
     }
 
-    /// Release the split queues of one finished or cancelled task.
-    ///
-    /// Closing wakes every parked scan exactly once so a terminated task never
-    /// leaves a driver waiting for splits that will not arrive.
-    pub(crate) fn close_split_queues(
-        &self,
-        execution_id: QueryExecutionId,
-        fragment_instance_id: novarocks_types::UniqueId,
-    ) {
-        self.split_queues
-            .close_attempt(novarocks_execution::connector::TaskAttemptKey::new(
-                execution_id,
-                fragment_instance_id,
-            ));
-    }
-
     /// Deliver one admitted task update into the per-plan-node split queues.
     ///
     /// The lifecycle owner has already decided this attempt may receive work;
@@ -895,6 +879,11 @@ impl FragmentControlHandle for RunningFragmentControl {
 }
 
 /// Close a task's split queues so every parked scan wakes exactly once.
+/// Release the split queues of one finished or cancelled task.
+///
+/// Closing wakes every parked scan exactly once so a terminated task never
+/// leaves a driver waiting for splits that will not arrive, and makes every
+/// later queue for that attempt born closed.
 fn close_task_split_queues(
     split_queues: &novarocks_execution::connector::SplitQueueRegistry,
     execution_id: QueryExecutionId,
@@ -1004,7 +993,8 @@ mod tests {
 
     use super::{
         NativeFragmentLifecycleEvent, NativeFragmentRequest, NativeFragmentService,
-        RunningFragmentControl, consume_terminal_fact, test_lifecycle_registry,
+        RunningFragmentControl, close_task_split_queues, consume_terminal_fact,
+        test_lifecycle_registry,
     };
 
     static SERVICE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1495,7 +1485,7 @@ mod tests {
         assert_eq!(stats.queued_splits, 1);
         assert!(stats.no_more_splits);
 
-        service.close_split_queues(execution_id, fragment_instance_id);
+        close_task_split_queues(&service.split_queues, execution_id, fragment_instance_id);
         assert!(queue.is_closed());
     }
 

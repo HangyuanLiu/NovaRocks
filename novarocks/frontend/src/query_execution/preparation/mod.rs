@@ -24,17 +24,11 @@ pub(crate) mod runtime_filter_view;
 pub(crate) mod scan;
 pub(crate) mod scan_preparation;
 mod topology;
-// MIGRATION: the round driver that consumes the typed scan lowering lands in a
-// later task of the same arc; until then nothing calls into these modules.
 #[allow(
     dead_code,
-    reason = "Consumed by the typed connector round driver later in this arc."
+    reason = "Predicate lowering exposes the full typed vocabulary; scan preparation uses the entry points, the round driver uses the rest."
 )]
 pub(crate) mod typed_predicate;
-#[allow(
-    dead_code,
-    reason = "Consumed by the typed connector round driver later in this arc."
-)]
 pub(crate) mod typed_scan;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,6 +59,7 @@ pub(crate) fn prepare_fragments(
     resolver: Option<&dyn scan::ScanBindingResolver>,
     scan_options: ScanPreparationOptions,
 ) -> Result<PreparedFragmentSet, String> {
+    let scan_options = &scan_options;
     let preparation_facts =
         novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
     let runtime_filter_facts =
@@ -142,7 +137,7 @@ pub(crate) fn prepare_fragments(
     let mut by_fragment = BTreeMap::new();
     let mut expected_range_keys = BTreeSet::new();
     let mut expected_binding_node_ids = BTreeSet::new();
-    let mut expected_connector_read_keys = BTreeSet::new();
+    let mut expected_typed_scan_keys = BTreeSet::new();
     for fragment in plan.fragments() {
         let mut scan_nodes = Vec::new();
         collect_scan_nodes(fragment.fragment_id, &fragment.root, &mut scan_nodes);
@@ -166,10 +161,10 @@ pub(crate) fn prepare_fragments(
                 ));
             }
             if scan_bindings
-                .connector_read(fragment.fragment_id, *node_id)
+                .typed_scan(fragment.fragment_id, *node_id)
                 .is_some()
             {
-                expected_connector_read_keys.insert((fragment.fragment_id, *node_id));
+                expected_typed_scan_keys.insert((fragment.fragment_id, *node_id));
             }
         }
         let scan_node_ids = scan_nodes.into_iter().map(|(node_id, _)| node_id).collect();
@@ -252,9 +247,9 @@ pub(crate) fn prepare_fragments(
         &scan_bindings.binding_node_ids().collect(),
     )?;
     validate_binding_keys(
-        "connector reads",
-        &expected_connector_read_keys,
-        &scan_bindings.connector_read_keys().collect(),
+        "typed connector scans",
+        &expected_typed_scan_keys,
+        &scan_bindings.typed_scan_keys().collect(),
     )?;
     Ok(PreparedFragmentSet::new(
         by_fragment,
