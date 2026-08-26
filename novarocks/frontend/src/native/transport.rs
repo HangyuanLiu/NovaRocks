@@ -1057,6 +1057,10 @@ fn stream_status_error(status: tonic::Status) -> QueryLifecycleTransportError {
 /// synchronous from the driver's point of view: the driver keeps one update in
 /// flight per task and uses the acknowledgement for backpressure, so there is
 /// no queue of unacknowledged updates to reconcile after a failure.
+#[expect(
+    dead_code,
+    reason = "Constructed by the coordinator round driver in the same PR."
+)]
 pub(crate) struct GrpcTaskUpdateTransport {
     clients: std::collections::BTreeMap<usize, Client>,
 }
