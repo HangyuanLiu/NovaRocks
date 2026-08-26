@@ -41,11 +41,18 @@ FE 配置必须包括：
 - FE Native gRPC 的 `[server].grpc_port`；
 - FE management HTTP 的 `[server].http_port`；
 - durable `[state_store]`；
+- 与 BE 相同的 mandatory `[native_trust]` deployment id、shared secret 和 transport mode；
 - 指向 BE Native gRPC endpoint 的 `[cluster].backends` additive seed。
 
 BE 配置必须包括自身不同的 Native gRPC 与 management HTTP 端口，以及本地
 connector object-store binding。两份配置在同一进程共享 logging 与 data-runtime
 sizing，其他 role-local 字段各自生效。
+
+`all-in-one` 不共享或绕过 Native trust：Server 仍分别为 FE 与 BE 构造 role-scoped
+trust snapshot，并在任何 listener 或 outbound connect 前拒绝两份配置的 deployment id、secret
+或 transport mode 不一致。省略 `[native_trust.transport]` 是 authenticated plaintext h2c；若
+启用 `automatic` 或 `pem`，两份配置必须一起使用同一 TLS 1.3 profile，JWT 仍为 mandatory。
+参阅 [Native trust、JWT 与可选 TLS](native-trust.md)。
 
 同一 address family 内，任意两个 listener 不能重叠：相同地址/端口冲突，wildcard
 地址也与同端口具体地址冲突。启动会在 logging、runtime、StateStore 或 listener
@@ -108,5 +115,7 @@ cargo run -p novarocks-server -- standalone --role all-in-one \
 | 启动前报 endpoint overlap | 为 FE MySQL、FE/BE Native gRPC、FE/BE management HTTP 分配不同端口；也检查 wildcard bind。 |
 | 启动前报 process configuration mismatch | 两份配置的 logging 与 data-runtime sizing 必须相同。 |
 | FE 提示缺少 StateStore | 为 FE 配置 durable `[state_store]`；不要以 transient/in-memory membership 替代。 |
+| native trust preflight failure | 使 FE/BE 的 `deployment_id`、resolved shared secret 与 transport mode 完全相同；完整 secret rotation 只能 homogeneous restart。 |
+| Native RPC `Unauthenticated` 或 TLS handshake failure | 检查 secret/env、token clock 和双方 TLS profile；不要降级或删除 JWT 来绕过失败。 |
 | 访问 `/metrics` 得到 Native 协议错误或 404 | 改访问对应 role 的 management HTTP port，而不是 Native gRPC port。 |
 | 连接 MySQL 失败 | 等待 `NOVAROCKS_READY`，然后确认 FE 的 `[standalone_server].mysql_port`。 |

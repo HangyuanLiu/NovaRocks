@@ -49,6 +49,8 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 - FE 节点和所有 BE 节点使用同一版本的 NovaRocks。
 - FE 节点可以访问每个 BE 的 `grpc_port`。
 - BE 节点可以访问 FE 的 `grpc_port`，用于向 coordinator 上报执行状态。
+- 所有 FE/BE 配置必须有完全相同的 `[native_trust].deployment_id`、shared
+  secret 与 transport mode；Native JWT 是 mandatory，TLS 只是在其上增加的可选层。
 - 所有 BE 节点都能访问相同的数据源、对象存储和 catalog。
 - 如果使用对象存储，所有节点的凭据、endpoint 和 path-style 设置应保持一致。
 - `role=fe` 必须配置一个可用的 `[state_store]`。它是 backend membership 的唯一 durable authority；SQLite 只适用于恰好一个 active FE。
@@ -88,6 +90,10 @@ log_level = "info"
 host = "0.0.0.0"
 grpc_port = 9080
 http_port = 8040
+
+[native_trust]
+deployment_id = "analytics-prod"
+shared_secret = "${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
 
 [cluster]
 role = "be"
@@ -149,6 +155,10 @@ host = "0.0.0.0"
 grpc_port = 9080
 http_port = 8040
 
+[native_trust]
+deployment_id = "analytics-prod"
+shared_secret = "${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
+
 [standalone_server]
 mysql_port = 9030
 user = "root"
@@ -183,6 +193,22 @@ NOVAROCKS_READY mysql_port=9030 pid=<pid>
 ```
 
 当前 MySQL 入口绑定在 `127.0.0.1`。如果需要远程访问，请在 FE 节点上使用 SSH tunnel、反向代理或本机客户端连接。
+
+## Native trust 与传输选择
+
+每个 deployable FE/BE role 都必须配置相同的 `[native_trust]`。它要求
+`deployment_id` 和至少 32 bytes 的 shared secret；secret 推荐以
+`openssl rand -base64 32` 生成，并通过每台主机受保护的
+`NOVAROCKS_NATIVE_SHARED_SECRET` 环境变量供 Server 在启动时解析。不要将 production
+secret 提交到 TOML、shell history 或日志。
+
+未写 `[native_trust.transport]` 时是 **authenticated h2c**：每个 Native RPC 都必须有
+短期 HS256 deployment JWT，但 protobuf body 仍是 plaintext。它只适用于明确可信、没有
+被动监听和主动中间人的内部网络。需要保密性、transport integrity 或 server endpoint
+cryptographic identity 时，所有 role 必须一起切换到 `automatic` 或 `pem` TLS 1.3。精确
+TLS profile、证书要求、DNS/IP identity、轮换和故障 runbook 见
+[Native trust、JWT 与可选 TLS](native-trust.md)。MySQL 与 management HTTP 不受
+`[native_trust]` 保护。
 
 ## 验证集群
 
@@ -251,6 +277,8 @@ ADD/DROP 的最终 desired membership 先写入 FE 的 StateStore，因此 clean
 | --- | --- |
 | `SHOW BACKENDS` 为空 | 检查 StateStore 中的 durable membership、`[cluster].backends` seeds，或使用 `ADD BACKEND 'host:port'` 注册后端。 |
 | BE 一直不 Alive | 确认 FE 节点能访问 BE 的 `grpc_port`，并检查 BE 的 `advertise_host`。 |
+| `Unauthenticated` 或 native trust startup failure | 检查每个 FE/BE 的 `deployment_id`、environment-resolved secret 与 transport mode 完全一致；不要为恢复连接而删除 `[native_trust]`。 |
+| TLS handshake / certificate failure | 所有 role 必须使用同一 TLS mode；检查 advertised IP/DNS reference 与 certificate SAN，PEM mode 还要检查显式 trust roots。 |
 | 查询报 `role=fe: no live backend available` | 当前 FE 没有可调度的 live BE；先恢复或注册 BE。 |
 | FE 启动时提示缺少 StateStore | 为 `role=fe` 配置 `[state_store]`；不要使用 core metadata 或内存 registry 作为 membership fallback。 |
 | BE 启动时配置校验失败 | `role=be` 不能配置 `[cluster].backends`。 |

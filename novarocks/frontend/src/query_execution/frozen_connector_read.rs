@@ -312,11 +312,11 @@ fn corrupt(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
 
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
+    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_spi::connector::{
         ConnectorControlPlanningLease, ConnectorExecutionDeclaration, ConnectorInstanceId,
         ConnectorInstanceIncarnation, ConnectorSplit, ConnectorTableIdentity,
@@ -332,7 +332,7 @@ mod tests {
             7,
             vec![LiveBackendTarget::new(
                 3,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19030),
+                RuntimeEndpoint::parse("127.0.0.1:19030").expect("endpoint"),
                 11,
             )],
         )

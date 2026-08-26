@@ -20,7 +20,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -37,6 +36,7 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_spi::state_store::{
     CommitResolution, Key, Precondition, StateRecord, StateStore, Value,
 };
@@ -53,7 +53,7 @@ use crate::native::transport::heartbeat as native_heartbeat;
 const CLUSTER_BACKENDS_KEY: &[u8] = b"novarocks/frontend/cluster-backends/v1/state";
 const CLUSTER_BACKENDS_SCHEMA_VERSION: u8 = 1;
 
-type HeartbeatProbe = dyn Fn(u32, SocketAddr) -> HeartbeatOutcome + Send + Sync + 'static;
+type HeartbeatProbe = dyn Fn(u32, RuntimeEndpoint) -> HeartbeatOutcome + Send + Sync + 'static;
 
 /// Immutable configuration used to open the frontend membership owner.
 ///
@@ -62,7 +62,7 @@ type HeartbeatProbe = dyn Fn(u32, SocketAddr) -> HeartbeatOutcome + Send + Sync 
 #[derive(Clone, Debug)]
 pub struct ClusterBackendOpenConfig {
     role: ClusterRole,
-    seed_endpoints: Vec<SocketAddr>,
+    seed_endpoints: Vec<RuntimeEndpoint>,
     heartbeat_interval: Duration,
     heartbeat_timeout_retries: u32,
     decommission_timeout: Duration,
@@ -71,7 +71,7 @@ pub struct ClusterBackendOpenConfig {
 impl ClusterBackendOpenConfig {
     pub fn new(
         role: ClusterRole,
-        seed_endpoints: Vec<SocketAddr>,
+        seed_endpoints: Vec<RuntimeEndpoint>,
         heartbeat_interval: Duration,
         heartbeat_timeout_retries: u32,
         decommission_timeout: Duration,
@@ -87,12 +87,7 @@ impl ClusterBackendOpenConfig {
         }
         let mut seen = BTreeSet::new();
         for endpoint in &seed_endpoints {
-            if endpoint.to_string().parse::<SocketAddr>().ok() != Some(*endpoint) {
-                return Err(format!(
-                    "cluster backend endpoint {endpoint} is not canonical"
-                ));
-            }
-            if !seen.insert(*endpoint) {
+            if !seen.insert(endpoint.clone()) {
                 return Err(format!(
                     "duplicate configured cluster backend endpoint {endpoint}"
                 ));
@@ -111,7 +106,7 @@ impl ClusterBackendOpenConfig {
         self.role
     }
 
-    pub fn seed_endpoints(&self) -> &[SocketAddr] {
+    pub fn seed_endpoints(&self) -> &[RuntimeEndpoint] {
         &self.seed_endpoints
     }
 
@@ -165,15 +160,15 @@ impl Default for StoredClusterBackendsV1 {
 
 #[derive(Clone, Debug)]
 enum RepositoryMutation {
-    ReconcileSeeds(Vec<SocketAddr>),
-    Add(SocketAddr),
+    ReconcileSeeds(Vec<RuntimeEndpoint>),
+    Add(RuntimeEndpoint),
     MarkDecommissioning {
         backend_id: u32,
-        endpoint: SocketAddr,
+        endpoint: RuntimeEndpoint,
     },
     Remove {
         backend_id: u32,
-        endpoint: SocketAddr,
+        endpoint: RuntimeEndpoint,
     },
 }
 
@@ -187,14 +182,14 @@ impl RepositoryMutation {
                     if state
                         .entries
                         .iter()
-                        .any(|entry| entry.endpoint == endpoint.to_string())
+                        .any(|entry| entry.endpoint == endpoint.as_host_port())
                     {
                         continue;
                     }
                     let backend_id = allocate_backend_id(state)?;
                     state.entries.push(StoredClusterBackendEntryV1 {
                         backend_id,
-                        endpoint: endpoint.to_string(),
+                        endpoint: endpoint.as_host_port(),
                         desired_state: DesiredBackendState::Active,
                     });
                     changed = true;
@@ -205,14 +200,14 @@ impl RepositoryMutation {
                 if state
                     .entries
                     .iter()
-                    .any(|entry| entry.endpoint == endpoint.to_string())
+                    .any(|entry| entry.endpoint == endpoint.as_host_port())
                 {
                     return Ok(false);
                 }
                 let backend_id = allocate_backend_id(state)?;
                 state.entries.push(StoredClusterBackendEntryV1 {
                     backend_id,
-                    endpoint: endpoint.to_string(),
+                    endpoint: endpoint.as_host_port(),
                     desired_state: DesiredBackendState::Active,
                 });
                 Ok(true)
@@ -221,7 +216,7 @@ impl RepositoryMutation {
                 backend_id,
                 endpoint,
             } => {
-                let entry = stored_entry_mut(state, *backend_id, *endpoint)?;
+                let entry = stored_entry_mut(state, *backend_id, endpoint.clone())?;
                 if entry.desired_state == DesiredBackendState::Decommissioning {
                     Ok(false)
                 } else {
@@ -237,7 +232,7 @@ impl RepositoryMutation {
                     .entries
                     .iter()
                     .position(|entry| {
-                        entry.backend_id == *backend_id && entry.endpoint == endpoint.to_string()
+                        entry.backend_id == *backend_id && entry.endpoint == endpoint.as_host_port()
                     })
                     .ok_or_else(|| {
                         format!(
@@ -256,25 +251,25 @@ impl RepositoryMutation {
                 state
                     .entries
                     .iter()
-                    .any(|entry| entry.endpoint == endpoint.to_string())
+                    .any(|entry| entry.endpoint == endpoint.as_host_port())
             }),
             Self::Add(endpoint) => state
                 .entries
                 .iter()
-                .any(|entry| entry.endpoint == endpoint.to_string()),
+                .any(|entry| entry.endpoint == endpoint.as_host_port()),
             Self::MarkDecommissioning {
                 backend_id,
                 endpoint,
             } => state.entries.iter().any(|entry| {
                 entry.backend_id == *backend_id
-                    && entry.endpoint == endpoint.to_string()
+                    && entry.endpoint == endpoint.as_host_port()
                     && entry.desired_state == DesiredBackendState::Decommissioning
             }),
             Self::Remove {
                 backend_id,
                 endpoint,
             } => !state.entries.iter().any(|entry| {
-                entry.backend_id == *backend_id && entry.endpoint == endpoint.to_string()
+                entry.backend_id == *backend_id && entry.endpoint == endpoint.as_host_port()
             }),
         }
     }
@@ -487,7 +482,7 @@ fn safe_native_build_identity(identity: &str) -> &str {
 
 #[derive(Clone, Debug)]
 struct FrontendBackendEntry {
-    endpoint: SocketAddr,
+    endpoint: RuntimeEndpoint,
     state: RuntimeBackendState,
     start_epoch: u64,
     version: String,
@@ -589,7 +584,7 @@ impl ClusterBackendService {
         heartbeat_probe: F,
     ) -> Self
     where
-        F: Fn(u32, SocketAddr) -> HeartbeatOutcome + Send + Sync + 'static,
+        F: Fn(u32, RuntimeEndpoint) -> HeartbeatOutcome + Send + Sync + 'static,
     {
         Self {
             state: Mutex::new(TopologyState {
@@ -657,7 +652,7 @@ impl ClusterBackendService {
                 (
                     target.backend_idx(),
                     FrontendBackendEntry {
-                        endpoint: target.endpoint(),
+                        endpoint: target.endpoint().clone(),
                         state: RuntimeBackendState::Live,
                         start_epoch: target.start_epoch(),
                         version: native_build_identity().to_string(),
@@ -807,7 +802,7 @@ impl ClusterBackendService {
                     let Ok(be_id) = u32::try_from(backend_idx) else {
                         continue;
                     };
-                    match (self.heartbeat_probe)(be_id, entry.endpoint) {
+                    match (self.heartbeat_probe)(be_id, entry.endpoint.clone()) {
                         HeartbeatOutcome::Ok {
                             start_epoch,
                             version,
@@ -1000,7 +995,7 @@ impl ClusterBackendService {
     fn apply_added(
         &self,
         stored: StoredClusterBackendsV1,
-        endpoint: SocketAddr,
+        endpoint: RuntimeEndpoint,
     ) -> Result<(), String> {
         let mut state = self
             .state
@@ -1016,7 +1011,7 @@ impl ClusterBackendService {
         let backend_idx = stored
             .entries
             .iter()
-            .find(|entry| entry.endpoint == endpoint.to_string())
+            .find(|entry| entry.endpoint == endpoint.as_host_port())
             .map(|entry| {
                 usize::try_from(entry.backend_id)
                     .map_err(|_| "backend id cannot be represented locally".to_string())
@@ -1038,7 +1033,7 @@ impl ClusterBackendService {
     fn mark_decommissioning_runtime(
         &self,
         backend_idx: usize,
-        endpoint: SocketAddr,
+        endpoint: RuntimeEndpoint,
     ) -> Result<(), String> {
         let mut state = self
             .state
@@ -1063,7 +1058,7 @@ impl ClusterBackendService {
         Ok(())
     }
 
-    fn remove_runtime(&self, backend_idx: usize, endpoint: SocketAddr) -> Result<(), String> {
+    fn remove_runtime(&self, backend_idx: usize, endpoint: RuntimeEndpoint) -> Result<(), String> {
         let mut state = self
             .state
             .lock()
@@ -1113,11 +1108,11 @@ impl ClusterBackendService {
             if self
                 .persist(RepositoryMutation::Remove {
                     backend_id: backend_idx as u32,
-                    endpoint: entry.endpoint,
+                    endpoint: entry.endpoint.clone(),
                 })
                 .is_ok()
             {
-                let _ = self.remove_runtime(backend_idx, entry.endpoint);
+                let _ = self.remove_runtime(backend_idx, entry.endpoint.clone());
             }
         }
     }
@@ -1163,7 +1158,7 @@ impl ClusterBackendService {
                     .iter()
                     .filter_map(|(id, entry)| {
                         (entry.state == RuntimeBackendState::Live).then_some(
-                            LiveBackendTarget::new(*id, entry.endpoint, entry.start_epoch),
+                            LiveBackendTarget::new(*id, entry.endpoint.clone(), entry.start_epoch),
                         )
                     })
                     .collect();
@@ -1265,7 +1260,7 @@ impl BackendTopologyPort for ClusterBackendService {
                 .filter_map(|(id, entry)| {
                     (entry.state == RuntimeBackendState::Live).then_some(LiveBackendTarget::new(
                         *id,
-                        entry.endpoint,
+                        entry.endpoint.clone(),
                         entry.start_epoch,
                     ))
                 })
@@ -1332,7 +1327,7 @@ impl BackendTopologyPort for ClusterBackendService {
         }
     }
 
-    fn add_backend(&self, endpoint: SocketAddr) -> Result<(), String> {
+    fn add_backend(&self, endpoint: RuntimeEndpoint) -> Result<(), String> {
         let _guard = self
             .mutation
             .lock()
@@ -1344,11 +1339,11 @@ impl BackendTopologyPort for ClusterBackendService {
         {
             return Ok(());
         }
-        let stored = self.persist(RepositoryMutation::Add(endpoint))?;
+        let stored = self.persist(RepositoryMutation::Add(endpoint.clone()))?;
         self.apply_added(stored, endpoint)
     }
 
-    fn drop_backend(&self, endpoint: SocketAddr, force: bool) -> Result<(), String> {
+    fn drop_backend(&self, endpoint: RuntimeEndpoint, force: bool) -> Result<(), String> {
         let _guard = self
             .mutation
             .lock()
@@ -1363,9 +1358,9 @@ impl BackendTopologyPort for ClusterBackendService {
         if force {
             self.persist(RepositoryMutation::Remove {
                 backend_id,
-                endpoint,
+                endpoint: endpoint.clone(),
             })?;
-            self.remove_runtime(backend_idx, endpoint)?;
+            self.remove_runtime(backend_idx, endpoint.clone())?;
             self.dispatch_event(BackendQueryEvent::Unavailable {
                 backend_idx,
                 reason: format!("backend {backend_idx} dropped forcefully"),
@@ -1374,13 +1369,13 @@ impl BackendTopologyPort for ClusterBackendService {
         }
         self.persist(RepositoryMutation::MarkDecommissioning {
             backend_id,
-            endpoint,
+            endpoint: endpoint.clone(),
         })?;
-        self.mark_decommissioning_runtime(backend_idx, endpoint)?;
+        self.mark_decommissioning_runtime(backend_idx, endpoint.clone())?;
         if !self.backend_has_active_queries(backend_idx) {
             self.persist(RepositoryMutation::Remove {
                 backend_id,
-                endpoint,
+                endpoint: endpoint.clone(),
             })?;
             self.remove_runtime(backend_idx, endpoint)?;
         }
@@ -1401,7 +1396,7 @@ impl BackendTopologyPort for ClusterBackendService {
         let mut columns = vec![Vec::<String>::new(); names.len()];
         for (backend_idx, entry) in self.rows() {
             columns[0].push(backend_idx.to_string());
-            columns[1].push(entry.endpoint.ip().to_string());
+            columns[1].push(entry.endpoint.host().to_string());
             columns[2].push(entry.endpoint.port().to_string());
             columns[3].push(entry.state.as_str().to_string());
             columns[4].push(entry.scheduled_fragments.to_string());
@@ -1455,7 +1450,7 @@ impl BackendTopologyPort for ClusterBackendService {
     }
 }
 
-fn registering_entry(endpoint: SocketAddr) -> FrontendBackendEntry {
+fn registering_entry(endpoint: RuntimeEndpoint) -> FrontendBackendEntry {
     FrontendBackendEntry {
         endpoint,
         state: RuntimeBackendState::Registering,
@@ -1549,11 +1544,10 @@ fn validate_stored_cluster_backends(state: &StoredClusterBackendsV1) -> Result<(
     Ok(())
 }
 
-fn parse_canonical_endpoint(value: &str) -> Result<SocketAddr, String> {
-    let endpoint = value
-        .parse::<SocketAddr>()
+fn parse_canonical_endpoint(value: &str) -> Result<RuntimeEndpoint, String> {
+    let endpoint = RuntimeEndpoint::parse(value)
         .map_err(|error| format!("invalid cluster backend endpoint {value:?}: {error}"))?;
-    if endpoint.to_string() != value {
+    if endpoint.as_host_port() != value {
         return Err(format!(
             "cluster backend endpoint {value:?} is not canonical"
         ));
@@ -1574,12 +1568,12 @@ fn allocate_backend_id(state: &mut StoredClusterBackendsV1) -> Result<u32, Strin
 fn stored_entry_mut(
     state: &mut StoredClusterBackendsV1,
     backend_id: u32,
-    endpoint: SocketAddr,
+    endpoint: RuntimeEndpoint,
 ) -> Result<&mut StoredClusterBackendEntryV1, String> {
     state
         .entries
         .iter_mut()
-        .find(|entry| entry.backend_id == backend_id && entry.endpoint == endpoint.to_string())
+        .find(|entry| entry.backend_id == backend_id && entry.endpoint == endpoint.as_host_port())
         .ok_or_else(|| {
             format!("backend {backend_id} at {endpoint} is absent from durable membership")
         })
@@ -1597,12 +1591,12 @@ fn invalid_state_store_request(
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
     use std::sync::{Arc, Mutex};
 
     use crate::common::backend_topology::{
         BackendQueryEvent, BackendQueryEventSink, BackendTopologyPort, LiveBackendTarget,
     };
+    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_version::native_build_identity;
 
     use super::{
@@ -1630,12 +1624,12 @@ mod tests {
     #[test]
     fn snapshot_and_management_are_frontend_owned() {
         let service = ClusterBackendService::new_for_test(1);
-        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
-        service.add_backend(endpoint).unwrap();
+        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9070").unwrap();
+        service.add_backend(endpoint.clone()).unwrap();
         service.record_heartbeat_success(0, 17, native_build_identity(), 2, 100);
         assert_eq!(
             service.live_backends(),
-            [LiveBackendTarget::new(0, endpoint, 17)]
+            [LiveBackendTarget::new(0, endpoint.clone(), 17)]
         );
         service.drop_backend(endpoint, true).unwrap();
         assert!(service.live_backends().is_empty());
@@ -1644,8 +1638,8 @@ mod tests {
     #[test]
     fn show_backends_includes_the_runtime_start_epoch() {
         let service = ClusterBackendService::new_for_test(1);
-        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
-        service.add_backend(endpoint).unwrap();
+        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9070").unwrap();
+        service.add_backend(endpoint.clone()).unwrap();
         service.record_heartbeat_success(0, 17, native_build_identity(), 2, 100);
 
         let result = service.show_backends().unwrap();
@@ -1671,8 +1665,8 @@ mod tests {
     #[test]
     fn mismatched_native_build_identity_is_not_schedulable_and_can_recover() {
         let service = ClusterBackendService::new_for_test(1);
-        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
-        service.add_backend(endpoint).unwrap();
+        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9070").unwrap();
+        service.add_backend(endpoint.clone()).unwrap();
 
         service.record_heartbeat_success(0, 17, "incompatible-build", 2, 100);
         assert!(service.live_backends().is_empty());
@@ -1699,7 +1693,7 @@ mod tests {
     #[test]
     fn repeated_mismatch_does_not_advance_revision_or_repeat_unavailable() {
         let service = ClusterBackendService::new_for_test(1);
-        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
+        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9070").unwrap();
         service.add_backend(endpoint).unwrap();
         service.record_heartbeat_success(0, 17, native_build_identity(), 2, 100);
         let events = Arc::new(RecordingBackendQueryEvents::default());
@@ -1736,7 +1730,7 @@ mod tests {
     #[test]
     fn incompatible_heartbeat_timeout_becomes_lost_but_keeps_admission_history() {
         let service = ClusterBackendService::new_for_test(1);
-        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
+        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9070").unwrap();
         service.add_backend(endpoint).unwrap();
         service.record_heartbeat_success(0, 17, "incompatible-build", 2, 100);
 
@@ -1751,7 +1745,7 @@ mod tests {
     #[test]
     fn live_backend_restart_with_mismatch_is_unavailable_not_restarted() {
         let service = ClusterBackendService::new_for_test(1);
-        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
+        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9070").unwrap();
         service.add_backend(endpoint).unwrap();
         service.record_heartbeat_success(0, 17, native_build_identity(), 2, 100);
         let events = Arc::new(RecordingBackendQueryEvents::default());
@@ -1768,8 +1762,8 @@ mod tests {
     #[test]
     fn decommissioning_backend_ignores_identity_admission() {
         let service = ClusterBackendService::new_for_test(1);
-        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
-        service.add_backend(endpoint).unwrap();
+        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9070").unwrap();
+        service.add_backend(endpoint.clone()).unwrap();
         service.mark_decommissioning_runtime(0, endpoint).unwrap();
 
         service.record_heartbeat_success(0, 17, "incompatible-build", 2, 100);
@@ -1781,7 +1775,7 @@ mod tests {
 
     #[test]
     fn captured_targets_use_the_current_native_build_identity() {
-        let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
+        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9070").unwrap();
         let service =
             ClusterBackendService::from_captured_targets_for_test(&[LiveBackendTarget::new(
                 0, endpoint, 17,
@@ -1819,11 +1813,11 @@ mod tests {
 
     #[test]
     fn open_config_rejects_duplicate_seed_identity() {
-        let endpoint: SocketAddr = "127.0.0.1:9010".parse().unwrap();
+        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9010").unwrap();
         assert!(
             ClusterBackendOpenConfig::new(
                 novarocks_types::ClusterRole::Fe,
-                vec![endpoint, endpoint],
+                vec![endpoint.clone(), endpoint],
                 std::time::Duration::from_secs(1),
                 1,
                 std::time::Duration::from_secs(1),

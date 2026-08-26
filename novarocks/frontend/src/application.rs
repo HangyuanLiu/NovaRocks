@@ -23,6 +23,7 @@ use tokio::runtime::Handle;
 
 use crate::query_execution::service::QueryExecutionService;
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
+use novarocks_native_trust::NativeTrust;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
 
@@ -42,6 +43,7 @@ use crate::mv::{
     FrontendMvRefreshProviderActivationPort, FrontendMvService, repository::StateStoreMvRepository,
 };
 use crate::native::data_runtime::FrontendDataRuntime;
+use crate::native::transport::FrontendNativeTransport;
 use crate::query_control::FrontendQueryControl;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::statistics::FrontendStatisticsService;
@@ -54,6 +56,23 @@ use crate::view::FrontendViewService;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+fn test_native_trust() -> Arc<NativeTrust> {
+    use novarocks_native_trust::{
+        DeploymentId, NativeCallerSubject, NativeTransportMode, ValidatedSharedSecret,
+    };
+
+    Arc::new(NativeTrust::new(
+        DeploymentId::parse("frontend-application-test").expect("fixed test deployment id"),
+        ValidatedSharedSecret::new(novarocks_secret::SecretValue::new(
+            "0123456789abcdef0123456789abcdef",
+        ))
+        .expect("fixed test shared secret"),
+        NativeCallerSubject::parse("fe@127.0.0.1:19040").expect("fixed test caller subject"),
+        NativeTransportMode::Disabled,
+    ))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrontendApplicationErrorKind {
@@ -275,8 +294,19 @@ impl FrontendApplicationHost {
         execution: FrontendExecutionConfig,
         backend: ClusterBackendOpenConfig,
         data_runtime: Handle,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
-        Self::open_with_factories(state_store, execution, backend, Vec::new(), data_runtime).await
+        Self::open_with_factories(
+            state_store,
+            execution,
+            backend,
+            Vec::new(),
+            data_runtime,
+            native_trust,
+            native_transport,
+        )
+        .await
     }
 
     pub async fn open_with_factories(
@@ -285,6 +315,8 @@ impl FrontendApplicationHost {
         backend: ClusterBackendOpenConfig,
         connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
         data_runtime: Handle,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
         let registry = StateStoreProviderRegistry::new();
         Self::open_with_factories_and_state_store_registry(
@@ -294,10 +326,16 @@ impl FrontendApplicationHost {
             backend,
             connector_factories,
             data_runtime,
+            native_trust,
+            native_transport,
         )
         .await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Server composition deliberately supplies StateStore, role execution, and immutable Native trust capabilities independently."
+    )]
     pub async fn open_with_factories_and_state_store_registry(
         state_store: Option<StateStoreHostInput>,
         state_store_registry: &StateStoreProviderRegistry,
@@ -305,8 +343,14 @@ impl FrontendApplicationHost {
         backend: ClusterBackendOpenConfig,
         connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
         data_runtime: Handle,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
-        let data_runtime = FrontendDataRuntime::new(data_runtime);
+        let data_runtime = FrontendDataRuntime::new_with_native_trust(
+            data_runtime,
+            native_trust,
+            native_transport,
+        );
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
@@ -782,12 +826,16 @@ impl FrontendApplicationHost {
     pub fn start_report_server(
         &self,
         bind_addr: std::net::SocketAddr,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
     ) -> Result<crate::native::report_server::FrontendReportServerHandle, FrontendApplicationError>
     {
         crate::native::report_server::FrontendReportServerHandle::start(
             bind_addr,
             self.terminal_ingress(),
             self.lifecycle_convergence_reader(),
+            native_trust,
+            native_transport,
         )
         .map_err(FrontendApplicationError::server)
     }
@@ -796,6 +844,8 @@ impl FrontendApplicationHost {
         &self,
         host: &str,
         port: u16,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
     ) -> Result<crate::native::report_server::FrontendReportServerHandle, FrontendApplicationError>
     {
         crate::native::report_server::FrontendReportServerHandle::start_from_host(
@@ -803,6 +853,8 @@ impl FrontendApplicationHost {
             port,
             self.terminal_ingress(),
             self.lifecycle_convergence_reader(),
+            native_trust,
+            native_transport,
         )
         .map_err(FrontendApplicationError::server)
     }
@@ -1042,7 +1094,7 @@ mod tests {
 
     use super::{
         FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-        FrontendExecutionConfig,
+        FrontendExecutionConfig, FrontendNativeTransport, test_native_trust,
     };
 
     const DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
@@ -1130,6 +1182,8 @@ mod tests {
             backend,
             Vec::new(),
             tokio::runtime::Handle::current(),
+            test_native_trust(),
+            FrontendNativeTransport::plaintext(),
         )
         .await
         .expect("host opens with the catalog controller");

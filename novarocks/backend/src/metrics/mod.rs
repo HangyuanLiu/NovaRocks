@@ -21,4 +21,5 @@ pub(crate) mod query_lifecycle;
 pub(crate) use http::{
     BackendMetricsRegistry, MetricsHttpServer, publish_backend_query_execution_resource,
     publish_backend_query_lifecycle_metrics, publish_backend_query_lifecycle_terminal_limits,
+    record_backend_native_authentication_failure, record_backend_native_tls_handshake_failure,
 };

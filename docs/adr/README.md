@@ -193,6 +193,15 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 
 - ADR-0026 — 为何退役 StarRocks-compatible backend runtime role，并把 StarRocks 限定为外部 Connector（superseded → ADR-0108）
 
+### native-transport-security
+
+领域哲学：Native transport 先证明 caller 属于 deployment，再由 TLS 选择性提供 channel confidentiality、
+integrity 与 server identity。transport proof 不取代 topology、lifecycle、Protocol 或 SQL authorization；
+plaintext 的残余风险必须可见，TLS profile 与证书/endpoint identity 必须是 closed contract，不能以 fallback、
+system default 或 role-local source 偷偷扩张。
+
+- ADR-0110 — Native caller authentication 为何采用 mandatory JWT、authenticated plaintext 默认与 optional TLS（active）
+
 ### backend-architecture
 
 领域哲学：Backend 的目录应表达真实 owner，而不是已退役的协议分类。领域 adapter 紧邻其状态、验证和 execution host；

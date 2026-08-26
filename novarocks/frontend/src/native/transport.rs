@@ -1,14 +1,13 @@
 //! Narrow FE-to-BE native transport adapters.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
 use crate::common::backend_topology::{BeId, HeartbeatOutcome, LiveBackendTarget};
@@ -21,6 +20,11 @@ use crate::query_execution::connector_binding::{
     ConnectorBindingDispatchError, ConnectorBindingRetirementError,
 };
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+use novarocks_native_trust::{
+    AutomaticTlsMaterial, NativeClientAuthInterceptor, NativeEndpointConnector,
+    NativeIncomingAdapter, NativeTlsMaterial,
+};
 use novarocks_proto::connector::{
     encode_connector_execution_binding_key, encode_connector_execution_declaration,
 };
@@ -39,7 +43,7 @@ use novarocks_proto_models::novarocks::{
     QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
     fetch_result_response::Status as FetchStatus,
 };
-use novarocks_types::{UniqueId, format_host_for_url};
+use novarocks_types::{NativeEndpoint, UniqueId};
 
 use super::data_runtime::FrontendDataRuntime;
 use super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
@@ -51,38 +55,85 @@ use super::query_lifecycle::{
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const QUERY_CONTROL_CHANNEL_CAPACITY: usize = 32;
 
+/// Server-materialized transport capability consumed by the Frontend role.
+///
+/// It contains no source configuration or filesystem path.  The Server builds
+/// it before role startup and Frontend uses it for every Native dial and the
+/// report listener's incoming stream.
+#[derive(Clone)]
+pub enum FrontendNativeTransport {
+    Plaintext,
+    Automatic(AutomaticTlsMaterial),
+    Pem(NativeTlsMaterial),
+}
+
+impl FrontendNativeTransport {
+    pub fn plaintext() -> Self {
+        Self::Plaintext
+    }
+
+    pub fn automatic(material: AutomaticTlsMaterial) -> Self {
+        Self::Automatic(material)
+    }
+
+    pub fn pem(material: NativeTlsMaterial) -> Self {
+        Self::Pem(material)
+    }
+
+    pub(crate) fn connector(
+        &self,
+        endpoint: NativeEndpoint,
+    ) -> Result<NativeEndpointConnector, String> {
+        match self {
+            Self::Plaintext => Ok(NativeEndpointConnector::plaintext(endpoint)),
+            Self::Automatic(material) => NativeEndpointConnector::automatic(endpoint, material)
+                .map_err(|error| {
+                    format!("construct automatic Native TLS connector failed: {error}")
+                }),
+            Self::Pem(material) => Ok(NativeEndpointConnector::pem(endpoint, material)),
+        }
+    }
+
+    pub(crate) fn incoming_adapter(&self) -> NativeIncomingAdapter {
+        match self {
+            Self::Plaintext => NativeIncomingAdapter::plaintext(),
+            Self::Automatic(material) => NativeIncomingAdapter::automatic(material),
+            Self::Pem(material) => NativeIncomingAdapter::pem(material),
+        }
+    }
+}
+
+type AuthenticatedNovaRocksGrpcClient =
+    NovaRocksGrpcClient<InterceptedService<Channel, NativeClientAuthInterceptor>>;
+
 #[derive(Clone)]
 struct Client {
-    host: String,
-    port: u16,
+    endpoint: NativeEndpoint,
     data_runtime: FrontendDataRuntime,
 }
 
 impl Client {
-    fn new(addr: SocketAddr, data_runtime: FrontendDataRuntime) -> Result<Self, String> {
-        let client = Self {
-            host: addr.ip().to_string(),
-            port: addr.port(),
+    fn new(endpoint: NativeEndpoint, data_runtime: FrontendDataRuntime) -> Self {
+        Self {
+            endpoint,
             data_runtime,
-        };
-        endpoint(&client.host, client.port)
-            .map_err(|error| format!("invalid BE endpoint {addr}: {error}"))?;
-        Ok(client)
+        }
     }
 
-    async fn grpc(&self) -> Result<NovaRocksGrpcClient<Channel>, String> {
-        Ok(
-            NovaRocksGrpcClient::new(channel(&self.data_runtime, &self.host, self.port).await?)
-                .max_encoding_message_size(MAX_MESSAGE_BYTES)
-                .max_decoding_message_size(MAX_MESSAGE_BYTES),
+    async fn grpc(&self) -> Result<AuthenticatedNovaRocksGrpcClient, String> {
+        Ok(NovaRocksGrpcClient::with_interceptor(
+            channel(&self.data_runtime, self.endpoint.clone()).await?,
+            NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
         )
+        .max_encoding_message_size(MAX_MESSAGE_BYTES)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES))
     }
 
     async fn grpc_deadline(
         &self,
         operation: &str,
         deadline: tokio::time::Instant,
-    ) -> Result<NovaRocksGrpcClient<Channel>, String> {
+    ) -> Result<AuthenticatedNovaRocksGrpcClient, String> {
         tokio::time::timeout_at(deadline, self.grpc())
             .await
             .map_err(|_| format!("{operation} deadline exceeded during channel acquisition"))?
@@ -90,36 +141,38 @@ impl Client {
     }
 }
 
-fn endpoint(host: &str, port: u16) -> Result<tonic::transport::Endpoint, tonic::transport::Error> {
-    format!("http://{}:{port}", format_host_for_url(host)).parse()
-}
-
 async fn channel(
     data_runtime: &FrontendDataRuntime,
-    host: &str,
-    port: u16,
+    endpoint: NativeEndpoint,
 ) -> Result<Channel, String> {
-    let key = format!("{}:{port}", format_host_for_url(host));
-    if let Some(channel) = data_runtime.cached_channel(&key) {
+    if let Some(channel) = data_runtime.cached_channel(&endpoint) {
         return Ok(channel);
     }
-    let created = endpoint(host, port)
-        .map_err(|error| format!("invalid endpoint: {error}"))?
+    // The URI only provides Tonic's HTTP/2 origin. The connector below owns
+    // the actual TCP/TLS dial using the typed endpoint; this never creates a
+    // bare h2c client factory.
+    let origin = format!("http://{endpoint}");
+    let created = tonic::transport::Endpoint::from_shared(origin)
+        .map_err(|error| format!("construct Native client origin failed: {error}"))?
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(10))
         .http2_adaptive_window(true)
         .initial_stream_window_size(Some(32 * 1024 * 1024))
         .initial_connection_window_size(Some(128 * 1024 * 1024))
-        .connect()
+        .connect_with_connector(
+            data_runtime
+                .native_transport()
+                .connector(endpoint.clone())?,
+        )
         .await
-        .map_err(|error| format!("connect exchange endpoint failed: {error}"))?;
-    data_runtime.cache_channel(key, created.clone());
+        .map_err(|error| format!("connect Native endpoint failed: {error}"))?;
+    data_runtime.cache_channel(endpoint, created.clone());
     Ok(created)
 }
 
 pub(crate) fn new_fragment_dispatcher(
-    backends: &[(usize, SocketAddr)],
+    backends: &[(usize, RuntimeEndpoint)],
     data_runtime: FrontendDataRuntime,
 ) -> Result<Arc<dyn FragmentDispatcher>, String> {
     Ok(Arc::new(RemoteDispatcher::new(backends, data_runtime)?))
@@ -127,11 +180,11 @@ pub(crate) fn new_fragment_dispatcher(
 
 struct RemoteDispatcher {
     clients: BTreeMap<usize, Client>,
-    endpoints: BTreeMap<usize, SocketAddr>,
+    endpoints: BTreeMap<usize, RuntimeEndpoint>,
 }
 impl RemoteDispatcher {
     fn new(
-        backends: &[(usize, SocketAddr)],
+        backends: &[(usize, RuntimeEndpoint)],
         data_runtime: FrontendDataRuntime,
     ) -> Result<Self, String> {
         if backends.is_empty() {
@@ -141,12 +194,15 @@ impl RemoteDispatcher {
         let mut endpoints = BTreeMap::new();
         for (id, endpoint) in backends {
             if clients
-                .insert(*id, Client::new(*endpoint, data_runtime.clone())?)
+                .insert(
+                    *id,
+                    Client::new(endpoint.native_endpoint().clone(), data_runtime.clone()),
+                )
                 .is_some()
             {
                 return Err(format!("duplicate backend_idx {id}"));
             }
-            endpoints.insert(*id, *endpoint);
+            endpoints.insert(*id, endpoint.clone());
         }
         Ok(Self { clients, endpoints })
     }
@@ -165,7 +221,7 @@ impl FragmentDispatcher for RemoteDispatcher {
                 self.clients.len()
             )
         })?;
-        let addr = self.endpoints[&backend_idx];
+        let addr = &self.endpoints[&backend_idx];
         let request = FetchResultRequest {
             finst_id: Some(ProtoUniqueId {
                 hi: finst_id.high(),
@@ -212,7 +268,7 @@ impl FragmentDispatcher for RemoteDispatcher {
 }
 
 pub(crate) fn new_connector_binding_dispatcher(
-    backends: &[(usize, SocketAddr)],
+    backends: &[(usize, RuntimeEndpoint)],
     data_runtime: FrontendDataRuntime,
 ) -> Result<Arc<dyn ConnectorBindingDispatcher>, String> {
     Ok(Arc::new(ConnectorBindingControl::new(
@@ -222,11 +278,11 @@ pub(crate) fn new_connector_binding_dispatcher(
 }
 struct ConnectorBindingControl {
     clients: BTreeMap<usize, Client>,
-    endpoints: BTreeMap<usize, SocketAddr>,
+    endpoints: BTreeMap<usize, RuntimeEndpoint>,
 }
 impl ConnectorBindingControl {
     fn new(
-        backends: &[(usize, SocketAddr)],
+        backends: &[(usize, RuntimeEndpoint)],
         data_runtime: FrontendDataRuntime,
     ) -> Result<Self, String> {
         if backends.is_empty() {
@@ -236,16 +292,19 @@ impl ConnectorBindingControl {
         let mut endpoints = BTreeMap::new();
         for (id, endpoint) in backends {
             if clients
-                .insert(*id, Client::new(*endpoint, data_runtime.clone())?)
+                .insert(
+                    *id,
+                    Client::new(endpoint.native_endpoint().clone(), data_runtime.clone()),
+                )
                 .is_some()
             {
                 return Err(format!("duplicate connector binding backend {id}"));
             }
-            endpoints.insert(*id, *endpoint);
+            endpoints.insert(*id, endpoint.clone());
         }
         Ok(Self { clients, endpoints })
     }
-    fn client(&self, backend_idx: usize, endpoint: SocketAddr) -> Result<&Client, String> {
+    fn client(&self, backend_idx: usize, endpoint: RuntimeEndpoint) -> Result<&Client, String> {
         if self.endpoints.get(&backend_idx) != Some(&endpoint) {
             return Err(format!(
                 "connector binding endpoint mismatch for backend {backend_idx}"
@@ -261,11 +320,11 @@ impl ConnectorBindingDispatcher for ConnectorBindingControl {
         &self,
         execution_id: novarocks_proto::lifecycle::QueryExecutionId,
         backend_idx: usize,
-        endpoint: SocketAddr,
+        endpoint: RuntimeEndpoint,
         declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
     ) -> Result<(), ConnectorBindingDispatchError> {
         let client = self
-            .client(backend_idx, endpoint)
+            .client(backend_idx, endpoint.clone())
             .map_err(ConnectorBindingDispatchError::Transport)?;
         let request = EnsureConnectorExecutionBindingRequest {
             execution_id: Some(ProtoQueryExecutionId {
@@ -304,7 +363,7 @@ impl ConnectorBindingDispatcher for ConnectorBindingControl {
     }
     fn retire(
         &self,
-        endpoint: SocketAddr,
+        endpoint: RuntimeEndpoint,
         key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
     ) -> Result<(), ConnectorBindingRetirementError> {
         let client = self.endpoints.iter().find_map(|(id, configured)| (*configured == endpoint).then(|| self.clients.get(id))).flatten().ok_or_else(|| ConnectorBindingRetirementError::Transport(format!("connector retirement endpoint {endpoint} is absent from configured backend snapshot")))?;
@@ -341,11 +400,11 @@ impl ConnectorBindingDispatcher for ConnectorBindingControl {
 pub(crate) fn heartbeat(
     data_runtime: &FrontendDataRuntime,
     be_id: BeId,
-    endpoint: SocketAddr,
+    endpoint: RuntimeEndpoint,
 ) -> HeartbeatOutcome {
     let started = Instant::now();
     let outcome = (|| -> Result<_, String> {
-        let client = Client::new(endpoint, data_runtime.clone())?;
+        let client = Client::new(endpoint.native_endpoint().clone(), data_runtime.clone());
         data_runtime.block_on(async {
             let mut grpc = client.grpc().await?;
             grpc.heartbeat(Request::new(
@@ -398,10 +457,13 @@ pub(crate) fn new_query_lifecycle_transport(
                 (
                     QueryLifecycleTarget::new(
                         backend.backend_idx(),
-                        backend.endpoint(),
+                        backend.endpoint().clone(),
                         backend.start_epoch(),
                     ),
-                    Client::new(backend.endpoint(), data_runtime.clone())?,
+                    Client::new(
+                        backend.endpoint().native_endpoint().clone(),
+                        data_runtime.clone(),
+                    ),
                 ),
             )
             .is_some()
@@ -447,7 +509,7 @@ impl QueryLifecycleTransport for LifecycleTransport {
         request: QueryInitRequest,
         timeout: Duration,
     ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
-        validate_init_target(target, &request)?;
+        validate_init_target(&target, &request)?;
         let identity = request
             .manifest()
             .and_then(|manifest| manifest.execution_id())
@@ -601,7 +663,7 @@ async fn call_unary<T, R, F, Fut>(
 ) -> Result<R, QueryLifecycleTransportError>
 where
     T: Send + 'static,
-    F: FnOnce(NovaRocksGrpcClient<Channel>, Request<T>) -> Fut + Send + 'static,
+    F: FnOnce(AuthenticatedNovaRocksGrpcClient, Request<T>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<tonic::Response<R>, tonic::Status>>,
 {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -634,7 +696,7 @@ fn unary<T, R, F, Fut>(
 where
     T: Send + 'static,
     R: Send + 'static,
-    F: FnOnce(NovaRocksGrpcClient<Channel>, Request<T>) -> Fut + Send + 'static,
+    F: FnOnce(AuthenticatedNovaRocksGrpcClient, Request<T>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<tonic::Response<R>, tonic::Status>>,
 {
     client
@@ -881,7 +943,7 @@ fn validate_control_event(
 }
 
 fn validate_init_target(
-    target: QueryLifecycleTarget,
+    target: &QueryLifecycleTarget,
     request: &QueryInitRequest,
 ) -> Result<(), QueryLifecycleTransportError> {
     let identity = request
@@ -891,13 +953,9 @@ fn validate_init_target(
     let id = usize::try_from(identity.backend_id())
         .map_err(|_| invalid("InitQuery backend id exceeds usize"))?;
     let endpoint = identity.endpoint().map_err(invalid)?;
-    let ip = IpAddr::from_str(endpoint.host()).map_err(|error| {
-        invalid(format!(
-            "InitQuery backend endpoint is not an IP address: {error}"
-        ))
-    })?;
     if id != target.backend_idx()
-        || SocketAddr::new(ip, endpoint.port()) != target.endpoint()
+        || endpoint.host() != target.endpoint().host()
+        || i32::from(endpoint.port()) != target.endpoint().port()
         || identity.start_epoch() != target.start_epoch()
     {
         return Err(invalid(

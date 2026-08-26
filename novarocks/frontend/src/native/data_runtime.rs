@@ -4,8 +4,12 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use novarocks_native_trust::NativeTrust;
+use novarocks_types::NativeEndpoint;
 use tokio::runtime::Handle;
 use tonic::transport::Channel;
+
+use super::transport::FrontendNativeTransport;
 
 /// The Frontend role's explicitly composed Tokio runtime capability.
 ///
@@ -15,15 +19,52 @@ use tonic::transport::Channel;
 #[derive(Clone)]
 pub(crate) struct FrontendDataRuntime {
     handle: Handle,
-    channels: Arc<Mutex<HashMap<String, Channel>>>,
+    native_trust: Arc<NativeTrust>,
+    native_transport: FrontendNativeTransport,
+    channels: Arc<Mutex<HashMap<NativeEndpoint, Channel>>>,
 }
 
 impl FrontendDataRuntime {
-    pub(crate) fn new(handle: Handle) -> Self {
+    pub(crate) fn new_with_native_trust(
+        handle: Handle,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
+    ) -> Self {
         Self {
             handle,
+            native_trust,
+            native_transport,
             channels: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(handle: Handle) -> Self {
+        use novarocks_native_trust::{
+            DeploymentId, NativeCallerSubject, NativeTransportMode, ValidatedSharedSecret,
+        };
+        use novarocks_secret::SecretValue;
+
+        let trust = NativeTrust::new(
+            DeploymentId::parse("frontend-test").expect("fixed test deployment"),
+            ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))
+                .expect("fixed test shared secret"),
+            NativeCallerSubject::parse("fe@127.0.0.1:19040").expect("fixed test caller"),
+            NativeTransportMode::Disabled,
+        );
+        Self::new_with_native_trust(
+            handle,
+            Arc::new(trust),
+            FrontendNativeTransport::plaintext(),
+        )
+    }
+
+    pub(crate) fn native_trust(&self) -> &Arc<NativeTrust> {
+        &self.native_trust
+    }
+
+    pub(crate) fn native_transport(&self) -> &FrontendNativeTransport {
+        &self.native_transport
     }
 
     pub(crate) fn block_on<F>(&self, future: F) -> Result<F::Output, String>
@@ -45,25 +86,49 @@ impl FrontendDataRuntime {
         self.handle.spawn(future)
     }
 
-    pub(crate) fn cached_channel(&self, key: &str) -> Option<Channel> {
+    pub(crate) fn cached_channel(&self, endpoint: &NativeEndpoint) -> Option<Channel> {
         self.channels
             .lock()
             .expect("frontend native channel cache lock")
-            .get(key)
+            .get(endpoint)
             .cloned()
     }
 
-    pub(crate) fn cache_channel(&self, key: String, channel: Channel) {
+    pub(crate) fn cache_channel(&self, endpoint: NativeEndpoint, channel: Channel) {
         self.channels
             .lock()
             .expect("frontend native channel cache lock")
-            .insert(key, channel);
+            .insert(endpoint, channel);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use novarocks_native_trust::{
+        DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
+    };
+    use novarocks_secret::SecretValue;
+    use novarocks_types::NativeEndpoint;
+
     use super::FrontendDataRuntime;
+    use crate::native::transport::FrontendNativeTransport;
+
+    fn data_runtime(handle: tokio::runtime::Handle) -> FrontendDataRuntime {
+        let trust = NativeTrust::new(
+            DeploymentId::parse("frontend-test").expect("deployment"),
+            ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))
+                .expect("secret"),
+            NativeCallerSubject::parse("fe@127.0.0.1:19040").expect("subject"),
+            NativeTransportMode::Disabled,
+        );
+        FrontendDataRuntime::new_with_native_trust(
+            handle,
+            Arc::new(trust),
+            FrontendNativeTransport::plaintext(),
+        )
+    }
 
     #[test]
     fn block_on_runs_outside_a_tokio_context() {
@@ -71,13 +136,13 @@ mod tests {
             .enable_all()
             .build()
             .expect("build runtime");
-        let data_runtime = FrontendDataRuntime::new(runtime.handle().clone());
+        let data_runtime = data_runtime(runtime.handle().clone());
         assert_eq!(data_runtime.block_on(async { 7_u8 }).expect("block_on"), 7);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn block_on_runs_inside_a_tokio_context() {
-        let data_runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+        let data_runtime = data_runtime(tokio::runtime::Handle::current());
         assert_eq!(
             data_runtime.block_on(async { 11_u8 }).expect("block_on"),
             11
@@ -90,14 +155,14 @@ mod tests {
             .enable_all()
             .build()
             .expect("build runtime");
-        let first = FrontendDataRuntime::new(runtime.handle().clone());
-        let channel = runtime.block_on(async {
-            tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy()
-        });
-        first.cache_channel("be-1".to_string(), channel);
-        assert!(first.cached_channel("be-1").is_some());
+        let first = data_runtime(runtime.handle().clone());
+        let (channel, _updates) =
+            runtime.block_on(async { tonic::transport::Channel::balance_channel::<String>(1) });
+        let endpoint = NativeEndpoint::from_host_port("be.example", 19040).expect("endpoint");
+        first.cache_channel(endpoint.clone(), channel);
+        assert!(first.cached_channel(&endpoint).is_some());
 
-        let next_generation = FrontendDataRuntime::new(runtime.handle().clone());
-        assert!(next_generation.cached_channel("be-1").is_none());
+        let next_generation = data_runtime(runtime.handle().clone());
+        assert!(next_generation.cached_channel(&endpoint).is_none());
     }
 }

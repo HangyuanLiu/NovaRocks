@@ -30,6 +30,7 @@ use crate::native::transport::new_query_lifecycle_transport;
 use crate::query_execution::contract::DistributedQueryIntent;
 use crate::query_execution::lifecycle_plan::{QueryInitBarrier, QueryInitPlan};
 use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::lifecycle as protocol_lifecycle;
 use novarocks_proto::lifecycle::{
     AttemptId, FragmentLiveObservation, ParticipantBackendIdentity, ParticipantManifest,
@@ -794,7 +795,7 @@ impl QueryLifecycleTransport for RecordingTransport {
         _timeout: Duration,
     ) -> Result<protocol_lifecycle::QueryInitAck, QueryLifecycleTransportError> {
         let mut state = self.state.lock().expect("recording transport lock");
-        state.init_calls.push((target, request));
+        state.init_calls.push((target.clone(), request));
         let result = state
             .init_results
             .get_mut(&target.backend_idx())
@@ -820,7 +821,7 @@ impl QueryLifecycleTransport for RecordingTransport {
         _timeout: Duration,
     ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
         let mut state = self.state.lock().expect("recording transport lock");
-        state.attach_calls.push((target, attach));
+        state.attach_calls.push((target.clone(), attach));
         state
             .attach_results
             .get_mut(&target.backend_idx())
@@ -840,7 +841,7 @@ impl QueryLifecycleTransport for RecordingTransport {
         _timeout: Duration,
     ) -> Result<protocol_lifecycle::QueryTerminationAck, QueryLifecycleTransportError> {
         let mut state = self.state.lock().expect("recording transport lock");
-        state.abort_calls.push((target, request.clone()));
+        state.abort_calls.push((target.clone(), request.clone()));
         state
             .abort_results
             .get_mut(&target.backend_idx())
@@ -880,8 +881,11 @@ fn protocol_backend_from_live(backend: LiveBackendTarget) -> ParticipantBackendI
     let endpoint = backend.endpoint();
     ParticipantBackendIdentity::new(
         backend.backend_idx() as u64,
-        QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port())
-            .expect("live backend endpoint"),
+        QueryControlEndpoint::new(
+            endpoint.host().to_string(),
+            u16::try_from(endpoint.port()).expect("runtime endpoint port"),
+        )
+        .expect("live backend endpoint"),
         backend.start_epoch(),
     )
     .expect("live backend identity")
@@ -1012,7 +1016,7 @@ fn observation_control(
         .freeze_admitted()
         .expect("fixture admits every ControlReady participant");
     let session = ActiveSession::new(
-        participant.target,
+        participant.target.clone(),
         participant.digest,
         Arc::new(RecordingSession::with_events([])),
     );
@@ -1944,9 +1948,9 @@ fn frontend_query_lifecycle_epoch_mismatch_is_classified_before_init() {
     registry.replace_live_backends(
         1,
         &[
-            LiveBackendTarget::new(0, "127.0.0.1:18000".parse().unwrap(), 90),
-            LiveBackendTarget::new(1, "127.0.0.1:18001".parse().unwrap(), 999),
-            LiveBackendTarget::new(2, "127.0.0.1:18002".parse().unwrap(), 92),
+            LiveBackendTarget::new(0, RuntimeEndpoint::parse("127.0.0.1:18000").unwrap(), 90),
+            LiveBackendTarget::new(1, RuntimeEndpoint::parse("127.0.0.1:18001").unwrap(), 999),
+            LiveBackendTarget::new(2, RuntimeEndpoint::parse("127.0.0.1:18002").unwrap(), 92),
         ],
     );
     let barrier =
@@ -2531,8 +2535,9 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
     let ingress = Arc::new(LiveLifecycleIngress::default());
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
 
-    let backend = LiveBackendTarget::new(7, endpoint, 77);
-    let request = live_init_request(backend, 801);
+    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
+    let backend = LiveBackendTarget::new(7, endpoint.clone(), 77);
+    let request = live_init_request(backend.clone(), 801);
     let execution_id = request
         .manifest()
         .expect("live manifest")
@@ -2543,8 +2548,9 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
     let plan = QueryInitPlan::from_manifests_for_contract_test(execution_id, [(7, live_manifest)])
         .expect("live plan");
     let (registry, _query) = registry_for(&plan);
-    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
-        .expect("production lifecycle transport");
+    let transport =
+        new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
+            .expect("production lifecycle transport");
     let live_config = FrontendQueryLifecycleConfig::new(
         Duration::from_millis(100),
         Duration::from_millis(300),
@@ -2563,7 +2569,7 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
         .expect("Finalize crosses the same control stream");
     let abort_ack = transport
         .abort_query(
-            QueryLifecycleTarget::new(7, endpoint, 77),
+            QueryLifecycleTarget::new(7, endpoint.clone(), 77),
             protocol_abort_for(execution_id, digest, "idempotent cleanup"),
             Duration::from_secs(2),
         )
@@ -2595,19 +2601,21 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
         ..Default::default()
     });
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress).await;
-    let backend = LiveBackendTarget::new(7, endpoint, 88);
+    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
+    let backend = LiveBackendTarget::new(7, endpoint.clone(), 88);
     let target = QueryLifecycleTarget::new(7, endpoint, 88);
-    let request = live_init_request(backend, 802);
+    let request = live_init_request(backend.clone(), 802);
     let execution_id = request
         .manifest()
         .expect("manifest")
         .execution_id()
         .expect("id");
     let digest = request.digest().expect("digest");
-    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
-        .expect("production lifecycle transport");
+    let transport =
+        new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
+            .expect("production lifecycle transport");
     transport
-        .init_query(target, request, Duration::from_secs(2))
+        .init_query(target.clone(), request, Duration::from_secs(2))
         .expect("InitQuery");
     let session = transport
         .attach_control(
@@ -2650,19 +2658,21 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
 async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal_is_observed() {
     let ingress = Arc::new(LiveLifecycleIngress::default());
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
-    let backend = LiveBackendTarget::new(7, endpoint, 89);
+    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
+    let backend = LiveBackendTarget::new(7, endpoint.clone(), 89);
     let target = QueryLifecycleTarget::new(7, endpoint, 89);
-    let request = live_init_request(backend, 803);
+    let request = live_init_request(backend.clone(), 803);
     let execution_id = request
         .manifest()
         .expect("manifest")
         .execution_id()
         .expect("id");
     let digest = request.digest().expect("digest");
-    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
-        .expect("production lifecycle transport");
+    let transport =
+        new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
+            .expect("production lifecycle transport");
     transport
-        .init_query(target, request, Duration::from_secs(2))
+        .init_query(target.clone(), request, Duration::from_secs(2))
         .expect("InitQuery");
     let session = transport
         .attach_control(
@@ -2720,19 +2730,21 @@ async fn frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_c
         ..Default::default()
     });
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
-    let backend = LiveBackendTarget::new(7, endpoint, 90);
+    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
+    let backend = LiveBackendTarget::new(7, endpoint.clone(), 90);
     let target = QueryLifecycleTarget::new(7, endpoint, 90);
-    let request = live_init_request(backend, 804);
+    let request = live_init_request(backend.clone(), 804);
     let execution_id = request
         .manifest()
         .expect("manifest")
         .execution_id()
         .expect("id");
     let digest = request.digest().expect("digest");
-    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
-        .expect("production lifecycle transport");
+    let transport =
+        new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
+            .expect("production lifecycle transport");
     transport
-        .init_query(target, request, Duration::from_secs(2))
+        .init_query(target.clone(), request, Duration::from_secs(2))
         .expect("InitQuery");
     let session = transport
         .attach_control(
@@ -2806,19 +2818,21 @@ async fn frontend_query_lifecycle_live_transport_rejects_mismatched_terminal_ack
         ..Default::default()
     });
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
-    let backend = LiveBackendTarget::new(7, endpoint, 91);
+    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
+    let backend = LiveBackendTarget::new(7, endpoint.clone(), 91);
     let target = QueryLifecycleTarget::new(7, endpoint, 91);
-    let request = live_init_request(backend, 805);
+    let request = live_init_request(backend.clone(), 805);
     let execution_id = request
         .manifest()
         .expect("manifest")
         .execution_id()
         .expect("id");
     let digest = request.digest().expect("digest");
-    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
-        .expect("production lifecycle transport");
+    let transport =
+        new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
+            .expect("production lifecycle transport");
     transport
-        .init_query(target, request, Duration::from_secs(2))
+        .init_query(target.clone(), request, Duration::from_secs(2))
         .expect("InitQuery");
     let session = transport
         .attach_control(
@@ -2857,19 +2871,21 @@ async fn frontend_query_lifecycle_live_transport_accepts_finalized_abort_replay_
         ..Default::default()
     });
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
-    let backend = LiveBackendTarget::new(7, endpoint, 93);
+    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
+    let backend = LiveBackendTarget::new(7, endpoint.clone(), 93);
     let target = QueryLifecycleTarget::new(7, endpoint, 93);
-    let request = live_init_request(backend, 807);
+    let request = live_init_request(backend.clone(), 807);
     let execution_id = request
         .manifest()
         .expect("manifest")
         .execution_id()
         .expect("id");
     let digest = request.digest().expect("digest");
-    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
-        .expect("production lifecycle transport");
+    let transport =
+        new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
+            .expect("production lifecycle transport");
     transport
-        .init_query(target, request, Duration::from_secs(2))
+        .init_query(target.clone(), request, Duration::from_secs(2))
         .expect("InitQuery");
     let session = transport
         .attach_control(
@@ -2922,14 +2938,16 @@ async fn frontend_query_lifecycle_live_transport_accepts_finalized_abort_replay_
 async fn frontend_query_lifecycle_live_transport_pre_submission_timeout_is_definite() {
     let ingress = Arc::new(LiveLifecycleIngress::default());
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress).await;
-    let backend = LiveBackendTarget::new(7, endpoint, 92);
+    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
+    let backend = LiveBackendTarget::new(7, endpoint.clone(), 92);
     let target = QueryLifecycleTarget::new(7, endpoint, 92);
-    let request = live_init_request(backend, 806);
-    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
-        .expect("production lifecycle transport");
+    let request = live_init_request(backend.clone(), 806);
+    let transport =
+        new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
+            .expect("production lifecycle transport");
 
     let error = transport
-        .init_query(target, request, Duration::ZERO)
+        .init_query(target.clone(), request, Duration::ZERO)
         .expect_err("channel acquisition deadline is a definite pre-submission failure");
     assert_eq!(error.kind(), QueryLifecycleTransportErrorKind::Unavailable);
     assert!(!error.is_unknown_init_outcome());
@@ -2942,15 +2960,17 @@ async fn frontend_query_lifecycle_live_transport_pre_submission_timeout_is_defin
 async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unknown() {
     let ingress = Arc::new(LiveLifecycleIngress::default());
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
-    let backend = LiveBackendTarget::new(7, endpoint, 93);
+    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
+    let backend = LiveBackendTarget::new(7, endpoint.clone(), 93);
     let target = QueryLifecycleTarget::new(7, endpoint, 93);
-    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
-        .expect("production lifecycle transport");
+    let transport =
+        new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
+            .expect("production lifecycle transport");
 
     transport
         .init_query(
-            target,
-            live_init_request(backend, 807),
+            target.clone(),
+            live_init_request(backend.clone(), 807),
             Duration::from_secs(2),
         )
         .expect("warm the channel before the delayed request");
@@ -2981,7 +3001,7 @@ fn live_init_request(
     QueryInitRequest::from_manifest(
         ParticipantManifest::new(
             execution_id,
-            protocol_backend_from_live(backend),
+            protocol_backend_from_live(backend.clone()),
             [ParticipantRole::FragmentExecutor],
             [proto_id(UniqueId::new(finst_high, 1))],
             QueryOptions::parse(proto::QueryOptions::default()).expect("fixture query options"),

@@ -25,6 +25,8 @@ application role 或生产拓扑。
 
 - [分布式部署](distributed.md)：将 NovaRocks `fe` 与一个或多个 `be` 拆开运行。
 - [all-in-one 部署](standalone.md)：在一个进程中运行 native FE/BE application host，适合本地验证和功能测试。
+- [Native trust、JWT 与可选 TLS](native-trust.md)：所有 deployable role 的 mandatory
+  Native RPC caller authentication、TLS 1.3 选择、轮换与运维边界。
 
 ## 部署流程
 
@@ -33,9 +35,11 @@ application role 或生产拓扑。
 1. 确认部署模式。
 2. 按部署模式编译 NovaRocks。
 3. 准备 NovaRocks 二进制文件和配置文件。
-4. 规划端口、主机名、对象存储、元数据路径和日志目录。
-5. 启动服务并确认 readiness 输出或管理 SQL 能正常返回。
-6. 运行一条最小查询，确认 SQL 入口、执行节点和存储访问都可用。
+4. 为所有 FE/BE 准备同一 `[native_trust]` deployment id 和 256-bit CSPRNG
+   shared secret；决定 trusted-network h2c 或 TLS 1.3 profile。
+5. 规划端口、主机名、对象存储、元数据路径和日志目录。
+6. 启动服务并确认 readiness 输出或管理 SQL 能正常返回。
+7. 运行一条最小查询，确认 SQL 入口、执行节点和存储访问都可用。
 
 ## 模式选择
 

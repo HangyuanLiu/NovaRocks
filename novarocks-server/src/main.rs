@@ -60,9 +60,13 @@ fn init_process(config: &NovaRocksConfig) -> anyhow::Result<tokio::runtime::Runt
         .map_err(|error| anyhow::anyhow!("build data Tokio runtime: {error}"))
 }
 
-fn run_frontend(config: NovaRocksConfig, runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
-    let frontend =
-        composition::compose_frontend_server_config(&config, None, runtime.handle().clone())?;
+fn run_frontend(role: launch::RoleConfig, runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    let frontend = composition::compose_frontend_server_config(
+        &role.config,
+        &role.native_trust,
+        None,
+        runtime.handle().clone(),
+    )?;
     runtime
         .block_on(novarocks_frontend::run_frontend_server_until_shutdown(
             frontend,
@@ -74,12 +78,21 @@ fn run_frontend(config: NovaRocksConfig, runtime: &tokio::runtime::Runtime) -> a
         .map_err(|error| anyhow::anyhow!("role=fe: {error}"))
 }
 
-fn run_backend(config: NovaRocksConfig, runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
-    let backend = composition::compose_backend_server_config(&config, runtime.handle().clone())?;
+fn run_backend(role: launch::RoleConfig, runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
+    let backend = composition::compose_backend_server_config(
+        &role.config,
+        &role.native_trust,
+        runtime.handle().clone(),
+    )?;
+    let data_runtime = novarocks_backend::BackendDataRuntime::new(
+        runtime.handle().clone(),
+        std::sync::Arc::clone(&backend.native_trust),
+        backend.native_transport.clone(),
+    );
     runtime
         .block_on(novarocks_backend::run_backend_server_until_shutdown(
             backend,
-            novarocks_backend::BackendDataRuntime::new(runtime.handle().clone()),
+            data_runtime,
             async {
                 let _ = tokio::signal::ctrl_c().await;
             },
@@ -96,12 +109,23 @@ async fn wait_for_stop(mut receiver: tokio::sync::watch::Receiver<bool>) {
 }
 
 async fn run_all_in_one(
-    fe: NovaRocksConfig,
-    be: NovaRocksConfig,
+    fe: launch::RoleConfig,
+    be: launch::RoleConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
-    let frontend = composition::compose_frontend_server_config(&fe, None, runtime.clone())?;
-    let backend = composition::compose_backend_server_config(&be, runtime.clone())?;
+    let frontend = composition::compose_frontend_server_config(
+        &fe.config,
+        &fe.native_trust,
+        None,
+        runtime.clone(),
+    )?;
+    let backend =
+        composition::compose_backend_server_config(&be.config, &be.native_trust, runtime.clone())?;
+    let backend_runtime = novarocks_backend::BackendDataRuntime::new(
+        runtime.clone(),
+        std::sync::Arc::clone(&backend.native_trust),
+        backend.native_transport.clone(),
+    );
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let frontend_runtime = runtime.clone();
     let frontend_stop = stop_rx.clone();
@@ -117,7 +141,7 @@ async fn run_all_in_one(
     let backend_run = async move {
         novarocks_backend::run_backend_server_until_shutdown(
             backend,
-            novarocks_backend::BackendDataRuntime::new(runtime),
+            backend_runtime,
             wait_for_stop(stop_rx),
         )
         .await
@@ -139,13 +163,11 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
     };
     let runtime = init_process(process_config)?;
     match resolved {
-        launch::ResolvedServerLaunch::Fe(role) => run_frontend(role.config, &runtime),
-        launch::ResolvedServerLaunch::Be(role) => run_backend(role.config, &runtime),
-        launch::ResolvedServerLaunch::AllInOne { fe, be } => runtime.block_on(run_all_in_one(
-            fe.config,
-            be.config,
-            runtime.handle().clone(),
-        )),
+        launch::ResolvedServerLaunch::Fe(role) => run_frontend(role, &runtime),
+        launch::ResolvedServerLaunch::Be(role) => run_backend(role, &runtime),
+        launch::ResolvedServerLaunch::AllInOne { fe, be } => {
+            runtime.block_on(run_all_in_one(fe, be, runtime.handle().clone()))
+        }
     }
 }
 

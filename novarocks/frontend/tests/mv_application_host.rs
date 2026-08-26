@@ -20,14 +20,28 @@ use novarocks_frontend::mv::domain::repository::MvRepositoryErrorKind;
 use novarocks_frontend::mv::repository::key::definition_by_id_key;
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationErrorKind, FrontendApplicationHost,
-    FrontendExecutionConfig,
+    FrontendExecutionConfig, FrontendNativeTransport,
 };
+use novarocks_native_trust::{
+    DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
+};
+use novarocks_secret::SecretValue;
 use novarocks_spi::state_store::{CommitOutcome, Precondition, TransactionId, Value};
 mod common;
 use common::state_store_fixture;
 use std::time::Duration;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+fn test_native_trust() -> std::sync::Arc<NativeTrust> {
+    std::sync::Arc::new(NativeTrust::new(
+        DeploymentId::parse("frontend-mv-integration-test").expect("deployment"),
+        ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))
+            .expect("secret"),
+        NativeCallerSubject::parse("fe@127.0.0.1:19040").expect("subject"),
+        NativeTransportMode::Disabled,
+    ))
+}
 
 fn state_store_input(temp: &TempDir) -> novarocks_frontend::StateStoreHostInput {
     state_store_fixture::input(format!("frontend-mv-host-{}", temp.path().display()))
@@ -48,6 +62,8 @@ async fn open_host(
         backend_config(),
         Vec::new(),
         tokio::runtime::Handle::current(),
+        test_native_trust(),
+        FrontendNativeTransport::plaintext(),
     )
     .await
 }

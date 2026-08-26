@@ -15,64 +15,75 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::net::SocketAddr;
+use std::{fmt, net::SocketAddr, str::FromStr};
 
-use novarocks_types::UniqueId;
+use novarocks_types::{NativeEndpoint, UniqueId};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RuntimeEndpoint {
-    host: String,
-    port: i32,
+    endpoint: NativeEndpoint,
+}
+
+impl fmt::Display for RuntimeEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.endpoint.fmt(formatter)
+    }
+}
+
+impl FromStr for RuntimeEndpoint {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
 }
 
 impl RuntimeEndpoint {
     pub fn new(host: impl Into<String>, port: i32) -> Result<Self, String> {
         let host = host.into();
-        let host = host.trim().to_string();
-        if host.is_empty() {
-            return Err("native runtime endpoint host must not be empty".to_string());
-        }
         if !(1..=i32::from(u16::MAX)).contains(&port) {
             return Err(format!(
                 "native runtime endpoint port {port} must be in 1..={}",
                 u16::MAX
             ));
         }
-        Ok(Self { host, port })
+        Ok(Self {
+            endpoint: NativeEndpoint::from_host_port(&host, port as u16)?,
+        })
     }
 
     pub fn host(&self) -> &str {
-        &self.host
+        self.endpoint.host()
     }
 
     pub fn retained_host_capacity(&self) -> usize {
-        self.host.capacity()
+        self.endpoint.host_capacity()
     }
 
     pub fn port(&self) -> i32 {
-        self.port
+        i32::from(self.endpoint.port())
     }
 
     pub fn from_socket_addr(addr: SocketAddr) -> Self {
         Self {
-            host: addr.ip().to_string(),
-            port: i32::from(addr.port()),
+            endpoint: NativeEndpoint::from_socket_addr(addr),
         }
     }
 
     /// Parse the neutral execution endpoint value used at role boundaries.
     pub fn parse(src: &str) -> Result<Self, String> {
-        let (host, port) = src
-            .rsplit_once(':')
-            .ok_or_else(|| format!("native runtime endpoint must be host:port, got '{src}'"))?;
-        let port = port
-            .parse::<i32>()
-            .map_err(|e| format!("native runtime endpoint has invalid port '{src}': {e}"))?;
-        Self::new(host, port)
+        let endpoint = src
+            .parse::<NativeEndpoint>()
+            .map_err(|error| format!("native runtime endpoint is invalid: {error}"))?;
+        Ok(Self { endpoint })
     }
 
     pub fn as_host_port(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        self.endpoint.as_host_port()
+    }
+
+    pub fn native_endpoint(&self) -> &NativeEndpoint {
+        &self.endpoint
     }
 }
 
@@ -125,7 +136,7 @@ mod tests {
 
     #[test]
     fn parses_host_port_endpoint() {
-        let endpoint = RuntimeEndpoint::parse("be-1.internal:8060").expect("endpoint");
+        let endpoint = RuntimeEndpoint::parse("BE-1.Internal:8060").expect("endpoint");
 
         assert_eq!(endpoint.host(), "be-1.internal");
         assert_eq!(endpoint.port(), 8060);
@@ -143,7 +154,7 @@ mod tests {
     fn rejects_empty_host() {
         let err = RuntimeEndpoint::parse(":8060").expect_err("empty host");
 
-        assert!(err.contains("host must not be empty"), "{err}");
+        assert!(err.contains("reference host"), "{err}");
     }
 
     #[test]
@@ -171,13 +182,13 @@ mod tests {
     fn rejects_negative_port() {
         let err = RuntimeEndpoint::parse("be-1.internal:-1").expect_err("negative port");
 
-        assert!(err.contains("must be in 1..=65535"), "{err}");
+        assert!(err.contains("invalid port"), "{err}");
     }
 
     #[test]
     fn rejects_invalid_port() {
         let err = RuntimeEndpoint::parse("be-1.internal:70000").expect_err("invalid port");
 
-        assert!(err.contains("must be in 1..=65535"), "{err}");
+        assert!(err.contains("invalid port"), "{err}");
     }
 }
