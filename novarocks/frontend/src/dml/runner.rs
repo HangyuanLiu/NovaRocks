@@ -302,3 +302,167 @@ fn with_terminal(mut error: DmlError, attempt: &DmlPublicationAttempt) -> DmlErr
     }
     error
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use bytes::Bytes;
+    use novarocks_spi::connector::{
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
+        ConnectorProviderId, ExternalMutationEffect, ExternalMutationFinalization,
+        LakePublicationDisposition,
+    };
+
+    use super::*;
+
+    enum Adjudication {
+        Committed,
+        Unproven,
+    }
+
+    struct UnknownCommitExecutor {
+        adjudication: Adjudication,
+        commits: AtomicUsize,
+        adjudications: AtomicUsize,
+        finalizations: AtomicUsize,
+    }
+
+    impl UnknownCommitExecutor {
+        fn evidence() -> ExternalMutationEvidence {
+            ExternalMutationEvidence::try_new(
+                1,
+                ConnectorInstanceDescriptor {
+                    provider_id: ConnectorProviderId::parse("iceberg-test").expect("provider"),
+                    instance_id: ConnectorInstanceId::parse("iceberg-test").expect("instance"),
+                },
+                ConnectorInstanceIncarnation::default(),
+                ConnectorMutationOperationId::from_bytes([9; 16]),
+                "write",
+                Bytes::from_static(b"exact-same-session-evidence"),
+            )
+            .expect("evidence")
+        }
+
+        fn receipt() -> ConnectorWriteReceipt {
+            ConnectorWriteReceipt::try_new(Bytes::from_static(b"receipt")).expect("receipt")
+        }
+    }
+
+    impl WriteExecutor for UnknownCommitExecutor {
+        type CommitHandle = ();
+        type AbortHandle = Infallible;
+
+        fn run_coordinated_write(
+            &self,
+            _spec: &WriteTransactionSpec,
+        ) -> Result<CoordinatedWriteReport<()>, DmlError> {
+            Ok(CoordinatedWriteReport::CommitRequired(()))
+        }
+
+        fn abort(
+            &self,
+            _spec: &WriteTransactionSpec,
+            handle: &Self::AbortHandle,
+        ) -> Result<ConnectorWriteAbortOutcome, String> {
+            match *handle {}
+        }
+
+        fn commit(
+            &self,
+            _spec: &WriteTransactionSpec,
+            _handle: &Self::CommitHandle,
+        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "commit response lost",
+                ),
+                evidence: Self::evidence(),
+            })
+        }
+
+        fn adjudicate_publication(
+            &self,
+            _spec: &WriteTransactionSpec,
+            _handle: &Self::CommitHandle,
+            _evidence: ExternalMutationEvidence,
+        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+            self.adjudications.fetch_add(1, Ordering::SeqCst);
+            match self.adjudication {
+                Adjudication::Committed => Ok(ExternalMutationOutcome::KnownCommitted {
+                    effect: ExternalMutationEffect::Applied,
+                    receipt: Self::receipt(),
+                    finalization: ExternalMutationFinalization::Complete,
+                }),
+                Adjudication::Unproven => Ok(ExternalMutationOutcome::KnownUncommitted {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::NotFound,
+                        "exact marker is absent",
+                    ),
+                }),
+            }
+        }
+
+        fn finalize(&self, _spec: &WriteTransactionSpec) -> Result<(), String> {
+            self.finalizations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn spec() -> WriteTransactionSpec {
+        WriteTransactionSpec {
+            publication_id: LakePublicationId::new_v7(),
+            target: WriteTarget {
+                catalog: "ice".to_string(),
+                namespace: "db".to_string(),
+                table: "orders".to_string(),
+                reference: None,
+            },
+        }
+    }
+
+    #[test]
+    fn exact_positive_adjudication_commits_once() {
+        let executor = UnknownCommitExecutor {
+            adjudication: Adjudication::Committed,
+            commits: AtomicUsize::new(0),
+            adjudications: AtomicUsize::new(0),
+            finalizations: AtomicUsize::new(0),
+        };
+
+        let outcome = StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
+            .run(spec())
+            .expect("exact positive adjudication commits");
+        assert!(outcome.committed_receipt.is_some());
+        assert_eq!(executor.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.adjudications.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.finalizations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn negative_adjudication_stays_unknown_without_finalization_or_retry() {
+        let executor = UnknownCommitExecutor {
+            adjudication: Adjudication::Unproven,
+            commits: AtomicUsize::new(0),
+            adjudications: AtomicUsize::new(0),
+            finalizations: AtomicUsize::new(0),
+        };
+
+        let error = StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
+            .run(spec())
+            .expect_err("negative adjudication remains unknown");
+        assert_eq!(
+            error
+                .publication_terminal()
+                .expect("terminal")
+                .disposition(),
+            LakePublicationDisposition::CommitUnknown
+        );
+        assert_eq!(executor.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.adjudications.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.finalizations.load(Ordering::SeqCst), 0);
+    }
+}
