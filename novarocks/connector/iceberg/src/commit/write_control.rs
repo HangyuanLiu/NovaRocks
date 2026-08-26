@@ -3140,6 +3140,7 @@ fn iceberg_uuid_from_object_id(object_id: &ConnectorTableObjectId) -> Result<Str
     Ok(uuid.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn operation_marker_partitioning(
     snapshot: &crate::iceberg::spec::Snapshot,
     metadata: &crate::iceberg::spec::TableMetadata,
@@ -4539,7 +4540,7 @@ mod tests {
     fn operation_marker_accepts_materialized_view_refresh_family() {
         let (_executor, control) = control();
         let owner = control.binding_key().clone();
-        let operation_id = ConnectorWriteOperationId::from_bytes([32; 16]);
+        let operation_id = ConnectorWriteOperationId::new();
         let mut request = activation_request(&owner, operation_id, 1);
         request.intent = ConnectorWriteActivationIntent::Publication(
             LakePublicationFamily::MaterializedViewRefresh,
@@ -4554,7 +4555,9 @@ mod tests {
             };
             active.clone()
         };
-        let marker = control.operation_marker(operation_id, &active, [4; 32], [5; 32]);
+        let marker = control
+            .operation_marker(operation_id, &active, [4; 32], [5; 32])
+            .expect("operation marker");
         let snapshot =
             snapshot_with_operation_marker(9, serde_json::to_string(&marker).expect("marker JSON"));
 
