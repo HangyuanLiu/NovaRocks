@@ -1397,7 +1397,10 @@ impl IcebergWriteControl {
         // known_uncommitted, as this once did, hands the caller a definite
         // "nothing was published" without proof, and that verdict authorizes
         // abort cleanup of files a committed snapshot may already reference.
-        let bridge_evidence = super::service::RecoveryEvidence::from_collector(&input.collector);
+        // Hold the collector, not a snapshot of it: the manifest cleanup token
+        // is minted inside the commit, so evidence built before the call would
+        // record `None` where the ordinary unknown path records the real token.
+        let bridge_collector = Arc::clone(&input.collector);
         let result = self
             .runtime
             .resources()
@@ -1406,7 +1409,7 @@ impl IcebergWriteControl {
             .map_err(|error| {
                 CommitServiceError::unknown(
                     format!("Iceberg commit runtime bridge: {error}"),
-                    bridge_evidence,
+                    super::service::RecoveryEvidence::from_collector(&bridge_collector),
                 )
             })??;
         let resulting_row_count = if matches!(

@@ -579,14 +579,14 @@ mod tests {
             creation.binding().staged_create().is_some(),
             "every Iceberg generation installs the staged-create adapter"
         );
-        // But the unanchored sweeper stays absent, and that ordering is
-        // load-bearing: the frontend derives this lease and sweeps during
-        // preflight, ahead of the prepare that reports the refusal. Attaching a
-        // sweeper to a catalog that cannot CTAS would delete objects before the
-        // statement was ever told it could not run.
+        // The sweeper attaches too, and deliberately does not ask whether this
+        // catalog can CTAS. One that cannot has never staged anything
+        // unanchored, so the sweep finds nothing; gating it here would replace
+        // the catalog's own explanation of why CTAS is impossible with a
+        // generic "no cleanup capability" from the lease derivation.
         assert!(
-            creation.binding().unanchored_ctas_cleanup().is_none(),
-            "a catalog that cannot CTAS stages nothing, so it sweeps nothing"
+            creation.binding().unanchored_ctas_cleanup().is_some(),
+            "the sweeper attaches wherever its warehouse is usable"
         );
         let recovery = creation
             .binding()

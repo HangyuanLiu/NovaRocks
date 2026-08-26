@@ -51,24 +51,19 @@ pub(crate) struct IcebergUnanchoredCtasCleanupAdapter {
 }
 
 impl IcebergUnanchoredCtasCleanupAdapter {
+    /// Attach a sweeper for this generation's unanchored CTAS staging root.
+    ///
+    /// This deliberately does not ask whether the catalog can run a CTAS. A
+    /// catalog that cannot has never staged anything unanchored, so the sweep
+    /// finds nothing and deletes nothing -- and gating here would replace the
+    /// catalog's own explanation of why CTAS is impossible with a generic
+    /// "no cleanup capability" from the lease derivation. The refusal belongs
+    /// where the reason is known.
     pub(crate) fn try_new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ConnectorInstanceIncarnation,
         runtime: Arc<IcebergMetadataContext>,
     ) -> Result<Self, ConnectorError> {
-        // A catalog that cannot publish a CTAS target atomically never stages
-        // anything unanchored, so there is nothing here to collect. Refusing at
-        // construction matters for ordering, not just tidiness: the frontend
-        // derives this lease and sweeps during preflight, ahead of the
-        // staged-create prepare that would report the refusal. Attaching a
-        // sweeper to a catalog that cannot CTAS would delete objects before the
-        // statement was told it could not run.
-        if let Err(reason) = runtime
-            .novarocks_catalog()
-            .admit_create(crate::catalog::CatalogCreateIntent::CreateTableAsSelect)
-        {
-            return Err(unsupported(reason.message().to_string()));
-        }
         let warehouse = runtime.control_state().configuration().warehouse_uri.trim();
         if warehouse.is_empty() {
             return Err(unsupported(
