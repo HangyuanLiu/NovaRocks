@@ -3154,6 +3154,7 @@ fn iceberg_uuid_from_object_id(object_id: &ConnectorTableObjectId) -> Result<Str
     Ok(uuid.to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn operation_marker_partitioning(
     snapshot: &crate::iceberg::spec::Snapshot,
     metadata: &crate::iceberg::spec::TableMetadata,

@@ -899,6 +899,7 @@ run_sql_suites() {
     ci_run_logged "$log_path" \
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \
+      NOVAROCKS_WORKSPACE_ROOT="$REPO_ROOT" \
       cargo run --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \

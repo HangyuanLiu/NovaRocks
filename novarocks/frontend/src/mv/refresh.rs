@@ -278,11 +278,13 @@ fn execute_data(
     let committed = dependencies
         .provider_activation
         .validate_write_commit(intent, &receipt)?;
+    wait_for_mv_recovery_phase(MvRecoveryPhase::WriteCommitted)?;
     let publication_version = if committed.intent().partition_spec_replacement().is_some() {
         committed.committed_version().clone()
     } else {
         publish_data_staging_branch(planning, &attempt, &finalize, &committed, context.clone())?
     };
+    wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)?;
     let snapshot = publication_version.snapshot_id().ok_or_else(|| {
         MvApplicationError::new(
             MvApplicationErrorKind::KnownCommittedFinalizeFailed,
@@ -479,6 +481,7 @@ fn execute_metadata_only(
         .committed_version()
         .cloned()
         .ok_or_else(|| invalid("metadata-only MV staging committed without a version"))?;
+    wait_for_mv_recovery_phase(MvRecoveryPhase::WriteCommitted)?;
     let published = require_catalog_commit(
         crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
             &mutation,
@@ -498,6 +501,7 @@ fn execute_metadata_only(
         ),
         "publish metadata-only MV snapshot",
     )?;
+    wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)?;
     let snapshot = published
         .receipt
         .committed_version()
@@ -512,6 +516,68 @@ fn execute_metadata_only(
         .project_observed(*attempt.publication_id.as_uuid(), &package)
         .map_err(repository_error)?;
     Ok(MvStatementResult::Ok)
+}
+
+/// Debug-only runner seam for the two durable MV recovery windows that are
+/// observable around the publication fence. Production builds never block on
+/// this filesystem trigger, and debug deployments do so only when the runner
+/// has supplied the exact fault root and trigger file.
+#[derive(Clone, Copy)]
+enum MvRecoveryPhase {
+    WriteCommitted,
+    PublicationCommitted,
+}
+
+#[cfg(debug_assertions)]
+impl MvRecoveryPhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::WriteCommitted => "write-committed",
+            Self::PublicationCommitted => "publication-committed",
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_mv_recovery_phase(phase: MvRecoveryPhase) -> Result<(), MvApplicationError> {
+    let Some(root) = novarocks_failpoint::configured_root() else {
+        return Ok(());
+    };
+    let phase = phase.as_str();
+    let trigger = root.join(format!("mv-refresh-at-{phase}.trigger"));
+    let contents = match std::fs::read_to_string(&trigger) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(unavailable(format!(
+                "read runner-owned MV recovery trigger {}: {error}",
+                trigger.display()
+            )));
+        }
+    };
+    let mut fields = contents.lines().filter_map(|line| line.split_once('='));
+    let Some(("token", token)) = fields.next() else {
+        return Err(invalid("MV recovery trigger has no token"));
+    };
+    if token.is_empty() || fields.next().is_some() {
+        return Err(invalid("MV recovery trigger has invalid contents"));
+    }
+    eprintln!("NOVAROCKS_MV_RECOVERY_PHASE phase={phase} token={token}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while trigger.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if trigger.exists() {
+        return Err(unavailable(format!(
+            "timed out waiting for runner-owned MV recovery barrier at phase {phase}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn wait_for_mv_recovery_phase(_phase: MvRecoveryPhase) -> Result<(), MvApplicationError> {
+    Ok(())
 }
 
 /// Debug-only runner seam: the lake publication is known committed and its
