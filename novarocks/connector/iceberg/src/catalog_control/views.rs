@@ -23,7 +23,6 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::naming::normalize_identifier;
 
-use crate::catalog_config::IcebergCatalogKind;
 use crate::iceberg::spec::{
     Schema, SqlViewRepresentation, ViewMetadata, ViewRepresentation, ViewRepresentations,
     ViewVersion,

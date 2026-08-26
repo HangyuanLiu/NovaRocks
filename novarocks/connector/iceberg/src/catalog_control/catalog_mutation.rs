@@ -744,13 +744,12 @@ fn drop_table(
             let (receipt, effect, witness) = committed
                 .into_known_committed()
                 .expect("the remaining arm is the committed one");
-            if data_disposition == ConnectorDropTableDataDisposition::Purge {
-                if let Some(request) =
+            if data_disposition == ConnectorDropTableDataDisposition::Purge
+                && let Some(request) =
                     crate::catalog_control::drop_cleanup::PostCommitCleanupRequest::
                         from_committed_drop(canonical, &receipt, &witness)
-                {
-                    runtime.drop_cleanup().enqueue(request);
-                }
+            {
+                runtime.drop_cleanup().enqueue(request);
             }
             Ok(effect)
         }
