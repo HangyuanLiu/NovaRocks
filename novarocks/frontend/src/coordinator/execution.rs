@@ -1978,7 +1978,10 @@ mod tests {
             outcome: QueryInitOutcome,
         ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
             let execution_id = Self::execution_id(request)?;
-            let digest = request.digest().map_err(super::protocol_contract_error)?;
+            let digest = request
+                .manifest()
+                .and_then(|manifest| manifest.digest())
+                .map_err(super::protocol_contract_error)?;
             QueryInitAck::parse(protocol::InitQueryResponse {
                 execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
                     execution_id,
