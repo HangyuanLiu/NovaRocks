@@ -2370,10 +2370,7 @@ mod tests {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(
-            None,
-            Arc::new(crate::statistics::FrontendStatisticsService::new()),
-        );
+        let dml = DmlService::new(Arc::new(crate::statistics::FrontendStatisticsService::new()));
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(41, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -2389,9 +2386,8 @@ mod tests {
             &context,
             default_query_options(),
         )
-        .expect_err("Iceberg INSERT without StateStore must fail in DML");
-
-        assert!(error.to_string().contains("state store is required"));
+        .expect_err("recording engine rejects the routed INSERT");
+        assert!(!error.contains("state store is required"));
         assert_eq!(engine.resolve_contexts.lock().unwrap().len(), 1);
         assert_eq!(command.calls.load(Ordering::SeqCst), 0);
     }
@@ -2401,10 +2397,7 @@ mod tests {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(
-            None,
-            Arc::new(crate::statistics::FrontendStatisticsService::new()),
-        );
+        let dml = DmlService::new(Arc::new(crate::statistics::FrontendStatisticsService::new()));
         let cancellation = QueryCancellationSource::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         let context = router_test_context(73, deadline, &cancellation);
@@ -2420,8 +2413,8 @@ mod tests {
             &context,
             default_query_options(),
         )
-        .expect_err("Iceberg INSERT without StateStore must fail in DML");
-        assert!(error.to_string().contains("state store is required"));
+        .expect_err("recording engine rejects the routed INSERT");
+        assert!(!error.contains("state store is required"));
 
         let resolve = engine.resolve_contexts.lock().unwrap();
         assert_eq!(resolve[0].topology().revision(), 73);
@@ -2437,14 +2430,12 @@ mod tests {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::new(Arc::new(
-            crate::dml::journal::testing::InMemoryOperationJournal::default(),
-        ));
+        let dml = DmlService::new(Arc::new(crate::statistics::FrontendStatisticsService::new()));
         let cancellation = QueryCancellationSource::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         let context = router_test_context(88, deadline, &cancellation);
 
-        execute_frontend_command(
+        let error = execute_frontend_command(
             &dml,
             &engine,
             &delete_engine,
@@ -2455,12 +2446,8 @@ mod tests {
             &context,
             default_query_options(),
         )
-        // The statement is routed to the frontend DELETE owner and never falls
-        // through to the core command. It then fails closed inside the DML
-        // runner: CP-3B forbids dispatching a writer before an external
-        // operation fence is established, and this focused-test service has no
-        // coordination authority to mint one from.
-        .expect_err("an unfenced DELETE must not dispatch");
+        .expect_err("recording engine rejects the routed DELETE");
+        assert!(!error.contains("coordination"));
 
         let executions = delete_engine.executions.lock().unwrap();
         assert_eq!(executions.len(), 1);
@@ -2474,10 +2461,7 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(
-            None,
-            Arc::new(crate::statistics::FrontendStatisticsService::new()),
-        );
+        let dml = DmlService::new(Arc::new(crate::statistics::FrontendStatisticsService::new()));
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(92, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -2508,10 +2492,7 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::compose(
-            None,
-            Arc::new(crate::statistics::FrontendStatisticsService::new()),
-        );
+        let dml = DmlService::new(Arc::new(crate::statistics::FrontendStatisticsService::new()));
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(93, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -2538,9 +2519,7 @@ mod tests {
         let delete = RecordingDeleteEngine::default();
         let mutation = RejectingMutationEngine;
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::new(Arc::new(
-            crate::dml::journal::testing::InMemoryOperationJournal::default(),
-        ));
+        let dml = DmlService::new(Arc::new(crate::statistics::FrontendStatisticsService::new()));
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(95, Instant::now() + Duration::from_secs(30), &cancellation);

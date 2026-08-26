@@ -17,7 +17,6 @@
 
 //! Frontend-owned DELETE statement recognition and application routing.
 
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -30,8 +29,10 @@ use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::LakePublicationId;
 
 use crate::dml::error::{AdmitError, DmlError};
-use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
-use crate::dml::runner::{CoordinatedWriteReport, StatementWriteTransactionRunner, WriteExecutor};
+use crate::dml::runner::{
+    CoordinatedWriteReport, StatementWriteTransactionRunner, WriteExecutor, WriteTarget,
+    WriteTransactionSpec,
+};
 use crate::dml::service::DmlService;
 use novarocks_spi::connector::LakePublicationFamily;
 
@@ -123,17 +124,12 @@ fn write_transaction_spec(prepared: &PreparedDelete) -> WriteTransactionSpec {
     let operation = &prepared.operation;
     WriteTransactionSpec {
         publication_id: operation.publication_id,
-        target: OperationTarget {
+        target: WriteTarget {
             catalog: operation.catalog.clone(),
             namespace: operation.namespace.clone(),
             table: operation.table.clone(),
-            ref_name: (operation.target_ref != "main").then(|| operation.target_ref.clone()),
+            reference: (operation.target_ref != "main").then(|| operation.target_ref.clone()),
         },
-        operation_kind: OperationKind::RowDelta,
-        operation_subkind: None,
-        attempt_id: operation.attempt_id.clone(),
-        base_snapshot_id: operation.base_snapshot_id,
-        base_snapshot_map: BTreeMap::new(),
     }
 }
 
@@ -180,18 +176,8 @@ impl DmlService {
             prepared: &prepared,
         };
         let spec = write_transaction_spec(&prepared);
-        let target = spec.target.clone();
         StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::DataMutation)
-            .run(spec)
-            .map_err(|error| {
-                error.with_publication_context(
-                    LakePublicationFamily::DataMutation,
-                    target.catalog,
-                    target.namespace,
-                    target.table,
-                    target.ref_name,
-                )
-            })?;
+            .run(spec)?;
         Ok(())
     }
 }

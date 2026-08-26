@@ -175,19 +175,9 @@ impl DmlService {
             .map_err(DmlError::executor)?;
         let spec = write_transaction_spec(&prepared);
         let executor = IcebergInsertWriteExecutor::new(engine, &prepared);
-        let target = spec.target.clone();
         StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
             .run(spec)
             .map(|_| ())
-            .map_err(|error| {
-                error.with_publication_context(
-                    LakePublicationFamily::Write,
-                    target.catalog,
-                    target.namespace,
-                    target.table,
-                    target.ref_name,
-                )
-            })
     }
 }
 

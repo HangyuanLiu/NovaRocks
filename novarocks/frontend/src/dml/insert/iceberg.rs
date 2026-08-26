@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -23,8 +22,9 @@ use crate::query_execution::dml::insert::{
     IcebergInsertCommit, IcebergWriteReport, InsertEngine, PreparedIcebergInsert,
 };
 
-use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
-use crate::dml::runner::{CoordinatedWriteReport, WriteExecutor};
+use crate::dml::runner::{
+    CoordinatedWriteReport, WriteExecutor, WriteTarget, WriteTransactionSpec,
+};
 
 pub(super) struct IcebergInsertWriteExecutor<'a> {
     engine: &'a dyn InsertEngine,
@@ -124,20 +124,11 @@ pub(super) fn write_transaction_spec(prepared: &PreparedIcebergInsert) -> WriteT
     let operation = &prepared.operation;
     WriteTransactionSpec {
         publication_id: operation.publication_id,
-        target: OperationTarget {
+        target: WriteTarget {
             catalog: operation.catalog.clone(),
             namespace: operation.namespace.clone(),
             table: operation.table.clone(),
-            ref_name: (operation.target_ref != "main").then(|| operation.target_ref.clone()),
+            reference: (operation.target_ref != "main").then(|| operation.target_ref.clone()),
         },
-        operation_kind: if operation.is_overwrite {
-            OperationKind::InsertOverwrite
-        } else {
-            OperationKind::InsertAppend
-        },
-        operation_subkind: None,
-        attempt_id: operation.attempt_id.clone(),
-        base_snapshot_id: operation.base_snapshot_id,
-        base_snapshot_map: BTreeMap::new(),
     }
 }
