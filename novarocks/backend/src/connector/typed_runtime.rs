@@ -46,10 +46,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::connector::runtime::ConnectorBatchTransform;
 use crate::runtime_filter::typed_dynamic_filter::scan_dynamic_filter;
 use novarocks_execution::connector::{
     ConnectorPageAdapter, PageConversion, SplitPoll, SplitQueue, TaskAttemptSplitQueues,
 };
+use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
 use novarocks_execution::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
 use novarocks_execution::exec::node::scan::{
     BoundScanRanges, IncrementalScanRange, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp,
@@ -60,7 +62,7 @@ use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_execution::runtime_filter::{RuntimeFilterConsumerContract, RuntimeFilterSessionRef};
 use novarocks_proto::connector_read::{
     ConnectorTableScanSource, ScheduledSplit, TypedConnectorPageSourceProvider,
-    ValidatedColumnHandle, WireDynamicFilter,
+    TypedConnectorSystemTableProvider, ValidatedColumnHandle, WireDynamicFilter,
 };
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_spi::connector::read_stack::{CompleteAllDynamicFilter, ConnectorSession};
@@ -120,12 +122,39 @@ struct TypedConnectorScanShared {
     /// them: checked before every open and on every driver turn.
     request: ConnectorRequestContext,
     plan_node_id: i32,
-    /// Ordered output slot ids. `slot_ids[i]` names page channel `i`.
+    /// Ordered read slot ids. `slot_ids[i]` names page channel `i`. These are
+    /// the columns the connector itself produces, which is not necessarily the
+    /// node's whole output.
     slot_ids: Vec<SlotId>,
     dynamic_filter: Arc<WireDynamicFilter>,
+    /// Builds the columns the connector does not read, and the output schema
+    /// the result must have.
+    ///
+    /// Absent when the node's output is exactly what the connector reads,
+    /// which is every scan that projects no derived column.
+    output_materialization: Option<OutputMaterialization>,
+}
+
+/// How one scan turns the connector's read columns into the node's output.
+struct OutputMaterialization {
+    transform: Arc<dyn ConnectorBatchTransform>,
+    chunk_schema: ChunkSchemaRef,
 }
 
 impl TypedConnectorScanShared {
+    /// Turn one read chunk into the node's output chunk.
+    ///
+    /// Without a materialization the connector already read the whole output,
+    /// so the chunk passes through untouched and no schema is rebuilt.
+    fn materialize_output(&self, chunk: Chunk) -> Result<Chunk, String> {
+        let Some(materialization) = self.output_materialization.as_ref() else {
+            return Ok(chunk);
+        };
+        let batch = materialization.transform.transform(chunk.batch)?;
+        Chunk::try_new_with_chunk_schema(batch, Arc::clone(&materialization.chunk_schema))
+            .map_err(|error| error.to_string())
+    }
+
     /// Fail fast on a cancelled or expired attempt, before any provider call.
     fn check_liveness(&self, action: &str) -> Result<(), String> {
         if self.request.cancellation().is_cancelled() {
@@ -169,9 +198,29 @@ impl TypedConnectorScanSource {
                 plan_node_id,
                 slot_ids,
                 dynamic_filter,
+                output_materialization: None,
             }),
             queues,
         }
+    }
+
+    /// Build the node's output columns from what the connector read.
+    ///
+    /// A scan whose output carries derived columns — VARIANT path columns are
+    /// the case that exists — reads only the physical ones and materializes
+    /// the rest here, so exactly one place produces the node's output schema.
+    pub fn with_output_materialization(
+        mut self,
+        transform: Arc<dyn ConnectorBatchTransform>,
+        chunk_schema: ChunkSchemaRef,
+    ) -> Self {
+        let shared = Arc::get_mut(&mut self.shared)
+            .expect("typed connector scan source is not shared before it is bound");
+        shared.output_materialization = Some(OutputMaterialization {
+            transform,
+            chunk_schema,
+        });
+        self
     }
 
     /// The single seam for a live, backend-driven dynamic filter.
@@ -204,6 +253,12 @@ impl TypedConnectorScanSource {
                 plan_node_id: self.shared.plan_node_id,
                 slot_ids: self.shared.slot_ids.clone(),
                 dynamic_filter,
+                output_materialization: self.shared.output_materialization.as_ref().map(
+                    |materialization| OutputMaterialization {
+                        transform: Arc::clone(&materialization.transform),
+                        chunk_schema: Arc::clone(&materialization.chunk_schema),
+                    },
+                ),
             }),
             queues: Arc::clone(&self.queues),
         }
@@ -447,7 +502,12 @@ impl Iterator for TypedConnectorSplitIter {
             if let Some(source) = self.current.as_ref() {
                 match source.pull() {
                     Err(error) => return Some(self.fail(error)),
-                    Ok(PageConversion::Chunk(chunk)) => return Some(Ok(chunk)),
+                    Ok(PageConversion::Chunk(chunk)) => {
+                        return Some(match self.shared.materialize_output(chunk) {
+                            Ok(chunk) => Ok(chunk),
+                            Err(error) => self.fail(error),
+                        });
+                    }
                     Ok(PageConversion::Idle) => {
                         // Nothing right now, which is not end of stream. Only a
                         // source that says it is waiting earns a sleep.
@@ -1213,6 +1273,112 @@ mod tests {
         assert!(rows.is_empty());
     }
 
+    /// A system relation resolved to one backend has no split at all, so its
+    /// scan must do its whole job in one morsel. A source that waited on a
+    /// split queue here would park forever.
+    struct ScriptedSystemTables {
+        script: Mutex<Vec<Option<SourcePage>>>,
+        opens: Arc<AtomicUsize>,
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl TypedConnectorSystemTableProvider for ScriptedSystemTables {
+        fn create_system_page_source(
+            &self,
+            _session: &ConnectorSession,
+            _table: &CatalogTableHandle,
+            _columns: &[ScanAssignment],
+        ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+            self.opens.fetch_add(1, Ordering::AcqRel);
+            let pages = std::mem::take(&mut *self.script.lock().expect("script lock"));
+            Ok(Box::new(ScriptedPageSource {
+                pages,
+                cursor: 0,
+                finished: false,
+                closes: Arc::clone(&self.closes),
+            }))
+        }
+    }
+
+    fn system_table_source(
+        provider: Arc<ScriptedSystemTables>,
+    ) -> TypedConnectorSystemTableScanSource {
+        TypedConnectorSystemTableScanSource::new(
+            scan_source(),
+            provider,
+            session(),
+            request(Arc::new(NeverCancelled)),
+            vec![SlotId::new(1)],
+        )
+    }
+
+    #[test]
+    fn a_system_relation_scan_reads_its_metadata_file_without_any_split() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(ScriptedSystemTables {
+            script: Mutex::new(vec![Some(int_page(vec![7, 8]))]),
+            opens: Arc::clone(&opens),
+            closes: Arc::clone(&closes),
+        });
+        let source = system_table_source(provider);
+        let op = source
+            .bind(BoundScanRanges::None)
+            .expect("a system relation binds with no range");
+
+        // One unit of work, known before execution: nothing can add more.
+        let morsels = op.build_morsels().expect("build morsels");
+        assert_eq!(morsels.morsels.len(), 1);
+        assert!(!morsels.has_more);
+
+        let rows = op
+            .execute_iter(ScanMorsel::Empty, None, None)
+            .expect("driver")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("drain the metadata file");
+        assert_eq!(
+            rows.iter()
+                .map(|chunk| chunk.batch.num_rows())
+                .sum::<usize>(),
+            2
+        );
+        assert_eq!(opens.load(Ordering::Acquire), 1, "opened exactly once");
+        assert_eq!(closes.load(Ordering::Acquire), 1, "closed exactly once");
+    }
+
+    /// Its work unit is the relation itself, so a morsel that names a physical
+    /// range belongs to some other scan and must not be silently accepted.
+    #[test]
+    fn a_system_relation_scan_refuses_a_morsel_it_does_not_own() {
+        let provider = Arc::new(ScriptedSystemTables {
+            script: Mutex::new(Vec::new()),
+            opens: Arc::new(AtomicUsize::new(0)),
+            closes: Arc::new(AtomicUsize::new(0)),
+        });
+        let source = system_table_source(provider);
+        let op = source.bind(BoundScanRanges::None).expect("bind");
+        let outcome = op.execute_iter(
+            ScanMorsel::FileRange {
+                path: "s3://bucket/f.parquet".to_string(),
+                offset: 0,
+                length: 1,
+                file_len: 1,
+                scan_range_id: 0,
+                external_datacache: None,
+            },
+            None,
+            None,
+        );
+        let error = match outcome {
+            Ok(_) => panic!("a file-range morsel is not this scan's work unit"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("file-range morsel"),
+            "unexpected error: {error}"
+        );
+    }
+
     #[test]
     fn typed_scan_reads_a_split_that_arrives_after_the_driver_started() {
         let queues = attempt_queues();
@@ -1506,5 +1672,235 @@ mod tests {
                 .columns_covered()
                 .is_empty()
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// System relations read by exactly one backend
+// ---------------------------------------------------------------------------
+
+/// A system relation whose rows come from one immutable metadata file.
+///
+/// It has no split and never touches the task-update queue: the coordinator
+/// resolved it to exactly one backend, and synthesizing a split would invent
+/// scheduling identity for work that has none. A scan bound to this source
+/// therefore does its whole job in one morsel and then finishes, instead of
+/// parking on a queue nobody will ever serve.
+///
+/// Reading it on more than one instance would duplicate every row, so the
+/// coordinator is the only thing that keeps this to a single task; this source
+/// does not and cannot check that.
+pub struct TypedConnectorSystemTableScanSource {
+    shared: Arc<TypedSystemTableScanShared>,
+}
+
+struct TypedSystemTableScanShared {
+    scan: ConnectorTableScanSource,
+    provider: Arc<dyn TypedConnectorSystemTableProvider>,
+    session: ConnectorSession,
+    request: ConnectorRequestContext,
+    /// Ordered output slot ids. `slot_ids[i]` names page channel `i`.
+    slot_ids: Vec<SlotId>,
+}
+
+impl TypedSystemTableScanShared {
+    /// Fail fast on a cancelled or expired attempt, before any provider call.
+    fn check_liveness(&self, action: &str) -> Result<(), String> {
+        if self.request.cancellation().is_cancelled() {
+            return Err(format!("typed system relation scan {action} was cancelled"));
+        }
+        if Instant::now() >= self.request.deadline() {
+            return Err(format!(
+                "typed system relation scan {action} deadline elapsed"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl TypedConnectorSystemTableScanSource {
+    pub fn new(
+        scan: ConnectorTableScanSource,
+        provider: Arc<dyn TypedConnectorSystemTableProvider>,
+        session: ConnectorSession,
+        request: ConnectorRequestContext,
+        slot_ids: Vec<SlotId>,
+    ) -> Self {
+        Self {
+            shared: Arc::new(TypedSystemTableScanShared {
+                scan,
+                provider,
+                session,
+                request,
+                slot_ids,
+            }),
+        }
+    }
+}
+
+impl ScanSource for TypedConnectorSystemTableScanSource {
+    fn bind(&self, ranges: BoundScanRanges) -> Result<Arc<dyn ScanOp>, String> {
+        match ranges {
+            BoundScanRanges::None => {}
+            BoundScanRanges::SchemaSelection { .. } => {
+                return Err(
+                    "typed system relation scan source requires an empty range binding".to_string(),
+                );
+            }
+        }
+        Ok(Arc::new(TypedConnectorSystemTableScanOp {
+            shared: Arc::clone(&self.shared),
+            sources: Arc::new(TypedPageSourceGroup::default()),
+        }))
+    }
+
+    fn profile_name(&self) -> Option<String> {
+        Some("TypedConnectorSystemTableScan".to_string())
+    }
+}
+
+/// One bound system relation scan.
+pub struct TypedConnectorSystemTableScanOp {
+    shared: Arc<TypedSystemTableScanShared>,
+    sources: Arc<TypedPageSourceGroup>,
+}
+
+impl ScanOp for TypedConnectorSystemTableScanOp {
+    fn terminate(&self) -> Result<(), String> {
+        self.sources.terminate()
+    }
+
+    fn build_morsels(&self) -> Result<ScanMorsels, String> {
+        // Exactly one unit of work, known before execution starts: the whole
+        // relation is one metadata file. `has_more` is false because nothing
+        // can add work to this scan later.
+        Ok(ScanMorsels::new(vec![ScanMorsel::Empty], false))
+    }
+
+    fn execute_iter(
+        &self,
+        morsel: ScanMorsel,
+        profile: Option<RuntimeProfile>,
+        _runtime_filters: Option<&RuntimeFilterContext>,
+    ) -> Result<BoxedExecIter, String> {
+        match morsel {
+            ScanMorsel::Empty => {}
+            ScanMorsel::FileRange { .. } => {
+                return Err(
+                    "typed system relation scan received a file-range morsel it does not own"
+                        .to_string(),
+                );
+            }
+            ScanMorsel::ConnectorScanUnit { .. } => {
+                return Err(
+                    "typed system relation scan received an opaque prepared-unit morsel"
+                        .to_string(),
+                );
+            }
+            ScanMorsel::Schema { .. } => {
+                return Err("typed system relation scan received a schema morsel".to_string());
+            }
+        }
+        Ok(Box::new(TypedSystemTableIter {
+            shared: Arc::clone(&self.shared),
+            sources: Arc::clone(&self.sources),
+            current: None,
+            opened: false,
+            finished: false,
+            profile,
+        }))
+    }
+}
+
+/// Drains one system relation's page source to end of stream.
+struct TypedSystemTableIter {
+    shared: Arc<TypedSystemTableScanShared>,
+    sources: Arc<TypedPageSourceGroup>,
+    current: Option<RegisteredPageSource>,
+    opened: bool,
+    finished: bool,
+    profile: Option<RuntimeProfile>,
+}
+
+impl TypedSystemTableIter {
+    fn open(&mut self) -> Result<(), String> {
+        self.shared.check_liveness("open")?;
+        let page_source = self
+            .shared
+            .provider
+            .create_system_page_source(
+                &self.shared.session,
+                self.shared.scan.table(),
+                self.shared.scan.assignments(),
+            )
+            .map_err(|error| format!("create typed system relation page source: {error}"))?;
+        let adapter = ConnectorPageAdapter::new(self.shared.slot_ids.clone(), page_source);
+        self.current = Some(self.sources.register(adapter)?);
+        if let Some(profile) = self.profile.as_ref() {
+            profile.counter_add("TypedSystemTablePageSourcesOpened", ProfileUnit::Unit, 1);
+        }
+        Ok(())
+    }
+
+    fn close_current(&mut self) -> Result<(), String> {
+        match self.current.take() {
+            Some(source) => source.close(),
+            None => Ok(()),
+        }
+    }
+
+    fn fail(&mut self, primary: String) -> ExecResult {
+        self.finished = true;
+        let _ = self.close_current();
+        Err(primary)
+    }
+}
+
+impl Iterator for TypedSystemTableIter {
+    type Item = ExecResult;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.finished {
+                return None;
+            }
+            if self.sources.is_terminal() {
+                self.finished = true;
+                return None;
+            }
+            if !self.opened {
+                self.opened = true;
+                if let Err(error) = self.open() {
+                    return Some(self.fail(error));
+                }
+            }
+            let Some(source) = self.current.as_ref() else {
+                self.finished = true;
+                return None;
+            };
+            match source.pull() {
+                Err(error) => return Some(self.fail(error)),
+                Ok(PageConversion::Chunk(chunk)) => return Some(Ok(chunk)),
+                Ok(PageConversion::Idle) => {
+                    // A metadata reader that is waiting is still waiting on its
+                    // own I/O, not on scheduling, so this yields rather than
+                    // sleeping on a wake that has no producer.
+                    if source.is_blocked() {
+                        std::thread::sleep(BLOCKED_PAGE_SOURCE_BACKOFF);
+                    }
+                    continue;
+                }
+                Ok(PageConversion::Finished) => {
+                    self.finished = true;
+                    return self.close_current().err().map(Err);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for TypedSystemTableIter {
+    fn drop(&mut self) {
+        let _ = self.close_current();
     }
 }
