@@ -166,12 +166,15 @@ pub(crate) enum CatalogTransactionStart {
 }
 
 impl CatalogTransactionStart {
-    /// True when the caller still owns everything the attempt touched.
+    /// True when admission failed and left the caller owning everything it
+    /// touched, so caller-owned temporary state is safe to release.
+    ///
+    /// This answers a question only the terminal arms have: a `Ready`
+    /// transaction has not failed at all, and releasing its state is
+    /// [`transaction::Transaction::abort`]'s business, which refuses once the
+    /// outcome is unknown.
     pub(crate) fn permits_cleanup(&self) -> bool {
-        matches!(
-            self,
-            Self::Unsupported(_) | Self::KnownUncommitted { .. } | Self::Ready(_)
-        )
+        matches!(self, Self::Unsupported(_) | Self::KnownUncommitted { .. })
     }
 }
 

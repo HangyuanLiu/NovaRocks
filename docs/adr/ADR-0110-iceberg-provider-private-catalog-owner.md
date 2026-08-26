@@ -89,6 +89,10 @@ exception、backend-specific stage-create fallback 与未闭合的 rollback clea
   取代独立、可漂移的 boolean capability authority。create request 必须显式携带 operation intent，至少区分
   empty table 与 CTAS：Hadoop 接受 empty-create 而对 CTAS 在副作用前 `Unsupported`；REST 只有同时能证明
   标准 stage-create、absent-target commit 与 exact unanchored staging root 时才接受 CTAS。
+- 允许一个**与构造器同源**的准入询问：`admit_create(intent)`。它不是能力表——它回答的就是
+  `new_create_table_transaction` 会做的那个裁决，只是让必须在构建表定义之前拒绝的调用方能够问到
+  （CTAS 必须在 source 执行前被拦下，先把定义建好等于为一个注定失败的请求白做工）。构造器自身调用它，
+  所以两个答案不可能漂移。
 - 采用 `new_transaction` / `new_create_table_transaction` / `new_create_or_replace_table_transaction`
   三个构造方法，统一返回一个 provider-private `Transaction`。不公开 `TableTransaction` /
   `CreateTableTransaction` 等平行类型；内部可用 private state 表达 existing-table、empty-create、
@@ -142,6 +146,18 @@ exception、backend-specific stage-create fallback 与未闭合的 rollback clea
   按词法前缀而非表的精确对象身份匹配、并且吞掉自身失败（部分删除仍报成功）。改为只删 catalog 指针后，
   空间回收要等到年龄窗到期的清理 pass，磁盘占用因此会在一段时间内高于从前。这是用回收延迟换正确性，
   我们认为值得；但它确实是可观测的行为退化，不应被描述为纯粹的改进。
+
+## 实现期修订（合入前）
+
+本 ADR 在实现期收到两处修订，均在合入前完成，因此直接写入正文而非另立 ADR：
+
+1. **文件系统 Catalog 的边界细节**（见「裁决」）：删除 Hadoop 的递归前缀删除后表重建失败，暴露出
+   filesystem catalog 的 catalog 条目本身就是存储对象。这不是立场变化，是把裁决说准。
+2. **view 一律 `Unsupported` 的代价被低估了**：实施后发现 NovaRocks 当时**没有任何枚举表的手段**
+   （解析器无 `SHOW TABLES`，`information_schema` 只有 `schemata`），因此 `DROP DATABASE ... FORCE`
+   是删非空库的唯一途径——「改用显式删表」对不预先知道表名的人不可达，SQL 测试 runner 的通用用例隔离
+   机制就是活证人。裁决保持不变（仍然一律 `Unsupported`），但同时补上 `information_schema.tables`
+   把能力洞堵上。这条正是下面「何时重新评估」第六项在实现期就触发的结果。
 
 ## 何时重新评估
 
