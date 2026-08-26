@@ -30,11 +30,9 @@
 //! [`SqlMetadataTableKind::parse`](crate::planner::table::SqlMetadataTableKind).
 
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
-use novarocks_parser::Span;
 use novarocks_types::schema::SqlType;
 use std::sync::Arc;
 
-use crate::analyze_error::AnalyzeError;
 use crate::planner::table::SqlMetadataTableKind;
 
 /// Time zone stamped on every `TIMESTAMP WITH TIME ZONE` metadata column.
@@ -481,81 +479,22 @@ fn partitions_columns(derived: &IcebergMetadataDerivedTypes) -> Vec<MetadataColu
 
 // ---------------------------------------------------------------------------
 // Refusals
-// ---------------------------------------------------------------------------
-
-// The two entry points below are the refusal half of the frozen contract.
-// They have no caller inside this module yet: the analyzer resolves metadata
-// expressions in `analyzer/resolve_expr.rs`, and the metadata-relation scope
-// is built in `analyzer/resolve_from.rs`, neither of which is owned by this
-// change. `#[allow(dead_code)]` keeps them compiled and tested until that
-// wiring lands; it is bookkeeping for a `pub(crate)` module, not a lint
-// escape for something unfinished.
-
-/// SQL name of a metadata relation, for user-facing messages.
-pub fn metadata_relation_suffix(kind: SqlMetadataTableKind) -> &'static str {
-    match kind {
-        SqlMetadataTableKind::Files => "$files",
-        SqlMetadataTableKind::Entries => "$entries",
-        SqlMetadataTableKind::Snapshots => "$snapshots",
-        SqlMetadataTableKind::History => "$history",
-        SqlMetadataTableKind::Refs => "$refs",
-        SqlMetadataTableKind::Manifests => "$manifests",
-        SqlMetadataTableKind::Partitions => "$partitions",
-    }
-}
-
-/// Stable refusal for a metadata-relation expression this read stack does not
-/// implement.
-///
-/// The alternative — declaring the column as `Int64`/`Utf8` so the expression
-/// type-checks — is forbidden: it turns "we cannot evaluate this" into a query
-/// that returns wrong answers with no warning. The error names the relation,
-/// the column, and what was attempted, so the user knows exactly which
-/// expression was refused and can project the column instead.
-///
-/// The stable code is `sql.analyze.unsupported_expression`.
-#[allow(dead_code)]
-pub fn unsupported_metadata_expression(
-    kind: SqlMetadataTableKind,
-    column: &str,
-    attempted: &str,
-    span: Span,
-) -> AnalyzeError {
-    AnalyzeError::unsupported_expression(
-        format!(
-            "iceberg metadata relation `{relation}` column `{column}`: {attempted} is not \
-             supported; project the column and evaluate it outside the query",
-            relation = metadata_relation_suffix(kind),
-        ),
-        span,
-    )
-}
-
-/// Whether an expression may be applied to `column` beyond projecting it.
-///
-/// ROW, MAP, and ARRAY columns are allowed: the analyzer already resolves
-/// field access and subscripts over them
-/// (`analyzer/resolve_expr.rs::analyze_access`), which is precisely why the
-/// schemas above declare them structurally instead of flattening them.
-///
-/// A JSON column is refused. NovaRocks does have a JSON logical type and a
-/// JSON function family, but the metadata-relation scope is built with
-/// `AnalyzerScope::add_column`, which carries only the Arrow carrier and
-/// drops `logical_type` (`analyzer/resolve_from.rs`). `readable_metrics`
-/// therefore reaches expression resolution as a bare `Utf8`, where
-/// `readable_metrics['x']` or `readable_metrics -> 'x'` would resolve as
-/// string operations and return plausible nonsense. Refusing is the only
-/// honest answer until the scope carries the logical type; the alternative —
-/// declaring the column VARCHAR so those expressions "work" — is exactly the
-/// downgrade this contract forbids.
-#[allow(dead_code)]
-pub fn metadata_column_supports_expressions(column: &MetadataColumn) -> bool {
-    column.logical_type != Some(SqlType::Json)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SQL name of a relation, for assertion messages.
+    fn metadata_relation_suffix(kind: SqlMetadataTableKind) -> &'static str {
+        match kind {
+            SqlMetadataTableKind::Files => "$files",
+            SqlMetadataTableKind::Entries => "$entries",
+            SqlMetadataTableKind::Snapshots => "$snapshots",
+            SqlMetadataTableKind::History => "$history",
+            SqlMetadataTableKind::Refs => "$refs",
+            SqlMetadataTableKind::Manifests => "$manifests",
+            SqlMetadataTableKind::Partitions => "$partitions",
+        }
+    }
 
     fn names(columns: &[MetadataColumn]) -> Vec<&str> {
         columns.iter().map(|c| c.name.as_str()).collect()
@@ -744,8 +683,11 @@ mod tests {
     fn files_readable_metrics_is_json_not_plain_varchar() {
         let columns = metadata_table_schema_with(SqlMetadataTableKind::Files, &full_derivation());
         let metrics = column(&columns, "readable_metrics");
+        // The JSON tag is what keeps this column distinguishable from the
+        // Utf8 that carries it; the analyzer scope propagates the tag, so
+        // expression resolution sees JSON rather than text.
         assert_eq!(metrics.logical_type, Some(SqlType::Json));
-        assert!(!metadata_column_supports_expressions(metrics));
+        assert_eq!(metrics.data_type, varchar());
     }
 
     #[test]
@@ -1272,37 +1214,5 @@ mod tests {
             IcebergMetadataDerivedTypes::try_new(None, Some(map_of(integer(), varchar())), None)
                 .expect_err("a MAP bounds derivation is a caller bug");
         assert!(error.contains("bounds"), "{error}");
-    }
-
-    #[test]
-    fn unsupported_metadata_expression_is_a_stable_not_supported() {
-        let error = unsupported_metadata_expression(
-            SqlMetadataTableKind::Files,
-            "readable_metrics",
-            "JSON navigation",
-            Span::new(7, 23),
-        );
-        assert_eq!(error.code().as_str(), "sql.analyze.unsupported_expression");
-        assert_eq!(error.span(), Some(Span::new(7, 23)));
-        let message = error.to_string();
-        assert!(message.contains("$files"), "{message}");
-        assert!(message.contains("readable_metrics"), "{message}");
-        assert!(message.contains("JSON navigation"), "{message}");
-        assert!(message.contains("not supported"), "{message}");
-    }
-
-    #[test]
-    fn json_columns_refuse_expressions_while_row_map_array_allow_them() {
-        let columns = metadata_table_schema_with(SqlMetadataTableKind::Files, &full_derivation());
-        assert!(!metadata_column_supports_expressions(column(
-            &columns,
-            "readable_metrics"
-        )));
-        for allowed in ["partition", "lower_bounds", "column_sizes", "split_offsets"] {
-            assert!(
-                metadata_column_supports_expressions(column(&columns, allowed)),
-                "{allowed} should stay expression-capable"
-            );
-        }
     }
 }
