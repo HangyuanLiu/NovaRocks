@@ -16,47 +16,41 @@
 // under the License.
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
+use novarocks_spi::connector::LakePublicationId;
 use uuid::Uuid;
 
 use crate::iceberg::spec::{Snapshot, SnapshotReference, SnapshotRetention};
 use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 
-pub const MV_REFRESH_ID_PROP: &str = "novarocks.mv.refresh_id";
-pub const MV_ID_PROP: &str = "novarocks.mv.id";
-pub const MV_REFRESH_TOKEN_PROP: &str = "novarocks.mv.refresh_token";
+pub const MV_PUBLICATION_ID_PROP: &str = "novarocks.mv.publication_id";
+pub const MV_PUBLICATION_STAGING_REF_PREFIX: &str = "__novarocks_mv_publication_";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MvRefreshSnapshotMarker {
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    pub token: String,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MvPublicationSnapshotMarker {
+    pub publication_id: LakePublicationId,
 }
 
-impl MvRefreshSnapshotMarker {
+impl MvPublicationSnapshotMarker {
     pub fn to_summary_properties(&self) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            (MV_REFRESH_ID_PROP.to_string(), self.refresh_id.to_string()),
-            (MV_ID_PROP.to_string(), self.mv_id.to_string()),
-            (MV_REFRESH_TOKEN_PROP.to_string(), self.token.clone()),
-        ])
+        BTreeMap::from([(
+            MV_PUBLICATION_ID_PROP.to_string(),
+            self.publication_id.to_string(),
+        )])
     }
 }
 
-pub fn snapshot_matches_refresh_marker(
+pub fn snapshot_matches_publication_marker(
     snapshot: &Snapshot,
-    marker: &MvRefreshSnapshotMarker,
+    marker: &MvPublicationSnapshotMarker,
 ) -> bool {
-    let props = &snapshot.summary().additional_properties;
-    props
-        .get(MV_REFRESH_ID_PROP)
-        .and_then(|value| value.parse::<i64>().ok())
-        == Some(marker.refresh_id)
-        && props
-            .get(MV_ID_PROP)
-            .and_then(|value| value.parse::<i64>().ok())
-            == Some(marker.mv_id)
-        && props.get(MV_REFRESH_TOKEN_PROP).map(String::as_str) == Some(marker.token.as_str())
+    snapshot
+        .summary()
+        .additional_properties
+        .get(MV_PUBLICATION_ID_PROP)
+        .and_then(|value| LakePublicationId::from_str(value).ok())
+        == Some(marker.publication_id)
 }
 
 fn ensure_staging_ref_is_branch(
@@ -79,7 +73,7 @@ pub struct MvRefreshPublishPlan {
     pub staging_branch: String,
     pub expected_main_snapshot_id: Option<i64>,
     pub staging_snapshot_id: i64,
-    pub marker: MvRefreshSnapshotMarker,
+    pub marker: MvPublicationSnapshotMarker,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,6 +85,16 @@ pub async fn publish_staging_branch_to_main(
     catalog: &dyn Catalog,
     plan: &MvRefreshPublishPlan,
 ) -> Result<MvRefreshPublishOutcome, String> {
+    let expected_staging_branch = format!(
+        "{MV_PUBLICATION_STAGING_REF_PREFIX}{}",
+        plan.marker.publication_id
+    );
+    if plan.staging_branch != expected_staging_branch {
+        return Err(
+            "iceberg mv publish: staging ref does not match the exact publication identity"
+                .to_string(),
+        );
+    }
     let ident = TableIdent::from_strs([plan.namespace.as_str(), plan.table.as_str()])
         .map_err(|e| format!("iceberg mv publish: invalid table identifier: {e}"))?;
     let table = catalog
@@ -128,7 +132,7 @@ pub async fn publish_staging_branch_to_main(
                 plan.staging_snapshot_id
             )
         })?;
-    if !snapshot_matches_refresh_marker(staging_snapshot, &plan.marker) {
+    if !snapshot_matches_publication_marker(staging_snapshot, &plan.marker) {
         return Err(format!(
             "iceberg mv publish: staging snapshot {} marker mismatch",
             plan.staging_snapshot_id
@@ -183,13 +187,15 @@ mod tests {
             namespace: "db".to_string(),
             table: "mv".to_string(),
             target_table_uuid: Uuid::from_u128(0x1234),
-            staging_branch: "mv_refresh_77".to_string(),
+            staging_branch: "__novarocks_mv_publication_01890f3c-4e70-7cc0-8000-000000000077"
+                .to_string(),
             expected_main_snapshot_id: Some(100),
             staging_snapshot_id: 300,
-            marker: MvRefreshSnapshotMarker {
-                refresh_id: 77,
-                mv_id: 12,
-                token: "token-77".to_string(),
+            marker: MvPublicationSnapshotMarker {
+                publication_id: LakePublicationId::try_from_uuid(
+                    Uuid::parse_str("01890f3c-4e70-7cc0-8000-000000000077").unwrap(),
+                )
+                .unwrap(),
             },
         }
     }
@@ -211,14 +217,14 @@ mod tests {
         );
         assert!(
             requirements.contains(&TableRequirement::RefSnapshotIdMatch {
-                r#ref: "mv_refresh_77".to_string(),
+                r#ref: plan.staging_branch.clone(),
                 snapshot_id: Some(300),
             })
         );
     }
 
     #[test]
-    fn marker_match_requires_all_three_fields() {
+    fn marker_match_requires_one_valid_v7_publication_id() {
         let plan = plan();
         let summary = Summary {
             operation: Operation::Append,
@@ -232,6 +238,6 @@ mod tests {
             .with_summary(summary)
             .with_schema_id(0)
             .build();
-        assert!(snapshot_matches_refresh_marker(&snapshot, &plan.marker));
+        assert!(snapshot_matches_publication_marker(&snapshot, &plan.marker));
     }
 }

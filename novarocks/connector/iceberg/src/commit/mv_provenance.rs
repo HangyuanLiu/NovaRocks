@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! V1 MV refresh provenance carried in an Iceberg snapshot summary.
+//! Publication-ID MV provenance carried in an Iceberg snapshot summary.
 
 use std::collections::BTreeMap;
 
@@ -24,10 +24,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::commit::{MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP};
+use novarocks_spi::connector::LakePublicationId;
 
-pub const MV_PROVENANCE_V1_PROP: &str = "novarocks.mv.provenance.v1";
-pub const MV_PROVENANCE_VERSION: u16 = 1;
+use crate::commit::MV_PUBLICATION_ID_PROP;
+
+pub const MV_PUBLICATION_PROVENANCE_PROP: &str = "novarocks.mv.publication.v2";
+pub const MV_PUBLICATION_PROVENANCE_VERSION: u16 = 2;
 pub const MV_REFRESH_ROW_COUNT_PROP: &str = "novarocks.mv.refresh.row_count";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,14 +50,15 @@ pub struct ProvenanceBase {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MvProvenanceV1 {
+#[serde(deny_unknown_fields)]
+pub struct MvPublicationProvenanceV2 {
     pub provenance_version: u16,
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    pub token: String,
+    pub publication_id: LakePublicationId,
     pub technique: RefreshTechnique,
     pub bases: Vec<ProvenanceBase>,
     pub definition_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub descriptor_properties_digest_base64: Option<String>,
     pub rows: i64,
 }
 
@@ -66,13 +69,17 @@ struct WaterlineBase {
     to_snapshot: i64,
 }
 
-impl MvProvenanceV1 {
+impl MvPublicationProvenanceV2 {
     pub fn to_summary_properties(&self) -> Result<BTreeMap<String, String>, String> {
         let mut props = BTreeMap::new();
-        props.insert(MV_REFRESH_ID_PROP.to_string(), self.refresh_id.to_string());
-        props.insert(MV_ID_PROP.to_string(), self.mv_id.to_string());
-        props.insert(MV_REFRESH_TOKEN_PROP.to_string(), self.token.clone());
-        props.insert(MV_PROVENANCE_V1_PROP.to_string(), self.to_canonical_json()?);
+        props.insert(
+            MV_PUBLICATION_ID_PROP.to_string(),
+            self.publication_id.to_string(),
+        );
+        props.insert(
+            MV_PUBLICATION_PROVENANCE_PROP.to_string(),
+            self.to_canonical_json()?,
+        );
         Ok(props)
     }
 
@@ -80,7 +87,7 @@ impl MvProvenanceV1 {
         let Some(raw) = snapshot
             .summary()
             .additional_properties
-            .get(MV_PROVENANCE_V1_PROP)
+            .get(MV_PUBLICATION_PROVENANCE_PROP)
         else {
             return Ok(None);
         };
@@ -116,11 +123,23 @@ impl MvProvenanceV1 {
     pub fn from_json(raw: &str) -> Result<Self, String> {
         let record: Self = serde_json::from_str(raw)
             .map_err(|err| format!("failed to parse MV provenance JSON: {err}"))?;
-        if record.provenance_version != MV_PROVENANCE_VERSION {
+        if record.provenance_version != MV_PUBLICATION_PROVENANCE_VERSION {
             return Err(format!(
                 "unsupported MV provenance version: expected {}, got {}",
-                MV_PROVENANCE_VERSION, record.provenance_version
+                MV_PUBLICATION_PROVENANCE_VERSION, record.provenance_version
             ));
+        }
+        LakePublicationId::try_from_uuid(*record.publication_id.as_uuid())
+            .map_err(|error| format!("invalid MV publication identity: {error}"))?;
+        if record.bases.is_empty()
+            || record.definition_fingerprint.is_empty()
+            || record.rows < 0
+            || record
+                .descriptor_properties_digest_base64
+                .as_ref()
+                .is_some_and(|value| value.is_empty())
+        {
+            return Err("MV publication provenance is incomplete or invalid".to_string());
         }
         Ok(record)
     }

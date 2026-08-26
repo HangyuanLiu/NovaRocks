@@ -37,11 +37,11 @@ use sha2::{Digest, Sha256};
 use novarocks_spi::connector::{
     ConnectorCommittedPartitionField, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorManagedPartitionField, ConnectorManagedPartitionSpecObservation,
-    ConnectorManagedPartitionSpecReplacement, ConnectorManagedPartitionTransform,
-    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
-    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ConnectorRequestContext, ConnectorRowMutationActivationRequest,
+    ConnectorManagedDescriptorProperties, ConnectorManagedPartitionField,
+    ConnectorManagedPartitionSpecObservation, ConnectorManagedPartitionSpecReplacement,
+    ConnectorManagedPartitionTransform, ConnectorManagedPublicationEmptyInputDisposition,
+    ConnectorManagedPublicationTechnique, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorRowMutationActivationRequest,
     ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationExecutionPlan,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
     ConnectorTableObjectId, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
@@ -454,11 +454,19 @@ impl IcebergWriteControl {
                         "decode admitted Iceberg write table metadata: {error}"
                     ))
                 })?;
+            if let ConnectorWriteActivationIntent::ManagedPublication(intent) = &request.intent {
+                validate_managed_publication_target(&metadata, intent)?;
+            }
             let partition_replacement = match &request.intent {
                 ConnectorWriteActivationIntent::ManagedPublication(intent) => intent
                     .partition_spec_replacement()
                     .map(|replacement| {
-                        prepare_partition_replacement(&metadata, replacement, request.operation_id)
+                        prepare_partition_replacement(
+                            &metadata,
+                            replacement,
+                            intent.descriptor_properties(),
+                            request.operation_id,
+                        )
                     })
                     .transpose()?,
                 ConnectorWriteActivationIntent::Ordinary
@@ -1078,11 +1086,9 @@ impl IcebergWriteControl {
                 // refresh) or the provider routes of a row-mutation apply
                 // (incremental refresh). Both stamp the same provenance; only a
                 // copy-on-write cohort is refused, above.
-                let provenance = super::MvProvenanceV1 {
-                    provenance_version: super::MV_PROVENANCE_VERSION,
-                    refresh_id: intent.refresh_id(),
-                    mv_id: intent.materialization_id(),
-                    token: intent.marker().to_string(),
+                let provenance = super::MvPublicationProvenanceV2 {
+                    provenance_version: super::MV_PUBLICATION_PROVENANCE_VERSION,
+                    publication_id: intent.publication_id(),
                     technique: match intent.technique() {
                         ConnectorManagedPublicationTechnique::Full => super::RefreshTechnique::Full,
                         ConnectorManagedPublicationTechnique::Incremental => {
@@ -1096,6 +1102,9 @@ impl IcebergWriteControl {
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(invalid)?,
                     definition_fingerprint: intent.definition_fingerprint().to_string(),
+                    descriptor_properties_digest_base64: Some(base64_encode(
+                        intent.descriptor_properties().digest(),
+                    )),
                     rows: 0,
                 };
                 IcebergFirstRefreshWritePlanPayloadV2 {
@@ -1435,12 +1444,14 @@ impl IcebergWriteControl {
         rows: u64,
     ) -> Result<BTreeMap<String, String>, CommitServiceError> {
         let mut properties = managed_snapshot_properties(&active.activation_intent, rows)?;
-        let marker = self.operation_marker(
-            request.operation_id(),
-            active,
-            request.sealed().digest(),
-            request.aggregate_digest(),
-        );
+        let marker = self
+            .operation_marker(
+                request.operation_id(),
+                active,
+                request.sealed().digest(),
+                request.aggregate_digest(),
+            )
+            .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?;
         let encoded = serde_json::to_string(&marker).map_err(|error| {
             CommitServiceError::invalid_input(format!(
                 "encode Iceberg write operation marker: {error}"
@@ -1464,7 +1475,7 @@ impl IcebergWriteControl {
         active: &ActiveOperation,
         cohort_set_digest: [u8; 32],
         aggregate_digest: [u8; 32],
-    ) -> IcebergWriteOperationMarkerV1 {
+    ) -> Result<IcebergWriteOperationMarkerV1, ConnectorError> {
         let family = match &active.activation_intent {
             ConnectorWriteActivationIntent::Ordinary => LakePublicationFamily::Write,
             ConnectorWriteActivationIntent::Publication(family) => *family,
@@ -1472,12 +1483,10 @@ impl IcebergWriteControl {
                 LakePublicationFamily::MaterializedViewRefresh
             }
         };
-        IcebergWriteOperationMarkerV1 {
+        let publication_id = LakePublicationId::try_from_bytes(operation_id.to_bytes())?;
+        Ok(IcebergWriteOperationMarkerV1 {
             version: ICEBERG_WRITE_OPERATION_MARKER_VERSION,
-            publication: LakePublicationMarkerHeader::new(
-                LakePublicationId::from_bytes(operation_id.to_bytes()),
-                family,
-            ),
+            publication: LakePublicationMarkerHeader::new(publication_id, family),
             instance_id: self.key.instance_id.as_str().to_string(),
             incarnation_base64: base64_encode(self.key.incarnation.to_bytes()),
             target_ref: if active.partition_replacement.is_some() {
@@ -1506,7 +1515,7 @@ impl IcebergWriteControl {
                 .partition_replacement
                 .as_ref()
                 .map(|replacement| base64_encode(replacement.committed.digest())),
-        }
+        })
     }
 
     fn invalidate_target_caches(&self, target: &ActiveTarget) {
@@ -2297,6 +2306,14 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 }
             }
         };
+        if matches!(
+            unknown.active.activation_intent,
+            ConnectorWriteActivationIntent::ManagedPublication(_)
+        ) {
+            return Err(unsupported(
+                "managed MV publication is crash-only and cannot be reconciled after CommitUnknown",
+            ));
+        }
         ensure_reconcile_partition_facts(&evidence, operation_id, &unknown.active)?;
         self.invalidate_target_caches(&unknown.active.target);
         let ident = crate::iceberg::TableIdent::from_strs([
@@ -2322,7 +2339,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
             &unknown.active,
             request.cohort_set_digest,
             request.aggregate_digest,
-        );
+        )?;
         let matched_snapshot = find_operation_marker_snapshot(
             table.metadata().snapshots().map(Arc::as_ref),
             &expected_marker,
@@ -2330,11 +2347,14 @@ impl ConnectorWriteControl for IcebergWriteControl {
         let outcome = if let Some(snapshot) = matched_snapshot {
             let row_count = match &unknown.active.activation_intent {
                 ConnectorWriteActivationIntent::ManagedPublication(expected) => {
-                    let provenance = super::MvProvenanceV1::from_snapshot_summary(snapshot)
-                        .map_err(corrupt)?
-                        .ok_or_else(|| {
-                            corrupt("Iceberg managed publication snapshot is missing provenance")
-                        })?;
+                    let provenance =
+                        super::MvPublicationProvenanceV2::from_snapshot_summary(snapshot)
+                            .map_err(corrupt)?
+                            .ok_or_else(|| {
+                                corrupt(
+                                    "Iceberg managed publication snapshot is missing provenance",
+                                )
+                            })?;
                     if !managed_provenance_matches(expected, &provenance) {
                         return Err(corrupt(
                             "Iceberg managed publication snapshot provenance does not match its operation marker",
@@ -2648,6 +2668,7 @@ fn commit_shape_for_intents(cohorts: &[DecodedCohort]) -> Result<CommitOpKind, C
 fn prepare_partition_replacement(
     metadata: &crate::iceberg::spec::TableMetadata,
     replacement: &ConnectorManagedPartitionSpecReplacement,
+    descriptor_properties: &ConnectorManagedDescriptorProperties,
     operation_id: ConnectorWriteOperationId,
 ) -> Result<ActivePartitionReplacement, ConnectorError> {
     if replacement.operation_id() != operation_id {
@@ -2695,17 +2716,20 @@ fn prepare_partition_replacement(
                 invalid(format!("build Iceberg replacement partition spec: {error}"))
             })?;
     }
+    let descriptor_properties = managed_descriptor_property_updates(descriptor_properties)?;
     let build =
         crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(metadata.clone(), None)
             .add_default_partition_spec(builder.build())
             .map_err(|error| invalid(format!("bind Iceberg replacement partition spec: {error}")))?
+            .set_properties(descriptor_properties)
+            .map_err(|error| invalid(format!("bind managed MV descriptor properties: {error}")))?
             .build()
             .map_err(|error| {
                 invalid(format!(
                     "finalize Iceberg replacement partition spec: {error}"
                 ))
             })?;
-    if build.changes.len() != 2
+    if build.changes.len() != 3
         || !matches!(
             build.changes[0],
             crate::iceberg::TableUpdate::AddSpec { .. }
@@ -2714,9 +2738,13 @@ fn prepare_partition_replacement(
             build.changes[1],
             crate::iceberg::TableUpdate::SetDefaultSpec { .. }
         )
+        || !matches!(
+            build.changes[2],
+            crate::iceberg::TableUpdate::SetProperties { .. }
+        )
     {
         return Err(invalid(
-            "Iceberg managed partition replacement did not produce AddSpec then SetDefaultSpec",
+            "Iceberg managed partition replacement did not produce AddSpec, SetDefaultSpec, then SetProperties",
         ));
     }
     let spec_id = build.metadata.default_partition_spec_id();
@@ -2766,6 +2794,57 @@ fn prepare_partition_replacement(
         metadata_updates: build.changes,
         committed,
     })
+}
+
+fn validate_managed_publication_target(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    intent: &novarocks_spi::connector::ConnectorManagedPublicationIntent,
+) -> Result<(), ConnectorError> {
+    let expected_uuid =
+        iceberg_uuid_from_object_id(intent.target().object_id()).map_err(invalid)?;
+    if metadata.uuid().to_string() != expected_uuid
+        || metadata.current_snapshot_id() != intent.target().expected_snapshot_id()
+    {
+        return Err(invalid(
+            "Iceberg managed publication target identity or snapshot does not match the exact frozen target",
+        ));
+    }
+    let descriptor = managed_descriptor_property_updates(intent.descriptor_properties())?;
+    if intent.partition_spec_replacement().is_none()
+        && descriptor
+            .iter()
+            .any(|(key, value)| metadata.properties().get(key) != Some(value))
+    {
+        return Err(invalid(
+            "Iceberg managed publication may change descriptor properties only in an atomic partition replacement",
+        ));
+    }
+    Ok(())
+}
+
+fn managed_descriptor_property_updates(
+    descriptor: &ConnectorManagedDescriptorProperties,
+) -> Result<HashMap<String, String>, ConnectorError> {
+    let mut updates = HashMap::with_capacity(descriptor.entries().len());
+    for (key, value) in descriptor.entries() {
+        if matches!(
+            key.as_ref(),
+            super::MV_PUBLICATION_ID_PROP
+                | super::MV_PUBLICATION_PROVENANCE_PROP
+                | super::MV_REFRESH_ROW_COUNT_PROP
+                | ICEBERG_WRITE_OPERATION_MARKER_PROPERTY
+        ) {
+            return Err(invalid(
+                "managed MV descriptor properties conflict with provider-owned publication metadata",
+            ));
+        }
+        if updates.insert(key.to_string(), value.to_string()).is_some() {
+            return Err(invalid(
+                "managed MV descriptor properties contain a duplicate key",
+            ));
+        }
+    }
+    Ok(updates)
 }
 
 fn managed_partition_fields(
@@ -2897,11 +2976,9 @@ fn managed_snapshot_properties(
             "Iceberg managed publication row count exceeds i64".to_string(),
         )
     })?;
-    super::MvProvenanceV1 {
-        provenance_version: super::MV_PROVENANCE_VERSION,
-        refresh_id: intent.refresh_id(),
-        mv_id: intent.materialization_id(),
-        token: intent.marker().to_string(),
+    super::MvPublicationProvenanceV2 {
+        provenance_version: super::MV_PUBLICATION_PROVENANCE_VERSION,
+        publication_id: intent.publication_id(),
         technique: match intent.technique() {
             ConnectorManagedPublicationTechnique::Full => super::RefreshTechnique::Full,
             ConnectorManagedPublicationTechnique::Incremental => {
@@ -2915,6 +2992,9 @@ fn managed_snapshot_properties(
             .collect::<Result<Vec<_>, _>>()
             .map_err(CommitServiceError::invalid_input)?,
         definition_fingerprint: intent.definition_fingerprint().to_string(),
+        descriptor_properties_digest_base64: Some(base64_encode(
+            intent.descriptor_properties().digest(),
+        )),
         rows,
     }
     .to_summary_properties()
@@ -2923,7 +3003,7 @@ fn managed_snapshot_properties(
 
 fn managed_provenance_matches(
     expected: &novarocks_spi::connector::ConnectorManagedPublicationIntent,
-    actual: &super::MvProvenanceV1,
+    actual: &super::MvPublicationProvenanceV2,
 ) -> bool {
     let technique = match expected.technique() {
         ConnectorManagedPublicationTechnique::Full => super::RefreshTechnique::Full,
@@ -2937,13 +3017,13 @@ fn managed_provenance_matches(
     let Ok(bases) = bases else {
         return false;
     };
-    actual.provenance_version == super::MV_PROVENANCE_VERSION
-        && actual.refresh_id == expected.refresh_id()
-        && actual.mv_id == expected.materialization_id()
-        && actual.token == expected.marker()
+    let descriptor_digest = base64_encode(expected.descriptor_properties().digest());
+    actual.provenance_version == super::MV_PUBLICATION_PROVENANCE_VERSION
+        && actual.publication_id == expected.publication_id()
         && actual.technique == technique
         && actual.bases == bases
         && actual.definition_fingerprint == expected.definition_fingerprint()
+        && actual.descriptor_properties_digest_base64.as_deref() == Some(descriptor_digest.as_str())
 }
 
 fn provenance_base_from_staged_fact(
@@ -3691,7 +3771,8 @@ mod tests {
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
         CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorInstanceId,
-        ConnectorManagedPublicationIntent, ConnectorProviderId, ConnectorSealedWriteCohortSet,
+        ConnectorManagedDescriptorProperties, ConnectorManagedPublicationIntent,
+        ConnectorManagedPublicationTarget, ConnectorProviderId, ConnectorSealedWriteCohortSet,
         ConnectorStagedPublicationBaseFact, ConnectorStagedReport, ConnectorStagedReportSummary,
         ConnectorTableHandle, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
         ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteFieldBinding,
@@ -3946,11 +4027,42 @@ mod tests {
             .build()
     }
 
+    fn descriptor_properties() -> ConnectorManagedDescriptorProperties {
+        ConnectorManagedDescriptorProperties::try_new(vec![
+            (
+                Arc::from("novarocks.mv.descriptor.hash"),
+                Arc::from("descriptor-hash"),
+            ),
+            (
+                Arc::from("novarocks.mv.descriptor.inline"),
+                Arc::from("descriptor-inline"),
+            ),
+            (
+                Arc::from("novarocks.mv.descriptor.package-id"),
+                Arc::from("db.mv"),
+            ),
+        ])
+        .expect("descriptor properties")
+    }
+
+    #[test]
+    fn managed_descriptor_properties_reject_provider_owned_keys() {
+        let descriptor = ConnectorManagedDescriptorProperties::try_new(vec![(
+            Arc::from(crate::commit::MV_PUBLICATION_ID_PROP),
+            Arc::from("01890f3c-4e70-7cc0-8000-000000000012"),
+        )])
+        .expect("opaque descriptor carrier");
+
+        let error = managed_descriptor_property_updates(&descriptor)
+            .expect_err("provider-owned descriptor key must fail closed");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
     #[test]
     fn atomic_partition_replacement_applies_spec_and_main_snapshot_once() {
         let (_executor, _warehouse, _control, table) = control_with_empty_table();
         let metadata = table.metadata().clone();
-        let operation_id = ConnectorWriteOperationId::from_bytes([21; 16]);
+        let operation_id = ConnectorWriteOperationId::new();
         let prior = ConnectorManagedPartitionSpecObservation::try_from_fields(
             metadata.default_partition_spec_id(),
             &[],
@@ -3965,11 +4077,17 @@ mod tests {
         let replacement =
             ConnectorManagedPartitionSpecReplacement::try_new(operation_id, prior, vec![requested])
                 .expect("replacement");
-        let prepared = prepare_partition_replacement(&metadata, &replacement, operation_id)
-            .expect("provider replacement");
+        let descriptor_properties = descriptor_properties();
+        let prepared = prepare_partition_replacement(
+            &metadata,
+            &replacement,
+            &descriptor_properties,
+            operation_id,
+        )
+        .expect("provider replacement");
         let new_spec_id = prepared.committed.spec_id();
         assert_ne!(new_spec_id, metadata.default_partition_spec_id());
-        assert_eq!(prepared.metadata_updates.len(), 2);
+        assert_eq!(prepared.metadata_updates.len(), 3);
 
         let snapshot_id = 77;
         let snapshot = Snapshot::builder()
@@ -4027,6 +4145,16 @@ mod tests {
         let applied = commit.apply(table).expect("one atomic metadata apply");
         assert_eq!(applied.metadata().default_partition_spec_id(), new_spec_id);
         assert_eq!(applied.metadata().current_snapshot_id(), Some(snapshot_id));
+        for (key, value) in descriptor_properties.entries() {
+            assert_eq!(
+                applied
+                    .metadata()
+                    .properties()
+                    .get(key.as_ref())
+                    .map(String::as_str),
+                Some(value.as_ref())
+            );
+        }
         assert_eq!(
             committed_partitioning_from_metadata(applied.metadata(), new_spec_id)
                 .expect("committed partitioning"),
@@ -4256,7 +4384,7 @@ mod tests {
     fn operation_marker_is_canonical_and_binds_exact_generation_and_aggregate() {
         let (_executor, control) = control();
         let owner = control.binding_key().clone();
-        let operation_id = ConnectorWriteOperationId::from_bytes([3; 16]);
+        let operation_id = ConnectorWriteOperationId::new();
         control
             .activate_write(activation_request(&owner, operation_id, 1))
             .expect("activate");
@@ -4269,7 +4397,9 @@ mod tests {
             };
             active.clone()
         };
-        let marker = control.operation_marker(operation_id, &active, [4; 32], [5; 32]);
+        let marker = control
+            .operation_marker(operation_id, &active, [4; 32], [5; 32])
+            .expect("operation marker");
         let encoded = serde_json::to_string(&marker).expect("marker JSON");
         let snapshot = snapshot_with_operation_marker(8, encoded);
         assert_eq!(
@@ -4282,7 +4412,7 @@ mod tests {
     fn operation_marker_preserves_the_activation_publication_family() {
         let (_executor, control) = control();
         let owner = control.binding_key().clone();
-        let operation_id = ConnectorWriteOperationId::from_bytes([31; 16]);
+        let operation_id = ConnectorWriteOperationId::new();
         let mut request = activation_request(&owner, operation_id, 1);
         request.intent =
             ConnectorWriteActivationIntent::Publication(LakePublicationFamily::DataMutation);
@@ -4300,6 +4430,7 @@ mod tests {
         assert_eq!(
             control
                 .operation_marker(operation_id, &active, [4; 32], [5; 32])
+                .expect("operation marker")
                 .publication
                 .family(),
             LakePublicationFamily::DataMutation
@@ -4346,7 +4477,7 @@ mod tests {
     fn historical_partition_marker_rejects_corrupt_transition_facts() {
         let (_executor, _warehouse, _control, table) = control_with_empty_table();
         let metadata = table.metadata().clone();
-        let operation_id = ConnectorWriteOperationId::from_bytes([26; 16]);
+        let operation_id = ConnectorWriteOperationId::new();
         let prior = ConnectorManagedPartitionSpecObservation::try_from_fields(
             metadata.default_partition_spec_id(),
             &[],
@@ -4365,13 +4496,19 @@ mod tests {
             ],
         )
         .expect("replacement");
-        let prospective = prepare_partition_replacement(&metadata, &replacement, operation_id)
-            .expect("provider replacement");
+        let prospective = prepare_partition_replacement(
+            &metadata,
+            &replacement,
+            &descriptor_properties(),
+            operation_id,
+        )
+        .expect("provider replacement");
         let marker =
             |replacement_id: [u8; 32], prior_digest: [u8; 32]| IcebergWriteOperationMarkerV1 {
                 version: ICEBERG_WRITE_OPERATION_MARKER_VERSION,
                 publication: LakePublicationMarkerHeader::new(
-                    LakePublicationId::from_bytes(operation_id.to_bytes()),
+                    LakePublicationId::try_from_bytes(operation_id.to_bytes())
+                        .expect("publication ID"),
                     LakePublicationFamily::Write,
                 ),
                 instance_id: "ice".to_string(),
@@ -4415,7 +4552,7 @@ mod tests {
     fn duplicate_operation_marker_matches_are_corrupt_data() {
         let (_executor, control) = control();
         let owner = control.binding_key().clone();
-        let operation_id = ConnectorWriteOperationId::from_bytes([3; 16]);
+        let operation_id = ConnectorWriteOperationId::new();
         control
             .activate_write(activation_request(&owner, operation_id, 1))
             .expect("activate");
@@ -4428,7 +4565,9 @@ mod tests {
             };
             active.clone()
         };
-        let marker = control.operation_marker(operation_id, &active, [4; 32], [5; 32]);
+        let marker = control
+            .operation_marker(operation_id, &active, [4; 32], [5; 32])
+            .expect("operation marker");
         let raw = serde_json::to_string(&marker).expect("marker JSON");
         let first = snapshot_with_operation_marker(8, raw.clone());
         let second = snapshot_with_operation_marker(9, raw);
@@ -4493,17 +4632,58 @@ mod tests {
     fn commit_unknown_marker_absent_preserves_provider_owned_staged_objects() {
         let (executor, _warehouse, control, table) = control_with_empty_table();
         let owner = control.binding_key().clone();
-        let operation_id = ConnectorWriteOperationId::from_bytes([22; 16]);
+        let publication_id = LakePublicationId::try_from_uuid(
+            uuid::Uuid::parse_str("01890f3c-4e70-7cc0-8000-000000000022").unwrap(),
+        )
+        .unwrap();
+        let operation_id = ConnectorWriteOperationId::from(publication_id);
+        let descriptor_properties = descriptor_properties();
+        let preparation_metadata =
+            TableMetadataBuilder::new_from_metadata(table.metadata().clone(), None)
+                .set_properties(
+                    descriptor_properties
+                        .entries()
+                        .iter()
+                        .map(|(key, value)| (key.to_string(), value.to_string()))
+                        .collect(),
+                )
+                .expect("set descriptor properties")
+                .build()
+                .expect("descriptor metadata")
+                .metadata;
+        let managed = ConnectorManagedPublicationIntent::try_new(
+            publication_id,
+            ConnectorManagedPublicationTarget::try_new(
+                ConnectorTableObjectId::try_new(Bytes::from(table.metadata().uuid().to_string()))
+                    .expect("target object ID"),
+                table.metadata().current_snapshot_id(),
+            )
+            .expect("managed target"),
+            ConnectorManagedPublicationTechnique::Full,
+            vec![ConnectorStagedPublicationBaseFact {
+                table: Arc::from("ice.db.base"),
+                object_id: ConnectorTableObjectId::try_new(Bytes::from_static(
+                    b"00112233-4455-6677-8899-aabbccddeeff",
+                ))
+                .expect("base object ID"),
+                from_version: None,
+                to_version: 1,
+            }],
+            "definition-fingerprint",
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            descriptor_properties,
+        )
+        .expect("managed publication");
         let activation = control
             .activate_write(ConnectorWriteActivationRequest {
                 operation_id,
                 source: ConnectorWriteActivationSource::Prepared(preparation_for_metadata(
                     &owner,
-                    table.metadata(),
+                    &preparation_metadata,
                     ConnectorWriteIntent::Overwrite,
                     22,
                 )),
-                intent: ConnectorWriteActivationIntent::Ordinary,
+                intent: ConnectorWriteActivationIntent::ManagedPublication(managed),
                 context: context(),
             })
             .expect("activate overwrite");
@@ -4704,7 +4884,7 @@ mod tests {
             }),
         );
 
-        let reconciled = control
+        let error = control
             .reconcile(ConnectorWriteReconcileRequest {
                 owner,
                 operation_id,
@@ -4713,11 +4893,8 @@ mod tests {
                 evidence,
                 context: context(),
             })
-            .expect("reconcile marker-absent operation");
-        assert!(matches!(
-            reconciled,
-            ExternalMutationOutcome::CommitUnknown { .. }
-        ));
+            .expect_err("managed CommitUnknown must not reconcile");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
         for path in &staged_paths {
             assert!(
                 executor
@@ -4762,7 +4939,11 @@ mod tests {
     fn managed_atomic_repartition_commits_writer_spec_snapshot_and_receipt_once() {
         let (_executor, _warehouse, control, table) = control_with_empty_table();
         let owner = control.binding_key().clone();
-        let operation_id = ConnectorWriteOperationId::from_bytes([12; 16]);
+        let publication_id = LakePublicationId::try_from_uuid(
+            uuid::Uuid::parse_str("01890f3c-4e70-7cc0-8000-000000000012").unwrap(),
+        )
+        .unwrap();
+        let operation_id = ConnectorWriteOperationId::from(publication_id);
         let prior = ConnectorManagedPartitionSpecObservation::try_from_fields(
             table.metadata().default_partition_spec_id(),
             &[],
@@ -4782,9 +4963,13 @@ mod tests {
         )
         .expect("replacement");
         let managed = ConnectorManagedPublicationIntent::try_new_with_partition_spec_replacement(
-            41,
-            7,
-            "refresh-41",
+            publication_id,
+            ConnectorManagedPublicationTarget::try_new(
+                ConnectorTableObjectId::try_new(Bytes::from(table.metadata().uuid().to_string()))
+                    .expect("target object ID"),
+                table.metadata().current_snapshot_id(),
+            )
+            .expect("managed target"),
             ConnectorManagedPublicationTechnique::Full,
             vec![ConnectorStagedPublicationBaseFact {
                 table: Arc::from("ice.db.base"),
@@ -4798,6 +4983,7 @@ mod tests {
             "definition-fingerprint",
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             replacement,
+            descriptor_properties(),
         )
         .expect("managed intent");
         let activation = control
@@ -4971,18 +5157,30 @@ mod tests {
             Some(committed_partitioning.digest())
         );
         assert!(
-            crate::commit::MvProvenanceV1::from_snapshot_summary(snapshot)
+            crate::commit::MvPublicationProvenanceV2::from_snapshot_summary(snapshot)
                 .expect("decode provenance")
                 .is_some_and(|provenance| {
-                    provenance.bases
-                        == vec![crate::commit::ProvenanceBase {
-                            table_fqn: "ice.db.base".to_string(),
-                            uuid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
-                            from_snapshot: None,
-                            to_snapshot: 1,
-                        }]
+                    provenance.publication_id == publication_id
+                        && provenance.bases
+                            == vec![crate::commit::ProvenanceBase {
+                                table_fqn: "ice.db.base".to_string(),
+                                uuid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+                                from_snapshot: None,
+                                to_snapshot: 1,
+                            }]
                 })
         );
+        for (key, value) in descriptor_properties().entries() {
+            assert_eq!(
+                loaded
+                    .table
+                    .metadata()
+                    .properties()
+                    .get(key.as_ref())
+                    .map(String::as_str),
+                Some(value.as_ref())
+            );
+        }
         let conflicting = activation_request(&owner, operation_id, 99);
         control
             .activations
