@@ -19,14 +19,17 @@
 
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const REQUIRED_BACKENDS: usize = 3;
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![Box::new(BackendSelfRegistration)]
+    vec![Box::new(BackendSelfRegistration), Box::new(PreReadyReplan)]
 }
 
 struct BackendSelfRegistration;
@@ -115,4 +118,117 @@ fn query_one(context: &mut ScenarioContext, phase: &str) -> Result<()> {
         "distributed query {phase} returned {rows:?}"
     );
     Ok(())
+}
+
+struct PreReadyReplan;
+
+impl Scenario for PreReadyReplan {
+    fn name(&self) -> &'static str {
+        "membership/pre-ready-replan"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        ensure!(
+            context.handle().be_count() == REQUIRED_BACKENDS,
+            "pre-ready replan acceptance requires exactly {REQUIRED_BACKENDS} BEs"
+        );
+        let target = 0;
+        let old_process_id = context.handle().backend_process_id(target)?;
+        context
+            .handle()
+            .arm_be_restart_after_init_ack(target)
+            .context("arm token-scoped BE restart after InitAck")?;
+        let token = context
+            .handle()
+            .armed_query_lifecycle_fault_token(target, "restart-after-init-ack")?
+            .context("armed pre-ready restart has no token")?;
+        let before_execution = context
+            .handle()
+            .query_lifecycle_structured_snapshot()?
+            .and_then(|snapshot| snapshot.execution_id);
+        context.action(format!(
+            "armed token-scoped restart after BE[{target}] InitAck; old_process_id={old_process_id}"
+        ));
+
+        let mysql_user = context.mysql_user().to_string();
+        let mysql_port = context.mysql_port();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let result = (|| -> Result<Vec<i64>> {
+                let mut connection =
+                    mysql_actor::connect(&mysql_user, mysql_port, Duration::from_secs(30))?;
+                connection
+                    .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+                    .context("run query during pre-ready replacement")
+            })();
+            let _ = sender.send(result);
+        });
+
+        wait_for_token_scoped_init_ack(context, target, &token)?;
+        let deadline = context.deadline();
+        context
+            .handle()
+            .restart_be_until(target, deadline)
+            .context("replace BE immediately after token-scoped InitAck")?;
+        let replacement_process_id = context.handle().backend_process_id(target)?;
+        ensure!(
+            replacement_process_id != old_process_id,
+            "pre-ready replacement must create a new BackendProcessId"
+        );
+        context
+            .handle()
+            .clear_query_lifecycle_faults()
+            .context("clear pre-ready restart trigger")?;
+
+        let remaining = context.remaining("await re-planned query")?;
+        let rows = receiver.recv_timeout(remaining).map_err(|error| {
+            anyhow::anyhow!("pre-ready query did not return before deadline: {error}")
+        })??;
+        ensure!(
+            rows == vec![1, 2],
+            "pre-ready re-planned query returned unexpected rows: {rows:?}"
+        );
+        let deadline = context.deadline();
+        let terminal = context
+            .handle()
+            .await_query_lifecycle_structured_snapshot_after(before_execution.as_deref(), deadline)
+            .context("read terminal snapshot for re-planned statement")?;
+        ensure!(
+            terminal.attempt_id == 2,
+            "pre-ready replacement must complete as statement attempt 2, got attempt {}",
+            terminal.attempt_id
+        );
+        context.action(format!(
+            "replaced BE[{target}] after InitAck and observed successful statement attempt=2 completion with new_process_id={replacement_process_id}"
+        ));
+        Ok(())
+    }
+}
+
+fn wait_for_token_scoped_init_ack(
+    context: &mut ScenarioContext,
+    backend_index: usize,
+    token: &str,
+) -> Result<()> {
+    let deadline = context.deadline();
+    loop {
+        let log = context.handle().be_log_contents(backend_index)?;
+        if log.lines().any(|line| {
+            line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
+                && line.contains(&format!("token={token}"))
+        }) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for token-scoped InitAck on BE[{backend_index}] token={token}; log_tail={:?}",
+                log.lines().rev().take(20).collect::<Vec<_>>()
+            );
+        }
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(25)),
+        );
+    }
 }
