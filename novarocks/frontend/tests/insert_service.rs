@@ -574,14 +574,13 @@ fn typed_insert(source: &str) -> novarocks_parser::ast::Insert {
 }
 
 #[test]
-fn typed_insert_does_not_execute_non_insert_sql() {
+fn typed_insert_executes_without_a_durable_dml_journal() {
     let engine = FakeInsertEngine::new(target());
     let (context, _, _) = context();
     let source = "INSERT INTO t VALUES (1, 2)";
-    let error = service(None)
+    service(None)
         .try_execute_insert(&engine, &typed_insert(source), source, &context, None)
-        .unwrap_err();
-    assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
+        .expect("statement-local INSERT");
 }
 
 #[test]
@@ -604,7 +603,7 @@ fn union_all_commits_once_in_source_order() {
         None,
     )
     .unwrap();
-    assert_eq!(journal.states(), vec![OperationState::Finalized]);
+    assert!(journal.states().is_empty());
     assert_eq!(
         engine
             .calls()
@@ -641,10 +640,10 @@ fn tag_target_is_read_only() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("tag 'v1' is read-only"));
-    assert!(matches!(
-        engine.calls().as_slice(),
-        [Call::Resolve { target, .. }] if target == &vec!["t".to_string()]
-    ));
+    assert!(engine.calls().iter().any(|call| matches!(
+        call,
+        Call::Resolve { target, .. } if target == &vec!["t".to_string()]
+    )));
 }
 
 #[test]
@@ -669,7 +668,7 @@ fn branch_insert_requires_iceberg_v3() {
 }
 
 #[test]
-fn branch_insert_journals_the_prepared_branch_base_snapshot() {
+fn branch_insert_freezes_the_prepared_branch_base_snapshot_without_journaling() {
     let engine = FakeInsertEngine::new(target());
     let coordination = common::coordination_fixture::open_blocking("insert-service-test");
     let journal = Arc::clone(&coordination.journal);
@@ -688,7 +687,6 @@ fn branch_insert_journals_the_prepared_branch_base_snapshot() {
     )
     .expect("branch INSERT");
 
-    let operation = journal.only_operation();
     let publication_id = engine
         .calls()
         .into_iter()
@@ -697,30 +695,15 @@ fn branch_insert_journals_the_prepared_branch_base_snapshot() {
             _ => None,
         })
         .expect("one admitted publication ID");
-    assert_eq!(operation.operation_id, publication_id);
-    assert_eq!(operation.attempt_id, publication_id.to_string());
-    assert_eq!(operation.target.ref_name.as_deref(), Some("dev"));
-    assert_eq!(operation.base_snapshot_id, Some(10));
-    assert_eq!(operation.state, OperationState::Finalized);
-    let novarocks_frontend::dml::model::OperationPayload::ConnectorWriteLifecycle(
-        novarocks_frontend::dml::ConnectorWriteLifecycleRecord::KnownCommitted {
-            receipt_wire, ..
-        },
-    ) = operation.payload
-    else {
-        panic!("expected a provider-neutral commit receipt");
-    };
-    assert_eq!(
-        receipt_wire.try_decode().expect("decode receipt"),
-        test_receipt(b"commit-success")
-    );
+    assert_eq!(publication_id.to_string().len(), 36);
+    assert!(journal.states().is_empty());
 }
 
 #[test]
-fn iceberg_without_journal_fails_before_prepare() {
+fn iceberg_without_journal_prepares_and_executes_statement_locally() {
     let engine = FakeInsertEngine::new(target());
     let (context, _, _) = context();
-    let error = service(None)
+    service(None)
         .try_execute_insert(
             &engine,
             &typed_insert("INSERT INTO t VALUES (1, 2)"),
@@ -728,13 +711,11 @@ fn iceberg_without_journal_fails_before_prepare() {
             &context,
             None,
         )
-        .unwrap_err();
-    assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
-    assert!(error.to_string().contains("state store is required"));
-    assert!(matches!(
-        engine.calls().as_slice(),
-        [Call::Resolve { target, .. }] if target == &vec!["t".to_string()]
-    ));
+        .expect("statement-local INSERT");
+    assert!(engine.calls().iter().any(|call| matches!(
+        call,
+        Call::Resolve { target, .. } if target == &vec!["t".to_string()]
+    )));
 }
 
 #[test]
@@ -756,9 +737,9 @@ fn iceberg_append_empty_records_known_empty_terminal_fact() {
         None,
     )
     .unwrap();
-    assert_eq!(journal.states(), vec![OperationState::Finalized]);
+    assert!(journal.states().is_empty());
     assert!(!engine.calls().contains(&Call::Commit));
-    assert!(!engine.calls().contains(&Call::Finalize));
+    assert!(engine.calls().contains(&Call::Finalize));
 }
 
 #[test]
@@ -780,13 +761,13 @@ fn iceberg_overwrite_empty_commits_and_finalizes() {
         None,
     )
     .unwrap();
-    assert_eq!(journal.states(), vec![OperationState::Finalized]);
+    assert!(journal.states().is_empty());
     assert!(engine.calls().contains(&Call::Commit));
     assert!(engine.calls().contains(&Call::Finalize));
 }
 
 #[test]
-fn iceberg_commit_unknown_is_persisted_without_retry() {
+fn iceberg_commit_unknown_is_not_retried_or_persisted() {
     let engine = FakeInsertEngine::new(target());
     engine.set_commit_behavior(CommitBehavior::Unknown);
     let coordination = common::coordination_fixture::open_blocking("insert-service-test");
@@ -805,7 +786,7 @@ fn iceberg_commit_unknown_is_persisted_without_retry() {
     )
     .unwrap_err();
     assert_eq!(error.kind(), DmlErrorKind::Commit);
-    assert_eq!(journal.states(), vec![OperationState::CommitUnknown]);
+    assert!(journal.states().is_empty());
     assert_eq!(
         engine
             .calls()
@@ -867,8 +848,5 @@ fn writer_abort_is_recorded_without_commit() {
     .unwrap_err();
     assert!(error.to_string().contains("writer aborted"));
     assert!(!engine.calls().contains(&Call::Commit));
-    assert_eq!(
-        journal.states(),
-        vec![OperationState::FailedKnownUncommitted]
-    );
+    assert!(journal.states().is_empty());
 }

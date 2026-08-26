@@ -96,6 +96,24 @@ impl WriteExecutor for IcebergInsertWriteExecutor<'_> {
             .commit_iceberg_write_terminal(self.prepared.handle.as_ref(), handle.as_ref())
     }
 
+    fn adjudicate_publication(
+        &self,
+        _spec: &WriteTransactionSpec,
+        handle: &Self::CommitHandle,
+        evidence: novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        self.engine.adjudicate_iceberg_write_publication(
+            self.prepared.handle.as_ref(),
+            handle.as_ref(),
+            evidence,
+        )
+    }
+
     fn finalize(&self, _spec: &WriteTransactionSpec) -> Result<(), String> {
         self.engine
             .finalize_iceberg_write(self.prepared.handle.as_ref())

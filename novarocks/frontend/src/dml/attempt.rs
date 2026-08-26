@@ -240,6 +240,22 @@ impl DmlPublicationAttempt {
         )
     }
 
+    /// Records a typed provider proof that publication did not occur. Unlike
+    /// an outer error, this may follow the conservative dispatch boundary:
+    /// the provider's explicit outcome, rather than the call boundary, is
+    /// what makes retry safe.
+    pub(crate) fn terminal_known_uncommitted(
+        &mut self,
+    ) -> Result<&LakePublicationTerminal, DmlPublicationAttemptError> {
+        if self.phase == DmlPublicationPhase::Terminal {
+            return Err(DmlPublicationAttemptError::TerminalAlreadyAssigned);
+        }
+        self.assign_terminal(
+            LakePublicationDisposition::KnownUncommitted,
+            DmlPublicationFinalization::NotApplicable,
+        )
+    }
+
     pub(crate) fn terminal_known_committed(
         &mut self,
         finalization: DmlPublicationFinalization,

@@ -30,7 +30,7 @@ use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::{LakePublicationFamily, LakePublicationId};
 
 use crate::dml::error::{AdmitError, DmlError};
-use crate::dml::runner::{ActiveWriteTransactionRunner, preparing_request};
+use crate::dml::runner::StatementWriteTransactionRunner;
 use crate::dml::service::DmlService;
 use crate::statistics::{
     StatisticsInsertObservation, StatisticsInsertSource, StatisticsLiteral, StatisticsOverwriteMode,
@@ -135,7 +135,6 @@ impl DmlService {
         context: &RequestContext,
         query_options: Option<&QueryOptions>,
     ) -> Result<(), DmlError> {
-        self.require_journal()?;
         let publication_id = LakePublicationId::new_v7();
         let (source, prepared_insert_columns) = match source {
             InsertCommandSource::Values(rows) => (
@@ -176,9 +175,8 @@ impl DmlService {
             .map_err(DmlError::executor)?;
         let spec = write_transaction_spec(&prepared);
         let executor = IcebergInsertWriteExecutor::new(engine, &prepared);
-        let operation = self.begin_write_operation(preparing_request(&spec))?;
         let target = spec.target.clone();
-        ActiveWriteTransactionRunner::new(operation, &executor)
+        StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::Write)
             .run(spec)
             .map(|_| ())
             .map_err(|error| {

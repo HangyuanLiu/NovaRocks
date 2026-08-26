@@ -25,9 +25,13 @@ use std::convert::Infallible;
 
 use novarocks_spi::connector::{
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorWriteAbortOutcome,
-    ConnectorWriteReceipt, ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorWriteReceipt, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, LakePublicationFamily, LakePublicationTarget,
 };
 
+use crate::dml::attempt::{
+    DmlPublicationAdjudicationOutcome, DmlPublicationAttempt, DmlPublicationFinalization,
+};
 use crate::dml::coordination::ActiveDmlOperation;
 use crate::dml::error::DmlError;
 use crate::dml::journal::OperationJournal;
@@ -71,7 +75,233 @@ pub trait WriteExecutor {
         handle: &Self::CommitHandle,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String>;
 
+    /// Read only the exact same-session publication evidence once after a
+    /// commit-unknown result. Implementations must not restart, abort, clean
+    /// up, or open a replacement connector session.
+    fn adjudicate_publication(
+        &self,
+        _spec: &WriteTransactionSpec,
+        _handle: &Self::CommitHandle,
+        _evidence: ExternalMutationEvidence,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, String> {
+        Err("write executor does not expose same-session publication adjudication".to_string())
+    }
+
     fn finalize(&self, spec: &WriteTransactionSpec) -> Result<(), String>;
+}
+
+/// Statement-local ordinary-write orchestration.  It deliberately retains no
+/// journal, StateStore admission, coordination lease, or recovery handle.
+pub(crate) struct StatementWriteTransactionRunner<'a, E: WriteExecutor> {
+    executor: &'a E,
+    family: LakePublicationFamily,
+}
+
+impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
+    pub(crate) const fn new(executor: &'a E, family: LakePublicationFamily) -> Self {
+        Self { executor, family }
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn run(
+        &self,
+        spec: WriteTransactionSpec,
+    ) -> Result<WriteTransactionOutcome, DmlError> {
+        let target = LakePublicationTarget::try_new(
+            spec.target.catalog.clone(),
+            spec.target.namespace.clone(),
+            Some(spec.target.table.clone()),
+            spec.target.ref_name.clone(),
+        )
+        .map_err(|error| DmlError::executor(error.to_string()))?;
+        let mut attempt =
+            DmlPublicationAttempt::new(spec.publication_id, self.family, target, None);
+        let report = match self.executor.run_coordinated_write(&spec) {
+            Ok(report) => report,
+            Err(error) => {
+                attempt
+                    .terminal_pre_dispatch_uncommitted()
+                    .map_err(attempt_error)?;
+                return Err(with_terminal(error, &attempt));
+            }
+        };
+        match report {
+            CoordinatedWriteReport::Aborted { reason } => {
+                attempt
+                    .terminal_pre_dispatch_uncommitted()
+                    .map_err(attempt_error)?;
+                Err(with_terminal(DmlError::executor(reason), &attempt))
+            }
+            CoordinatedWriteReport::NoOp => {
+                attempt.mark_dispatch_possible().map_err(attempt_error)?;
+                self.finish_committed(&spec, &mut attempt, None)
+            }
+            CoordinatedWriteReport::CommitRequired(handle) => {
+                attempt.mark_dispatch_possible().map_err(attempt_error)?;
+                match self.executor.commit(&spec, &handle) {
+                    Ok(outcome) => self.complete_commit(&spec, &mut attempt, &handle, outcome),
+                    Err(message) => {
+                        attempt
+                            .terminal_after_outer_failure()
+                            .map_err(attempt_error)?;
+                        Err(with_terminal(DmlError::commit(message), &attempt))
+                    }
+                }
+            }
+            CoordinatedWriteReport::AbortRequired { reason, handle } => {
+                match self.executor.abort(&spec, &handle) {
+                    Ok(ConnectorWriteAbortOutcome::KnownUncommitted { .. }) => {
+                        attempt
+                            .terminal_known_uncommitted()
+                            .map_err(attempt_error)?;
+                        Err(with_terminal(DmlError::executor(reason), &attempt))
+                    }
+                    Ok(ConnectorWriteAbortOutcome::KnownCommitted { receipt, .. }) => {
+                        attempt.mark_dispatch_possible().map_err(attempt_error)?;
+                        self.finish_committed(&spec, &mut attempt, Some(receipt))
+                    }
+                    Ok(ConnectorWriteAbortOutcome::CommitUnknown { failure, .. }) => {
+                        attempt.mark_dispatch_possible().map_err(attempt_error)?;
+                        attempt.terminal_commit_unknown().map_err(attempt_error)?;
+                        Err(with_terminal(DmlError::commit(failure.message()), &attempt))
+                    }
+                    Err(message) => {
+                        attempt.mark_dispatch_possible().map_err(attempt_error)?;
+                        attempt
+                            .terminal_after_outer_failure()
+                            .map_err(attempt_error)?;
+                        Err(with_terminal(DmlError::commit(message), &attempt))
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn complete_commit(
+        &self,
+        spec: &WriteTransactionSpec,
+        attempt: &mut DmlPublicationAttempt,
+        handle: &E::CommitHandle,
+        outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
+    ) -> Result<WriteTransactionOutcome, DmlError> {
+        match outcome {
+            ExternalMutationOutcome::KnownCommitted { receipt, .. } => {
+                self.finish_committed(spec, attempt, Some(receipt))
+            }
+            ExternalMutationOutcome::KnownUncommitted { failure } => {
+                attempt
+                    .terminal_known_uncommitted()
+                    .map_err(attempt_error)?;
+                Err(with_terminal(DmlError::commit(failure.message()), attempt))
+            }
+            ExternalMutationOutcome::CommitUnknown {
+                failure: _,
+                evidence,
+            } => {
+                let token = attempt.begin_adjudication().map_err(attempt_error)?;
+                match self
+                    .executor
+                    .adjudicate_publication(spec, &handle, evidence)
+                {
+                    Ok(ExternalMutationOutcome::KnownCommitted { receipt, .. }) => {
+                        let finalize = self.executor.finalize(spec);
+                        let finalization = if finalize.is_ok() {
+                            DmlPublicationFinalization::Succeeded
+                        } else {
+                            DmlPublicationFinalization::Failed
+                        };
+                        let terminal = attempt
+                            .finish_adjudication(
+                                token,
+                                DmlPublicationAdjudicationOutcome::KnownCommitted,
+                                finalization,
+                            )
+                            .map_err(attempt_error)?
+                            .clone();
+                        if let Err(message) = finalize {
+                            return Err(DmlError::known_committed_finalization_failed(
+                                terminal, message,
+                            ));
+                        }
+                        Ok(WriteTransactionOutcome {
+                            operation_id: None,
+                            committed_receipt: Some(receipt),
+                        })
+                    }
+                    Ok(ExternalMutationOutcome::KnownUncommitted { failure }) => {
+                        attempt
+                            .finish_adjudication(
+                                token,
+                                DmlPublicationAdjudicationOutcome::CommitUnknown,
+                                DmlPublicationFinalization::NotApplicable,
+                            )
+                            .map_err(attempt_error)?;
+                        Err(with_terminal(DmlError::commit(failure.message()), attempt))
+                    }
+                    Ok(ExternalMutationOutcome::CommitUnknown { failure, .. }) => {
+                        attempt
+                            .finish_adjudication(
+                                token,
+                                DmlPublicationAdjudicationOutcome::CommitUnknown,
+                                DmlPublicationFinalization::NotApplicable,
+                            )
+                            .map_err(attempt_error)?;
+                        Err(with_terminal(DmlError::commit(failure.message()), attempt))
+                    }
+                    Err(message) => {
+                        attempt
+                            .finish_adjudication(
+                                token,
+                                DmlPublicationAdjudicationOutcome::CommitUnknown,
+                                DmlPublicationFinalization::NotApplicable,
+                            )
+                            .map_err(attempt_error)?;
+                        Err(with_terminal(DmlError::commit(message), attempt))
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn finish_committed(
+        &self,
+        spec: &WriteTransactionSpec,
+        attempt: &mut DmlPublicationAttempt,
+        receipt: Option<ConnectorWriteReceipt>,
+    ) -> Result<WriteTransactionOutcome, DmlError> {
+        let finalization = if self.executor.finalize(spec).is_ok() {
+            DmlPublicationFinalization::Succeeded
+        } else {
+            DmlPublicationFinalization::Failed
+        };
+        let terminal = attempt
+            .terminal_known_committed(finalization)
+            .map_err(attempt_error)?
+            .clone();
+        if finalization == DmlPublicationFinalization::Failed {
+            return Err(DmlError::known_committed_finalization_failed(
+                terminal,
+                "post-commit finalization failed",
+            ));
+        }
+        Ok(WriteTransactionOutcome {
+            operation_id: None,
+            committed_receipt: receipt,
+        })
+    }
+}
+
+fn attempt_error(error: crate::dml::attempt::DmlPublicationAttemptError) -> DmlError {
+    DmlError::executor(error.to_string())
+}
+
+fn with_terminal(mut error: DmlError, attempt: &DmlPublicationAttempt) -> DmlError {
+    if let Some(terminal) = attempt.terminal() {
+        error = error.with_publication_terminal(terminal.clone());
+    }
+    error
 }
 
 pub(crate) trait WriteAdmission: Send + Sync {

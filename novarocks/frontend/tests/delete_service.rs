@@ -312,11 +312,11 @@ fn context() -> (RequestContext, QueryCancellationSource, Instant) {
 }
 
 #[test]
-fn delete_requires_journal_before_prepare() {
+fn delete_executes_without_a_durable_dml_journal() {
     let engine = FakeDeleteEngine::new(WriteBehavior::NoOp);
     let (context, _, _) = context();
     let source = "DELETE FROM orders WHERE id = 1";
-    let error = DmlService::compose(None, Arc::new(FrontendStatisticsService::new()))
+    DmlService::compose(None, Arc::new(FrontendStatisticsService::new()))
         .execute_delete(
             &engine,
             DeleteStatement::Predicate(&typed_delete(source)),
@@ -324,9 +324,8 @@ fn delete_requires_journal_before_prepare() {
             &context,
             None,
         )
-        .unwrap_err();
-    assert_eq!(error.kind(), DmlErrorKind::JournalUnavailable);
-    assert!(engine.prepare_calls.lock().unwrap().is_empty());
+        .expect("statement-local DELETE");
+    assert_eq!(engine.prepare_calls.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -355,9 +354,9 @@ fn delete_uses_admitted_context_and_records_noop_as_known_empty() {
         engine.prepare_calls.lock().unwrap().as_slice(),
         &[(DeleteStatementKind::Predicate, 91, Some(deadline))],
     );
-    assert_eq!(journal.states(), vec![OperationState::Finalized]);
+    assert!(journal.states().is_empty());
     assert_eq!(*engine.commit_calls.lock().unwrap(), 0);
-    assert_eq!(*engine.finalize_calls.lock().unwrap(), 0);
+    assert_eq!(*engine.finalize_calls.lock().unwrap(), 1);
 }
 
 #[test]
@@ -386,13 +385,10 @@ fn equality_delete_commits_and_finalizes_row_delta() {
         engine.prepare_calls.lock().unwrap()[0].0,
         DeleteStatementKind::Equality,
     );
-    assert_eq!(journal.states(), vec![OperationState::Finalized]);
+    assert!(journal.states().is_empty());
     assert_eq!(*engine.commit_calls.lock().unwrap(), 1);
     assert_eq!(*engine.finalize_calls.lock().unwrap(), 1);
-    assert_eq!(
-        service.list_operations().unwrap()[0].operation_kind,
-        OperationKind::RowDelta,
-    );
+    assert!(service.list_operations().unwrap().is_empty());
 }
 
 #[test]
@@ -418,9 +414,6 @@ fn aborted_delete_does_not_commit() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("writer aborted"));
-    assert_eq!(
-        journal.states(),
-        vec![OperationState::FailedKnownUncommitted]
-    );
+    assert!(journal.states().is_empty());
     assert_eq!(*engine.commit_calls.lock().unwrap(), 0);
 }
