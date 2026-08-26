@@ -113,12 +113,23 @@ impl TokioFileIoRuntime {
 
 impl FileIoRuntime for TokioFileIoRuntime {
     fn block_on_bytes(&self, future: FileBytesFuture) -> FileResult<Bytes> {
-        self.handle.block_on(future)
+        block_on(&self.handle, future)
     }
 
     fn block_on_u64(&self, future: FileU64Future) -> FileResult<u64> {
-        self.handle.block_on(future)
+        block_on(&self.handle, future)
     }
+}
+
+/// File readers are synchronous pipeline callbacks, but their object-store
+/// operations are asynchronous. Production data runtimes are multi-threaded;
+/// yield the worker before driving the explicitly injected handle so a reader
+/// reached from that runtime never nests `Handle::block_on` and panics.
+fn block_on<T>(handle: &Handle, future: impl Future<Output = T>) -> T {
+    if Handle::try_current().is_ok() {
+        return tokio::task::block_in_place(|| handle.block_on(future));
+    }
+    handle.block_on(future)
 }
 
 #[derive(Clone)]
@@ -135,5 +146,30 @@ impl TokioFileTaskSpawner {
 impl FileTaskSpawner for TokioFileTaskSpawner {
     fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
         Ok(FileTask::new(self.handle.spawn(task)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_io_runtime_bridges_from_its_runtime_worker() {
+        let runtime = Arc::new(TokioFileIoRuntime::new(Handle::current()));
+
+        assert_eq!(
+            runtime
+                .block_on_bytes(Box::pin(async { Ok(Bytes::from_static(b"bytes")) }))
+                .expect("bytes bridge"),
+            Bytes::from_static(b"bytes")
+        );
+        assert_eq!(
+            runtime
+                .block_on_u64(Box::pin(async { Ok(7_u64) }))
+                .expect("u64 bridge"),
+            7
+        );
     }
 }
