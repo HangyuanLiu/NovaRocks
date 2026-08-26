@@ -27,8 +27,7 @@ use crate::query_execution::lifecycle_plan::{
 };
 use novarocks_proto::lifecycle::{
     AttemptId as CoreAttemptId, AttemptId as ProtocolAttemptId, QueryControlAttach,
-    QueryExecutionId, QueryInitOutcome, QueryStageAck, QueryStageRequest, QueryStartAck,
-    QueryStartRequest,
+    QueryExecutionId, QueryInitOutcome, QueryStageAck, QueryStartAck, QueryStartRequest,
 };
 use novarocks_proto_models::novarocks as protocol_wire;
 

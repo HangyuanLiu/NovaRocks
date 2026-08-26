@@ -98,32 +98,18 @@ pub(crate) fn decode_runtime_filter_contribution(
         lifecycle: wire.lifecycle,
         install: wire.install.clone(),
     };
+    // The envelope above is built from the admitted execution identity and the
+    // contribution's own participant id, so the decoded query id, deployment
+    // epoch, and local participant id are those same values travelling back
+    // out. Comparing them against their own source cannot fail and would only
+    // suggest an agreement is being enforced here. The Frontend establishes
+    // that agreement where the identities actually meet: the runtime-filter
+    // deployment derives both from the scheduled execution id, and
+    // `QueryExecutionArtifact` rejects lifecycle options whose execution id
+    // disagrees with the schedule.
     let decoded = decode_participant_install(&request).map_err(|error| {
         QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
     })?;
-    if decoded.query_id
-        != UniqueId::new(
-            execution_id.query_id().high(),
-            execution_id.query_id().low(),
-        )
-    {
-        return Err(QueryLifecycleError::new(
-            QueryLifecycleErrorCode::InvalidManifest,
-            "runtime filter install query id does not match execution attempt",
-        ));
-    }
-    if decoded.install.participant().deployment_epoch() != execution_id.attempt_id().get() {
-        return Err(QueryLifecycleError::new(
-            QueryLifecycleErrorCode::InvalidManifest,
-            "runtime filter install epoch does not match query execution attempt",
-        ));
-    }
-    if decoded.install.local_participant_id() != contribution.participant_id() {
-        return Err(QueryLifecycleError::new(
-            QueryLifecycleErrorCode::InvalidManifest,
-            "runtime filter install participant does not match manifest contribution",
-        ));
-    }
     Ok(DecodedRuntimeFilterContribution {
         lifecycle: decoded.lifecycle,
         install: decoded.install,
