@@ -274,7 +274,6 @@ struct CommitUnknownOperation {
     aggregate_digest: [u8; 32],
     outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
     active: ActiveOperation,
-    request: ConnectorWriteCommitRequest,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1552,60 +1551,6 @@ impl IcebergWriteControl {
         Ok(super::CleanupAttempt::from_cleanup_errors(&cleanup))
     }
 
-    fn cleanup_operation_manifests(
-        &self,
-        target: &ActiveTarget,
-        token: &str,
-    ) -> Result<super::CleanupAttempt, String> {
-        let metadata_dir = format!("{}/metadata", target.location.trim_end_matches('/'));
-        let binding = self.runtime.resources().planning_binding();
-        let access = binding
-            .resolve_access_for_locations([metadata_dir.as_str()])
-            .map_err(|error| error.to_string())?;
-        let relative_paths = access.operator_relative_paths();
-        let [relative_dir] = relative_paths.as_slice() else {
-            return Err(
-                "resolve Iceberg manifest cleanup directory: expected exactly one path".to_string(),
-            );
-        };
-        let prefix = format!("{}/", relative_dir.trim_end_matches('/'));
-        let operator = access.operator();
-        let token = token.to_string();
-        let error_paths = self
-            .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                let entries = match operator.list(&prefix).await {
-                    Ok(entries) => entries,
-                    Err(error) if error.kind() == crate::opendal::ErrorKind::NotFound => {
-                        return Ok::<_, String>(Vec::new());
-                    }
-                    Err(error) => {
-                        return Err(format!(
-                            "list Iceberg operation manifest prefix `{prefix}`: {error}"
-                        ));
-                    }
-                };
-                let mut errors = Vec::new();
-                for entry in entries {
-                    if entry.metadata().is_dir() {
-                        continue;
-                    }
-                    let Some(name) = entry.path().rsplit('/').next() else {
-                        continue;
-                    };
-                    if operation_manifest_name_owned(name, &token)
-                        && let Err(error) = operator.delete(entry.path()).await
-                    {
-                        errors.push(format!("{}: {error}", entry.path()));
-                    }
-                }
-                Ok(errors)
-            })??;
-        Ok(super::CleanupAttempt::completed(error_paths))
-    }
-
     /// Seal provider recovery facts into the exact-generation SPI envelope.
     /// The provider commit action calls this only after it has classified an
     /// external commit result as uncertain.
@@ -2086,7 +2031,6 @@ impl ConnectorWriteControl for IcebergWriteControl {
                     aggregate_digest: request.aggregate_digest(),
                     outcome: outcome.clone(),
                     active: *active.clone(),
-                    request: request.clone(),
                 })
             }
         };
@@ -2383,7 +2327,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
             table.metadata().snapshots().map(Arc::as_ref),
             &expected_marker,
         )?;
-        let (outcome, known_uncommitted_finalization) = if let Some(snapshot) = matched_snapshot {
+        let outcome = if let Some(snapshot) = matched_snapshot {
             let row_count = match &unknown.active.activation_intent {
                 ConnectorWriteActivationIntent::ManagedPublication(expected) => {
                     let provenance = super::MvProvenanceV1::from_snapshot_summary(snapshot)
@@ -2425,54 +2369,28 @@ impl ConnectorWriteControl for IcebergWriteControl {
                     Ok(actual)
                 })
                 .transpose()?;
-            (
-                ExternalMutationOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    receipt: crate::write_codec::connector_write_receipt_with_partitioning(
-                        snapshot.snapshot_id(),
-                        row_count,
-                        committed_partitioning,
-                    )
-                    .map_err(internal)?,
-                    finalization: ExternalMutationFinalization::Complete,
-                },
-                None,
-            )
+            ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::Applied,
+                receipt: crate::write_codec::connector_write_receipt_with_partitioning(
+                    snapshot.snapshot_id(),
+                    row_count,
+                    committed_partitioning,
+                )
+                .map_err(internal)?,
+                finalization: ExternalMutationFinalization::Complete,
+            }
         } else {
-            let decode_metadata = unknown
-                .active
-                .partition_replacement
-                .as_ref()
-                .map(|replacement| &replacement.prospective_metadata)
-                .unwrap_or_else(|| table.metadata());
-            let decoded =
-                self.decode_commit_cohorts(&unknown.request, &unknown.active, decode_metadata)?;
-            let files = decoded
-                .into_iter()
-                .flat_map(|cohort| cohort.files)
-                .collect::<Vec<_>>();
-            let data_cleanup = self.cleanup_files(&files).map_err(internal)?;
-            let manifest_cleanup = evidence
-                .recovery
-                .manifest_cleanup_token
-                .as_deref()
-                .map(|token| self.cleanup_operation_manifests(&unknown.active.target, token))
-                .transpose()
-                .map_err(internal)?
-                .unwrap_or_else(super::CleanupAttempt::not_attempted);
-            let cleanup = merge_cleanup_attempts(data_cleanup, manifest_cleanup);
-            (
-                ExternalMutationOutcome::KnownUncommitted {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Conflict,
-                        format!(
-                            "Iceberg write operation marker is absent; staged cleanup errors={}",
-                            cleanup.error_count
-                        ),
-                    ),
-                },
-                Some(cleanup_finalization(&cleanup)),
-            )
+            // Marker absence is not proof that an externally dispatched
+            // publication did not commit. Reconciliation is read-only: leave
+            // the exact commit-unknown state and all provider-owned staged
+            // objects untouched for independent inspection or later GC.
+            return Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "Iceberg write operation marker is absent during read-only adjudication",
+                ),
+                evidence: request.evidence,
+            });
         };
         let mut operations = self.operations.lock().map_err(operation_lock_error)?;
         match &outcome {
@@ -2486,50 +2404,13 @@ impl ConnectorWriteControl for IcebergWriteControl {
                     }),
                 );
             }
-            ExternalMutationOutcome::KnownUncommitted { .. } => {
-                operations.insert(
-                    operation_id,
-                    OperationState::KnownUncommitted(KnownUncommittedOperation {
-                        cohort_set_digest: request.cohort_set_digest,
-                        aggregate_digest: request.aggregate_digest,
-                        outcome: ConnectorWriteAbortOutcome::KnownUncommitted {
-                            cleanup: known_uncommitted_finalization.clone().ok_or_else(|| {
-                                internal(
-                                    "Iceberg reconciled known-uncommitted operation is missing cleanup finalization",
-                                )
-                            })?,
-                        },
-                    }),
-                );
-            }
-            ExternalMutationOutcome::CommitUnknown { .. } => unreachable!(),
+            ExternalMutationOutcome::KnownUncommitted { .. }
+            | ExternalMutationOutcome::CommitUnknown { .. } => unreachable!(),
         }
         drop(operations);
         self.activations.release(operation_id)?;
         Ok(outcome)
     }
-}
-
-fn operation_manifest_name_owned(name: &str, token: &str) -> bool {
-    let manifest_prefix = format!("{token}-");
-    if let Some(rest) = name.strip_prefix(&manifest_prefix) {
-        return rest.ends_with(".avro")
-            && [
-                "append-data-",
-                "overwrite-",
-                "row-delta-",
-                "rewrite-",
-                "cow-update-",
-                "truncate-",
-                "selected-rewrite-",
-            ]
-            .iter()
-            .any(|prefix| rest.starts_with(prefix));
-    }
-    let snapshot_suffix = format!("-{token}.avro");
-    name.strip_prefix("snap-")
-        .and_then(|rest| rest.strip_suffix(&snapshot_suffix))
-        .is_some_and(|snapshot_id| snapshot_id.parse::<i64>().is_ok())
 }
 
 fn ensure_reconcile_partition_facts(
@@ -3645,21 +3526,6 @@ fn cleanup_finalization(cleanup: &super::CleanupAttempt) -> ExternalMutationFina
     }
 }
 
-fn merge_cleanup_attempts(
-    left: super::CleanupAttempt,
-    right: super::CleanupAttempt,
-) -> super::CleanupAttempt {
-    let mut error_paths = left.error_paths;
-    error_paths.extend(right.error_paths);
-    error_paths.sort();
-    error_paths.dedup();
-    super::CleanupAttempt {
-        attempted: left.attempted || right.attempted,
-        error_count: error_paths.len(),
-        error_paths,
-    }
-}
-
 fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
     if context.cancellation().is_cancelled() {
         return Err(ConnectorError::new(
@@ -4592,7 +4458,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_unknown_marker_absent_cleans_exact_data_and_manifest_paths() {
+    fn commit_unknown_marker_absent_preserves_provider_owned_staged_objects() {
         let (executor, _warehouse, control, table) = control_with_empty_table();
         let owner = control.binding_key().clone();
         let operation_id = ConnectorWriteOperationId::from_bytes([22; 16]);
@@ -4803,7 +4669,6 @@ mod tests {
                 aggregate_digest,
                 outcome,
                 active: *active,
-                request,
             }),
         );
 
@@ -4819,20 +4684,20 @@ mod tests {
             .expect("reconcile marker-absent operation");
         assert!(matches!(
             reconciled,
-            ExternalMutationOutcome::KnownUncommitted { .. }
+            ExternalMutationOutcome::CommitUnknown { .. }
         ));
         for path in &staged_paths {
             assert!(
-                !executor
+                executor
                     .block_on(
                         table
                             .file_io()
                             .new_input(path)
-                            .expect("cleaned input")
+                            .expect("staged input")
                             .exists()
                     )
-                    .expect("cleaned existence"),
-                "reconcile left staged object {path}"
+                    .expect("staged existence"),
+                "read-only adjudication deleted staged object {path}"
             );
         }
         assert!(

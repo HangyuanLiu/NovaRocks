@@ -33,13 +33,13 @@ use novarocks_spi::connector::{
     ConnectorPartitionTransform, ConnectorRequestContext, ConnectorStagedCreate,
     ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
     ConnectorStagedCreateOperationId, ConnectorStagedCreatePrepareOutcome,
-    ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublishOutcome,
+    ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublicationAdjudicationOutcome,
+    ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublishOutcome,
     ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
-    ConnectorStagedCreateReceiptPhase, ConnectorStagedCreateReconcileOutcome,
-    ConnectorStagedCreateReconcilePhase, ConnectorStagedCreateReconcileRequest,
-    ConnectorStagedTableHandle, ConnectorStagedWritePlanningBinding,
-    ConnectorStagedWritePlanningRequest, ConnectorWriteControl, ConnectorWriteOperationCompletion,
-    CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
+    ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
+    ConnectorWriteControl, ConnectorWriteOperationCompletion, CreatePolicy, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -375,7 +375,8 @@ enum OperationState {
     Prepared(PreparedOperation),
     Published,
     Aborted,
-    Unknown(UnknownOperation),
+    Unknown,
+    PublicationUnknown(PublicationUnknownOperation),
 }
 
 #[derive(Clone)]
@@ -398,10 +399,9 @@ struct StagedWrite {
 }
 
 #[derive(Clone)]
-struct UnknownOperation {
-    phase: ConnectorStagedCreateReconcilePhase,
+struct PublicationUnknownOperation {
     evidence_digest: [u8; 32],
-    prepared: Option<PreparedOperation>,
+    prepared: PreparedOperation,
 }
 
 type StagedCreateAction = (Vec<TableUpdate>, Option<i64>, Arc<AbortLog>);
@@ -483,7 +483,7 @@ impl IcebergStagedCreateAdapter {
     fn evidence(
         &self,
         operation_id: ConnectorStagedCreateOperationId,
-        phase: ConnectorStagedCreateReconcilePhase,
+        operation_kind: &'static str,
         payload: Bytes,
     ) -> Result<ExternalMutationEvidence, ConnectorError> {
         ExternalMutationEvidence::try_new(
@@ -491,7 +491,7 @@ impl IcebergStagedCreateAdapter {
             self.descriptor.clone(),
             self.incarnation,
             operation_id,
-            operation_kind(phase),
+            operation_kind,
             payload,
         )
     }
@@ -515,11 +515,7 @@ impl IcebergStagedCreateAdapter {
         })
         .map(Bytes::from)
         .map_err(|error| internal(format!("encode staged-create publish evidence: {error}")))?;
-        self.evidence(
-            dispatch_operation_id,
-            ConnectorStagedCreateReconcilePhase::Publish,
-            payload,
-        )
+        self.evidence(dispatch_operation_id, "staged-create-publish", payload)
     }
 
     fn record_terminal(
@@ -533,17 +529,19 @@ impl IcebergStagedCreateAdapter {
             .insert(operation_id, state);
     }
 
-    fn set_unknown(
+    fn set_unknown(&self, operation_id: ConnectorStagedCreateOperationId) {
+        self.record_terminal(operation_id, OperationState::Unknown);
+    }
+
+    fn set_publication_unknown(
         &self,
         operation_id: ConnectorStagedCreateOperationId,
-        phase: ConnectorStagedCreateReconcilePhase,
         evidence: &ExternalMutationEvidence,
-        prepared: Option<PreparedOperation>,
+        prepared: PreparedOperation,
     ) {
         self.record_terminal(
             operation_id,
-            OperationState::Unknown(UnknownOperation {
-                phase,
+            OperationState::PublicationUnknown(PublicationUnknownOperation {
                 evidence_digest: evidence.digest(),
                 prepared,
             }),
@@ -851,15 +849,10 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 {
                     let evidence = self.evidence(
                         request.operation_id,
-                        ConnectorStagedCreateReconcilePhase::Prepare,
+                        "staged-create-prepare",
                         Bytes::copy_from_slice(&request.operation_id.to_bytes()),
                     )?;
-                    self.set_unknown(
-                        request.operation_id,
-                        ConnectorStagedCreateReconcilePhase::Prepare,
-                        &evidence,
-                        None,
-                    );
+                    self.set_unknown(request.operation_id);
                     return Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown {
                         failure: ConnectorMutationFailure::new(
                             ConnectorMutationFailureKind::Unavailable,
@@ -925,15 +918,10 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             Err(RestStagedPrepareFailure::CommitUnknown(message)) => {
                 let evidence = self.evidence(
                     request.operation_id,
-                    ConnectorStagedCreateReconcilePhase::Prepare,
+                    "staged-create-prepare",
                     Bytes::copy_from_slice(&request.operation_id.to_bytes()),
                 )?;
-                self.set_unknown(
-                    request.operation_id,
-                    ConnectorStagedCreateReconcilePhase::Prepare,
-                    &evidence,
-                    None,
-                );
+                self.set_unknown(request.operation_id);
                 Ok(ConnectorStagedCreatePrepareOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
                         ConnectorMutationFailureKind::Unavailable,
@@ -1149,12 +1137,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     &prepared,
                     expected_snapshot_id,
                 )?;
-                self.set_unknown(
-                    operation_id,
-                    ConnectorStagedCreateReconcilePhase::Publish,
-                    &evidence,
-                    Some(prepared),
-                );
+                self.set_publication_unknown(operation_id, &evidence, prepared);
                 Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
                         ConnectorMutationFailureKind::Unavailable,
@@ -1203,12 +1186,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     &prepared,
                     expected_snapshot_id,
                 )?;
-                self.set_unknown(
-                    operation_id,
-                    ConnectorStagedCreateReconcilePhase::Publish,
-                    &evidence,
-                    Some(prepared),
-                );
+                self.set_publication_unknown(operation_id, &evidence, prepared);
                 Ok(ConnectorStagedCreatePublishOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
                         ConnectorMutationFailureKind::Unavailable,
@@ -1293,17 +1271,17 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         })
     }
 
-    fn reconcile(
+    fn adjudicate_publication(
         &self,
-        request: ConnectorStagedCreateReconcileRequest,
-    ) -> Result<ConnectorStagedCreateReconcileOutcome, ConnectorError> {
+        request: ConnectorStagedCreatePublicationAdjudicationRequest,
+    ) -> Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError> {
         Self::validate_context(&request.context)?;
         if request.evidence.descriptor() != &self.descriptor
             || request.evidence.incarnation() != self.incarnation
-            || request.evidence.operation_kind() != operation_kind(request.phase)
+            || request.evidence.operation_kind() != "staged-create-publish"
         {
             return Err(invalid(
-                "Iceberg staged-create reconcile evidence is foreign",
+                "Iceberg staged-create publication adjudication evidence is foreign",
             ));
         }
         let operation_id = request.target_operation_id;
@@ -1313,46 +1291,20 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 .operations
                 .lock()
                 .map_err(|error| internal(format!("staged-create operation lock: {error}")))?;
-            let Some(OperationState::Unknown(unknown)) = operations.get(&operation_id) else {
+            let Some(OperationState::PublicationUnknown(unknown)) = operations.get(&operation_id)
+            else {
                 return Err(invalid(
-                    "Iceberg staged-create reconcile requires the exact unresolved operation",
+                    "Iceberg staged-create publication adjudication requires the exact publish-unknown operation",
                 ));
             };
             unknown.clone()
         };
-        if unknown.phase != request.phase || unknown.evidence_digest != request.evidence.digest() {
+        if unknown.evidence_digest != request.evidence.digest() {
             return Err(invalid(
-                "Iceberg staged-create reconcile evidence digest or phase mismatch",
+                "Iceberg staged-create publication adjudication evidence digest mismatch",
             ));
         }
-        if request.phase == ConnectorStagedCreateReconcilePhase::Prepare {
-            return Ok(ConnectorStagedCreateReconcileOutcome::CommitUnknown {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Unavailable,
-                    "Iceberg staged-create prepare remains unresolved",
-                ),
-                evidence: request.evidence,
-            });
-        }
-        let Some(prepared) = unknown.prepared else {
-            return Err(invalid(
-                "Iceberg staged-create reconcile lost its exact prepared operation",
-            ));
-        };
-        if request.phase == ConnectorStagedCreateReconcilePhase::Abort {
-            let finalization = self.abort_prepared(&prepared);
-            let finalization = self.finish_write_terminal(&prepared, finalization);
-            self.record_terminal(operation_id, OperationState::Aborted);
-            return Ok(ConnectorStagedCreateReconcileOutcome::Aborted {
-                receipt: self.receipt(
-                    dispatch_operation_id,
-                    ConnectorStagedCreateReceiptPhase::Aborted,
-                    ExternalMutationEffect::Applied,
-                    Bytes::new(),
-                )?,
-                finalization,
-            });
-        }
+        let prepared = unknown.prepared;
         let evidence: PublishEvidenceV1 =
             serde_json::from_slice(request.evidence.provider_payload()).map_err(|error| {
                 invalid(format!(
@@ -1397,50 +1349,58 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 let finalization =
                     self.finish_write_terminal(&prepared, ExternalMutationFinalization::Complete);
                 self.record_terminal(operation_id, OperationState::Published);
-                Ok(ConnectorStagedCreateReconcileOutcome::Published {
-                    receipt,
-                    finalization,
-                })
+                Ok(
+                    ConnectorStagedCreatePublicationAdjudicationOutcome::Published {
+                        receipt,
+                        finalization,
+                    },
+                )
             }
-            Ok(Ok(table)) if table.metadata().uuid().to_string() != evidence.table_uuid => {
-                self.record_terminal(operation_id, OperationState::Prepared(prepared));
-                Ok(ConnectorStagedCreateReconcileOutcome::KnownUncommitted {
+            Ok(Ok(table)) if table.metadata().uuid().to_string() != evidence.table_uuid => Ok(
+                ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
                         ConnectorMutationFailureKind::Conflict,
                         "a different table is authoritative at the staged-create target",
                     ),
-                })
-            }
-            Ok(Ok(_)) => Ok(ConnectorStagedCreateReconcileOutcome::CommitUnknown {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Unavailable,
-                    "the target does not yet prove the exact staged-create publication",
-                ),
-                evidence: request.evidence,
-            }),
-            Ok(Err(error)) if error.kind() == ErrorKind::TableNotFound => {
-                self.record_terminal(operation_id, OperationState::Prepared(prepared));
-                Ok(ConnectorStagedCreateReconcileOutcome::KnownUncommitted {
+                    evidence: request.evidence,
+                },
+            ),
+            Ok(Ok(_)) => Ok(
+                ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        "the target does not yet prove the exact staged-create publication",
+                    ),
+                    evidence: request.evidence,
+                },
+            ),
+            Ok(Err(error)) if error.kind() == ErrorKind::TableNotFound => Ok(
+                ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
                         ConnectorMutationFailureKind::Unavailable,
                         "the staged-create target is authoritatively absent",
                     ),
-                })
-            }
-            Ok(Err(error)) => Ok(ConnectorStagedCreateReconcileOutcome::CommitUnknown {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Unavailable,
-                    format!("authoritative staged-create reload failed: {error}"),
-                ),
-                evidence: request.evidence,
-            }),
-            Err(error) => Ok(ConnectorStagedCreateReconcileOutcome::CommitUnknown {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Unavailable,
-                    format!("authoritative staged-create reload runtime failed: {error}"),
-                ),
-                evidence: request.evidence,
-            }),
+                    evidence: request.evidence,
+                },
+            ),
+            Ok(Err(error)) => Ok(
+                ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        format!("authoritative staged-create reload failed: {error}"),
+                    ),
+                    evidence: request.evidence,
+                },
+            ),
+            Err(error) => Ok(
+                ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
+                    failure: ConnectorMutationFailure::new(
+                        ConnectorMutationFailureKind::Unavailable,
+                        format!("authoritative staged-create reload runtime failed: {error}"),
+                    ),
+                    evidence: request.evidence,
+                },
+            ),
         }
     }
 }
@@ -1525,14 +1485,6 @@ fn failure_from_connector(error: ConnectorError) -> ConnectorMutationFailure {
         ConnectorErrorKind::Internal => ConnectorMutationFailureKind::Internal,
     };
     ConnectorMutationFailure::new(kind, error.to_string())
-}
-
-fn operation_kind(phase: ConnectorStagedCreateReconcilePhase) -> &'static str {
-    match phase {
-        ConnectorStagedCreateReconcilePhase::Prepare => "staged-create-prepare",
-        ConnectorStagedCreateReconcilePhase::Publish => "staged-create-publish",
-        ConnectorStagedCreateReconcilePhase::Abort => "staged-create-abort",
-    }
 }
 
 fn operation_marker(operation_id: ConnectorStagedCreateOperationId) -> String {
