@@ -31,6 +31,7 @@ use uuid::Uuid;
 
 pub mod command;
 pub mod create_table_ddl;
+pub mod desired_state;
 pub mod iceberg_ref_command;
 pub mod information_schema;
 pub mod model;
@@ -43,6 +44,11 @@ pub mod system_catalog;
 pub mod virtual_table;
 
 pub mod frontend_port;
+pub use desired_state::{
+    CatalogCredentialReference, CatalogDesiredStateEntry, CatalogDesiredStateSnapshot,
+    CatalogDesiredStateSnapshotIdentity, CatalogDesiredStateSource, CatalogDesiredStateSourceMode,
+    CatalogLogicalConfig, CatalogSourceEntryIdentity, CatalogSqlMutationAdmission,
+};
 pub use frontend_port::FrontendCatalogApplicationPort;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,6 +119,26 @@ pub enum CatalogApplicationErrorKind {
     Conflict,
     Unavailable,
     Internal,
+    /// The selected catalog desired-state source mode does not admit the
+    /// requested operation.
+    ///
+    /// Distinct from `InvalidRequest` because the request is well formed and
+    /// would be admitted by another deployment: what refuses it is this
+    /// deployment's choice of desired-state authority. Retrying, rephrasing, or
+    /// waiting cannot help — either the operator reconfigures the source or the
+    /// change goes to whichever authority owns it.
+    UnsupportedSourceMode,
+    /// The selected source could not deliver one complete, trustworthy
+    /// enumeration of catalog desired state.
+    ///
+    /// Deliberately its own kind, and deliberately never reported as a snapshot
+    /// holding zero catalogs: a reconcile treats every catalog missing from a
+    /// snapshot as no longer wanted, so an enumeration failure that degraded
+    /// into an empty snapshot would retire every catalog in the deployment. The
+    /// blast radius is global — the frontend must not become serviceable — as
+    /// opposed to one catalog failing to materialize, which reports
+    /// `Unavailable` for that catalog alone.
+    DesiredStateEnumerationIncomplete,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -128,6 +128,16 @@ impl CatalogAttachmentRepository {
             .await
     }
 
+    /// Enumerates the complete attachment prefix, or fails.
+    ///
+    /// This is the dynamic StateStore mode's snapshot-enumeration entry point,
+    /// and the "complete or fail" shape is what its caller depends on: a
+    /// catalog desired-state snapshot is total truth, so a reconcile retires
+    /// every catalog the enumeration did not return. Returning the pages that
+    /// happened to read successfully would therefore delete catalogs nobody
+    /// asked to remove. Every failure below — a page read, an undecodable
+    /// record, an unsupported record version — aborts the whole enumeration
+    /// instead of shortening it.
     pub async fn list_with_page_size(
         &self,
         page_size: usize,
