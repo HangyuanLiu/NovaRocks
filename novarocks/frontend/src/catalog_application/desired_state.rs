@@ -79,7 +79,7 @@ const DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION: u8 =
 /// The modes are mutually exclusive by construction: a deployment names one,
 /// and [`CatalogDesiredStateSource`] binds that one to an authority.  There is
 /// no merge of two modes into a dual authority and no runtime switch.
-// Design: ADR-0066 (docs/adr/ADR-0066-state-store-catalog-attachment-authority.md)
+// Design: ADR-0115 (docs/adr/ADR-0115-catalog-desired-state-source-modes.md)
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogDesiredStateSourceMode {
     /// StateStore attachment records are the desired-state authority, and SQL

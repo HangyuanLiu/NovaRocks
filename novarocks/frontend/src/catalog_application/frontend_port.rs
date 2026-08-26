@@ -95,7 +95,7 @@ impl LocalProjection {
 /// process. `None` means this frontend was composed without any source at all
 /// — a role that never serves external catalogs — which is a different thing
 /// from a source that exists and is failing.
-// Design: ADR-0066 (docs/adr/ADR-0066-state-store-catalog-attachment-authority.md)
+// Design: ADR-0115 (docs/adr/ADR-0115-catalog-desired-state-source-modes.md)
 pub struct FrontendCatalogApplicationPort {
     source: Option<CatalogDesiredStateSource>,
     control: Arc<ConnectorControlHost>,

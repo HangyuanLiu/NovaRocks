@@ -234,14 +234,32 @@ fencing/takeover 仍须单独裁决。
 
 ### catalog-attachment
 
-领域哲学：「集群挂了哪些外部 catalog」是 StateStore 里的单一权威事实，frontend 是它唯一的 owner；每个 FE
-把同一份 durable 记录派生成自己的只读运行时投影，查询热路径只读内存、绝不逐次访问共享存储。change hint 只是
-唤醒信号，拿到提示后一律重读权威记录，丢通知与 retention gap 都退化为有界全量重建。DDL 以 durable commit /
+领域哲学：「集群挂了哪些外部 catalog」是一份**精确全量的期望态快照**，来自三个互斥 source mode 之一
+（静态文件 / StateStore / 未来的 managed controller）；frontend 是它唯一的 owner，每个 FE 把同一份快照派生成
+自己的只读运行时投影，查询热路径只读内存、绝不逐次访问共享存储。StateStore 只是其中一个 mode，而不是通用真源。
+枚举不完整是全局失败（绝不退化成空快照），单个 catalog 物化失败只隔离该 catalog。change hint 只是唤醒信号，
+拿到提示后一律重读权威记录，丢通知与 retention gap 都退化为有界全量重建。DDL 以 durable commit /
 exact-version delete 为线性化点，发布本地 control generation 才让 SQL catalog 名可解析、撤销发布先于退役
 generation；`Absent`（未知）与 `Unavailable`（本机未物化）永远分开，store 不可用时 DDL 与超预算的 read
-admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。
+admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。跨 family 的同事务约束不可用：被读的一侧若是
+可清除的加速态，那个「保证」会在缓存被清空时静默消失。
 
-- ADR-0066 — 外部 catalog attachment 为何由 StateStore 单一持久化、各 FE 只派生只读投影（active）
+- ADR-0115 — catalog 期望态为何收敛为单一 typed 快照 + 三个互斥 source mode（active）
+- ADR-0116 — `DROP CATALOG` 的 MV 引用检查为何降级为 best-effort 运维保护（active）
+
+历史：
+
+- ADR-0066 — 外部 catalog attachment 为何由 StateStore 单一持久化、各 FE 只派生只读投影（superseded → ADR-0115）
+
+### frontend-state-families
+
+领域哲学：湖是用户数据与已发布语义的唯一共享真源，因此每一份 frontend 本地状态只可能是三类之一：外部期望态的
+投影、只属于当前进程/attempt 的运行态、可从外部权威确定性重建的加速态。第四类（既无外部真源、又要求持久）
+不允许存在。分类是编译期穷尽的闭合枚举，运行态在类型上无法携带持久前缀，持久前缀与记录版本只在 manifest 中
+定义一次；完成态的判据是扫描真实 store 内容，而不是检查源码里还有没有某个字面量。
+
+- ADR-0114 — frontend 本地状态为何采用闭合三分类 manifest、且持久前缀只在 manifest 定义（active）
+- ADR-0117 — 本地 view registry 为何是进程运行态而非 frontend durable 真源（active）
 
 ### frontend-durable-records
 

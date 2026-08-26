@@ -172,7 +172,7 @@ impl std::error::Error for CatalogApplicationError {}
 ///
 /// Implemented by Frontend. Core must not downcast this port to access an
 /// attachment repository, control host, registry, or provider handle.
-// Design: ADR-0066 (docs/adr/ADR-0066-state-store-catalog-attachment-authority.md)
+// Design: ADR-0115 (docs/adr/ADR-0115-catalog-desired-state-source-modes.md)
 pub trait CatalogApplicationPort: Send + Sync {
     fn create_catalog(
         &self,
@@ -231,7 +231,7 @@ impl QueryCatalogBinding {
 /// installed and unpublishes before retiring it. Core wraps the Frontend
 /// application port with this set so a stale or partially installed local
 /// projection can never be admitted into query materialization.
-// Design: ADR-0066 (docs/adr/ADR-0066-state-store-catalog-attachment-authority.md)
+// Design: ADR-0115 (docs/adr/ADR-0115-catalog-desired-state-source-modes.md)
 pub struct CatalogRuntimeProjection {
     published: Mutex<BTreeMap<ConnectorInstanceId, CatalogRuntimeObservation>>,
     query_catalog: Mutex<Option<QueryCatalogBinding>>,

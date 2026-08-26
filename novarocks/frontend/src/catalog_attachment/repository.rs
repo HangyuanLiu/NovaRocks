@@ -91,7 +91,7 @@ impl fmt::Display for CatalogAttachmentError {
 
 impl std::error::Error for CatalogAttachmentError {}
 
-// Design: ADR-0066 (docs/adr/ADR-0066-state-store-catalog-attachment-authority.md)
+// Design: ADR-0115 (docs/adr/ADR-0115-catalog-desired-state-source-modes.md)
 #[derive(Clone)]
 pub struct CatalogAttachmentRepository {
     store: Arc<dyn StateStore>,
