@@ -316,7 +316,7 @@ pub(crate) mod transaction;
 /// updates arrive after the writer runs. Admission here is the identity and
 /// name check, which is exactly the work that must happen before a source
 /// executes.
-pub(crate) fn start_update_table_transaction(
+fn start_update_table_transaction(
     delegate: &delegate::CatalogDelegate,
     request: transaction::TransactionRequest,
 ) -> CatalogTransactionStart {
@@ -345,14 +345,14 @@ pub(crate) fn start_update_table_transaction(
     CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(
         request.identity,
         request.target,
-        transaction::TransactionShape::ExistingTable,
+        transaction::TransactionShape::Existing,
         evidence,
         dispatch,
     )))
 }
 
 /// Begin a publication that creates a table through one catalog request.
-pub(crate) fn start_create_table_transaction(
+fn start_create_table_transaction(
     delegate: &delegate::CatalogDelegate,
     request: transaction::CreateTableTransactionRequest,
 ) -> CatalogTransactionStart {
@@ -389,7 +389,7 @@ pub(crate) fn start_create_table_transaction(
     CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(
         request.identity,
         request.target,
-        transaction::TransactionShape::CreateTable(request.intent),
+        transaction::TransactionShape::Create(request.intent),
         evidence,
         dispatch,
     )))

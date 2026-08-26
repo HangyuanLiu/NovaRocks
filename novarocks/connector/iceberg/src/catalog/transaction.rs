@@ -164,9 +164,9 @@ pub(crate) trait CatalogCommitDispatch: std::fmt::Debug + Send + Sync {
 /// callers above see one lifecycle rather than four.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TransactionShape {
-    ExistingTable,
-    CreateTable(CatalogCreateIntent),
-    CreateOrReplaceTable,
+    Existing,
+    Create(CatalogCreateIntent),
+    CreateOrReplace,
 }
 
 /// Where the single frontier currently stands.
@@ -499,7 +499,7 @@ mod tests {
         Transaction::new(
             TransactionIdentity::new("test", [7u8; 16]),
             CatalogTableName::new("db", "t"),
-            TransactionShape::ExistingTable,
+            TransactionShape::Existing,
             CatalogCommitEvidence::for_target("db.t").with_commit_uuid("commit-uuid"),
             dispatch,
         )
