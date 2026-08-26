@@ -53,7 +53,13 @@
 // single-authority cut removes this attribute; it must not survive the PR.
 #![allow(dead_code)]
 
+pub(crate) mod delegate;
+pub(crate) mod dispatch;
 pub(crate) mod error;
+pub(crate) mod factory;
+pub(crate) mod hadoop;
+pub(crate) mod hive;
+pub(crate) mod rest;
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -266,10 +272,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     ///
     /// This removes catalog visibility only. Object deletion is the filesystem
     /// owner's job and may only proceed on `KnownCommitted`; see ADR-0110.
-    async fn drop_table(
-        &self,
-        table: CatalogTableName,
-    ) -> CatalogOutcome<CatalogDropTableReceipt>;
+    async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt>;
 
     /// Anchor an already-written metadata file into the catalog.
     ///
@@ -306,3 +309,88 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
 }
 
 pub(crate) mod transaction;
+
+/// Begin a publication against an existing table.
+///
+/// Every catalog shares this: the frontier is one `update_table`, and the
+/// updates arrive after the writer runs. Admission here is the identity and
+/// name check, which is exactly the work that must happen before a source
+/// executes.
+pub(crate) fn start_update_table_transaction(
+    delegate: &delegate::CatalogDelegate,
+    request: transaction::TransactionRequest,
+) -> CatalogTransactionStart {
+    let ident = match delegate::table_ident(&request.target) {
+        Ok(ident) => ident,
+        Err(error) => {
+            return CatalogTransactionStart::KnownUncommitted {
+                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
+                    error.to_string(),
+                ),
+            };
+        }
+    };
+    let mut evidence = error::CatalogCommitEvidence::for_target(request.target.canonical())
+        .with_target_ref(Arc::clone(&request.target_ref))
+        .with_base_snapshot_id(request.base_snapshot_id);
+    if let Some(uuid) = &request.expected_table_uuid {
+        evidence = evidence.with_target_uuid(Arc::clone(uuid));
+    }
+    let dispatch = Arc::new(dispatch::UpdateTableDispatch::new(
+        Arc::clone(delegate.client()),
+        ident,
+        request.marker.clone(),
+    ));
+    CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(
+        request.identity,
+        request.target,
+        transaction::TransactionShape::ExistingTable,
+        evidence,
+        dispatch,
+    )))
+}
+
+/// Begin a publication that creates a table through one catalog request.
+pub(crate) fn start_create_table_transaction(
+    delegate: &delegate::CatalogDelegate,
+    request: transaction::CreateTableTransactionRequest,
+) -> CatalogTransactionStart {
+    let namespace = CatalogNamespaceName::new(Arc::clone(&request.target.namespace));
+    let namespace_ident = match delegate::namespace_ident(&namespace) {
+        Ok(ident) => ident,
+        Err(error) => {
+            return CatalogTransactionStart::KnownUncommitted {
+                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
+                    error.to_string(),
+                ),
+            };
+        }
+    };
+    let table_ident = match delegate::table_ident(&request.target) {
+        Ok(ident) => ident,
+        Err(error) => {
+            return CatalogTransactionStart::KnownUncommitted {
+                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
+                    error.to_string(),
+                ),
+            };
+        }
+    };
+    let evidence = error::CatalogCommitEvidence::for_target(request.target.canonical());
+    let dispatch = Arc::new(dispatch::CreateTableDispatch::new(
+        Arc::clone(delegate.client()),
+        namespace_ident,
+        request.creation,
+        table_ident,
+    ));
+    CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(
+        request.identity,
+        request.target,
+        transaction::TransactionShape::CreateTable(request.intent),
+        evidence,
+        dispatch,
+    )))
+}

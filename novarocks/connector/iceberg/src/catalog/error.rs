@@ -312,7 +312,10 @@ pub(crate) fn classify_bridge_failure<T>(
     message: &str,
     evidence: CatalogCommitEvidence,
 ) -> CatalogOutcome<T> {
-    CatalogOutcome::unknown(format!("Iceberg catalog runtime bridge: {message}"), evidence)
+    CatalogOutcome::unknown(
+        format!("Iceberg catalog runtime bridge: {message}"),
+        evidence,
+    )
 }
 
 #[cfg(test)]

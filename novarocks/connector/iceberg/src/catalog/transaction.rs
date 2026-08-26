@@ -52,6 +52,24 @@ use super::error::{
 };
 use super::{CatalogCreateIntent, CatalogTableName};
 
+/// Updates a publication will apply, supplied between admission and commit.
+///
+/// Existing-table publications only know what they are writing after the
+/// writer has run, which is the whole reason admission and dispatch are
+/// separate steps: the catalog proves it can publish *before* the source
+/// executes, and the staged result arrives later. Creations stage nothing.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StagedCommit {
+    pub(crate) updates: Vec<crate::iceberg::TableUpdate>,
+    pub(crate) requirements: Vec<crate::iceberg::TableRequirement>,
+}
+
+impl StagedCommit {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.updates.is_empty()
+    }
+}
+
 /// The exact identity a publication attempt is bound to.
 ///
 /// # On the identity type
@@ -124,7 +142,10 @@ pub(crate) trait CatalogCommitDispatch: std::fmt::Debug + Send + Sync {
     /// Implementations must not retry, must not fall back to a second request,
     /// and must not consult `Error::retryable()`. Returning `Err` hands the
     /// dispatch question to [`super::error::proves_uncommitted`].
-    async fn dispatch_once(&self) -> Result<CommitProof, crate::iceberg::Error>;
+    async fn dispatch_once(
+        &self,
+        staged: StagedCommit,
+    ) -> Result<CommitProof, crate::iceberg::Error>;
 
     /// Re-read the catalog and report whether this exact publication is
     /// present.
@@ -169,14 +190,26 @@ pub(crate) struct TransactionRequest {
     pub(crate) target_ref: Arc<str>,
     pub(crate) base_snapshot_id: Option<i64>,
     pub(crate) expected_table_uuid: Option<Arc<str>>,
+    /// Snapshot-summary property that identifies this exact publication.
+    ///
+    /// Without one, a later adjudication cannot tell this attempt's snapshot
+    /// from anyone else's, so it refuses to answer rather than guessing.
+    pub(crate) marker: Option<(Arc<str>, Arc<str>)>,
 }
 
 /// Inputs for a transaction that creates a table.
-#[derive(Clone, Debug)]
+///
+/// Not `Clone`: the vendored `TableCreation` is not cloneable, and a creation
+/// request is consumed by exactly one attempt anyway.
+#[derive(Debug)]
 pub(crate) struct CreateTableTransactionRequest {
     pub(crate) identity: TransactionIdentity,
     pub(crate) target: CatalogTableName,
     pub(crate) intent: CatalogCreateIntent,
+    /// The full table definition. Creation has no caller-owned staging gap in
+    /// which to supply this later, so it is part of admission: a definition the
+    /// catalog cannot accept is refused before anything is attempted.
+    pub(crate) creation: crate::iceberg::TableCreation,
     /// Explicit warehouse root. CTAS admission requires one; empty-table
     /// creation may fall back to the catalog's own table location.
     pub(crate) warehouse: Option<Arc<str>>,
@@ -190,6 +223,7 @@ pub(crate) struct Transaction {
     shape: TransactionShape,
     evidence: CatalogCommitEvidence,
     dispatch: Arc<dyn CatalogCommitDispatch>,
+    staged: StagedCommit,
     state: TransactionState,
 }
 
@@ -207,6 +241,7 @@ impl Transaction {
             shape,
             evidence,
             dispatch,
+            staged: StagedCommit::default(),
             state: TransactionState::Admitted,
         }
     }
@@ -229,6 +264,24 @@ impl Transaction {
             self.state,
             TransactionState::Unknown(_) | TransactionState::Committed
         )
+    }
+
+    /// Supply the updates this publication will apply.
+    ///
+    /// Refused once the frontier has moved: re-staging after a dispatch would
+    /// mean publishing something other than what was admitted.
+    pub(crate) fn stage(&mut self, staged: StagedCommit) -> Result<(), ConnectorError> {
+        if !matches!(self.state, TransactionState::Admitted) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!(
+                    "Iceberg publication {} has already left admission; staging is refused",
+                    self.identity.hex()
+                ),
+            ));
+        }
+        self.staged = staged;
+        Ok(())
     }
 
     /// Publish, with exactly one external request.
@@ -275,7 +328,7 @@ impl Transaction {
             }
         }
 
-        match self.dispatch.dispatch_once().await {
+        match self.dispatch.dispatch_once(self.staged.clone()).await {
             Ok(proof) => {
                 self.state = TransactionState::Committed;
                 let effect = proof.effect;
@@ -334,7 +387,9 @@ impl Transaction {
     /// state unknown: a catalog that does not show the publication may simply
     /// not show it yet, and treating that as proof of absence is how orphaned
     /// data gets deleted while it is still live.
-    pub(crate) async fn adjudicate(&mut self) -> Result<CatalogOutcome<CommitProof>, ConnectorError> {
+    pub(crate) async fn adjudicate(
+        &mut self,
+    ) -> Result<CatalogOutcome<CommitProof>, ConnectorError> {
         let TransactionState::Unknown(evidence) = &self.state else {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -415,7 +470,7 @@ mod tests {
 
     #[async_trait]
     impl CatalogCommitDispatch for FakeDispatch {
-        async fn dispatch_once(&self) -> Result<CommitProof, IcebergError> {
+        async fn dispatch_once(&self, _staged: StagedCommit) -> Result<CommitProof, IcebergError> {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
                 Behavior::Succeed => Ok(CommitProof::applied(Some(41))),
