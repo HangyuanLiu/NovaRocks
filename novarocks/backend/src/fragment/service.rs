@@ -313,15 +313,48 @@ impl NativeFragmentService {
         let mut accepted = Vec::with_capacity(assignments.len());
         for assignment in assignments {
             match attempt.offer(assignment) {
-                Ok(outcome) => accepted.push(TaskUpdateAcceptedNode {
-                    plan_node_id: assignment.plan_node_id(),
-                    accepted_through_sequence: outcome.max_accepted_sequence.unwrap_or_default(),
-                    no_more_splits: outcome.no_more_splits,
-                    queued_splits: attempt
-                        .existing_queue(assignment.plan_node_id())
-                        .map(|queue| queue.stats().queued_splits as u64)
-                        .unwrap_or_default(),
-                }),
+                Ok(outcome) => {
+                    // Stable acceptance evidence for distributed acceptance
+                    // runs: it proves a real remote assignment reached this
+                    // task, which a single-process smoke cannot show.
+                    if crate::config::debug_emit_connector_reader_marker() {
+                        println!(
+                            "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED execution_id={}:{}:{} finst={:x}:{:x} plan_node={} enqueued={} replayed={} accepted_through={}",
+                            execution_id.query_id().high(),
+                            execution_id.query_id().low(),
+                            execution_id.attempt_id().get(),
+                            fragment_instance_id.high(),
+                            fragment_instance_id.low(),
+                            assignment.plan_node_id(),
+                            outcome.enqueued.len(),
+                            outcome.replayed.len(),
+                            outcome.max_accepted_sequence.unwrap_or_default(),
+                        );
+                        if outcome.no_more_splits {
+                            println!(
+                                "NOVAROCKS_TASK_SPLIT_NO_MORE execution_id={}:{}:{} finst={:x}:{:x} plan_node={}",
+                                execution_id.query_id().high(),
+                                execution_id.query_id().low(),
+                                execution_id.attempt_id().get(),
+                                fragment_instance_id.high(),
+                                fragment_instance_id.low(),
+                                assignment.plan_node_id(),
+                            );
+                        }
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
+                    accepted.push(TaskUpdateAcceptedNode {
+                        plan_node_id: assignment.plan_node_id(),
+                        accepted_through_sequence: outcome
+                            .max_accepted_sequence
+                            .unwrap_or_default(),
+                        no_more_splits: outcome.no_more_splits,
+                        queued_splits: attempt
+                            .existing_queue(assignment.plan_node_id())
+                            .map(|queue| queue.stats().queued_splits as u64)
+                            .unwrap_or_default(),
+                    });
+                }
                 Err(error) => {
                     // A partially applied update is still reported: the queue
                     // itself is all-or-nothing per assignment, so the sender
