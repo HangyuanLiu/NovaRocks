@@ -1294,6 +1294,15 @@ struct BackendTopologyRow {
     status_detail: String,
 }
 
+impl BackendTopologyRow {
+    fn is_eligible_live(&self) -> bool {
+        self.state == "Live"
+            && self.alive
+            && !self.build_identity.is_empty()
+            && self.status_detail.is_empty()
+    }
+}
+
 fn parse_frontend_show_backends_values(values: &[String]) -> Result<BackendTopologyRow> {
     let process_id = values
         .first()
@@ -1520,12 +1529,7 @@ fn validate_live_backend_topology(
     let expected = expected_ports.len();
     let live_rows = rows
         .iter()
-        .filter(|row| {
-            row.state == "Live"
-                && row.alive
-                && !row.build_identity.is_empty()
-                && row.status_detail.is_empty()
-        })
+        .filter(|row| row.is_eligible_live())
         .collect::<Vec<_>>();
     let live = live_rows.len();
     let identities = live_rows
@@ -3551,7 +3555,7 @@ impl ServerHandle for CrossProcessServerHandle {
             TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
         )?;
         rows.into_iter()
-            .find(|row| row.grpc_port == grpc_port)
+            .find(|row| row.grpc_port == grpc_port && row.is_eligible_live())
             .map(|row| row.scheduled_fragments)
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -3570,7 +3574,7 @@ impl ServerHandle for CrossProcessServerHandle {
             TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
         )?
         .into_iter()
-        .find(|row| row.grpc_port == grpc_port)
+        .find(|row| row.grpc_port == grpc_port && row.is_eligible_live())
         .map(|row| row.process_id)
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -3810,8 +3814,9 @@ impl ServerHandle for CrossProcessServerHandle {
             )
             .ok()
             .and_then(|rows| {
-                rows.into_iter()
-                    .find(|row| row.grpc_port == self.be_grpc_ports[index])
+                rows.into_iter().find(|row| {
+                    row.grpc_port == self.be_grpc_ports[index] && row.is_eligible_live()
+                })
             });
             if observed
                 .as_ref()
@@ -4800,6 +4805,11 @@ mod tests {
         ];
         validate_live_backend_topology(&expected, &retained_replacement)
             .expect("a retained replaced process must not alter the live topology");
+        let selected = retained_replacement
+            .iter()
+            .find(|row| row.grpc_port == 19071 && row.is_eligible_live())
+            .expect("the replacement endpoint must select its current eligible process");
+        assert_eq!(selected.process_id, "01900000-0000-7000-8000-000000004a7f");
     }
 
     #[test]
