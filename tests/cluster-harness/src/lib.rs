@@ -3567,20 +3567,25 @@ impl ServerHandle for CrossProcessServerHandle {
     fn backend_process_id(&self, index: usize) -> Result<String> {
         self.ensure_be_index(index)?;
         let grpc_port = self.be_grpc_ports[index];
-        query_frontend_backend_topology(
+        let rows = query_frontend_backend_topology(
             &self.mysql_user,
             &self.target_host,
             self.target_port,
             TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
-        )?
-        .into_iter()
-        .find(|row| row.grpc_port == grpc_port && row.is_eligible_live())
-        .map(|row| row.process_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "SHOW BACKENDS has no row for cross-process BE[{index}] grpc_port={grpc_port}"
-            )
-        })
+        )?;
+        rows.iter()
+            .find(|row| row.grpc_port == grpc_port && row.is_eligible_live())
+            // During a deliberate drain, no live entry exists. The retained
+            // diagnostic identity is only the old-value comparison for the
+            // following replacement; it is never returned while a live entry
+            // for this endpoint exists.
+            .or_else(|| rows.iter().find(|row| row.grpc_port == grpc_port))
+            .map(|row| row.process_id.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "SHOW BACKENDS has no row for cross-process BE[{index}] grpc_port={grpc_port}"
+                )
+            })
     }
 
     fn arm_fragment_executor_failure(&mut self, index: usize) -> Result<()> {
