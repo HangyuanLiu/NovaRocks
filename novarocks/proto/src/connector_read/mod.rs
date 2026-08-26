@@ -6,6 +6,7 @@
 //! not own connector semantics: a provider variant is carried and validated
 //! structurally, and only the provider that produced it interprets it.
 
+mod execution;
 mod handle;
 mod predicate;
 mod scan;
@@ -13,6 +14,11 @@ mod split;
 mod task_update;
 mod value;
 
+pub use execution::{
+    TypedConnectorPageSourceProvider, TypedConnectorSplitManager, TypedConnectorSplitSource,
+    TypedConnectorSystemTableProvider, WireConstraint, WireDynamicFilter,
+    WireDynamicFilterSnapshot,
+};
 pub use handle::{
     CatalogTableHandle, ConnectorRelation, ConnectorRelationKind, TableExecuteProcedure,
     ValidatedConnectorChangeWindowHandle, ValidatedConnectorMergeTableHandle,
