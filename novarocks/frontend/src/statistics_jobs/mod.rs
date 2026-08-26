@@ -15,11 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Versioned frontend persistence for durable statistics jobs.
-//!
-//! This module is intentionally independent from the legacy in-memory
-//! `statistics` service. A later worker supplies a StateStore lease-fence
-//! validator to every mutating call before the job record is changed.
+//! Current-process frontend statistics jobs.
 
 pub mod application;
 pub(crate) mod attempt_executor;

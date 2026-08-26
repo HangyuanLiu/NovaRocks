@@ -603,12 +603,6 @@ pub struct StatisticsPublishPreparationRequest {
     pub context: ConnectorRequestContext,
 }
 
-#[derive(Clone)]
-pub struct StatisticsReconcileRequest {
-    pub evidence: ExternalMutationEvidence,
-    pub context: ConnectorRequestContext,
-}
-
 #[derive(Clone, Eq, PartialEq)]
 pub struct StatisticsReceipt {
     descriptor: ConnectorInstanceDescriptor,
@@ -701,10 +695,6 @@ pub trait StatisticsCollection: Send + Sync {
     fn publish_statistics(
         &self,
         request: StatisticsPublishRequest,
-    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError>;
-    fn reconcile_statistics(
-        &self,
-        request: StatisticsReconcileRequest,
     ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError>;
 }
 
@@ -841,17 +831,6 @@ impl ConnectorStatisticsLease {
         }
         Ok(evidence)
     }
-    pub fn reconcile(
-        &self,
-        request: StatisticsReconcileRequest,
-    ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
-        self.validate_evidence(&request.evidence)?;
-        let operation_id = request.evidence.operation_id();
-        let outcome = self.collection()?.reconcile_statistics(request)?;
-        self.validate_outcome(operation_id, &outcome)?;
-        Ok(outcome)
-    }
-
     fn collection(&self) -> Result<&dyn StatisticsCollection, ConnectorError> {
         self.statistics.collection().ok_or_else(|| {
             ConnectorError::new(

@@ -25,8 +25,7 @@ use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorControlRegistry, ConnectorControlResolver,
     ConnectorDataMutationLease, ConnectorDataMutationResolver, ConnectorDistributedRewriteLease,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorHistoricalMaintenanceLease,
-    ConnectorHistoricalMaintenanceResolver, ConnectorInstanceId, ConnectorMetadataMaintenanceLease,
+    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMetadataMaintenanceLease,
     ConnectorMetadataMaintenanceResolver, ConnectorProviderId, ConnectorStatisticsLease,
     ConnectorStatisticsResolver, ConnectorWriteLease,
 };
@@ -59,7 +58,6 @@ struct ControlGeneration {
     metadata_maintenance_leases: usize,
     distributed_rewrite_leases: usize,
     cleanup_maintenance_leases: usize,
-    historical_maintenance_leases: usize,
     write_leases: usize,
     statistics_leases: usize,
 }
@@ -72,7 +70,6 @@ impl ControlGeneration {
             && self.metadata_maintenance_leases == 0
             && self.distributed_rewrite_leases == 0
             && self.cleanup_maintenance_leases == 0
-            && self.historical_maintenance_leases == 0
             && self.write_leases == 0
             && self.statistics_leases == 0
     }
@@ -190,7 +187,6 @@ impl ConnectorControlHost {
                 metadata_maintenance_leases: 0,
                 distributed_rewrite_leases: 0,
                 cleanup_maintenance_leases: 0,
-                historical_maintenance_leases: 0,
                 write_leases: 0,
                 statistics_leases: 0,
             },
@@ -574,69 +570,6 @@ impl ConnectorControlHost {
         )
     }
 
-    /// Acquire the live generation's inspector for maintenance a dead
-    /// generation left behind.
-    ///
-    /// Only the active generation is eligible. A retiring one is already
-    /// draining, and its view of the lake is the one being replaced.
-    fn acquire_current_historical_maintenance(
-        &self,
-        instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorHistoricalMaintenanceLease, ConnectorError> {
-        let key = {
-            let state = self.lock_state()?;
-            state.active.get(instance_id).cloned().ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::NotFound,
-                    format!(
-                        "connector control instance `{}` is not active",
-                        instance_id.as_str()
-                    ),
-                )
-            })?
-        };
-        let (descriptor, recovery) = {
-            let mut state = self.lock_state()?;
-            let generation = state.generations.get_mut(&key).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::NotFound,
-                    "connector control generation is not registered",
-                )
-            })?;
-            if generation.state != ControlGenerationState::Active {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::Unavailable,
-                    "connector control generation is retiring",
-                ));
-            }
-            let recovery = generation
-                .binding
-                .historical_maintenance_recovery()
-                .cloned()
-                .ok_or_else(|| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::Unsupported,
-                        "connector control generation has no historical maintenance recovery \
-                         capability",
-                    )
-                })?;
-            generation.historical_maintenance_leases =
-                generation.historical_maintenance_leases.saturating_add(1);
-            (generation.binding.descriptor().clone(), recovery)
-        };
-        let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
-        let lease_key = key.clone();
-        ConnectorHistoricalMaintenanceLease::new(descriptor, key, recovery, move || {
-            release_lease(
-                &state,
-                &retirement_sink,
-                lease_key,
-                LeaseKind::HistoricalMaintenance,
-            );
-        })
-    }
-
     fn acquire_current_distributed_rewrite(
         &self,
         instance_id: &ConnectorInstanceId,
@@ -998,15 +931,6 @@ impl ConnectorCleanupMaintenanceResolver for ConnectorControlHost {
     }
 }
 
-impl ConnectorHistoricalMaintenanceResolver for ConnectorControlHost {
-    fn acquire_current_historical_maintenance(
-        &self,
-        instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorHistoricalMaintenanceLease, ConnectorError> {
-        Self::acquire_current_historical_maintenance(self, instance_id)
-    }
-}
-
 impl ConnectorDistributedRewriteResolver for ConnectorControlHost {
     fn acquire_current_distributed_rewrite(
         &self,
@@ -1054,7 +978,6 @@ enum LeaseKind {
     MetadataMaintenance,
     DistributedRewrite,
     CleanupMaintenance,
-    HistoricalMaintenance,
     Write,
     Statistics,
 }
@@ -1095,10 +1018,6 @@ fn release_lease(
         LeaseKind::CleanupMaintenance => {
             generation.cleanup_maintenance_leases =
                 generation.cleanup_maintenance_leases.saturating_sub(1);
-        }
-        LeaseKind::HistoricalMaintenance => {
-            generation.historical_maintenance_leases =
-                generation.historical_maintenance_leases.saturating_sub(1);
         }
         LeaseKind::Write => {
             generation.write_leases = generation.write_leases.saturating_sub(1);

@@ -45,12 +45,10 @@ use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_control::FrontendQueryControl;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::statistics::FrontendStatisticsService;
-use crate::statistics_jobs::repository::StatisticsJobRepository;
 use crate::statistics_jobs::service::{
     FrontendStatisticsApplicationPort, StatisticsApplicationService,
 };
 use crate::table_maintenance::FrontendTableMaintenanceService;
-use crate::table_maintenance::coordination::MaintenanceCoordination;
 use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
 use crate::view::FrontendViewService;
 
@@ -459,31 +457,14 @@ impl FrontendApplicationHost {
                 return Err(host.cleanup_open_error(error).await);
             }
         }
-        // A frontend that owns durable maintenance records also owns the lease
-        // authority for them. `coordination` is present whenever a StateStore
-        // is, so this never installs an unfenced durable owner.
-        let table_maintenance_open = match host.coordination() {
-            Some(coordination) => FrontendTableMaintenanceService::open_with_coordination(
-                host.state_store(),
-                tokio::runtime::Handle::current(),
-                MaintenanceCoordination::from_frontend(
-                    coordination.as_ref(),
-                    tokio::runtime::Handle::current(),
-                ),
-            )
-            .await
-            .map(|service| {
-                service.with_lake_publication_runtime_policy(host.lake_publication_runtime_policy())
-            }),
-            None => FrontendTableMaintenanceService::open(
-                host.state_store(),
-                tokio::runtime::Handle::current(),
-            )
-            .await
-            .map(|service| {
-                service.with_lake_publication_runtime_policy(host.lake_publication_runtime_policy())
-            }),
-        };
+        let table_maintenance_open = FrontendTableMaintenanceService::open(
+            host.state_store(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .map(|service| {
+            service.with_lake_publication_runtime_policy(host.lake_publication_runtime_policy())
+        });
         match table_maintenance_open {
             Ok(service) => host.table_maintenance_service = Some(Arc::new(service)),
             Err(error) => {
@@ -611,39 +592,11 @@ impl FrontendApplicationHost {
         }) {
             return Err(host.cleanup_open_error(error).await);
         }
-        host.statistics_application_service = match host.state_store() {
-            Some(store) => match StatisticsJobRepository::open(store).await {
-                Ok(repository) => Some(Arc::new(StatisticsApplicationService::with_repository(
-                    repository,
-                ))),
-                Err(error) => {
-                    return Err(host
-                        .cleanup_open_error(FrontendApplicationError::new(
-                            FrontendApplicationErrorKind::StatisticsApplicationServiceOpen,
-                            error,
-                        ))
-                        .await);
-                }
-            },
-            None => Some(Arc::new(StatisticsApplicationService::unavailable())),
-        };
-        let statistics_application_port = match host.coordination() {
-            Some(coordination) => FrontendStatisticsApplicationPort::with_frontend_coordination(
-                host.statistics_application_service().as_ref().clone(),
-                tokio::runtime::Handle::current(),
-                coordination.as_ref(),
-            )
-            .map_err(|error| {
-                FrontendApplicationError::new(
-                    FrontendApplicationErrorKind::StatisticsApplicationServiceOpen,
-                    error,
-                )
-            }),
-            None => Ok(FrontendStatisticsApplicationPort::new(
-                host.statistics_application_service().as_ref().clone(),
-                tokio::runtime::Handle::current(),
-            )),
-        };
+        host.statistics_application_service = Some(Arc::new(StatisticsApplicationService::new()));
+        let statistics_application_port = Ok(FrontendStatisticsApplicationPort::new(
+            host.statistics_application_service().as_ref().clone(),
+            tokio::runtime::Handle::current(),
+        ));
         match statistics_application_port {
             Ok(port) => host.statistics_application_port = Some(Arc::new(port)),
             Err(error) => return Err(host.cleanup_open_error(error).await),
@@ -1021,9 +974,8 @@ impl FrontendApplicationHost {
         self.dml_service.take();
         self.table_maintenance_service.take();
         self.statistics_service.take();
-        // The durable application service owns a StateStore reference through
-        // its repository, so it must be released before StateStoreHost closes
-        // its deployment lock.
+        // Process-local job services do not own StateStore job records. Release
+        // their workers before closing the host's remaining durable owners.
         self.statistics_application_port.take();
         self.statistics_application_service.take();
         let catalog_controller_error = match self.catalog_controller.take() {

@@ -1204,27 +1204,6 @@ impl ConnectorCleanupExecuteRequest {
 }
 
 #[derive(Clone)]
-pub struct ConnectorCleanupReconcileRequest {
-    pub plan: ConnectorCleanupPlan,
-    pub prepared: PreparedBatch,
-    pub context: ConnectorRequestContext,
-}
-impl ConnectorCleanupReconcileRequest {
-    pub fn try_new(
-        plan: ConnectorCleanupPlan,
-        prepared: PreparedBatch,
-        context: ConnectorRequestContext,
-    ) -> Result<Self, ConnectorError> {
-        ConnectorCleanupExecuteRequest::try_new(plan.clone(), prepared.clone(), context.clone())?;
-        Ok(Self {
-            plan,
-            prepared,
-            context,
-        })
-    }
-}
-
-#[derive(Clone)]
 pub struct ConnectorCleanupCandidatePageRequest {
     pub plan: ConnectorCleanupPlan,
     pub offset: u64,
@@ -1270,8 +1249,7 @@ impl ConnectorCleanupFinalizeRequest {
 }
 
 /// A cleanup provider never receives an opportunity to re-list candidates after
-/// planning. `execute_batch` is invoked once per prepared batch; any uncertain
-/// response is repaired exclusively through `reconcile_batch`.
+/// planning. `execute_batch` is invoked once per prepared batch.
 pub trait ConnectorCleanupMaintenance: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn binding_key(&self) -> &ConnectorExecutionBindingKey;
@@ -1286,10 +1264,6 @@ pub trait ConnectorCleanupMaintenance: Send + Sync {
     fn execute_batch(
         &self,
         request: ConnectorCleanupExecuteRequest,
-    ) -> Result<BatchReceipt, ConnectorError>;
-    fn reconcile_batch(
-        &self,
-        request: ConnectorCleanupReconcileRequest,
     ) -> Result<BatchReceipt, ConnectorError>;
     fn read_candidate_page(
         &self,
@@ -1408,16 +1382,6 @@ impl ConnectorCleanupMaintenanceLease {
         self.validate_plan(&request.plan)?;
         validate_prepared_for_plan(&request.plan, &request.prepared)?;
         let receipt = self.cleanup.execute_batch(request.clone())?;
-        self.validate_receipt(&request.plan, &request.prepared, &receipt)?;
-        Ok(receipt)
-    }
-    pub fn reconcile_batch(
-        &self,
-        request: ConnectorCleanupReconcileRequest,
-    ) -> Result<BatchReceipt, ConnectorError> {
-        self.validate_plan(&request.plan)?;
-        validate_prepared_for_plan(&request.plan, &request.prepared)?;
-        let receipt = self.cleanup.reconcile_batch(request.clone())?;
         self.validate_receipt(&request.plan, &request.prepared, &receipt)?;
         Ok(receipt)
     }

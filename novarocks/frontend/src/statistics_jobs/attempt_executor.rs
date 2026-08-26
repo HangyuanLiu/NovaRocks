@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend-owned native execution adapter for durable ANALYZE attempts.
+//! Frontend-owned native execution adapter for current-process ANALYZE attempts.
 //!
 //! Core owns the provider-neutral statistics program and its one-shot
 //! prepare/finish boundary.  This adapter owns the only native mapping step:
@@ -38,10 +38,10 @@ use novarocks_spi::connector::{
     ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     StatisticsCollectionRequest, StatisticsMetric, StatisticsMetricRequest,
-    StatisticsPublishPreparationRequest, StatisticsPublishRequest, StatisticsReconcileRequest,
+    StatisticsPublishPreparationRequest, StatisticsPublishRequest,
 };
 
-/// Exact Frontend composition leaves retained by the durable ANALYZE worker.
+/// Exact Frontend composition leaves retained by the process-owned ANALYZE worker.
 /// Each collection takes a fresh live topology snapshot. The worker persists
 /// only a logical target and physical object ID; a current binding, its data
 /// version, and schema columns are attempt-local facts.
@@ -72,7 +72,7 @@ impl StatisticsAttemptExecutionPorts {
     }
 }
 
-/// Implements Core's durable-worker port while retaining the native encoder
+/// Implements Core's process-worker port while retaining the native encoder
 /// exclusively in Frontend.
 pub(crate) struct FrontendStatisticsAttemptExecutor {
     ports: StatisticsAttemptExecutionPorts,
@@ -201,12 +201,21 @@ impl FrontendStatisticsAttemptExecutor {
             ExternalMutationOutcome::KnownCommitted {
                 finalization: ExternalMutationFinalization::Failed(failure),
                 ..
-            }
-            | ExternalMutationOutcome::KnownUncommitted { failure } => {
-                Err(StatisticsApplicationError::new(failure.to_string()))
-            }
+            } => Err(StatisticsApplicationError::publication(
+                crate::statistics_jobs::application::StatisticsPublicationTerminal::KnownCommittedFinalization,
+                failure.to_string(),
+            )),
+            ExternalMutationOutcome::KnownUncommitted { failure } => Err(
+                StatisticsApplicationError::publication(
+                    crate::statistics_jobs::application::StatisticsPublicationTerminal::KnownUncommitted,
+                    failure.to_string(),
+                ),
+            ),
             ExternalMutationOutcome::CommitUnknown { failure, .. } => {
-                Err(StatisticsApplicationError::reconcile(failure.to_string()))
+                Err(StatisticsApplicationError::publication(
+                    crate::statistics_jobs::application::StatisticsPublicationTerminal::CommitUnknown,
+                    failure.to_string(),
+                ))
             }
         }
     }
@@ -243,16 +252,16 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
             .ports
             .connector_control
             .acquire_current(&instance_id)
-            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         // Rebinding and collection preparation intentionally share one current
         // connector generation. Do not translate this error: its typed physical
-        // object binding classification must reach the durable worker unchanged.
+        // object binding classification must reach the process worker unchanged.
         let binding = rebind_table_object(&planning_lease, context.clone(), request)?;
         let columns = Self::resolve_columns(request, &binding.sql_columns)?;
         let metrics = Self::metrics(&columns)?;
         let lease = planning_lease
             .derive_statistics_lease()
-            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         let data_version = binding.data_version.clone();
         let plan = lease
             .prepare_collection(StatisticsCollectionRequest {
@@ -266,7 +275,7 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
         let program = crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
             plan,
             crate::query_execution::statistics::StatisticsExecutionPolicy::try_new(
-                crate::query_execution::statistics::StatisticsExecutionMode::DurableJobAttempt,
+                crate::query_execution::statistics::StatisticsExecutionMode::ProcessJobAttempt,
                 self.ports.attempt_timeout,
             )
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
@@ -276,7 +285,7 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
             .ports
             .backend_topology
             .snapshot()
-            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         let cancellation = crate::common::query_cancellation::QueryCancellationSource::new();
         let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
             self.ports.execution_role,
@@ -301,21 +310,21 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
             program,
             planning_lease,
         )
-        .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         let native_attachment = crate::native::fragment_encoder::encode_native_fragment_bundle(
             prepared.encoding_view(),
         )
-        .map_err(StatisticsApplicationError::transient)?;
+        .map_err(StatisticsApplicationError::new)?;
         let distributed = prepared
             .finish(native_attachment)
-            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         let result = self
             .ports
             .query_execution
             .execute(distributed)
             .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_statistics)
             .map(|outcome| outcome.into_collection_result())
-            .map_err(|error| StatisticsApplicationError::transient(error.to_string()))?;
+            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         Ok(Box::new(FrontendStatisticsCollectedAttempt {
             lease,
             table: binding.table,
@@ -360,25 +369,6 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
                     evidence: evidence.clone(),
                 })
                 .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
-        )
-    }
-
-    fn reconcile(
-        &self,
-        evidence: &ExternalMutationEvidence,
-    ) -> Result<(), StatisticsApplicationError> {
-        let lease = self
-            .ports
-            .connector_control
-            .acquire_current_statistics(&evidence.descriptor().instance_id)
-            .map_err(|error| StatisticsApplicationError::reconcile(error.to_string()))?;
-        Self::outcome(
-            lease
-                .reconcile(StatisticsReconcileRequest {
-                    evidence: evidence.clone(),
-                    context: self.collection_context()?,
-                })
-                .map_err(|error| StatisticsApplicationError::reconcile(error.to_string()))?,
         )
     }
 }

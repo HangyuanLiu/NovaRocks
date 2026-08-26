@@ -33,8 +33,7 @@ use novarocks_spi::connector::{
     ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorErrorKind,
     ConnectorRequestContext, ConnectorTableHandle, ConnectorWriteAbortOutcome,
     ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteExecutionId,
-    ConnectorWriteOperationId, ConnectorWriteReceipt, ExternalMutationEvidence,
-    ExternalMutationOutcome,
+    ConnectorWriteOperationId, ConnectorWriteReceipt, ExternalMutationOutcome,
 };
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
@@ -336,17 +335,6 @@ impl ConnectorDistributedRewriteSession {
         Ok(completion)
     }
 
-    /// Restore the persisted aggregate C1 decision before marker-only
-    /// reconcile.  This has no staging path and therefore cannot re-submit a
-    /// rewrite that may already have reached the catalog.
-    pub fn restore_for_reconcile(&self, aggregate_digest: [u8; 32]) -> Result<(), ConnectorError> {
-        self.inner
-            .write_session
-            .as_ref()
-            .ok_or_else(|| invalid("distributed rewrite no-op has no C1 reconcile"))?
-            .restore_for_reconcile(aggregate_digest)
-    }
-
     /// Commit every accepted cohort through the same exact C1 control lease.
     pub fn commit(
         &self,
@@ -369,19 +357,6 @@ impl ConnectorDistributedRewriteSession {
             .as_ref()
             .ok_or_else(|| invalid("distributed rewrite no-op has no C1 abort"))?
             .abort(context)
-    }
-
-    /// Reconcile only after the C1 session made its aggregate commit decision.
-    pub fn reconcile(
-        &self,
-        evidence: ExternalMutationEvidence,
-        context: ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        self.inner
-            .write_session
-            .as_ref()
-            .ok_or_else(|| invalid("distributed rewrite no-op has no C1 reconcile"))?
-            .reconcile(evidence, context)
     }
 
     /// Project a known-committed C1 receipt only through the provider that

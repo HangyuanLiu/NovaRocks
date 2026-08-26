@@ -18,7 +18,7 @@
 //! Typed frontend application contract for unified statistics commands.
 //!
 //! This module deliberately contains no parser AST or raw-SQL interception.
-//! The frontend owns target resolution, durable job state, and worker composition.
+//! The frontend owns target resolution, current-process job state, and worker composition.
 
 use std::any::Any;
 use std::fmt;
@@ -49,7 +49,7 @@ pub struct StatisticsTableTarget {
     pub table: String,
 }
 
-/// Column-selection intent retained by a durable ANALYZE job.
+/// Column-selection intent retained by a current-process ANALYZE job.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum StatisticsColumnIntent {
     /// The attempt expands all SQL-visible columns from its freshly rebound schema.
@@ -71,7 +71,7 @@ pub struct StatisticsTargetCapture {
     pub sql_columns: Vec<String>,
 }
 
-/// One durable-worker request. It carries only logical identity, physical
+/// One current-process worker request. It carries only logical identity, physical
 /// object identity, and collection intent; provider handles and versions are
 /// strictly attempt-local.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,7 +85,7 @@ pub struct StatisticsAttemptRequest {
 }
 
 /// Identity-gated current binding retained only within one attempt and its
-/// planning lease lifetime. It must never be stored in StateStore.
+/// planning lease lifetime. It must never be retained by the process runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsAttemptBinding {
     pub table: novarocks_spi::connector::ConnectorTableHandle,
@@ -93,7 +93,7 @@ pub struct StatisticsAttemptBinding {
     pub sql_columns: Vec<String>,
 }
 
-/// The frontend captures a logical ANALYZE target before durable job creation.
+/// The frontend captures a logical ANALYZE target before job creation.
 pub trait StatisticsTargetResolver: Send + Sync {
     fn capture_table_object(
         &self,
@@ -112,7 +112,7 @@ pub trait StatisticsTargetResolverSink: Send + Sync {
 }
 
 /// Read-only frontend table-statistics surface. Unlike ANALYZE submission, it is
-/// intentionally available without a StateStore and resolves its latest table
+/// intentionally short-lived and resolves its latest table
 /// metadata only for this one short-lived read.
 pub trait StatisticsTableReader: Send + Sync {
     fn show_table_stats(
@@ -132,8 +132,6 @@ pub trait StatisticsTableReaderSink: Send + Sync {
 }
 
 /// Attempt-local material retained only by the execution/publish boundary.
-/// It is deliberately opaque to the durable frontend: StateStore persists
-/// just the separately prepared reconciliation evidence.
 pub trait StatisticsCollectedAttempt: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
@@ -143,7 +141,7 @@ pub trait StatisticsCollectedAttempt: Send + Sync {
 }
 
 /// Frontend-owned implementation of provider-native collection and
-/// publication. The frontend retains this durable-worker port and the immutable
+/// publication. The frontend retains this process-worker port and the immutable
 /// request types; the frontend owns connector leases, native mapping, the
 /// distributed request, and `ExternalMutationOutcome` handling.
 pub trait StatisticsAttemptExecutor: Send + Sync {
@@ -164,17 +162,10 @@ pub trait StatisticsAttemptExecutor: Send + Sync {
         collected: &dyn StatisticsCollectedAttempt,
         evidence: &ExternalMutationEvidence,
     ) -> Result<(), StatisticsApplicationError>;
-
-    fn reconcile(
-        &self,
-        evidence: &ExternalMutationEvidence,
-    ) -> Result<(), StatisticsApplicationError>;
 }
 
 /// Composition sink used after the frontend has installed connector control and the
-/// native coordinator.  A frontend with no StateStore may bind the read-only
-/// surfaces above but must decline this executor rather than construct an
-/// in-memory job table.
+/// native coordinator.
 pub trait StatisticsAttemptExecutorSink: Send + Sync {
     fn bind_statistics_attempt_executor(
         &self,
@@ -570,7 +561,7 @@ pub trait StatisticsApplicationPort: Send + Sync {
     ) -> Result<StatisticsApplicationResult, StatisticsApplicationError>;
 }
 
-/// A frontend composition with no durable statistics authority fails closed.
+/// A frontend composition with no statistics application authority fails closed.
 pub struct UnavailableStatisticsApplicationPort;
 
 impl StatisticsApplicationPort for UnavailableStatisticsApplicationPort {
@@ -588,63 +579,50 @@ impl StatisticsApplicationPort for UnavailableStatisticsApplicationPort {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsApplicationError {
     message: String,
-    retryable: bool,
-    requires_reconcile: bool,
+    publication_terminal: Option<StatisticsPublicationTerminal>,
     target_binding_failure: Option<ConnectorTableObjectBindingFailure>,
+}
+
+/// Exact publication classification carried across the current attempt only.
+/// It is terminal diagnostics, never a request to recover or reconcile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatisticsPublicationTerminal {
+    KnownUncommitted,
+    KnownCommittedFinalization,
+    CommitUnknown,
 }
 
 impl StatisticsApplicationError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            retryable: false,
-            requires_reconcile: false,
+            publication_terminal: None,
             target_binding_failure: None,
         }
     }
 
-    pub fn transient(message: impl Into<String>) -> Self {
+    pub fn publication(
+        terminal: StatisticsPublicationTerminal,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             message: message.into(),
-            retryable: true,
-            requires_reconcile: false,
-            target_binding_failure: None,
-        }
-    }
-
-    pub fn reconcile(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            retryable: false,
-            requires_reconcile: true,
+            publication_terminal: Some(terminal),
             target_binding_failure: None,
         }
     }
 
     fn from_connector_error(error: ConnectorError) -> Self {
         let target_binding_failure = error.table_object_binding_failure();
-        let retryable = target_binding_failure.is_none()
-            && (error.retryable_before_progress()
-                || matches!(
-                    error.kind(),
-                    novarocks_spi::connector::ConnectorErrorKind::Unavailable
-                        | novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded
-                        | novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
-                ));
         Self {
             message: error.to_string(),
-            retryable,
-            requires_reconcile: false,
+            publication_terminal: None,
             target_binding_failure,
         }
     }
 
-    pub const fn retryable(&self) -> bool {
-        self.retryable
-    }
-
-    pub const fn requires_reconcile(&self) -> bool {
-        self.requires_reconcile
+    pub const fn publication_terminal(&self) -> Option<StatisticsPublicationTerminal> {
+        self.publication_terminal
     }
 
     pub const fn target_binding_failure(&self) -> Option<ConnectorTableObjectBindingFailure> {

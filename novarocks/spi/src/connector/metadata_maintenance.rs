@@ -506,36 +506,6 @@ impl fmt::Debug for ConnectorMetadataMaintenanceReceipt {
     }
 }
 
-#[derive(Clone)]
-pub struct ConnectorMetadataMaintenanceReconcileRequest {
-    pub plan: ConnectorMetadataMaintenancePlan,
-    pub evidence: Option<ExternalMutationEvidence>,
-    pub context: ConnectorRequestContext,
-}
-impl ConnectorMetadataMaintenanceReconcileRequest {
-    pub fn try_new(
-        plan: ConnectorMetadataMaintenancePlan,
-        evidence: Option<ExternalMutationEvidence>,
-        context: ConnectorRequestContext,
-    ) -> Result<Self, ConnectorError> {
-        plan.validate()?;
-        if let Some(value) = &evidence
-            && (value.operation_id() != plan.operation_id
-                || value.operation_kind() != plan.operation_kind.as_ref())
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "metadata maintenance evidence does not match plan",
-            ));
-        }
-        Ok(Self {
-            plan,
-            evidence,
-            context,
-        })
-    }
-}
-
 /// Read-only observation request for one base table.
 ///
 /// This request deliberately carries no operation id: the observation is not a
@@ -590,10 +560,6 @@ pub trait ConnectorMetadataMaintenance: Send + Sync {
     fn execute(
         &self,
         request: ConnectorMetadataMaintenanceExecuteRequest,
-    ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>;
-    fn reconcile(
-        &self,
-        request: ConnectorMetadataMaintenanceReconcileRequest,
     ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError>;
     /// Reads the largest number of data files the provider would place into one
     /// of its own rewrite groups for this table. The grouping rule stays
@@ -705,23 +671,6 @@ impl ConnectorMetadataMaintenanceLease {
         self.validate_plan(&request.plan)?;
         let plan = request.plan.clone();
         let outcome = self.maintenance.execute(request)?;
-        self.validate_outcome(&plan, &outcome)?;
-        Ok(outcome)
-    }
-    pub fn reconcile(
-        &self,
-        request: ConnectorMetadataMaintenanceReconcileRequest,
-    ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError> {
-        self.validate_plan(&request.plan)?;
-        if let Some(evidence) = &request.evidence {
-            self.validate_evidence(
-                request.plan.operation_id,
-                request.plan.operation_kind(),
-                evidence,
-            )?;
-        }
-        let plan = request.plan.clone();
-        let outcome = self.maintenance.reconcile(request)?;
         self.validate_outcome(&plan, &outcome)?;
         Ok(outcome)
     }

@@ -72,12 +72,12 @@ const VISIBLE_ROW_ARTIFACT_VERSION: u8 = 1;
 const STATISTICS_FRAGMENT_PAYLOAD_VERSION: u8 = 2;
 
 /// A statistics collection is either tied to a statement wait or owned by a
-/// durable frontend job. Only the former observes the statement cancellation
+/// process-owned frontend job. Only the former observes the statement cancellation
 /// view supplied to distributed execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatisticsExecutionMode {
     SynchronousWait,
-    DurableJobAttempt,
+    ProcessJobAttempt,
 }
 
 impl StatisticsExecutionMode {
@@ -87,7 +87,7 @@ impl StatisticsExecutionMode {
 }
 
 /// Validated execution policy handed from the application service to Core.
-/// A durable job's explicit cancellation is delivered by its worker control
+/// A process job's explicit cancellation is delivered by its worker control
 /// plane; it must not be synthesized from a disconnected SQL client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatisticsExecutionPolicy {
@@ -1936,7 +1936,7 @@ mod tests {
         StatisticsCollectionProgram::try_new(
             plan,
             StatisticsExecutionPolicy::try_new(
-                StatisticsExecutionMode::DurableJobAttempt,
+                StatisticsExecutionMode::ProcessJobAttempt,
                 Duration::from_secs(60),
             )
             .expect("policy"),

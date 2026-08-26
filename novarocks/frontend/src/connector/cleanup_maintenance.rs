@@ -19,8 +19,7 @@
 //!
 //! This module owns exact-generation lease lifetime and the one-way dispatch
 //! barrier only. Candidate discovery, immutable artifacts, object identity,
-//! deletion, receipts, and reconciliation remain provider responsibilities.
-//! Design: ADR-0035 (docs/adr/ADR-0035-connector-orphan-cleanup-reconcile-contract.md)
+//! deletion and receipts remain provider responsibilities.
 
 use std::collections::BTreeSet;
 use std::sync::Mutex;
@@ -31,9 +30,8 @@ use novarocks_spi::connector::{
     ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver,
     ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
     ConnectorCleanupPlan, ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
-    ConnectorCleanupReconcileRequest, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution, PreparedBatch,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorRequestContext,
+    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution, PreparedBatch,
 };
 
 /// The durable frontend owner needs to distinguish an invalid pre-dispatch
@@ -45,8 +43,7 @@ use novarocks_spi::connector::{
 )]
 pub enum CleanupBatchExecution {
     Receipt(BatchReceipt),
-    /// The prepared batch was dispatched, but a receipt is unavailable. The
-    /// only legal follow-up is `reconcile_batch` on this exact session.
+    /// The prepared batch was dispatched, but a receipt is unavailable.
     Uncertain(ConnectorError),
 }
 
@@ -58,14 +55,7 @@ pub struct CleanupMaintenanceSession {
     table: ConnectorTableIdentity,
     plan: ConnectorCleanupPlan,
     context: ConnectorRequestContext,
-    mode: CleanupSessionMode,
     executed_ordinals: Mutex<BTreeSet<u32>>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CleanupSessionMode {
-    Active,
-    ReconcileOnly,
 }
 
 impl CleanupMaintenanceSession {
@@ -165,50 +155,7 @@ impl CleanupMaintenanceSession {
             table,
             plan,
             context,
-            mode: CleanupSessionMode::Active,
             executed_ordinals: Mutex::new(BTreeSet::new()),
-        })
-    }
-
-    /// Restore one persisted plan and prepared batch on its recorded exact
-    /// generation. Recovery deliberately has no metadata load, replan,
-    /// prepare, or execute capability.
-    pub fn recover_for_reconcile(
-        resolver: &dyn ConnectorCleanupMaintenanceResolver,
-        table: ConnectorTableIdentity,
-        plan: ConnectorCleanupPlan,
-        prepared: PreparedBatch,
-        context: ConnectorRequestContext,
-    ) -> Result<Self, ConnectorError> {
-        plan.validate()?;
-        prepared.validate()?;
-        if table.instance_id != plan.owner().instance_id {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "cleanup recovery table does not match persisted plan owner",
-            ));
-        }
-        if prepared.owner() != plan.owner()
-            || prepared.operation_id() != plan.operation_id()
-            || prepared.plan_digest() != plan.plan_digest()
-            || prepared.manifest_digest() != plan.manifest_digest()
-            || prepared.batch_ordinal() >= plan.summary().batch_count()
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "cleanup recovery prepared evidence does not match persisted plan",
-            ));
-        }
-        let lease = resolver.acquire_exact_cleanup_maintenance(plan.owner())?;
-        let mut executed_ordinals = BTreeSet::new();
-        executed_ordinals.insert(prepared.batch_ordinal());
-        Ok(Self {
-            lease,
-            table,
-            plan,
-            context,
-            mode: CleanupSessionMode::ReconcileOnly,
-            executed_ordinals: Mutex::new(executed_ordinals),
         })
     }
 
@@ -239,8 +186,8 @@ impl CleanupMaintenanceSession {
 
     /// Dispatch exactly once for this in-memory session. Any provider error
     /// after the prepared request has been constructed is intentionally
-    /// represented as uncertain; callers must persist that state and use
-    /// `reconcile_batch`, never execute again.
+    /// represented as uncertain; the current process never re-executes or
+    /// recovers that batch.
     pub fn execute_batch(
         &self,
         prepared: PreparedBatch,
@@ -273,25 +220,6 @@ impl CleanupMaintenanceSession {
         }
     }
 
-    /// Reconciliation is available only on a recovery session. It reads the
-    /// persisted batch/object identity and never lists, plans, prepares, or
-    /// dispatches a deletion.
-    pub fn reconcile_batch(&self, prepared: PreparedBatch) -> Result<BatchReceipt, ConnectorError> {
-        if self.mode != CleanupSessionMode::ReconcileOnly {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "cleanup reconciliation requires a recovered exact-generation session",
-            ));
-        }
-        self.validate_prepared(&prepared)?;
-        self.lease
-            .reconcile_batch(ConnectorCleanupReconcileRequest::try_new(
-                self.plan.clone(),
-                prepared,
-                self.context.clone(),
-            )?)
-    }
-
     /// Read only canonical candidate locations from the persisted manifest.
     pub fn read_candidate_page(
         &self,
@@ -317,13 +245,7 @@ impl CleanupMaintenanceSession {
             )?)
     }
 
-    fn ensure_active(&self, operation: &str) -> Result<(), ConnectorError> {
-        if self.mode == CleanupSessionMode::ReconcileOnly {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                format!("recovered cleanup session cannot {operation}"),
-            ));
-        }
+    fn ensure_active(&self, _operation: &str) -> Result<(), ConnectorError> {
         Ok(())
     }
 
@@ -341,22 +263,5 @@ impl CleanupMaintenanceSession {
             ));
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recovery_mode_cannot_become_a_new_dispatch_path() {
-        assert_eq!(
-            CleanupSessionMode::ReconcileOnly,
-            CleanupSessionMode::ReconcileOnly
-        );
-        assert_ne!(
-            CleanupSessionMode::Active,
-            CleanupSessionMode::ReconcileOnly
-        );
     }
 }
