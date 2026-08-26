@@ -85,7 +85,9 @@ ORDER BY k1;
 -- @skip_result_check=true
 INSERT INTO lnp3d_repart_${uuid0}.ns_${uuid0}.orders VALUES
   (4, 'north', 40);
-REFRESH MATERIALIZED VIEW lnp3d_repart_${uuid0}.ns_${uuid0}.orders_mv;
+SET CATALOG lnp3d_repart_${uuid0};
+USE ns_${uuid0};
+REFRESH MATERIALIZED VIEW orders_mv;
 
 -- query 6
 -- @retry_count=30

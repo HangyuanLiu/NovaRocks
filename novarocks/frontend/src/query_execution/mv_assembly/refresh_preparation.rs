@@ -37,6 +37,9 @@ use crate::mv::domain::iceberg_refresh::{
     IcebergMvCorePorts, join_base_refs_for_schema_contract,
     plan_iceberg_mv_refresh_with_connector_context,
 };
+use crate::mv::domain::persistence::schema::{
+    MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
+};
 use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
 use crate::mv::domain::refresh::definition::{
     load_iceberg_mv_definition_by_target, mv_definition_fingerprint, parse_mv_select_query,
@@ -74,7 +77,8 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorManagedDescriptorProperties,
+    ConnectorCommittedPartitioning, ConnectorExecutionBindingKey, ConnectorInstanceId,
+    ConnectorManagedDescriptorProperties, ConnectorManagedPartitionSpecPreviewRequest,
     ConnectorTableIdentity, ConnectorTableObjectId,
 };
 use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
@@ -181,7 +185,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                 retain_exact_repartition_target(self.source, &plan.contract, self.connector_context)
             })
             .transpose()?;
-        let partition_spec_replacement = match self.repartition_fields {
+        let repartition_transition = match self.repartition_fields {
             Some(fields) => {
                 plan.contract.decision = ExecutableRefreshDecision::FirstRefresh;
                 Some(prepare_managed_repartition_transition(
@@ -270,7 +274,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                     &request.attempt,
                     &base_table_object_ids,
                     observed_binding.clone(),
-                    partition_spec_replacement.clone(),
+                    repartition_transition.as_ref(),
                     retained_repartition_target.as_ref(),
                     self.connector_context.clone(),
                 )?),
@@ -331,6 +335,11 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
 struct RetainedRepartitionTarget {
     binding: crate::mv::domain::refresh::target_binding::MvTargetBinding,
     schema_validation: MvSchemaValidationObservation,
+}
+
+struct PreparedManagedRepartitionTransition {
+    replacement: novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement,
+    preview: ConnectorCommittedPartitioning,
 }
 
 fn retain_exact_repartition_target(
@@ -412,7 +421,7 @@ fn prepare_managed_repartition_transition(
     operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
     retained_target: &RetainedRepartitionTarget,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement, String> {
+) -> Result<PreparedManagedRepartitionTransition, String> {
     let target = IcebergMvTarget {
         catalog: contract
             .target
@@ -520,12 +529,29 @@ fn prepare_managed_repartition_transition(
             .map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement::try_new(
+    let replacement = novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement::try_new(
         operation_id,
         expected_prior,
         replacement_fields,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    let write_lease = retained_target
+        .binding
+        .lease()
+        .derive_write_lease()
+        .map_err(|error| format!("derive MV repartition preview lease: {error}"))?;
+    let preview = write_lease
+        .preview_managed_partition_spec(ConnectorManagedPartitionSpecPreviewRequest::new(
+            operation_id,
+            retained_target.binding.handle().clone(),
+            replacement.clone(),
+            connector_context.clone(),
+        ))
+        .map_err(|error| format!("preview managed MV repartition: {error}"))?;
+    Ok(PreparedManagedRepartitionTransition {
+        replacement,
+        preview: preview.committed_partitioning().clone(),
+    })
 }
 
 fn managed_repartition_field(
@@ -596,9 +622,7 @@ fn prepare_frontend_first_refresh_write(
     attempt: &MvRefreshAttemptIdentity,
     base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
     observed_binding: ConnectorExecutionBindingKey,
-    partition_spec_replacement: Option<
-        novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement,
-    >,
+    repartition_transition: Option<&PreparedManagedRepartitionTransition>,
     retained_repartition_target: Option<&RetainedRepartitionTarget>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedMvFirstRefreshWrite, String> {
@@ -644,8 +668,38 @@ fn prepare_frontend_first_refresh_write(
         &refresh_query_source,
         base_table_object_ids,
     )?;
-    if let Some(replacement) = partition_spec_replacement.clone() {
-        publication_intent = publication_intent.with_partition_spec_replacement(replacement);
+    if let Some(transition) = repartition_transition {
+        let retained = retained_repartition_target.ok_or_else(|| {
+            "MV repartition preparation lost its retained target binding".to_string()
+        })?;
+        let package = crate::mv::domain::storage_observation::observe_lake_package(
+            source.storage_observation(),
+            retained.binding.lease(),
+            retained.binding.metadata(),
+            connector_context.clone(),
+        )
+        .map_err(|error| format!("observe exact MV descriptor for repartition: {error}"))?
+        .ok_or_else(|| "MV repartition target is missing its lake descriptor".to_string())?;
+        if package
+            .source_revision()
+            .map_err(|error| error.to_string())?
+            .descriptor_content_hash
+            != definition.source_revision.descriptor_content_hash
+        {
+            return Err(
+                "MV repartition descriptor drifted from its ready accelerator projection"
+                    .to_string(),
+            );
+        }
+        let mut descriptor = package.descriptor;
+        descriptor.schema_contract.target.partition = Some(
+            mv_partition_contract_from_committed_partitioning(&transition.preview)?,
+        );
+        publication_intent = publication_intent.with_partition_spec_replacement(
+            transition.replacement.clone(),
+            transition.preview.clone(),
+            managed_descriptor_properties_from_descriptor(&descriptor)?,
+        );
     }
     let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
         "Iceberg MV first-refresh requires a persisted schema contract".to_string()
@@ -821,7 +875,7 @@ fn prepare_frontend_first_refresh_write(
             )?,
             publication_intent,
         )?;
-        return Ok(if partition_spec_replacement.is_some() {
+        return Ok(if repartition_transition.is_some() {
             prepared.into_full_overwrite()
         } else {
             prepared
@@ -915,7 +969,7 @@ fn prepare_frontend_first_refresh_write(
         attempt.write_operation_id(),
     )?;
     let prepared = MvFirstRefreshWritePreparer::prepare(request, physical_sql, publication_intent)?;
-    Ok(if partition_spec_replacement.is_some() {
+    Ok(if repartition_transition.is_some() {
         prepared.into_full_overwrite()
     } else {
         prepared
@@ -1116,6 +1170,70 @@ fn managed_descriptor_properties(
         Arc::from(definition.source_revision.descriptor_content_hash.as_str()),
     )])
     .map_err(|error| format!("build managed MV descriptor properties: {error}"))
+}
+
+fn managed_descriptor_properties_from_descriptor(
+    descriptor: &crate::mv::domain::persistence::descriptor::MvDescriptorV3,
+) -> Result<ConnectorManagedDescriptorProperties, String> {
+    let mut entries = descriptor.to_storage_properties()?;
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    ConnectorManagedDescriptorProperties::try_new(
+        entries
+            .into_iter()
+            .map(|(key, value)| (Arc::from(key), Arc::from(value)))
+            .collect(),
+    )
+    .map_err(|error| format!("build complete managed MV descriptor properties: {error}"))
+}
+
+fn mv_partition_contract_from_committed_partitioning(
+    partitioning: &ConnectorCommittedPartitioning,
+) -> Result<MvPartitionContract, String> {
+    partitioning.validate().map_err(|error| error.to_string())?;
+    let fields = partitioning
+        .fields()
+        .iter()
+        .map(|field| {
+            Ok(MvPartitionFieldContract {
+                partition_field_id: field.partition_field_id(),
+                partition_field_name: field.partition_field_name().to_string(),
+                source_target_field_id: field.source_field_id(),
+                source_column_name: field.source_column_name().to_string(),
+                transform: match field.transform() {
+                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Identity => {
+                        MvPartitionTransformContract::Identity
+                    }
+                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Year => {
+                        MvPartitionTransformContract::Year
+                    }
+                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Month => {
+                        MvPartitionTransformContract::Month
+                    }
+                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Day => {
+                        MvPartitionTransformContract::Day
+                    }
+                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Hour => {
+                        MvPartitionTransformContract::Hour
+                    }
+                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Bucket {
+                        buckets,
+                    } => MvPartitionTransformContract::Bucket {
+                        num_buckets: buckets,
+                    },
+                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Truncate {
+                        width,
+                    } => MvPartitionTransformContract::Truncate { width },
+                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Void => {
+                        MvPartitionTransformContract::Void
+                    }
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(MvPartitionContract {
+        target_spec_id: partitioning.spec_id(),
+        fields,
+    })
 }
 
 /// Prepare the value-only non-join incremental handoff.  This is deliberately

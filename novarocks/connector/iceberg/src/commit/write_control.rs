@@ -38,7 +38,8 @@ use novarocks_spi::connector::{
     ConnectorCommittedPartitionField, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
     ConnectorManagedDescriptorProperties, ConnectorManagedPartitionField,
-    ConnectorManagedPartitionSpecObservation, ConnectorManagedPartitionSpecReplacement,
+    ConnectorManagedPartitionSpecObservation, ConnectorManagedPartitionSpecPreview,
+    ConnectorManagedPartitionSpecPreviewRequest, ConnectorManagedPartitionSpecReplacement,
     ConnectorManagedPartitionTransform, ConnectorManagedPublicationEmptyInputDisposition,
     ConnectorManagedPublicationTechnique, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorMutationOperationId, ConnectorRequestContext, ConnectorRowMutationActivationRequest,
@@ -461,12 +462,23 @@ impl IcebergWriteControl {
                 ConnectorWriteActivationIntent::ManagedPublication(intent) => intent
                     .partition_spec_replacement()
                     .map(|replacement| {
-                        prepare_partition_replacement(
+                        let prepared = prepare_partition_replacement(
                             &metadata,
                             replacement,
                             intent.descriptor_properties(),
                             request.operation_id,
-                        )
+                        )?;
+                        let expected = intent.expected_committed_partitioning().ok_or_else(|| {
+                            invalid(
+                                "Iceberg managed partition replacement is missing its exact preview partitioning",
+                            )
+                        })?;
+                        if &prepared.committed != expected {
+                            return Err(invalid(
+                                "Iceberg managed partition replacement no longer matches its exact preview partitioning",
+                            ));
+                        }
+                        Ok(prepared)
                     })
                     .transpose()?,
                 ConnectorWriteActivationIntent::Ordinary
@@ -1698,6 +1710,41 @@ impl ConnectorWriteControl for IcebergWriteControl {
         super::row_mutation_preparation::prepare_row_mutation(request, &self.key)
     }
 
+    fn preview_managed_partition_spec(
+        &self,
+        request: ConnectorManagedPartitionSpecPreviewRequest,
+    ) -> Result<ConnectorManagedPartitionSpecPreview, ConnectorError> {
+        validate_context(request.context())?;
+        request.validate(&self.key)?;
+        let table = self.provider.table_payload(request.table())?;
+        if table.metadata_table_type.is_some() {
+            return Err(invalid(
+                "Iceberg metadata tables cannot be repartition targets",
+            ));
+        }
+        let table_info = table.table_info.ok_or_else(|| {
+            corrupt("admitted Iceberg repartition target is missing its frozen table descriptor")
+        })?;
+        let serialized = table_info.serialized_metadata.as_deref().ok_or_else(|| {
+            corrupt("admitted Iceberg repartition target is missing frozen metadata")
+        })?;
+        let metadata = serde_json::from_str(serialized).map_err(|error| {
+            corrupt(format!(
+                "decode admitted Iceberg repartition target metadata: {error}"
+            ))
+        })?;
+        let prepared = prepare_partition_replacement_base(
+            &metadata,
+            request.replacement(),
+            request.operation_id(),
+        )?;
+        ConnectorManagedPartitionSpecPreview::try_new(
+            self.key.clone(),
+            request.operation_id(),
+            prepared.committed,
+        )
+    }
+
     fn activate_row_mutation(
         &self,
         request: ConnectorRowMutationActivationRequest,
@@ -2665,10 +2712,9 @@ fn commit_shape_for_intents(cohorts: &[DecodedCohort]) -> Result<CommitOpKind, C
     })
 }
 
-fn prepare_partition_replacement(
+fn prepare_partition_replacement_base(
     metadata: &crate::iceberg::spec::TableMetadata,
     replacement: &ConnectorManagedPartitionSpecReplacement,
-    descriptor_properties: &ConnectorManagedDescriptorProperties,
     operation_id: ConnectorWriteOperationId,
 ) -> Result<ActivePartitionReplacement, ConnectorError> {
     if replacement.operation_id() != operation_id {
@@ -2716,20 +2762,17 @@ fn prepare_partition_replacement(
                 invalid(format!("build Iceberg replacement partition spec: {error}"))
             })?;
     }
-    let descriptor_properties = managed_descriptor_property_updates(descriptor_properties)?;
     let build =
         crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(metadata.clone(), None)
             .add_default_partition_spec(builder.build())
             .map_err(|error| invalid(format!("bind Iceberg replacement partition spec: {error}")))?
-            .set_properties(descriptor_properties)
-            .map_err(|error| invalid(format!("bind managed MV descriptor properties: {error}")))?
             .build()
             .map_err(|error| {
                 invalid(format!(
                     "finalize Iceberg replacement partition spec: {error}"
                 ))
             })?;
-    if build.changes.len() != 3
+    if build.changes.len() != 2
         || !matches!(
             build.changes[0],
             crate::iceberg::TableUpdate::AddSpec { .. }
@@ -2738,13 +2781,9 @@ fn prepare_partition_replacement(
             build.changes[1],
             crate::iceberg::TableUpdate::SetDefaultSpec { .. }
         )
-        || !matches!(
-            build.changes[2],
-            crate::iceberg::TableUpdate::SetProperties { .. }
-        )
     {
         return Err(invalid(
-            "Iceberg managed partition replacement did not produce AddSpec, SetDefaultSpec, then SetProperties",
+            "Iceberg managed partition replacement did not produce AddSpec then SetDefaultSpec",
         ));
     }
     let spec_id = build.metadata.default_partition_spec_id();
@@ -2757,6 +2796,23 @@ fn prepare_partition_replacement(
         .metadata
         .partition_spec_by_id(spec_id)
         .ok_or_else(|| corrupt("Iceberg prospective default partition spec is missing"))?;
+    // `TableMetadataBuilder` assigns the actual field IDs while binding the
+    // prospective spec, but its emitted `AddSpec` update retains the original
+    // unbound fields. That shape is accepted by the in-memory apply path yet
+    // serializes as `field-id: null`, which the REST Catalog rejects. Publish
+    // the same bound spec in the existing atomic TableCommit instead.
+    let mut metadata_updates = build.changes;
+    let crate::iceberg::TableUpdate::AddSpec { spec } = &mut metadata_updates[0] else {
+        return Err(corrupt(
+            "Iceberg managed partition replacement is missing its AddSpec update",
+        ));
+    };
+    *spec = committed_spec.as_ref().clone().into_unbound();
+    if spec.fields().iter().any(|field| field.field_id.is_none()) {
+        return Err(corrupt(
+            "Iceberg managed partition replacement emitted an unassigned partition field ID",
+        ));
+    }
     let committed_fields = committed_spec
         .fields()
         .iter()
@@ -2791,9 +2847,44 @@ fn prepare_partition_replacement(
         replacement_id: replacement.replacement_id().to_bytes(),
         expected_prior_default: replacement.expected_prior_default(),
         prospective_metadata: build.metadata,
-        metadata_updates: build.changes,
+        metadata_updates,
         committed,
     })
+}
+
+fn prepare_partition_replacement(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    replacement: &ConnectorManagedPartitionSpecReplacement,
+    descriptor_properties: &ConnectorManagedDescriptorProperties,
+    operation_id: ConnectorWriteOperationId,
+) -> Result<ActivePartitionReplacement, ConnectorError> {
+    let mut prepared = prepare_partition_replacement_base(metadata, replacement, operation_id)?;
+    let descriptor_properties = managed_descriptor_property_updates(descriptor_properties)?;
+    let build = crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(
+        prepared.prospective_metadata.clone(),
+        None,
+    )
+    .set_properties(descriptor_properties)
+    .map_err(|error| invalid(format!("bind managed MV descriptor properties: {error}")))?
+    .build()
+    .map_err(|error| {
+        invalid(format!(
+            "finalize managed MV descriptor properties: {error}"
+        ))
+    })?;
+    if build.changes.len() != 1
+        || !matches!(
+            build.changes[0],
+            crate::iceberg::TableUpdate::SetProperties { .. }
+        )
+    {
+        return Err(invalid(
+            "Iceberg managed partition replacement did not append one SetProperties update",
+        ));
+    }
+    prepared.prospective_metadata = build.metadata;
+    prepared.metadata_updates.extend(build.changes);
+    Ok(prepared)
 }
 
 fn validate_managed_publication_target(
@@ -4088,6 +4179,13 @@ mod tests {
         let new_spec_id = prepared.committed.spec_id();
         assert_ne!(new_spec_id, metadata.default_partition_spec_id());
         assert_eq!(prepared.metadata_updates.len(), 3);
+        let crate::iceberg::TableUpdate::AddSpec { spec } = &prepared.metadata_updates[0] else {
+            panic!("partition replacement must start with AddSpec");
+        };
+        assert!(
+            spec.fields().iter().all(|field| field.field_id.is_some()),
+            "REST Catalog rejects an AddSpec update containing an unassigned field ID"
+        );
 
         let snapshot_id = 77;
         let snapshot = Snapshot::builder()
@@ -4962,6 +5060,16 @@ mod tests {
             ],
         )
         .expect("replacement");
+        let preparation =
+            preparation_for_metadata(&owner, table.metadata(), ConnectorWriteIntent::Overwrite, 6);
+        let preview = control
+            .preview_managed_partition_spec(ConnectorManagedPartitionSpecPreviewRequest::new(
+                operation_id,
+                preparation.table().clone(),
+                replacement.clone(),
+                context(),
+            ))
+            .expect("preview managed partition replacement");
         let managed = ConnectorManagedPublicationIntent::try_new_with_partition_spec_replacement(
             publication_id,
             ConnectorManagedPublicationTarget::try_new(
@@ -4982,19 +5090,15 @@ mod tests {
             }],
             "definition-fingerprint",
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
-            replacement,
+            replacement.clone(),
+            preview.committed_partitioning().clone(),
             descriptor_properties(),
         )
         .expect("managed intent");
         let activation = control
             .activate_write(ConnectorWriteActivationRequest {
                 operation_id,
-                source: ConnectorWriteActivationSource::Prepared(preparation_for_metadata(
-                    &owner,
-                    table.metadata(),
-                    ConnectorWriteIntent::Overwrite,
-                    6,
-                )),
+                source: ConnectorWriteActivationSource::Prepared(preparation),
                 intent: ConnectorWriteActivationIntent::ManagedPublication(managed),
                 context: context(),
             })
@@ -5099,6 +5203,11 @@ mod tests {
             .committed_partitioning()
             .expect("committed partitioning")
             .clone();
+        assert_eq!(
+            committed_partitioning,
+            *preview.committed_partitioning(),
+            "activation must commit exactly the frozen preview partitioning"
+        );
         assert_eq!(
             committed_partitioning.spec_id(),
             writer_handle.target_partition_spec_id

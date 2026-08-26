@@ -307,6 +307,13 @@ pub(crate) fn managed_publication_activation_intent(
                 arguments.4,
                 arguments.5,
                 replacement.clone(),
+                publication
+                    .expected_committed_partitioning()
+                    .cloned()
+                    .ok_or_else(|| {
+                        "managed MV partition replacement is missing its exact preview partitioning"
+                            .to_string()
+                    })?,
                 arguments.6,
             )
         }

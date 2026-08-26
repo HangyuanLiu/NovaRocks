@@ -584,6 +584,21 @@ mod tests {
         .expect("valid lake package")
     }
 
+    fn sample_package_for_catalog(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> MvLakePackageObservation {
+        let mut package = sample_package(sample_publication());
+        package.table.instance_id = ConnectorInstanceId::parse(catalog).expect("instance ID");
+        package.table.namespace = Arc::from(namespace);
+        package.table.table = Arc::from(table);
+        package.descriptor.package_id = format!("{namespace}.{table}");
+        package.descriptor.schema_contract.target.table_fqn =
+            format!("{catalog}.{namespace}.{table}");
+        package
+    }
+
     fn sample_publication() -> MvLakePublication {
         MvLakePublication::Published(
             MvPublishedLakeFacts::try_new(
@@ -708,6 +723,43 @@ mod tests {
                 .expect("list ready projections")
                 .is_empty(),
             "a retained StateStore row must not outlive incomplete lake discovery"
+        );
+    }
+
+    #[test]
+    fn incomplete_catalog_quarantine_preserves_other_catalog_projections() {
+        let repository = Arc::new(InMemoryMvRepository::default());
+        let repository_port: Arc<dyn MvRepository> = repository;
+        let readiness = MvReadinessPort::new(
+            Arc::clone(&repository_port),
+            Arc::new(ProcessRuntime::default()),
+        );
+        let affected = sample_package_for_catalog("ice_a", "analytics_a", "mv_orders_a");
+        let unaffected = sample_package_for_catalog("ice_b", "analytics_b", "mv_orders_b");
+
+        readiness
+            .project_observed(uuid::Uuid::now_v7(), &affected)
+            .expect("project affected package");
+        readiness
+            .project_observed(uuid::Uuid::now_v7(), &unaffected)
+            .expect("project unaffected package");
+
+        readiness
+            .quarantine_catalog("ice_a", "namespace enumeration failed".to_string())
+            .expect("quarantine affected catalog");
+
+        let ready = readiness
+            .list_ready_projections()
+            .expect("list ready projections");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].definition.target_catalog.as_deref(), Some("ice_b"));
+        assert_eq!(
+            ready[0].definition.target_namespace,
+            Some("analytics_b".to_string())
+        );
+        assert_eq!(
+            ready[0].definition.target_table,
+            Some("mv_orders_b".to_string())
         );
     }
 

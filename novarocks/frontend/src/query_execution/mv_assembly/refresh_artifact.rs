@@ -123,6 +123,7 @@ pub struct MvRefreshPublicationIntent {
     target_namespace: String,
     target_name: String,
     partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
+    expected_committed_partitioning: Option<ConnectorCommittedPartitioning>,
 }
 
 impl MvRefreshPublicationIntent {
@@ -169,6 +170,7 @@ impl MvRefreshPublicationIntent {
             target_namespace,
             target_name,
             partition_spec_replacement: None,
+            expected_committed_partitioning: None,
         })
     }
 
@@ -211,13 +213,21 @@ impl MvRefreshPublicationIntent {
     pub(crate) fn with_partition_spec_replacement(
         mut self,
         replacement: ConnectorManagedPartitionSpecReplacement,
+        expected_committed_partitioning: ConnectorCommittedPartitioning,
+        descriptor_properties: ConnectorManagedDescriptorProperties,
     ) -> Self {
         self.partition_spec_replacement = Some(replacement);
+        self.expected_committed_partitioning = Some(expected_committed_partitioning);
+        self.descriptor_properties = descriptor_properties;
         self
     }
 
     pub fn partition_spec_replacement(&self) -> Option<&ConnectorManagedPartitionSpecReplacement> {
         self.partition_spec_replacement.as_ref()
+    }
+
+    pub fn expected_committed_partitioning(&self) -> Option<&ConnectorCommittedPartitioning> {
+        self.expected_committed_partitioning.as_ref()
     }
 }
 
@@ -248,6 +258,12 @@ impl MvRefreshCommittedFacts {
         if intent.partition_spec_replacement().is_some() != committed_partitioning.is_some() {
             return Err(
                 "MV refresh committed partitioning does not match the requested transition"
+                    .to_string(),
+            );
+        }
+        if committed_partitioning.as_ref() != intent.expected_committed_partitioning() {
+            return Err(
+                "MV refresh committed partitioning does not match its exact prepared preview"
                     .to_string(),
             );
         }

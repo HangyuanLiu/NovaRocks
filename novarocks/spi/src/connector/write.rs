@@ -1087,6 +1087,112 @@ impl ConnectorManagedPartitionSpecReplacement {
     }
 }
 
+/// A read-only request to derive the provider-assigned physical identities
+/// that an atomic managed partition replacement would produce. The request
+/// carries an opaque target handle from the same retained control generation;
+/// callers cannot manufacture provider metadata or physical field IDs.
+#[derive(Clone)]
+pub struct ConnectorManagedPartitionSpecPreviewRequest {
+    operation_id: ConnectorWriteOperationId,
+    table: super::ConnectorTableHandle,
+    replacement: ConnectorManagedPartitionSpecReplacement,
+    context: ConnectorRequestContext,
+}
+
+impl ConnectorManagedPartitionSpecPreviewRequest {
+    pub fn new(
+        operation_id: ConnectorWriteOperationId,
+        table: super::ConnectorTableHandle,
+        replacement: ConnectorManagedPartitionSpecReplacement,
+        context: ConnectorRequestContext,
+    ) -> Self {
+        Self {
+            operation_id,
+            table,
+            replacement,
+            context,
+        }
+    }
+
+    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
+        self.operation_id
+    }
+
+    pub const fn table(&self) -> &super::ConnectorTableHandle {
+        &self.table
+    }
+
+    pub const fn replacement(&self) -> &ConnectorManagedPartitionSpecReplacement {
+        &self.replacement
+    }
+
+    pub const fn context(&self) -> &ConnectorRequestContext {
+        &self.context
+    }
+
+    pub fn validate(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
+        if self.table.owner() != &owner.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "managed partition preview table does not belong to the exact connector instance",
+            ));
+        }
+        self.replacement.validate_for_operation(self.operation_id)
+    }
+}
+
+/// The exact provider-assigned partitioning predicted from one frozen target.
+/// This is a preparation fact, not a committed result: activation must derive
+/// it again from the same admitted table and reject any mismatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorManagedPartitionSpecPreview {
+    owner: ConnectorExecutionBindingKey,
+    operation_id: ConnectorWriteOperationId,
+    committed_partitioning: ConnectorCommittedPartitioning,
+}
+
+impl ConnectorManagedPartitionSpecPreview {
+    pub fn try_new(
+        owner: ConnectorExecutionBindingKey,
+        operation_id: ConnectorWriteOperationId,
+        committed_partitioning: ConnectorCommittedPartitioning,
+    ) -> Result<Self, ConnectorError> {
+        committed_partitioning.validate()?;
+        Ok(Self {
+            owner,
+            operation_id,
+            committed_partitioning,
+        })
+    }
+
+    pub const fn owner(&self) -> &ConnectorExecutionBindingKey {
+        &self.owner
+    }
+
+    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
+        self.operation_id
+    }
+
+    pub const fn committed_partitioning(&self) -> &ConnectorCommittedPartitioning {
+        &self.committed_partitioning
+    }
+
+    fn validate_for_request(
+        &self,
+        owner: &ConnectorExecutionBindingKey,
+        operation_id: ConnectorWriteOperationId,
+    ) -> Result<(), ConnectorError> {
+        self.committed_partitioning.validate()?;
+        if &self.owner != owner || self.operation_id != operation_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "managed partition preview does not retain the exact lease generation or operation",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// One exact provider-assigned field in committed partitioning. Both physical
 /// and source identities are application facts required to finalize or recover
 /// the durable MV partition contract without interpreting provider metadata.
@@ -1418,6 +1524,7 @@ pub struct ConnectorManagedPublicationIntent {
     definition_fingerprint: Arc<str>,
     empty_input: ConnectorManagedPublicationEmptyInputDisposition,
     partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
+    expected_committed_partitioning: Option<ConnectorCommittedPartitioning>,
     descriptor_properties: ConnectorManagedDescriptorProperties,
 }
 
@@ -1440,6 +1547,7 @@ impl ConnectorManagedPublicationIntent {
             definition_fingerprint.into(),
             empty_input,
             None,
+            None,
             descriptor_properties,
         )
     }
@@ -1453,6 +1561,7 @@ impl ConnectorManagedPublicationIntent {
         definition_fingerprint: impl Into<Arc<str>>,
         empty_input: ConnectorManagedPublicationEmptyInputDisposition,
         partition_spec_replacement: ConnectorManagedPartitionSpecReplacement,
+        expected_committed_partitioning: ConnectorCommittedPartitioning,
         descriptor_properties: ConnectorManagedDescriptorProperties,
     ) -> Result<Self, ConnectorError> {
         Self::try_new_inner(
@@ -1463,6 +1572,7 @@ impl ConnectorManagedPublicationIntent {
             definition_fingerprint.into(),
             empty_input,
             Some(partition_spec_replacement),
+            Some(expected_committed_partitioning),
             descriptor_properties,
         )
     }
@@ -1476,6 +1586,7 @@ impl ConnectorManagedPublicationIntent {
         definition_fingerprint: Arc<str>,
         empty_input: ConnectorManagedPublicationEmptyInputDisposition,
         partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
+        expected_committed_partitioning: Option<ConnectorCommittedPartitioning>,
         descriptor_properties: ConnectorManagedDescriptorProperties,
     ) -> Result<Self, ConnectorError> {
         if definition_fingerprint.is_empty()
@@ -1513,6 +1624,15 @@ impl ConnectorManagedPublicationIntent {
                 "connector managed partition replacement requires a full publication that commits empty input",
             ));
         }
+        if partition_spec_replacement.is_some() != expected_committed_partitioning.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "managed partition replacement must carry its exact preview partitioning",
+            ));
+        }
+        if let Some(partitioning) = &expected_committed_partitioning {
+            partitioning.validate()?;
+        }
         Ok(Self {
             publication_id,
             target,
@@ -1521,6 +1641,7 @@ impl ConnectorManagedPublicationIntent {
             definition_fingerprint,
             empty_input,
             partition_spec_replacement,
+            expected_committed_partitioning,
             descriptor_properties,
         })
     }
@@ -1546,6 +1667,9 @@ impl ConnectorManagedPublicationIntent {
     pub fn partition_spec_replacement(&self) -> Option<&ConnectorManagedPartitionSpecReplacement> {
         self.partition_spec_replacement.as_ref()
     }
+    pub fn expected_committed_partitioning(&self) -> Option<&ConnectorCommittedPartitioning> {
+        self.expected_committed_partitioning.as_ref()
+    }
     pub const fn descriptor_properties(&self) -> &ConnectorManagedDescriptorProperties {
         &self.descriptor_properties
     }
@@ -1562,6 +1686,9 @@ impl ConnectorManagedPublicationIntent {
         }
         if let Some(replacement) = &self.partition_spec_replacement {
             replacement.validate_for_operation(operation_id)?;
+        }
+        if let Some(partitioning) = &self.expected_committed_partitioning {
+            partitioning.validate()?;
         }
         Ok(())
     }
@@ -1600,6 +1727,10 @@ impl ConnectorManagedPublicationIntent {
         if let Some(replacement) = &self.partition_spec_replacement {
             hasher.update(b"partition-spec-replacement\0");
             hasher.update(replacement.digest());
+            // Constructor validation guarantees the paired fact is present.
+            if let Some(partitioning) = &self.expected_committed_partitioning {
+                hasher.update(partitioning.digest());
+            }
         }
         hasher.finalize().into()
     }
@@ -3175,6 +3306,19 @@ pub trait ConnectorWriteControl: Send + Sync {
         ))
     }
 
+    /// Preview one managed partition replacement from the caller's exact
+    /// admitted target. This must not reserve a writer, mutate catalog state,
+    /// or resolve a later connector generation.
+    fn preview_managed_partition_spec(
+        &self,
+        _request: ConnectorManagedPartitionSpecPreviewRequest,
+    ) -> Result<ConnectorManagedPartitionSpecPreview, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "connector write control does not implement managed partition preview",
+        ))
+    }
+
     /// Activates a sealed direct route set or COW preparation plus bounded
     /// selection. Implementations must not obtain a new control generation.
     fn activate_row_mutation(
@@ -3300,6 +3444,17 @@ impl ConnectorWriteLease {
             }
         }
         Ok(outcome)
+    }
+
+    pub fn preview_managed_partition_spec(
+        &self,
+        request: ConnectorManagedPartitionSpecPreviewRequest,
+    ) -> Result<ConnectorManagedPartitionSpecPreview, ConnectorError> {
+        request.validate(&self.binding_key)?;
+        let operation_id = request.operation_id();
+        let preview = self.control.preview_managed_partition_spec(request)?;
+        preview.validate_for_request(&self.binding_key, operation_id)?;
+        Ok(preview)
     }
 
     pub fn activate_row_mutation(
@@ -4066,6 +4221,7 @@ mod tests {
                 "definition",
                 ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
                 replacement,
+                ConnectorCommittedPartitioning::try_new(4, committed_partition_fields()).unwrap(),
                 descriptor_properties(),
             )
             .expect("repartition intent");
@@ -4164,6 +4320,7 @@ mod tests {
                 "definition",
                 ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
                 replacement.clone(),
+                ConnectorCommittedPartitioning::try_new(4, committed_partition_fields()).unwrap(),
                 descriptor_properties(),
             )
             .is_err()
@@ -4177,6 +4334,7 @@ mod tests {
                 "definition",
                 ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit,
                 replacement,
+                ConnectorCommittedPartitioning::try_new(4, committed_partition_fields()).unwrap(),
                 descriptor_properties(),
             )
             .is_err()
