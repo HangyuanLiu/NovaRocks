@@ -69,8 +69,9 @@ SELECT COUNT(*) AS n FROM ${case_db}.t1;
 
 -- query 6
 -- @skip_result_check=true
--- Future cutoff: all data files are referenced by live snapshots so 0 files deleted.
-ALTER TABLE ${case_db}.t1 REMOVE ORPHAN FILES OLDER THAN '2099-01-01 00:00:00';
+-- Historical cutoff stays behind the shared safe-GC boundary; all data files
+-- are newer and referenced by live snapshots, so 0 files are deleted.
+ALTER TABLE ${case_db}.t1 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 7
 -- All 3 rows must remain visible after the noop orphan removal.
@@ -97,7 +98,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t2;
 -- query 11
 -- @skip_result_check=true
 -- Empty table has no data files to scan; command succeeds without error.
-ALTER TABLE ${case_db}.t2 REMOVE ORPHAN FILES OLDER THAN '2099-01-01 00:00:00';
+ALTER TABLE ${case_db}.t2 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 12
 -- Still empty after noop orphan removal.
@@ -135,12 +136,12 @@ SELECT COUNT(*) AS n FROM ${case_db}.t3;
 -- query 18
 -- @skip_result_check=true
 -- Step 1: EXPIRE SNAPSHOTS (noop on live chain).
-ALTER TABLE ${case_db}.t3 EXPIRE SNAPSHOTS OLDER THAN '2099-01-01 00:00:00';
+ALTER TABLE ${case_db}.t3 EXPIRE SNAPSHOTS OLDER THAN '2020-01-01 00:00:00';
 
 -- query 19
 -- @skip_result_check=true
 -- Step 2: REMOVE ORPHAN FILES after EXPIRE succeeds without error.
-ALTER TABLE ${case_db}.t3 REMOVE ORPHAN FILES OLDER THAN '2099-01-01 00:00:00';
+ALTER TABLE ${case_db}.t3 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 20
 -- All rows visible after EXPIRE+ORPHAN pipeline.
@@ -172,7 +173,7 @@ TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
 
 -- query 24
 -- @expect_error=does not support branch
-ALTER TABLE ${case_db}.t5.branch_dev REMOVE ORPHAN FILES OLDER THAN '2099-01-01 00:00:00';
+ALTER TABLE ${case_db}.t5.branch_dev REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- ---------------------------------------------------------------------------
 -- Case 6: V2 table support
@@ -199,7 +200,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t6;
 -- query 29
 -- @skip_result_check=true
 -- REMOVE ORPHAN FILES on v2 table: noop (all files live) and no error.
-ALTER TABLE ${case_db}.t6 REMOVE ORPHAN FILES OLDER THAN '2099-01-01 00:00:00';
+ALTER TABLE ${case_db}.t6 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 30
 -- Data intact after orphan removal on v2 table.
@@ -245,14 +246,13 @@ TBLPROPERTIES ("format-version" = "2");
 
 -- query 37
 -- @expect_error=unsupported trailing
-ALTER TABLE ${case_db}.t8 REMOVE ORPHAN FILES OLDER THAN '2099-01-01 00:00:00' WHERE size_in_bytes < 100;
+ALTER TABLE ${case_db}.t8 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00' WHERE size_in_bytes < 100;
 
 -- ---------------------------------------------------------------------------
--- Case 9: OLDER THAN far-future is accepted
--- Verifies: cutoff in year 2099 is parsed and applied without error.
--- (All current data files are "newer" than the threshold under REMOVE ORPHAN
--- semantics when the threshold is in the future -- files referenced by live
--- snapshots are always exempt; this is a noop.)
+-- Case 9: historical safe-GC cutoff is accepted
+-- Verifies: a cutoff older than the shared safe-GC boundary is parsed and
+-- applied without error. Current data files are newer and referenced by live
+-- snapshots, so the operation is a noop.
 -- ---------------------------------------------------------------------------
 
 -- query 38
@@ -275,7 +275,7 @@ SELECT COUNT(*) AS n FROM ${case_db}.t9;
 -- query 42
 -- @skip_result_check=true
 -- Far-future cutoff: all files are live-referenced, 0 orphans, command succeeds.
-ALTER TABLE ${case_db}.t9 REMOVE ORPHAN FILES OLDER THAN '2099-12-31 23:59:59';
+ALTER TABLE ${case_db}.t9 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 43
 -- Row count unchanged confirming no data files removed.
@@ -312,12 +312,12 @@ SELECT COUNT(*) AS n FROM ${case_db}.t10;
 -- query 49
 -- @skip_result_check=true
 -- Maintenance step 1: expire old snapshots (noop on live chain).
-ALTER TABLE ${case_db}.t10 EXPIRE SNAPSHOTS OLDER THAN '2099-01-01 00:00:00';
+ALTER TABLE ${case_db}.t10 EXPIRE SNAPSHOTS OLDER THAN '2020-01-01 00:00:00';
 
 -- query 50
 -- @skip_result_check=true
 -- Maintenance step 2: remove orphan files (noop, no stale files).
-ALTER TABLE ${case_db}.t10 REMOVE ORPHAN FILES OLDER THAN '2099-01-01 00:00:00';
+ALTER TABLE ${case_db}.t10 REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 51
 -- @skip_result_check=true

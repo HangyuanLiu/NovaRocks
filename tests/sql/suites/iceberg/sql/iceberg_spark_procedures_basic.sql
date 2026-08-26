@@ -60,7 +60,7 @@ CALL proc_ice_${uuid0}.system.rewrite_position_delete_files(table => 'ns_${uuid0
 
 -- query 4
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
-CALL proc_ice_${uuid0}.system.remove_orphan_files(table => 'ns_${uuid0}.orders', older_than => TIMESTAMP '2099-01-01 00:00:00');
+CALL proc_ice_${uuid0}.system.remove_orphan_files(table => 'ns_${uuid0}.orders', older_than => TIMESTAMP '2020-01-01 00:00:00');
 
 -- query 5
 -- @db=proc_ice_${uuid0}.ns_${uuid0}
