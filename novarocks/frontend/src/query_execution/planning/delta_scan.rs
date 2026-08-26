@@ -15,11 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Application-owned lookup for provider-sealed change-window scans.
+//! Application-owned lookup for change-window scans.
 //!
-//! The provider admits the physical change read while the refresh owns its
-//! exact planning lease. Preparation retrieves only the sealed SPI scan by its
-//! query-local token and snapshot window.
+//! The statement admits the relation while it still holds its exact planning
+//! lease; the refresh owns that lease for the rest of compilation. This lookup
+//! recovers only the admitted materialization named by the scan's query-local
+//! token, and it validates that the scan states both window endpoints.
+//!
+//! It deliberately does not resolve the window itself. A change window is the
+//! set difference between the rows visible at its two endpoints — never a
+//! replay of the manifests between them, in which a row written and deleted
+//! inside the window would appear although it is invisible at both endpoints.
+//! Only the connector can compute that difference, so preparation hands it the
+//! two endpoints and the connector freezes the relation.
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::query_execution::preparation::scan::{ResolvedScanExecution, ScanBindingResolver};
@@ -51,87 +59,84 @@ impl ScanBindingResolver for QueryTableBindingScanResolver<'_> {
         if facts.category() != SqlScanPreparationCategory::Delta {
             return Ok(None);
         }
-        let window = facts.delta_window().ok_or_else(|| {
+        // Both endpoints must be stated by the scan. A window missing one has
+        // no set difference to describe at all.
+        facts.delta_window().ok_or_else(|| {
             format!(
-                "SQL delta scan facts for '{}' are missing a sealed change window",
+                "SQL delta scan facts for '{}' are missing a change window",
                 facts.identity().fqn()
             )
         })?;
-        let from_snapshot_id = window.from_snapshot_id();
-        let to_snapshot_id = window.to_snapshot_id();
-        let binding = self.bindings.binding(facts.binding())?;
-        let admitted_scan = binding
-            .admitted_change_scans
-            .get(&(from_snapshot_id, to_snapshot_id))
-            .cloned()
+        let materialization = self
+            .bindings
+            .scan_materialization(facts.binding())?
             .ok_or_else(|| {
                 format!(
-                    "SQL delta scan binding for '{}.{}.{}' has no sealed change-window admission from_snapshot_id={from_snapshot_id} to_snapshot_id={to_snapshot_id}",
+                    "SQL delta scan binding for '{}.{}.{}' has no scan materialization",
                     facts.identity().catalog(),
                     facts.identity().namespace(),
                     facts.identity().table()
                 )
             })?;
-        Ok(Some(ResolvedScanExecution::SealedConnectorScan(
-            admitted_scan,
+        Ok(Some(ResolvedScanExecution::AdmittedChangeWindow(
+            materialization,
         )))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::num::NonZeroU64;
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
     use arrow::datatypes::Schema;
-    use bytes::Bytes;
-    use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorChangeWindow, ConnectorChangeWindowAdmission,
-        ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    };
+    use novarocks_spi::connector::{ConnectorReadSelector, ConnectorTablePlanningFacts};
 
     use super::{QueryTableBindingScanResolver, ScanBindingResolver};
     use crate::catalog_application::query_bindings::{
-        QueryTableBindingKey, QueryTableBindingStore, admitted_change_window_binding_for_test,
+        QueryScanMaterialization, QueryTableBinding, QueryTableBindingAdmission,
+        QueryTableBindingKey, QueryTableBindingStore,
     };
-    use crate::query_execution::preparation::scan::ResolvedScanExecution;
+    use crate::query_execution::preparation::scan::{
+        ResolvedScanExecution, fixture_query_scan_materialization,
+    };
+    use novarocks_sql::binding::SqlTableBindingId;
     use novarocks_sql::plan_read::{DistributedNodeKind, PlanScanNode};
+    use novarocks_sql::planning::catalog::{
+        ConnectorReadTableFacts, materialize_connector_read_table,
+    };
     use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
+    /// One admitted binding of the delta fixture's table, with or without the
+    /// scan materialization the change-window lane must recover.
+    fn change_window_binding(
+        binding: SqlTableBindingId,
+        materialization: Option<QueryScanMaterialization>,
+    ) -> QueryTableBinding {
+        let resolved = materialize_connector_read_table(ConnectorReadTableFacts {
+            catalog: "test_catalog".to_string(),
+            namespace: "test_db".to_string(),
+            table: "test_table".to_string(),
+            columns: Vec::new(),
+            iceberg_row_lineage_metadata_columns: Vec::new(),
+            schema: Arc::new(Schema::empty()),
+            binding,
+            selector: ConnectorReadSelector::Current,
+            planning_facts: ConnectorTablePlanningFacts::empty(),
+        })
+        .expect("test catalog facts materialize")
+        .into_resolved_table();
+        QueryTableBinding {
+            resolved,
+            statistics_pin: None,
+            admission: QueryTableBindingAdmission::Local,
+            scan_materialization: materialization,
+            mv_target_read: None,
+            write_target_admission: None,
+            frozen_snapshot_materializations: BTreeMap::new(),
+            admitted_change_scans: BTreeMap::new(),
         }
-    }
-
-    fn admitted_scan(from_snapshot_id: i64, to_snapshot_id: i64) -> ConnectorScan {
-        let owner = ConnectorExecutionBindingKey {
-            instance_id: ConnectorInstanceId::parse("ice").expect("instance ID"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
-        };
-        let context = ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
-            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        )
-        .expect("request context");
-        ConnectorScan::try_new_change_window(
-            owner.clone(),
-            ConnectorChangeWindow::new(from_snapshot_id, to_snapshot_id),
-            ConnectorChangeWindowAdmission::MetadataOnly,
-            ConnectorScanHandle::try_new(owner.instance_id, Bytes::from_static(b"change-v1"))
-                .expect("scan handle"),
-            Arc::new(Schema::empty()),
-            Vec::new(),
-            &context,
-        )
-        .expect("sealed scan")
     }
 
     fn delta_scan(fixture: NativeScanFixture) -> PlanScanNode {
@@ -151,22 +156,23 @@ mod tests {
         )
     }
 
-    #[test]
-    fn sqlx2_preparation_delta_resolves_only_its_admitted_window() {
-        let bindings = test_store();
-        bindings
+    fn admit(store: &QueryTableBindingStore, materialization: Option<QueryScanMaterialization>) {
+        store
             .resolve_or_insert_with_id(
                 QueryTableBindingKey::snapshot("test_catalog", "test_db", "test_table", 7),
-                |binding| {
-                    Ok(admitted_change_window_binding_for_test(
-                        binding,
-                        6,
-                        7,
-                        admitted_scan(6, 7),
-                    ))
-                },
+                |binding| Ok(change_window_binding(binding, materialization.clone())),
             )
             .expect("admit binding");
+    }
+
+    /// The delta lane recovers the exact query-local admission of its relation.
+    /// The window itself stays on the scan: the connector is what turns two
+    /// endpoints into one change-window relation.
+    #[test]
+    fn a_delta_scan_resolves_its_exact_query_local_admission() {
+        let bindings = test_store();
+        let materialization = fixture_query_scan_materialization("test_catalog");
+        admit(&bindings, Some(materialization.clone()));
         let resolver = QueryTableBindingScanResolver::new(&bindings);
         let scan = delta_scan(NativeScanFixture::DeltaForPreparedBinding);
 
@@ -174,43 +180,41 @@ mod tests {
             .resolve_scan(7, &scan)
             .expect("resolve admitted delta")
             .expect("delta scan execution");
-        let ResolvedScanExecution::SealedConnectorScan(scan) = resolved else {
-            panic!("expected sealed connector scan");
+        let ResolvedScanExecution::AdmittedChangeWindow(resolved) = resolved else {
+            panic!("expected an admitted change window");
         };
         assert_eq!(
-            scan.selection(),
-            novarocks_spi::connector::ConnectorScanSelection::ChangeWindow(
-                ConnectorChangeWindow::new(6, 7)
-            )
+            resolved.planning_lease.binding().incarnation(),
+            materialization.planning_lease.binding().incarnation(),
+            "the lane must reuse the exact admitted generation"
         );
+    }
 
-        let unadmitted = delta_scan(NativeScanFixture::DeltaWithStaleUnprojectedColumn);
-        let error = resolver
-            .resolve_scan(7, &unadmitted)
-            .expect_err("unadmitted window must fail before submission");
-        assert!(
-            error.contains("no sealed change-window admission"),
-            "error={error}"
-        );
+    /// A binding with no admitted materialization is a submission-time
+    /// contract failure, never permission to resolve the relation again.
+    #[test]
+    fn a_delta_scan_without_an_admitted_materialization_fails_closed() {
+        let bindings = test_store();
+        admit(&bindings, None);
+        let error = QueryTableBindingScanResolver::new(&bindings)
+            .resolve_scan(7, &delta_scan(NativeScanFixture::DeltaForPreparedBinding))
+            .expect_err("an unadmitted relation must fail before submission");
+        assert!(error.contains("no scan materialization"), "error={error}");
     }
 
     #[test]
     fn sqlx2_preparation_delta_rejects_cross_request_token() {
-        let first = QueryTableBindingStore::try_new().expect("first binding store");
+        // A named scope keeps this a cross-request test whatever order the
+        // suite runs in: an allocated scope could coincide with the fixture's
+        // and turn the refusal into "missing from this request" instead.
+        let first = QueryTableBindingStore::try_new_with_scope_for_test(
+            NonZeroU64::new(2).expect("second fixture binding scope"),
+        );
         let second = test_store();
-        second
-            .resolve_or_insert_with_id(
-                QueryTableBindingKey::snapshot("test_catalog", "test_db", "test_table", 7),
-                |binding| {
-                    Ok(admitted_change_window_binding_for_test(
-                        binding,
-                        6,
-                        7,
-                        admitted_scan(6, 7),
-                    ))
-                },
-            )
-            .expect("admit second binding");
+        admit(
+            &second,
+            Some(fixture_query_scan_materialization("test_catalog")),
+        );
         let scan = delta_scan(NativeScanFixture::DeltaForPreparedBinding);
 
         let error = QueryTableBindingScanResolver::new(&first)

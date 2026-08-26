@@ -46,12 +46,13 @@ pub mod table_execute;
 pub mod table_handle;
 
 pub use change_window::{
-    IcebergAddedRows, IcebergChangeSide, IcebergChangeSplit, IcebergChangeWindowHandle,
-    IcebergChangeWindowHandleParams, IcebergChangeWindowPlan, IcebergChangeWindowPlanOutcome,
-    IcebergDeletedDataFileRows, IcebergEndpointVisibility, IcebergEqualityDeletedRows,
-    IcebergPositionDeletedRows, MAX_RESTRICTED_ROW_IDS, TABLE_CHANGES_METADATA_COLUMNS,
-    TableChangesChangeType, TableChangesFileChange, TableChangesFunctionHandle,
-    TableChangesFunctionHandleParams, TableChangesSplit, TableChangesSplitParams,
+    ICEBERG_CHANGE_OP_COLUMN, ICEBERG_CHANGE_OP_FIELD_ID, IcebergAddedRows, IcebergChangeSide,
+    IcebergChangeSplit, IcebergChangeWindowHandle, IcebergChangeWindowHandleParams,
+    IcebergChangeWindowPlan, IcebergChangeWindowPlanOutcome, IcebergDeletedDataFileRows,
+    IcebergEndpointVisibility, IcebergEqualityDeletedRows, IcebergPositionDeletedRows,
+    MAX_RESTRICTED_ROW_IDS, TABLE_CHANGES_METADATA_COLUMNS, TableChangesChangeType,
+    TableChangesFileChange, TableChangesFunctionHandle, TableChangesFunctionHandleParams,
+    TableChangesSplit, TableChangesSplitParams, change_op_column_handle,
 };
 pub use column_handle::{
     ColumnIdentity, ColumnIdentityCategory, IcebergColumnHandle, IcebergColumnHandleParams,
@@ -68,8 +69,8 @@ pub use page_source::{
     ParquetFooterCache, create_iceberg_page_source,
 };
 pub use page_source_provider::{
-    IcebergPageSourceProvider, IcebergPageSourceProviderOptions, iceberg_data_split,
-    iceberg_scan_columns, iceberg_table_handle,
+    IcebergPageSourceProvider, IcebergPageSourceProviderOptions, iceberg_change_window_handle,
+    iceberg_change_window_split, iceberg_data_split, iceberg_scan_columns, iceberg_table_handle,
 };
 pub use schema_binding::{
     FileFieldIdCoverage, ICEBERG_METADATA_FIELD_ID_FILE_MODIFIED_TIME,
@@ -85,8 +86,9 @@ pub use split::{
     IcebergSplitWeightParameters, ParquetFileDecryptionData, iceberg_split_weight,
 };
 pub use split_source::{
-    DEFAULT_TARGET_SPLIT_SIZE_BYTES, IcebergDeleteFileFacts, IcebergPlannedDataFile,
-    IcebergSplitSource, IcebergSplitSourceOptions, READ_SPLIT_TARGET_SIZE_PROPERTY,
+    DEFAULT_TARGET_SPLIT_SIZE_BYTES, IcebergChangeWindowEndpoints, IcebergChangeWindowSplitSource,
+    IcebergDeleteFileFacts, IcebergPlannedDataFile, IcebergSplitSource, IcebergSplitSourceOptions,
+    READ_SPLIT_TARGET_SIZE_PROPERTY, plan_change_window_splits,
 };
 pub use system_page_source::{
     IcebergSystemPageSource, IcebergSystemTableProvider, bounds_row_type,

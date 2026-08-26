@@ -141,6 +141,36 @@ pub(crate) fn connector_value_type(data_type: &DataType) -> Option<ConnectorValu
     }
 }
 
+/// The typed counterpart of a scan output column's engine type.
+///
+/// An output column is not a predicate operand: it only has to be projected
+/// and read. So a type with no comparable counterpart is typed
+/// [`ConnectorValueType::NonComparable`] rather than refused, which states
+/// exactly that no comparison is possible over it and nothing more. The
+/// column's real shape stays where it already was, on the plan node's own
+/// output column, and the fragment decoder agrees the two orders.
+///
+/// A type that is *scalar but inexact* — a zoned timestamp in a zone the
+/// engine cannot convert, an out-of-range decimal — is still refused: calling
+/// it non-comparable would hide a column the connector cannot read correctly
+/// behind a word about comparison.
+pub(crate) fn scan_output_value_type(data_type: &DataType) -> Option<ConnectorValueType> {
+    if let Some(value_type) = connector_value_type(data_type) {
+        return Some(value_type);
+    }
+    match data_type {
+        DataType::Struct(_)
+        | DataType::List(_)
+        | DataType::LargeList(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::Map(_, _)
+        // The carrier of VARIANT and of any other value the engine keeps as an
+        // opaque blob. Plain `Binary` stays VARBINARY: it is comparable.
+        | DataType::LargeBinary => Some(ConnectorValueType::NonComparable),
+        _ => None,
+    }
+}
+
 fn is_utc(zone: &str) -> bool {
     zone.eq_ignore_ascii_case("UTC")
 }
@@ -317,6 +347,9 @@ fn lower_literal(expr: &TypedExpr, expected: ConnectorValueType) -> Option<Conne
         return None;
     };
     let value = match expected {
+        // A column with no comparable counterpart has no literal to compare
+        // against, so no conjunct over it can be pushed down.
+        ConnectorValueType::NonComparable => return None,
         ConnectorValueType::Boolean => match literal {
             LiteralValue::Bool(value) => ConnectorValue::Boolean(*value),
             _ => return None,

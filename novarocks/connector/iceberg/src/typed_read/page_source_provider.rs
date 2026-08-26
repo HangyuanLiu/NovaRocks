@@ -39,7 +39,8 @@ use novarocks_spi::connector::read_stack::{ConnectorPageSource, ConnectorSession
 
 use crate::access_binding::IcebergReadBinding;
 
-use super::column_handle::{IcebergColumnHandle, invalid};
+use super::change_window::{IcebergChangeSplit, IcebergChangeWindowHandle};
+use super::column_handle::{IcebergColumnHandle, invalid, unsupported};
 use super::delete_manager::DeleteManager;
 use super::page_source::{
     IcebergPageSourceRequest, ParquetFooterCache, create_iceberg_page_source,
@@ -138,6 +139,18 @@ impl TypedConnectorPageSourceProvider for IcebergPageSourceProvider {
                 .create_files_page_source(&files_split, &columns);
         }
 
+        // A change-window split reads data files, but not with the data
+        // relation's semantics: its sign comes from the split variant and its
+        // reverse side selects the rows a delete removed instead of hiding
+        // them. Both carriers are decoded here so a mismatched pairing fails
+        // as a mismatch, then the lane reports exactly what it still lacks.
+        if split.category() == SplitCategory::ChangeWindow {
+            return Err(change_window_read_not_implemented(
+                &iceberg_change_window_handle(table)?,
+                &iceberg_change_window_split(split)?,
+            ));
+        }
+
         let table_handle = iceberg_table_handle(table)?;
         let split = iceberg_data_split(split)?;
 
@@ -204,6 +217,92 @@ pub fn iceberg_data_split(split: &ValidatedConnectorSplit) -> Result<IcebergSpli
     }
 }
 
+/// Turn a protocol-validated relation into the Iceberg CHANGE WINDOW handle.
+pub fn iceberg_change_window_handle(
+    table: &CatalogTableHandle,
+) -> Result<IcebergChangeWindowHandle, ConnectorError> {
+    match table.relation() {
+        ConnectorRelation::ChangeWindow(handle) => {
+            IcebergChangeWindowHandle::from_change_window_handle_proto(handle)
+        }
+        ConnectorRelation::Table(_) => Err(invalid(
+            "a change-window split names a change window, not a table",
+        )),
+        ConnectorRelation::TableFunction(_) => Err(invalid(
+            "a change-window split names a change window, not a table function",
+        )),
+        ConnectorRelation::SystemTable(_) => Err(invalid(
+            "a change-window split names a change window, not a system relation",
+        )),
+        ConnectorRelation::TableExecute(_) => Err(invalid(
+            "a change-window split names a change window, not a table execute target",
+        )),
+        ConnectorRelation::MergeTable(_) => Err(invalid(
+            "a change-window split names a change window, not a merge target",
+        )),
+    }
+}
+
+/// Turn a protocol-validated split into the Iceberg CHANGE WINDOW split.
+pub fn iceberg_change_window_split(
+    split: &ValidatedConnectorSplit,
+) -> Result<IcebergChangeSplit, ConnectorError> {
+    match split.category() {
+        SplitCategory::ChangeWindow => {
+            IcebergChangeSplit::from_connector_split_proto(split.as_proto())
+        }
+        SplitCategory::Data => Err(invalid(
+            "the iceberg change-window reader reads a change-window split, not a data split",
+        )),
+        SplitCategory::TableChanges => Err(invalid(
+            "the iceberg change-window reader reads a change-window split, not a table-changes split",
+        )),
+        SplitCategory::SystemFiles => Err(invalid(
+            "the iceberg change-window reader reads a change-window split, not a system-files split",
+        )),
+        SplitCategory::RewritePositionDeleteFiles => Err(invalid(
+            "the iceberg change-window reader reads a change-window split, not a rewrite-position-delete split",
+        )),
+    }
+}
+
+/// The stable rejection every change-window split currently receives.
+///
+/// The coordinator side of this lane is complete -- a window is admitted, its
+/// columns are named, and its splits are the proven difference of the two
+/// endpoints -- but no worker can execute one yet, and two facts are missing
+/// for reasons that live outside this connector:
+///
+/// * `ConnectorChangeWindowHandle` carries a schema, columns, a name mapping,
+///   and the two endpoints, and no partition specs. Reading a data file needs
+///   the spec named by `IcebergSplit::partition_spec_id` to decode
+///   `partition_data_json`, and inventing one would be a guess about the
+///   relation's own partitioning;
+/// * the reverse side needs delete verdicts this stack does not express:
+///   `IcebergPositionDeletedRows` selects the rows its newly applied artifacts
+///   name, which is the inverse of every mode `DeleteEvaluationMode` offers,
+///   and `IcebergEqualityDeletedRows` needs `EqualityMatchOnly`, which
+///   `create_iceberg_page_source` never asks for.
+///
+/// Returning a stable `Unsupported` here keeps a wrong answer impossible: a
+/// reader that ignored either fact would silently emit the wrong rows with the
+/// right shape.
+fn change_window_read_not_implemented(
+    handle: &IcebergChangeWindowHandle,
+    split: &IcebergChangeSplit,
+) -> ConnectorError {
+    unsupported(format!(
+        "iceberg change window {}.{} over snapshots ({}, {}] is not readable by this page source: \
+         its handle carries no partition spec for data file {}, and the change-window delete \
+         verdicts are not implemented",
+        handle.schema_table_name().schema_name(),
+        handle.schema_table_name().table_name(),
+        handle.from_snapshot_id_exclusive(),
+        handle.to_snapshot_id_inclusive(),
+        split.data().path(),
+    ))
+}
+
 /// Turn a protocol-validated split into the `$files` manifest split.
 pub fn iceberg_files_table_split(
     split: &ValidatedConnectorSplit,
@@ -257,14 +356,127 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use std::collections::BTreeSet;
+
     use novarocks_fs::{
         FileCancellation, FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime,
         TokioFileTaskSpawner,
     };
     use novarocks_proto::FieldPath;
     use novarocks_proto_models::connector_read as dto;
+    use novarocks_spi::connector::ConnectorErrorKind;
+    use novarocks_spi::connector::read_stack::{
+        DynamicFilter, SchemaTableName, SplitWeight, TupleDomain,
+    };
 
+    use super::super::change_window::{IcebergAddedRows, IcebergChangeWindowHandleParams};
+    use super::super::split::{IcebergFileFormat, IcebergSplitParams};
+    use super::super::table_handle::tests::partitioned_schema;
     use super::*;
+
+    /// The unconstrained filter every scan starts from. It answers nothing and
+    /// is never waited on, so it cannot affect what a dispatch decides.
+    struct UnconstrainedDynamicFilter {
+        covered: BTreeSet<novarocks_proto::connector_read::ValidatedColumnHandle>,
+    }
+
+    impl DynamicFilter<novarocks_proto::connector_read::ValidatedColumnHandle>
+        for UnconstrainedDynamicFilter
+    {
+        fn columns_covered(
+            &self,
+        ) -> &BTreeSet<novarocks_proto::connector_read::ValidatedColumnHandle> {
+            &self.covered
+        }
+
+        fn current_predicate(
+            &self,
+        ) -> TupleDomain<novarocks_proto::connector_read::ValidatedColumnHandle> {
+            TupleDomain::all()
+        }
+
+        fn is_complete(&self) -> bool {
+            true
+        }
+
+        fn is_awaitable(&self) -> bool {
+            false
+        }
+    }
+
+    fn unconstrained_filter() -> Arc<WireDynamicFilter> {
+        Arc::new(UnconstrainedDynamicFilter {
+            covered: BTreeSet::new(),
+        })
+    }
+
+    fn change_window_relation() -> CatalogTableHandle {
+        let schema = partitioned_schema();
+        let handle = IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
+            schema_table_name: SchemaTableName::try_new("sales", "orders").expect("name"),
+            table_schema_json: serde_json::to_string(&schema).expect("schema json"),
+            columns: vec![
+                IcebergColumnHandle::base_column_of(&schema, 1).expect("id"),
+                IcebergColumnHandle::base_column_of(&schema, 3).expect("amount"),
+            ],
+            name_mapping_json: None,
+            from_snapshot_id_exclusive: 11,
+            to_snapshot_id_inclusive: 12,
+            partition_spec_jsons: std::collections::BTreeMap::new(),
+        })
+        .expect("change window handle");
+        let raw = dto::CatalogTableHandle {
+            catalog_name: "lake".to_owned(),
+            instance_incarnation: vec![7_u8; 16],
+            transaction: Some(dto::ConnectorTransactionHandle {
+                handle: Some(dto::connector_transaction_handle::Handle::Iceberg(
+                    dto::HiveTransactionHandle {
+                        auto_commit: true,
+                        uuid: vec![1_u8; 16],
+                    },
+                )),
+            }),
+            relation: Some(dto::catalog_table_handle::Relation::ChangeWindow(
+                handle.to_change_window_handle_proto(),
+            )),
+        };
+        CatalogTableHandle::parse(raw, FieldPath::root("catalog_table_handle"))
+            .expect("valid change window relation")
+    }
+
+    fn change_window_split() -> ValidatedConnectorSplit {
+        let data = IcebergSplit::try_new(IcebergSplitParams {
+            path: "s3://lake/orders/added.parquet".to_owned(),
+            start: 0,
+            length: 100,
+            file_size: 100,
+            file_record_count: 10,
+            file_format: IcebergFileFormat::Parquet,
+            partition_spec_id: 7,
+            partition_data_json: "{}".to_owned(),
+            deletes: Vec::new(),
+            file_statistics_domain: TupleDomain::all(),
+            data_sequence_number: Some(4),
+            file_first_row_id: None,
+            decryption_data: None,
+            split_weight: SplitWeight::STANDARD,
+            affinity_key: None,
+        })
+        .expect("data split");
+        let split = IcebergChangeSplit::AddedRows(
+            IcebergAddedRows::try_new(data, Vec::new()).expect("added rows"),
+        );
+        ValidatedConnectorSplit::parse(
+            split.to_connector_split_proto(),
+            FieldPath::root("connector_split"),
+        )
+        .expect("valid change window split")
+    }
+
+    fn session() -> ConnectorSession {
+        ConnectorSession::try_new("q1", "u", "UTC", "en_US", std::time::SystemTime::UNIX_EPOCH)
+            .expect("session")
+    }
 
     fn provider_options() -> IcebergPageSourceProviderOptions {
         IcebergPageSourceProviderOptions {
@@ -340,6 +552,49 @@ mod tests {
             error.kind(),
             novarocks_spi::connector::ConnectorErrorKind::InvalidRequest
         );
+    }
+
+    #[test]
+    fn a_change_window_split_is_routed_to_the_change_window_lane_and_reports_what_it_lacks() {
+        let (_runtime, provider) = provider();
+        let outcome = provider.create_page_source(
+            &session(),
+            &change_window_relation(),
+            &change_window_split(),
+            0,
+            &[],
+            &unconstrained_filter(),
+        );
+        let Err(error) = outcome else {
+            panic!("the change-window lane is not readable yet");
+        };
+
+        // A stable Unsupported, not a wrong answer with the right shape: the
+        // handle carries no partition spec for the split's data file, and the
+        // reverse side's delete verdicts are not implemented.
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(error.to_string().contains("sales"));
+        assert!(error.to_string().contains("added.parquet"));
+        // It reached the change-window branch rather than the data reader's
+        // generic split rejection.
+        assert!(!error.to_string().contains("not a change-window split"));
+    }
+
+    #[test]
+    fn a_change_window_carrier_never_answers_a_data_relations_decoder_or_the_reverse() {
+        // The two lanes are separate questions, so neither carrier decodes as
+        // the other one. Accepting either pairing would read a relation whose
+        // semantics the chosen reader does not implement.
+        assert!(iceberg_table_handle(&change_window_relation()).is_err());
+        assert!(iceberg_data_split(&change_window_split()).is_err());
+        assert!(iceberg_change_window_handle(&system_table_relation()).is_err());
+
+        let window = iceberg_change_window_handle(&change_window_relation()).expect("window");
+        assert_eq!(window.from_snapshot_id_exclusive(), 11);
+        assert_eq!(window.to_snapshot_id_inclusive(), 12);
+        let split = iceberg_change_window_split(&change_window_split()).expect("split");
+        // The sign comes from the variant, never from a field on the wire.
+        assert_eq!(split.change_op(), 1);
     }
 
     #[test]

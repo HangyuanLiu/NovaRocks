@@ -34,11 +34,13 @@ use crate::connector::typed_control_registry::{
 };
 use crate::query_execution::connector_domain::CatalogHandle;
 use crate::query_execution::preparation::scan::{
-    PreparedTypedConnectorScan, ResolvedScanBinding, ResolvedScanExecution, ScanBindingResolver,
-    ScanExecutionBindings,
+    PreparedTypedConnectorScan, ResolvedScanBinding, ResolvedScanColumn, ResolvedScanExecution,
+    ScanBindingResolver, ScanExecutionBindings,
 };
-use crate::query_execution::preparation::typed_scan::prepare_typed_scan;
-use novarocks_proto::connector_read::{ConnectorRelationKind, TypedRelationVersion};
+use crate::query_execution::preparation::typed_scan::{TypedRelationFreeze, prepare_typed_scan};
+use novarocks_proto::connector_read::{
+    ConnectorRelationKind, TypedChangeWindow, TypedRelationVersion,
+};
 use novarocks_spi::connector::read_stack::{ConnectorSession, SchemaTableName};
 use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorReadSelector};
 use novarocks_sql::plan_read::PlanScanNode;
@@ -285,9 +287,12 @@ fn prepare_scan_node(
                 "SQL frozen scan node_id={node_id} has timestamp selector {timestamp} without an admitted snapshot file set"
             ));
         }
-        // An Iceberg metadata table is a system relation. The typed stack has
-        // no system-table lane yet, so refusing here is what keeps a metadata
-        // scan from silently freezing the base table's DATA handle instead.
+        // An Iceberg metadata table is a system relation. The connector
+        // implements `get_system_table_plan`, but the relation it names is
+        // `<table>$<SUFFIX>` and the suffix comes from the SQL scan's metadata
+        // table kind, which `SqlScanPreparationFacts` does not carry. Refusing
+        // here is what keeps a metadata scan from silently freezing the base
+        // table's DATA handle instead of guessing which system relation it is.
         SqlScanPreparationCategory::AdmittedMetadata => {
             return Err(unsupported_relation(
                 node_id,
@@ -295,14 +300,28 @@ fn prepare_scan_node(
                 ConnectorRelationKind::SystemTable,
             ));
         }
-        // A change-window read has its own relation family and its own
-        // enumerator; neither has a typed equivalent in this cut.
+        // A change-window read is its own relation family. The two endpoints
+        // are stated by the scan; the exact query-local admission that names
+        // the relation comes from the resolver, never from a fresh lookup.
         SqlScanPreparationCategory::Delta => {
-            return Err(unsupported_relation(
-                node_id,
-                &facts,
-                ConnectorRelationKind::ChangeWindow,
-            ));
+            let source_context = facts.source_context();
+            let resolver = resolver.ok_or_else(|| {
+                format!(
+                    "scan source {source_context} node_id={node_id} requires scan binding resolver"
+                )
+            })?;
+            resolver
+                .resolve_scan(node_id, scan)
+                .map_err(|error| {
+                    format!(
+                        "scan binding resolver failed for required source {source_context} node_id={node_id}: {error}"
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "scan binding resolver returned no binding for required source {source_context} node_id={node_id}"
+                    )
+                })?
         }
         // Both MV target lanes share one frozen materialization and lower to
         // an ordinary pinned DATA scan; the lane itself carries no execution
@@ -326,30 +345,55 @@ fn prepare_scan_node(
         }
     };
     validate_resolved_execution_kind(node_id, &facts, &execution)?;
+    // The connector produces exactly the scan's physical columns. A synthetic
+    // output — a VARIANT path column — is deliberately not one of them: the
+    // backend materializes those on top of the physical read slots, so
+    // offering one to the connector would ask for a column it does not have.
     let physical_columns = resolve_physical_columns(node_id, scan)?;
     let (ranges, equality_required, typed_scan) = match &execution {
-        // Both remaining variants are produced only by the lanes refused
-        // above; they are matched exhaustively so that adding a lane is a
-        // compile error here rather than a silent opaque read.
+        // The opaque lane is produced only by the pre-pinned source refused
+        // above; every variant is named so that adding a lane is a compile
+        // error here rather than a silent opaque read.
         ResolvedScanExecution::ConnectorRead => {
             return Err(format!(
                 "scan preparation node_id={node_id}: a pre-pinned opaque connector read has no typed lowering"
             ));
         }
-        ResolvedScanExecution::SealedConnectorScan(_) => {
-            return Err(unsupported_relation(
-                node_id,
-                &facts,
-                ConnectorRelationKind::ChangeWindow,
-            ));
-        }
-        ResolvedScanExecution::AdmittedConnectorRead(materialization) => {
+        ResolvedScanExecution::AdmittedChangeWindow(materialization) => {
+            let window = facts.delta_window().ok_or_else(|| {
+                format!(
+                    "scan preparation node_id={node_id}: a change-window scan requires a SQL delta source stating both endpoints"
+                )
+            })?;
             let prepared = prepare_typed_connector_scan(
                 node_id,
                 node_limit,
                 scan,
+                &physical_columns,
                 &facts,
                 materialization,
+                TypedRelationFreeze::ChangeWindow(TypedChangeWindow::new(
+                    window.from_snapshot_id(),
+                    window.to_snapshot_id(),
+                )),
+                context,
+                options,
+            )?;
+            (Vec::new(), Vec::new(), prepared)
+        }
+        ResolvedScanExecution::AdmittedConnectorRead(materialization) => {
+            let version = typed_relation_version(node_id, &facts, materialization.selector)?;
+            let prepared = prepare_typed_connector_scan(
+                node_id,
+                node_limit,
+                scan,
+                &physical_columns,
+                &facts,
+                materialization,
+                TypedRelationFreeze::Table {
+                    version,
+                    reference: None,
+                },
                 context,
                 options,
             )?;
@@ -367,17 +411,25 @@ fn prepare_scan_node(
     bindings.insert_scan_ranges(fragment_id, node_id, ranges)
 }
 
-/// Lower one admitted DATA relation onto the typed connector read stack.
+/// Lower one admitted relation onto the typed connector read stack.
 ///
 /// The exact-generation rule is unchanged: the relation is frozen through the
 /// control installed for the binding generation the materialization's planning
-/// lease holds, never through a name-based or "current" lookup.
+/// lease holds, never through a name-based or "current" lookup. `freeze` names
+/// the relation family the lane asked for, and the connector's answer must be
+/// exactly that family.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Every argument is a distinct frozen fact of one scan; grouping them would hide which of them the connector sees."
+)]
 fn prepare_typed_connector_scan(
     node_id: i32,
     node_limit: i64,
     scan: &PlanScanNode,
+    physical_columns: &[ResolvedScanColumn],
     facts: &SqlScanPreparationFacts,
     materialization: &QueryScanMaterialization,
+    freeze: TypedRelationFreeze<'_>,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     options: &ScanPreparationOptions,
 ) -> Result<PreparedTypedConnectorScan, String> {
@@ -413,7 +465,6 @@ fn prepare_typed_connector_scan(
                 facts.identity().fqn()
             )
         })?;
-    let version = typed_relation_version(node_id, facts, materialization.selector)?;
     let catalog = CatalogHandle::new(
         binding_key.instance_id.as_str(),
         binding_key.incarnation.to_bytes(),
@@ -427,25 +478,25 @@ fn prepare_typed_connector_scan(
         &control,
         node_id,
         scan,
+        physical_columns,
         &relation,
-        version,
-        None,
+        freeze,
         node_scan_limit(node_limit),
         &[],
     )
     .map_err(|error| format!("scan preparation node_id={node_id}: {error}"))?;
-    // The relation family the connector actually froze decides whether this
-    // cut can read it. Every kind is named so a new one is a compile error
-    // here rather than a scan that reaches a reader with no contract for it.
-    match prepared.table_scan.table().relation_kind() {
-        ConnectorRelationKind::Table => {}
-        kind @ (ConnectorRelationKind::TableFunction
-        | ConnectorRelationKind::ChangeWindow
-        | ConnectorRelationKind::SystemTable
-        | ConnectorRelationKind::TableExecute
-        | ConnectorRelationKind::MergeTable) => {
-            return Err(unsupported_relation(node_id, facts, kind));
-        }
+    // The relation family the connector actually froze must be the family this
+    // lane asked it to freeze. Anything else would hand the reader a relation
+    // it has no contract for -- a change-window request answered with a table
+    // handle would silently read the whole relation.
+    let frozen_kind = prepared.table_scan.table().relation_kind();
+    if frozen_kind != freeze.relation_kind() {
+        return Err(format!(
+            "typed connector scan node_id={node_id} on '{}' asked the connector to freeze relation kind `{}` but it froze `{}`",
+            facts.identity().fqn(),
+            relation_kind_name(freeze.relation_kind()),
+            relation_kind_name(frozen_kind)
+        ));
     }
     let residual_predicates = prepared
         .residual_ordinals
@@ -500,18 +551,26 @@ fn unsupported_relation(
     facts: &SqlScanPreparationFacts,
     kind: ConnectorRelationKind,
 ) -> String {
-    let named = match kind {
+    format!(
+        "typed connector scan node_id={node_id} on '{}' names relation kind `{}`, which this read stack does not admit",
+        facts.identity().fqn(),
+        relation_kind_name(kind)
+    )
+}
+
+/// The stable wire vocabulary for one relation family.
+///
+/// Every kind is named so a new one is a compile error here rather than a
+/// relation that reports itself under some other family's name.
+const fn relation_kind_name(kind: ConnectorRelationKind) -> &'static str {
+    match kind {
         ConnectorRelationKind::Table => "table",
         ConnectorRelationKind::TableFunction => "table_function",
         ConnectorRelationKind::ChangeWindow => "change_window",
         ConnectorRelationKind::SystemTable => "system_table",
         ConnectorRelationKind::TableExecute => "table_execute",
         ConnectorRelationKind::MergeTable => "merge_table",
-    };
-    format!(
-        "typed connector scan node_id={node_id} on '{}' names relation kind `{named}`, which this read stack does not admit",
-        facts.identity().fqn()
-    )
+    }
 }
 
 /// Recover an IMV target scan only from its admitted query-local token.  The
@@ -567,7 +626,7 @@ fn validate_resolved_execution_kind(
             matches!(execution, ResolvedScanExecution::ConnectorRead)
         }
         SqlScanPreparationCategory::Delta => {
-            matches!(execution, ResolvedScanExecution::SealedConnectorScan(_))
+            matches!(execution, ResolvedScanExecution::AdmittedChangeWindow(_))
         }
         SqlScanPreparationCategory::AdmittedData
         | SqlScanPreparationCategory::AdmittedFrozenCurrent
@@ -584,7 +643,7 @@ fn validate_resolved_execution_kind(
     }
     let required = match facts.category() {
         SqlScanPreparationCategory::ConnectorRead => "ConnectorRead",
-        SqlScanPreparationCategory::Delta => "IcebergDelta",
+        SqlScanPreparationCategory::Delta => "AdmittedChangeWindow",
         SqlScanPreparationCategory::AdmittedData
         | SqlScanPreparationCategory::AdmittedFrozenCurrent
         | SqlScanPreparationCategory::AdmittedFrozenSnapshot

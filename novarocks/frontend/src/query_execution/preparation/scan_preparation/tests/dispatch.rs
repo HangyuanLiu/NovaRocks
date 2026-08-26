@@ -83,32 +83,6 @@ impl novarocks_spi::connector::ConnectorControlResolver for RejectCurrentControl
     }
 }
 
-struct JoinRefreshDeltaResolver;
-
-impl ScanBindingResolver for JoinRefreshDeltaResolver {
-    fn resolve_scan(
-        &self,
-        _node_id: i32,
-        scan: &PlanScanNode,
-    ) -> Result<Option<ResolvedScanExecution>, String> {
-        let facts = scan_preparation_facts(scan);
-        if facts.category() != SqlScanPreparationCategory::Delta {
-            return Err("join refresh fixture resolver received a non-delta scan".to_string());
-        }
-        let delta = facts
-            .delta_window()
-            .ok_or_else(|| "join refresh fixture delta lacks a snapshot window".to_string())?;
-        Ok(Some(ResolvedScanExecution::SealedConnectorScan(
-            fixture_sealed_change_scan(
-                facts.identity().catalog(),
-                facts.identity().table(),
-                delta.from_snapshot_id(),
-                delta.to_snapshot_id(),
-            ),
-        )))
-    }
-}
-
 #[test]
 fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() {
     fn collect(
@@ -155,12 +129,16 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
     );
     let controls = crate::connector::FixtureControlResolver::new(registry);
     let bindings = fixture_query_table_bindings(&distributed, &controls);
+    // The delta lane resolves through the production query-local resolver, so
+    // the fixture exercises exactly the lookup a refresh performs.
+    let delta_resolver =
+        crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new(&bindings);
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
         &controls,
         &crate::connector::test_request_context(),
         Some(&bindings),
-        Some(&JoinRefreshDeltaResolver),
+        Some(&delta_resolver),
         fixture_scan_preparation_options(fixture_typed_control_registry(&distributed, &controls)),
     )
     .expect("tokenized coalesce scans must prepare from exact bindings");
@@ -231,28 +209,27 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
         &fixture_scan_preparation_options(fixture_typed_control_registry(&plan, &controls)),
     )
     .expect("exact query binding must plan the scan");
-    assert!(
-        !prepared
-            .connector_read(0, 10)
-            .expect("prepared connector read")
-            .splits
-            .is_empty(),
-        "preparation must use files retained by the binding, not stale SQL plan files"
-    );
-    let retained = prepared
-        .connector_read(0, 10)
-        .expect("prepared connector read")
-        .planning_lease
-        .clone();
+    let typed = prepared.typed_scan(0, 10).expect("prepared typed scan");
     let DistributedNodeKind::Scan(scan) = &plan.fragments()[0].root.payload else {
         panic!("sealed fixture must retain its scan root");
     };
     let expected = bindings
         .exact_planning_lease(scan_preparation_facts(scan).binding())
         .expect("fixture exact lease");
+    // The lease preparation retained, the generation its declaration installs,
+    // and the generation the frozen relation names are all the one the query
+    // already admitted -- never a generation acquired now.
     assert_eq!(
-        retained.binding().incarnation(),
+        typed.planning_lease.binding().incarnation(),
         expected.binding().incarnation()
+    );
+    assert_eq!(
+        typed.declaration.binding_key().incarnation,
+        expected.binding().incarnation()
+    );
+    assert_eq!(
+        typed.prepared.table_scan.table().catalog().incarnation(),
+        expected.binding().incarnation().to_bytes()
     );
 }
 
@@ -297,13 +274,9 @@ fn ordinary_current_snapshot_is_immutable_and_does_not_invoke_resolver() {
     assert_eq!(format!("{plan:#?}"), before);
     assert!(bindings.binding(10).is_some());
     assert!(bindings.scan_ranges(0, 10).expect("ranges").is_empty());
-    assert_eq!(
-        bindings
-            .connector_read(0, 10)
-            .expect("opaque connector read")
-            .splits
-            .len(),
-        1
+    assert!(
+        bindings.typed_scan(0, 10).is_some(),
+        "an ordinary current-snapshot scan lowers onto the typed stack"
     );
 }
 
@@ -335,9 +308,9 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
         novarocks_spi::connector::ConnectorReadSelector::Current
     );
 
-    // This is what would be visible if the second pass resolved Current again.
-    // The re-plan must instead retain the table handle and exact planning lease
-    // stored above, so it cannot observe this replacement.
+    // A second registration stands for a catalog that moved on. The re-plan
+    // must retain the table handle and exact planning lease stored above, so
+    // it cannot observe this replacement at all.
     crate::connector::scan_model::register_planned_files_fixture(
         &registry,
         "test_catalog",
@@ -384,25 +357,31 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
     )
     .expect("topology-only re-planning must reuse its admitted binding");
 
-    let first_path = crate::connector::scan_model::planned_split_file_for_test(
-        &first
-            .connector_read(0, 10)
-            .expect("first connector read")
-            .splits[0],
-    )
-    .expect("first split payload")
-    .path;
-    let second_path = crate::connector::scan_model::planned_split_file_for_test(
-        &second
-            .connector_read(0, 10)
-            .expect("second connector read")
-            .splits[0],
-    )
-    .expect("second split payload")
-    .path;
-
-    assert_eq!(first_path, "s3://bucket/first-admission.parquet");
-    assert_eq!(second_path, first_path);
+    // Preparation enumerates no split, so the observable retention is the
+    // frozen generation itself: both passes install the exact generation the
+    // first admission acquired, and the second pass never reached the
+    // replacement registered above.
+    let first_typed = first.typed_scan(0, 10).expect("first typed scan");
+    let second_typed = second.typed_scan(0, 10).expect("second typed scan");
+    let admitted_incarnation = admitted
+        .admission
+        .exact_planning_lease()
+        .expect("first admission lease")
+        .binding()
+        .incarnation();
+    assert_eq!(
+        first_typed.declaration.binding_key().incarnation,
+        admitted_incarnation
+    );
+    assert_eq!(
+        second_typed.declaration.binding_key().incarnation,
+        admitted_incarnation
+    );
+    assert_eq!(
+        second_typed.prepared.table_scan.table().handle(),
+        first_typed.prepared.table_scan.table().handle(),
+        "a topology-only re-plan must freeze the very same relation handle"
+    );
 }
 
 #[test]
@@ -516,42 +495,33 @@ fn resolver_failure_precedes_invalid_physical_projection() {
     );
 }
 
-#[test]
-fn target_state_and_locator_reject_equality_deletes() {
-    for (fixture, expected_kind) in [
-        (NativeScanFixture::TargetLocatorProjection, "target-locator"),
-        (NativeScanFixture::TargetStateProjection, "target-state"),
-    ] {
-        let plan = native_scan_plan(fixture).expect("sealed target fixture");
-        let mut file = data_file("s3://bucket/target-data.parquet");
-        file.deletes = vec![equality_delete_file(Vec::new(), vec![3])];
-        let controls = crate::connector::FixtureControlResolver::new(registry(vec![file]));
-        let err = match prepare_scan_bindings_with_controls(&plan, &controls, None) {
-            Ok(_) => panic!("{expected_kind} equality-delete scan must fail"),
-            Err(err) => err,
-        };
-
-        assert!(err.contains(expected_kind), "{err}");
-        assert!(err.contains("does not support equality deletes"), "{err}");
-    }
-}
-
+/// A resolver may not hand one lane another lane's execution: a delta scan
+/// answered with an ordinary admitted read would silently become a full read
+/// of the relation instead of the difference between two snapshots.
 #[test]
 fn resolver_execution_kind_must_match_semantic_source() {
     let resolver = StaticResolver {
-        execution: resolved_delta(),
+        execution: ResolvedScanExecution::AdmittedConnectorRead(
+            crate::query_execution::preparation::scan::fixture_query_scan_materialization(
+                "test_catalog",
+            ),
+        ),
     };
 
     let err = match prepare_scan_bindings(
-        &native_scan_plan(NativeScanFixture::ConnectorRead).expect("sealed connector-read fixture"),
+        &native_scan_plan(NativeScanFixture::DeltaForPreparedBinding)
+            .expect("sealed delta fixture"),
         &FixtureConnectorRegistry::new(),
         Some(&resolver),
     ) {
-        Ok(_) => panic!("connector scan must reject delta execution"),
+        Ok(_) => panic!("a delta scan must reject an ordinary admitted read"),
         Err(err) => err,
     };
 
-    assert!(err.contains("SqlConnectorRead"), "{err}");
-    assert!(err.contains("requires ConnectorRead execution"), "{err}");
+    assert!(err.contains("SqlDelta"), "{err}");
+    assert!(
+        err.contains("requires AdmittedChangeWindow execution"),
+        "{err}"
+    );
     assert!(err.contains("node_id=10"), "{err}");
 }

@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use novarocks_proto::FieldPath;
 use novarocks_proto::connector_read::{
-    CatalogTableHandle, ConnectorRelation, ScanAssignment, TypedColumnBinding,
+    CatalogTableHandle, ConnectorRelation, ScanAssignment, TypedChangeWindow, TypedColumnBinding,
     TypedConnectorMetadata, TypedConnectorSplitManager, TypedConnectorSplitSource,
     TypedFilterApplication, TypedLimitApplication, TypedRelationVersion, TypedSystemTablePlan,
     ValidatedColumnHandle, ValidatedConnectorSplit, WireConstraint, WireDynamicFilterSnapshot,
@@ -67,8 +67,8 @@ use novarocks_spi::connector::{
 use crate::control_runtime::IcebergControlRuntime;
 use crate::file_pruning::file_may_satisfy_physical_predicates;
 use crate::iceberg::spec::{
-    DataContentType, DataFileFormat, Datum, Literal, ManifestStatus, NestedField, PrimitiveLiteral,
-    PrimitiveType, Schema, SchemaRef, TableMetadata, Type,
+    DataContentType, DataFileFormat, Datum, FormatVersion, Literal, ManifestStatus, NestedField,
+    PrimitiveLiteral, PrimitiveType, Schema, SchemaRef, StructType, TableMetadata, Type,
 };
 use crate::iceberg::table::Table;
 use crate::loaded_table::IcebergPhysicalTable;
@@ -86,11 +86,13 @@ use crate::scan_model::{
 };
 use crate::typed_read::column_handle::{corrupt, from_protocol, invalid, unsupported};
 use crate::typed_read::{
-    HiveTransactionHandle, IcebergColumnHandle, IcebergDeleteFileFacts, IcebergFileFormat,
+    HiveTransactionHandle, ICEBERG_CHANGE_OP_COLUMN, IcebergChangeSplit,
+    IcebergChangeWindowEndpoints, IcebergChangeWindowHandle, IcebergChangeWindowHandleParams,
+    IcebergChangeWindowSplitSource, IcebergColumnHandle, IcebergDeleteFileFacts, IcebergFileFormat,
     IcebergPlannedDataFile, IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions,
-    IcebergTableHandle, IcebergTableHandleParams,
+    IcebergTableHandle, IcebergTableHandleParams, change_op_column_handle,
     decode_tuple_domain as decode_iceberg_tuple_domain,
-    encode_tuple_domain as encode_iceberg_tuple_domain,
+    encode_tuple_domain as encode_iceberg_tuple_domain, plan_change_window_splits,
 };
 
 /// The Iceberg table property carrying the default name mapping.
@@ -389,12 +391,6 @@ impl IcebergTypedBoundary {
 
         let mut planned = Vec::with_capacity(read_snapshot.files.len());
         for read_file in read_snapshot.files {
-            let data_facts = facts.data.get(&read_file.path).ok_or_else(|| {
-                corrupt(format!(
-                    "iceberg data file {} has no manifest entry in the pinned snapshot",
-                    read_file.path
-                ))
-            })?;
             if !predicates.is_empty()
                 && !file_may_satisfy_physical_predicates(
                     &pruning_view(handle, &schema, &read_file)?,
@@ -403,33 +399,124 @@ impl IcebergTypedBoundary {
             {
                 continue;
             }
-            let mut delete_facts = BTreeMap::new();
-            for delete in &read_file.deletes {
-                let fact = facts.deletes.get(&delete.path).ok_or_else(|| {
-                    corrupt(format!(
-                        "iceberg delete file {} has no manifest entry in the pinned snapshot",
-                        delete.path
-                    ))
-                })?;
-                delete_facts.insert(delete.path.clone(), fact.clone());
-            }
-            planned.push(IcebergPlannedDataFile {
-                file_format: IcebergFileFormat::from_data_file_format(data_facts.file_format)?,
-                split_offsets: data_facts.split_offsets.clone(),
-                key_metadata: data_facts.key_metadata.clone(),
-                // This boundary proves no per-file value bound of its own.
-                // Coordinator-side pruning above already used the manifest
-                // facts in their native, untyped form; re-encoding those bytes
-                // as typed domain values would invent a type the manifest never
-                // recorded, so the truthful statistics domain here is "all".
-                file_statistics_domain: TupleDomain::all(),
-                decryption_data: None,
-                delete_facts,
-                read_file,
-            });
+            planned.push(planned_data_file(read_file, &facts)?);
         }
         Ok(planned)
     }
+
+    /// The visible files of one change-window endpoint.
+    ///
+    /// No predicate is applied: a change window is a difference of two endpoint
+    /// row sets, and pruning one endpoint's files without pruning the other's
+    /// identically would turn a survived file into a spurious add or removal.
+    fn change_window_endpoint_files(
+        &self,
+        table: &Table,
+        snapshot_id: i64,
+    ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
+        let table = table.clone();
+        let (read_snapshot, facts) = self
+            .runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { plan_pinned_snapshot(table, snapshot_id).await })
+            .map_err(unavailable)?
+            .map_err(unavailable)?;
+        read_snapshot
+            .files
+            .into_iter()
+            .map(|read_file| planned_data_file(read_file, &facts))
+            .collect()
+    }
+
+    /// The concrete change-window handle behind a validated carrier.
+    fn change_window_handle(
+        &self,
+        table: &CatalogTableHandle,
+    ) -> Result<IcebergChangeWindowHandle, ConnectorError> {
+        self.ensure_owned(table)?;
+        match table.relation() {
+            ConnectorRelation::ChangeWindow(handle) => {
+                IcebergChangeWindowHandle::from_change_window_handle_proto(handle)
+            }
+            ConnectorRelation::Table(_) => Err(unsupported(
+                "an iceberg data relation is not a change window",
+            )),
+            ConnectorRelation::TableFunction(_) => Err(unsupported(
+                "an iceberg table-function relation is not a change window",
+            )),
+            ConnectorRelation::SystemTable(_) => Err(unsupported(
+                "an iceberg system relation is not a change window",
+            )),
+            ConnectorRelation::TableExecute(_) => Err(unsupported(
+                "an iceberg table-execute relation is not a change window",
+            )),
+            ConnectorRelation::MergeTable(_) => Err(unsupported(
+                "an iceberg merge relation is not a change window",
+            )),
+        }
+    }
+
+    /// Enumerate one frozen change window as the difference of its endpoints.
+    fn change_window_split_source(
+        &self,
+        handle: &IcebergChangeWindowHandle,
+    ) -> Result<IcebergChangeWindowSplitSource, ConnectorError> {
+        let physical = self.load_pinned_relation(handle.schema_table_name())?;
+        let schema = handle.parse_table_schema()?;
+        let partition_types = change_window_partition_types(physical.table.metadata(), &schema)?;
+        let from_visible = self
+            .change_window_endpoint_files(&physical.table, handle.from_snapshot_id_exclusive())?;
+        let to_visible =
+            self.change_window_endpoint_files(&physical.table, handle.to_snapshot_id_inclusive())?;
+        let plan = plan_change_window_splits(
+            handle,
+            IcebergChangeWindowEndpoints {
+                from_visible: &from_visible,
+                to_visible: &to_visible,
+            },
+            &partition_types,
+            self.split_source_options,
+        )?;
+        Ok(IcebergChangeWindowSplitSource::new(plan))
+    }
+}
+
+/// Pair one snapshot's read view of a data file with its manifest facts.
+fn planned_data_file(
+    read_file: IcebergReadFile,
+    facts: &ManifestFacts,
+) -> Result<IcebergPlannedDataFile, ConnectorError> {
+    let data_facts = facts.data.get(&read_file.path).ok_or_else(|| {
+        corrupt(format!(
+            "iceberg data file {} has no manifest entry in the pinned snapshot",
+            read_file.path
+        ))
+    })?;
+    let mut delete_facts = BTreeMap::new();
+    for delete in &read_file.deletes {
+        let fact = facts.deletes.get(&delete.path).ok_or_else(|| {
+            corrupt(format!(
+                "iceberg delete file {} has no manifest entry in the pinned snapshot",
+                delete.path
+            ))
+        })?;
+        delete_facts.insert(delete.path.clone(), fact.clone());
+    }
+    Ok(IcebergPlannedDataFile {
+        file_format: IcebergFileFormat::from_data_file_format(data_facts.file_format)?,
+        split_offsets: data_facts.split_offsets.clone(),
+        key_metadata: data_facts.key_metadata.clone(),
+        // This boundary proves no per-file value bound of its own.
+        // Coordinator-side pruning already used the manifest facts in their
+        // native, untyped form; re-encoding those bytes as typed domain values
+        // would invent a type the manifest never recorded, so the truthful
+        // statistics domain here is "all".
+        file_statistics_domain: TupleDomain::all(),
+        decryption_data: None,
+        delete_facts,
+        read_file,
+    })
 }
 
 impl std::fmt::Debug for IcebergTypedBoundary {
@@ -471,26 +558,41 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
         _session: &ConnectorSession,
         table: &CatalogTableHandle,
     ) -> Result<Vec<TypedColumnBinding>, ConnectorError> {
-        let handle = self.data_table_handle(table)?;
-        let schema = handle.parse_table_schema()?;
-        let fields = schema.as_struct().fields();
-        let mut bindings = Vec::with_capacity(fields.len() + 5);
-        for field in fields {
-            let column = IcebergColumnHandle::base_column(field.as_ref())?;
-            bindings.push(TypedColumnBinding::new(
-                &field.name,
-                iceberg_column_to_wire(&column)?,
-                false,
-            ));
+        self.ensure_owned(table)?;
+        // A change window exposes a different column set from the data
+        // relation it differences, so the two are answered separately rather
+        // than by one shape that would have to be right for both.
+        match table.relation() {
+            ConnectorRelation::ChangeWindow(_) => {
+                change_window_column_bindings(&self.change_window_handle(table)?)
+            }
+            ConnectorRelation::Table(_)
+            | ConnectorRelation::TableFunction(_)
+            | ConnectorRelation::SystemTable(_)
+            | ConnectorRelation::TableExecute(_)
+            | ConnectorRelation::MergeTable(_) => {
+                let handle = self.data_table_handle(table)?;
+                let schema = handle.parse_table_schema()?;
+                let fields = schema.as_struct().fields();
+                let mut bindings = Vec::with_capacity(fields.len() + 5);
+                for field in fields {
+                    let column = IcebergColumnHandle::base_column(field.as_ref())?;
+                    bindings.push(TypedColumnBinding::new(
+                        &field.name,
+                        iceberg_column_to_wire(&column)?,
+                        false,
+                    ));
+                }
+                for (name, column) in metadata_pseudo_columns(&handle, &schema)? {
+                    bindings.push(TypedColumnBinding::new(
+                        name,
+                        iceberg_column_to_wire(&column)?,
+                        true,
+                    ));
+                }
+                Ok(bindings)
+            }
         }
-        for (name, column) in metadata_pseudo_columns(&handle, &schema)? {
-            bindings.push(TypedColumnBinding::new(
-                name,
-                iceberg_column_to_wire(&column)?,
-                true,
-            ));
-        }
-        Ok(bindings)
     }
 
     fn apply_filter(
@@ -609,6 +711,32 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
             relation.distribution(),
         )))
     }
+
+    fn get_change_window_plan(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+        window: TypedChangeWindow,
+    ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+        if system_relation_of(name.table_name()).is_some() {
+            // A `<table>$<suffix>` relation is a view of one pinned metadata
+            // file. It has no row history at all, so it exposes no change
+            // window -- which is absence, not a window this connector failed
+            // to serve.
+            return Ok(None);
+        }
+        let Some(physical) = self.load_relation(name)? else {
+            return Ok(None);
+        };
+        let Some(handle) = pinned_change_window_handle(name, physical.table.metadata(), window)?
+        else {
+            return Ok(None);
+        };
+        self.wrap_relation(dto::catalog_table_handle::Relation::ChangeWindow(
+            handle.to_change_window_handle_proto(),
+        ))
+        .map(Some)
+    }
 }
 
 impl TypedConnectorSplitManager for IcebergTypedBoundary {
@@ -620,13 +748,25 @@ impl TypedConnectorSplitManager for IcebergTypedBoundary {
         dynamic_filter_columns: &BTreeSet<ValidatedColumnHandle>,
         constraint: &WireConstraint,
     ) -> Result<Box<dyn TypedConnectorSplitSource>, ConnectorError> {
-        let handle = self.data_table_handle(table)?;
+        self.ensure_owned(table)?;
         // Every dynamic-filter column must be one this connector can name. A
         // column it cannot decode could never be matched against a split, so
         // accepting it would silently disable the filter instead of failing.
         for column in dynamic_filter_columns {
             wire_column_to_iceberg(column)?;
         }
+
+        // A change window enumerates the difference of two endpoints, which is
+        // a different question from cutting one pinned snapshot's files. It
+        // gets its own enumerator rather than a mode of this one.
+        if let ConnectorRelation::ChangeWindow(_) = table.relation() {
+            let handle = self.change_window_handle(table)?;
+            return Ok(Box::new(IcebergTypedSplitSource::new(
+                self.change_window_split_source(&handle)?,
+            )));
+        }
+
+        let handle = self.data_table_handle(table)?;
 
         // The split source decides its partition-only fast path from the
         // handle's projected column set, and a zero-column projection qualifies
@@ -673,9 +813,31 @@ impl<S> IcebergTypedSplitSource<S> {
     }
 }
 
+/// A concrete Iceberg split that knows its own neutral scheduler envelope.
+///
+/// The trait exists so the wire-facing wrapper below stays one implementation
+/// for both enumerated split kinds. It is deliberately not blanket: a third
+/// split kind has to state how it encodes before it can be wrapped.
+pub trait IcebergWireSplit {
+    fn to_wire_split_proto(&self) -> dto::ConnectorSplit;
+}
+
+impl IcebergWireSplit for IcebergSplit {
+    fn to_wire_split_proto(&self) -> dto::ConnectorSplit {
+        self.to_connector_split_proto()
+    }
+}
+
+impl IcebergWireSplit for IcebergChangeSplit {
+    fn to_wire_split_proto(&self) -> dto::ConnectorSplit {
+        self.to_connector_split_proto()
+    }
+}
+
 impl<S> TypedConnectorSplitSource for IcebergTypedSplitSource<S>
 where
-    S: ConnectorSplitSource<Split = IcebergSplit, Column = IcebergColumnHandle> + Send,
+    S: ConnectorSplitSource<Column = IcebergColumnHandle> + Send,
+    S::Split: IcebergWireSplit,
 {
     fn next_batch(
         &mut self,
@@ -704,7 +866,7 @@ where
             // one would silently return fewer rows than the query asked for.
             splits.push(
                 ValidatedConnectorSplit::parse(
-                    split.to_connector_split_proto(),
+                    split.to_wire_split_proto(),
                     FieldPath::root("connector_split"),
                 )
                 .map_err(from_protocol)?,
@@ -834,6 +996,220 @@ fn pinned_table_handle(
         table_location: metadata.location().to_string(),
         storage_properties: reader_visible_storage_properties(metadata.properties()),
     })
+}
+
+/// Freeze one worker-visible change-window relation handle.
+///
+/// The two answers this returns are deliberately different questions.
+/// `Ok(None)` is a fact about the *relation*: a v1 table has no delete files at
+/// all, so it can never express a row that stopped being visible, and this
+/// connector exposes no change window over one. Every error below is a fact
+/// about *this window*, and each is raised now rather than becoming a
+/// difference that quietly means something else:
+///
+/// * an endpoint that is not in the metadata cannot be differenced at all;
+/// * `to` must descend from `from`, because the two must be points on one
+///   history for their difference to be the window's changes rather than the
+///   distance between two unrelated branches;
+/// * the handle carries exactly one schema, so the endpoints must agree on the
+///   field identities it describes.
+///
+/// Both endpoints are pinned here, exactly as [`pinned_table_handle`] pins one
+/// snapshot: nothing downstream resolves either of them again.
+fn pinned_change_window_handle(
+    name: &SchemaTableName,
+    metadata: &TableMetadata,
+    window: TypedChangeWindow,
+) -> Result<Option<IcebergChangeWindowHandle>, ConnectorError> {
+    match metadata.format_version() {
+        FormatVersion::V2 | FormatVersion::V3 => {}
+        FormatVersion::V1 => return Ok(None),
+    }
+
+    let from = window.from_snapshot_id();
+    let to = window.to_snapshot_id();
+    for snapshot_id in [from, to] {
+        if metadata.snapshot_by_id(snapshot_id).is_none() {
+            return Err(not_found(format!(
+                "iceberg snapshot {snapshot_id} does not exist"
+            )));
+        }
+    }
+    if !snapshot_descends_from(metadata, to, from) {
+        return Err(unsupported(format!(
+            "iceberg snapshot {to} does not descend from snapshot {from}, so the two are not endpoints of one change window"
+        )));
+    }
+
+    let from_schema = pinned_schema(metadata, Some(from))?;
+    let to_schema = pinned_schema(metadata, Some(to))?;
+    if !struct_types_share_field_identities(from_schema.as_struct(), to_schema.as_struct()) {
+        // A rename preserves every field ID, so one frozen schema still
+        // describes both endpoints. Anything else does not, and the single
+        // `table_schema_json` this handle carries would misdescribe one side.
+        return Err(unsupported(format!(
+            "iceberg snapshots {from} and {to} do not share field identities, so one change-window schema cannot describe both"
+        )));
+    }
+
+    let fields = to_schema.as_struct().fields();
+    let mut columns = Vec::with_capacity(fields.len());
+    for field in fields {
+        columns.push(IcebergColumnHandle::base_column(field.as_ref())?);
+    }
+    let table_schema_json = serde_json::to_string(to_schema.as_ref())
+        .map_err(|error| corrupt(format!("iceberg table schema cannot be encoded: {error}")))?;
+
+    // Every spec, not the default one: a window spans two snapshots, so files
+    // written under an older spec can appear on either side of the difference
+    // and each split must be decodable from the handle alone.
+    let mut partition_spec_jsons = BTreeMap::new();
+    for spec in metadata.partition_specs_iter() {
+        let json = serde_json::to_string(spec.as_ref()).map_err(|error| {
+            corrupt(format!(
+                "iceberg partition spec {} cannot be encoded: {error}",
+                spec.spec_id()
+            ))
+        })?;
+        partition_spec_jsons.insert(spec.spec_id(), json);
+    }
+
+    IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
+        schema_table_name: name.clone(),
+        table_schema_json,
+        columns,
+        name_mapping_json: metadata.properties().get(NAME_MAPPING_PROPERTY).cloned(),
+        from_snapshot_id_exclusive: from,
+        to_snapshot_id_inclusive: to,
+        partition_spec_jsons,
+    })
+    .map(Some)
+}
+
+/// Whether `descendant` reaches `ancestor` by following parent pointers.
+///
+/// The walk is bounded by the number of snapshots the metadata carries, so a
+/// corrupted parent cycle ends the search instead of hanging the coordinator.
+fn snapshot_descends_from(metadata: &TableMetadata, descendant: i64, ancestor: i64) -> bool {
+    let mut cursor = Some(descendant);
+    for _ in 0..=metadata.snapshots().len() {
+        let Some(snapshot_id) = cursor else {
+            return false;
+        };
+        if snapshot_id == ancestor {
+            return true;
+        }
+        cursor = metadata
+            .snapshot_by_id(snapshot_id)
+            .and_then(|snapshot| snapshot.parent_snapshot_id());
+    }
+    false
+}
+
+/// Whether two schemas describe the same fields, ignoring their names.
+///
+/// Field IDs and types are what a read binds to, so a pure rename leaves a
+/// frozen read valid; anything else changes what a column *is*.
+fn struct_types_share_field_identities(previous: &StructType, next: &StructType) -> bool {
+    let previous = previous.fields();
+    let next = next.fields();
+    previous.len() == next.len()
+        && previous.iter().zip(next.iter()).all(|(previous, next)| {
+            previous.id == next.id
+                && previous.required == next.required
+                && types_share_field_identities(&previous.field_type, &next.field_type)
+        })
+}
+
+fn types_share_field_identities(previous: &Type, next: &Type) -> bool {
+    match (previous, next) {
+        (Type::Primitive(previous), Type::Primitive(next)) => previous == next,
+        (Type::Struct(previous), Type::Struct(next)) => {
+            struct_types_share_field_identities(previous, next)
+        }
+        (Type::List(previous), Type::List(next)) => {
+            previous.element_field.id == next.element_field.id
+                && previous.element_field.required == next.element_field.required
+                && types_share_field_identities(
+                    &previous.element_field.field_type,
+                    &next.element_field.field_type,
+                )
+        }
+        (Type::Map(previous), Type::Map(next)) => {
+            previous.key_field.id == next.key_field.id
+                && previous.value_field.id == next.value_field.id
+                && previous.value_field.required == next.value_field.required
+                && types_share_field_identities(
+                    &previous.key_field.field_type,
+                    &next.key_field.field_type,
+                )
+                && types_share_field_identities(
+                    &previous.value_field.field_type,
+                    &next.value_field.field_type,
+                )
+        }
+        (Type::Primitive(_) | Type::Struct(_) | Type::List(_) | Type::Map(_), _) => false,
+    }
+}
+
+/// The partition type of every spec the relation carries, keyed by spec id.
+///
+/// Enumeration needs these to encode a data file's frozen partition values;
+/// the change-window handle itself carries no spec, so they are resolved from
+/// the same metadata the endpoints were pinned from.
+fn change_window_partition_types(
+    metadata: &TableMetadata,
+    schema: &Schema,
+) -> Result<BTreeMap<i32, Type>, ConnectorError> {
+    let mut partition_types = BTreeMap::new();
+    for spec in metadata.partition_specs_iter() {
+        let partition_type = spec.partition_type(schema).map_err(|error| {
+            corrupt(format!(
+                "iceberg partition spec {} does not bind to the change window's frozen schema: {error}",
+                spec.spec_id()
+            ))
+        })?;
+        partition_types.insert(spec.spec_id(), Type::Struct(partition_type));
+    }
+    Ok(partition_types)
+}
+
+/// The columns a change-window relation exposes.
+///
+/// They are the frozen relation's own fields plus `__change_op`. The sign is
+/// visible rather than hidden because it is the point of the relation: a change
+/// row without it says a row differs between the endpoints but not in which
+/// direction. It is also the one column no file can supply -- the split variant
+/// is its only source -- so it is appended, never bound to a table field.
+fn change_window_column_bindings(
+    handle: &IcebergChangeWindowHandle,
+) -> Result<Vec<TypedColumnBinding>, ConnectorError> {
+    let schema = handle.parse_table_schema()?;
+    let fields = schema.as_struct().fields();
+    let mut bindings = Vec::with_capacity(fields.len() + 1);
+    for field in fields {
+        if field.name == ICEBERG_CHANGE_OP_COLUMN {
+            // Two columns of the same name would make the relation ambiguous,
+            // and silently renaming either one would hide a real collision.
+            return Err(unsupported(format!(
+                "iceberg relation {}.{} has a field named {ICEBERG_CHANGE_OP_COLUMN}, which a change window reserves for its sign",
+                handle.schema_table_name().schema_name(),
+                handle.schema_table_name().table_name()
+            )));
+        }
+        let column = IcebergColumnHandle::base_column(field.as_ref())?;
+        bindings.push(TypedColumnBinding::new(
+            &field.name,
+            iceberg_column_to_wire(&column)?,
+            false,
+        ));
+    }
+    bindings.push(TypedColumnBinding::new(
+        ICEBERG_CHANGE_OP_COLUMN,
+        iceberg_column_to_wire(&change_op_column_handle()?)?,
+        false,
+    ));
+    Ok(bindings)
 }
 
 /// Keep only table properties provably safe to hand a worker.
@@ -1518,12 +1894,14 @@ mod tests {
             properties,
         )
         .expect("metadata builder");
-        for snapshot_id in [11_i64, 12] {
+        // 12 descends from 11: the two are points on one history, which is what
+        // lets a change window treat them as endpoints of the same window.
+        for (snapshot_id, parent_snapshot_id) in [(11_i64, None), (12, Some(11_i64))] {
             builder = builder
                 .add_snapshot(
                     Snapshot::builder()
                         .with_snapshot_id(snapshot_id)
-                        .with_parent_snapshot_id(None)
+                        .with_parent_snapshot_id(parent_snapshot_id)
                         .with_sequence_number(snapshot_id)
                         .with_timestamp_ms(1_700_000_000_000 + snapshot_id)
                         .with_manifest_list(format!(
@@ -2227,5 +2605,231 @@ mod tests {
         )]))
         .expect("predicate");
         assert!(physical_predicates(&nullable, &schema).is_empty());
+    }
+
+    #[test]
+    fn a_change_window_handle_pins_both_endpoints_and_survives_the_wire() {
+        let fixture = fixture();
+        let metadata = metadata_with_history();
+        let handle = pinned_change_window_handle(
+            &name("db", "t"),
+            &metadata,
+            TypedChangeWindow::new(11, 12),
+        )
+        .expect("pinned change window")
+        .expect("a v2 relation exposes change windows");
+
+        assert_eq!(handle.from_snapshot_id_exclusive(), 11);
+        assert_eq!(handle.to_snapshot_id_inclusive(), 12);
+        // The relation's own fields are the window's ordered output columns;
+        // the sign is not one of them, because no file carries it.
+        assert_eq!(handle.columns().len(), 3);
+        assert!(handle.parse_table_schema().is_ok());
+
+        let wrapped = fixture
+            .boundary
+            .wrap_relation(dto::catalog_table_handle::Relation::ChangeWindow(
+                handle.to_change_window_handle_proto(),
+            ))
+            .expect("wrap");
+        assert!(matches!(
+            wrapped.relation(),
+            ConnectorRelation::ChangeWindow(_)
+        ));
+        // Re-parsing the same bytes yields the same carrier, and the carrier
+        // yields back the same pinned endpoints.
+        let reparsed = CatalogTableHandle::parse(
+            wrapped.as_proto().clone(),
+            FieldPath::root("catalog_table_handle"),
+        )
+        .expect("reparse");
+        assert_eq!(reparsed, wrapped);
+        let decoded = fixture
+            .boundary
+            .change_window_handle(&wrapped)
+            .expect("concrete change window");
+        assert_eq!(decoded, handle);
+        // A data relation and a change window are different questions, so
+        // neither carrier answers the other one's decoder.
+        assert!(fixture.boundary.data_table_handle(&wrapped).is_err());
+    }
+
+    #[test]
+    fn a_window_the_connector_cannot_serve_is_a_typed_error_rather_than_absence() {
+        let fixture = fixture();
+        fixture.create_table("db", "t", StdHashMap::new());
+
+        // The relation exists but has no snapshots at all, so neither endpoint
+        // can be pinned. That is a window this connector cannot serve, which is
+        // not the same answer as "this relation has no change windows".
+        assert_eq!(
+            fixture
+                .boundary
+                .get_change_window_plan(
+                    &session(),
+                    &name("db", "t"),
+                    TypedChangeWindow::new(11, 12)
+                )
+                .expect_err("unservable window")
+                .kind(),
+            ConnectorErrorKind::NotFound
+        );
+
+        // Absence stays absence: a relation that does not exist, and a system
+        // relation that has no row history, both answer `None`.
+        assert!(
+            fixture
+                .boundary
+                .get_change_window_plan(
+                    &session(),
+                    &name("db", "absent"),
+                    TypedChangeWindow::new(11, 12),
+                )
+                .expect("missing relation")
+                .is_none()
+        );
+        assert!(
+            fixture
+                .boundary
+                .get_change_window_plan(
+                    &session(),
+                    &name("db", "t$files"),
+                    TypedChangeWindow::new(11, 12),
+                )
+                .expect("system relation")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_v1_relation_exposes_no_change_window_at_all_rather_than_a_failed_one() {
+        // v1 has no delete files, so no row of a v1 table can ever stop being
+        // visible: the relation has no change windows to expose. That is a fact
+        // about the relation, so it is absence -- and it is decided before the
+        // endpoints are even looked at, which is why this metadata carries
+        // none at all and still answers `None` instead of "snapshot missing".
+        let metadata = TableMetadataBuilder::new(
+            table_schema(),
+            PartitionSpec::builder(StdArc::new(table_schema()))
+                .with_spec_id(0)
+                .build()
+                .expect("partition spec")
+                .into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///typed-boundary-v1".to_string(),
+            FormatVersion::V1,
+            StdHashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+
+        assert!(
+            pinned_change_window_handle(
+                &name("db", "t"),
+                &metadata,
+                TypedChangeWindow::new(11, 12),
+            )
+            .expect("a v1 relation is absence, never an error")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn unrelated_snapshots_and_equal_endpoints_are_never_one_change_window() {
+        let metadata = metadata_with_history();
+
+        // 11 is the parent of 12, so the window runs forwards and only
+        // forwards: differencing an unrelated pair would report the distance
+        // between two histories rather than one window's changes.
+        assert!(
+            pinned_change_window_handle(
+                &name("db", "t"),
+                &metadata,
+                TypedChangeWindow::new(12, 11),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            pinned_change_window_handle(
+                &name("db", "t"),
+                &metadata,
+                TypedChangeWindow::new(11, 99),
+            )
+            .expect_err("absent endpoint")
+            .kind(),
+            ConnectorErrorKind::NotFound
+        );
+        // Two equal endpoints have an empty difference by definition, so a
+        // window over them is a request that means nothing.
+        assert!(
+            pinned_change_window_handle(
+                &name("db", "t"),
+                &metadata,
+                TypedChangeWindow::new(12, 12),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn change_window_bindings_are_the_relation_fields_plus_the_derived_sign() {
+        let fixture = fixture();
+        let metadata = metadata_with_history();
+        let handle = pinned_change_window_handle(
+            &name("db", "t"),
+            &metadata,
+            TypedChangeWindow::new(11, 12),
+        )
+        .expect("pinned change window")
+        .expect("a v2 relation exposes change windows");
+        let wrapped = fixture
+            .boundary
+            .wrap_relation(dto::catalog_table_handle::Relation::ChangeWindow(
+                handle.to_change_window_handle_proto(),
+            ))
+            .expect("wrap");
+
+        let bindings = fixture
+            .boundary
+            .get_column_bindings(&session(), &wrapped)
+            .expect("column bindings");
+
+        // The relation's own fields in schema order, then the sign. Every one
+        // is visible: a change row without its sign says that something
+        // differs between the endpoints but not in which direction.
+        assert_eq!(
+            bindings
+                .iter()
+                .map(TypedColumnBinding::name)
+                .collect::<Vec<_>>(),
+            vec!["id", "region", "amount", ICEBERG_CHANGE_OP_COLUMN]
+        );
+        assert!(bindings.iter().all(|binding| !binding.is_hidden()));
+
+        // The sign is a reserved metadata identity, never a table field: no
+        // rename of a real column can collide with it, and nothing binds it to
+        // a physical field of a data file.
+        let sign = wire_column_to_iceberg(
+            bindings
+                .iter()
+                .find(|binding| binding.name() == ICEBERG_CHANGE_OP_COLUMN)
+                .expect("sign binding")
+                .column(),
+        )
+        .expect("concrete column");
+        assert_eq!(
+            sign.base_field_id(),
+            crate::typed_read::ICEBERG_CHANGE_OP_FIELD_ID
+        );
+        assert!(
+            metadata
+                .current_schema()
+                .as_struct()
+                .fields()
+                .iter()
+                .all(|field| field.id != crate::typed_read::ICEBERG_CHANGE_OP_FIELD_ID)
+        );
     }
 }

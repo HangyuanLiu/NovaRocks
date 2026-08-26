@@ -60,76 +60,13 @@ pub(crate) enum ResolvedScanExecution {
     /// A query-local opaque read admission.  Core may inspect only its SPI
     /// schema and selector while preparation asks the exact lease to plan it.
     AdmittedConnectorRead(QueryScanMaterialization),
-    /// A provider-sealed scan admitted earlier by the application. Preparation
-    /// validates its exact generation and selection, then plans opaque splits
-    /// without decoding or recreating provider physical facts.
-    SealedConnectorScan(ConnectorScan),
-}
-
-#[cfg(test)]
-pub(crate) fn fixture_sealed_change_scan(
-    instance_id: &str,
-    from_snapshot_id: i64,
-    to_snapshot_id: i64,
-) -> ConnectorScan {
-    fixture_sealed_change_scan_for_table(instance_id, "orders", from_snapshot_id, to_snapshot_id)
-}
-
-#[cfg(test)]
-pub(crate) fn fixture_sealed_change_scan_for_table(
-    instance_id: &str,
-    table: &str,
-    from_snapshot_id: i64,
-    to_snapshot_id: i64,
-) -> ConnectorScan {
-    use std::sync::Arc;
-
-    use novarocks_spi::connector::{
-        ConnectorBeginScanRequest, ConnectorChangeWindow, ConnectorInstanceId,
-        ConnectorReadPurpose, ConnectorScanSelection, ConnectorTableIdentity,
-        ConnectorTableRequest, ConnectorTableResolution,
-    };
-
-    let lease = fixture_planning_lease(instance_id);
-    let context = crate::connector::test_request_context();
-    let metadata = lease
-        .binding()
-        .metadata()
-        .load_table(ConnectorTableRequest {
-            table: ConnectorTableIdentity {
-                instance_id: ConnectorInstanceId::parse(instance_id)
-                    .expect("fixture connector instance ID"),
-                namespace: Arc::from("db"),
-                table: Arc::from(table),
-            },
-            resolution: ConnectorTableResolution::StrictBaseTable,
-            context: context.clone(),
-        })
-        .expect("fixture connector table metadata");
-    let projection = (0..metadata.schema.fields().len()).collect();
-    lease
-        .binding()
-        .planning()
-        .begin_scan(
-            &metadata.table,
-            ConnectorBeginScanRequest {
-                projection,
-                static_predicates: Vec::new(),
-                selection: ConnectorScanSelection::ChangeWindow(ConnectorChangeWindow::new(
-                    from_snapshot_id,
-                    to_snapshot_id,
-                )),
-                purpose: ConnectorReadPurpose::Query,
-                limit: None,
-                batch: ConnectorBatchBudget {
-                    max_rows: std::num::NonZeroUsize::new(4096).expect("nonzero rows"),
-                    max_bytes: std::num::NonZeroUsize::new(context.max_handle_payload_bytes())
-                        .expect("nonzero bytes"),
-                },
-                context,
-            },
-        )
-        .expect("fixture change-window scan")
+    /// A query-local admission read as a change window over its relation.
+    ///
+    /// It carries the same admitted materialization as an ordinary read: the
+    /// exact planning lease and table handle the statement froze. The window's
+    /// two endpoints come from the SQL scan itself, and the connector freezes
+    /// one change-window relation pinned to both of them.
+    AdmittedChangeWindow(QueryScanMaterialization),
 }
 
 #[cfg(test)]
@@ -148,10 +85,6 @@ pub(crate) fn fixture_planning_lease(instance_id: &str) -> ConnectorControlPlann
 }
 
 #[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Retained for isolated frontend scan-materialization regression fixtures."
-)]
 pub(crate) fn fixture_query_scan_materialization(instance_id: &str) -> QueryScanMaterialization {
     use std::sync::Arc;
 
@@ -612,7 +545,7 @@ mod tests {
     }
 
     fn delta_execution() -> ResolvedScanExecution {
-        ResolvedScanExecution::SealedConnectorScan(fixture_sealed_change_scan("ice", 6, 7))
+        ResolvedScanExecution::AdmittedChangeWindow(fixture_query_scan_materialization("ice"))
     }
 
     fn binding(

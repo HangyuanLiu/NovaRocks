@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::super::super::typed_predicate::test_support::column_handle;
+use super::iceberg::only_scan_node;
 use super::*;
 use novarocks_sql::plan_read::ColumnId;
 
@@ -54,12 +56,14 @@ fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
         ICEBERG_ROW_POS_COL,
     };
 
-    let (registry, seen_column_names) =
-        recording_registry(vec![data_file("s3://bucket/target-6.parquet")]);
     let plan = native_scan_plan(NativeScanFixture::TargetLocatorProjection)
         .expect("sealed target-locator projection fixture");
-    let bindings =
-        prepare_scan_bindings(&plan, &registry, None).expect("prepare target locator scan");
+    let bindings = prepare_scan_bindings(
+        &plan,
+        &registry(vec![data_file("s3://bucket/target-6.parquet")]),
+        None,
+    )
+    .expect("prepare target locator scan");
     let binding = bindings.binding(10).expect("binding");
     let physical = &binding.physical_columns;
 
@@ -90,13 +94,28 @@ fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
             ICEBERG_LAST_UPDATED_SEQ_COL,
         ]
     );
+    // The ordered assignments are what preparation actually asks the connector
+    // for, and they are exactly the physical columns above -- in that order.
+    let (fragment_id, node_id) = only_scan_node(&bindings);
+    let assignments = bindings
+        .typed_scan(fragment_id, node_id)
+        .expect("typed connector scan")
+        .prepared
+        .table_scan
+        .source()
+        .assignments();
     assert_eq!(
-        seen_column_names
-            .lock()
-            .expect("seen column names lock")
-            .last()
-            .cloned(),
-        Some(vec![0, 6, 7, 8, 9])
+        assignments
+            .iter()
+            .map(|assignment| assignment.column().clone())
+            .collect::<Vec<_>>(),
+        vec![
+            column_handle(1, "id"),
+            column_handle(10, ICEBERG_FILE_PATH_COL),
+            column_handle(11, ICEBERG_ROW_POS_COL),
+            column_handle(12, ICEBERG_ROW_ID_COL),
+            column_handle(13, ICEBERG_LAST_UPDATED_SEQ_COL),
+        ]
     );
 }
 
@@ -141,9 +160,8 @@ fn hidden_equality_key_remains_provider_owned_without_plan_mutation() {
     let mut file = data_file("s3://bucket/data.parquet");
     file.deletes = vec![equality_delete_file(Vec::new(), vec![3])];
 
-    let (registry, seen_column_names) = recording_registry(vec![file]);
-    let bindings =
-        prepare_scan_bindings(&plan, &registry, None).expect("prepare equality-delete scan");
+    let bindings = prepare_scan_bindings(&plan, &registry(vec![file]), None)
+        .expect("prepare equality-delete scan");
     let binding = bindings.binding(10).expect("binding");
 
     assert_eq!(format!("{plan:#?}"), before);
@@ -157,33 +175,13 @@ fn hidden_equality_key_remains_provider_owned_without_plan_mutation() {
         ResolvedReadReason::PlannerRequiredOrOutput
     );
     assert!(bindings.scan_ranges(0, 10).expect("ranges").is_empty());
-    let planned = bindings
-        .connector_read(0, 10)
-        .expect("opaque connector read");
-    let file = crate::connector::scan_model::planned_split_file_for_test(&planned.splits[0])
-        .expect("decode fixture split");
-    assert_eq!(file.deletes.len(), 1);
-    assert_eq!(
-        file.deletes[0].kind,
-        crate::connector::scan_model::FixtureDeleteKind::Equality
-    );
-    assert_eq!(
-        seen_column_names
-            .lock()
-            .expect("seen column names lock")
-            .last()
-            .cloned(),
-        Some(vec![0])
-    );
 }
 
 #[test]
 fn variant_synthetic_output_is_not_prepared_as_a_physical_column() {
-    let (registry, seen_column_names) =
-        recording_registry(vec![data_file("s3://bucket/variant.parquet")]);
     let bindings = prepare_scan_bindings(
         &native_scan_plan(NativeScanFixture::VariantProjection).expect("sealed VARIANT fixture"),
-        &registry,
+        &registry(vec![data_file("s3://bucket/variant.parquet")]),
         None,
     )
     .expect("prepare bound VARIANT scan");
@@ -191,14 +189,6 @@ fn variant_synthetic_output_is_not_prepared_as_a_physical_column() {
     assert_eq!(binding.physical_columns.len(), 1);
     assert_eq!(binding.physical_columns[0].source.name, "v");
     assert!(binding.required_reads.is_empty());
-    assert_eq!(
-        seen_column_names
-            .lock()
-            .expect("seen column names lock")
-            .last()
-            .cloned(),
-        Some(vec![2])
-    );
 }
 
 #[test]

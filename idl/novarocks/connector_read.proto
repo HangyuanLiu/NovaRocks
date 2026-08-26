@@ -307,6 +307,11 @@ message IcebergChangeWindowHandle {
   optional string name_mapping_json = 4;
   int64 from_snapshot_id_exclusive = 5;
   int64 to_snapshot_id_inclusive = 6;
+  // Every partition spec a split of this window may name. A window spans two
+  // snapshots, so files written under different specs can appear on both
+  // sides of the difference and every one of them must be decodable without
+  // resolving the relation through the catalog again.
+  map<int32, string> partition_spec_jsons = 7;
 }
 
 message ConnectorChangeWindowHandle {

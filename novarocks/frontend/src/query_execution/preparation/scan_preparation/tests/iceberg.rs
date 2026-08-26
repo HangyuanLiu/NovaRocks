@@ -32,7 +32,7 @@ fn expect_preparation_error(
 }
 
 /// The one scan node every single-scan fixture plan has.
-fn only_scan_node(
+pub(super) fn only_scan_node(
     bindings: &crate::query_execution::preparation::scan::ScanExecutionBindings,
 ) -> (novarocks_sql::plan_read::FragmentId, i32) {
     let mut keys = bindings.typed_scan_keys().collect::<Vec<_>>();
@@ -163,10 +163,50 @@ fn an_mv_target_scan_lowers_to_an_ordinary_pinned_data_handle() {
     }
 }
 
-/// A change-window read is its own relation family with its own enumerator.
-/// It must refuse by name instead of silently reaching the opaque carrier.
+/// A change-window read is its own relation family. It lowers to a typed
+/// change-window relation pinned to both endpoints -- the set difference of
+/// the rows visible at each, never a replay of the manifests between them.
 #[test]
-fn a_change_window_scan_is_a_typed_unsupported_relation_error() {
+fn a_change_window_scan_lowers_to_a_typed_change_window_relation() {
+    let bindings = prepare_scan_bindings_with_delta_resolver(
+        &native_scan_plan(NativeScanFixture::DeltaForPreparedBinding)
+            .expect("sealed delta fixture"),
+        &registry(vec![data_file("s3://bucket/data.parquet")]),
+    )
+    .expect("typed change-window preparation");
+
+    let (fragment_id, node_id) = only_scan_node(&bindings);
+    let typed = bindings
+        .typed_scan(fragment_id, node_id)
+        .expect("typed connector scan");
+    assert_eq!(
+        typed.prepared.table_scan.table().relation_kind(),
+        novarocks_proto::connector_read::ConnectorRelationKind::ChangeWindow
+    );
+    let novarocks_proto::connector_read::ConnectorRelation::ChangeWindow(window) =
+        typed.prepared.table_scan.table().handle().relation()
+    else {
+        panic!("a change-window scan freezes a change-window relation");
+    };
+    let Some(
+        novarocks_proto_models::connector_read::connector_change_window_handle::Handle::Iceberg(
+            iceberg,
+        ),
+    ) = window.handle.as_ref()
+    else {
+        panic!("the fixture control freezes an Iceberg change window");
+    };
+    // The fixture delta scan names snapshots 6 and 7; both endpoints reach the
+    // connector exactly as the scan stated them.
+    assert_eq!(iceberg.from_snapshot_id_exclusive, 6);
+    assert_eq!(iceberg.to_snapshot_id_inclusive, 7);
+}
+
+/// A change-window lane that reaches preparation with no resolver has no
+/// query-local admission to freeze, and must say so rather than reading the
+/// relation whole.
+#[test]
+fn a_change_window_scan_without_its_query_local_admission_fails_closed() {
     let error = expect_preparation_error(
         prepare_scan_bindings(
             &native_scan_plan(NativeScanFixture::DeltaForPreparedBinding)
@@ -174,12 +214,42 @@ fn a_change_window_scan_is_a_typed_unsupported_relation_error() {
             &registry(vec![data_file("s3://bucket/data.parquet")]),
             None,
         ),
-        "a change-window scan has no typed lowering",
+        "a change-window scan has no admission without its resolver",
     );
     assert!(
-        error.contains("change_window") && error.contains("does not admit"),
+        error.contains("SqlDelta") && error.contains("requires scan binding resolver"),
         "unexpected error: {error}"
     );
+}
+
+/// A synthetic VARIANT output has no connector column. Only the physical
+/// columns are assigned; the backend materializes the synthetic one on top of
+/// those read slots.
+#[test]
+fn a_variant_scan_assigns_only_its_physical_column() {
+    let plan =
+        native_scan_plan(NativeScanFixture::VariantProjection).expect("sealed VARIANT fixture");
+    let bindings = prepare_scan_bindings(
+        &plan,
+        &registry(vec![data_file("s3://bucket/variant.parquet")]),
+        None,
+    )
+    .expect("typed scan preparation");
+
+    let (fragment_id, node_id) = only_scan_node(&bindings);
+    let assignments = bindings
+        .typed_scan(fragment_id, node_id)
+        .expect("typed connector scan")
+        .prepared
+        .table_scan
+        .source()
+        .assignments();
+    assert_eq!(
+        assignments.len(),
+        1,
+        "a synthetic VARIANT output is not a connector column"
+    );
+    assert_eq!(assignments[0].variable(), "v0");
 }
 
 /// A pre-pinned opaque read has no relation name or version left to freeze, so

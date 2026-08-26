@@ -563,7 +563,10 @@ fn validate_iceberg_change_window_handle(
         path.field("from_snapshot_id_exclusive"),
         path.field("to_snapshot_id_inclusive"),
         "change window endpoints must name two different snapshots",
-    )
+    )?;
+    // No single selected spec: a window's splits each name their own, so there
+    // is nothing here for a `spec_id` to point at.
+    validate_partition_spec_jsons(&raw.partition_spec_jsons, None, &path)
 }
 
 fn validate_connector_change_window_handle(
@@ -1328,6 +1331,7 @@ mod tests {
                     name_mapping_json: None,
                     from_snapshot_id_exclusive: 3,
                     to_snapshot_id_inclusive: 9,
+                    partition_spec_jsons: BTreeMap::from([(0, "{\"spec-id\":0}".to_owned())]),
                 },
             )),
         }

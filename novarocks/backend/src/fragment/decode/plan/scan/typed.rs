@@ -30,9 +30,9 @@ use std::sync::Arc;
 
 use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::expr::ExprArena;
-use novarocks_execution::exec::node::scan::BoundScanRanges;
+use novarocks_execution::exec::node::scan::{BoundScanRanges, ScanSource};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::connector_read::{ConnectorRelation, ConnectorRelationKind};
+use novarocks_proto::connector_read::{ConnectorRelation, ConnectorRelationKind, ScanWorkSource};
 use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{connector_read as dto, plan};
 use novarocks_spi::connector::{
@@ -42,7 +42,9 @@ use novarocks_types::SlotId;
 
 use crate::connector::runtime::ConnectorBatchTransform;
 use crate::connector::typed_registry::TypedConnectorProviderRegistry;
-use crate::connector::typed_runtime::TypedConnectorScanSource;
+use crate::connector::typed_runtime::{
+    TypedConnectorScanSource, TypedConnectorSystemTableScanSource,
+};
 
 use super::super::context::NativePlanDecodeContext;
 use super::super::error::NativeFragmentLeafDecodeError;
@@ -79,10 +81,12 @@ pub(super) fn lower_typed_connector_scan(
     // typed refusal naming that kind, never a `_` arm that would silently
     // accept the next relation someone adds.
     match table.relation() {
-        ConnectorRelation::Table(_) => {}
+        // A system relation is read like any other: what differs is only how
+        // its work reaches this backend, which the carrier states separately as
+        // its work source.
+        ConnectorRelation::Table(_) | ConnectorRelation::SystemTable(_) => {}
         ConnectorRelation::TableFunction(_)
         | ConnectorRelation::ChangeWindow(_)
-        | ConnectorRelation::SystemTable(_)
         | ConnectorRelation::TableExecute(_)
         | ConnectorRelation::MergeTable(_) => {
             return Err(unsupported_relation(table.relation_kind()));
@@ -114,47 +118,70 @@ pub(super) fn lower_typed_connector_scan(
     })?;
 
     let predicate = lower_scan_predicate(scan, arena, &layout, ctx)?;
-    // The provider is built per fragment instance so its footer cache and
-    // delete manager cannot outlive the request that opened them.
-    let page_source_provider = providers.page_source(&inputs.request).map_err(|error| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InvalidValue,
-            "table",
-            error.to_string(),
-        )
-        .append_field("catalog_name")
-    })?;
-    let scan_source = TypedConnectorScanSource::new(
-        scan_source,
-        page_source_provider,
-        inputs.session,
-        inputs.request,
-        inputs.queues,
-        node.node_id,
-        // `slot_ids[i]` names page channel `i`, and a page channel exists for
-        // each assignment, so this is the connector's read column list rather
-        // than the node's output schema. Whatever separates the two is the
-        // materialization's job, not this list's.
-        read_slot_ids,
-        inputs.runtime_filter,
-    );
-    let scan_source = match output_materialization {
-        Some(transform) => {
-            scan_source.with_output_materialization(transform, Arc::clone(&output_schema))
+    // `slot_ids[i]` names page channel `i`, and a page channel exists for each
+    // assignment, so both lanes are handed the connector's read column list
+    // rather than the node's output schema. Whatever separates the two is the
+    // materialization's job, not this list's.
+    let source: Arc<dyn ScanSource> = match scan_source.work_source() {
+        ScanWorkSource::RuntimeSplits => {
+            // The provider is built per fragment instance so its footer cache
+            // and delete manager cannot outlive the request that opened them.
+            let page_source_provider = providers
+                .page_source(&inputs.request)
+                .map_err(provider_refusal)?;
+            let source = TypedConnectorScanSource::new(
+                scan_source,
+                page_source_provider,
+                inputs.session,
+                inputs.request,
+                inputs.queues,
+                node.node_id,
+                read_slot_ids,
+                inputs.runtime_filter,
+            );
+            match output_materialization {
+                Some(transform) => Arc::new(
+                    source.with_output_materialization(transform, Arc::clone(&output_schema)),
+                ),
+                None => Arc::new(source),
+            }
         }
-        None => scan_source,
+        ScanWorkSource::WholeRelation => {
+            // One backend reads the whole relation itself, so this lane needs
+            // no split queue and no runtime filter: there is nothing to divide
+            // and nothing to prune between splits.
+            let system_table_provider = providers
+                .system_table(&inputs.request)
+                .map_err(provider_refusal)?;
+            let source = TypedConnectorSystemTableScanSource::new(
+                scan_source,
+                system_table_provider,
+                inputs.session,
+                inputs.request,
+                node.node_id,
+                read_slot_ids,
+            );
+            match output_materialization {
+                Some(transform) => Arc::new(
+                    source.with_output_materialization(transform, Arc::clone(&output_schema)),
+                ),
+                None => Arc::new(source),
+            }
+        }
     };
 
-    // A typed scan carries no frozen range: its work arrives as splits on the
-    // task-update queue, so the range binding is empty by construction.
+    // Neither lane carries a frozen range: the split-driven one receives its
+    // work on the task-update queue, and the whole-relation one already knows
+    // its single unit of work. The range binding is therefore empty by
+    // construction for both.
     ctx.capture_scan_ranges(node.node_id, BoundScanRanges::None);
-    let scan_node = novarocks_execution::exec::node::scan::ScanNode::new(Arc::new(scan_source))
+    let scan_node = novarocks_execution::exec::node::scan::ScanNode::new(source)
         .with_node_id(node.node_id)
         .with_output_chunk_schema(Arc::clone(&output_schema))
         .with_limit(parse_scan_limit(node.limit)?)
         .with_conjunct_predicate(predicate)
-        // A task scan may legally start with zero splits, so an empty morsel
-        // set must not be padded into a synthetic one.
+        // A split-driven scan may legally start with zero splits, so an empty
+        // morsel set must not be padded into a synthetic one.
         .with_accept_empty_scan_ranges(true);
     Ok(DecodedNode {
         node: ExecNode {
@@ -298,6 +325,21 @@ fn output_materialization(
     ))))
 }
 
+/// Carry a provider refusal back as the catalog name it was resolved under.
+///
+/// Both lanes resolve a per-fragment-instance provider from the same installed
+/// binding, so both name the same wire field when that resolution fails.
+fn provider_refusal(
+    error: novarocks_spi::connector::ConnectorError,
+) -> NativeFragmentLeafDecodeError {
+    NativeFragmentLeafDecodeError::at_field(
+        ProtocolErrorKind::InvalidValue,
+        "table",
+        error.to_string(),
+    )
+    .append_field("catalog_name")
+}
+
 /// The exact connector binding generation this relation belongs to.
 fn binding_key(
     table: &novarocks_proto::connector_read::CatalogTableHandle,
@@ -360,6 +402,8 @@ mod tests {
     use novarocks_proto_models::common;
 
     use crate::connector::typed_runtime::test_support;
+
+    use novarocks_execution::exec::node::scan::{ScanMorsel, ScanMorsels};
 
     use super::super::super::node::decode_node;
     use super::*;
@@ -572,6 +616,59 @@ mod tests {
         source
     }
 
+    /// The `$files` system relation, whose reference is valid for either lane.
+    fn system_table_relation() -> dto::catalog_table_handle::Relation {
+        dto::catalog_table_handle::Relation::SystemTable(dto::ConnectorSystemTableReference {
+            reference: Some(dto::connector_system_table_reference::Reference::Iceberg(
+                dto::IcebergSystemTableReference {
+                    schema_table_name: Some(test_support::schema_table_name()),
+                    system_table_type: dto::IcebergSystemTableType::Files as i32,
+                    metadata_file_location: "s3://bucket/warehouse/db/t/metadata/v3.json"
+                        .to_owned(),
+                    table_uuid: "6b1c2f0a-9d4e-4f7b-8a31-0c5d7e9f1234".to_owned(),
+                    snapshot_id: Some(11),
+                },
+            )),
+        })
+    }
+
+    /// A system relation carrier that states how its work reaches this backend.
+    fn system_table_scan_source(work_source: dto::ScanWorkSource) -> dto::ConnectorTableScanSource {
+        let mut source = scan_with_relation(system_table_relation());
+        source.work_source = work_source as i32;
+        source
+    }
+
+    /// Lower one typed scan and bind its source the way the pipeline does.
+    ///
+    /// Returns the bound source's profile name, which is how a test tells the
+    /// two lanes apart, and the morsel set it built before any split was ever
+    /// offered.
+    fn lower_and_build_morsels(node: &plan::DistributedNode) -> (String, ScanMorsels) {
+        let ctx = NativePlanDecodeContext::default()
+            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
+            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+        let decoded =
+            decode_node(node, &mut ExprArena::default(), &ctx).expect("lower the typed scan");
+        let ExecNodeKind::Scan(scan) = decoded.node.kind else {
+            panic!("a lowered typed scan is a scan node");
+        };
+        let profile = scan
+            .source()
+            .profile_name()
+            .expect("a bound scan source names its profile");
+        let morsels = scan
+            .source()
+            .bind(
+                ctx.captured_ranges_for_test(node.node_id)
+                    .expect("scan decode captures ranges"),
+            )
+            .expect("bind the lowered scan source")
+            .build_morsels()
+            .expect("build the lowered scan's morsels");
+        (profile, morsels)
+    }
+
     /// Replace the carrier's relation while keeping everything else valid.
     fn scan_with_relation(
         relation: dto::catalog_table_handle::Relation,
@@ -732,6 +829,88 @@ mod tests {
             .expect("an opaque assignment variable binds the typed scan");
     }
 
+    /// Derived columns are a property of the plan node, not of how the scan's
+    /// work arrives, so the split-free lane materializes them through the same
+    /// seam the split-driven one uses.
+    #[test]
+    fn typed_scan_decode_materializes_variant_path_columns_on_the_split_free_lane_too() {
+        let node = typed_variant_scan_node(
+            system_table_scan_source(dto::ScanWorkSource::WholeRelation),
+            &[],
+        );
+        let ctx = NativePlanDecodeContext::default()
+            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
+            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+        let decoded = decode_node(&node, &mut ExprArena::default(), &ctx)
+            .expect("a whole-relation scan with a VARIANT path column lowers");
+        let ExecNodeKind::Scan(scan) = &decoded.node.kind else {
+            panic!("a lowered typed scan is a scan node");
+        };
+        assert_eq!(
+            scan.source()
+                .profile_name()
+                .expect("a bound scan source names its profile"),
+            "TypedConnectorSystemTableScan"
+        );
+        assert_eq!(
+            decoded.output_schema.slot_ids(),
+            [SlotId::new(1), SlotId::new(2)],
+            "the node must still declare the synthetic column it materializes"
+        );
+    }
+
+    /// A distributed system relation is scheduled exactly like a data table:
+    /// its splits arrive on the task-update queue, so it binds the split-driven
+    /// source and stays alive until that queue is exhausted.
+    #[test]
+    fn typed_scan_decode_lowers_a_runtime_split_system_relation_to_the_split_driven_source() {
+        let node = typed_scan_node(
+            system_table_scan_source(dto::ScanWorkSource::RuntimeSplits),
+            vec![output_column(1, "id")],
+        );
+        let (profile, morsels) = lower_and_build_morsels(&node);
+        assert_eq!(profile, "TypedConnectorScan");
+        // Nothing has been offered yet, and this lane must keep asking.
+        assert!(morsels.morsels.is_empty());
+        assert!(
+            morsels.has_more,
+            "a split-driven scan stays alive until its queue is exhausted"
+        );
+    }
+
+    /// A single-backend system relation has no split at all: one backend reads
+    /// the whole relation itself, so it binds the split-free source.
+    #[test]
+    fn typed_scan_decode_lowers_a_whole_relation_system_relation_to_the_split_free_source() {
+        let node = typed_scan_node(
+            system_table_scan_source(dto::ScanWorkSource::WholeRelation),
+            vec![output_column(1, "id")],
+        );
+        let (profile, _) = lower_and_build_morsels(&node);
+        assert_eq!(profile, "TypedConnectorSystemTableScan");
+    }
+
+    /// The failure the split-driven lane would have hung on: no split is ever
+    /// offered for a whole-relation scan, so its work must already be complete
+    /// and closed at bind time rather than waiting for one that never comes.
+    #[test]
+    fn typed_scan_decode_lets_a_whole_relation_system_scan_terminate_with_no_split_offered() {
+        let node = typed_scan_node(
+            system_table_scan_source(dto::ScanWorkSource::WholeRelation),
+            vec![output_column(1, "id")],
+        );
+        let (_, morsels) = lower_and_build_morsels(&node);
+        assert!(
+            matches!(&morsels.morsels[..], [ScanMorsel::Empty]),
+            "the whole relation is exactly one unit of work: {:?}",
+            morsels.morsels
+        );
+        assert!(
+            !morsels.has_more,
+            "nothing can add work to a whole-relation scan, so it must not wait for a split"
+        );
+    }
+
     #[test]
     fn typed_scan_decode_refuses_every_relation_kind_it_does_not_read_yet() {
         let cases = [
@@ -765,28 +944,15 @@ mod tests {
                                 name_mapping_json: None,
                                 from_snapshot_id_exclusive: 3,
                                 to_snapshot_id_inclusive: 9,
+                                partition_spec_jsons: std::collections::BTreeMap::from([(
+                                    0,
+                                    "{\"spec-id\":0}".to_owned(),
+                                )]),
                             },
                         )),
                     },
                 ),
                 "change_window",
-            ),
-            (
-                dto::catalog_table_handle::Relation::SystemTable(
-                    dto::ConnectorSystemTableReference {
-                        reference: Some(dto::connector_system_table_reference::Reference::Iceberg(
-                            dto::IcebergSystemTableReference {
-                                schema_table_name: Some(test_support::schema_table_name()),
-                                system_table_type: dto::IcebergSystemTableType::Files as i32,
-                                metadata_file_location:
-                                    "s3://bucket/warehouse/db/t/metadata/v3.json".to_owned(),
-                                table_uuid: "6b1c2f0a-9d4e-4f7b-8a31-0c5d7e9f1234".to_owned(),
-                                snapshot_id: Some(11),
-                            },
-                        )),
-                    },
-                ),
-                "system_table",
             ),
             (
                 dto::catalog_table_handle::Relation::TableExecute(

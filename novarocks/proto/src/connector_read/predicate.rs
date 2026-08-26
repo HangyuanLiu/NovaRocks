@@ -585,6 +585,28 @@ mod tests {
         )
     }
 
+    /// A column with no comparable counterpart can be projected but never
+    /// constrained. There is no `Value` arm for it, so the only way one could
+    /// reach a predicate is an all-or-none domain, which this refuses.
+    #[test]
+    fn a_domain_over_a_non_comparable_column_type_is_refused() {
+        let raw = dto::Domain {
+            values: Some(dto::ValueSet {
+                value_type: Some(super::super::value::encode_value_type(
+                    ConnectorValueType::NonComparable,
+                )),
+                ranges: Vec::new(),
+            }),
+            null_allowed: true,
+        };
+        let error = decode_domain(&raw, root()).expect_err("a non-comparable domain");
+        assert_eq!(error.kind(), crate::ProtocolErrorKind::InvalidValue);
+        assert!(
+            error.to_string().contains("non-comparable"),
+            "unexpected detail: {error}"
+        );
+    }
+
     #[test]
     fn tuple_domains_round_trip_in_canonical_column_order() {
         let mut domains = BTreeMap::new();

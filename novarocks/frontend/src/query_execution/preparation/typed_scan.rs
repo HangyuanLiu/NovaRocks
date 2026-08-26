@@ -33,9 +33,9 @@ use std::sync::Arc;
 
 use novarocks_proto::FieldPath;
 use novarocks_proto::connector_read::{
-    ConnectorTableScanSource, ScanAssignment, TypedColumnBinding, TypedConnectorSplitManager,
-    TypedRelationVersion, ValidatedColumnHandle, WireConstraint, encode_connector_expression,
-    encode_tuple_domain, encode_value_type,
+    ConnectorRelationKind, ConnectorTableScanSource, ScanAssignment, TypedChangeWindow,
+    TypedColumnBinding, TypedConnectorSplitManager, TypedRelationVersion, ValidatedColumnHandle,
+    WireConstraint, encode_connector_expression, encode_tuple_domain, encode_value_type,
 };
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
@@ -46,7 +46,8 @@ use novarocks_sql::plan_read::PlanScanNode;
 use crate::connector::typed_control_registry::TypedConnectorControl;
 use crate::query_execution::connector_domain::{CatalogHandle, TableHandle, TableScanNode};
 
-use super::typed_predicate::{connector_value_type, lower_scan_predicates};
+use super::scan::ResolvedScanColumn;
+use super::typed_predicate::{lower_scan_predicates, scan_output_value_type};
 
 /// Reader batch budgets for a typed scan.
 ///
@@ -60,6 +61,38 @@ const DEFAULT_MAX_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 /// the name unique within one scan without depending on the column's SQL name,
 /// which may be an alias.
 const SCAN_VARIABLE_PREFIX: &str = "v";
+
+/// Which relation family preparation asks the connector to freeze, and the
+/// exact pin that names it.
+///
+/// The variant decides which control entry point is called, so a lane can never
+/// reach a family it did not ask for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TypedRelationFreeze<'a> {
+    /// One relation as of a point in time, optionally reached through a
+    /// connector-resolved branch or tag name.
+    Table {
+        version: TypedRelationVersion,
+        reference: Option<&'a str>,
+    },
+    /// The set difference between the rows visible at two snapshots.
+    ///
+    /// Both endpoints are pinned by the frozen handle. A row written and
+    /// deleted inside the window is invisible at both endpoints and is
+    /// therefore not part of the window: this is a difference of two visible
+    /// row sets, never a replay of the manifests between them.
+    ChangeWindow(TypedChangeWindow),
+}
+
+impl TypedRelationFreeze<'_> {
+    /// The relation family this freeze must produce.
+    pub(crate) const fn relation_kind(self) -> ConnectorRelationKind {
+        match self {
+            Self::Table { .. } => ConnectorRelationKind::Table,
+            Self::ChangeWindow(_) => ConnectorRelationKind::ChangeWindow,
+        }
+    }
+}
 
 /// One SQL scan lowered against one installed typed connector control.
 pub(crate) struct PreparedTypedScan {
@@ -101,6 +134,11 @@ impl std::fmt::Debug for PreparedTypedScan {
 
 /// Lower one SQL scan into a typed connector scan node.
 ///
+/// `physical_columns` is the scan's ordered *physical* output: the columns the
+/// connector itself produces. A synthetic output — a VARIANT path column, for
+/// instance — is deliberately absent, because the connector has no column for
+/// it; the backend materializes those on top of the physical read slots.
+///
 /// `dynamic_filters` pairs a runtime-filter id with the scan output column
 /// name it constrains. A name this scan does not output is an error: silently
 /// dropping the binding would leave the filter's producer waiting on a
@@ -115,28 +153,46 @@ pub(crate) fn prepare_typed_scan(
     control: &TypedConnectorControl,
     plan_node_id: i32,
     scan: &PlanScanNode,
+    physical_columns: &[ResolvedScanColumn],
     relation: &SchemaTableName,
-    version: TypedRelationVersion,
-    reference: Option<&str>,
+    freeze: TypedRelationFreeze<'_>,
     limit: Option<u64>,
     dynamic_filters: &[(u32, String)],
 ) -> Result<PreparedTypedScan, String> {
     let metadata = control.metadata();
     let relation_name = format!("{}.{}", relation.schema_name(), relation.table_name());
 
-    // 1. Freeze the relation. Admission already resolved this name, so a
-    //    connector that now reports nothing means the pin is gone rather than
-    //    that the query referenced an unknown table.
-    let mut handle = metadata
-        .get_table_handle(session, relation, version, reference)
-        .map_err(|error| {
-            format!("typed scan cannot freeze relation {relation_name}: {error}")
-        })?
-        .ok_or_else(|| {
-            format!(
-                "typed scan relation {relation_name} is no longer resolvable after admission pinned it"
-            )
-        })?;
+    // 1. Freeze the relation the lane asked for. Admission already resolved
+    //    this name, so a connector that now reports nothing means the pin is
+    //    gone rather than that the query referenced an unknown table.
+    let mut handle = match freeze {
+        TypedRelationFreeze::Table { version, reference } => metadata
+            .get_table_handle(session, relation, version, reference)
+            .map_err(|error| {
+                format!("typed scan cannot freeze relation {relation_name}: {error}")
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "typed scan relation {relation_name} is no longer resolvable after admission pinned it"
+                )
+            })?,
+        TypedRelationFreeze::ChangeWindow(window) => metadata
+            .get_change_window_plan(session, relation, window)
+            .map_err(|error| {
+                format!(
+                    "typed scan cannot freeze the change window of relation {relation_name} from snapshot {} to snapshot {}: {error}",
+                    window.from_snapshot_id(),
+                    window.to_snapshot_id()
+                )
+            })?
+            .ok_or_else(|| {
+                format!(
+                    "typed scan relation {relation_name} exposes no change window from snapshot {} to snapshot {}",
+                    window.from_snapshot_id(),
+                    window.to_snapshot_id()
+                )
+            })?,
+    };
 
     // 2. Resolve the relation's columns.
     let column_bindings = metadata
@@ -146,22 +202,47 @@ pub(crate) fn prepare_typed_scan(
         })?;
 
     // 3. Build the ordered assignments. `scan.columns` order is the output
-    //    authority, so it is walked once and never sorted or deduplicated.
-    let mut assignments = Vec::with_capacity(scan.columns.len());
+    //    authority, and the connector produces exactly its physical subset, so
+    //    the scan's own order is walked once and never sorted or deduplicated.
+    //    Taking `physical_columns` order instead would reorder the assignments
+    //    whenever a refresh lane resolved its physical columns in some other
+    //    order than the plan node outputs them.
+    let physical_by_column_id = physical_columns
+        .iter()
+        .map(|column| (column.planner.column_id, column))
+        .collect::<BTreeMap<_, _>>();
+    let ordered_physical = scan
+        .columns
+        .iter()
+        .filter_map(|column| physical_by_column_id.get(&column.column_id).copied())
+        .collect::<Vec<_>>();
+    // A physical column the scan does not output has no output slot to fill,
+    // and dropping it would silently shift every later assignment.
+    if ordered_physical.len() != physical_columns.len() {
+        return Err(format!(
+            "typed scan of relation {relation_name} resolved {} physical columns but the scan outputs only {} of them",
+            physical_columns.len(),
+            ordered_physical.len()
+        ));
+    }
+    let mut assignments = Vec::with_capacity(ordered_physical.len());
     let mut columns_by_name: BTreeMap<String, ValidatedColumnHandle> = BTreeMap::new();
     let mut value_types_by_name: BTreeMap<String, ConnectorValueType> = BTreeMap::new();
     let mut variables_by_name: BTreeMap<String, String> = BTreeMap::new();
-    for (ordinal, output) in scan.columns.iter().enumerate() {
-        let binding = unique_binding(&column_bindings, &output.name, &relation_name)?;
+    for (ordinal, output) in ordered_physical.iter().enumerate() {
+        // The connector is asked for the column by its own schema spelling;
+        // the planner name beside it may be an alias and is never provider
+        // identity.
+        let binding = unique_binding(&column_bindings, &output.source.name, &relation_name)?;
         // `TypedColumnBinding` carries column identity, not column type, so
         // the assignment's exact type is the engine's own declared type. A
         // type with no exact typed counterpart is rejected rather than
         // approximated: the connector would otherwise filter and decode
         // against a type the query never stated.
-        let value_type = connector_value_type(&output.data_type).ok_or_else(|| {
+        let value_type = scan_output_value_type(&output.planner.data_type).ok_or_else(|| {
             format!(
                 "typed scan output column '{}' of relation {relation_name} has engine type {:?}, which has no exact typed connector counterpart",
-                output.name, output.data_type
+                output.source.name, output.planner.data_type
             )
         })?;
         let variable = format!("{SCAN_VARIABLE_PREFIX}{ordinal}");
@@ -174,25 +255,27 @@ pub(crate) fn prepare_typed_scan(
             FieldPath::root("scan_assignment"),
         )
         .map_err(|error| {
-            let column_name = &output.name;
+            let column_name = &output.source.name;
             format!(
                 "typed scan assignment for output column '{column_name}' of relation {relation_name}: {error}"
             )
         })?;
-        // Predicate and dynamic-filter lookups are by output column name. Two
-        // outputs sharing a name would make those lookups ambiguous, and
-        // picking either one would push down a predicate about the other.
+        // Predicate and dynamic-filter lookups are by planner output column
+        // name, because that is the name the plan's own column references
+        // resolve to. Two outputs sharing a name would make those lookups
+        // ambiguous, and picking either one would push down a predicate about
+        // the other.
         if columns_by_name
-            .insert(output.name.clone(), binding.column().clone())
+            .insert(output.planner.name.clone(), binding.column().clone())
             .is_some()
         {
             return Err(format!(
                 "typed scan of relation {relation_name} outputs column '{}' more than once",
-                output.name
+                output.planner.name
             ));
         }
-        value_types_by_name.insert(output.name.clone(), value_type);
-        variables_by_name.insert(output.name.clone(), variable);
+        value_types_by_name.insert(output.planner.name.clone(), value_type);
+        variables_by_name.insert(output.planner.name.clone(), variable);
         assignments.push(assignment);
     }
 
@@ -256,6 +339,16 @@ pub(crate) fn prepare_typed_scan(
     // 8. Bind the dynamic filters and validate the whole source.
     let dynamic_filter_bindings =
         bind_dynamic_filters(dynamic_filters, &variables_by_name, &relation_name)?;
+    // Both families this preparation freezes are enumerated: a table and a
+    // change window each produce splits the round drives at runtime. Reading a
+    // relation whole belongs to a system relation resolved to one task, which
+    // this preparation cannot freeze, so naming the variants here keeps adding
+    // one a compile error rather than a scan that reads nothing.
+    let work_source = match freeze {
+        TypedRelationFreeze::Table { .. } | TypedRelationFreeze::ChangeWindow(_) => {
+            dto::ScanWorkSource::RuntimeSplits
+        }
+    };
     let source = dto::ConnectorTableScanSource {
         table: Some(handle.as_proto().clone()),
         assignments: assignments
@@ -270,6 +363,7 @@ pub(crate) fn prepare_typed_scan(
         dynamic_filters: dynamic_filter_bindings,
         max_batch_rows: DEFAULT_MAX_BATCH_ROWS,
         max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
+        work_source: work_source as i32,
     };
     let source = ConnectorTableScanSource::parse(
         source,
@@ -344,18 +438,21 @@ fn bind_dynamic_filters(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::SystemTime;
 
     use arrow::datatypes::DataType;
     use novarocks_proto::connector_read::{
-        CatalogTableHandle, TypedConnectorMetadata, TypedConnectorSplitSource,
+        CatalogTableHandle, ConnectorRelation, TypedConnectorMetadata, TypedConnectorSplitSource,
         TypedFilterApplication, TypedLimitApplication, TypedSystemTablePlan,
     };
     use novarocks_spi::connector::read_stack::{ConnectorValue, Domain, ValueSet};
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
     use novarocks_sql::plan_read::{BinOp, OutputColumn};
+    use novarocks_types::schema::ColumnDef;
 
+    use super::super::scan::ResolvedScanColumnKind;
     use super::super::typed_predicate::test_support::{
         binary, column_handle, column_ref, int_literal, output, scan,
     };
@@ -382,16 +479,20 @@ mod tests {
 
     struct StubControl {
         handle: Option<CatalogTableHandle>,
+        change_window: Option<CatalogTableHandle>,
         bindings: Vec<TypedColumnBinding>,
         filter: FilterBehavior,
         limit: LimitBehavior,
         splits_requested: AtomicUsize,
+        /// Every change window the stub was asked to freeze.
+        change_windows_requested: Mutex<Vec<TypedChangeWindow>>,
     }
 
     impl StubControl {
         fn new() -> Self {
             Self {
                 handle: Some(catalog_table_handle()),
+                change_window: Some(catalog_change_window_handle()),
                 bindings: vec![
                     TypedColumnBinding::new("id", column_handle(1, "id"), false),
                     TypedColumnBinding::new("category", column_handle(2, "category"), false),
@@ -399,6 +500,7 @@ mod tests {
                 filter: FilterBehavior::AcceptAll,
                 limit: LimitBehavior::Decline,
                 splits_requested: AtomicUsize::new(0),
+                change_windows_requested: Mutex::new(Vec::new()),
             }
         }
     }
@@ -480,6 +582,19 @@ mod tests {
         ) -> Result<Option<TypedSystemTablePlan>, ConnectorError> {
             Ok(None)
         }
+
+        fn get_change_window_plan(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+            window: TypedChangeWindow,
+        ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+            self.change_windows_requested
+                .lock()
+                .expect("change window log")
+                .push(window);
+            Ok(self.change_window.clone())
+        }
     }
 
     impl TypedConnectorSplitManager for StubControl {
@@ -549,6 +664,62 @@ mod tests {
         .expect("valid catalog table handle")
     }
 
+    /// The stub's frozen change window, pinned to both endpoints.
+    fn catalog_change_window_handle() -> CatalogTableHandle {
+        CatalogTableHandle::parse(
+            dto::CatalogTableHandle {
+                catalog_name: "ice".to_owned(),
+                instance_incarnation: vec![1_u8; 16],
+                transaction: Some(dto::ConnectorTransactionHandle {
+                    handle: Some(dto::connector_transaction_handle::Handle::Iceberg(
+                        dto::HiveTransactionHandle {
+                            auto_commit: true,
+                            uuid: vec![2_u8; 16],
+                        },
+                    )),
+                }),
+                relation: Some(dto::catalog_table_handle::Relation::ChangeWindow(
+                    dto::ConnectorChangeWindowHandle {
+                        handle: Some(dto::connector_change_window_handle::Handle::Iceberg(
+                            dto::IcebergChangeWindowHandle {
+                                schema_table_name: Some(dto::SchemaTableName {
+                                    schema_name: "db".to_owned(),
+                                    table_name: "t".to_owned(),
+                                }),
+                                table_schema_json: "{}".to_owned(),
+                                columns: vec![
+                                    iceberg_column(1, "id"),
+                                    iceberg_column(2, "category"),
+                                ],
+                                name_mapping_json: None,
+                                from_snapshot_id_exclusive: 6,
+                                to_snapshot_id_inclusive: 7,
+                            },
+                        )),
+                    },
+                )),
+            },
+            FieldPath::root("catalog_table_handle"),
+        )
+        .expect("valid catalog change window handle")
+    }
+
+    fn iceberg_column(field_id: i32, name: &str) -> dto::IcebergColumnHandle {
+        dto::IcebergColumnHandle {
+            base_column_identity: Some(dto::ColumnIdentity {
+                field_id,
+                name: name.to_owned(),
+                category: dto::ColumnIdentityCategory::Primitive as i32,
+                children: Vec::new(),
+            }),
+            base_type_json: "\"long\"".to_owned(),
+            field_id_path: Vec::new(),
+            type_json: "\"long\"".to_owned(),
+            nullable: true,
+            comment: None,
+        }
+    }
+
     fn session() -> ConnectorSession {
         ConnectorSession::try_new("q1", "u", "UTC", "en_US", SystemTime::UNIX_EPOCH)
             .expect("valid session")
@@ -563,6 +734,25 @@ mod tests {
             output(1, "id", DataType::Int32, false),
             output(3, "category", DataType::Utf8, true),
         ]
+    }
+
+    /// Pair each planner output with the physical column it resolved to, the
+    /// way `resolve_physical_columns` does before preparation runs.
+    fn physical(columns: &[OutputColumn]) -> Vec<ResolvedScanColumn> {
+        columns
+            .iter()
+            .map(|planner| ResolvedScanColumn {
+                planner: planner.clone(),
+                source: ColumnDef {
+                    name: planner.name.clone(),
+                    data_type: planner.data_type.clone(),
+                    nullable: planner.nullable,
+                    write_default: None,
+                    logical_type: None,
+                },
+                kind: ResolvedScanColumnKind::PhysicalTableColumn,
+            })
+            .collect()
     }
 
     fn id_predicate() -> Vec<novarocks_sql::plan_read::TypedExpr> {
@@ -580,6 +770,31 @@ mod tests {
         limit: Option<u64>,
         dynamic_filters: &[(u32, String)],
     ) -> Result<PreparedTypedScan, String> {
+        let physical_columns = physical(&columns);
+        prepare_with_physical_columns(
+            stub,
+            columns,
+            &physical_columns,
+            predicates,
+            TypedRelationFreeze::Table {
+                version: TypedRelationVersion::Current,
+                reference: None,
+            },
+            limit,
+            dynamic_filters,
+        )
+    }
+
+    /// The helper mirrors `prepare_typed_scan`'s own frozen inputs.
+    fn prepare_with_physical_columns(
+        stub: Arc<StubControl>,
+        columns: Vec<OutputColumn>,
+        physical_columns: &[ResolvedScanColumn],
+        predicates: Vec<novarocks_sql::plan_read::TypedExpr>,
+        freeze: TypedRelationFreeze<'_>,
+        limit: Option<u64>,
+        dynamic_filters: &[(u32, String)],
+    ) -> Result<PreparedTypedScan, String> {
         let control = TypedConnectorControl::new(stub.clone(), stub);
         prepare_typed_scan(
             &session(),
@@ -587,9 +802,9 @@ mod tests {
             &control,
             11,
             &scan(columns, predicates),
+            physical_columns,
             &relation(),
-            TypedRelationVersion::Current,
-            None,
+            freeze,
             limit,
             dynamic_filters,
         )
@@ -857,5 +1072,106 @@ mod tests {
                 .is_err()
         );
         assert_eq!(stub.splits_requested.load(Ordering::SeqCst), 1);
+    }
+
+    /// A synthetic output — a VARIANT path column — has no connector column at
+    /// all. Only the physical columns are assigned; the backend materializes
+    /// the synthetic one on top of those read slots.
+    #[test]
+    fn a_synthetic_output_column_is_not_assigned() {
+        let mut columns = outputs();
+        let physical_columns = physical(&columns);
+        columns.push(output(9, "__nr_var_v_0", DataType::LargeBinary, true));
+
+        let prepared = prepare_with_physical_columns(
+            Arc::new(StubControl::new()),
+            columns,
+            &physical_columns,
+            Vec::new(),
+            TypedRelationFreeze::Table {
+                version: TypedRelationVersion::Current,
+                reference: None,
+            },
+            None,
+            &[],
+        )
+        .expect("a synthetic output must not be offered to the connector");
+        let assignments = prepared.table_scan.source().assignments();
+        assert_eq!(
+            assignments.len(),
+            2,
+            "only the physical columns are assigned"
+        );
+        assert_eq!(assignments[0].column(), &column_handle(1, "id"));
+        assert_eq!(assignments[1].column(), &column_handle(2, "category"));
+    }
+
+    /// A change window is frozen through its own control entry point and the
+    /// frozen handle pins both endpoints.
+    #[test]
+    fn a_change_window_freezes_through_the_change_window_entry_point() {
+        let stub = Arc::new(StubControl::new());
+        let columns = outputs();
+        let physical_columns = physical(&columns);
+        let prepared = prepare_with_physical_columns(
+            Arc::clone(&stub),
+            columns,
+            &physical_columns,
+            Vec::new(),
+            TypedRelationFreeze::ChangeWindow(TypedChangeWindow::new(6, 7)),
+            None,
+            &[],
+        )
+        .expect("prepared change-window scan");
+
+        assert_eq!(
+            *stub
+                .change_windows_requested
+                .lock()
+                .expect("change window log"),
+            vec![TypedChangeWindow::new(6, 7)],
+            "the window preparation asked for is the window the scan names"
+        );
+        assert_eq!(
+            prepared.table_scan.table().relation_kind(),
+            ConnectorRelationKind::ChangeWindow
+        );
+        let ConnectorRelation::ChangeWindow(window) =
+            prepared.table_scan.table().handle().relation()
+        else {
+            panic!("a change-window freeze produces a change-window relation");
+        };
+        let Some(dto::connector_change_window_handle::Handle::Iceberg(iceberg)) =
+            window.handle.as_ref()
+        else {
+            panic!("the stub freezes an Iceberg change window");
+        };
+        assert_eq!(iceberg.from_snapshot_id_exclusive, 6);
+        assert_eq!(iceberg.to_snapshot_id_inclusive, 7);
+    }
+
+    /// A relation the connector does not expose a change window over is a
+    /// refusal that names both endpoints, never a silent full-table read.
+    #[test]
+    fn a_relation_without_a_change_window_is_an_error() {
+        let mut stub = StubControl::new();
+        stub.change_window = None;
+        let columns = outputs();
+        let physical_columns = physical(&columns);
+        let error = prepare_with_physical_columns(
+            Arc::new(stub),
+            columns,
+            &physical_columns,
+            Vec::new(),
+            TypedRelationFreeze::ChangeWindow(TypedChangeWindow::new(6, 7)),
+            None,
+            &[],
+        )
+        .expect_err("an absent change window cannot fall back to the table");
+        assert!(
+            error.contains("db.t")
+                && error.contains("exposes no change window from snapshot 6 to snapshot 7"),
+            "unexpected error: {error}"
+        );
     }
 }

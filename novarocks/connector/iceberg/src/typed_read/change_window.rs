@@ -56,7 +56,7 @@ use novarocks_spi::connector::{
     ConnectorChangeWindowFullRebuildReason, ConnectorError, ConnectorErrorKind,
 };
 
-use crate::iceberg::spec::Schema;
+use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, unsupported};
 use super::split::{
@@ -74,6 +74,37 @@ pub const TABLE_CHANGES_METADATA_COLUMNS: [&str; 4] = [
 
 /// Maximum number of row IDs one added-rows split may be narrowed to.
 pub const MAX_RESTRICTED_ROW_IDS: usize = 4096;
+
+/// The name of the change window's sign column.
+///
+/// It is not a field of the table schema and is never read from a data file:
+/// [`IcebergChangeSplit::change_op`] derives it from the split variant, so
+/// every row a split produces carries the same sign by construction.
+pub const ICEBERG_CHANGE_OP_COLUMN: &str = "__change_op";
+
+/// The field ID this connector assigns to `__change_op`.
+///
+/// Iceberg reserves 2147483447..=2147483646 for metadata columns and assigns
+/// no ID to a change sign, because the table format has no notion of one.
+/// Taking an ID from inside the reserved block keeps it from colliding with a
+/// real table field, which the format keeps below the block, and this
+/// particular value collides with none of the reserved IDs this crate already
+/// spends.
+pub const ICEBERG_CHANGE_OP_FIELD_ID: i32 = i32::MAX - 300;
+
+/// The column handle behind `__change_op`.
+///
+/// The declared type is Iceberg `int`: the table format has no eight-bit
+/// integer, and naming one here would claim a type Iceberg cannot express. The
+/// column is required because a change row without a sign has no meaning, and
+/// the variant that produces it always has one.
+pub fn change_op_column_handle() -> Result<IcebergColumnHandle, ConnectorError> {
+    IcebergColumnHandle::base_column(&NestedField::required(
+        ICEBERG_CHANGE_OP_FIELD_ID,
+        ICEBERG_CHANGE_OP_COLUMN,
+        Type::Primitive(PrimitiveType::Int),
+    ))
+}
 
 // ---------------------------------------------------------------------------
 // Trino table_changes
@@ -565,6 +596,11 @@ pub struct IcebergChangeWindowHandleParams {
     pub name_mapping_json: Option<String>,
     pub from_snapshot_id_exclusive: i64,
     pub to_snapshot_id_inclusive: i64,
+    /// Every partition spec a split of this window may name. A window spans
+    /// two snapshots, so files written under different specs appear on both
+    /// sides of the difference and each must decode without resolving the
+    /// relation through the catalog again.
+    pub partition_spec_jsons: BTreeMap<i32, String>,
 }
 
 /// One net row difference between two pinned Iceberg snapshots.
@@ -582,6 +618,7 @@ pub struct IcebergChangeWindowHandle {
     name_mapping_json: Option<Arc<str>>,
     from_snapshot_id_exclusive: i64,
     to_snapshot_id_inclusive: i64,
+    partition_spec_jsons: BTreeMap<i32, String>,
 }
 
 impl IcebergChangeWindowHandle {
@@ -593,6 +630,7 @@ impl IcebergChangeWindowHandle {
             name_mapping_json,
             from_snapshot_id_exclusive,
             to_snapshot_id_inclusive,
+            partition_spec_jsons,
         } = params;
 
         validate_change_columns(&table_schema_json, &columns, name_mapping_json.as_deref())?;
@@ -609,7 +647,13 @@ impl IcebergChangeWindowHandle {
             name_mapping_json: name_mapping_json.map(|value| Arc::from(value.as_str())),
             from_snapshot_id_exclusive,
             to_snapshot_id_inclusive,
+            partition_spec_jsons,
         })
+    }
+
+    /// The partition spec a split names, by spec id.
+    pub const fn partition_spec_jsons(&self) -> &BTreeMap<i32, String> {
+        &self.partition_spec_jsons
     }
 
     pub const fn schema_table_name(&self) -> &SchemaTableName {
@@ -659,6 +703,7 @@ impl IcebergChangeWindowHandle {
                 .map(|value| value.to_string()),
             from_snapshot_id_exclusive: self.from_snapshot_id_exclusive,
             to_snapshot_id_inclusive: self.to_snapshot_id_inclusive,
+            partition_spec_jsons: self.partition_spec_jsons.clone(),
         }
     }
 
@@ -685,6 +730,7 @@ impl IcebergChangeWindowHandle {
             name_mapping_json: raw.name_mapping_json.clone(),
             from_snapshot_id_exclusive: raw.from_snapshot_id_exclusive,
             to_snapshot_id_inclusive: raw.to_snapshot_id_inclusive,
+            partition_spec_jsons: raw.partition_spec_jsons.clone(),
         })
     }
 
@@ -1646,6 +1692,7 @@ mod tests {
             name_mapping_json: None,
             from_snapshot_id_exclusive: 10,
             to_snapshot_id_inclusive: 20,
+            partition_spec_jsons: BTreeMap::new(),
         })
         .expect("handle")
     }
@@ -1714,6 +1761,32 @@ mod tests {
             assert_eq!(reverse.change_op(), -1);
             assert_eq!(reverse.side(), IcebergChangeSide::Reverse);
         }
+    }
+
+    #[test]
+    fn the_change_op_column_is_a_reserved_identity_no_table_field_can_claim() {
+        let handle = change_op_column_handle().expect("change op column");
+        assert_eq!(handle.base_field_id(), ICEBERG_CHANGE_OP_FIELD_ID);
+        assert_eq!(
+            handle.base_column_identity().name(),
+            ICEBERG_CHANGE_OP_COLUMN
+        );
+        // A base column with no dereference path, and required: a change row
+        // whose sign were absent would say nothing at all.
+        assert!(handle.is_base_column());
+        assert!(!handle.nullable());
+        // Iceberg keeps real table fields below the reserved metadata block, so
+        // no rename of a table column can ever collide with the sign.
+        assert!(
+            partitioned_schema()
+                .as_struct()
+                .fields()
+                .iter()
+                .all(|field| field.id < ICEBERG_CHANGE_OP_FIELD_ID)
+        );
+        // The sign is this connector's own IMV vocabulary, not one of Trino's
+        // `table_changes` metadata columns.
+        assert!(!TABLE_CHANGES_METADATA_COLUMNS.contains(&ICEBERG_CHANGE_OP_COLUMN));
     }
 
     #[test]
@@ -2083,6 +2156,7 @@ mod tests {
                 name_mapping_json: None,
                 from_snapshot_id_exclusive: 10,
                 to_snapshot_id_inclusive: 20,
+                partition_spec_jsons: BTreeMap::new(),
             })
             .is_err()
         );
@@ -2094,6 +2168,7 @@ mod tests {
                 name_mapping_json: None,
                 from_snapshot_id_exclusive: 10,
                 to_snapshot_id_inclusive: 10,
+                partition_spec_jsons: BTreeMap::new(),
             })
             .is_err()
         );
@@ -2105,6 +2180,7 @@ mod tests {
                 name_mapping_json: None,
                 from_snapshot_id_exclusive: 10,
                 to_snapshot_id_inclusive: 20,
+                partition_spec_jsons: BTreeMap::new(),
             })
             .is_err()
         );

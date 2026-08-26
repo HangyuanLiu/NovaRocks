@@ -106,7 +106,11 @@ impl<'a> NativeScanBindingView<'a> {
             ResolvedScanExecution::AdmittedConnectorRead(_) => {
                 NativeScanExecutionKind::AdmittedConnectorRead
             }
-            ResolvedScanExecution::SealedConnectorScan(_) => {
+            // The encoder-facing name is still `SealedConnectorScan`; it marks
+            // the change-window lane, which no longer carries a provider-sealed
+            // opaque scan. Renaming the encoder-visible variant is a separate
+            // change to the native fragment encoder.
+            ResolvedScanExecution::AdmittedChangeWindow(_) => {
                 NativeScanExecutionKind::SealedConnectorScan
             }
         }

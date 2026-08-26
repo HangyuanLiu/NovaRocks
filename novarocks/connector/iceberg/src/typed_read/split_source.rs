@@ -37,6 +37,11 @@ use crate::read_model::{
     delete_applies_to_data_file,
 };
 
+use super::change_window::{
+    IcebergAddedRows, IcebergChangeSplit, IcebergChangeWindowHandle, IcebergChangeWindowPlan,
+    IcebergChangeWindowPlanOutcome, IcebergDeletedDataFileRows, IcebergEndpointVisibility,
+    IcebergEqualityDeletedRows, IcebergPositionDeletedRows,
+};
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, unsupported};
 use super::split::{
     DEFAULT_MINIMUM_ASSIGNED_SPLIT_WEIGHT, IcebergDeleteFile, IcebergDeleteFileContent,
@@ -205,35 +210,7 @@ impl IcebergSplitSource {
     ) -> Result<Vec<IcebergSplit>, ConnectorError> {
         // Admission first: a split we could never open must not reach a
         // scheduler, and it must fail by its declared format, not by a suffix.
-        match file.file_format {
-            IcebergFileFormat::Parquet => {}
-            IcebergFileFormat::Orc => {
-                return Err(unsupported(
-                    "iceberg orc data files are not supported by the connector read stack",
-                ));
-            }
-            IcebergFileFormat::Avro => {
-                return Err(unsupported(
-                    "iceberg avro data files are not supported by the connector read stack",
-                ));
-            }
-            IcebergFileFormat::Puffin => {
-                return Err(corrupt(
-                    "an iceberg data file is never in the puffin delete-artifact format"
-                        .to_string(),
-                ));
-            }
-        }
-        if !file.key_metadata.is_empty() {
-            return Err(unsupported(
-                "iceberg encrypted manifest key metadata is not supported by the connector read stack",
-            ));
-        }
-        if file.decryption_data.is_some() {
-            return Err(unsupported(
-                "iceberg parquet modular encryption is not supported by the connector read stack",
-            ));
-        }
+        admit_readable_data_file(file)?;
 
         let read_file = &file.read_file;
         let partition_spec_id = read_file.partition_spec_id.ok_or_else(|| {
@@ -311,37 +288,12 @@ impl IcebergSplitSource {
         file: &IcebergPlannedDataFile,
         file_size: i64,
     ) -> Result<Vec<(i64, i64)>, ConnectorError> {
-        if legal_split_offsets(&file.split_offsets, file_size) {
-            let mut ranges = Vec::with_capacity(file.split_offsets.len());
-            for (index, start) in file.split_offsets.iter().enumerate() {
-                let end = file
-                    .split_offsets
-                    .get(index + 1)
-                    .copied()
-                    .unwrap_or(file_size);
-                ranges.push((*start, end - *start));
-            }
-            if self.merge_adjacent_split_offsets {
-                return Ok(merge_adjacent_ranges(ranges, self.target_split_size));
-            }
-            return Ok(ranges);
-        }
-
-        // No usable offsets: cut contiguous target-sized ranges. Files are
-        // never combined, so a range always names exactly one file.
-        let mut ranges = Vec::new();
-        let mut start = 0_i64;
-        while start < file_size {
-            let length = self.target_split_size.min(file_size - start);
-            ranges.push((start, length));
-            start += length;
-        }
-        if ranges.is_empty() {
-            // A zero-byte file still yields exactly one split so its record
-            // count and partition constants stay reachable.
-            ranges.push((0, 0));
-        }
-        Ok(ranges)
+        Ok(data_file_byte_ranges(
+            &file.split_offsets,
+            file_size,
+            self.target_split_size,
+            self.merge_adjacent_split_offsets,
+        ))
     }
 
     fn partition_data_json(
@@ -358,38 +310,7 @@ impl IcebergSplitSource {
                     read_file.path
                 ))
             })?;
-        let values = read_file.partition_values.as_ref().ok_or_else(|| {
-            corrupt(format!(
-                "iceberg data file {} is missing its partition values",
-                read_file.path
-            ))
-        })?;
-        let expected = match partition_type {
-            Type::Struct(struct_type) => struct_type.fields().len(),
-            Type::Primitive(_) | Type::List(_) | Type::Map(_) => {
-                return Err(corrupt(
-                    "iceberg partition type must be a struct".to_string(),
-                ));
-            }
-        };
-        // The Iceberg JSON encoder zips values against fields, so a mismatched
-        // arity would silently drop partition values instead of failing.
-        if values.iter().len() != expected {
-            return Err(corrupt(format!(
-                "iceberg data file {} carries {} partition values for a spec with {expected} fields",
-                read_file.path,
-                values.iter().len()
-            )));
-        }
-        let json = Literal::Struct(values.clone())
-            .try_into_json(partition_type)
-            .map_err(|error| {
-                corrupt(format!(
-                    "iceberg partition values of {} cannot be encoded: {error}",
-                    read_file.path
-                ))
-            })?;
-        Ok(json.to_string())
+        encode_partition_data_json(partition_type, read_file)
     }
 
     fn deletes_for_file(
@@ -418,76 +339,205 @@ impl IcebergSplitSource {
         read_delete: &IcebergReadDeleteFile,
         file: &IcebergPlannedDataFile,
     ) -> Result<IcebergDeleteFile, ConnectorError> {
-        let facts = file.delete_facts.get(&read_delete.path).ok_or_else(|| {
-            corrupt(format!(
-                "iceberg delete file {} is missing its manifest facts",
-                read_delete.path
-            ))
-        })?;
-        let format = match read_delete.file_format {
-            IcebergReadDeleteFormat::Parquet => IcebergFileFormat::Parquet,
-            IcebergReadDeleteFormat::Puffin => IcebergFileFormat::Puffin,
-        };
-        let (content, equality_field_ids) = match &read_delete.kind {
-            IcebergReadDeleteKind::Position => {
-                (IcebergDeleteFileContent::PositionDeletes, Vec::new())
-            }
-            IcebergReadDeleteKind::Equality { equality_field_ids } => (
-                IcebergDeleteFileContent::EqualityDeletes,
-                self.equality_field_ids_in_schema_order(equality_field_ids)?,
-            ),
-        };
-        let file_size_in_bytes = read_delete.length.ok_or_else(|| {
-            corrupt(format!(
-                "iceberg delete file {} is missing its file size",
-                read_delete.path
-            ))
-        })?;
-        let data_sequence_number = read_delete.sequence_number.ok_or_else(|| {
-            corrupt(format!(
-                "iceberg delete file {} is missing its data sequence number",
-                read_delete.path
-            ))
-        })?;
-
-        IcebergDeleteFile::try_new(IcebergDeleteFileParams {
-            content,
-            path: read_delete.path.clone(),
-            format,
-            record_count: facts.record_count,
-            file_size_in_bytes,
-            equality_field_ids,
-            row_position_lower_bound: facts.row_position_lower_bound,
-            row_position_upper_bound: facts.row_position_upper_bound,
-            data_sequence_number,
-            content_offset: read_delete.content_offset,
-            content_size_in_bytes: read_delete.content_size_in_bytes,
-            decryption_data: facts.decryption_data.clone(),
-        })
+        delete_descriptor_of(read_delete, file, &self.schema_field_order)
     }
+}
 
-    fn equality_field_ids_in_schema_order(
-        &self,
-        field_ids: &[i32],
-    ) -> Result<Vec<i32>, ConnectorError> {
-        let mut seen = BTreeSet::new();
-        let mut ordered = Vec::with_capacity(field_ids.len());
-        for field_id in field_ids {
-            if !seen.insert(*field_id) {
-                return Err(corrupt(format!(
-                    "iceberg equality-delete file declares duplicate equality field id {field_id}"
-                )));
-            }
-            let order = self.schema_field_order.get(field_id).ok_or_else(|| {
-                corrupt(format!(
-                    "iceberg equality-delete field id {field_id} is not present in the frozen table schema"
-                ))
-            })?;
-            ordered.push((*order, *field_id));
+/// Reject a planned data file this read stack could never open.
+///
+/// It fails by the manifest's declared format and declared encryption
+/// material, never by a path suffix, and it runs before any split of the file
+/// is produced so an unreadable file never reaches a scheduler.
+fn admit_readable_data_file(file: &IcebergPlannedDataFile) -> Result<(), ConnectorError> {
+    match file.file_format {
+        IcebergFileFormat::Parquet => {}
+        IcebergFileFormat::Orc => {
+            return Err(unsupported(
+                "iceberg orc data files are not supported by the connector read stack",
+            ));
         }
-        ordered.sort_unstable();
-        Ok(ordered.into_iter().map(|(_, field_id)| field_id).collect())
+        IcebergFileFormat::Avro => {
+            return Err(unsupported(
+                "iceberg avro data files are not supported by the connector read stack",
+            ));
+        }
+        IcebergFileFormat::Puffin => {
+            return Err(corrupt(
+                "an iceberg data file is never in the puffin delete-artifact format".to_string(),
+            ));
+        }
     }
+    if !file.key_metadata.is_empty() {
+        return Err(unsupported(
+            "iceberg encrypted manifest key metadata is not supported by the connector read stack",
+        ));
+    }
+    if file.decryption_data.is_some() {
+        return Err(unsupported(
+            "iceberg parquet modular encryption is not supported by the connector read stack",
+        ));
+    }
+    Ok(())
+}
+
+/// Turn one applicable delete of a planned file into its wire descriptor.
+///
+/// The schema order is passed in rather than re-derived so a change-window
+/// endpoint and an ordinary scan canonicalize equality field IDs against the
+/// very same frozen schema.
+fn delete_descriptor_of(
+    read_delete: &IcebergReadDeleteFile,
+    file: &IcebergPlannedDataFile,
+    schema_field_order: &BTreeMap<i32, usize>,
+) -> Result<IcebergDeleteFile, ConnectorError> {
+    let facts = file.delete_facts.get(&read_delete.path).ok_or_else(|| {
+        corrupt(format!(
+            "iceberg delete file {} is missing its manifest facts",
+            read_delete.path
+        ))
+    })?;
+    let format = match read_delete.file_format {
+        IcebergReadDeleteFormat::Parquet => IcebergFileFormat::Parquet,
+        IcebergReadDeleteFormat::Puffin => IcebergFileFormat::Puffin,
+    };
+    let (content, equality_field_ids) = match &read_delete.kind {
+        IcebergReadDeleteKind::Position => (IcebergDeleteFileContent::PositionDeletes, Vec::new()),
+        IcebergReadDeleteKind::Equality { equality_field_ids } => (
+            IcebergDeleteFileContent::EqualityDeletes,
+            equality_field_ids_in_schema_order(equality_field_ids, schema_field_order)?,
+        ),
+    };
+    let file_size_in_bytes = read_delete.length.ok_or_else(|| {
+        corrupt(format!(
+            "iceberg delete file {} is missing its file size",
+            read_delete.path
+        ))
+    })?;
+    let data_sequence_number = read_delete.sequence_number.ok_or_else(|| {
+        corrupt(format!(
+            "iceberg delete file {} is missing its data sequence number",
+            read_delete.path
+        ))
+    })?;
+
+    IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+        content,
+        path: read_delete.path.clone(),
+        format,
+        record_count: facts.record_count,
+        file_size_in_bytes,
+        equality_field_ids,
+        row_position_lower_bound: facts.row_position_lower_bound,
+        row_position_upper_bound: facts.row_position_upper_bound,
+        data_sequence_number,
+        content_offset: read_delete.content_offset,
+        content_size_in_bytes: read_delete.content_size_in_bytes,
+        decryption_data: facts.decryption_data.clone(),
+    })
+}
+
+fn equality_field_ids_in_schema_order(
+    field_ids: &[i32],
+    schema_field_order: &BTreeMap<i32, usize>,
+) -> Result<Vec<i32>, ConnectorError> {
+    let mut seen = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(field_ids.len());
+    for field_id in field_ids {
+        if !seen.insert(*field_id) {
+            return Err(corrupt(format!(
+                "iceberg equality-delete file declares duplicate equality field id {field_id}"
+            )));
+        }
+        let order = schema_field_order.get(field_id).ok_or_else(|| {
+            corrupt(format!(
+                "iceberg equality-delete field id {field_id} is not present in the frozen table schema"
+            ))
+        })?;
+        ordered.push((*order, *field_id));
+    }
+    ordered.sort_unstable();
+    Ok(ordered.into_iter().map(|(_, field_id)| field_id).collect())
+}
+
+/// Cut one data file into byte ranges that tile it exactly once.
+///
+/// The manifest's own `split_offsets` win when they are usable, because they
+/// name the writer's row-group boundaries; otherwise the file is cut into
+/// contiguous target-sized ranges. Either way the ranges cover `[0, file_size)`
+/// with no gap and no overlap, which is what lets a change window prove that
+/// its splits neither drop nor double a row.
+fn data_file_byte_ranges(
+    split_offsets: &[i64],
+    file_size: i64,
+    target_split_size: i64,
+    merge_adjacent_split_offsets: bool,
+) -> Vec<(i64, i64)> {
+    if legal_split_offsets(split_offsets, file_size) {
+        let mut ranges = Vec::with_capacity(split_offsets.len());
+        for (index, start) in split_offsets.iter().enumerate() {
+            let end = split_offsets.get(index + 1).copied().unwrap_or(file_size);
+            ranges.push((*start, end - *start));
+        }
+        if merge_adjacent_split_offsets {
+            return merge_adjacent_ranges(ranges, target_split_size);
+        }
+        return ranges;
+    }
+
+    // No usable offsets: cut contiguous target-sized ranges. Files are
+    // never combined, so a range always names exactly one file.
+    let mut ranges = Vec::new();
+    let mut start = 0_i64;
+    while start < file_size {
+        let length = target_split_size.min(file_size - start);
+        ranges.push((start, length));
+        start += length;
+    }
+    if ranges.is_empty() {
+        // A zero-byte file still yields exactly one split so its record
+        // count and partition constants stay reachable.
+        ranges.push((0, 0));
+    }
+    ranges
+}
+
+/// Encode a data file's frozen partition values against its spec's type.
+fn encode_partition_data_json(
+    partition_type: &Type,
+    read_file: &IcebergReadFile,
+) -> Result<String, ConnectorError> {
+    let values = read_file.partition_values.as_ref().ok_or_else(|| {
+        corrupt(format!(
+            "iceberg data file {} is missing its partition values",
+            read_file.path
+        ))
+    })?;
+    let expected = match partition_type {
+        Type::Struct(struct_type) => struct_type.fields().len(),
+        Type::Primitive(_) | Type::List(_) | Type::Map(_) => {
+            return Err(corrupt(
+                "iceberg partition type must be a struct".to_string(),
+            ));
+        }
+    };
+    // The Iceberg JSON encoder zips values against fields, so a mismatched
+    // arity would silently drop partition values instead of failing.
+    if values.iter().len() != expected {
+        return Err(corrupt(format!(
+            "iceberg data file {} carries {} partition values for a spec with {expected} fields",
+            read_file.path,
+            values.iter().len()
+        )));
+    }
+    let json = Literal::Struct(values.clone())
+        .try_into_json(partition_type)
+        .map_err(|error| {
+            corrupt(format!(
+                "iceberg partition values of {} cannot be encoded: {error}",
+                read_file.path
+            ))
+        })?;
+    Ok(json.to_string())
 }
 
 impl ConnectorSplitSource for IcebergSplitSource {
@@ -613,6 +663,437 @@ fn merge_adjacent_ranges(ranges: Vec<(i64, i64)>, target_split_size: i64) -> Vec
     merged
 }
 
+// ---------------------------------------------------------------------------
+// Change-window enumeration
+// ---------------------------------------------------------------------------
+
+/// The two endpoints of one change window, each already reduced to the data
+/// files it makes visible together with their frozen delete closures.
+pub struct IcebergChangeWindowEndpoints<'a> {
+    /// Files visible at the exclusive lower endpoint.
+    pub from_visible: &'a [IcebergPlannedDataFile],
+    /// Files visible at the inclusive upper endpoint.
+    pub to_visible: &'a [IcebergPlannedDataFile],
+}
+
+/// Turn two endpoint file sets into one window's proven-disjoint split set.
+///
+/// This is a **set difference of the two endpoints**, never a replay of the
+/// snapshots between them. The distinction is the whole contract: a data file
+/// written and dropped again inside the window is visible at neither endpoint,
+/// so it appears in neither index below and is reached by no branch. A replay
+/// would find its add and its delete in the manifests and emit both, which
+/// looks entirely plausible until a materialized view stops converging.
+///
+/// The same rule at row granularity is what the delete closures carry: a file
+/// added inside the window keeps the *upper* endpoint's closure, so rows that
+/// were written and then deleted inside the window are already invisible in
+/// what the forward side reads.
+pub fn plan_change_window_splits(
+    handle: &IcebergChangeWindowHandle,
+    endpoints: IcebergChangeWindowEndpoints<'_>,
+    partition_types: &BTreeMap<i32, Type>,
+    options: IcebergSplitSourceOptions,
+) -> Result<IcebergChangeWindowPlan, ConnectorError> {
+    let schema = handle.parse_table_schema()?;
+    // A change window carries no table properties of its own, so the session is
+    // the only thing that can change the cut. It changes how a file is divided,
+    // never which rows the difference owns.
+    let target_split_size = options
+        .session_max_split_size
+        .unwrap_or(DEFAULT_TARGET_SPLIT_SIZE_BYTES);
+    let context = ChangeWindowContext {
+        partition_types,
+        schema_field_order: schema_field_order(&schema),
+        target_split_size: i64::try_from(target_split_size).unwrap_or(i64::MAX),
+        merge_adjacent_split_offsets: options.merge_adjacent_split_offsets,
+        weight_parameters: IcebergSplitWeightParameters::try_new(
+            target_split_size,
+            options.minimum_assigned_split_weight,
+        )?,
+    };
+
+    let from_visible = index_visible_files(endpoints.from_visible)?;
+    let to_visible = index_visible_files(endpoints.to_visible)?;
+
+    let mut splits = Vec::new();
+    for (path, to_file) in &to_visible {
+        match from_visible.get(path) {
+            None => context.push_added_rows(to_file, &mut splits)?,
+            Some(from_file) => context.push_surviving_file(from_file, to_file, &mut splits)?,
+        }
+    }
+    for (path, from_file) in &from_visible {
+        if to_visible.contains_key(path) {
+            continue;
+        }
+        context.push_deleted_data_file_rows(from_file, &mut splits)?;
+    }
+
+    match IcebergChangeWindowPlan::try_plan(
+        handle.clone(),
+        IcebergEndpointVisibility::Proven,
+        splits,
+    )? {
+        IcebergChangeWindowPlanOutcome::Incremental(plan) => Ok(plan),
+        // Admission already proved both endpoints, so a rebuild verdict here
+        // would mean the proof and the plan disagree about the same window.
+        // The arm exists because the outcome is a closed enum, and quietly
+        // returning no splits would be indistinguishable from an empty window.
+        IcebergChangeWindowPlanOutcome::FullRebuild(reason) => Err(corrupt(format!(
+            "iceberg change window was admitted as proven but planning reported a full rebuild: {reason:?}"
+        ))),
+    }
+}
+
+/// One endpoint's visible files, keyed by data file path.
+fn index_visible_files(
+    files: &[IcebergPlannedDataFile],
+) -> Result<BTreeMap<&str, &IcebergPlannedDataFile>, ConnectorError> {
+    let mut indexed = BTreeMap::new();
+    for file in files {
+        if indexed.insert(file.read_file.path.as_str(), file).is_some() {
+            // An endpoint lists one data file exactly once. Two entries would
+            // make "visible here" ambiguous and could emit its rows twice.
+            return Err(corrupt(format!(
+                "iceberg snapshot lists data file {} more than once",
+                file.read_file.path
+            )));
+        }
+    }
+    Ok(indexed)
+}
+
+/// The frozen facts every variant of one data file shares.
+struct ChangeFileFacts {
+    partition_spec_id: i32,
+    partition_data_json: String,
+    file_record_count: i64,
+    /// Byte ranges that tile the file exactly once.
+    ranges: Vec<(i64, i64)>,
+}
+
+/// Everything the endpoint difference needs beyond the two file sets.
+struct ChangeWindowContext<'a> {
+    partition_types: &'a BTreeMap<i32, Type>,
+    schema_field_order: BTreeMap<i32, usize>,
+    target_split_size: i64,
+    merge_adjacent_split_offsets: bool,
+    weight_parameters: IcebergSplitWeightParameters,
+}
+
+impl ChangeWindowContext<'_> {
+    /// Rows visible at `to` for a file that did not exist at `from`.
+    ///
+    /// The upper endpoint's own delete closure travels with the data split, so
+    /// what a reader emits is exactly the rows the file still has at `to` --
+    /// never the rows it was written with.
+    fn push_added_rows(
+        &self,
+        file: &IcebergPlannedDataFile,
+        splits: &mut Vec<IcebergChangeSplit>,
+    ) -> Result<(), ConnectorError> {
+        let facts = self.file_facts(file)?;
+        let deletes = self.closure_of(file)?.into_values().collect::<Vec<_>>();
+        for split in self.data_splits(file, &facts, deletes)? {
+            splits.push(IcebergChangeSplit::AddedRows(IcebergAddedRows::try_new(
+                split,
+                // Enumeration narrows nothing: the delete closure above already
+                // states exactly which rows survive at `to`.
+                Vec::new(),
+            )?));
+        }
+        Ok(())
+    }
+
+    /// Rows visible at `from` for a file that is gone at `to`.
+    fn push_deleted_data_file_rows(
+        &self,
+        file: &IcebergPlannedDataFile,
+        splits: &mut Vec<IcebergChangeSplit>,
+    ) -> Result<(), ConnectorError> {
+        let facts = self.file_facts(file)?;
+        let previously = self.closure_of(file)?.into_values().collect::<Vec<_>>();
+        // The data split carries no exclusion closure of its own: rows that
+        // were already invisible at `from` are named as typed variant facts,
+        // so one split never carries two contradictory delete meanings.
+        for split in self.data_splits(file, &facts, Vec::new())? {
+            splits.push(IcebergChangeSplit::DeletedDataFileRows(
+                IcebergDeletedDataFileRows::try_new(split, previously.clone())?,
+            ));
+        }
+        Ok(())
+    }
+
+    /// A file visible at both endpoints: only its delete closure can differ.
+    fn push_surviving_file(
+        &self,
+        from_file: &IcebergPlannedDataFile,
+        to_file: &IcebergPlannedDataFile,
+        splits: &mut Vec<IcebergChangeSplit>,
+    ) -> Result<(), ConnectorError> {
+        // Iceberg data files are immutable, so one path at two endpoints must
+        // describe the same bytes and the same rows.
+        if from_file.read_file.size != to_file.read_file.size
+            || from_file.read_file.record_count != to_file.read_file.record_count
+        {
+            return Err(corrupt(format!(
+                "iceberg data file {} describes different content at the two change-window endpoints",
+                to_file.read_file.path
+            )));
+        }
+
+        let from_closure = self.closure_of(from_file)?;
+        let to_closure = self.closure_of(to_file)?;
+        for path in from_closure.keys() {
+            if !to_closure.contains_key(path) {
+                // A delete that applied at `from` and no longer applies at `to`
+                // has two possible meanings, and nothing here can tell them
+                // apart: either its rows became visible again -- a forward-side
+                // row set of a file that was never added, which none of the
+                // four typed variants can express -- or a rewrite replaced it
+                // with an artifact that already covers those same rows, as a
+                // deletion vector does when it is rewritten. Proving the second
+                // would mean opening both artifacts and comparing their
+                // positions, which planning does not do, so the window fails
+                // closed rather than emitting rows it cannot justify.
+                //
+                // The cost is real: a v3 table whose deletion vector is
+                // rewritten inside the window is rejected today even though its
+                // difference is expressible as `newly = [new DV]`,
+                // `previously = [old DV]`. Lifting that needs a proof that the
+                // replacement subsumes what it replaced, not a weaker check
+                // here.
+                return Err(unsupported(format!(
+                    "iceberg delete file {path} stopped applying to data file {} inside the change window",
+                    to_file.read_file.path
+                )));
+            }
+        }
+
+        let newly = to_closure
+            .iter()
+            .filter(|(path, _)| !from_closure.contains_key(*path))
+            .map(|(_, delete)| delete.clone())
+            .collect::<Vec<_>>();
+        if newly.is_empty() {
+            // Present at both endpoints with the same closure: the file's
+            // visible rows did not change, so the difference owns none of them.
+            return Ok(());
+        }
+
+        let previously = from_closure.into_values().collect::<Vec<_>>();
+        let (newly_position, newly_equality): (Vec<_>, Vec<_>) = newly
+            .into_iter()
+            .partition(|delete| delete.content() == IcebergDeleteFileContent::PositionDeletes);
+
+        let facts = self.file_facts(to_file)?;
+        if !newly_position.is_empty() {
+            for split in self.data_splits(to_file, &facts, Vec::new())? {
+                splits.push(IcebergChangeSplit::PositionDeletedRows(
+                    IcebergPositionDeletedRows::try_new(
+                        split,
+                        newly_position.clone(),
+                        previously.clone(),
+                    )?,
+                ));
+            }
+        }
+        if !newly_equality.is_empty() {
+            // The equality variant owns only what the position variant did
+            // not, so every newly applied position delete is handed to it as
+            // already applied and its rows are subtracted rather than emitted
+            // a second time.
+            let mut equality_previously = previously.clone();
+            equality_previously.extend(newly_position.iter().cloned());
+            for split in self.data_splits(to_file, &facts, Vec::new())? {
+                splits.push(IcebergChangeSplit::EqualityDeletedRows(
+                    IcebergEqualityDeletedRows::try_new(
+                        split,
+                        newly_equality.clone(),
+                        equality_previously.clone(),
+                    )?,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn file_facts(&self, file: &IcebergPlannedDataFile) -> Result<ChangeFileFacts, ConnectorError> {
+        admit_readable_data_file(file)?;
+        let read_file = &file.read_file;
+        let partition_spec_id = read_file.partition_spec_id.ok_or_else(|| {
+            corrupt(format!(
+                "iceberg data file {} is missing its partition spec id",
+                read_file.path
+            ))
+        })?;
+        let file_record_count = read_file.record_count.ok_or_else(|| {
+            corrupt(format!(
+                "iceberg data file {} is missing its record count",
+                read_file.path
+            ))
+        })?;
+        if read_file.size < 0 {
+            return Err(corrupt(format!(
+                "iceberg data file {} has a negative size",
+                read_file.path
+            )));
+        }
+        let partition_type = self.partition_types.get(&partition_spec_id).ok_or_else(|| {
+            corrupt(format!(
+                "iceberg data file {} references partition spec id {partition_spec_id} that the change window does not carry",
+                read_file.path
+            ))
+        })?;
+        Ok(ChangeFileFacts {
+            partition_spec_id,
+            partition_data_json: encode_partition_data_json(partition_type, read_file)?,
+            file_record_count,
+            ranges: data_file_byte_ranges(
+                &file.split_offsets,
+                read_file.size,
+                self.target_split_size,
+                self.merge_adjacent_split_offsets,
+            ),
+        })
+    }
+
+    /// One endpoint's applicable delete closure for one file, by delete path.
+    fn closure_of(
+        &self,
+        file: &IcebergPlannedDataFile,
+    ) -> Result<BTreeMap<String, IcebergDeleteFile>, ConnectorError> {
+        let read_file = &file.read_file;
+        let mut closure = BTreeMap::new();
+        for read_delete in &read_file.deletes {
+            // Applicability was decided by the endpoint's manifest walk. This
+            // is a guard, not a re-derivation: it catches a closure attached
+            // from a different data file.
+            if !delete_applies_to_data_file(read_delete, read_file) {
+                return Err(corrupt(format!(
+                    "iceberg delete file {} does not apply to data file {}",
+                    read_delete.path, read_file.path
+                )));
+            }
+            let descriptor = delete_descriptor_of(read_delete, file, &self.schema_field_order)?;
+            if closure
+                .insert(read_delete.path.clone(), descriptor)
+                .is_some()
+            {
+                return Err(corrupt(format!(
+                    "iceberg delete file {} is attached to data file {} more than once",
+                    read_delete.path, read_file.path
+                )));
+            }
+        }
+        Ok(closure)
+    }
+
+    fn data_splits(
+        &self,
+        file: &IcebergPlannedDataFile,
+        facts: &ChangeFileFacts,
+        deletes: Vec<IcebergDeleteFile>,
+    ) -> Result<Vec<IcebergSplit>, ConnectorError> {
+        let read_file = &file.read_file;
+        let mut splits = Vec::with_capacity(facts.ranges.len());
+        for (start, length) in &facts.ranges {
+            splits.push(IcebergSplit::try_new(IcebergSplitParams {
+                path: read_file.path.clone(),
+                start: *start,
+                length: *length,
+                file_size: read_file.size,
+                file_record_count: facts.file_record_count,
+                file_format: file.file_format,
+                partition_spec_id: facts.partition_spec_id,
+                partition_data_json: facts.partition_data_json.clone(),
+                deletes: deletes.clone(),
+                file_statistics_domain: file.file_statistics_domain.clone(),
+                data_sequence_number: read_file.data_sequence_number,
+                file_first_row_id: read_file.first_row_id,
+                decryption_data: None,
+                split_weight: iceberg_split_weight(*length, &deletes, self.weight_parameters)?,
+                affinity_key: Some(read_file.path.clone()),
+            })?);
+        }
+        Ok(splits)
+    }
+}
+
+/// A bounded enumerator over one change window's proven-disjoint split set.
+#[derive(Debug)]
+pub struct IcebergChangeWindowSplitSource {
+    pending: VecDeque<IcebergChangeSplit>,
+    closed: bool,
+    /// Set when a runtime predicate proved the scan reads nothing.
+    exhausted: bool,
+}
+
+impl IcebergChangeWindowSplitSource {
+    /// Only an admitted plan can build one.
+    ///
+    /// Disjointness is a property of the whole split set rather than of any one
+    /// split, so a loose `Vec` must not be a constructor argument: it would let
+    /// an unproven set be enumerated as if it had been checked.
+    pub fn new(plan: IcebergChangeWindowPlan) -> Self {
+        Self {
+            pending: VecDeque::from(plan.into_splits()),
+            closed: false,
+            exhausted: false,
+        }
+    }
+}
+
+impl ConnectorSplitSource for IcebergChangeWindowSplitSource {
+    type Split = IcebergChangeSplit;
+    type Column = IcebergColumnHandle;
+
+    fn next_batch(
+        &mut self,
+        max_size: usize,
+        dynamic_filter: &DynamicFilterSnapshot<Self::Column>,
+    ) -> Result<ConnectorSplitBatch<Self::Split>, ConnectorError> {
+        if max_size == 0 {
+            return Err(invalid("connector split batch size must be positive"));
+        }
+        if self.closed || self.exhausted {
+            return Ok(ConnectorSplitBatch::finished());
+        }
+        // A change window is a proven set difference, so a runtime predicate
+        // must not narrow it split by split: dropping one would lose rows the
+        // difference owns. An unsatisfiable predicate is the single exception,
+        // because it proves the scan reads nothing at all.
+        if dynamic_filter.current_predicate().is_none() {
+            self.exhausted = true;
+            self.pending.clear();
+            return Ok(ConnectorSplitBatch::finished());
+        }
+
+        let max_size = max_size.min(MAX_SPLITS_PER_ASSIGNMENT);
+        let mut produced = Vec::with_capacity(max_size.min(self.pending.len()));
+        while produced.len() < max_size {
+            let Some(split) = self.pending.pop_front() else {
+                break;
+            };
+            produced.push(split);
+        }
+        Ok(ConnectorSplitBatch::new(produced, self.pending.is_empty()))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.closed || self.exhausted || self.pending.is_empty()
+    }
+
+    /// Idempotent, exactly like the data enumerator: a batch already returned
+    /// by value cannot be retracted.
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        self.closed = true;
+        self.pending.clear();
+        Ok(())
+    }
+}
+
 /// A deterministic pre-order index of every field ID in a schema.
 ///
 /// Equality-delete field IDs are canonicalized into this order, which is the
@@ -661,11 +1142,12 @@ fn index_type_fields(value: &Type, order: &mut BTreeMap<i32, usize>, next: &mut 
 mod tests {
     use novarocks_spi::connector::ConnectorErrorKind;
     use novarocks_spi::connector::read_stack::{
-        ConnectorValue, ConnectorValueType, Domain, ValueSet,
+        ConnectorValue, ConnectorValueType, Domain, SchemaTableName, ValueSet,
     };
 
     use crate::iceberg::spec::{Literal as IcebergLiteral, PartitionSpec, Struct};
     use crate::read_model::iceberg_partition_key;
+    use crate::typed_read::change_window::{IcebergChangeSide, IcebergChangeWindowHandleParams};
     use crate::typed_read::table_handle::tests::{
         identity_partition_spec, partitioned_schema, table_handle_params,
     };
@@ -1374,5 +1856,347 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::CorruptData
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Change-window enumeration
+    // -----------------------------------------------------------------------
+
+    fn change_window_handle() -> IcebergChangeWindowHandle {
+        let schema = partitioned_schema();
+        IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
+            schema_table_name: SchemaTableName::try_new("db", "t").expect("schema table name"),
+            table_schema_json: serde_json::to_string(&schema).expect("schema json"),
+            columns: vec![region_column(), amount_column()],
+            name_mapping_json: None,
+            from_snapshot_id_exclusive: 10,
+            to_snapshot_id_inclusive: 20,
+            partition_spec_jsons: BTreeMap::new(),
+        })
+        .expect("change window handle")
+    }
+
+    fn change_partition_types() -> BTreeMap<i32, Type> {
+        let schema = partitioned_schema();
+        let spec = identity_partition_spec(&schema);
+        BTreeMap::from([(
+            spec.spec_id(),
+            Type::Struct(spec.partition_type(&schema).expect("partition type")),
+        )])
+    }
+
+    fn position_delete_of(
+        path: &str,
+        data_path: &str,
+        sequence_number: i64,
+    ) -> IcebergReadDeleteFile {
+        IcebergReadDeleteFile {
+            path: path.to_string(),
+            file_format: IcebergReadDeleteFormat::Parquet,
+            kind: IcebergReadDeleteKind::Position,
+            length: Some(64),
+            content_offset: None,
+            content_size_in_bytes: None,
+            sequence_number: Some(sequence_number),
+            partition_spec_id: Some(7),
+            partition_key: None,
+            referenced_data_file: Some(data_path.to_string()),
+        }
+    }
+
+    fn equality_delete_of(path: &str, sequence_number: i64) -> IcebergReadDeleteFile {
+        IcebergReadDeleteFile {
+            path: path.to_string(),
+            file_format: IcebergReadDeleteFormat::Parquet,
+            kind: IcebergReadDeleteKind::Equality {
+                equality_field_ids: vec![1],
+            },
+            length: Some(64),
+            content_offset: None,
+            content_size_in_bytes: None,
+            sequence_number: Some(sequence_number),
+            partition_spec_id: Some(7),
+            partition_key: None,
+            referenced_data_file: None,
+        }
+    }
+
+    /// One endpoint's view of a file, with manifest facts for every delete it
+    /// carries so enumeration never fails for a missing fact.
+    fn endpoint_file(path: &str, deletes: Vec<IcebergReadDeleteFile>) -> IcebergPlannedDataFile {
+        let mut read = read_file(path, 100, 10);
+        read.deletes = deletes;
+        let mut file = planned(read);
+        for delete in file.read_file.deletes.clone() {
+            file.delete_facts.insert(
+                delete.path.clone(),
+                IcebergDeleteFileFacts {
+                    record_count: 2,
+                    row_position_lower_bound: Some(0),
+                    row_position_upper_bound: Some(5),
+                    decryption_data: None,
+                },
+            );
+        }
+        file
+    }
+
+    fn window_plan(
+        from_visible: Vec<IcebergPlannedDataFile>,
+        to_visible: Vec<IcebergPlannedDataFile>,
+    ) -> Result<IcebergChangeWindowPlan, ConnectorError> {
+        plan_change_window_splits(
+            &change_window_handle(),
+            IcebergChangeWindowEndpoints {
+                from_visible: &from_visible,
+                to_visible: &to_visible,
+            },
+            &change_partition_types(),
+            IcebergSplitSourceOptions::default(),
+        )
+    }
+
+    fn emitted(plan: &IcebergChangeWindowPlan) -> BTreeSet<(String, i8)> {
+        plan.splits()
+            .iter()
+            .map(|split| (split.data().path().to_string(), split.change_op()))
+            .collect()
+    }
+
+    #[test]
+    fn a_row_written_and_deleted_inside_the_window_is_not_emitted_by_the_forward_side() {
+        // `added.parquet` was written after `from` and one of its rows was
+        // deleted again before `to`. That row is invisible at *both* endpoints,
+        // so the difference does not own it. The forward split proves this by
+        // carrying the upper endpoint's own delete closure: the reader emits
+        // the rows the file still has at `to`, never the rows it was written
+        // with. Replaying the snapshots in between would emit the row as an
+        // insert and, on a good day, its delete too.
+        let plan = window_plan(
+            Vec::new(),
+            vec![endpoint_file(
+                "added.parquet",
+                vec![position_delete_of("d0.parquet", "added.parquet", 11)],
+            )],
+        )
+        .expect("plan");
+
+        assert_eq!(plan.splits().len(), 1);
+        let split = &plan.splits()[0];
+        assert_eq!(split.side(), IcebergChangeSide::Forward);
+        assert_eq!(split.data().deletes().len(), 1);
+        assert_eq!(split.data().deletes()[0].path(), "d0.parquet");
+        // The file did not exist at `from`, so nothing on the reverse side
+        // claims those same rows a second time.
+        assert!(
+            plan.splits()
+                .iter()
+                .all(|split| split.side() == IcebergChangeSide::Forward)
+        );
+    }
+
+    #[test]
+    fn only_a_files_endpoint_membership_puts_it_into_the_difference() {
+        // Three of the four cases are representable as endpoint input: a file
+        // in both endpoints, one only at `to`, and one only at `from`. The
+        // fourth -- written and dropped again inside the window -- is visible
+        // at neither endpoint, so it cannot even be named here: it appears in
+        // neither index and no branch can reach it. A manifest replay would
+        // find its add and its delete and emit both.
+        let plan = window_plan(
+            vec![
+                endpoint_file("kept.parquet", Vec::new()),
+                endpoint_file("removed.parquet", Vec::new()),
+            ],
+            vec![
+                endpoint_file("kept.parquet", Vec::new()),
+                endpoint_file("added.parquet", Vec::new()),
+            ],
+        )
+        .expect("plan");
+
+        assert_eq!(
+            emitted(&plan),
+            BTreeSet::from([
+                ("added.parquet".to_string(), 1),
+                ("removed.parquet".to_string(), -1),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_change_op_of_an_enumerated_split_follows_its_variant() {
+        let plan = window_plan(
+            vec![
+                endpoint_file("kept.parquet", Vec::new()),
+                endpoint_file("removed.parquet", Vec::new()),
+            ],
+            vec![
+                endpoint_file(
+                    "kept.parquet",
+                    vec![position_delete_of("d1.parquet", "kept.parquet", 12)],
+                ),
+                endpoint_file("added.parquet", Vec::new()),
+            ],
+        )
+        .expect("plan");
+
+        let mut seen = BTreeMap::new();
+        for split in plan.splits() {
+            let variant = match split {
+                IcebergChangeSplit::AddedRows(_) => "added",
+                IcebergChangeSplit::PositionDeletedRows(_) => "position",
+                IcebergChangeSplit::EqualityDeletedRows(_) => "equality",
+                IcebergChangeSplit::DeletedDataFileRows(_) => "removed",
+            };
+            seen.insert(
+                split.data().path().to_string(),
+                (variant, split.change_op()),
+            );
+        }
+        assert_eq!(
+            seen,
+            BTreeMap::from([
+                ("added.parquet".to_string(), ("added", 1_i8)),
+                ("kept.parquet".to_string(), ("position", -1)),
+                ("removed.parquet".to_string(), ("removed", -1)),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_reverse_side_split_names_its_deletes_instead_of_carrying_an_exclusion_closure() {
+        let plan = window_plan(
+            vec![endpoint_file(
+                "removed.parquet",
+                vec![position_delete_of("d2.parquet", "removed.parquet", 11)],
+            )],
+            Vec::new(),
+        )
+        .expect("plan");
+
+        assert_eq!(plan.splits().len(), 1);
+        let IcebergChangeSplit::DeletedDataFileRows(rows) = &plan.splits()[0] else {
+            panic!("a file gone at the upper endpoint is a removed data file");
+        };
+        // The rows already invisible at `from` are subtracted, not emitted, and
+        // they travel as typed variant facts rather than as the data split's
+        // own exclusion closure.
+        assert!(rows.data().deletes().is_empty());
+        assert_eq!(rows.previously_applied_deletes().len(), 1);
+        assert_eq!(rows.previously_applied_deletes()[0].path(), "d2.parquet");
+    }
+
+    #[test]
+    fn an_equality_deleted_file_subtracts_the_position_deletes_of_the_same_window() {
+        let plan = window_plan(
+            vec![endpoint_file("kept.parquet", Vec::new())],
+            vec![endpoint_file(
+                "kept.parquet",
+                vec![
+                    position_delete_of("d3.parquet", "kept.parquet", 12),
+                    equality_delete_of("e3.parquet", 13),
+                ],
+            )],
+        )
+        .expect("plan");
+
+        assert_eq!(plan.splits().len(), 2);
+        let equality = plan
+            .splits()
+            .iter()
+            .find_map(|split| match split {
+                IcebergChangeSplit::EqualityDeletedRows(rows) => Some(rows),
+                IcebergChangeSplit::AddedRows(_)
+                | IcebergChangeSplit::PositionDeletedRows(_)
+                | IcebergChangeSplit::DeletedDataFileRows(_) => None,
+            })
+            .expect("an equality-deleted variant");
+        assert_eq!(equality.newly_applied_equality_deletes().len(), 1);
+        // The position variant already owns the rows `d3.parquet` removed, so
+        // the equality variant is handed it as already applied and emits only
+        // what is left.
+        assert_eq!(
+            equality
+                .previously_applied_deletes()
+                .iter()
+                .map(|delete| delete.path().to_string())
+                .collect::<Vec<_>>(),
+            vec!["d3.parquet".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_delete_that_stopped_applying_inside_the_window_fails_closed() {
+        // Rows of a surviving file becoming visible again is a forward-side row
+        // set of a file that was never added. None of the four typed variants
+        // can express it, so it is rejected rather than dropped.
+        let error = window_plan(
+            vec![endpoint_file(
+                "kept.parquet",
+                vec![position_delete_of("d4.parquet", "kept.parquet", 12)],
+            )],
+            vec![endpoint_file("kept.parquet", Vec::new())],
+        )
+        .expect_err("a delete stopped applying");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn one_data_file_listed_twice_at_an_endpoint_is_corrupt_data() {
+        let error = window_plan(
+            Vec::new(),
+            vec![
+                endpoint_file("added.parquet", Vec::new()),
+                endpoint_file("added.parquet", Vec::new()),
+            ],
+        )
+        .expect_err("duplicate endpoint entry");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn change_window_batches_are_bounded_and_close_is_idempotent() {
+        let plan = window_plan(
+            vec![endpoint_file("removed.parquet", Vec::new())],
+            vec![
+                endpoint_file("added.parquet", Vec::new()),
+                endpoint_file("second.parquet", Vec::new()),
+            ],
+        )
+        .expect("plan");
+        assert_eq!(plan.splits().len(), 3);
+
+        let filter = DynamicFilterSnapshot::all_complete();
+        let mut source = IcebergChangeWindowSplitSource::new(plan);
+        let first = source.next_batch(2, &filter).expect("first batch");
+        assert_eq!(first.into_splits().len(), 2);
+        let second = source.next_batch(2, &filter).expect("second batch");
+        assert!(second.no_more_splits());
+        assert_eq!(second.into_splits().len(), 1);
+        assert!(source.is_finished());
+
+        assert!(source.close().is_ok());
+        assert!(source.close().is_ok());
+        assert!(
+            source
+                .next_batch(2, &filter)
+                .expect("closed batch")
+                .into_splits()
+                .is_empty()
+        );
+        assert!(source.next_batch(0, &filter).is_err());
+    }
+
+    #[test]
+    fn an_unsatisfiable_predicate_ends_change_window_enumeration_without_narrowing_it() {
+        let plan = window_plan(Vec::new(), vec![endpoint_file("added.parquet", Vec::new())])
+            .expect("plan");
+        let mut source = IcebergChangeWindowSplitSource::new(plan);
+        let unsatisfiable = DynamicFilterSnapshot::new(TupleDomain::none(), true);
+        let batch = source.next_batch(4, &unsatisfiable).expect("batch");
+        assert!(batch.no_more_splits());
+        assert!(batch.into_splits().is_empty());
+        assert!(source.is_finished());
     }
 }
