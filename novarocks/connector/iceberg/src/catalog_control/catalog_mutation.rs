@@ -2202,7 +2202,7 @@ fn execute_guarded_publication(
             crate::commit::publish_staging_branch_to_main(catalog.as_ref(), &plan).await
         });
     match result {
-        Ok(Ok(_)) => {
+        Ok(Ok(outcome)) => {
             provider
                 .runtime()
                 .control_state()
@@ -2213,11 +2213,12 @@ fn execute_guarded_publication(
                 .map_err(unavailable)?;
             Ok(ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::Applied,
-                receipt: receipt_with_version(
+                receipt: guarded_publication_receipt(
                     provider,
                     request.operation_id,
                     request.operation.kind(),
                     current.table.metadata_location(),
+                    outcome.published_snapshot_id,
                 )?,
                 finalization: ExternalMutationFinalization::Complete,
             })
@@ -2937,6 +2938,27 @@ fn receipt_with_version(
     )
 }
 
+fn guarded_publication_receipt(
+    provider: &IcebergControlProvider,
+    operation_id: ConnectorMutationOperationId,
+    operation_kind: &str,
+    metadata_location: Option<&str>,
+    published_snapshot_id: i64,
+) -> Result<ConnectorCatalogMutationReceipt, ConnectorError> {
+    let committed_version = ConnectorCommittedVersion::try_new(
+        Bytes::from(format!("iceberg/mv-publication/v1/{published_snapshot_id}")),
+        Some(published_snapshot_id),
+    )?;
+    ConnectorCatalogMutationReceipt::try_new_with_committed_version(
+        provider.descriptor().clone(),
+        provider.incarnation(),
+        operation_id,
+        operation_kind,
+        metadata_location.map(|location| Bytes::copy_from_slice(location.as_bytes())),
+        Some(committed_version),
+    )
+}
+
 #[derive(serde::Serialize)]
 struct HadoopCreateProviderVersion<'a> {
     metadata_location: &'a str,
@@ -3620,6 +3642,33 @@ mod tests {
             ExternalMutationOutcome::KnownUncommitted { failure }
                 if failure.kind() == ConnectorMutationFailureKind::Conflict
         ));
+    }
+
+    #[test]
+    fn guarded_publication_receipt_carries_the_actual_published_snapshot() {
+        let (_executor, _warehouse, provider) = provider();
+
+        let receipt = guarded_publication_receipt(
+            &provider,
+            ConnectorMutationOperationId::new(),
+            "alter-ref",
+            Some("file:///warehouse/guarded/orders/metadata/v1.metadata.json"),
+            42,
+        )
+        .expect("receipt");
+
+        assert_eq!(
+            receipt.provider_version(),
+            Some(&Bytes::from_static(
+                b"file:///warehouse/guarded/orders/metadata/v1.metadata.json"
+            ))
+        );
+        assert_eq!(
+            receipt
+                .committed_version()
+                .and_then(ConnectorCommittedVersion::snapshot_id),
+            Some(42)
+        );
     }
 
     #[test]
