@@ -15,13 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::net::SocketAddr;
+use std::{fmt, net::SocketAddr, str::FromStr};
 
 use novarocks_types::{NativeEndpoint, UniqueId};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RuntimeEndpoint {
     endpoint: NativeEndpoint,
+}
+
+impl fmt::Display for RuntimeEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.endpoint.fmt(formatter)
+    }
+}
+
+impl FromStr for RuntimeEndpoint {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
 }
 
 impl RuntimeEndpoint {
