@@ -424,12 +424,6 @@ impl ClusterBackendRepository {
     }
 }
 
-#[derive(Clone)]
-enum MembershipStorage {
-    Durable(ClusterBackendRepository),
-    Transient,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeBackendState {
     Registering,
@@ -525,7 +519,7 @@ struct HeartbeatSignal {
 /// StateStore; liveness and fragment activity remain process-local observations.
 pub(crate) struct ClusterBackendService {
     state: Mutex<TopologyState>,
-    storage: MembershipStorage,
+    storage: ClusterBackendRepository,
     runtime: Handle,
     heartbeat_interval: Duration,
     mutation: Mutex<()>,
@@ -551,11 +545,9 @@ impl ClusterBackendService {
         data_runtime: FrontendDataRuntime,
     ) -> Result<Arc<Self>, String> {
         let storage = match config.role() {
-            ClusterRole::Fe => MembershipStorage::Durable(ClusterBackendRepository::new(
-                state_store.ok_or_else(|| {
-                    "role=fe requires StateStore for durable cluster backend membership".to_string()
-                })?,
-            )),
+            ClusterRole::Fe => ClusterBackendRepository::new(state_store.ok_or_else(|| {
+                "role=fe requires StateStore for durable cluster backend membership".to_string()
+            })?),
             ClusterRole::Be => {
                 return Err("role=be must not open ClusterBackendService".to_string());
             }
@@ -566,36 +558,32 @@ impl ClusterBackendService {
             &config,
             move |be_id, endpoint| native_heartbeat(&data_runtime, be_id, endpoint),
         ));
-        if let MembershipStorage::Durable(repository) = &service.storage {
-            let stored = match repository.load().await? {
-                Some(_) => {
-                    repository
-                        .mutate(RepositoryMutation::ReconcileSeeds(
-                            config.seed_endpoints.clone(),
-                        ))
-                        .await?
-                }
-                None if config.seed_endpoints.is_empty() => StoredClusterBackendsV1::default(),
-                None => {
-                    repository
-                        .mutate(RepositoryMutation::ReconcileSeeds(
-                            config.seed_endpoints.clone(),
-                        ))
-                        .await?
-                }
-            };
-            service.restore_durable_state(stored)?;
-        } else {
-            for endpoint in config.seed_endpoints() {
-                service.add_transient(*endpoint)?;
+        let stored = match service.storage.load().await? {
+            Some(_) => {
+                service
+                    .storage
+                    .mutate(RepositoryMutation::ReconcileSeeds(
+                        config.seed_endpoints.clone(),
+                    ))
+                    .await?
             }
-        }
+            None if config.seed_endpoints.is_empty() => StoredClusterBackendsV1::default(),
+            None => {
+                service
+                    .storage
+                    .mutate(RepositoryMutation::ReconcileSeeds(
+                        config.seed_endpoints.clone(),
+                    ))
+                    .await?
+            }
+        };
+        service.restore_durable_state(stored)?;
         service.publish_snapshot();
         Ok(service)
     }
 
     fn new<F>(
-        storage: MembershipStorage,
+        storage: ClusterBackendRepository,
         runtime: Handle,
         config: &ClusterBackendOpenConfig,
         heartbeat_probe: F,
@@ -630,7 +618,7 @@ impl ClusterBackendService {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_transient_for_test(timeout_retries: u32) -> Self {
+    pub(crate) fn new_for_test(timeout_retries: u32) -> Self {
         let config = ClusterBackendOpenConfig::new(
             ClusterRole::Fe,
             Vec::new(),
@@ -648,7 +636,9 @@ impl ClusterBackendService {
         let handle = runtime.handle().clone();
         let data_runtime = FrontendDataRuntime::new(handle.clone());
         let mut service = Self::new(
-            MembershipStorage::Transient,
+            ClusterBackendRepository::new(Arc::new(
+                novarocks_spi::state_store::testing::InMemoryStateStore::new("topology-test"),
+            )),
             handle,
             &config,
             move |be_id, endpoint| native_heartbeat(&data_runtime, be_id, endpoint),
@@ -659,7 +649,7 @@ impl ClusterBackendService {
 
     #[cfg(test)]
     pub(crate) fn from_captured_targets_for_test(targets: &[LiveBackendTarget]) -> Self {
-        let service = Self::new_transient_for_test(1);
+        let service = Self::new_for_test(1);
         let mut state = service.state.lock().expect("frontend topology lock");
         state.entries = targets
             .iter()
@@ -992,28 +982,6 @@ impl ClusterBackendService {
         transitioned
     }
 
-    fn add_transient(&self, endpoint: SocketAddr) -> Result<(), String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "lock frontend topology failed".to_string())?;
-        if state
-            .entries
-            .values()
-            .any(|entry| entry.endpoint == endpoint)
-        {
-            return Ok(());
-        }
-        let backend_idx = next_runtime_backend_id(&state)?;
-        advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
-        state
-            .entries
-            .insert(backend_idx, registering_entry(endpoint));
-        drop(state);
-        self.publish_snapshot();
-        Ok(())
-    }
-
     fn block_on<T>(&self, future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
         match Handle::try_current() {
             Ok(_) if self.runtime.runtime_flavor() == RuntimeFlavor::CurrentThread => Err(
@@ -1025,21 +993,13 @@ impl ClusterBackendService {
         }
     }
 
-    fn persist(
-        &self,
-        mutation: RepositoryMutation,
-    ) -> Result<Option<StoredClusterBackendsV1>, String> {
-        match &self.storage {
-            MembershipStorage::Durable(repository) => {
-                self.block_on(repository.mutate(mutation)).map(Some)
-            }
-            MembershipStorage::Transient => Ok(None),
-        }
+    fn persist(&self, mutation: RepositoryMutation) -> Result<StoredClusterBackendsV1, String> {
+        self.block_on(self.storage.mutate(mutation))
     }
 
     fn apply_added(
         &self,
-        stored: Option<StoredClusterBackendsV1>,
+        stored: StoredClusterBackendsV1,
         endpoint: SocketAddr,
     ) -> Result<(), String> {
         let mut state = self
@@ -1053,21 +1013,18 @@ impl ClusterBackendService {
         {
             return Ok(());
         }
-        let backend_idx = match stored {
-            Some(stored) => stored
-                .entries
-                .iter()
-                .find(|entry| entry.endpoint == endpoint.to_string())
-                .map(|entry| {
-                    usize::try_from(entry.backend_id)
-                        .map_err(|_| "backend id cannot be represented locally".to_string())
-                })
-                .transpose()?
-                .ok_or_else(|| {
-                    format!("durable membership did not contain added backend {endpoint}")
-                })?,
-            None => next_runtime_backend_id(&state)?,
-        };
+        let backend_idx = stored
+            .entries
+            .iter()
+            .find(|entry| entry.endpoint == endpoint.to_string())
+            .map(|entry| {
+                usize::try_from(entry.backend_id)
+                    .map_err(|_| "backend id cannot be represented locally".to_string())
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                format!("durable membership did not contain added backend {endpoint}")
+            })?;
         advance_topology_revision(&mut state).map_err(|error| error.to_string())?;
         state
             .entries
@@ -1515,20 +1472,6 @@ fn registering_entry(endpoint: SocketAddr) -> FrontendBackendEntry {
     }
 }
 
-fn next_runtime_backend_id(state: &TopologyState) -> Result<usize, String> {
-    state
-        .entries
-        .keys()
-        .next_back()
-        .copied()
-        .map(|id| {
-            id.checked_add(1)
-                .ok_or_else(|| "frontend backend id overflow".to_string())
-        })
-        .transpose()
-        .map(|id| id.unwrap_or(0))
-}
-
 fn advance_topology_revision(state: &mut TopologyState) -> Result<(), BackendTopologyError> {
     if let Some(message) = &state.terminal_error {
         return Err(BackendTopologyError::Unavailable {
@@ -1686,7 +1629,7 @@ mod tests {
 
     #[test]
     fn snapshot_and_management_are_frontend_owned() {
-        let service = ClusterBackendService::new_transient_for_test(1);
+        let service = ClusterBackendService::new_for_test(1);
         let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
         service.add_backend(endpoint).unwrap();
         service.record_heartbeat_success(0, 17, native_build_identity(), 2, 100);
@@ -1700,7 +1643,7 @@ mod tests {
 
     #[test]
     fn show_backends_includes_the_runtime_start_epoch() {
-        let service = ClusterBackendService::new_transient_for_test(1);
+        let service = ClusterBackendService::new_for_test(1);
         let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
         service.add_backend(endpoint).unwrap();
         service.record_heartbeat_success(0, 17, native_build_identity(), 2, 100);
@@ -1727,7 +1670,7 @@ mod tests {
 
     #[test]
     fn mismatched_native_build_identity_is_not_schedulable_and_can_recover() {
-        let service = ClusterBackendService::new_transient_for_test(1);
+        let service = ClusterBackendService::new_for_test(1);
         let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
         service.add_backend(endpoint).unwrap();
 
@@ -1755,7 +1698,7 @@ mod tests {
 
     #[test]
     fn repeated_mismatch_does_not_advance_revision_or_repeat_unavailable() {
-        let service = ClusterBackendService::new_transient_for_test(1);
+        let service = ClusterBackendService::new_for_test(1);
         let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
         service.add_backend(endpoint).unwrap();
         service.record_heartbeat_success(0, 17, native_build_identity(), 2, 100);
@@ -1792,7 +1735,7 @@ mod tests {
 
     #[test]
     fn incompatible_heartbeat_timeout_becomes_lost_but_keeps_admission_history() {
-        let service = ClusterBackendService::new_transient_for_test(1);
+        let service = ClusterBackendService::new_for_test(1);
         let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
         service.add_backend(endpoint).unwrap();
         service.record_heartbeat_success(0, 17, "incompatible-build", 2, 100);
@@ -1807,7 +1750,7 @@ mod tests {
 
     #[test]
     fn live_backend_restart_with_mismatch_is_unavailable_not_restarted() {
-        let service = ClusterBackendService::new_transient_for_test(1);
+        let service = ClusterBackendService::new_for_test(1);
         let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
         service.add_backend(endpoint).unwrap();
         service.record_heartbeat_success(0, 17, native_build_identity(), 2, 100);
@@ -1824,7 +1767,7 @@ mod tests {
 
     #[test]
     fn decommissioning_backend_ignores_identity_admission() {
-        let service = ClusterBackendService::new_transient_for_test(1);
+        let service = ClusterBackendService::new_for_test(1);
         let endpoint: SocketAddr = "127.0.0.1:9070".parse().unwrap();
         service.add_backend(endpoint).unwrap();
         service.mark_decommissioning_runtime(0, endpoint).unwrap();
