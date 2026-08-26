@@ -69,6 +69,7 @@ pub(crate) fn decode_fragment_submission(
     execution_resolver: Arc<dyn ConnectorExecutionResolver>,
     connector_cancellation: Arc<dyn ConnectorCancellation>,
     exchange_wait: Duration,
+    typed_scan_runtime: Option<super::context::TypedScanRuntime>,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
     let root_path = FieldPath::root("plan_fragment").field("root");
     let root = require_root(fragment).map_err(NativeFragmentDecodeError::from)?;
@@ -105,7 +106,8 @@ pub(crate) fn decode_fragment_submission(
         instance.query_id,
         instance.fragment_instance_id,
         exchange_wait,
-    );
+    )
+    .with_typed_scan_runtime(typed_scan_runtime);
     let mut ledger = NativeRuntimeFilterDecodeLedger::decode(
         fragment.fragment_id,
         fragment.runtime_filter_bindings.as_ref(),
@@ -296,6 +298,7 @@ mod tests {
             Arc::new(NeverResolved),
             Arc::new(NeverCancelled),
             Duration::from_secs(1),
+            None,
         )
     }
 

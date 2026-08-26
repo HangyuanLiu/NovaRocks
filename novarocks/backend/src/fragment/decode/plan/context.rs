@@ -43,6 +43,43 @@ use crate::fragment::decode::plan::error::{
 };
 use crate::fragment::decode::plan::layout::Layout;
 
+/// Everything a typed connector scan needs that only the fragment runtime can
+/// supply: the installed provider generation, this task attempt's split queues,
+/// and the role-local session. Bundled so the decode-context constructor does
+/// not keep growing one parameter at a time.
+#[derive(Clone)]
+pub(crate) struct TypedScanRuntime {
+    providers: Arc<crate::connector::TypedConnectorProviderRegistry>,
+    queues: Arc<novarocks_execution::connector::TaskAttemptSplitQueues>,
+    session: novarocks_spi::connector::read_stack::ConnectorSession,
+}
+
+impl TypedScanRuntime {
+    pub(crate) fn new(
+        providers: Arc<crate::connector::TypedConnectorProviderRegistry>,
+        queues: Arc<novarocks_execution::connector::TaskAttemptSplitQueues>,
+        session: novarocks_spi::connector::read_stack::ConnectorSession,
+    ) -> Self {
+        Self {
+            providers,
+            queues,
+            session,
+        }
+    }
+
+    pub(crate) fn providers(&self) -> Arc<crate::connector::TypedConnectorProviderRegistry> {
+        Arc::clone(&self.providers)
+    }
+
+    pub(crate) fn queues(&self) -> Arc<novarocks_execution::connector::TaskAttemptSplitQueues> {
+        Arc::clone(&self.queues)
+    }
+
+    pub(crate) fn session(&self) -> novarocks_spi::connector::read_stack::ConnectorSession {
+        self.session.clone()
+    }
+}
+
 /// All non-wire dependencies required while lowering one native fragment.
 ///
 /// The query-scoped cancellation handle is deliberately opaque. This type
@@ -64,6 +101,9 @@ pub(crate) struct NativePlanDecodeContext {
     fragment_instance_id: FragmentInstanceId,
     /// Exchange-source wait resolved from `[runtime]` at Backend startup.
     exchange_wait: Duration,
+    /// Absent for a fragment with no typed connector scan; a typed scan that
+    /// finds it absent fails closed rather than inventing a registry.
+    typed_scan_runtime: Option<TypedScanRuntime>,
 }
 
 impl Default for NativePlanDecodeContext {
@@ -79,6 +119,7 @@ impl Default for NativePlanDecodeContext {
             query_id: None,
             fragment_instance_id: FragmentInstanceId::new(novarocks_types::UniqueId::new(0, 0)),
             exchange_wait: Duration::from_millis(120_000),
+            typed_scan_runtime: None,
         }
     }
 }
@@ -111,7 +152,17 @@ impl NativePlanDecodeContext {
             query_id: Some(query_id),
             fragment_instance_id,
             exchange_wait,
+            typed_scan_runtime: None,
         }
+    }
+
+    pub(crate) fn with_typed_scan_runtime(mut self, runtime: Option<TypedScanRuntime>) -> Self {
+        self.typed_scan_runtime = runtime;
+        self
+    }
+
+    pub(crate) fn typed_scan_runtime(&self) -> Option<&TypedScanRuntime> {
+        self.typed_scan_runtime.as_ref()
     }
 
     pub(crate) fn decode_output_layout(

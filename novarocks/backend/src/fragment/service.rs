@@ -129,6 +129,9 @@ pub struct NativeFragmentService {
     /// and fragment instance, so a replaced attempt gets a fresh queue set and
     /// can never inherit a sequence space.
     split_queues: Arc<novarocks_execution::connector::SplitQueueRegistry>,
+    /// Typed connector providers installed for this backend, keyed by the exact
+    /// binding generation. The server composition root owns installation.
+    typed_providers: Arc<crate::connector::TypedConnectorProviderRegistry>,
     lifecycle_observer: Option<LifecycleObserver>,
     #[cfg(test)]
     after_lifecycle_admission: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -194,6 +197,7 @@ impl NativeFragmentService {
             commit_port: Arc::new(BackendSinkCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
             split_queues: Arc::new(novarocks_execution::connector::SplitQueueRegistry::new()),
+            typed_providers: Arc::new(crate::connector::TypedConnectorProviderRegistry::new()),
             lifecycle_observer: None,
             #[cfg(test)]
             after_lifecycle_admission: None,
@@ -273,6 +277,46 @@ impl NativeFragmentService {
     /// Materializes a complete fragment bundle without starting its drivers.
     /// Every spawned worker waits on the query-owned gate; gate abort is a
     /// pure cleanup path and never calls `DormantFragmentHandle::start`.
+    /// Assemble the runtime inputs a typed connector scan needs.
+    ///
+    /// The queue set is opened here rather than on first delivery so a task
+    /// scan can start, and block, before any split has arrived.
+    fn typed_scan_runtime(
+        &self,
+        execution_id: QueryExecutionId,
+        instance_params: &novarocks_proto_models::novarocks::InstanceParams,
+    ) -> crate::fragment::decode::plan::context::TypedScanRuntime {
+        let fragment_instance_id = instance_params
+            .fragment_instance_id
+            .as_ref()
+            .map(|id| novarocks_types::UniqueId::new(id.hi, id.lo))
+            .unwrap_or_else(|| novarocks_types::UniqueId::new(0, 0));
+        let queues = self.split_queues.open_attempt(
+            novarocks_execution::connector::TaskAttemptKey::new(execution_id, fragment_instance_id),
+            novarocks_execution::connector::SplitQueueConfig::default(),
+        );
+        // The session is role-local and carries no credential: object-store
+        // access stays with the binding owner.
+        let session = novarocks_spi::connector::read_stack::ConnectorSession::try_new(
+            format!(
+                "{}:{}:{}",
+                execution_id.query_id().high(),
+                execution_id.query_id().low(),
+                execution_id.attempt_id().get()
+            ),
+            "novarocks",
+            "UTC",
+            "en_US",
+            std::time::SystemTime::now(),
+        )
+        .expect("a query execution id is never an empty session query id");
+        crate::fragment::decode::plan::context::TypedScanRuntime::new(
+            Arc::clone(&self.typed_providers),
+            queues,
+            session,
+        )
+    }
+
     /// Release the split queues of one finished or cancelled task.
     ///
     /// Closing wakes every parked scan exactly once so a terminated task never
@@ -416,6 +460,7 @@ impl NativeFragmentService {
                 self.queries
                     .connector_cancellation_for_execution(execution_id),
                 std::time::Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
+                Some(self.typed_scan_runtime(execution_id, fragment.instance_params())),
             )?;
             self.stage_one(request, Arc::clone(&gate))?;
         }
