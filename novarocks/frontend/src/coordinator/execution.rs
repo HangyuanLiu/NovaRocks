@@ -1172,7 +1172,6 @@ impl FrontendDistributedQueryCoordinator {
             query_lifecycle_lease,
             connector_binding_lease: _connector_binding_lease,
             connector_write_plans,
-            connector_read_sessions,
         } = execution.into_parts();
         let mut query_lifecycle_lease = Some(query_lifecycle_lease);
         if let Some(message) = self.registry.first_failure(query_id)
@@ -1373,11 +1372,6 @@ impl FrontendDistributedQueryCoordinator {
                 format!("runtime split assignment failed: {error}"),
             );
             return Err(message);
-        }
-        if !connector_read_sessions.is_empty()
-            && let Err(error) = connector_read_sessions.finish_completed()
-        {
-            tracing::warn!(error = %error, "connector read-session completed cleanup failed");
         }
         outcome
     }
@@ -2509,7 +2503,6 @@ fn prepare_round_split_assignment(
             })?;
         sources.push(RoundSplitSource {
             plan_node_id,
-            catalog: table_scan.table().catalog().clone(),
             source,
         });
     }

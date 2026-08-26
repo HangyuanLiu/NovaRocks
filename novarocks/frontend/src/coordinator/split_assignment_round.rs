@@ -236,9 +236,7 @@ mod tests {
         assert!(
             SplitAssignmentRoundGuard::start(
                 execution_id(),
-                Arc::new(NeverCalled),
-                BTreeMap::new(),
-                Vec::new(),
+                RoundSplitAssignmentPlan::new(Arc::new(NeverCalled), BTreeMap::new(), Vec::new(),),
             )
             .is_none()
         );

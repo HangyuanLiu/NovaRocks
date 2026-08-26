@@ -73,7 +73,6 @@ pub use schedule::FragmentInstancePlacement;
 pub mod post_compile;
 pub mod prepared_write;
 pub(crate) mod profile;
-pub mod read_session;
 pub(crate) mod row_mutation;
 pub(crate) mod runtime_filter_terminal_rollup;
 pub(crate) mod schedule;

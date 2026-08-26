@@ -80,18 +80,19 @@ impl TableHandle {
 
 /// One unit of schedulable read work, bound to the catalog that produced it.
 #[derive(Clone, Debug)]
+/// One split as the coordinator sees it, for placement only.
+///
+/// It carries no catalog: which connector generation a split belongs to is
+/// decided by the scan node it was enumerated for, and the backend resolves the
+/// provider from that node's own frozen table handle. Repeating it here would
+/// create a second authority that could disagree with the first.
 pub(crate) struct Split {
-    catalog: CatalogHandle,
     split: ValidatedConnectorSplit,
 }
 
 impl Split {
-    pub(crate) fn new(catalog: CatalogHandle, split: ValidatedConnectorSplit) -> Self {
-        Self { catalog, split }
-    }
-
-    pub(crate) const fn catalog(&self) -> &CatalogHandle {
-        &self.catalog
+    pub(crate) fn new(split: ValidatedConnectorSplit) -> Self {
+        Self { split }
     }
 
     pub(crate) const fn split(&self) -> &ValidatedConnectorSplit {

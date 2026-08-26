@@ -280,7 +280,7 @@ mod tests {
         };
         let validated = ValidatedConnectorSplit::parse(raw, FieldPath::root("connector_split"))
             .expect("valid split");
-        Split::new(CatalogHandle::new("ice", [1; 16]), validated)
+        Split::new(validated)
     }
 
     fn iceberg_split() -> dto::IcebergSplit {
