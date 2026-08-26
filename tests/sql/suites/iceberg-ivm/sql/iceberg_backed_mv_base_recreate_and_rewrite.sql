@@ -149,8 +149,11 @@ DROP MATERIALIZED VIEW test_mv1;
 DROP TABLE mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.mv_ice_tbl_${uuid0} FORCE;
 
 -- query 15
+-- The MV and the base table are already dropped above, so this needs no FORCE.
+-- FORCE would enumerate the namespace's views, which a Hadoop catalog cannot
+-- answer -- it reports Unsupported rather than fabricating an empty list.
 -- @skip_result_check=true
-DROP DATABASE mv_iceberg_${uuid0}.mv_ice_db_${uuid0} FORCE;
+DROP DATABASE mv_iceberg_${uuid0}.mv_ice_db_${uuid0};
 
 -- query 16
 -- @skip_result_check=true

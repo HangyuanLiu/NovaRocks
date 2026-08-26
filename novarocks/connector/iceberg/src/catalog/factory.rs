@@ -176,6 +176,48 @@ mod tests {
         assert_eq!(loaded.kind(), ConnectorErrorKind::Unsupported);
     }
 
+    /// Absence must be readable from the error's kind alone.
+    ///
+    /// The owner classifies reads purely by `iceberg::ErrorKind`; the
+    /// message-sniffing fallback that used to recognize a missing table from
+    /// wording like "does not exist" is gone. That only works if every backend
+    /// tags absence honestly, and two of them did not: the vendored REST client
+    /// reported a 404 as the generic `Unexpected`, and the vendored HMS client
+    /// funnelled `NoSuchObjectException` into it. Both are patched. This pins
+    /// the contract for the backend that can be exercised in-process, so a
+    /// regression shows up as a failing test rather than as `IF EXISTS`
+    /// reporting an unavailable control plane.
+    #[tokio::test]
+    async fn absence_is_reported_as_not_found_rather_than_unavailable() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let catalog = adopted(&hadoop_configuration(warehouse.path()))
+            .await
+            .expect("catalog");
+        assert!(matches!(
+            catalog
+                .create_namespace(CatalogNamespaceName::new("db"))
+                .await,
+            CatalogOutcome::KnownCommitted { .. }
+        ));
+
+        let missing = catalog
+            .load_table(CatalogTableName::new("db", "absent"))
+            .await
+            .expect_err("loading an absent table must fail");
+        assert_eq!(
+            missing.kind(),
+            ConnectorErrorKind::NotFound,
+            "an absent table must be NotFound, not an unavailable control plane"
+        );
+
+        assert!(
+            !catalog
+                .table_exists(CatalogTableName::new("db", "absent"))
+                .await
+                .expect("table_exists answers for a catalog that can tell"),
+        );
+    }
+
     /// Admission is a per-request question, not a per-catalog flag: the same
     /// catalog accepts one create intent and refuses the other.
     #[tokio::test]

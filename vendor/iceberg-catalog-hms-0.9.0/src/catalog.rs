@@ -306,10 +306,25 @@ impl Catalog for HmsCatalog {
         let db = self
             .client
             .0
-            .get_database(name.into())
-            .await
-            .map(from_thrift_exception)
-            .map_err(from_thrift_error)??;
+            .get_database(name.clone().into())
+            .await;
+        let db = match db {
+            Ok(MaybeException::Ok(value)) => value,
+            Ok(MaybeException::Exception(ThriftHiveMetastoreGetDatabaseException::O1(_))) => {
+                return Err(Error::new(
+                    ErrorKind::NamespaceNotFound,
+                    format!("no such namespace: {name}"),
+                ));
+            }
+            Ok(MaybeException::Exception(exception)) => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Operation failed for hitting thrift error".to_string(),
+                )
+                .with_source(anyhow!("thrift error: {exception:?}")));
+            }
+            Err(err) => return Err(from_thrift_error(err)),
+        };
 
         let ns = convert_to_namespace(&db)?;
 
@@ -506,13 +521,33 @@ impl Catalog for HmsCatalog {
     async fn load_table(&self, table: &TableIdent) -> Result<Table> {
         let db_name = validate_namespace(table.namespace())?;
 
-        let hive_table = self
+        // A NoSuchObjectException is the metastore stating the table is absent.
+        // Upstream funnels it into the generic `Unexpected` alongside real
+        // transport failures, while `table_exists` in this same file already
+        // matches the typed variant -- so callers that must distinguish absence
+        // from "could not tell" had nothing to read. It now says TableNotFound.
+        let hive_table = match self
             .client
             .0
             .get_table(db_name.clone().into(), table.name.clone().into())
             .await
-            .map(from_thrift_exception)
-            .map_err(from_thrift_error)??;
+        {
+            Ok(MaybeException::Ok(value)) => value,
+            Ok(MaybeException::Exception(ThriftHiveMetastoreGetTableException::O2(_))) => {
+                return Err(Error::new(
+                    ErrorKind::TableNotFound,
+                    format!("no such table: {}.{}", db_name, table.name),
+                ));
+            }
+            Ok(MaybeException::Exception(exception)) => {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Operation failed for hitting thrift error".to_string(),
+                )
+                .with_source(anyhow!("thrift error: {exception:?}")));
+            }
+            Err(err) => return Err(from_thrift_error(err)),
+        };
 
         let metadata_location = get_metadata_location(&hive_table.parameters)?;
 
