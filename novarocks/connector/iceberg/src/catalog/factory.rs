@@ -33,6 +33,42 @@ use super::NovaRocksCatalog;
 pub(crate) struct NovaRocksCatalogFactory;
 
 impl NovaRocksCatalogFactory {
+    /// Wrap a client this generation already built.
+    ///
+    /// The generation must end up with exactly one client. Building a second
+    /// one here would give it two with separate in-memory state, and they would
+    /// disagree about the same lake — a table dropped through one still
+    /// resolving through the other.
+    pub(crate) fn adopt(
+        configuration: &IcebergCatalogConfiguration,
+        client: &crate::catalog_runtime::IcebergCatalogClient,
+    ) -> Result<Arc<dyn NovaRocksCatalog>, String> {
+        let warehouse: Option<Arc<str>> = if configuration.warehouse_uri.is_empty() {
+            None
+        } else {
+            Some(Arc::from(configuration.warehouse_uri.as_str()))
+        };
+        match configuration.kind {
+            IcebergCatalogKind::Hadoop => {
+                let hadoop = client.hadoop().cloned().ok_or_else(|| {
+                    "Hadoop Iceberg configuration produced no Hadoop client".to_string()
+                })?;
+                Ok(Arc::new(super::hadoop::NovaRocksHadoopCatalog::new(hadoop)))
+            }
+            IcebergCatalogKind::Rest => {
+                let rest = client.rest().cloned().ok_or_else(|| {
+                    "REST Iceberg configuration produced no REST client".to_string()
+                })?;
+                Ok(Arc::new(super::rest::NovaRocksRestCatalog::new(
+                    rest, warehouse,
+                )))
+            }
+            IcebergCatalogKind::Hive => Ok(Arc::new(super::hive::NovaRocksHiveCatalog::adopt(
+                Arc::clone(client.generic()),
+            ))),
+        }
+    }
+
     /// Construct exactly one catalog for this configuration.
     ///
     /// A generation gets one call and keeps the result: rebuilding would give

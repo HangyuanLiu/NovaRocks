@@ -53,12 +53,23 @@ impl NovaRocksHiveCatalog {
             delegate: CatalogDelegate::new(client),
         }
     }
+
+    /// Wrap a client the generation already built.
+    pub(super) fn adopt(client: Arc<dyn crate::iceberg::Catalog>) -> Self {
+        Self {
+            delegate: CatalogDelegate::new(client),
+        }
+    }
 }
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksHiveCatalog {
     fn implementation_name(&self) -> &'static str {
         "hive"
+    }
+
+    fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
+        Arc::clone(self.delegate.client())
     }
 
     fn admit_create(&self, intent: CatalogCreateIntent) -> Result<(), CatalogUnsupported> {

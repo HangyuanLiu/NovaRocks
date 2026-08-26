@@ -72,19 +72,21 @@ impl IcebergMetadataContext {
             )?
             .map_err(|error| format!("build Iceberg control-generation catalog: {error}"))?;
         let rest_catalog = catalog.rest().cloned();
-        let configuration = control_state.configuration().clone();
-        let novarocks_catalog = resources
-            .catalog_runtime()
-            .block_on(async move {
-                crate::catalog::factory::NovaRocksCatalogFactory::build(&configuration).await
-            })?
-            .map_err(|error| format!("build Iceberg control-generation catalog owner: {error}"))?;
+        // Every handle below is derived from this one client. Building a second
+        // one for the owner would give the generation two clients with separate
+        // in-memory state, and they would disagree about the same lake -- a
+        // table dropped through one still resolving through the other.
+        let novarocks_catalog = crate::catalog::factory::NovaRocksCatalogFactory::adopt(
+            control_state.configuration(),
+            &catalog,
+        )?;
+        let legacy_client = novarocks_catalog.vendored_client();
         Ok(Self {
             control_state,
             resources,
             novarocks_catalog,
             drop_cleanup: Arc::new(crate::catalog_control::drop_cleanup::DropCleanupQueue::new()),
-            catalog: Arc::clone(catalog.generic()),
+            catalog: legacy_client,
             hadoop_catalog: catalog.hadoop().cloned(),
             rest_catalog,
             write_activations: Arc::new(
@@ -332,5 +334,18 @@ mod tests {
         assert_eq!(generation.control_state().properties().len(), 2);
         assert!(Arc::strong_count(generation.catalog()) >= 1);
         assert!(Arc::strong_count(generation.write_activation_reservations()) >= 1);
+
+        // The legacy handle and the owner are the same allocation, not two
+        // clients built from the same configuration. Two would have separate
+        // in-memory state and disagree about the same lake: a table dropped
+        // through one would still resolve through the other. This held once
+        // during development and cost a passing test to find.
+        assert!(
+            Arc::ptr_eq(
+                generation.catalog(),
+                &generation.novarocks_catalog().vendored_client()
+            ),
+            "a generation must hold exactly one catalog client"
+        );
     }
 }

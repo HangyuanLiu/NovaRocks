@@ -347,8 +347,8 @@ fn execute_operation(
                     "a table with the requested Iceberg view name already exists",
                 ));
             }
-            let exists = super::views::view_exists(provider.runtime(), &view.namespace, &view.view)
-                .map_err(map_view_error)?;
+            let exists =
+                super::views::view_exists(provider.runtime(), &view.namespace, &view.view)?;
             match (*policy, exists) {
                 (CreateOrReplacePolicy::NoOpIfExists, true) => {
                     return Ok(ExternalMutationEffect::NoOp);
@@ -373,8 +373,8 @@ fn execute_operation(
         }
         ConnectorCatalogMutationOperation::DropView { view, policy } => {
             ensure_owner(provider, &view.instance_id)?;
-            let exists = super::views::view_exists(provider.runtime(), &view.namespace, &view.view)
-                .map_err(map_view_error)?;
+            let exists =
+                super::views::view_exists(provider.runtime(), &view.namespace, &view.view)?;
             if !exists {
                 return if *policy == DropPolicy::NoOpIfMissing {
                     Ok(ExternalMutationEffect::NoOp)
@@ -677,11 +677,25 @@ fn execute_hadoop_create_table(
     }
 }
 
+/// Drop a table from the catalog, and hand its objects to collection only if
+/// the drop is proven committed.
+///
+/// The `data_disposition` argument used to be ignored outright, so `Purge` and
+/// `Retain` were indistinguishable and neither reclaimed anything. It is now
+/// what decides whether the dropped table's objects become eligible for
+/// collection at all.
+///
+/// The ordering is the point. Exact object identity is captured before the
+/// catalog request, because it is unreadable afterwards; the drop then returns
+/// a three-state outcome; and only `KnownCommitted` produces the witness that
+/// a cleanup request needs. A drop whose response was lost enqueues nothing and
+/// deletes nothing — those objects leak, and identity-aware collection reclaims
+/// them later by re-proving they are dead.
 fn drop_table(
     provider: &IcebergMetadata,
     table: &ConnectorTableIdentity,
     policy: DropPolicy,
-    _data_disposition: ConnectorDropTableDataDisposition,
+    data_disposition: ConnectorDropTableDataDisposition,
 ) -> Result<ExternalMutationEffect, ConnectorError> {
     ensure_owner(provider, &table.instance_id)?;
     if !provider
@@ -695,20 +709,74 @@ fn drop_table(
             Err(not_found("Iceberg table does not exist"))
         };
     }
-    let ident = table_ident(table).map_err(invalid)?;
-    let catalog = provider.runtime().catalog().clone();
-    provider
-        .runtime()
+    let runtime = provider.runtime();
+    let catalog = std::sync::Arc::clone(runtime.novarocks_catalog());
+    let name =
+        crate::catalog::CatalogTableName::new(table.namespace.as_ref(), table.table.as_ref());
+    let canonical = name.canonical();
+    let outcome = runtime
         .resources()
         .catalog_runtime()
-        .block_on(async move { catalog.drop_table(&ident).await })
-        .map_err(unavailable)?
-        .map_err(map_iceberg)?;
-    provider
-        .runtime()
+        .block_on(async move { catalog.drop_table(name).await })
+        .map_err(unavailable)?;
+
+    // Cache invalidation is post-outcome finalization. It cannot change what
+    // the catalog did, so its result never downgrades a committed drop.
+    runtime
         .control_state()
         .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(ExternalMutationEffect::Applied)
+
+    use crate::catalog::error::CatalogOutcome;
+    match outcome {
+        CatalogOutcome::Unsupported(reason) => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            reason.message().to_string(),
+        )),
+        CatalogOutcome::KnownUncommitted { failure } => Err(map_mutation_failure(&failure)),
+        // Nothing is enqueued and nothing is deleted. The objects leak on
+        // purpose: the drop may have landed, and acting on that guess is how
+        // live data disappears.
+        CatalogOutcome::CommitUnknown { failure, .. } => Err(ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            failure.to_string(),
+        )),
+        committed => {
+            let (receipt, effect, witness) = committed
+                .into_known_committed()
+                .expect("the remaining arm is the committed one");
+            if data_disposition == ConnectorDropTableDataDisposition::Purge {
+                if let Some(request) =
+                    crate::catalog_control::drop_cleanup::PostCommitCleanupRequest::
+                        from_committed_drop(canonical, &receipt, &witness)
+                {
+                    runtime.drop_cleanup().enqueue(request);
+                }
+            }
+            Ok(effect)
+        }
+    }
+}
+
+/// Project a typed catalog mutation failure onto the neutral error vocabulary.
+fn map_mutation_failure(
+    failure: &novarocks_spi::connector::ConnectorMutationFailure,
+) -> ConnectorError {
+    use novarocks_spi::connector::ConnectorMutationFailureKind as Kind;
+    let kind = match failure.kind() {
+        Kind::NotFound => ConnectorErrorKind::NotFound,
+        Kind::AlreadyExists | Kind::Conflict | Kind::InvalidRequest => {
+            ConnectorErrorKind::InvalidRequest
+        }
+        Kind::Unsupported => ConnectorErrorKind::Unsupported,
+        Kind::PermissionDenied | Kind::Unauthenticated => ConnectorErrorKind::PermissionDenied,
+        Kind::Cancelled => ConnectorErrorKind::Cancelled,
+        Kind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
+        Kind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
+        Kind::CorruptData => ConnectorErrorKind::CorruptData,
+        Kind::Unavailable => ConnectorErrorKind::Unavailable,
+        Kind::Internal => ConnectorErrorKind::Internal,
+    };
+    ConnectorError::new(kind, failure.to_string())
 }
 
 pub(crate) fn table_properties(
@@ -2524,8 +2592,7 @@ fn reconcile_evidence(
             view,
             should_exist,
         } => {
-            let exists = super::views::view_exists(provider.runtime(), &namespace, &view)
-                .map_err(map_view_error)?;
+            let exists = super::views::view_exists(provider.runtime(), &namespace, &view)?;
             if exists == should_exist {
                 ambiguous("Iceberg view postcondition matches but cannot be attributed")
             } else {

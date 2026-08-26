@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorViewDefinition, ConnectorViewSourceFormat,
@@ -49,14 +50,26 @@ pub(crate) struct LoadedIcebergView {
     pub properties: HashMap<String, String>,
 }
 
-fn ensure_rest(runtime: &IcebergMetadataContext) -> Result<(), String> {
-    let kind = runtime.control_state().configuration().kind;
-    if kind != IcebergCatalogKind::Rest {
-        return Err(format!(
-            "view operations require a REST iceberg catalog; this catalog is {kind:?}"
-        ));
-    }
-    Ok(())
+/// Poll one catalog call on the generation's runtime.
+///
+/// The bridge wraps the request, so a bridge failure says nothing about
+/// whether the request reached the catalog. Reads have no publication frontier,
+/// so `Unavailable` is the honest answer here.
+fn bridge<F, T>(runtime: &IcebergMetadataContext, future: F) -> Result<T, ConnectorError>
+where
+    F: std::future::Future<Output = Result<T, ConnectorError>> + Send + 'static,
+    T: Send + 'static,
+{
+    runtime
+        .resources()
+        .catalog_runtime()
+        .block_on(future)
+        .map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                format!("Iceberg catalog runtime bridge: {error}"),
+            )
+        })?
 }
 
 fn view_ident(namespace: &str, view: &str) -> Result<(NamespaceIdent, TableIdent), String> {
@@ -141,7 +154,6 @@ pub(crate) fn create_view(
     replace: bool,
     extra_properties: &[(String, String)],
 ) -> Result<(), String> {
-    ensure_rest(runtime)?;
     let (source_catalog, source_namespace, source_format) = novarocks_source_context(definition)?;
     let (namespace_ident, ident) = view_ident(namespace, view)?;
     let schema = build_view_schema(columns)?;
@@ -265,7 +277,6 @@ pub(crate) fn load_view(
     namespace: &str,
     view: &str,
 ) -> Result<LoadedIcebergView, String> {
-    ensure_rest(runtime)?;
     let (_, ident) = view_ident(namespace, view)?;
     let catalog = runtime.catalog().clone();
     let metadata = runtime
@@ -284,7 +295,6 @@ pub(crate) fn drop_view(
     namespace: &str,
     view: &str,
 ) -> Result<(), String> {
-    ensure_rest(runtime)?;
     let (_, ident) = view_ident(namespace, view)?;
     let catalog = runtime.catalog().clone();
     runtime
@@ -297,51 +307,40 @@ pub(crate) fn drop_view(
         .map_err(|error| map_view_error(&ident, "drop", error))
 }
 
+/// Whether the view exists.
+///
+/// A catalog that cannot answer says so. This used to short-circuit to
+/// `Ok(false)` whenever the generation had no REST client, which turned
+/// "this catalog cannot hold views" into "this catalog says there is no such
+/// view" — the same sentence a caller gets for a name that genuinely is not a
+/// view. Callers that only want a hint may still treat `Unsupported` as "not a
+/// view"; callers that need an authoritative answer now get to know they did
+/// not receive one.
 pub(crate) fn view_exists(
     runtime: &IcebergMetadataContext,
     namespace: &str,
     view: &str,
-) -> Result<bool, String> {
-    // Same reasoning as `list_views`: a catalog that cannot create views holds
-    // none, so existence is answerable without a view catalog.
-    if runtime.rest_catalog().is_none() {
-        return Ok(false);
-    }
-    ensure_rest(runtime)?;
-    let (_, ident) = view_ident(namespace, view)?;
-    let catalog = runtime.catalog().clone();
-    runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { catalog.view_exists(&ident).await })?
-        .map_err(|error| format!("check Iceberg view: {error}"))
+) -> Result<bool, ConnectorError> {
+    let catalog = Arc::clone(runtime.novarocks_catalog());
+    let name = crate::catalog::CatalogTableName::new(namespace, view);
+    bridge(runtime, async move { catalog.view_exists(name).await })
 }
 
+/// Enumerate views in a namespace.
+///
+/// This used to return an empty vector whenever the generation had no REST
+/// client, with the reasoning that a catalog which cannot create views holds
+/// none. That is true of the catalog and false of the answer: an empty list is
+/// indistinguishable from an authoritative "no views here", and
+/// `DROP DATABASE ... FORCE` consumed it as exactly that. It now reports what
+/// the catalog actually said.
 pub(crate) fn list_views(
     runtime: &IcebergMetadataContext,
     namespace: &str,
-) -> Result<Vec<String>, String> {
-    // A catalog that cannot create views cannot contain any, so enumerating
-    // them answers "none" rather than failing. Callers that merely need to know
-    // whether a namespace holds views -- DROP DATABASE ... FORCE is the one
-    // that matters -- must not be turned into a hard error by a catalog kind
-    // they never asked about. Mutating view operations still fail loudly.
-    if runtime.rest_catalog().is_none() {
-        return Ok(Vec::new());
-    }
-    ensure_rest(runtime)?;
-    let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
-    let catalog = runtime.catalog().clone();
-    let mut views = runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { catalog.list_views(&namespace).await })?
-        .map_err(|error| format!("list Iceberg views: {error}"))?
-        .into_iter()
-        .map(|ident| ident.name)
-        .collect::<Vec<_>>();
-    views.sort();
-    Ok(views)
+) -> Result<Vec<String>, ConnectorError> {
+    let catalog = Arc::clone(runtime.novarocks_catalog());
+    let name = crate::catalog::CatalogNamespaceName::new(namespace);
+    bridge(runtime, async move { catalog.list_views(name).await })
 }
 
 fn map_view_error(ident: &TableIdent, action: &str, error: impl std::fmt::Display) -> String {
@@ -413,8 +412,10 @@ impl ConnectorViewMetadata for IcebergMetadata {
 
     fn view_exists(&self, request: ConnectorViewRequest) -> Result<bool, ConnectorError> {
         ensure_request(self, &request.view.instance_id, &request.context)?;
+        // The typed result reaches the caller intact. Flattening it to
+        // Unavailable here would tell a caller "ask again later" about a
+        // catalog that will never be able to answer.
         view_exists(self.runtime(), &request.view.namespace, &request.view.view)
-            .map_err(unavailable)
     }
 
     fn load_view(
@@ -458,8 +459,7 @@ impl ConnectorViewMetadata for IcebergMetadata {
         request: ConnectorListViewsRequest,
     ) -> Result<Vec<ConnectorViewIdentity>, ConnectorError> {
         ensure_request(self, &request.namespace.instance_id, &request.context)?;
-        list_views(self.runtime(), &request.namespace.namespace)
-            .map_err(unavailable)?
+        list_views(self.runtime(), &request.namespace.namespace)?
             .into_iter()
             .map(|view| {
                 Ok(ConnectorViewIdentity {
@@ -517,7 +517,6 @@ fn unavailable(error: String) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
@@ -566,15 +565,26 @@ mod tests {
         (executor, warehouse, runtime)
     }
 
+    /// A catalog that cannot hold views says so, instead of answering.
+    ///
+    /// This test previously asserted the opposite for the probes: that
+    /// `view_exists` returned `false` and `list_views` returned an empty list
+    /// on a Hadoop catalog. Both are indistinguishable from an authoritative
+    /// answer, and `DROP DATABASE ... FORCE` consumed the empty list as exactly
+    /// that. The catalog now reports that it cannot answer, and the caller
+    /// decides what to do with that.
     #[test]
-    fn hadoop_rejects_view_mutations_and_loads_but_answers_empty_probes() {
+    fn hadoop_reports_unsupported_rather_than_answering_view_questions() {
         let (_executor, _warehouse, runtime) = hadoop_runtime();
-        let assert_gate = |result: Result<(), String>| {
-            let error = result.expect_err("Hadoop must not expose a view operation");
-            assert!(error.contains("require a REST"), "{error}");
+        let assert_mutation_gate = |result: Result<(), String>| {
+            let error = result.expect_err("Hadoop must not expose a view mutation");
+            assert!(
+                error.to_lowercase().contains("unsupported"),
+                "expected an unsupported refusal, got: {error}"
+            );
         };
 
-        assert_gate(create_view(
+        assert_mutation_gate(create_view(
             &runtime,
             "db",
             "v",
@@ -584,14 +594,16 @@ mod tests {
             false,
             &[],
         ));
-        assert_gate(drop_view(&runtime, "db", "v"));
-        assert_gate(load_view(&runtime, "db", "v").map(|_| ()));
-        assert!(!view_exists(&runtime, "db", "v").expect("Hadoop view probe"));
-        assert!(
-            list_views(&runtime, "db")
-                .expect("Hadoop view listing probe")
-                .is_empty()
-        );
+        assert_mutation_gate(drop_view(&runtime, "db", "v"));
+        assert_mutation_gate(load_view(&runtime, "db", "v").map(|_| ()));
+
+        let exists = view_exists(&runtime, "db", "v")
+            .expect_err("a probe must not be answered by a catalog that cannot hold views");
+        assert_eq!(exists.kind(), ConnectorErrorKind::Unsupported);
+
+        let listed = list_views(&runtime, "db")
+            .expect_err("an enumeration must not be answered with an empty list");
+        assert_eq!(listed.kind(), ConnectorErrorKind::Unsupported);
     }
 
     #[test]

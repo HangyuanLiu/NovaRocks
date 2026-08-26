@@ -200,9 +200,13 @@ impl<T> CatalogOutcome<T> {
     /// Returns `None` for every other arm, which is the point: `CommitUnknown`
     /// must leak rather than delete, and `Unsupported` / `KnownUncommitted`
     /// have nothing published to clean up after.
-    pub(crate) fn into_known_committed(self) -> Option<(T, KnownCommitted)> {
+    pub(crate) fn into_known_committed(
+        self,
+    ) -> Option<(T, ExternalMutationEffect, KnownCommitted)> {
         match self {
-            Self::KnownCommitted { receipt, .. } => Some((receipt, KnownCommitted(()))),
+            Self::KnownCommitted {
+                receipt, effect, ..
+            } => Some((receipt, effect, KnownCommitted(()))),
             _ => None,
         }
     }
@@ -445,7 +449,7 @@ mod tests {
         // That is what stops a lost response from authorizing a delete.
         let committed: CatalogOutcome<&str> =
             CatalogOutcome::committed("receipt", ExternalMutationEffect::Applied);
-        let (receipt, _witness) = committed
+        let (receipt, _effect, _witness) = committed
             .into_known_committed()
             .expect("a committed outcome authorizes cleanup");
         assert_eq!(receipt, "receipt");

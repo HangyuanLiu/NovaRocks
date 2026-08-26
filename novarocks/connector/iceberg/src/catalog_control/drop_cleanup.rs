@@ -248,7 +248,7 @@ mod tests {
 
     fn committed_request() -> PostCommitCleanupRequest {
         let outcome = CatalogOutcome::committed(receipt(), ExternalMutationEffect::Applied);
-        let (receipt, witness) = outcome.into_known_committed().expect("committed");
+        let (receipt, _effect, witness) = outcome.into_known_committed().expect("committed");
         PostCommitCleanupRequest::from_committed_drop(Arc::from("db.t"), &receipt, &witness)
             .expect("exact identity and a readable age were captured")
     }
@@ -283,7 +283,7 @@ mod tests {
             },
             ExternalMutationEffect::Applied,
         );
-        let (receipt, witness) = outcome.into_known_committed().expect("committed");
+        let (receipt, _effect, witness) = outcome.into_known_committed().expect("committed");
         assert!(
             PostCommitCleanupRequest::from_committed_drop(Arc::from("db.t"), &receipt, &witness)
                 .is_none(),
@@ -300,7 +300,7 @@ mod tests {
             },
             ExternalMutationEffect::Applied,
         );
-        let (receipt, witness) = outcome.into_known_committed().expect("committed");
+        let (receipt, _effect, witness) = outcome.into_known_committed().expect("committed");
         assert!(
             PostCommitCleanupRequest::from_committed_drop(Arc::from("db.t"), &receipt, &witness)
                 .is_none()

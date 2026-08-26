@@ -79,6 +79,10 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         "rest"
     }
 
+    fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
+        Arc::clone(self.delegate.client())
+    }
+
     fn admit_create(
         &self,
         intent: CatalogCreateIntent,
