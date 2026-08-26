@@ -4586,7 +4586,9 @@ mod tests {
             };
             active.clone()
         };
-        let marker = control.operation_marker(operation_id, &active, [4; 32], [5; 32]);
+        let marker = control
+            .operation_marker(operation_id, &active, [4; 32], [5; 32])
+            .expect("operation marker");
         let snapshot =
             snapshot_with_operation_marker(9, serde_json::to_string(&marker).expect("marker JSON"));
 
