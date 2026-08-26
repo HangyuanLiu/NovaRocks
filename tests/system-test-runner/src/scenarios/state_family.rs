@@ -43,7 +43,10 @@ impl Scenario for WipeStartRebuild {
 
         // The warehouse lives outside the durable store, so it is the lake for
         // the purposes of this scenario and must survive the wipe untouched.
-        let warehouse = context.runtime_dir().join("warehouses").join("state-family");
+        let warehouse = context
+            .runtime_dir()
+            .join("warehouses")
+            .join("state-family");
         std::fs::create_dir_all(&warehouse)
             .with_context(|| format!("create warehouse {}", warehouse.display()))?;
         let warehouse = warehouse.to_string_lossy().replace('"', "\\\"");

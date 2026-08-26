@@ -7,7 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-08-26
 provenance:
-  - "PR: https://github.com/NovaRocks/NovaRocks/pull/983"
+  - "PR: pending; mechanism: closed frontend state family manifest and catalog desired-state source modes"
   - "discussion: 2026-08-25, catalog projection versus rebuildable MV accelerator"
 code-anchors:
   - "novarocks/frontend/src/catalog_attachment/repository.rs (observe_materialized_view_references)"
