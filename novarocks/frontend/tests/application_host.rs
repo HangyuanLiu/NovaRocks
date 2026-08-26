@@ -475,7 +475,7 @@ async fn view_open_failure_precedes_table_maintenance_open_failure() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn corrupt_table_maintenance_record_fails_open_and_releases_partial_resources() {
+async fn legacy_maintenance_and_gc_observation_records_do_not_block_host_open() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
     let host = open_host(Some(config.clone()))
@@ -485,7 +485,7 @@ async fn corrupt_table_maintenance_record_fails_open_and_releases_partial_resour
     let mut transaction = store
         .begin_write(
             TransactionId::from(Uuid::now_v7()),
-            "seed corrupt frontend table-maintenance record",
+            "seed legacy frontend table-maintenance records",
         )
         .await
         .expect("begin corrupt record write");
@@ -500,6 +500,18 @@ async fn corrupt_table_maintenance_record_fails_open_and_releases_partial_resour
         )
         .await
         .expect("stage corrupt maintenance record");
+    transaction
+        .put(
+            Key::try_from(Bytes::from_static(
+                b"novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/00000000-0000-0000-0000-0000000003c3/5f5f6e6f7661726f636b735f5f636f7272757074",
+            ))
+            .expect("GC observation key"),
+            Value::try_from(Bytes::from_static(b"not-canonical-json"))
+                .expect("corrupt GC observation value"),
+            Precondition::Absent,
+        )
+        .await
+        .expect("stage corrupt GC observation record");
     assert!(matches!(
         transaction.commit().await,
         CommitOutcome::Committed(_)
@@ -508,18 +520,9 @@ async fn corrupt_table_maintenance_record_fails_open_and_releases_partial_resour
     host.shutdown().await.expect("seed host shutdown");
 
     for _ in 0..2 {
-        let error = match open_host(Some(config.clone())).await {
-            Ok(_) => panic!("corrupt maintenance metadata must reject host open"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error.kind(),
-            FrontendApplicationErrorKind::TableMaintenanceServiceOpen
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("open frontend optimize job repository")
-        );
+        let reopened = open_host(Some(config.clone()))
+            .await
+            .expect("legacy maintenance and corrupt GC observation data must not block host open");
+        reopened.shutdown().await.expect("reopened host shutdown");
     }
 }

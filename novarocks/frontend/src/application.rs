@@ -974,9 +974,8 @@ impl FrontendApplicationHost {
         self.dml_service.take();
         self.table_maintenance_service.take();
         self.statistics_service.take();
-        // The durable application service owns a StateStore reference through
-        // its repository, so it must be released before StateStoreHost closes
-        // its deployment lock.
+        // Process-local job services do not own StateStore job records. Release
+        // their workers before closing the host's remaining durable owners.
         self.statistics_application_port.take();
         self.statistics_application_service.take();
         let catalog_controller_error = match self.catalog_controller.take() {
