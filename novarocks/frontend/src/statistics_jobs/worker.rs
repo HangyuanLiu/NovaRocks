@@ -9,96 +9,69 @@
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
+// software distributed under the Apache License is distributed on an
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
 
-//! Durable ownership for the frontend ANALYZE worker.
+//! Process-owned, one-shot ANALYZE worker.
 //!
-//! Job records remain in the repository. This module owns only the global
-//! worker lease and the fence validator injected into repository mutations.
-//! It never opens writes or starts a restore: an existing coordination plane
-//! is respected exactly as it was found.
+//! There is no lease, takeover, retry queue, startup scan, or reconciliation
+//! pass. Every submission is one fresh attempt owned by this frontend process.
 
 use std::any::Any;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use crate::state_store::OperationId;
-use crate::state_store::coordination::{
-    AcquireOutcome, AttemptId, CoordinationError, CoordinationErrorKind, LeaseFence, LeaseManager,
-    ResourceKey,
-};
-use bytes::Bytes;
 use novarocks_spi::connector::ExternalMutationEvidence;
-use novarocks_spi::state_store::StateStore;
 use uuid::Uuid;
 
+use super::application::StatisticsPublicationTerminal;
 use super::model::{StatisticsJob, StatisticsJobError, StatisticsJobErrorKind, StatisticsJobState};
-use super::repository::FenceValidator;
 use super::repository::StatisticsJobRepository;
-use crate::coordination::FrontendCoordinationRuntime;
 
-/// One process-wide lease protects all durable ANALYZE attempts for a frontend
-/// deployment. It is deliberately not keyed by table or session.
-pub const STATISTICS_ANALYZE_WORKER_RESOURCE: &str = "frontend/statistics/analyze-worker/v1";
-const STATISTICS_ANALYZE_WORKER_RESOURCE_BYTES: &[u8] = b"frontend/statistics/analyze-worker/v1";
+pub const STATISTICS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub const STATISTICS_LEASE_DURATION: Duration = Duration::from_secs(15);
-pub const STATISTICS_LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(5);
-pub const STATISTICS_MAX_CLOCK_SKEW: Duration = Duration::from_secs(1);
-pub const STATISTICS_TAKEOVER_OBSERVATION: Duration = Duration::from_secs(2);
-const STATISTICS_WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const STATISTICS_LEASE_RELEASE_MAX_ATTEMPTS: usize = 8;
-const MAX_STATISTICS_ATTEMPTS: u32 = 3;
-const RETRY_BACKOFF_BASE: Duration = Duration::from_secs(1);
-const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(30);
-
-/// An execution error whose retry semantics are explicit. A publish outcome
-/// that may have reached the connector is never retried by this worker: its
-/// operation ID must be reconciled from the `PUBLISHING` record instead.
+/// A failed attempt is terminal. In particular, no error is retryable and a
+/// `CommitUnknown` must not invoke any mutation after the failed publication.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsAttemptError {
     pub kind: StatisticsJobErrorKind,
     pub message: String,
-    pub transient: bool,
-    pub requires_reconcile: bool,
+    pub publication: Option<StatisticsPublicationTerminal>,
 }
 
 impl StatisticsAttemptError {
-    pub fn transient(kind: StatisticsJobErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-            transient: true,
-            requires_reconcile: false,
-        }
-    }
-
     pub fn permanent(kind: StatisticsJobErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
-            transient: false,
-            requires_reconcile: false,
+            publication: None,
         }
     }
 
-    pub fn reconcile(kind: StatisticsJobErrorKind, message: impl Into<String>) -> Self {
+    pub fn publication(
+        terminal: StatisticsPublicationTerminal,
+        message: impl Into<String>,
+    ) -> Self {
+        let kind = match terminal {
+            StatisticsPublicationTerminal::KnownUncommitted => StatisticsJobErrorKind::Publish,
+            StatisticsPublicationTerminal::KnownCommittedFinalization => {
+                StatisticsJobErrorKind::KnownCommittedFinalization
+            }
+            StatisticsPublicationTerminal::CommitUnknown => StatisticsJobErrorKind::CommitUnknown,
+        };
         Self {
             kind,
             message: message.into(),
-            transient: false,
-            requires_reconcile: true,
+            publication: Some(terminal),
         }
     }
 }
 
-/// Attempt-local collection material. It never crosses a StateStore boundary:
-/// only the separately prepared reconciliation evidence is durable.
+/// Attempt-local collection material. It never crosses a process boundary.
 pub trait StatisticsCollectedAttempt: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn basis_data_version(&self) -> &[u8];
@@ -114,17 +87,14 @@ impl StatisticsCollectedAttempt for () {
     }
 }
 
-/// Connector-neutral execution owned by the frontend worker. Implementations
-/// receive the durable operation ID from `job` and must use it for all
-/// external collection/publish reconciliation.
+/// Connector-neutral execution owned by the frontend process worker.
 pub trait StatisticsAttemptExecutor: Send + Sync {
     fn collect(
         &self,
         job: &StatisticsJob,
     ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsAttemptError>;
 
-    /// Must be side-effect free. Its result is persisted atomically before
-    /// `publish` is ever called.
+    /// Side-effect-free preparation for the one publication attempt.
     fn prepare_publish(
         &self,
         job: &StatisticsJob,
@@ -137,78 +107,66 @@ pub trait StatisticsAttemptExecutor: Send + Sync {
         collected: &dyn StatisticsCollectedAttempt,
         evidence: &ExternalMutationEvidence,
     ) -> Result<(), StatisticsAttemptError>;
-
-    fn reconcile(
-        &self,
-        job: &StatisticsJob,
-        evidence: &ExternalMutationEvidence,
-    ) -> Result<(), StatisticsAttemptError>;
 }
 
-/// Lifecycle owner for the durable statistics worker task.
+/// Lifecycle owner for the current process worker task.
 pub struct StatisticsAnalyzeWorker {
+    repository: StatisticsJobRepository,
     stop: Arc<AtomicBool>,
-    wakeup: Arc<tokio::sync::Notify>,
     join: Option<tokio::task::JoinHandle<Result<(), String>>>,
 }
 
 impl StatisticsAnalyzeWorker {
     pub async fn start(
         runtime: &tokio::runtime::Handle,
-        repository: Arc<StatisticsJobRepository>,
+        repository: StatisticsJobRepository,
         executor: Arc<dyn StatisticsAttemptExecutor>,
-    ) -> Result<Self, String> {
-        let frontend_coordination = FrontendCoordinationRuntime::open(repository.store())
-            .await
-            .map_err(|error| format!("open statistics worker coordination failed: {error}"))?;
-        Self::start_with_coordination(
-            runtime,
-            repository,
-            executor,
-            StatisticsAnalyzeWorkerCoordination::from_frontend(&frontend_coordination)
-                .map_err(|error| error.to_string())?,
-        )
-        .await
-    }
-
-    pub(crate) async fn start_with_coordination(
-        runtime: &tokio::runtime::Handle,
-        repository: Arc<StatisticsJobRepository>,
-        executor: Arc<dyn StatisticsAttemptExecutor>,
-        coordination: StatisticsAnalyzeWorkerCoordination,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
-        let wakeup = Arc::new(tokio::sync::Notify::new());
         let join = runtime.spawn(run_worker(
-            repository,
+            repository.clone(),
             Arc::downgrade(&executor),
-            coordination,
             Arc::clone(&stop),
-            Arc::clone(&wakeup),
         ));
         Ok(Self {
+            repository,
             stop,
-            wakeup,
             join: Some(join),
         })
     }
 
     pub fn wakeup(&self) {
-        self.wakeup.notify_one();
+        // Repository mutations wake the worker. Keep this method for the
+        // application port's explicit post-submit signal.
+        self.repository.notify_worker();
     }
 
     pub fn shutdown(&mut self) -> Result<(), String> {
         self.stop.store(true, Ordering::Release);
+        let now = now_ms();
+        let repository = self.repository.clone();
+        let cancel = async move { repository.cancel_active_for_shutdown(now).await };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+                return Err("statistics worker cannot synchronously join from a current-thread Tokio runtime".into());
+            }
+            tokio::task::block_in_place(|| runtime.block_on(cancel))
+                .map_err(|error| error.to_string())?;
+        } else {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("build statistics worker join runtime failed: {error}"))?
+                .block_on(cancel)
+                .map_err(|error| error.to_string())?;
+        }
         self.wakeup();
         let Some(join) = self.join.take() else {
             return Ok(());
         };
         let joined = if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-                return Err(
-                    "statistics worker cannot synchronously join from a current-thread Tokio runtime"
-                        .to_string(),
-                );
+                return Err("statistics worker cannot synchronously join from a current-thread Tokio runtime".into());
             }
             tokio::task::block_in_place(|| runtime.block_on(join))
         } else {
@@ -223,637 +181,219 @@ impl StatisticsAnalyzeWorker {
 }
 
 async fn run_worker(
-    repository: Arc<StatisticsJobRepository>,
+    repository: StatisticsJobRepository,
     executor: Weak<dyn StatisticsAttemptExecutor>,
-    coordination: StatisticsAnalyzeWorkerCoordination,
     stop: Arc<AtomicBool>,
-    wakeup: Arc<tokio::sync::Notify>,
 ) -> Result<(), String> {
     loop {
-        if stop.load(Ordering::Acquire) || executor.upgrade().is_none() {
-            return Ok(());
-        }
-        let acquired = match coordination.acquire().await {
-            Ok(outcome) => Some(outcome),
-            // A definite transaction conflict acquires no lease and is retried
-            // on the next poll, exactly as `release_worker_lease` retries it;
-            // a closed write path means teardown already started. Both are
-            // routine during FE shutdown, while other StateStore-backed workers
-            // finish their writes, and neither may turn worker teardown into a
-            // failed shutdown.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    CoordinationErrorKind::OperationNotCommitted
-                        | CoordinationErrorKind::WriteClosed
-                ) =>
-            {
-                None
-            }
-            Err(error) => {
-                return Err(format!("acquire statistics worker lease failed: {error}"));
-            }
-        };
-        match acquired {
-            Some(AcquireOutcome::Acquired(mut guard)) => {
-                let current_fence = crate::coordination::CurrentLeaseFence::new(guard.fence());
-                let fence = current_fence.validator();
-                process_cancellation_requests(&repository, now_unix_millis(), &fence).await?;
-                recover_incomplete(&repository, now_unix_millis(), &fence).await?;
-                let result = reconcile_publishing(
-                    repository.as_ref(),
-                    &executor,
-                    &mut guard,
-                    &current_fence,
-                    &fence,
-                    stop.as_ref(),
-                )
-                .await;
-                let result = match result {
-                    Ok(()) => match coordination.admit_submitted_claims(&current_fence).await {
-                        Ok(claim_fence) => {
-                            process_submitted(
-                                repository.as_ref(),
-                                &executor,
-                                &mut guard,
-                                &current_fence,
-                                &claim_fence,
-                                &fence,
-                                stop.as_ref(),
-                            )
-                            .await
-                        }
-                        Err(error) if error.kind() == CoordinationErrorKind::WriteClosed => Ok(()),
-                        Err(error) => {
-                            Err(format!("admit submitted statistics jobs failed: {error}"))
-                        }
-                    },
-                    Err(error) => Err(error),
-                };
-                let release = release_worker_lease(&mut guard).await;
-                result?;
-                release
-                    .map_err(|error| format!("release statistics worker lease failed: {error}"))?;
-            }
-            Some(AcquireOutcome::Contended(_) | AcquireOutcome::AwaitingTakeover(_)) | None => {}
-        }
-        tokio::select! {
-            _ = wakeup.notified() => {}
-            _ = tokio::time::sleep(STATISTICS_WORKER_POLL_INTERVAL) => {}
-        }
-    }
-}
-
-async fn release_worker_lease(
-    guard: &mut crate::state_store::coordination::LeaseGuard,
-) -> Result<(), CoordinationError> {
-    for attempt in 1..=STATISTICS_LEASE_RELEASE_MAX_ATTEMPTS {
-        let operation_id = OperationId::new_v7();
-        let result = match guard.release(operation_id).await {
-            Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
-                guard.recover_release(operation_id).await
-            }
-            result => result,
-        };
-        match result {
-            Ok(()) => return Ok(()),
-            Err(error)
-                if error.kind() == CoordinationErrorKind::OperationNotCommitted
-                    && attempt < STATISTICS_LEASE_RELEASE_MAX_ATTEMPTS =>
-            {
-                // A definite transaction conflict leaves the guard active and
-                // clears its recovery state, so releasing under a fresh
-                // operation ID is safe. This is common during FE shutdown
-                // while other StateStore-backed workers finish their writes.
-                tokio::task::yield_now().await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("statistics lease release attempts are non-zero")
-}
-
-async fn recover_incomplete(
-    repository: &StatisticsJobRepository,
-    now_ms: i64,
-    fence: &FenceValidator,
-) -> Result<(), String> {
-    for state in [StatisticsJobState::Preparing, StatisticsJobState::Running] {
-        for job in repository
-            .list_by_state(state)
-            .await
-            .map_err(|error| format!("list recoverable statistics jobs failed: {error}"))?
-        {
-            repository
-                .requeue_incomplete(job.job_id, now_ms, fence)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "requeue incomplete statistics job {} failed: {error}",
-                        job.job_id
-                    )
-                })?;
-        }
-    }
-    Ok(())
-}
-
-async fn process_cancellation_requests(
-    repository: &StatisticsJobRepository,
-    now_ms: i64,
-    fence: &FenceValidator,
-) -> Result<(), String> {
-    for state in [
-        StatisticsJobState::Submitted,
-        StatisticsJobState::Preparing,
-        StatisticsJobState::Running,
-    ] {
-        for job in repository
-            .list_by_state(state)
-            .await
-            .map_err(|error| format!("list cancellable statistics jobs failed: {error}"))?
-        {
-            if !job.cancel_requested {
-                continue;
-            }
-            repository
-                .transition(
-                    job.job_id,
-                    state,
-                    StatisticsJobState::Cancelled,
-                    now_ms,
-                    None,
-                    fence,
-                )
-                .await
-                .map_err(|error| {
-                    format!(
-                        "cancel statistics job {} under worker fence failed: {error}",
-                        job.job_id
-                    )
-                })?;
-        }
-    }
-    Ok(())
-}
-
-async fn reconcile_publishing(
-    repository: &StatisticsJobRepository,
-    executor: &Weak<dyn StatisticsAttemptExecutor>,
-    guard: &mut crate::state_store::coordination::LeaseGuard,
-    current_fence: &crate::coordination::CurrentLeaseFence,
-    fence: &FenceValidator,
-    stop: &AtomicBool,
-) -> Result<(), String> {
-    let mut publishing = repository
-        .list_by_state(StatisticsJobState::Publishing)
-        .await
-        .map_err(|error| format!("list publishing statistics jobs failed: {error}"))?;
-    publishing.sort_by_key(|job| job.job_id);
-    for job in publishing {
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
+        let Some(job) = repository
+            .claim_next(now_ms())
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            tokio::select! {
+                _ = repository.wait_for_change() => {}
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+            continue;
+        };
         let Some(executor) = executor.upgrade() else {
             return Ok(());
         };
-        let evidence = job.publication_evidence.as_deref().ok_or_else(|| {
-            format!(
-                "publishing statistics job {} is missing operation evidence",
-                job.job_id
-            )
-        })?;
-        let evidence = ExternalMutationEvidence::try_from_wire_v1(evidence)
-            .map_err(|error| format!("decode statistics publication evidence: {error}"))?;
-        let outcome = run_with_lease_renewal(guard, current_fence, {
-            let executor = Arc::clone(&executor);
-            let job = job.clone();
-            move || executor.reconcile(&job, &evidence)
-        })
-        .await;
-        match outcome {
-            Ok(()) => {
-                repository
-                    .transition(
-                        job.job_id,
-                        StatisticsJobState::Publishing,
-                        StatisticsJobState::Succeeded,
-                        now_unix_millis(),
-                        None,
-                        fence,
-                    )
-                    .await
-                    .map_err(|error| {
-                        format!(
-                            "finish reconciled statistics job {} failed: {error}",
-                            job.job_id
-                        )
-                    })?;
-            }
-            Err(error) if error.requires_reconcile => {
-                // The receipt remains uncertain; preserve PUBLISHING and let
-                // a future fenced owner retry reconciliation with exactly the
-                // same operation ID.
-            }
-            Err(error) => {
-                repository
-                    .transition(
-                        job.job_id,
-                        StatisticsJobState::Publishing,
-                        StatisticsJobState::Failed,
-                        now_unix_millis(),
-                        Some(job_error(&error)),
-                        fence,
-                    )
-                    .await
-                    .map_err(|repository_error| {
-                        format!(
-                            "fail reconciled statistics job {} failed: {repository_error}",
-                            job.job_id
-                        )
-                    })?;
-            }
-        };
+        run_attempt(
+            &repository,
+            executor.as_ref(),
+            job,
+            STATISTICS_ATTEMPT_TIMEOUT,
+        )
+        .await?;
     }
-    Ok(())
 }
 
-async fn process_submitted(
+async fn run_attempt(
     repository: &StatisticsJobRepository,
-    executor: &Weak<dyn StatisticsAttemptExecutor>,
-    guard: &mut crate::state_store::coordination::LeaseGuard,
-    current_fence: &crate::coordination::CurrentLeaseFence,
-    claim_fence: &FenceValidator,
-    fence: &FenceValidator,
-    stop: &AtomicBool,
+    executor: &dyn StatisticsAttemptExecutor,
+    job: StatisticsJob,
+    timeout: Duration,
 ) -> Result<(), String> {
-    let mut submitted = repository
-        .list_by_state(StatisticsJobState::Submitted)
+    let started = Instant::now();
+    if must_stop(repository, job.job_id, started, timeout).await? {
+        return cancel(
+            repository,
+            job.job_id,
+            StatisticsJobState::Preparing,
+            "statistics job cancelled before collection",
+        )
+        .await;
+    }
+    let running = repository
+        .transition(
+            job.job_id,
+            StatisticsJobState::Preparing,
+            StatisticsJobState::Running,
+            now_ms(),
+            None,
+        )
         .await
-        .map_err(|error| format!("list submitted statistics jobs failed: {error}"))?;
-    submitted.sort_by_key(|job| job.job_id);
-    for job in submitted {
-        if stop.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        if job
-            .retry_not_before_ms
-            .is_some_and(|deadline| deadline > now_unix_millis())
-        {
-            continue;
-        }
-        let Some(executor) = executor.upgrade() else {
-            return Ok(());
-        };
-        let Some(preparing) = repository
-            .claim(job.job_id, now_unix_millis(), claim_fence)
-            .await
-            .map_err(|error| format!("claim statistics job {} failed: {error}", job.job_id))?
-        else {
-            continue;
-        };
-        let running = repository
-            .transition(
-                preparing.job_id,
-                StatisticsJobState::Preparing,
-                StatisticsJobState::Running,
-                now_unix_millis(),
-                None,
-                fence,
-            )
-            .await
-            .map_err(|error| {
-                format!("start statistics job {} failed: {error}", preparing.job_id)
-            })?;
-        let collect = run_with_lease_renewal(guard, current_fence, {
-            let executor = Arc::clone(&executor);
-            let running = running.clone();
-            move || executor.collect(&running)
-        })
-        .await;
-        let collected: Arc<dyn StatisticsCollectedAttempt> = match collect {
-            Ok(collected) => Arc::from(collected),
-            Err(error) => {
-                resolve_collection_error(repository, &running, error, fence).await?;
-                continue;
-            }
-        };
-        // An explicit cancellation can still win before PUBLISHING. Once the
-        // state crosses that boundary the repository returns a typed conflict.
-        let Some(current) = repository
-            .get(running.job_id)
-            .await
-            .map_err(|error| format!("read statistics job {} failed: {error}", running.job_id))?
-        else {
-            return Err(format!("statistics job {} disappeared", running.job_id));
-        };
-        if current.state == StatisticsJobState::Cancelled {
-            continue;
-        }
-        if current.cancel_requested {
-            repository
-                .transition(
-                    running.job_id,
-                    StatisticsJobState::Running,
-                    StatisticsJobState::Cancelled,
-                    now_unix_millis(),
-                    None,
-                    fence,
-                )
-                .await
-                .map_err(|error| {
-                    format!(
-                        "cancel running statistics job {} failed: {error}",
-                        running.job_id
-                    )
-                })?;
-            continue;
-        }
-        let evidence = run_with_lease_renewal(guard, current_fence, {
-            let executor = Arc::clone(&executor);
-            let running = running.clone();
-            let collected = Arc::clone(&collected);
-            move || executor.prepare_publish(&running, collected.as_ref())
-        })
-        .await;
-        let evidence = match evidence {
-            Ok(evidence) => evidence,
-            Err(error) => {
-                resolve_collection_error(repository, &running, error, fence).await?;
-                continue;
-            }
-        };
-        let evidence_wire = evidence
-            .try_to_wire_v1()
-            .map_err(|error| format!("encode statistics publication evidence: {error}"))?;
-        let publishing = repository
-            .begin_publishing(
+        .map_err(|error| error.to_string())?;
+    let collected = match executor.collect(&running) {
+        Ok(collected) => collected,
+        Err(error) => {
+            return finish_error(
+                repository,
                 running.job_id,
-                now_unix_millis(),
-                evidence_wire,
-                Bytes::copy_from_slice(collected.basis_data_version()),
-                fence,
+                StatisticsJobState::Running,
+                error,
             )
-            .await
-            .map_err(|error| {
-                format!(
-                    "begin publish for statistics job {} failed: {error}",
-                    running.job_id
-                )
-            })?;
-        let publish = run_with_lease_renewal(guard, current_fence, {
-            let executor = Arc::clone(&executor);
-            let publishing = publishing.clone();
-            let collected = Arc::clone(&collected);
-            let evidence = evidence.clone();
-            move || executor.publish(&publishing, collected.as_ref(), &evidence)
-        })
+            .await;
+        }
+    };
+    if must_stop(repository, running.job_id, started, timeout).await? {
+        return cancel(
+            repository,
+            running.job_id,
+            StatisticsJobState::Running,
+            "statistics job cancelled before publication preparation",
+        )
         .await;
-        match publish {
-            Ok(()) => {
-                repository
-                    .transition(
-                        publishing.job_id,
-                        StatisticsJobState::Publishing,
-                        StatisticsJobState::Succeeded,
-                        now_unix_millis(),
-                        None,
-                        fence,
-                    )
-                    .await
-                    .map_err(|error| {
-                        format!(
-                            "finish statistics job {} failed: {error}",
-                            publishing.job_id
-                        )
-                    })?;
-            }
-            Err(error) if error.requires_reconcile => {
-                // Keep PUBLISHING durable. The next fenced worker reconciles
-                // with the exact evidence written before external publication.
-            }
-            Err(error) => {
-                repository
-                    .transition(
-                        publishing.job_id,
-                        StatisticsJobState::Publishing,
-                        StatisticsJobState::Failed,
-                        now_unix_millis(),
-                        Some(job_error(&error)),
-                        fence,
-                    )
-                    .await
-                    .map_err(|repository_error| {
-                        format!(
-                            "fail publish for statistics job {} failed: {repository_error}",
-                            publishing.job_id
-                        )
-                    })?;
-            }
+    }
+    let evidence = match executor.prepare_publish(&running, collected.as_ref()) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            return finish_error(
+                repository,
+                running.job_id,
+                StatisticsJobState::Running,
+                error,
+            )
+            .await;
+        }
+    };
+    if must_stop(repository, running.job_id, started, timeout).await? {
+        return cancel(
+            repository,
+            running.job_id,
+            StatisticsJobState::Running,
+            "statistics job cancelled before publication dispatch",
+        )
+        .await;
+    }
+    let publishing = repository
+        .transition(
+            running.job_id,
+            StatisticsJobState::Running,
+            StatisticsJobState::Publishing,
+            now_ms(),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    match executor.publish(&publishing, collected.as_ref(), &evidence) {
+        Ok(()) => {
+            repository
+                .transition(
+                    publishing.job_id,
+                    StatisticsJobState::Publishing,
+                    StatisticsJobState::Succeeded,
+                    now_ms(),
+                    None,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
+        Err(error) => {
+            finish_error(
+                repository,
+                publishing.job_id,
+                StatisticsJobState::Publishing,
+                error,
+            )
+            .await
         }
     }
-    Ok(())
 }
 
-async fn resolve_collection_error(
+async fn must_stop(
     repository: &StatisticsJobRepository,
-    job: &StatisticsJob,
-    error: StatisticsAttemptError,
-    fence: &FenceValidator,
+    job_id: Uuid,
+    started: Instant,
+    timeout: Duration,
+) -> Result<bool, String> {
+    if started.elapsed() >= timeout {
+        return Ok(true);
+    }
+    repository
+        .cancellation_requested(job_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn cancel(
+    repository: &StatisticsJobRepository,
+    job_id: Uuid,
+    expected: StatisticsJobState,
+    message: &str,
 ) -> Result<(), String> {
-    if matches!(
-        error.kind,
-        StatisticsJobErrorKind::TargetReplaced | StatisticsJobErrorKind::TargetMissing
-    ) {
-        // A typed binding failure means the persisted physical target was
-        // replaced or disappeared, so retrying could attach ANALYZE to another table.
-        repository
-            .transition(
-                job.job_id,
-                StatisticsJobState::Running,
-                StatisticsJobState::Stale,
-                now_unix_millis(),
-                Some(job_error(&error)),
-                fence,
-            )
-            .await
-            .map_err(|repository_error| {
-                format!(
-                    "record stale statistics job {} failed: {repository_error}",
-                    job.job_id
-                )
-            })?;
-        return Ok(());
-    }
-    if error.transient && job.attempt < MAX_STATISTICS_ATTEMPTS {
-        let now_ms = now_unix_millis();
-        repository
-            .retry_running(
-                job.job_id,
-                now_ms,
-                now_ms.saturating_add(retry_backoff(job.attempt).as_millis() as i64),
-                fence,
-            )
-            .await
-            .map_err(|repository_error| {
-                format!(
-                    "schedule retry for statistics job {} failed: {repository_error}",
-                    job.job_id
-                )
-            })?;
-    } else {
-        repository
-            .transition(
-                job.job_id,
-                StatisticsJobState::Running,
-                StatisticsJobState::Failed,
-                now_unix_millis(),
-                Some(job_error(&error)),
-                fence,
-            )
-            .await
-            .map_err(|repository_error| {
-                format!(
-                    "record collection failure for statistics job {} failed: {repository_error}",
-                    job.job_id
-                )
-            })?;
-    }
-    Ok(())
+    repository
+        .transition(
+            job_id,
+            expected,
+            StatisticsJobState::Cancelled,
+            now_ms(),
+            Some(StatisticsJobError {
+                kind: StatisticsJobErrorKind::Cancelled,
+                message: message.into(),
+            }),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
-fn retry_backoff(attempt: u32) -> Duration {
-    let exponent = attempt.saturating_sub(1).min(5);
-    RETRY_BACKOFF_BASE
-        .checked_mul(1_u32 << exponent)
-        .unwrap_or(RETRY_BACKOFF_MAX)
-        .min(RETRY_BACKOFF_MAX)
-}
-
-async fn run_with_lease_renewal<T, F>(
-    guard: &mut crate::state_store::coordination::LeaseGuard,
-    current_fence: &crate::coordination::CurrentLeaseFence,
-    work: F,
-) -> Result<T, StatisticsAttemptError>
-where
-    T: Send + 'static,
-    F: FnOnce() -> Result<T, StatisticsAttemptError> + Send + 'static,
-{
-    let mut task = tokio::task::spawn_blocking(work);
-    loop {
-        tokio::select! {
-            result = &mut task => {
-                return result.map_err(|error| StatisticsAttemptError::permanent(
-                    StatisticsJobErrorKind::Internal,
-                    format!("statistics attempt task failed: {error}"),
-                ))?;
-            }
-            _ = tokio::time::sleep(guard.renew_after()) => {
-                let operation_id = OperationId::new_v7();
-                let renewal = match guard.renew(operation_id).await {
-                    Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
-                        guard.recover_renew(operation_id).await
-                    }
-                    result => result,
-                };
-                if let Err(error) = renewal {
-                    let _ = task.await;
-                    return Err(StatisticsAttemptError::reconcile(
-                        StatisticsJobErrorKind::Internal,
-                        format!("statistics worker lease renewal failed: {error}"),
-                    ));
-                }
-                current_fence.replace(guard.fence()).map_err(|message| {
-                    StatisticsAttemptError::permanent(StatisticsJobErrorKind::Internal, message)
-                })?;
-            }
+async fn finish_error(
+    repository: &StatisticsJobRepository,
+    job_id: Uuid,
+    expected: StatisticsJobState,
+    error: StatisticsAttemptError,
+) -> Result<(), String> {
+    let (next, kind) = match error.publication {
+        Some(StatisticsPublicationTerminal::CommitUnknown) => (
+            StatisticsJobState::CommitUnknown,
+            StatisticsJobErrorKind::CommitUnknown,
+        ),
+        Some(StatisticsPublicationTerminal::KnownCommittedFinalization) => (
+            StatisticsJobState::Succeeded,
+            StatisticsJobErrorKind::KnownCommittedFinalization,
+        ),
+        Some(StatisticsPublicationTerminal::KnownUncommitted) | None => {
+            (StatisticsJobState::Failed, error.kind)
         }
-    }
+    };
+    repository
+        .transition(
+            job_id,
+            expected,
+            next,
+            now_ms(),
+            Some(StatisticsJobError {
+                kind,
+                message: error.message,
+            }),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
-fn job_error(error: &StatisticsAttemptError) -> StatisticsJobError {
-    StatisticsJobError {
-        kind: error.kind,
-        message: error.message.clone(),
-    }
-}
-
-fn now_unix_millis() -> i64 {
-    i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(i64::MAX)
-}
-
-/// Coordination facade used by the durable worker. Opening it may bootstrap a
-/// missing coordination record, but never mutates an already bootstrapped
-/// incarnation's restore/write mode.
-#[derive(Clone)]
-pub struct StatisticsAnalyzeWorkerCoordination {
-    frontend: FrontendCoordinationRuntime,
-    manager: LeaseManager,
-    resource: ResourceKey,
-}
-
-impl StatisticsAnalyzeWorkerCoordination {
-    pub async fn open(store: Arc<dyn StateStore>) -> Result<Self, CoordinationError> {
-        let frontend = FrontendCoordinationRuntime::open(store).await?;
-        Self::from_frontend(&frontend)
-    }
-
-    pub(crate) fn from_frontend(
-        frontend: &FrontendCoordinationRuntime,
-    ) -> Result<Self, CoordinationError> {
-        Ok(Self {
-            frontend: frontend.clone(),
-            manager: frontend.lease_manager(),
-            resource: ResourceKey::try_from(Bytes::from_static(
-                STATISTICS_ANALYZE_WORKER_RESOURCE_BYTES,
-            ))?,
-        })
-    }
-
-    pub async fn acquire(&self) -> Result<AcquireOutcome, CoordinationError> {
-        let attempt = AttemptId::try_from(Uuid::now_v7())?;
-        let operation_id = OperationId::new_v7();
-        match self
-            .manager
-            .acquire(self.resource.clone(), attempt, operation_id)
-            .await
-        {
-            Err(error) if error.kind() == CoordinationErrorKind::CommitUncertain => {
-                self.manager
-                    .recover_acquire(self.resource.clone(), attempt, operation_id)
-                    .await
-            }
-            result => result,
-        }
-    }
-
-    async fn admit_submitted_claims(
-        &self,
-        current_fence: &crate::coordination::CurrentLeaseFence,
-    ) -> Result<FenceValidator, CoordinationError> {
-        let admission = self.frontend.admit_writes().await?;
-        Ok(current_fence.validator_with_admission(admission))
-    }
-
-    /// Creates the validator used by repository mutation transactions. The
-    /// fence is checked in the same transaction as the job-record CAS and
-    /// state-index transition, so a lost worker can never publish a stale job
-    /// state after takeover.
-    pub fn fence_validator(fence: LeaseFence) -> FenceValidator {
-        Arc::new(move |transaction| {
-            let fence = fence.clone();
-            Box::pin(async move {
-                fence
-                    .validate_in(transaction)
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-        })
-    }
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }

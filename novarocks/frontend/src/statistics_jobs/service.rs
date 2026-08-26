@@ -9,18 +9,13 @@
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
+// software distributed under the Apache License is distributed on an
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
 
-//! Typed frontend application surface for statistics statements.
-//!
-//! Parser integration converts only the four supported statement AST variants
-//! to `StatisticsStatement`; this module never receives SQL text and never
-//! reparses it.  A missing StateStore remains a configuration error for every
-//! job command, while read-only table-stat display is supplied independently.
+//! Typed frontend application surface for current-process statistics jobs.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -32,10 +27,9 @@ use super::application;
 use super::model::{StatisticsJob, StatisticsJobCreate, StatisticsJobTarget};
 use super::repository::{StatisticsJobRepository, StatisticsJobRepositoryError};
 use super::worker::{
-    StatisticsAnalyzeWorker, StatisticsAnalyzeWorkerCoordination, StatisticsAttemptError,
-    StatisticsAttemptExecutor, StatisticsCollectedAttempt,
+    StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor,
+    StatisticsCollectedAttempt,
 };
-use crate::coordination::FrontendCoordinationRuntime;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalyzeTableStatement {
@@ -86,8 +80,6 @@ pub struct StatisticsTableStatRow {
     pub basis_relation: String,
 }
 
-/// Read-only statistics data may exist without a StateStore. This port is
-/// intentionally separate from durable job ownership and has no write method.
 pub trait TableStatisticsReader: Send + Sync {
     fn show_table_stats(
         &self,
@@ -95,8 +87,6 @@ pub trait TableStatisticsReader: Send + Sync {
     ) -> Result<Vec<StatisticsTableStatRow>, String>;
 }
 
-/// Captures the physical identity of an ANALYZE target before durable job
-/// creation. The returned schema columns are admission-only and never stored.
 pub trait StatisticsJobTargetResolver: Send + Sync {
     fn capture_table_object(
         &self,
@@ -116,11 +106,11 @@ impl StatisticsJobTargetResolver for UnavailableStatisticsJobTargetResolver {
 }
 
 struct StatisticsTargetResolverAdapter {
-    inner: std::sync::Arc<dyn application::StatisticsTargetResolver>,
+    inner: Arc<dyn application::StatisticsTargetResolver>,
 }
 
 struct StatisticsTableReaderAdapter {
-    inner: std::sync::Arc<dyn application::StatisticsTableReader>,
+    inner: Arc<dyn application::StatisticsTableReader>,
 }
 
 impl TableStatisticsReader for StatisticsTableReaderAdapter {
@@ -168,67 +158,39 @@ impl StatisticsJobTargetResolver for StatisticsTargetResolverAdapter {
 
 #[derive(Clone)]
 pub struct StatisticsApplicationService {
-    repository: Option<StatisticsJobRepository>,
-    target_resolver: std::sync::Arc<StatisticsTargetResolverSlot>,
+    repository: StatisticsJobRepository,
+    target_resolver: Arc<StatisticsTargetResolverSlot>,
 }
 
 struct StatisticsTargetResolverSlot {
-    resolver: std::sync::RwLock<std::sync::Arc<dyn StatisticsJobTargetResolver>>,
+    resolver: std::sync::RwLock<Arc<dyn StatisticsJobTargetResolver>>,
     bound: std::sync::atomic::AtomicBool,
 }
 
 impl StatisticsTargetResolverSlot {
     fn unbound() -> Self {
         Self {
-            resolver: std::sync::RwLock::new(std::sync::Arc::new(
-                UnavailableStatisticsJobTargetResolver,
-            )),
+            resolver: std::sync::RwLock::new(Arc::new(UnavailableStatisticsJobTargetResolver)),
             bound: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-
-    fn bound(resolver: std::sync::Arc<dyn StatisticsJobTargetResolver>) -> Self {
-        Self {
-            resolver: std::sync::RwLock::new(resolver),
-            bound: std::sync::atomic::AtomicBool::new(true),
         }
     }
 }
 
 impl StatisticsApplicationService {
-    pub fn unavailable() -> Self {
+    pub fn new() -> Self {
         Self {
-            repository: None,
-            target_resolver: std::sync::Arc::new(StatisticsTargetResolverSlot::unbound()),
+            repository: StatisticsJobRepository::new(),
+            target_resolver: Arc::new(StatisticsTargetResolverSlot::unbound()),
         }
     }
 
-    pub fn with_repository(repository: StatisticsJobRepository) -> Self {
-        Self {
-            repository: Some(repository),
-            target_resolver: std::sync::Arc::new(StatisticsTargetResolverSlot::unbound()),
-        }
-    }
-
-    pub fn worker_repository(&self) -> Option<StatisticsJobRepository> {
+    pub fn repository(&self) -> StatisticsJobRepository {
         self.repository.clone()
-    }
-
-    pub fn with_repository_and_target_resolver(
-        repository: StatisticsJobRepository,
-        target_resolver: std::sync::Arc<dyn StatisticsJobTargetResolver>,
-    ) -> Self {
-        Self {
-            repository: Some(repository),
-            target_resolver: std::sync::Arc::new(StatisticsTargetResolverSlot::bound(
-                target_resolver,
-            )),
-        }
     }
 
     pub fn bind_target_resolver(
         &self,
-        resolver: std::sync::Arc<dyn StatisticsJobTargetResolver>,
+        resolver: Arc<dyn StatisticsJobTargetResolver>,
     ) -> Result<(), String> {
         let mut slot = self
             .target_resolver
@@ -260,21 +222,21 @@ impl StatisticsApplicationService {
     ) -> Result<StatisticsStatementResult, StatisticsApplicationError> {
         match statement {
             StatisticsStatement::AnalyzeTable(statement) => {
-                let repository = self.repository()?;
                 let resolver = self
                     .target_resolver
                     .resolver
                     .read()
                     .map_err(|_| {
                         StatisticsApplicationError::target_resolution(
-                            "statistics target resolver lock poisoned".to_string(),
+                            "statistics target resolver lock poisoned",
                         )
                     })?
                     .clone();
                 let target_capture = resolver
                     .capture_table_object(&statement.target)
                     .map_err(StatisticsApplicationError::target_resolution)?;
-                let job = repository
+                let job = self
+                    .repository
                     .create(StatisticsJobCreate {
                         target: statement.target,
                         connector_instance_id: target_capture.connector_instance_id,
@@ -287,8 +249,8 @@ impl StatisticsApplicationService {
                 Ok(StatisticsStatementResult::JobSubmitted(job))
             }
             StatisticsStatement::ShowAnalyzeJobs(statement) => {
-                let repository = self.repository()?;
-                let mut jobs = repository
+                let mut jobs = self
+                    .repository
                     .list()
                     .await
                     .map_err(StatisticsApplicationError::repository)?;
@@ -297,14 +259,12 @@ impl StatisticsApplicationService {
                 }
                 Ok(StatisticsStatementResult::AnalyzeJobs(jobs))
             }
-            StatisticsStatement::CancelAnalyze(statement) => {
-                let repository = self.repository()?;
-                repository
-                    .request_cancel(statement.job_id, submitted_at_ms)
-                    .await
-                    .map(StatisticsStatementResult::JobCancellationRequested)
-                    .map_err(StatisticsApplicationError::repository)
-            }
+            StatisticsStatement::CancelAnalyze(statement) => self
+                .repository
+                .request_cancel(statement.job_id, submitted_at_ms)
+                .await
+                .map(StatisticsStatementResult::JobCancellationRequested)
+                .map_err(StatisticsApplicationError::repository),
             StatisticsStatement::ShowTableStats(statement) => table_statistics
                 .show_table_stats(&statement.target)
                 .map(StatisticsStatementResult::TableStats)
@@ -312,17 +272,14 @@ impl StatisticsApplicationService {
         }
     }
 
-    /// Wait only for a durable job observation. Statement cancellation or its
-    /// deadline ends this wait without writing cancellation intent; the worker
-    /// remains the only owner that can cancel its durable operation.
     async fn wait_for_terminal(
         &self,
         job_id: Uuid,
         execution: &crate::common::admitted_query_context::QueryExecutionContext,
     ) -> Result<Option<StatisticsJob>, StatisticsApplicationError> {
-        let repository = self.repository()?;
         loop {
-            let job = repository
+            let job = self
+                .repository
                 .get(job_id)
                 .await
                 .map_err(StatisticsApplicationError::repository)?
@@ -335,6 +292,7 @@ impl StatisticsApplicationService {
             if job.state.is_terminal() {
                 return Ok(Some(job));
             }
+            // This observer detaches; it never changes the process-owned job.
             if execution.cancellation().is_cancelled() {
                 return Ok(None);
             }
@@ -351,17 +309,16 @@ impl StatisticsApplicationService {
             tokio::time::sleep(sleep_for).await;
         }
     }
+}
 
-    fn repository(&self) -> Result<&StatisticsJobRepository, StatisticsApplicationError> {
-        self.repository
-            .as_ref()
-            .ok_or_else(StatisticsApplicationError::state_store_required)
+impl Default for StatisticsApplicationService {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatisticsApplicationErrorKind {
-    StateStoreRequired,
     Repository,
     TableStatistics,
     TargetResolution,
@@ -374,13 +331,6 @@ pub struct StatisticsApplicationError {
 }
 
 impl StatisticsApplicationError {
-    fn state_store_required() -> Self {
-        Self {
-            kind: StatisticsApplicationErrorKind::StateStoreRequired,
-            message: "statistics job commands require a configured frontend StateStore".into(),
-        }
-    }
-
     fn repository(error: StatisticsJobRepositoryError) -> Self {
         Self {
             kind: StatisticsApplicationErrorKind::Repository,
@@ -395,10 +345,10 @@ impl StatisticsApplicationError {
         }
     }
 
-    fn target_resolution(error: String) -> Self {
+    fn target_resolution(error: impl Into<String>) -> Self {
         Self {
             kind: StatisticsApplicationErrorKind::TargetResolution,
-            message: error,
+            message: error.into(),
         }
     }
 
@@ -415,13 +365,12 @@ impl fmt::Display for StatisticsApplicationError {
 
 impl std::error::Error for StatisticsApplicationError {}
 
-/// Frontend application owner for parsed statistics commands and durable
-/// StateStore access. It accepts no SQL text across this boundary.
+/// Frontend owner for parsed statistics commands and the current process
+/// worker. It accepts no SQL text across this boundary.
 pub struct FrontendStatisticsApplicationPort {
     service: StatisticsApplicationService,
-    table_statistics: std::sync::RwLock<Option<std::sync::Arc<dyn TableStatisticsReader>>>,
+    table_statistics: std::sync::RwLock<Option<Arc<dyn TableStatisticsReader>>>,
     runtime: tokio::runtime::Handle,
-    coordination: Option<StatisticsAnalyzeWorkerCoordination>,
     attempt_executor: Mutex<Option<Arc<dyn StatisticsAttemptExecutor>>>,
     worker: Mutex<Option<StatisticsAnalyzeWorker>>,
 }
@@ -432,36 +381,14 @@ impl FrontendStatisticsApplicationPort {
             service,
             table_statistics: std::sync::RwLock::new(None),
             runtime,
-            coordination: None,
             attempt_executor: Mutex::new(None),
             worker: Mutex::new(None),
         }
     }
 
-    pub(crate) fn with_frontend_coordination(
-        service: StatisticsApplicationService,
-        runtime: tokio::runtime::Handle,
-        frontend: &FrontendCoordinationRuntime,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            service,
-            table_statistics: std::sync::RwLock::new(None),
-            runtime,
-            coordination: Some(
-                StatisticsAnalyzeWorkerCoordination::from_frontend(frontend)
-                    .map_err(|error| error.to_string())?,
-            ),
-            attempt_executor: Mutex::new(None),
-            worker: Mutex::new(None),
-        })
-    }
-
-    /// Called only after frontend composition has opened its pin-aware statistics reader.
-    /// Rebinding would permit a stale engine to replace the active reader, so
-    /// reject it rather than silently changing a live application boundary.
     pub fn bind_table_statistics_reader(
         &self,
-        reader: std::sync::Arc<dyn TableStatisticsReader>,
+        reader: Arc<dyn TableStatisticsReader>,
     ) -> Result<(), String> {
         let mut slot = self
             .table_statistics
@@ -474,15 +401,12 @@ impl FrontendStatisticsApplicationPort {
         Ok(())
     }
 
-    /// Called after frontend composition has opened its connector-control registry. Rebinding
-    /// would permit a different engine generation to change ANALYZE target
-    /// resolution while jobs are live, so fail rather than silently replace it.
     pub fn bind_statistics_target_resolver(
         &self,
-        resolver: std::sync::Arc<dyn application::StatisticsTargetResolver>,
+        resolver: Arc<dyn application::StatisticsTargetResolver>,
     ) -> Result<(), String> {
         self.service
-            .bind_target_resolver(std::sync::Arc::new(StatisticsTargetResolverAdapter {
+            .bind_target_resolver(Arc::new(StatisticsTargetResolverAdapter {
                 inner: resolver,
             }))
     }
@@ -491,11 +415,6 @@ impl FrontendStatisticsApplicationPort {
         &self,
         executor: Arc<dyn application::StatisticsAttemptExecutor>,
     ) -> Result<(), String> {
-        let Some(repository) = self.service.worker_repository() else {
-            // SHOW TABLE STATS remains available without StateStore, but a
-            // durable job worker must never fall back to an in-memory table.
-            return Ok(());
-        };
         let adapter: Arc<dyn StatisticsAttemptExecutor> =
             Arc::new(StatisticsAttemptAdapter { inner: executor });
         let mut executor_slot = self
@@ -505,21 +424,12 @@ impl FrontendStatisticsApplicationPort {
         if executor_slot.is_some() {
             return Err("statistics attempt executor is already bound".to_string());
         }
-        let worker = tokio::task::block_in_place(|| match self.coordination.clone() {
-            Some(coordination) => {
-                self.runtime
-                    .block_on(StatisticsAnalyzeWorker::start_with_coordination(
-                        &self.runtime,
-                        Arc::new(repository),
-                        Arc::clone(&adapter),
-                        coordination,
-                    ))
-            }
-            None => self.runtime.block_on(StatisticsAnalyzeWorker::start(
+        let worker = tokio::task::block_in_place(|| {
+            self.runtime.block_on(StatisticsAnalyzeWorker::start(
                 &self.runtime,
-                Arc::new(repository),
+                self.service.repository(),
                 Arc::clone(&adapter),
-            )),
+            ))
         })?;
         let mut worker_slot = self
             .worker
@@ -534,12 +444,12 @@ impl FrontendStatisticsApplicationPort {
     }
 
     pub fn shutdown_worker(&self) -> Result<(), String> {
-        let worker = self
+        if let Some(mut worker) = self
             .worker
             .lock()
             .map_err(|_| "statistics worker lock poisoned".to_string())?
-            .take();
-        if let Some(mut worker) = worker {
+            .take()
+        {
             worker.shutdown()?;
         }
         self.attempt_executor
@@ -576,16 +486,7 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
                 })
             }
         };
-        let submitted_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| application::StatisticsApplicationError::new(error.to_string()))?
-            .as_millis()
-            .try_into()
-            .map_err(|_| {
-                application::StatisticsApplicationError::new(
-                    "statistics submission timestamp overflow",
-                )
-            })?;
+        let submitted_at_ms = now_ms().map_err(application::StatisticsApplicationError::new)?;
         let reader = self
             .table_statistics
             .read()
@@ -594,9 +495,8 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
                     "statistics table reader lock poisoned",
                 )
             })?
-            .clone();
-        let reader: std::sync::Arc<dyn TableStatisticsReader> =
-            reader.unwrap_or_else(|| std::sync::Arc::new(UnboundTableStatisticsReader));
+            .clone()
+            .unwrap_or_else(|| Arc::new(UnboundTableStatisticsReader));
         let result = tokio::task::block_in_place(|| {
             self.runtime.block_on(
                 self.service
@@ -634,7 +534,7 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
 impl application::StatisticsTargetResolverSink for FrontendStatisticsApplicationPort {
     fn bind_statistics_target_resolver(
         &self,
-        resolver: std::sync::Arc<dyn application::StatisticsTargetResolver>,
+        resolver: Arc<dyn application::StatisticsTargetResolver>,
     ) -> Result<(), String> {
         self.bind_statistics_target_resolver(resolver)
     }
@@ -643,11 +543,9 @@ impl application::StatisticsTargetResolverSink for FrontendStatisticsApplication
 impl application::StatisticsTableReaderSink for FrontendStatisticsApplicationPort {
     fn bind_statistics_table_reader(
         &self,
-        reader: std::sync::Arc<dyn application::StatisticsTableReader>,
+        reader: Arc<dyn application::StatisticsTableReader>,
     ) -> Result<(), String> {
-        self.bind_table_statistics_reader(std::sync::Arc::new(StatisticsTableReaderAdapter {
-            inner: reader,
-        }))
+        self.bind_table_statistics_reader(Arc::new(StatisticsTableReaderAdapter { inner: reader }))
     }
 }
 
@@ -668,9 +566,8 @@ impl StatisticsCollectedAttempt for StatisticsCollectedAttemptAdapter {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-
     fn basis_data_version(&self) -> &[u8] {
-        self.inner.basis_data_version().as_bytes().as_ref()
+        self.inner.basis_data_version().as_bytes()
     }
 }
 
@@ -716,16 +613,8 @@ impl StatisticsAttemptAdapter {
                 }
             };
             StatisticsAttemptError::permanent(kind, error.to_string())
-        } else if error.requires_reconcile() {
-            StatisticsAttemptError::reconcile(
-                super::model::StatisticsJobErrorKind::Publish,
-                error.to_string(),
-            )
-        } else if error.retryable() {
-            StatisticsAttemptError::transient(
-                super::model::StatisticsJobErrorKind::Connector,
-                error.to_string(),
-            )
+        } else if let Some(terminal) = error.publication_terminal() {
+            StatisticsAttemptError::publication(terminal, error.to_string())
         } else {
             StatisticsAttemptError::permanent(
                 super::model::StatisticsJobErrorKind::Connector,
@@ -769,15 +658,6 @@ impl StatisticsAttemptExecutor for StatisticsAttemptAdapter {
             .publish(&Self::request(job), Self::collected(collected)?, evidence)
             .map_err(Self::map_error)
     }
-
-    fn reconcile(
-        &self,
-        job: &StatisticsJob,
-        evidence: &novarocks_spi::connector::ExternalMutationEvidence,
-    ) -> Result<(), StatisticsAttemptError> {
-        let _ = job;
-        self.inner.reconcile(evidence).map_err(Self::map_error)
-    }
 }
 
 struct UnboundTableStatisticsReader;
@@ -787,17 +667,10 @@ impl TableStatisticsReader for UnboundTableStatisticsReader {
         &self,
         _target: &StatisticsJobTarget,
     ) -> Result<Vec<StatisticsTableStatRow>, String> {
-        Err("SHOW TABLE STATS is unavailable until the frontend statistics reader is bound".into())
-    }
-}
-
-impl From<application::StatisticsTableTarget> for StatisticsJobTarget {
-    fn from(value: application::StatisticsTableTarget) -> Self {
-        Self {
-            catalog: value.catalog,
-            namespace: value.namespace,
-            table: value.table,
-        }
+        Err(
+            "SHOW TABLE STATS is unavailable until the frontend statistics table reader is bound"
+                .into(),
+        )
     }
 }
 
@@ -805,10 +678,8 @@ fn map_application_result(
     result: StatisticsStatementResult,
 ) -> application::StatisticsApplicationResult {
     match result {
-        StatisticsStatementResult::JobSubmitted(job) => {
-            application::StatisticsApplicationResult::JobSubmitted(job_view(job))
-        }
-        StatisticsStatementResult::JobCompleted(job) => {
+        StatisticsStatementResult::JobSubmitted(job)
+        | StatisticsStatementResult::JobCompleted(job) => {
             application::StatisticsApplicationResult::JobSubmitted(job_view(job))
         }
         StatisticsStatementResult::JobCancellationRequested(job) => {
@@ -848,19 +719,19 @@ fn job_view(job: StatisticsJob) -> application::StatisticsJobView {
             namespace: job.target.namespace,
             table: job.target.table,
         },
-        error_kind: job.error.as_ref().map(|error| {
-            match error.kind {
-                super::model::StatisticsJobErrorKind::Configuration => "CONFIGURATION",
-                super::model::StatisticsJobErrorKind::Connector => "CONNECTOR",
-                super::model::StatisticsJobErrorKind::Collection => "COLLECTION",
-                super::model::StatisticsJobErrorKind::Publish => "PUBLISH",
-                super::model::StatisticsJobErrorKind::TargetReplaced => "TARGET_REPLACED",
-                super::model::StatisticsJobErrorKind::TargetMissing => "TARGET_MISSING",
-                super::model::StatisticsJobErrorKind::Cancelled => "CANCELLED",
-                super::model::StatisticsJobErrorKind::Internal => "INTERNAL",
-            }
-            .to_string()
-        }),
+        error_kind: job
+            .error
+            .as_ref()
+            .map(|error| format!("{:?}", error.kind).to_ascii_uppercase()),
         error_message: job.error.map(|error| error.message),
     }
+}
+
+fn now_ms() -> Result<i64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis()
+        .try_into()
+        .map_err(|_| "statistics submission timestamp overflow".to_string())
 }

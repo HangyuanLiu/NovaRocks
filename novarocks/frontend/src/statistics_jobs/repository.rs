@@ -9,77 +9,38 @@
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
+// software distributed under the Apache License is distributed on an
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
 
-use std::fmt;
-use std::sync::Arc;
+//! Bounded in-memory repository for the current frontend process.
 
-use bytes::Bytes;
-use novarocks_spi::connector::ExternalMutationEvidence;
-use novarocks_spi::state_store::{
-    CommitOutcome, Direction, Key, KeyRange, Precondition, RangeRequest, ReadTransaction,
-    StateStore, StateStoreError, StateStoreErrorKind, TransactionId, Value, VersionToken,
-    WriteTransaction,
-};
-use serde::de::DeserializeOwned;
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::sync::{Arc, Mutex};
+
 use uuid::Uuid;
 
-use crate::durable::{DurableOpaqueBytes, DurableRecordError, DurableRecordStore};
+use super::model::{StatisticsJob, StatisticsJobCreate, StatisticsJobError, StatisticsJobState};
 
-use super::model::{
-    MAX_DURABLE_STATISTICS_BASIS_DATA_VERSION_BYTES,
-    MAX_DURABLE_STATISTICS_PUBLICATION_EVIDENCE_BYTES,
-    MAX_DURABLE_STATISTICS_TABLE_OBJECT_ID_BYTES, MAX_STATISTICS_ERROR_MESSAGE_BYTES,
-    MAX_STATISTICS_EXPLICIT_COLUMN_BYTES, MAX_STATISTICS_EXPLICIT_COLUMNS,
-    MAX_STATISTICS_TARGET_COMPONENT_BYTES, STATISTICS_JOB_SCHEMA_VERSION, StatisticsJob,
-    StatisticsJobCreate, StatisticsJobError, StatisticsJobState, StoredStatisticsJobV3,
-};
-
-const JOB_PREFIX: &str = "novarocks/frontend/statistics/v2/jobs/";
-const STATISTICS_JOB_STATE_INDEX_VALUE_BYTES: usize = 36;
-// A create has unique job and state-index keys, so a SQLite snapshot conflict
-// is never a semantic duplicate. Retry the same durable identity instead of
-// exposing storage contention as an ANALYZE failure.
-const CREATE_CONFLICT_RETRY_LIMIT: usize = 8;
-
-/// A worker passes this closure to atomically validate its coordination fence
-/// before a durable job mutation. The repository deliberately has no lease
-/// dependency and never manufactures an in-memory ownership fallback.
-///
-/// Defined once in [`crate::coordination`] so the statistics and MV refresh
-/// owners cannot drift into two different notions of "validated in the same
-/// transaction".
-pub use crate::coordination::FenceValidator;
+pub const MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS: usize = 1024;
+pub const MAX_RECENT_TERMINAL_STATISTICS_JOBS: usize = 4096;
+pub const RECENT_TERMINAL_STATISTICS_JOB_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatisticsJobRepositoryErrorKind {
     NotFound,
     Conflict,
+    Capacity,
     InvalidTransition,
-    UnsupportedSchemaVersion,
-    Corruption,
-    CommitUnknown,
-    BudgetExceeded,
-    Store,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StatisticsJobRecordBudget {
-    pub record_kind: &'static str,
-    pub schema_version: u8,
-    pub actual_bytes: usize,
-    pub limit_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsJobRepositoryError {
     kind: StatisticsJobRepositoryErrorKind,
     message: String,
-    budget: Option<StatisticsJobRecordBudget>,
 }
 
 impl StatisticsJobRepositoryError {
@@ -87,51 +48,10 @@ impl StatisticsJobRepositoryError {
         self.kind
     }
 
-    pub const fn budget(&self) -> Option<StatisticsJobRecordBudget> {
-        self.budget
-    }
-
     fn new(kind: StatisticsJobRepositoryErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
-            budget: None,
-        }
-    }
-
-    fn corruption(message: impl Into<String>) -> Self {
-        Self::new(StatisticsJobRepositoryErrorKind::Corruption, message)
-    }
-
-    fn unsupported_schema_version(schema_version: u8) -> Self {
-        Self::new(
-            StatisticsJobRepositoryErrorKind::UnsupportedSchemaVersion,
-            format!(
-                "statistics job record has unsupported schema version {schema_version}; expected {STATISTICS_JOB_SCHEMA_VERSION}"
-            ),
-        )
-    }
-
-    fn durable(error: DurableRecordError) -> Self {
-        match error {
-            DurableRecordError::BudgetExceeded {
-                record_kind,
-                schema_version,
-                actual_bytes,
-                limit_bytes,
-            } => Self {
-                kind: StatisticsJobRepositoryErrorKind::BudgetExceeded,
-                message: format!(
-                    "statistics durable record {record_kind} schema version {schema_version} encoded to {actual_bytes} bytes, exceeding its {limit_bytes}-byte budget"
-                ),
-                budget: Some(StatisticsJobRecordBudget {
-                    record_kind,
-                    schema_version,
-                    actual_bytes,
-                    limit_bytes,
-                }),
-            },
-            other => Self::corruption(other.to_string()),
         }
     }
 }
@@ -144,12 +64,16 @@ impl fmt::Display for StatisticsJobRepositoryError {
 
 impl std::error::Error for StatisticsJobRepositoryError {}
 
-type RepositoryResult<T> = Result<T, StatisticsJobRepositoryError>;
+#[derive(Default)]
+struct RuntimeState {
+    active: HashMap<Uuid, StatisticsJob>,
+    terminal: VecDeque<StatisticsJob>,
+}
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct StatisticsJobRepository {
-    store: Arc<dyn StateStore>,
-    durable_records: DurableRecordStore,
+    state: Arc<Mutex<RuntimeState>>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl fmt::Debug for StatisticsJobRepository {
@@ -161,194 +85,113 @@ impl fmt::Debug for StatisticsJobRepository {
 }
 
 impl StatisticsJobRepository {
-    pub async fn open(store: Arc<dyn StateStore>) -> RepositoryResult<Self> {
-        let repository = Self {
-            durable_records: DurableRecordStore::new(Arc::clone(&store)),
-            store,
-        };
-        repository.list().await?;
-        Ok(repository)
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    pub(crate) fn store(&self) -> Arc<dyn StateStore> {
-        Arc::clone(&self.store)
-    }
-
-    pub async fn create(&self, request: StatisticsJobCreate) -> RepositoryResult<StatisticsJob> {
-        self.create_with_fence(request, None).await
-    }
-
-    pub async fn create_with_fence(
+    pub async fn create(
         &self,
         request: StatisticsJobCreate,
-        fence: Option<&FenceValidator>,
-    ) -> RepositoryResult<StatisticsJob> {
-        validate_create(&request)?;
-        let job_id = Uuid::now_v7();
-        let operation_id = novarocks_spi::connector::LakePublicationId::new_v7();
-        let stored = StoredStatisticsJobV3::try_new(job_id, operation_id, request)
-            .map_err(StatisticsJobRepositoryError::durable)?;
-        for retry in 0..=CREATE_CONFLICT_RETRY_LIMIT {
-            let mut transaction = self.begin_write("create frontend statistics job").await?;
-            validate_fence(fence, transaction.as_mut()).await?;
-            let record = self
-                .durable_records
-                .encode(&stored)
-                .map_err(StatisticsJobRepositoryError::durable)?;
-            let state_index = self.index_value(job_id)?;
-            self.durable_records
-                .put_record(
-                    transaction.as_mut(),
-                    job_key(job_id)?,
-                    record,
-                    Precondition::Absent,
-                )
-                .await
-                .map_err(store_error)?;
-            transaction
-                .put(
-                    state_key(StatisticsJobState::Submitted, job_id)?,
-                    state_index,
-                    Precondition::Absent,
-                )
-                .await
-                .map_err(store_error)?;
-            match self
-                .commit_or_recover(transaction, "create frontend statistics job", &stored)
-                .await
-            {
-                Ok(job) => return Ok(job),
-                Err(error)
-                    if error.kind() == StatisticsJobRepositoryErrorKind::Conflict
-                        && retry < CREATE_CONFLICT_RETRY_LIMIT =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error),
-            }
+    ) -> Result<StatisticsJob, StatisticsJobRepositoryError> {
+        let mut state = self.lock()?;
+        Self::prune_locked(&mut state, request.submitted_at_ms);
+        if state.active.len() >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS {
+            return Err(StatisticsJobRepositoryError::new(
+                StatisticsJobRepositoryErrorKind::Capacity,
+                format!(
+                    "statistics runtime has reached its {MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS} active or queued job limit"
+                ),
+            ));
         }
-        unreachable!("statistics create retry loop always returns")
+        let job = StatisticsJob::new(
+            Uuid::now_v7(),
+            novarocks_spi::connector::LakePublicationId::new_v7(),
+            request,
+        );
+        state.active.insert(job.job_id, job.clone());
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(job)
     }
 
-    pub async fn get(&self, job_id: Uuid) -> RepositoryResult<Option<StatisticsJob>> {
-        let mut transaction = self.store.begin_read().await.map_err(store_error)?;
-        let result = load_job(transaction.as_mut(), job_id)
-            .await?
-            .map(|job| StatisticsJob::from(&job.stored));
-        transaction.abort().await.map_err(store_error)?;
+    pub async fn get(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Option<StatisticsJob>, StatisticsJobRepositoryError> {
+        let state = self.lock()?;
+        Ok(state.active.get(&job_id).cloned().or_else(|| {
+            state
+                .terminal
+                .iter()
+                .find(|job| job.job_id == job_id)
+                .cloned()
+        }))
+    }
+
+    pub async fn list(&self) -> Result<Vec<StatisticsJob>, StatisticsJobRepositoryError> {
+        let mut state = self.lock()?;
+        Self::prune_locked(&mut state, now_ms());
+        let mut jobs: Vec<_> = state.active.values().cloned().collect();
+        jobs.extend(state.terminal.iter().cloned());
+        jobs.sort_by_key(|job| (job.submitted_at_ms, job.job_id));
+        Ok(jobs)
+    }
+
+    pub async fn request_cancel(
+        &self,
+        job_id: Uuid,
+        at_ms: i64,
+    ) -> Result<StatisticsJob, StatisticsJobRepositoryError> {
+        let mut state = self.lock()?;
+        let Some(job) = state.active.get_mut(&job_id) else {
+            return Err(StatisticsJobRepositoryError::new(
+                StatisticsJobRepositoryErrorKind::NotFound,
+                format!("statistics job {job_id} is not in this frontend process"),
+            ));
+        };
+        job.cancel_requested = true;
+        job.updated_at_ms = at_ms;
+        if job.state == StatisticsJobState::Submitted {
+            let mut terminal = state.active.remove(&job_id).expect("submitted job exists");
+            terminal.state = StatisticsJobState::Cancelled;
+            terminal.completed_at_ms = Some(at_ms);
+            terminal.error = Some(StatisticsJobError {
+                kind: super::model::StatisticsJobErrorKind::Cancelled,
+                message: "statistics job cancelled before dispatch".into(),
+            });
+            state.terminal.push_back(terminal.clone());
+            Self::prune_locked(&mut state, at_ms);
+            drop(state);
+            self.changed.notify_waiters();
+            return Ok(terminal);
+        }
+        let result = job.clone();
+        drop(state);
+        self.changed.notify_waiters();
         Ok(result)
     }
 
-    pub async fn list(&self) -> RepositoryResult<Vec<StatisticsJob>> {
-        let prefix = key(JOB_PREFIX)?;
-        let range = KeyRange::for_prefix(prefix).map_err(store_error)?;
-        let mut transaction = self.store.begin_read().await.map_err(store_error)?;
-        let mut request = RangeRequest {
-            range,
-            direction: Direction::Forward,
-            page_size: self.store.limits().max_page_size,
-            continuation: None,
-        };
-        let mut jobs = Vec::new();
-        loop {
-            let page = transaction.range(&request).await.map_err(store_error)?;
-            for record in page.records {
-                let header: StoredStatisticsJobHeader =
-                    decode_json(record.value.as_bytes(), "statistics job header")?;
-                if header.schema_version != STATISTICS_JOB_SCHEMA_VERSION {
-                    return Err(StatisticsJobRepositoryError::unsupported_schema_version(
-                        header.schema_version,
-                    ));
-                }
-                let stored: StoredStatisticsJobV3 =
-                    decode_json(record.value.as_bytes(), "statistics job")?;
-                validate_stored(&stored)?;
-                jobs.push(StatisticsJob::from(&stored));
-            }
-            let Some(continuation) = page.continuation else {
-                break;
-            };
-            request.continuation = Some(continuation);
-        }
-        transaction.abort().await.map_err(store_error)?;
-        jobs.sort_by_key(|job| job.job_id);
-        Ok(jobs)
-    }
-
-    pub async fn list_by_state(
+    pub async fn claim_next(
         &self,
-        state: StatisticsJobState,
-    ) -> RepositoryResult<Vec<StatisticsJob>> {
-        let prefix_text = state_prefix(state);
-        let prefix = key(prefix_text)?;
-        let range = KeyRange::for_prefix(prefix).map_err(store_error)?;
-        let mut transaction = self.store.begin_read().await.map_err(store_error)?;
-        let mut request = RangeRequest {
-            range,
-            direction: Direction::Forward,
-            page_size: self.store.limits().max_page_size,
-            continuation: None,
-        };
-        let mut jobs = Vec::new();
-        loop {
-            let page = transaction.range(&request).await.map_err(store_error)?;
-            for record in page.records {
-                let job_id = decode_index_value(&record.value)?;
-                let stored = load_job(transaction.as_mut(), job_id)
-                    .await?
-                    .ok_or_else(|| {
-                        StatisticsJobRepositoryError::corruption(
-                            "statistics job state index references a missing job",
-                        )
-                    })?;
-                if stored.stored.state != state {
-                    return Err(StatisticsJobRepositoryError::corruption(
-                        "statistics job state index does not match its job record",
-                    ));
-                }
-                jobs.push(StatisticsJob::from(&stored.stored));
-            }
-            let Some(continuation) = page.continuation else {
-                break;
-            };
-            request.continuation = Some(continuation);
-        }
-        transaction.abort().await.map_err(store_error)?;
-        jobs.sort_by_key(|job| job.job_id);
-        Ok(jobs)
-    }
-
-    /// Claiming begins the worker-owned lifecycle by atomically moving a
-    /// submitted job into PREPARING and incrementing its retry attempt.
-    pub async fn claim(
-        &self,
-        job_id: Uuid,
-        now_ms: i64,
-        fence: &FenceValidator,
-    ) -> RepositoryResult<Option<StatisticsJob>> {
-        let Some(job) = self.get(job_id).await? else {
+        at_ms: i64,
+    ) -> Result<Option<StatisticsJob>, StatisticsJobRepositoryError> {
+        let mut state = self.lock()?;
+        let job_id = state
+            .active
+            .values()
+            .filter(|job| job.state == StatisticsJobState::Submitted && !job.cancel_requested)
+            .min_by_key(|job| (job.submitted_at_ms, job.job_id))
+            .map(|job| job.job_id);
+        let Some(job_id) = job_id else {
             return Ok(None);
         };
-        if job.state != StatisticsJobState::Submitted {
-            return Ok(None);
-        }
-        if job.cancel_requested {
-            return Ok(None);
-        }
-        self.transition_with_fence(
-            job_id,
-            StatisticsJobState::Submitted,
-            StatisticsJobState::Preparing,
-            now_ms,
-            None,
-            Some(fence),
-            true,
-            None,
-            None,
-            None,
-        )
-        .await
-        .map(Some)
+        let job = state.active.get_mut(&job_id).expect("selected job exists");
+        job.state = StatisticsJobState::Preparing;
+        job.updated_at_ms = at_ms;
+        let result = job.clone();
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(Some(result))
     }
 
     pub async fn transition(
@@ -356,638 +199,114 @@ impl StatisticsJobRepository {
         job_id: Uuid,
         expected: StatisticsJobState,
         next: StatisticsJobState,
-        now_ms: i64,
+        at_ms: i64,
         error: Option<StatisticsJobError>,
-        fence: &FenceValidator,
-    ) -> RepositoryResult<StatisticsJob> {
-        if next == StatisticsJobState::Publishing {
-            return Err(StatisticsJobRepositoryError::corruption(
-                "statistics publication requires operation evidence",
-            ));
-        }
-        self.transition_with_fence(
-            job_id,
-            expected,
-            next,
-            now_ms,
-            error,
-            Some(fence),
-            false,
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
-    /// Atomically installs the already-prepared reconciliation evidence and
-    /// crosses the irreversible publish boundary under the active lease
-    /// fence. A crash after this commit can only reconcile, never recollect or
-    /// republish blindly.
-    pub async fn begin_publishing(
-        &self,
-        job_id: Uuid,
-        now_ms: i64,
-        publication_evidence: Bytes,
-        basis_data_version: Bytes,
-        fence: &FenceValidator,
-    ) -> RepositoryResult<StatisticsJob> {
-        let publication_evidence = DurableOpaqueBytes::try_new(publication_evidence.to_vec())
-            .map_err(StatisticsJobRepositoryError::durable)?;
-        let basis_data_version = DurableOpaqueBytes::try_new(basis_data_version.to_vec())
-            .map_err(StatisticsJobRepositoryError::durable)?;
-        self.transition_with_fence(
-            job_id,
-            StatisticsJobState::Running,
-            StatisticsJobState::Publishing,
-            now_ms,
-            None,
-            Some(fence),
-            false,
-            None,
-            Some(publication_evidence),
-            Some(basis_data_version),
-        )
-        .await
-    }
-
-    /// Replays an incomplete attempt after frontend failover. Only preparation
-    /// and collection can return to SUBMITTED: PUBLISHING is intentionally
-    /// excluded because it must reconcile its operation-specific receipt.
-    pub async fn requeue_incomplete(
-        &self,
-        job_id: Uuid,
-        now_ms: i64,
-        fence: &FenceValidator,
-    ) -> RepositoryResult<Option<StatisticsJob>> {
-        let Some(job) = self.get(job_id).await? else {
-            return Ok(None);
-        };
-        if !matches!(
-            job.state,
-            StatisticsJobState::Preparing | StatisticsJobState::Running
-        ) {
-            return Ok(None);
-        }
-        self.transition_with_fence(
-            job_id,
-            job.state,
-            StatisticsJobState::Submitted,
-            now_ms,
-            None,
-            Some(fence),
-            false,
-            None,
-            None,
-            None,
-        )
-        .await
-        .map(Some)
-    }
-
-    /// Records client cancellation intent without changing the worker-owned
-    /// lifecycle state.  The active fenced worker consumes this bit in the
-    /// same transaction as its `state -> CANCELLED` CAS.
-    pub async fn request_cancel(
-        &self,
-        job_id: Uuid,
-        now_ms: i64,
-    ) -> RepositoryResult<StatisticsJob> {
-        let mut transaction = self
-            .begin_write("request frontend statistics job cancellation")
-            .await?;
-        let versioned = load_job(transaction.as_mut(), job_id)
-            .await?
-            .ok_or_else(|| not_found(job_id))?;
-        if !matches!(
-            versioned.stored.state,
-            StatisticsJobState::Submitted
-                | StatisticsJobState::Preparing
-                | StatisticsJobState::Running
-        ) {
-            return Err(StatisticsJobRepositoryError::new(
-                StatisticsJobRepositoryErrorKind::Conflict,
-                format!(
-                    "cancel statistics job {job_id} conflicts with {:?}",
-                    versioned.stored.state
-                ),
-            ));
-        }
-        let mut stored = versioned.stored;
-        stored.cancel_requested = true;
-        stored.updated_at_ms = now_ms;
-        let record = self
-            .durable_records
-            .encode(&stored)
-            .map_err(StatisticsJobRepositoryError::durable)?;
-        self.durable_records
-            .put_record(
-                transaction.as_mut(),
-                job_key(job_id)?,
-                record,
-                Precondition::Version(versioned.version),
+    ) -> Result<StatisticsJob, StatisticsJobRepositoryError> {
+        let mut state = self.lock()?;
+        let job = state.active.get(&job_id).cloned().ok_or_else(|| {
+            StatisticsJobRepositoryError::new(
+                StatisticsJobRepositoryErrorKind::NotFound,
+                format!("statistics job {job_id} is not in this frontend process"),
             )
-            .await
-            .map_err(store_error)?;
-        self.commit_or_recover(
-            transaction,
-            "request frontend statistics job cancellation",
-            &stored,
-        )
-        .await
-    }
-
-    /// Worker-only cancellation transition. Callers must provide the active
-    /// lease fence; clients use `request_cancel` instead.
-    pub async fn cancel(
-        &self,
-        job_id: Uuid,
-        now_ms: i64,
-        fence: &FenceValidator,
-    ) -> RepositoryResult<StatisticsJob> {
-        let job = self.get(job_id).await?.ok_or_else(|| not_found(job_id))?;
-        if job.state == StatisticsJobState::Publishing {
-            return Err(StatisticsJobRepositoryError::new(
-                StatisticsJobRepositoryErrorKind::Conflict,
-                format!("cancel statistics job {job_id} conflicts with PUBLISHING"),
-            ));
-        }
-        self.transition_with_fence(
-            job_id,
-            job.state,
-            StatisticsJobState::Cancelled,
-            now_ms,
-            None,
-            Some(fence),
-            false,
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
-    /// Requeues a transient collection failure with a durable retry deadline.
-    /// The deadline is atomically written with the CAS and fence validation,
-    /// so frontend failover cannot convert backoff into an immediate retry.
-    pub async fn retry_running(
-        &self,
-        job_id: Uuid,
-        now_ms: i64,
-        retry_not_before_ms: i64,
-        fence: &FenceValidator,
-    ) -> RepositoryResult<StatisticsJob> {
-        if retry_not_before_ms <= now_ms {
-            return Err(StatisticsJobRepositoryError::corruption(
-                "statistics retry deadline must be after transition time",
-            ));
-        }
-        self.transition_with_fence(
-            job_id,
-            StatisticsJobState::Running,
-            StatisticsJobState::Submitted,
-            now_ms,
-            None,
-            Some(fence),
-            false,
-            Some(retry_not_before_ms),
-            None,
-            None,
-        )
-        .await
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "The durable job transition keeps its independently validated state inputs explicit."
-    )]
-    async fn transition_with_fence(
-        &self,
-        job_id: Uuid,
-        expected: StatisticsJobState,
-        next: StatisticsJobState,
-        now_ms: i64,
-        error: Option<StatisticsJobError>,
-        fence: Option<&FenceValidator>,
-        increment_attempt: bool,
-        retry_not_before_ms: Option<i64>,
-        publication_evidence: Option<
-            DurableOpaqueBytes<MAX_DURABLE_STATISTICS_PUBLICATION_EVIDENCE_BYTES>,
-        >,
-        basis_data_version: Option<
-            DurableOpaqueBytes<MAX_DURABLE_STATISTICS_BASIS_DATA_VERSION_BYTES>,
-        >,
-    ) -> RepositoryResult<StatisticsJob> {
-        if !expected.can_transition_to(next) {
-            return Err(invalid_transition(job_id, expected, next));
-        }
-        validate_error(error.as_ref())?;
-        let mut transaction = self
-            .begin_write("transition frontend statistics job")
-            .await?;
-        validate_fence(fence, transaction.as_mut()).await?;
-        let versioned = load_job(transaction.as_mut(), job_id)
-            .await?
-            .ok_or_else(|| not_found(job_id))?;
-        if versioned.stored.state != expected {
-            return Err(StatisticsJobRepositoryError::new(
-                StatisticsJobRepositoryErrorKind::Conflict,
-                format!(
-                    "statistics job {job_id} state changed from {expected:?} to {:?}",
-                    versioned.stored.state
-                ),
-            ));
-        }
-        let old_index = state_key(expected, job_id)?;
-        if transaction
-            .get(&old_index)
-            .await
-            .map_err(store_error)?
-            .is_none()
-        {
-            return Err(StatisticsJobRepositoryError::corruption(
-                "statistics job record has no matching state index",
-            ));
-        }
-        let mut stored = versioned.stored;
-        stored.state = next;
-        stored.updated_at_ms = now_ms;
-        stored.error = error;
-        stored.retry_not_before_ms = retry_not_before_ms;
-        if next == StatisticsJobState::Publishing && publication_evidence.is_none() {
-            return Err(StatisticsJobRepositoryError::corruption(
-                "statistics publication transition is missing operation evidence",
-            ));
-        }
-        if let Some(publication_evidence) = publication_evidence {
-            stored.publication_evidence = Some(publication_evidence);
-        }
-        if let Some(basis_data_version) = basis_data_version {
-            stored.basis_data_version = Some(basis_data_version);
-        }
-        stored.cancel_requested = false;
-        if increment_attempt {
-            stored.attempt = stored.attempt.checked_add(1).ok_or_else(|| {
-                StatisticsJobRepositoryError::corruption("statistics job attempt overflow")
-            })?;
-        }
-        stored.completed_at_ms = next.is_terminal().then_some(now_ms);
-        let record = self
-            .durable_records
-            .encode(&stored)
-            .map_err(StatisticsJobRepositoryError::durable)?;
-        let next_state_index = self.index_value(job_id)?;
-        self.durable_records
-            .put_record(
-                transaction.as_mut(),
-                job_key(job_id)?,
-                record,
-                Precondition::Version(versioned.version),
-            )
-            .await
-            .map_err(store_error)?;
-        transaction
-            .delete(old_index, Precondition::Present)
-            .await
-            .map_err(store_error)?;
-        transaction
-            .put(
-                state_key(next, job_id)?,
-                next_state_index,
-                Precondition::Absent,
-            )
-            .await
-            .map_err(store_error)?;
-        self.commit_or_recover(transaction, "transition frontend statistics job", &stored)
-            .await
-    }
-
-    async fn begin_write(&self, purpose: &str) -> RepositoryResult<Box<dyn WriteTransaction>> {
-        self.store
-            .begin_write(TransactionId::from(Uuid::now_v7()), purpose)
-            .await
-            .map_err(store_error)
-    }
-
-    /// A commit-unknown is never retried. Resolve the transaction first, then
-    /// prove the exact durable successor by its job and operation IDs.
-    async fn commit_or_recover(
-        &self,
-        transaction: Box<dyn WriteTransaction>,
-        context: &str,
-        expected: &StoredStatisticsJobV3,
-    ) -> RepositoryResult<StatisticsJob> {
-        let transaction_id = *transaction.transaction_id();
-        match transaction.commit().await {
-            CommitOutcome::Committed(_) => Ok(StatisticsJob::from(expected)),
-            CommitOutcome::Conflict(error) => Err(StatisticsJobRepositoryError::new(
-                StatisticsJobRepositoryErrorKind::Conflict,
-                format!("{context} conflicted: {error}"),
-            )),
-            CommitOutcome::CommitUnknown(error) => {
-                self.reconcile_commit_unknown(transaction_id, context, expected, error)
-                    .await
-            }
-            CommitOutcome::TransientBeforeCommit(error) | CommitOutcome::DefiniteFailure(error) => {
-                Err(store_error(error))
-            }
-        }
-    }
-
-    async fn reconcile_commit_unknown(
-        &self,
-        transaction_id: TransactionId,
-        context: &str,
-        expected: &StoredStatisticsJobV3,
-        commit_error: StateStoreError,
-    ) -> RepositoryResult<StatisticsJob> {
-        let resolution = self
-            .store
-            .resolve_commit(&transaction_id)
-            .await
-            .map_err(store_error)?;
-        let mut transaction = self.store.begin_read().await.map_err(store_error)?;
-        let recovered = load_job(transaction.as_mut(), expected.job_id).await?;
-        transaction.abort().await.map_err(store_error)?;
-        match (resolution, recovered) {
-            (_, Some(recovered))
-                if recovered.stored == *expected
-                    && recovered.stored.operation_id == expected.operation_id =>
-            {
-                Ok(StatisticsJob::from(&recovered.stored))
-            }
-            (novarocks_spi::state_store::CommitResolution::NotCommitted, _) => {
-                Err(StatisticsJobRepositoryError::new(
-                    StatisticsJobRepositoryErrorKind::Store,
-                    format!(
-                        "{context} transaction {} was not committed: {commit_error}",
-                        transaction_id.as_uuid()
-                    ),
-                ))
-            }
-            (novarocks_spi::state_store::CommitResolution::Committed(_), _) => {
-                Err(StatisticsJobRepositoryError::corruption(format!(
-                    "{context} transaction {} is committed but the authoritative job record differs",
-                    transaction_id.as_uuid()
-                )))
-            }
-            (novarocks_spi::state_store::CommitResolution::Unresolved, _) => {
-                Err(StatisticsJobRepositoryError::new(
-                    StatisticsJobRepositoryErrorKind::CommitUnknown,
-                    format!(
-                        "{context} transaction {} remains unresolved after authoritative reread: {commit_error}",
-                        transaction_id.as_uuid()
-                    ),
-                ))
-            }
-        }
-    }
-}
-
-struct VersionedJob {
-    stored: StoredStatisticsJobV3,
-    version: VersionToken,
-}
-
-async fn load_job(
-    transaction: &mut dyn ReadTransaction,
-    job_id: Uuid,
-) -> RepositoryResult<Option<VersionedJob>> {
-    let Some(record) = transaction
-        .get(&job_key(job_id)?)
-        .await
-        .map_err(store_error)?
-    else {
-        return Ok(None);
-    };
-    let header: StoredStatisticsJobHeader =
-        decode_json(record.value.as_bytes(), "statistics job header")?;
-    if header.schema_version != STATISTICS_JOB_SCHEMA_VERSION {
-        return Err(StatisticsJobRepositoryError::unsupported_schema_version(
-            header.schema_version,
-        ));
-    }
-    let stored: StoredStatisticsJobV3 = decode_json(record.value.as_bytes(), "statistics job")?;
-    validate_stored(&stored)?;
-    if stored.job_id != job_id {
-        return Err(StatisticsJobRepositoryError::corruption(
-            "statistics job key does not match record job id",
-        ));
-    }
-    Ok(Some(VersionedJob {
-        stored,
-        version: record.version,
-    }))
-}
-
-async fn validate_fence(
-    fence: Option<&FenceValidator>,
-    transaction: &mut dyn WriteTransaction,
-) -> RepositoryResult<()> {
-    if let Some(fence) = fence {
-        fence(transaction).await.map_err(|message| {
-            StatisticsJobRepositoryError::new(StatisticsJobRepositoryErrorKind::Store, message)
         })?;
-    }
-    Ok(())
-}
-
-fn validate_create(request: &StatisticsJobCreate) -> RepositoryResult<()> {
-    for component in [
-        &request.target.catalog,
-        &request.target.namespace,
-        &request.target.table,
-    ] {
-        if component.is_empty() || component.len() > MAX_STATISTICS_TARGET_COMPONENT_BYTES {
-            return Err(StatisticsJobRepositoryError::corruption(
-                "statistics job target components must be non-empty and bounded",
+        if job.state != expected {
+            return Err(StatisticsJobRepositoryError::new(
+                StatisticsJobRepositoryErrorKind::Conflict,
+                format!(
+                    "statistics job {job_id} is {:?}, not expected {:?}",
+                    job.state, expected
+                ),
             ));
         }
-    }
-    novarocks_spi::connector::ConnectorInstanceId::parse(&request.connector_instance_id).map_err(
-        |error| {
-            StatisticsJobRepositoryError::corruption(format!(
-                "invalid statistics connector instance ID: {error}"
-            ))
-        },
-    )?;
-    if request.object_id.is_empty()
-        || request.object_id.len() > MAX_DURABLE_STATISTICS_TABLE_OBJECT_ID_BYTES
-    {
-        return Err(StatisticsJobRepositoryError::corruption(
-            "statistics job object ID is empty or exceeds the durable bound",
-        ));
-    }
-    if let super::application::StatisticsColumnIntent::Explicit(columns) = &request.columns {
-        if columns.is_empty() || columns.len() > MAX_STATISTICS_EXPLICIT_COLUMNS {
-            return Err(StatisticsJobRepositoryError::corruption(
-                "statistics explicit columns must be non-empty and bounded",
+        if !expected.can_transition_to(next) {
+            return Err(StatisticsJobRepositoryError::new(
+                StatisticsJobRepositoryErrorKind::InvalidTransition,
+                format!(
+                    "statistics job cannot transition from {:?} to {:?}",
+                    expected, next
+                ),
             ));
         }
-        if columns
-            .iter()
-            .any(|column| column.is_empty() || column.len() > MAX_STATISTICS_EXPLICIT_COLUMN_BYTES)
-            || columns.iter().enumerate().any(|(index, column)| {
-                columns[..index]
-                    .iter()
-                    .any(|seen| seen.eq_ignore_ascii_case(column))
-            })
-        {
-            return Err(StatisticsJobRepositoryError::corruption(
-                "statistics explicit columns are invalid or contain duplicates",
-            ));
+        let mut updated = job;
+        updated.state = next;
+        updated.updated_at_ms = at_ms;
+        updated.error = error;
+        if next.is_terminal() {
+            updated.completed_at_ms = Some(at_ms);
+            state.active.remove(&job_id);
+            state.terminal.push_back(updated.clone());
+            Self::prune_locked(&mut state, at_ms);
+        } else {
+            state.active.insert(job_id, updated.clone());
         }
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(updated)
     }
-    Ok(())
-}
 
-fn validate_error(error: Option<&StatisticsJobError>) -> RepositoryResult<()> {
-    if error.is_some_and(|error| {
-        error.message.is_empty() || error.message.len() > MAX_STATISTICS_ERROR_MESSAGE_BYTES
-    }) {
-        return Err(StatisticsJobRepositoryError::corruption(
-            "statistics job error message is empty or exceeds the bound",
-        ));
+    pub async fn cancellation_requested(
+        &self,
+        job_id: Uuid,
+    ) -> Result<bool, StatisticsJobRepositoryError> {
+        let state = self.lock()?;
+        Ok(state
+            .active
+            .get(&job_id)
+            .is_some_and(|job| job.cancel_requested))
     }
-    Ok(())
-}
 
-fn validate_stored(stored: &StoredStatisticsJobV3) -> RepositoryResult<()> {
-    if stored.schema_version != STATISTICS_JOB_SCHEMA_VERSION {
-        return Err(StatisticsJobRepositoryError::unsupported_schema_version(
-            stored.schema_version,
-        ));
-    }
-    validate_create(&StatisticsJobCreate {
-        target: stored.target.clone(),
-        connector_instance_id: stored.connector_instance_id.clone(),
-        object_id: stored.object_id.as_bytes().to_vec(),
-        columns: stored.columns.clone(),
-        submitted_at_ms: stored.submitted_at_ms,
-    })?;
-    validate_error(stored.error.as_ref())?;
-    if stored
-        .publication_evidence
-        .as_ref()
-        .is_some_and(|evidence| evidence.as_bytes().is_empty())
-    {
-        return Err(StatisticsJobRepositoryError::corruption(
-            "statistics job publication evidence is empty or exceeds the bound",
-        ));
-    }
-    if stored.state == StatisticsJobState::Publishing && stored.publication_evidence.is_none() {
-        return Err(StatisticsJobRepositoryError::corruption(
-            "publishing statistics job is missing operation evidence",
-        ));
-    }
-    if matches!(
-        stored.state,
-        StatisticsJobState::Publishing | StatisticsJobState::Succeeded
-    ) && stored.basis_data_version.is_none()
-    {
-        return Err(StatisticsJobRepositoryError::corruption(
-            "published statistics job is missing its basis data version",
-        ));
-    }
-    if let Some(wire) = &stored.publication_evidence {
-        let evidence =
-            ExternalMutationEvidence::try_from_wire_v1(wire.as_bytes()).map_err(|error| {
-                StatisticsJobRepositoryError::corruption(format!(
-                    "statistics job publication evidence is invalid: {error}"
-                ))
-            })?;
-        if evidence.operation_id().to_bytes() != stored.operation_id.to_bytes() {
-            return Err(StatisticsJobRepositoryError::corruption(
-                "statistics job publication evidence operation ID does not match its job",
-            ));
+    pub async fn cancel_active_for_shutdown(
+        &self,
+        at_ms: i64,
+    ) -> Result<(), StatisticsJobRepositoryError> {
+        let mut state = self.lock()?;
+        for job in state.active.values_mut() {
+            job.cancel_requested = true;
+            job.updated_at_ms = at_ms;
         }
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
     }
-    if stored.state.is_terminal() != stored.completed_at_ms.is_some() {
-        return Err(StatisticsJobRepositoryError::corruption(
-            "statistics job terminal state and completion timestamp disagree",
-        ));
+
+    pub(crate) async fn wait_for_change(&self) {
+        self.changed.notified().await;
     }
-    Ok(())
-}
 
-fn key(value: impl AsRef<[u8]>) -> RepositoryResult<Key> {
-    Key::try_from(Bytes::copy_from_slice(value.as_ref())).map_err(store_error)
-}
-
-fn job_key(job_id: Uuid) -> RepositoryResult<Key> {
-    key(format!("{JOB_PREFIX}{job_id}"))
-}
-
-fn state_prefix(state: StatisticsJobState) -> &'static str {
-    match state {
-        StatisticsJobState::Submitted => "novarocks/frontend/statistics/v1/state/SUBMITTED/",
-        StatisticsJobState::Preparing => "novarocks/frontend/statistics/v1/state/PREPARING/",
-        StatisticsJobState::Running => "novarocks/frontend/statistics/v1/state/RUNNING/",
-        StatisticsJobState::Publishing => "novarocks/frontend/statistics/v1/state/PUBLISHING/",
-        StatisticsJobState::Succeeded => "novarocks/frontend/statistics/v1/state/SUCCEEDED/",
-        StatisticsJobState::Failed => "novarocks/frontend/statistics/v1/state/FAILED/",
-        StatisticsJobState::Stale => "novarocks/frontend/statistics/v1/state/STALE/",
-        StatisticsJobState::Cancelled => "novarocks/frontend/statistics/v1/state/CANCELLED/",
+    pub(crate) fn notify_worker(&self) {
+        self.changed.notify_waiters();
     }
-}
 
-fn state_key(state: StatisticsJobState, job_id: Uuid) -> RepositoryResult<Key> {
-    key(format!("{}{job_id}", state_prefix(state)))
-}
-
-impl StatisticsJobRepository {
-    fn index_value(&self, job_id: Uuid) -> RepositoryResult<Value> {
-        self.durable_records
-            .encode_small_value(
-                "statistics job state index",
-                Bytes::from(job_id.to_string()),
-                STATISTICS_JOB_STATE_INDEX_VALUE_BYTES,
+    fn lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, RuntimeState>, StatisticsJobRepositoryError> {
+        self.state.lock().map_err(|_| {
+            StatisticsJobRepositoryError::new(
+                StatisticsJobRepositoryErrorKind::Conflict,
+                "statistics runtime lock poisoned",
             )
-            .map_err(StatisticsJobRepositoryError::durable)
+        })
+    }
+
+    fn prune_locked(state: &mut RuntimeState, at_ms: i64) {
+        while state.terminal.front().is_some_and(|job| {
+            job.completed_at_ms.is_some_and(|completed| {
+                at_ms.saturating_sub(completed) >= RECENT_TERMINAL_STATISTICS_JOB_RETENTION_MS
+            })
+        }) {
+            state.terminal.pop_front();
+        }
+        while state.terminal.len() > MAX_RECENT_TERMINAL_STATISTICS_JOBS {
+            state.terminal.pop_front();
+        }
     }
 }
 
-fn decode_index_value(value: &Value) -> RepositoryResult<Uuid> {
-    std::str::from_utf8(value.as_bytes())
-        .map_err(|_| StatisticsJobRepositoryError::corruption("statistics job index is not UTF-8"))?
-        .parse()
-        .map_err(|_| StatisticsJobRepositoryError::corruption("statistics job index is not a UUID"))
-}
-
-fn decode_json<T: DeserializeOwned>(bytes: &[u8], context: &str) -> RepositoryResult<T> {
-    serde_json::from_slice(bytes).map_err(|error| {
-        StatisticsJobRepositoryError::corruption(format!("decode {context} failed: {error}"))
-    })
-}
-
-#[derive(serde::Deserialize)]
-struct StoredStatisticsJobHeader {
-    schema_version: u8,
-}
-
-fn not_found(job_id: Uuid) -> StatisticsJobRepositoryError {
-    StatisticsJobRepositoryError::new(
-        StatisticsJobRepositoryErrorKind::NotFound,
-        format!("statistics job {job_id} does not exist"),
-    )
-}
-
-fn invalid_transition(
-    job_id: Uuid,
-    expected: StatisticsJobState,
-    next: StatisticsJobState,
-) -> StatisticsJobRepositoryError {
-    StatisticsJobRepositoryError::new(
-        StatisticsJobRepositoryErrorKind::InvalidTransition,
-        format!("statistics job {job_id} cannot transition from {expected:?} to {next:?}"),
-    )
-}
-
-fn store_error(error: StateStoreError) -> StatisticsJobRepositoryError {
-    let kind = if error.kind() == StateStoreErrorKind::Corruption {
-        StatisticsJobRepositoryErrorKind::Corruption
-    } else {
-        StatisticsJobRepositoryErrorKind::Store
-    };
-    StatisticsJobRepositoryError::new(kind, error.to_string())
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }

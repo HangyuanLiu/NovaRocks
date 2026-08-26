@@ -428,7 +428,7 @@ fn statistics_program() -> crate::query_execution::statistics::StatisticsCollect
     crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
         plan,
         StatisticsExecutionPolicy::try_new(
-            StatisticsExecutionMode::DurableJobAttempt,
+            StatisticsExecutionMode::ProcessJobAttempt,
             std::time::Duration::from_secs(60),
         )
         .expect("policy"),
@@ -585,7 +585,7 @@ fn statistics_sink_rejects_version_drift_and_metric_expansion() {
 #[test]
 fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
     let policy = StatisticsExecutionPolicy::try_new(
-        StatisticsExecutionMode::DurableJobAttempt,
+        StatisticsExecutionMode::ProcessJobAttempt,
         std::time::Duration::from_secs(30 * 60),
     )
     .expect("maximum durable policy");
@@ -596,7 +596,7 @@ fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
     );
     assert!(
         StatisticsExecutionPolicy::try_new(
-            StatisticsExecutionMode::DurableJobAttempt,
+            StatisticsExecutionMode::ProcessJobAttempt,
             std::time::Duration::from_secs(30 * 60 + 1),
         )
         .is_ok(),
@@ -604,7 +604,7 @@ fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
     );
     assert!(
         StatisticsExecutionPolicy::try_new(
-            StatisticsExecutionMode::DurableJobAttempt,
+            StatisticsExecutionMode::ProcessJobAttempt,
             std::time::Duration::ZERO,
         )
         .is_err()
