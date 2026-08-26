@@ -18,12 +18,21 @@
 use serde::{Deserialize, Serialize};
 
 use crate::durable::{DurableRecord, DurableRecordError, DurableRecordStore, EncodedRecord};
+use crate::state_family::StateFamily;
 
 /// Catalog attachments have no opaque payload fields. Their complete durable
 /// JSON record is capped at the global StateStore value budget before a write
 /// transaction is opened.
 const CATALOG_ATTACHMENT_ENCODED_LIMIT: usize = novarocks_spi::state_store::MAX_VALUE_BYTES;
-pub(crate) const CATALOG_ATTACHMENT_SCHEMA_VERSION: u8 = 1;
+/// Record version of the catalog desired-state family.
+///
+/// Declared by the manifest, not here: a second literal could disagree with
+/// the version the manifest publishes and nothing would catch it.
+pub(crate) const CATALOG_ATTACHMENT_SCHEMA_VERSION: u8 =
+    match StateFamily::CatalogDesiredState.record_version() {
+        Some(version) => version,
+        None => panic!("catalog desired state is a durable external projection"),
+    };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

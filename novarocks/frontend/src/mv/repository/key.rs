@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::Bytes;
 use novarocks_spi::connector::ConnectorInstanceId;
 use novarocks_spi::state_store::Key;
 use novarocks_types::naming::normalize_identifier;
@@ -23,8 +22,16 @@ use novarocks_types::naming::normalize_identifier;
 use crate::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
+use crate::state_family::{PersistentKeyPrefix, StateFamily};
 
-const PREFIX: &str = "novarocks/frontend/mv/accelerator/v1";
+/// Read from the closed state family manifest, which is the only place a
+/// persistent prefix is defined.  The prefix carries no trailing separator, so
+/// this owner supplies the `/` that joins it to its own path.
+const ACCELERATOR_PREFIX: PersistentKeyPrefix = match StateFamily::MvAccelerator.persistent_prefix()
+{
+    Some(prefix) => prefix,
+    None => panic!("MV accelerator is a durable accelerator family"),
+};
 const DEPENDENCY_SEPARATOR: char = '|';
 const MAX_MV_KEY_BYTES: usize = 512;
 
@@ -132,77 +139,36 @@ pub fn decode_key(key: &Key) -> Result<DecodedMvKey, String> {
     let raw = std::str::from_utf8(key.as_bytes())
         .map_err(|_| "MV Accelerator key is not UTF-8".to_string())?;
     let segments: Vec<_> = raw.split('/').collect();
-    if segments.get(..5) != Some(["novarocks", "frontend", "mv", "accelerator", "v1"].as_slice()) {
+    // The leading segments are compared against the manifest prefix rather than
+    // a literal repeated here, so the classifier cannot drift from the prefix
+    // the encoder writes under.
+    let prefix_segments = ACCELERATOR_PREFIX.as_str().split('/').count();
+    let carries_prefix = segments.get(..prefix_segments).is_some_and(|head| {
+        head.iter()
+            .copied()
+            .eq(ACCELERATOR_PREFIX.as_str().split('/'))
+    });
+    if !carries_prefix {
         return Err(format!("invalid MV Accelerator key prefix: {raw}"));
     }
-    let kind = match segments.as_slice() {
-        [
-            "novarocks",
-            "frontend",
-            "mv",
-            "accelerator",
-            "v1",
-            "sequence",
-            "mv-id",
-        ] => MvKeyKind::Sequence,
-        [
-            "novarocks",
-            "frontend",
-            "mv",
-            "accelerator",
-            "v1",
-            "projection",
-            "by-id",
-            id,
-        ] => {
+    let kind = match &segments[prefix_segments..] {
+        ["sequence", "mv-id"] => MvKeyKind::Sequence,
+        ["projection", "by-id", id] => {
             decode_positive_id(id)?;
             MvKeyKind::Projection
         }
-        [
-            "novarocks",
-            "frontend",
-            "mv",
-            "accelerator",
-            "v1",
-            "index",
-            "by-target",
-            catalog,
-            namespace,
-            table,
-        ] => {
+        ["index", "by-target", catalog, namespace, table] => {
             decode_hex_catalog_identifier(catalog)?;
             decode_hex_identifier(namespace)?;
             decode_hex_identifier(table)?;
             MvKeyKind::TargetLookup
         }
-        [
-            "novarocks",
-            "frontend",
-            "mv",
-            "accelerator",
-            "v1",
-            "index",
-            "dependency",
-            "by-downstream",
-            id,
-            identity,
-        ] => {
+        ["index", "dependency", "by-downstream", id, identity] => {
             decode_positive_id(id)?;
             decode_dependency_identity(identity)?;
             MvKeyKind::DependencyDownstream
         }
-        [
-            "novarocks",
-            "frontend",
-            "mv",
-            "accelerator",
-            "v1",
-            "index",
-            "dependency",
-            "by-upstream",
-            identity,
-            id,
-        ] => {
+        ["index", "dependency", "by-upstream", identity, id] => {
             decode_dependency_identity(identity)?;
             decode_positive_id(id)?;
             MvKeyKind::DependencyUpstream
@@ -217,14 +183,15 @@ pub(crate) fn expected_record_kind(key: &Key) -> Result<MvKeyKind, String> {
 }
 
 fn key_from_path(path: &str) -> Result<Key, String> {
-    let bytes = Bytes::from(format!("{PREFIX}/{path}"));
-    if bytes.len() > MAX_MV_KEY_BYTES {
+    let suffix = format!("/{path}");
+    let key_bytes = ACCELERATOR_PREFIX.as_bytes().len() + suffix.len();
+    if key_bytes > MAX_MV_KEY_BYTES {
         return Err(format!(
-            "MV Accelerator StateStore key exceeds the 512-byte limit: {} bytes",
-            bytes.len()
+            "MV Accelerator StateStore key exceeds the 512-byte limit: {key_bytes} bytes"
         ));
     }
-    Key::try_from(bytes)
+    ACCELERATOR_PREFIX
+        .key_with_suffix(&suffix)
         .map_err(|error| format!("encode MV Accelerator StateStore key failed: {error}"))
 }
 
@@ -347,4 +314,33 @@ fn decode_dependency_identity(value: &str) -> Result<(), String> {
         return Err(format!("dependency identity is not canonical: {value}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These bytes are already in deployed stores.  The literals are repeated
+    /// here rather than read from the manifest on purpose: an edit to the
+    /// registered prefix has to be made twice, deliberately, or this assertion
+    /// catches it before a live store is silently orphaned.
+    ///
+    /// The family-wide scan prefix is the interesting case: the registered
+    /// prefix carries no trailing separator, so the `/` this owner appends is
+    /// part of the frozen bytes.
+    #[test]
+    fn key_bytes_are_stable_under_the_registered_prefix() {
+        assert_eq!(
+            accelerator_prefix().expect("family prefix").as_bytes(),
+            b"novarocks/frontend/mv/accelerator/v1/"
+        );
+        assert_eq!(
+            projection_prefix().expect("projection prefix").as_bytes(),
+            b"novarocks/frontend/mv/accelerator/v1/projection/by-id/"
+        );
+        assert_eq!(
+            sequence_key().expect("sequence key").as_bytes(),
+            b"novarocks/frontend/mv/accelerator/v1/sequence/mv-id"
+        );
+    }
 }

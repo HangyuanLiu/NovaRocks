@@ -24,7 +24,6 @@
 use std::fmt;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use novarocks_spi::state_store::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, StateStoreError,
     WriteTransaction,
@@ -33,24 +32,46 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::durable::{DurableRecord, DurableRecordStore, EncodedRecord};
+use crate::state_family::{ClonePolicy, PersistentKeyPrefix, StateFamily};
 use crate::state_store::metrics::StateStoreMetrics;
 use crate::state_store::{OperationId, RunFailure, run_side_effect_free};
 
-pub const GC_OWNED_REF_OBSERVATION_FAMILY: &str =
-    "frontend/table-maintenance/gc-owned-ref-observation";
-pub const GC_OWNED_REF_OBSERVATION_SCHEMA_VERSION: u8 = 7;
+/// This family's entry in the closed state family manifest.  Every declarative
+/// fact below is read from it, so the module holds no second copy of the family
+/// id, the record version, the prefix, or the retain/clone policy.
+const MANIFEST_ENTRY: StateFamily = StateFamily::GcOwnedRefObservation;
+
+pub const GC_OWNED_REF_OBSERVATION_FAMILY: &str = MANIFEST_ENTRY.family_id();
+pub const GC_OWNED_REF_OBSERVATION_SCHEMA_VERSION: u8 = match MANIFEST_ENTRY.record_version() {
+    Some(version) => version,
+    None => panic!("GC owned-ref observation is a durable accelerator family"),
+};
 pub const GC_OWNED_REF_OBSERVATION_MAX_REF_NAME_BYTES: usize = 256;
 pub const GC_OWNED_REF_OBSERVATION_RECORD_ENCODED_LIMIT: usize = 4 * 1024;
 
-const GC_OWNED_REF_OBSERVATION_PREFIX: &str =
-    "novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/";
+/// The prefix already ends in `/`, so the suffixes below are record paths alone.
+const GC_OWNED_REF_OBSERVATION_PREFIX: PersistentKeyPrefix =
+    match MANIFEST_ENTRY.persistent_prefix() {
+        Some(prefix) => prefix,
+        None => panic!("GC owned-ref observation is a durable accelerator family"),
+    };
 
-/// Stable policy surface for a StateStore family that must never cross a
-/// deployment clone boundary with its maturity intact.
+/// Thin accessor over this family's manifest entry.
+///
+/// It declares nothing of its own: the family id, record version, restart
+/// retention and clone policy all resolve to [`MANIFEST_ENTRY`].  What stays
+/// here is the *executable* clone wipe, which needs a live accelerator the
+/// manifest cannot hold — the manifest declares only that this family wipes on
+/// clone, not how to carry the wipe out.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcOwnedRefObservationFamilyPolicy;
 
 impl GcOwnedRefObservationFamilyPolicy {
+    /// The manifest entry every fact below is read from.
+    pub const fn family(self) -> StateFamily {
+        MANIFEST_ENTRY
+    }
+
     pub const fn family_id(self) -> &'static str {
         GC_OWNED_REF_OBSERVATION_FAMILY
     }
@@ -60,11 +81,11 @@ impl GcOwnedRefObservationFamilyPolicy {
     }
 
     pub const fn retain_on_restart(self) -> bool {
-        true
+        MANIFEST_ENTRY.retain_on_restart()
     }
 
     pub const fn wipe_on_clone(self) -> bool {
-        true
+        matches!(MANIFEST_ENTRY.clone_policy(), ClonePolicy::WipeAndRebuild)
     }
 
     pub async fn wipe_for_clone(
@@ -309,7 +330,9 @@ impl GcOwnedRefObservationAccelerator {
     pub async fn wipe_family(&self) -> Result<u64, GcOwnedRefObservationError> {
         let mut deleted = 0_u64;
         loop {
-            let prefix = key_from_bytes(GC_OWNED_REF_OBSERVATION_PREFIX, "build GC wipe range")?;
+            let prefix = GC_OWNED_REF_OBSERVATION_PREFIX.key().map_err(|error| {
+                GcOwnedRefObservationError::store(format!("build GC wipe range failed: {error}"))
+            })?;
             let range = KeyRange::for_prefix(prefix).map_err(|error| {
                 GcOwnedRefObservationError::store(format!("build GC wipe range failed: {error}"))
             })?;
@@ -530,22 +553,17 @@ fn observation_key(table_uuid: &Uuid, ref_name: &str) -> Result<Key, GcOwnedRefO
     GcOwnedRefObservation::validate_key(*table_uuid, ref_name).map_err(|error| {
         GcOwnedRefObservationError::corruption(format!("invalid GC owned-ref key: {error}"))
     })?;
-    key_from_bytes(
-        format!(
-            "{GC_OWNED_REF_OBSERVATION_PREFIX}{}/{}",
+    GC_OWNED_REF_OBSERVATION_PREFIX
+        .key_with_suffix(&format!(
+            "{}/{}",
             table_uuid,
             hex::encode(ref_name.as_bytes())
-        ),
-        "build GC owned-ref observation key",
-    )
-}
-
-fn key_from_bytes(
-    value: impl AsRef<[u8]>,
-    context: &str,
-) -> Result<Key, GcOwnedRefObservationError> {
-    Key::try_from(Bytes::copy_from_slice(value.as_ref()))
-        .map_err(|error| GcOwnedRefObservationError::store(format!("{context} failed: {error}")))
+        ))
+        .map_err(|error| {
+            GcOwnedRefObservationError::store(format!(
+                "build GC owned-ref observation key failed: {error}"
+            ))
+        })
 }
 
 fn encode_record<T: DurableRecord>(
@@ -580,5 +598,57 @@ fn format_run_failure(context: &str, failure: RunFailure) -> GcOwnedRefObservati
         RunFailure::DeadlineExceeded => GcOwnedRefObservationError::store(format!(
             "{context} failed: state store deadline exceeded"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These bytes are already in deployed stores.  The literals are repeated
+    /// here rather than read from the manifest on purpose: an edit to the
+    /// registered prefix has to be made twice, deliberately, or this assertion
+    /// catches it before a live store is silently orphaned.
+    #[test]
+    fn key_bytes_are_stable_under_the_registered_prefix() {
+        assert_eq!(
+            GC_OWNED_REF_OBSERVATION_PREFIX
+                .key()
+                .expect("family prefix")
+                .as_bytes(),
+            b"novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/"
+        );
+        // The same key `tests/application_host.rs` seeds a corrupt record
+        // under, so the two literals cross-check each other.
+        assert_eq!(
+            observation_key(&Uuid::from_u128(0x3c3), "__novarocks__corrupt")
+                .expect("observation key")
+                .as_bytes(),
+            concat!(
+                "novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/",
+                "00000000-0000-0000-0000-0000000003c3/",
+                "5f5f6e6f7661726f636b735f5f636f7272757074"
+            )
+            .as_bytes()
+        );
+    }
+
+    /// The record version is the manifest's, not a second literal, and it must
+    /// still be the `7` already written to deployed stores.
+    #[test]
+    fn record_version_and_clone_policy_come_from_the_manifest() {
+        let policy = GcOwnedRefObservationFamilyPolicy;
+        assert_eq!(policy.family(), StateFamily::GcOwnedRefObservation);
+        assert_eq!(policy.schema_version(), 7);
+        assert_eq!(
+            policy.family_id(),
+            "frontend/table-maintenance/gc-owned-ref-observation"
+        );
+        assert!(policy.retain_on_restart());
+        assert!(policy.wipe_on_clone());
+        assert_eq!(
+            StoredGcOwnedRefObservationV7::SCHEMA_VERSION,
+            policy.schema_version()
+        );
     }
 }
