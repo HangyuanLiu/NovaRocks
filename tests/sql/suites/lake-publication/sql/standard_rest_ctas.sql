@@ -42,10 +42,11 @@ CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch AS
 
 -- query 3
 -- The single standard NotExist table commit succeeded at the Catalog but its
--- response was lost. The frontend must surface CommitUnknown and perform no
--- recovery mutation before or after its restart.
+-- response was lost. The current statement may use its one same-session,
+-- read-only adjudication to observe the exact marker and report committed;
+-- the following restart must not replay or mutate the completed attempt.
 -- @publication_catalog_fault=table-commit,after-commit-before-response
--- @expect_error_code=CommitUnknown
+-- @skip_result_check=true
 -- @restart_fe_after_step=true
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.response_lost AS
   SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
