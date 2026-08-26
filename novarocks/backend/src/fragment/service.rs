@@ -1428,6 +1428,73 @@ mod tests {
     }
 
     #[test]
+    fn delivered_splits_reach_the_queue_the_decode_context_opens() {
+        // Delivery and decode derive the task key independently. If they ever
+        // disagreed, a task would block forever on a queue nobody fills.
+        let _service_guard = SERVICE_TEST_LOCK.lock().expect("service test lock");
+        let service = NativeFragmentService::new(
+            crate::fragment::grpc_exchange_transmitter(
+                crate::rpc::runtime::test_backend_data_runtime(),
+            ),
+            crate::fragment::grpc_fragment_lookup_client(
+                crate::rpc::runtime::test_backend_data_runtime(),
+            ),
+            crate::fragment::native_result_writer(),
+            test_lifecycle_registry(Arc::new(FragmentControlRegistry::default())),
+            Arc::new(ConnectorRegistry::new()),
+        );
+
+        let execution_id = QueryExecutionId::new(
+            novarocks_types::QueryId::new(77, 5),
+            novarocks_types::AttemptId::new(1).expect("attempt"),
+        )
+        .expect("execution id");
+        let fragment_instance_id = novarocks_types::UniqueId::new(77, 9);
+
+        let raw = novarocks_proto_models::connector_read::SplitAssignment {
+            plan_node_id: 3,
+            splits: vec![crate::connector::typed_runtime::test_support::split_proto(
+                3, 0,
+            )],
+            no_more_splits: true,
+        };
+        let assignment = novarocks_proto::connector_read::SplitAssignment::parse(
+            raw,
+            novarocks_proto::FieldPath::root("split_assignment"),
+        )
+        .expect("valid assignment");
+
+        let ack = service.deliver_split_assignments(
+            execution_id,
+            fragment_instance_id,
+            std::slice::from_ref(&assignment),
+        );
+        assert!(matches!(
+            ack,
+            crate::query_lifecycle::task_update::TaskUpdateAck::Accepted(_)
+        ));
+
+        let params = novarocks_proto_models::novarocks::InstanceParams {
+            fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
+                hi: fragment_instance_id.high(),
+                lo: fragment_instance_id.low(),
+            }),
+            ..Default::default()
+        };
+        let runtime = service.typed_scan_runtime(execution_id, &params);
+        let queue = runtime
+            .queues()
+            .existing_queue(3)
+            .expect("the delivered plan node has a queue");
+        let stats = queue.stats();
+        assert_eq!(stats.queued_splits, 1);
+        assert!(stats.no_more_splits);
+
+        service.close_split_queues(execution_id, fragment_instance_id);
+        assert!(queue.is_closed());
+    }
+
+    #[test]
     fn registration_failure_drops_dormant_resources_before_retry() {
         let _service_guard = SERVICE_TEST_LOCK.lock().expect("service test lock");
         let service = NativeFragmentService::new(
