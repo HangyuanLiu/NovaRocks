@@ -105,6 +105,7 @@ fn provider_neutral_repository_preserves_create_refresh_partition_and_dependency
             novarocks_frontend::mv::domain::repository::FinalizeMvRefreshWithPartitionsRequest {
                 refresh: MvRefreshFinalizeRequest {
                     refresh_id: refresh.refresh_id,
+                    last_refresh_ms: 2,
                     rows: 3,
                     base_snapshots: BTreeMap::new(),
                     base_table_object_ids: BTreeMap::new(),

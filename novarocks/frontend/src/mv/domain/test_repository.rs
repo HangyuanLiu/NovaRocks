@@ -240,6 +240,7 @@ impl InMemoryMvRepository {
                 format!("MV definition {} does not exist", refresh.mv_id),
             )
         })?;
+        definition.last_refresh_ms = Some(request.last_refresh_ms);
         definition.last_refresh_rows = Some(request.rows);
         definition.last_refresh_snapshots = request.base_snapshots;
         definition.last_refresh_table_object_ids = request.base_table_object_ids;

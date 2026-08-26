@@ -3753,6 +3753,7 @@ async fn finalize_refresh_transaction(
             "mv definition active refresh is , expected",
         ));
     }
+    definition.last_refresh_ms = Some(request.last_refresh_ms);
     definition.last_refresh_rows = Some(request.rows);
     definition.last_refresh_snapshots = request.base_snapshots;
     definition.last_refresh_table_object_ids = request.base_table_object_ids;
@@ -3820,6 +3821,7 @@ async fn finalize_frontend_refresh_without_external_actions_transaction(
             "mv definition active refresh is , expected",
         ));
     }
+    definition.last_refresh_ms = Some(request.last_refresh_ms);
     definition.last_refresh_rows = Some(request.rows);
     definition.last_refresh_snapshots = request.base_snapshots;
     definition.last_refresh_table_object_ids = request.base_table_object_ids;

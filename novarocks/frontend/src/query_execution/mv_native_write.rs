@@ -26,11 +26,13 @@
 use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorCommittedPartitioning, ConnectorControlPlanningLease, ConnectorRequestContext,
-    ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWriteReceipt,
+    ConnectorTableIdentity, ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId,
+    ConnectorWriteReceipt,
 };
 
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::mv::domain::persistence::schema::MvPartitionContract;
+use crate::mv::domain::storage_observation::MvLakePublishedProjection;
 use crate::query_execution::contract::ConnectorWriteOperationRegistration;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvRefreshCommittedFacts, MvRefreshPublicationIntent,
@@ -123,6 +125,17 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         intent: MvRefreshPublicationIntent,
         receipt: &ConnectorWriteReceipt,
     ) -> Result<MvRefreshCommittedFacts, String>;
+
+    /// Observe the lake-owned projection after a known publication. The caller
+    /// supplies the retained exact lease and the snapshot identity it already
+    /// proved; implementations must reject a missing, stale, or advanced head.
+    fn observe_published_projection(
+        &self,
+        planning_lease: &ConnectorControlPlanningLease,
+        table: &ConnectorTableIdentity,
+        expected_snapshot_id: i64,
+        connector_context: &ConnectorRequestContext,
+    ) -> Result<MvLakePublishedProjection, String>;
 
     /// Project a provider-committed repartition contract into the lake-owned
     /// MV descriptor. The atomic table commit is already durable when this is
