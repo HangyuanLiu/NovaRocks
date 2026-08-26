@@ -1127,8 +1127,7 @@ impl FrontendQuerySession {
             match tokio::time::timeout(timeout_duration, &mut worker).await {
                 Ok(result) => result.map_err(|error| internal_error(error.to_string()))?,
                 Err(_) => {
-                    let timeout_ms =
-                        u64::try_from(timeout_duration.as_millis()).unwrap_or(u64::MAX);
+                    let timeout_ms = timeout_message_millis(timeout_duration);
                     self.cancel_current(QueryCancellationReason::DeadlineExceeded { timeout_ms });
                     // A timeout is not complete until the worker releases the
                     // statement lease. Waiting here also fences Backend abort
@@ -1909,6 +1908,14 @@ fn internal_error(message: impl Into<String>) -> QueryServiceError {
     QueryServiceError::new(QueryServiceErrorKind::Internal, message)
 }
 
+/// Keep a user-visible timeout at its admitted millisecond precision. The
+/// remaining duration is sampled after deadline admission, so truncating it
+/// can turn a one-second timeout into a misleading `999 ms` message.
+fn timeout_message_millis(timeout: Duration) -> u64 {
+    let millis = timeout.as_nanos().saturating_add(999_999) / 1_000_000;
+    u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
 fn cancellation_error(reason: QueryCancellationReason) -> QueryServiceError {
     let (kind, message) = match reason {
         QueryCancellationReason::DeadlineExceeded { timeout_ms } => (
@@ -2665,6 +2672,15 @@ mod tests {
             .kind(),
             QueryServiceErrorKind::Interrupted
         );
+    }
+
+    #[test]
+    fn timeout_message_rounds_a_sampled_deadline_up_to_milliseconds() {
+        assert_eq!(
+            timeout_message_millis(Duration::from_nanos(999_999_999)),
+            1_000
+        );
+        assert_eq!(timeout_message_millis(Duration::from_millis(1_000)), 1_000);
     }
 
     #[test]

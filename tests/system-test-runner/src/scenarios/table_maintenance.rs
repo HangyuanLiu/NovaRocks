@@ -104,10 +104,9 @@ impl Scenario for OptimizeTargetReplacement {
         )?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
-        wait_for_job_state(context, &mut conn, catalog, first.job_id, "TARGET_REPLACED")?;
-        assert_dispatch_count(context, &first, 0)?;
+        assert_job_not_listed(context, &mut conn, catalog, first.job_id)?;
         context.action(
-            "verified TARGET_REPLACED and its zero-dispatch evidence survive FE restart in native 1FE+3BE",
+            "verified the restarted FE discards process-local optimize history in native 1FE+3BE",
         );
         Ok(())
     }
@@ -341,6 +340,25 @@ fn wait_for_terminal_job(
     }
 }
 
+fn assert_job_not_listed(
+    context: &mut ScenarioContext,
+    conn: &mut Conn,
+    catalog: &str,
+    job_id: i64,
+) -> Result<()> {
+    let jobs = list_optimize_jobs(context, conn, catalog)?;
+    if jobs
+        .iter()
+        .any(|(observed_job_id, _)| *observed_job_id == job_id)
+    {
+        bail!(
+            "optimize job {job_id} survived FE restart even though optimize job state is process-local; {}",
+            context.diagnostics()
+        );
+    }
+    Ok(())
+}
+
 fn list_optimize_jobs(
     context: &mut ScenarioContext,
     conn: &mut Conn,
@@ -352,7 +370,7 @@ fn list_optimize_jobs(
         &format!(
             "SHOW ALTER TABLE OPTIMIZE FROM {catalog}.ns WHERE TableName = 'orders' ORDER BY CreateTime DESC"
         ),
-        "read durable optimize job state",
+        "read current-process optimize job state",
     )?;
     rows.into_iter()
         .map(|row| {

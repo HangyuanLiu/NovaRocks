@@ -262,7 +262,8 @@ fn recover_one(
             refresh.refresh_id,
             "provider could not prove MV publication disposition",
         ),
-        ConnectorStagedPublicationDisposition::Published => {
+        ConnectorStagedPublicationDisposition::Published
+        | ConnectorStagedPublicationDisposition::CleanupPending => {
             let committed_partitioning = observation.committed_partitioning.clone();
             finalize_published(
                 repository,
@@ -275,13 +276,22 @@ fn recover_one(
             )?;
             Ok(RecoveryResult::Resolved)
         }
-        ConnectorStagedPublicationDisposition::Superseded
-        | ConnectorStagedPublicationDisposition::CleanupPending
-        | ConnectorStagedPublicationDisposition::KnownUncommitted
-        | ConnectorStagedPublicationDisposition::Staged => unresolved(
+        ConnectorStagedPublicationDisposition::KnownUncommitted
+        | ConnectorStagedPublicationDisposition::Staged => {
+            // The current connector generation has proved that main was never
+            // published. Terminate only the local attempt so it releases the
+            // durable MV ownership fence; any owned staging branch remains for
+            // the connector's age-gated garbage collector. Recovery neither
+            // retries publication nor issues an external cleanup mutation.
+            repository
+                .abort_recovered_uncommitted_refresh(refresh.refresh_id)
+                .map_err(|_| ())?;
+            Ok(RecoveryResult::Resolved)
+        }
+        ConnectorStagedPublicationDisposition::Superseded => unresolved(
             repository,
             refresh.refresh_id,
-            "MV recovery only projects an exact published lake frontier; all other dispositions remain manual",
+            "MV recovery cannot project a superseded lake frontier",
         ),
     }
 }
@@ -308,7 +318,8 @@ fn recover_legacy_one(
         .map_err(|_| ())?;
     match observation.disposition {
         ConnectorStagedPublicationDisposition::Ambiguous => Err(()),
-        ConnectorStagedPublicationDisposition::Published => {
+        ConnectorStagedPublicationDisposition::Published
+        | ConnectorStagedPublicationDisposition::CleanupPending => {
             finalize_legacy_published(
                 repository,
                 dependencies,
@@ -319,10 +330,14 @@ fn recover_legacy_one(
             )?;
             Ok(RecoveryResult::Resolved)
         }
-        ConnectorStagedPublicationDisposition::Superseded
-        | ConnectorStagedPublicationDisposition::CleanupPending
-        | ConnectorStagedPublicationDisposition::KnownUncommitted
-        | ConnectorStagedPublicationDisposition::Staged => Err(()),
+        ConnectorStagedPublicationDisposition::KnownUncommitted
+        | ConnectorStagedPublicationDisposition::Staged => {
+            repository
+                .clear_refresh_progress(refresh.mv_id)
+                .map_err(|_| ())?;
+            Ok(RecoveryResult::Resolved)
+        }
+        ConnectorStagedPublicationDisposition::Superseded => Err(()),
     }
 }
 
@@ -1514,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn known_uncommitted_remains_manual_without_cleanup_or_abort() {
+    fn known_uncommitted_aborts_locally_without_external_cleanup() {
         let environment = TestEnvironment::open();
         let key = current_binding_key();
         let refresh = environment.begin_refresh("known_uncommitted", &key);
@@ -1534,8 +1549,8 @@ mod tests {
             summary,
             FrontendMvRecoverySummary {
                 candidates: 1,
-                resolved: 0,
-                unresolved: 1,
+                resolved: 1,
+                unresolved: 0,
                 cleanup_backlog: 0,
             }
         );
@@ -1545,13 +1560,16 @@ mod tests {
             .load_refresh(refresh.refresh_id)
             .expect("load refresh")
             .expect("refresh exists");
-        assert_ne!(recovered.state, MvRefreshState::Aborted);
+        assert_eq!(recovered.state, MvRefreshState::Aborted);
         let ledger = recovered.frontend_recovery.expect("recovery ledger");
-        assert_eq!(ledger.status, FrontendMvRefreshRecoveryStatus::Unresolved);
+        assert_eq!(
+            ledger.status,
+            FrontendMvRefreshRecoveryStatus::ResolvedAborted
+        );
     }
 
     #[test]
-    fn proof_only_staging_create_then_uncommitted_write_remains_manual() {
+    fn proof_only_staging_create_then_uncommitted_write_aborts_locally() {
         let environment = TestEnvironment::open();
         let key = current_binding_key();
         let refresh = environment.begin_refresh("atomic_uncommitted", &key);
@@ -1583,7 +1601,8 @@ mod tests {
 
         let summary = recover_once(environment.repository.as_ref(), &dependencies);
 
-        assert_eq!(summary.unresolved, 1);
+        assert_eq!(summary.resolved, 1);
+        assert_eq!(summary.unresolved, 0);
         assert_eq!(summary.cleanup_backlog, 0);
         assert_eq!(recovery.cleanup_calls.load(Ordering::SeqCst), 0);
         let recovered = environment
@@ -1591,10 +1610,10 @@ mod tests {
             .load_refresh(refresh.refresh_id)
             .expect("load refresh")
             .expect("refresh exists");
-        assert_ne!(recovered.state, MvRefreshState::Aborted);
+        assert_eq!(recovered.state, MvRefreshState::Aborted);
         assert_eq!(
             recovered.frontend_recovery.expect("recovery ledger").status,
-            FrontendMvRefreshRecoveryStatus::Unresolved
+            FrontendMvRefreshRecoveryStatus::ResolvedAborted
         );
     }
 
@@ -1889,7 +1908,7 @@ mod tests {
         let recovery = Arc::new(TestRecovery::with_observations(
             key,
             vec![observation_with_proof(
-                ConnectorStagedPublicationDisposition::Published,
+                ConnectorStagedPublicationDisposition::CleanupPending,
                 true,
                 b"lake-proof-published",
             )],
@@ -1915,5 +1934,12 @@ mod tests {
             FrontendMvRefreshRecoveryStatus::ResolvedPublished
         );
         assert_eq!(ledger.cleanup_state, None);
+        let definition = environment
+            .repository
+            .load_by_id(refresh.mv_id)
+            .expect("load definition")
+            .expect("definition exists");
+        assert_eq!(definition.last_refresh_ms, Some(1));
+        assert_eq!(definition.last_refreshed_iceberg_snapshot_id, Some(42));
     }
 }

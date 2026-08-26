@@ -2386,7 +2386,6 @@ impl StateStoreMvRepository {
                     if !matches!(
                         observation.disposition,
                         crate::mv::domain::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Published
-                            | crate::mv::domain::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Superseded
                             | crate::mv::domain::persistence::refresh::FrontendMvRefreshRecoveryDisposition::CleanupPending
                     ) {
                         return Err(conflict_state_store("recovery observation does not prove publication"));
@@ -2402,6 +2401,7 @@ impl StateStoreMvRepository {
                         converge_recovered_repartition_actions(&mut refresh, observation)?;
                     }
                     if !matches!(refresh.state, MvRefreshState::Finalized) {
+                        definition.last_refresh_ms = Some(request.finalize.last_refresh_ms);
                         definition.last_refresh_rows = Some(request.finalize.rows);
                         definition.last_refresh_snapshots = request.finalize.base_snapshots;
                         definition.last_refresh_table_object_ids =
@@ -2479,14 +2479,6 @@ impl StateStoreMvRepository {
                             | Some(crate::mv::domain::persistence::refresh::FrontendMvRefreshRecoveryDisposition::Staged)
                     ) {
                         return Err(conflict_state_store("recovery observation does not prove an uncommitted refresh"));
-                    }
-                    if recovery
-                        .observation
-                        .as_ref()
-                        .is_some_and(|observation| observation.cleanup_required)
-                        && recovery.cleanup_state != Some(FrontendMvRefreshActionState::KnownCommitted)
-                    {
-                        return Err(conflict_state_store("uncommitted refresh cleanup is not known committed"));
                     }
                     let (definition_record, mut definition) =
                         load_definition_transaction(transaction, refresh.mv_id).await?;

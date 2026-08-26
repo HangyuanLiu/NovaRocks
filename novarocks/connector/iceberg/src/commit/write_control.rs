@@ -3078,9 +3078,12 @@ pub(crate) fn operation_marker_from_snapshot(
         ));
     }
     decode_marker_fixed::<16>(&marker.incarnation_base64, "incarnation")?;
-    if marker.publication.family() != LakePublicationFamily::Write {
+    if !matches!(
+        marker.publication.family(),
+        LakePublicationFamily::Write | LakePublicationFamily::MaterializedViewRefresh
+    ) {
         return Err(corrupt(
-            "Iceberg write operation marker has a non-write publication family",
+            "Iceberg write operation marker has an unsupported publication family",
         ));
     }
     decode_marker_fixed::<32>(&marker.cohort_set_digest_base64, "cohort set digest")?;
@@ -4300,6 +4303,35 @@ mod tests {
                 .publication
                 .family(),
             LakePublicationFamily::DataMutation
+        );
+    }
+
+    #[test]
+    fn operation_marker_accepts_materialized_view_refresh_family() {
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let operation_id = ConnectorWriteOperationId::from_bytes([32; 16]);
+        let mut request = activation_request(&owner, operation_id, 1);
+        request.intent = ConnectorWriteActivationIntent::Publication(
+            LakePublicationFamily::MaterializedViewRefresh,
+        );
+        control.activate_write(request).expect("activate");
+        let active = {
+            let operations = control.operations.lock().expect("operation table");
+            let OperationState::Active(active) =
+                operations.get(&operation_id).expect("active operation")
+            else {
+                panic!("expected active operation");
+            };
+            active.clone()
+        };
+        let marker = control.operation_marker(operation_id, &active, [4; 32], [5; 32]);
+        let snapshot =
+            snapshot_with_operation_marker(9, serde_json::to_string(&marker).expect("marker JSON"));
+
+        assert_eq!(
+            operation_marker_from_snapshot(&snapshot).expect("decode marker"),
+            Some(marker)
         );
     }
 
