@@ -1600,4 +1600,11 @@ select /*+ set_var(pipeline_dop=1) */ pk, array_length(arr_bigint), arr_bigint f
 
 -- query 339
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_contains FORCE;
+-- A catalog that cannot hold views cannot answer view enumeration, so
+-- DROP DATABASE ... FORCE is refused here rather than silently assuming
+-- the namespace holds none. Drop the tables explicitly instead.
+USE sql_tests_complex_test_array_contains;
+DROP TABLE IF EXISTS t;
+DROP TABLE IF EXISTS test_array_contains;
+DROP TABLE IF EXISTS test_array_contains_complex_type;
+DROP DATABASE IF EXISTS sql_tests_complex_test_array_contains;

@@ -559,4 +559,17 @@ SELECT null_or_empty(COLB) FROM flatten_test ORDER BY COLA;
 
 -- query 109
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array FORCE;
+-- A catalog that cannot hold views cannot answer view enumeration, so
+-- DROP DATABASE ... FORCE is refused here rather than silently assuming
+-- the namespace holds none. Drop the tables explicitly instead.
+USE sql_tests_complex_test_array;
+DROP TABLE IF EXISTS array_data_type;
+DROP TABLE IF EXISTS array_data_type_1;
+DROP TABLE IF EXISTS array_top_n;
+DROP TABLE IF EXISTS array_exprr;
+DROP TABLE IF EXISTS t2;
+DROP TABLE IF EXISTS repeat_test;
+DROP TABLE IF EXISTS flatten_test;
+DROP TABLE IF EXISTS flatten_one_layer_arr_test;
+DROP TABLE IF EXISTS null_or_empty_test;
+DROP DATABASE IF EXISTS sql_tests_complex_test_array;

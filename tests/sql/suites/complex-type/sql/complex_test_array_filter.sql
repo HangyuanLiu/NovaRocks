@@ -91,4 +91,9 @@ select array_filter(null, [1,0,1,null]) from t;
 
 -- query 16
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_filter FORCE;
+-- A catalog that cannot hold views cannot answer view enumeration, so
+-- DROP DATABASE ... FORCE is refused here rather than silently assuming
+-- the namespace holds none. Drop the tables explicitly instead.
+USE sql_tests_complex_test_array_filter;
+DROP TABLE IF EXISTS t;
+DROP DATABASE IF EXISTS sql_tests_complex_test_array_filter;

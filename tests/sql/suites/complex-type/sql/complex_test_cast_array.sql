@@ -86,4 +86,9 @@ select array_agg(arr)[1] from (select cast("[[1, 2, 3], [1, 2, 3]]" as array<arr
 
 -- query 13
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_cast_array FORCE;
+-- A catalog that cannot hold views cannot answer view enumeration, so
+-- DROP DATABASE ... FORCE is refused here rather than silently assuming
+-- the namespace holds none. Drop the tables explicitly instead.
+USE sql_tests_complex_test_cast_array;
+DROP TABLE IF EXISTS tbl;
+DROP DATABASE IF EXISTS sql_tests_complex_test_cast_array;

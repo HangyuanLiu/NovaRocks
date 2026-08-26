@@ -153,4 +153,9 @@ DROP TABLE test_array_top_n;
 
 -- query 26
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_top_n FORCE;
+-- A catalog that cannot hold views cannot answer view enumeration, so
+-- DROP DATABASE ... FORCE is refused here rather than silently assuming
+-- the namespace holds none. Drop the tables explicitly instead.
+USE sql_tests_complex_test_array_top_n;
+DROP TABLE IF EXISTS test_array_top_n;
+DROP DATABASE IF EXISTS sql_tests_complex_test_array_top_n;
