@@ -22,9 +22,10 @@ http_port = 8040
 
 [cluster]
 role = "fe"
-# Additive durable-membership seeds. SQL ADD/DROP BACKEND remains authoritative
-# after the first successful FE start.
-backends = ["127.0.0.1:9081"]
+# Backend desired lifecycle belongs to the external orchestrator. Each BE
+# announces itself to this FE endpoint; FE keeps only an in-memory observed
+# eligibility projection. SQL ADD/DROP BACKEND and cluster.backends are not
+# supported configuration or management surfaces.
 
 [state_store]
 provider = "sqlite"

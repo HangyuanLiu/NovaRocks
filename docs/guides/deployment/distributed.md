@@ -32,7 +32,7 @@ MySQL client
   |
   v
 NovaRocks role=fe
-  |  StateStore durable membership + cluster.backends additive seeds
+  |  Native self-registration + FE-pull exact heartbeat verification
   v
 NovaRocks role=be  +  NovaRocks role=be  +  ...
 ```
@@ -53,7 +53,7 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
   secret 与 transport mode；Native JWT 是 mandatory，TLS 只是在其上增加的可选层。
 - 所有 BE 节点都能访问相同的数据源、对象存储和 catalog。
 - 如果使用对象存储，所有节点的凭据、endpoint 和 path-style 设置应保持一致。
-- `role=fe` 必须配置一个可用的 `[state_store]`。它是 backend membership 的唯一 durable authority；SQLite 只适用于恰好一个 active FE。
+- `role=fe` 必须配置一个可用的 `[state_store]`，供 catalog、MV 等其余 FE durable owner 使用；它不是 backend membership source。backend desired lifecycle 属于外部 orchestrator，FE 的 observed registry 会由 BE announce 和 FE-pull heartbeat 在重启后重建。SQLite 只适用于恰好一个 active FE。
 
 ## 编译 NovaRocks
 
