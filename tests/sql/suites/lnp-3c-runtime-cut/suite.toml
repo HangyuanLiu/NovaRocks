@@ -1,0 +1,3 @@
+# LNP-3C is an explicit product-topology acceptance suite. It owns an FE
+# restart and must never run in all-in-one mode.
+explicit_only = true

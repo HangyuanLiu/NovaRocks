@@ -3714,6 +3714,24 @@ fn validate_lake_publication_preflight(
     Ok(())
 }
 
+fn validate_lnp_3c_runtime_cut_preflight(
+    suite_names: &[String],
+    mode: ClusterMode,
+    cluster_size: usize,
+    jobs: usize,
+) -> Result<()> {
+    if !suite_names.iter().any(|suite| suite == "lnp-3c-runtime-cut") {
+        return Ok(());
+    }
+    if mode != ClusterMode::CrossProcess || cluster_size != 3 {
+        bail!("lnp-3c-runtime-cut requires --cluster-mode cross-process --cluster-size 3");
+    }
+    if jobs != 1 {
+        bail!("lnp-3c-runtime-cut requires -j 1 because it restarts the shared frontend");
+    }
+    Ok(())
+}
+
 fn validate_publication_catalog_directives(
     suite_name: &str,
     cases: &[SqlCase],
@@ -3950,6 +3968,15 @@ fn run() -> Result<i32> {
         return Ok(1);
     }
     if let Err(error) = validate_lake_publication_preflight(
+        &suite_names,
+        selected_cluster_mode,
+        selected_cluster_size,
+        cli.jobs,
+    ) {
+        println!("❌ ERROR: {error}");
+        return Ok(1);
+    }
+    if let Err(error) = validate_lnp_3c_runtime_cut_preflight(
         &suite_names,
         selected_cluster_mode,
         selected_cluster_size,
