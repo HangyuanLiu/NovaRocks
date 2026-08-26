@@ -53,7 +53,9 @@ pub use identity::{
     AttemptId, ExecutionIdentityError, LocalQuerySequence, QueryExecutionId, QueryId,
     QueryIdAttribution, QueryProcessNamespace, UniqueId, format_uuid,
 };
-pub use network::{AdvertiseEndpoint, format_host_for_url};
+pub use network::{
+    AdvertiseEndpoint, CanonicalDnsName, NativeEndpoint, NativeReferenceHost, format_host_for_url,
+};
 pub use primitive::PrimitiveType;
 pub use slot_id::SlotId;
 
