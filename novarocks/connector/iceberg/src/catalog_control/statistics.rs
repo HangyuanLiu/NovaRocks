@@ -1006,36 +1006,15 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
-
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorMutationOperationId, ConnectorProviderId,
-        ConnectorRequestContext,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        ConnectorMutationOperationId, ConnectorProviderId,
     };
 
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::control_runtime::IcebergControlRuntime;
     use crate::resources::IcebergControlResources;
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
-    fn context() -> ConnectorRequestContext {
-        ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
-            1024,
-            4096,
-        )
-        .expect("context")
-    }
 
     fn provider() -> (
         tokio::runtime::Runtime,
@@ -1363,7 +1342,9 @@ mod tests {
         )
         .expect("evidence replay");
         assert_eq!(first, second);
-        let decoded = decode_statistics_evidence(first.provider_payload()).expect("decode");
+        let decoded =
+            crate::reconcile_payload::decode_statistics_evidence(first.provider_payload())
+                .expect("decode");
         assert_eq!(decoded.namespace, "db");
         assert_eq!(decoded.table, "t");
         assert_eq!(

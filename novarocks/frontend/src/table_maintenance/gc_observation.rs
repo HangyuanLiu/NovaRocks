@@ -582,11 +582,3 @@ fn format_run_failure(context: &str, failure: RunFailure) -> GcOwnedRefObservati
         )),
     }
 }
-
-#[cfg(test)]
-pub(crate) fn observation_key_for_test(
-    table_uuid: Uuid,
-    ref_name: &str,
-) -> Result<Key, GcOwnedRefObservationError> {
-    observation_key(&table_uuid, ref_name)
-}

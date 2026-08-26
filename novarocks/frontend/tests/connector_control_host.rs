@@ -27,9 +27,9 @@ use novarocks_spi::connector::{
     ConnectorCatalogMutationResolver, ConnectorCleanupCandidatePageRequest,
     ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
     ConnectorCleanupMaintenanceResolver, ConnectorCleanupPlan, ConnectorCleanupPlanningRequest,
-    ConnectorCleanupPrepareRequest, ConnectorCleanupReconcileRequest, ConnectorControlBinding,
-    ConnectorControlResolver, ConnectorDataMutation, ConnectorDataMutationExecuteRequest,
-    ConnectorDataMutationPlan, ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
+    ConnectorCleanupPrepareRequest, ConnectorControlBinding, ConnectorControlResolver,
+    ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
+    ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
     ConnectorDistributedRewrite, ConnectorDistributedRewriteAttemptCheckpoint,
     ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewritePlan,
@@ -40,16 +40,16 @@ use novarocks_spi::connector::{
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorMetadataMaintenance,
     ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
-    ConnectorMetadataMaintenanceReconcileRequest, ConnectorMetadataMaintenanceResolver,
-    ConnectorNamespaceRequest, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorStatistics,
-    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
-    ConnectorTableRequest, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
-    ConnectorWriteActivation, ConnectorWriteAttemptCompletion, ConnectorWriteCommitRequest,
-    ConnectorWriteControl, ConnectorWritePlan, ConnectorWritePlanningRequest,
-    ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ExternalMutationOutcome,
-    StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision, StatisticsReadRequest,
-    StatisticsReader, StatisticsRowCoverage,
+    ConnectorMetadataMaintenanceResolver, ConnectorNamespaceRequest, ConnectorProviderId,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorSplitPlanningRequest, ConnectorStatistics, ConnectorStatisticsResolver,
+    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest,
+    ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest, ConnectorWriteActivation,
+    ConnectorWriteAttemptCompletion, ConnectorWriteCommitRequest, ConnectorWriteControl,
+    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWriteReceipt,
+    ConnectorWriteReconcileRequest, ExternalMutationOutcome, StatisticsDataVersion,
+    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsReadRequest, StatisticsReader,
+    StatisticsRowCoverage,
 };
 
 struct TestControl {
@@ -289,13 +289,6 @@ impl ConnectorCleanupMaintenance for TestCleanupMaintenance {
         Err(unsupported())
     }
 
-    fn reconcile_batch(
-        &self,
-        _request: ConnectorCleanupReconcileRequest,
-    ) -> Result<novarocks_spi::connector::BatchReceipt, ConnectorError> {
-        Err(unsupported())
-    }
-
     fn read_candidate_page(
         &self,
         _request: ConnectorCleanupCandidatePageRequest,
@@ -365,13 +358,6 @@ impl ConnectorMetadataMaintenance for TestMetadataMaintenance {
     fn execute(
         &self,
         _request: ConnectorMetadataMaintenanceExecuteRequest,
-    ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError> {
-        Err(unsupported())
-    }
-
-    fn reconcile(
-        &self,
-        _request: ConnectorMetadataMaintenanceReconcileRequest,
     ) -> Result<ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>, ConnectorError> {
         Err(unsupported())
     }

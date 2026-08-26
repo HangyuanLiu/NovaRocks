@@ -1590,24 +1590,6 @@ mod tests {
         (executor, warehouse, runtime)
     }
 
-    fn size_mtime_identity(executor: &tokio::runtime::Runtime, location: &str) -> ObjectIdentity {
-        let access = crate::fs_io::resolve_access_for_location(location, None).expect("access");
-        let path = access.single_relative_path().expect("relative path");
-        let metadata = executor
-            .block_on(access.operator().stat(path))
-            .expect("metadata");
-        ObjectIdentity::SizeMtime {
-            size: metadata.content_length(),
-            mtime_ms: canonical_object_mtime_ms(
-                metadata
-                    .last_modified()
-                    .expect("modification time")
-                    .into_inner()
-                    .as_millisecond(),
-            ),
-        }
-    }
-
     fn object_record(
         ordinal: u32,
         location: impl Into<String>,
@@ -1619,16 +1601,6 @@ mod tests {
                 location: location.into(),
                 identity,
             },
-        }
-    }
-
-    fn test_payload() -> PlanPayload {
-        PlanPayload {
-            version: ARTIFACT_VERSION,
-            namespace: "db".to_string(),
-            table: "t".to_string(),
-            table_uuid: "00000000-0000-0000-0000-000000000000".to_string(),
-            artifact_root: "file:///tmp/cleanup".to_string(),
         }
     }
 
