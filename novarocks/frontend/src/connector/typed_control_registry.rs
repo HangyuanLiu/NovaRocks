@@ -32,24 +32,24 @@ use novarocks_spi::connector::ConnectorExecutionBindingKey;
 
 /// The pair of coordinator-side entry points one installed provider offers.
 #[derive(Clone)]
-pub(crate) struct TypedConnectorControl {
+pub struct TypedConnectorControl {
     metadata: Arc<dyn TypedConnectorMetadata>,
     splits: Arc<dyn TypedConnectorSplitManager>,
 }
 
 impl TypedConnectorControl {
-    pub(crate) fn new(
+    pub fn new(
         metadata: Arc<dyn TypedConnectorMetadata>,
         splits: Arc<dyn TypedConnectorSplitManager>,
     ) -> Self {
         Self { metadata, splits }
     }
 
-    pub(crate) fn metadata(&self) -> Arc<dyn TypedConnectorMetadata> {
+    pub fn metadata(&self) -> Arc<dyn TypedConnectorMetadata> {
         Arc::clone(&self.metadata)
     }
 
-    pub(crate) fn splits(&self) -> Arc<dyn TypedConnectorSplitManager> {
+    pub fn splits(&self) -> Arc<dyn TypedConnectorSplitManager> {
         Arc::clone(&self.splits)
     }
 }
@@ -63,7 +63,7 @@ impl fmt::Debug for TypedConnectorControl {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TypedControlRegistryErrorKind {
+pub enum TypedControlRegistryErrorKind {
     /// The instance is already installed at another incarnation. Replacing it
     /// silently would let an in-flight statement straddle two control
     /// generations.
@@ -73,7 +73,7 @@ pub(crate) enum TypedControlRegistryErrorKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TypedControlRegistryError {
+pub struct TypedControlRegistryError {
     kind: TypedControlRegistryErrorKind,
     instance_id: String,
     detail: String,
@@ -84,11 +84,11 @@ impl TypedControlRegistryError {
         self.kind
     }
 
-    pub(crate) fn instance_id(&self) -> &str {
+    pub fn instance_id(&self) -> &str {
         &self.instance_id
     }
 
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 }
@@ -107,16 +107,16 @@ impl std::error::Error for TypedControlRegistryError {}
 
 /// Frontend-owned map from one exact binding generation to its control pair.
 #[derive(Default)]
-pub(crate) struct TypedConnectorControlRegistry {
+pub struct TypedConnectorControlRegistry {
     installed: Mutex<BTreeMap<ConnectorExecutionBindingKey, TypedConnectorControl>>,
 }
 
 impl TypedConnectorControlRegistry {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn install(
+    pub fn install(
         &self,
         key: ConnectorExecutionBindingKey,
         control: TypedConnectorControl,
@@ -139,7 +139,7 @@ impl TypedConnectorControlRegistry {
         Ok(())
     }
 
-    pub(crate) fn resolve(
+    pub fn resolve(
         &self,
         key: &ConnectorExecutionBindingKey,
     ) -> Result<TypedConnectorControl, TypedControlRegistryError> {
@@ -156,7 +156,7 @@ impl TypedConnectorControlRegistry {
             })
     }
 
-    pub(crate) fn retire(&self, key: &ConnectorExecutionBindingKey) -> bool {
+    pub fn retire(&self, key: &ConnectorExecutionBindingKey) -> bool {
         self.installed
             .lock()
             .expect("typed control registry lock")
@@ -164,7 +164,7 @@ impl TypedConnectorControlRegistry {
             .is_some()
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.installed
             .lock()
             .expect("typed control registry lock")

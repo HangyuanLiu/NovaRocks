@@ -61,6 +61,7 @@ pub use client_connection::{
     ClientConnectionTerminationReason, ClientConnectionToken, ClientConnectionTokenError,
 };
 pub use common::admitted_query_context::LakePublicationRuntimePolicy;
+pub use connector::typed_control_registry::{TypedConnectorControl, TypedConnectorControlRegistry};
 pub use dml::error::ERROR_CODE_DESCRIPTORS as DML_ERROR_CODE_DESCRIPTORS;
 pub use mv::FrontendMvService;
 pub use mv::maintenance::MaintenanceCoordinatorConfig;

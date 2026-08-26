@@ -70,6 +70,11 @@ pub struct FrontendServerConfig {
     pub mysql_listener: ResolvedMysqlListenerSettings,
     /// Provider-owned FE control factories composed by the server root.
     pub connector_control_factories: Vec<Arc<dyn ConnectorControlFactory>>,
+    /// Coordinator-side typed connector control, keyed by the exact binding
+    /// generation. The composition root installs into the same instance the
+    /// planner resolves from, so there is one answer to "which generation".
+    pub typed_connector_control:
+        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
     /// Application-owned storage observation composed by the server role.
     /// Frontend and Core never decode provider table handles directly.
     pub mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -785,6 +790,9 @@ mod tests {
                 "root",
             ),
             connector_control_factories: Vec::new(),
+            typed_connector_control: Arc::new(
+                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
+            ),
             mv_storage_observation: Arc::new(UnavailableMvStorageObservationPort),
             state_store_input: None,
             state_store_provider_registry: StateStoreProviderRegistry::new(),

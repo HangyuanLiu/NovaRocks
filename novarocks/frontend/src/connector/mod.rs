@@ -21,7 +21,7 @@ pub(crate) mod control_host;
     dead_code,
     reason = "Consumed by the frontend typed-scan lowering in the same PR."
 )]
-pub(crate) mod typed_control_registry;
+pub mod typed_control_registry;
 
 pub mod backend;
 pub mod cleanup_maintenance;
