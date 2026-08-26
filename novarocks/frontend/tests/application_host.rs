@@ -248,8 +248,8 @@ async fn sqlite_host_bootstraps_once_and_preserves_reconciling_mode() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fe_without_state_store_fails_before_frontend_services_open() {
-    let error = match FrontendApplicationHost::open(
+async fn fe_without_state_store_opens_ephemeral_membership_host() {
+    let host = FrontendApplicationHost::open(
         None,
         execution_config(),
         fe_backend_config(),
@@ -258,19 +258,14 @@ async fn fe_without_state_store_fails_before_frontend_services_open() {
         FrontendNativeTransport::plaintext(),
     )
     .await
-    {
-        Ok(host) => {
-            host.shutdown().await.expect("shutdown unexpected FE host");
-            panic!("role=fe must not open without StateStore membership authority");
-        }
-        Err(error) => error,
-    };
-
-    assert_eq!(
-        error.kind(),
-        FrontendApplicationErrorKind::ClusterBackendOpen
+    .expect("role=fe must permit an ephemeral self-registration membership projection");
+    assert!(
+        host.state_store().is_none(),
+        "the test host must prove membership does not require StateStore"
     );
-    assert!(error.to_string().contains("requires StateStore"), "{error}");
+    host.shutdown()
+        .await
+        .expect("shutdown ephemeral membership host");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
