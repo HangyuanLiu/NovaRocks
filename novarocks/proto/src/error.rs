@@ -87,7 +87,6 @@ pub enum ProtocolErrorKind {
     Conflict,
     Capacity,
     VersionMismatch,
-    DigestMismatch,
 }
 
 impl fmt::Display for ProtocolErrorKind {
@@ -103,7 +102,6 @@ impl fmt::Display for ProtocolErrorKind {
             Self::Conflict => f.write_str("conflict"),
             Self::Capacity => f.write_str("capacity"),
             Self::VersionMismatch => f.write_str("version mismatch"),
-            Self::DigestMismatch => f.write_str("digest mismatch"),
         }
     }
 }

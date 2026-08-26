@@ -34,7 +34,6 @@ use novarocks_proto_models::{common, filter, novarocks as proto_novarocks, plan}
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 use prost::Message;
-use sha2::Digest;
 
 use super::entry::QueryLifecyclePhase;
 use super::registry::{
@@ -857,10 +856,7 @@ fn protocol_unique_id(id: UniqueId) -> common::UniqueId {
     }
 }
 
-fn runtime_filter_contribution(
-    execution_id: QueryExecutionId,
-    participant_id: u32,
-) -> RuntimeFilterContribution {
+fn runtime_filter_contribution(participant_id: u32) -> RuntimeFilterContribution {
     let lifecycle = filter::RuntimeFilterQueryLifecycleOptions {
         delivery_expire_ms: 1,
         query_expire_ms: 1,
@@ -870,25 +866,10 @@ fn runtime_filter_contribution(
         transport_max_pending_entries: 1,
         transport_max_pending_bytes: 1,
     };
-    let install = filter::RuntimeFilterParticipantInstall::default();
-    let envelope = filter::InstallRuntimeFilterDeploymentRequest {
-        query_id: Some(common::UniqueId {
-            hi: execution_id.query_id().high(),
-            lo: execution_id.query_id().low(),
-        }),
-        deployment_epoch: execution_id.attempt_id().get(),
-        participant_id,
-        lifecycle: Some(lifecycle),
-        install: Some(install.clone()),
-    };
-    let mut digest = sha2::Sha256::new();
-    digest.update(b"novarocks.query-lifecycle.runtime-filter-contribution.v1\0");
-    digest.update(envelope.encode_to_vec());
     RuntimeFilterContribution::parse(proto_novarocks::RuntimeFilterContribution {
         participant_id,
         lifecycle: Some(lifecycle),
-        install: Some(install),
-        contribution_digest: digest.finalize().to_vec(),
+        install: Some(filter::RuntimeFilterParticipantInstall::default()),
     })
     .expect("valid runtime-filter contribution")
 }
@@ -900,7 +881,7 @@ fn init_request_fixture(
     query_deadline_unix_ms: u64,
 ) -> QueryInitRequest {
     let execution_id = execution_id(query_low, attempt);
-    let runtime_filter = runtime_filter_contribution(execution_id, 3);
+    let runtime_filter = runtime_filter_contribution(3);
     let manifest = ParticipantManifest::new(
         execution_id,
         ParticipantBackendIdentity::new(
@@ -966,7 +947,7 @@ fn fragment_runtime_filter_init_request_fixture(
         default_query_options(),
         10_000,
         [],
-        Some(runtime_filter_contribution(execution_id, 3)),
+        Some(runtime_filter_contribution(3)),
         Duration::from_secs(30),
         QueryControlEndpoint::new("127.0.0.1", 9031).expect("valid report endpoint"),
     )

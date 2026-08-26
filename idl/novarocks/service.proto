@@ -114,7 +114,8 @@ message RuntimeFilterContribution {
   uint32 participant_id = 1;
   novarocks.filter.RuntimeFilterQueryLifecycleOptions lifecycle = 2;
   novarocks.filter.RuntimeFilterParticipantInstall install = 3;
-  bytes contribution_digest = 4;
+  reserved 4;
+  reserved "contribution_digest";
 }
 
 message ParticipantManifest {

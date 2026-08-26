@@ -149,6 +149,11 @@ fn retired_request_self_attestation_fields_remain_reserved() {
     for (message_name, field_number, field_name) in [
         ("novarocks.InitQueryRequest", 2, "init_digest"),
         ("novarocks.StageFragmentsRequest", 4, "stage_digest"),
+        (
+            "novarocks.RuntimeFilterContribution",
+            4,
+            "contribution_digest",
+        ),
     ] {
         let message = pool
             .get_message_by_name(message_name)

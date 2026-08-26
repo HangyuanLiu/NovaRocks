@@ -241,12 +241,6 @@ impl RuntimeFilterContribution {
                 "runtime filter participant id must be nonzero",
             ));
         }
-        if raw.contribution_digest.len() != 32 {
-            return Err(invalid(
-                FieldPath::root("runtime_filter_contribution").field("contribution_digest"),
-                "runtime filter contribution digest must be 32 bytes",
-            ));
-        }
         Ok(Self { raw })
     }
 
@@ -256,10 +250,6 @@ impl RuntimeFilterContribution {
 
     pub const fn participant_id(&self) -> u32 {
         self.raw.participant_id
-    }
-
-    pub fn digest(&self) -> &[u8] {
-        &self.raw.contribution_digest
     }
 }
 
@@ -715,7 +705,6 @@ mod tests {
     fn contribution() -> novarocks::RuntimeFilterContribution {
         novarocks::RuntimeFilterContribution {
             participant_id: 7,
-            contribution_digest: vec![3; 32],
             ..Default::default()
         }
     }
@@ -815,13 +804,13 @@ mod tests {
         );
 
         let filter_error = RuntimeFilterContribution::parse(novarocks::RuntimeFilterContribution {
-            contribution_digest: vec![0; 31],
+            participant_id: 0,
             ..contribution()
         })
-        .expect_err("short runtime-filter digest");
+        .expect_err("unaddressed runtime-filter contribution");
         assert_eq!(
             filter_error.detail(),
-            "runtime filter contribution digest must be 32 bytes"
+            "runtime filter participant id must be nonzero"
         );
     }
 
@@ -929,17 +918,42 @@ mod tests {
             .as_mut()
             .expect("lifecycle")
             .delivery_expire_ms = 2;
-        let changed_again = ParticipantManifest::parse(changed_again_raw).expect("valid manifest");
+        let changed_again =
+            ParticipantManifest::parse(changed_again_raw.clone()).expect("valid manifest");
+        let mut changed_install_raw = changed_again_raw;
+        changed_install_raw
+            .runtime_filter
+            .as_mut()
+            .expect("filter")
+            .install = Some(
+            novarocks_proto_models::filter::RuntimeFilterParticipantInstall {
+                core_channels: vec![
+                    novarocks_proto_models::filter::RuntimeFilterChannelDeployment {
+                        channel_id: 9,
+                        ..Default::default()
+                    },
+                ],
+                routing_channels: Vec::new(),
+            },
+        );
+        let changed_install =
+            ParticipantManifest::parse(changed_install_raw).expect("valid manifest");
 
         assert_ne!(
             first.digest().expect("digest"),
             changed.digest().expect("digest")
         );
-        // The old projection digested only contribution_digest, not this
-        // generated lifecycle field. Descriptor traversal covers it directly.
+        // A hand-written projection had to enumerate every nested generated
+        // field such as these. Descriptor traversal covers the contribution's
+        // lifecycle and install subtrees directly, so the contribution needs no
+        // self-attestation of its own.
         assert_ne!(
             changed.digest().expect("digest"),
             changed_again.digest().expect("digest")
+        );
+        assert_ne!(
+            changed_again.digest().expect("digest"),
+            changed_install.digest().expect("digest")
         );
     }
 

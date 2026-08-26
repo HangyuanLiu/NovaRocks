@@ -913,7 +913,6 @@ fn manifest(
             Some(
                 RuntimeFilterContribution::parse(proto::RuntimeFilterContribution {
                     participant_id: backend_idx as u32 + 1,
-                    contribution_digest: vec![0; 32],
                     ..Default::default()
                 })
                 .expect("fixture runtime-filter contribution"),
@@ -1828,6 +1827,54 @@ fn frontend_query_lifecycle_manifest_conflict_is_classified() {
     match barrier.initialize_all(plan) {
         Ok(_) => panic!("manifest conflict must fail the barrier"),
         Err(error) => assert!(error.message().contains("RejectedConflict"), "{error}"),
+    }
+
+    assert_eq!(barrier.metrics_snapshot().manifest_conflicts, 1);
+}
+
+#[test]
+fn frontend_query_lifecycle_rejects_an_ack_covering_a_different_runtime_filter_contribution() {
+    let plan = query_init_plan(Some(1));
+    let execution_id = plan.execution_id();
+    let sent = plan.participant(1).expect("fixture participant").digest();
+
+    // Model a backend that admitted a runtime-filter contribution whose content
+    // differs while staying structurally valid, so no boundary decoder rejects
+    // it. Manifest identity is derived from content by both roles, so the
+    // acknowledged digest can no longer match the retained one.
+    let mut received_raw = manifest(execution_id, 1, true).as_proto().clone();
+    received_raw
+        .runtime_filter
+        .as_mut()
+        .expect("fixture contribution")
+        .lifecycle = Some(filter::RuntimeFilterQueryLifecycleOptions {
+        delivery_expire_ms: 1,
+        ..Default::default()
+    });
+    let received = ParticipantManifest::parse(received_raw)
+        .expect("a structurally valid manifest still decodes")
+        .digest()
+        .expect("derived manifest identity");
+    assert_ne!(sent.as_bytes(), received.as_bytes());
+
+    let (transport, _) = RecordingTransport::ready(&plan);
+    transport.state.lock().unwrap().init_results.insert(
+        1,
+        VecDeque::from([Ok(QueryInitAck::new(
+            execution_id,
+            received,
+            QueryInitOutcome::QueryInitApplied,
+        ))]),
+    );
+    let (registry, _query) = registry_for(&plan);
+    let barrier = FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, config());
+
+    match barrier.initialize_all(plan) {
+        Ok(_) => panic!("a contribution-only difference must fail the barrier"),
+        Err(error) => assert!(
+            error.message().contains("InitAck digest mismatch"),
+            "{error}"
+        ),
     }
 
     assert_eq!(barrier.metrics_snapshot().manifest_conflicts, 1);

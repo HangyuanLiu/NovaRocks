@@ -33,7 +33,6 @@ fn request_with_runtime_filter() -> QueryInitRequest {
     .expect("nonzero query id");
     let contribution = RuntimeFilterContribution::parse(novarocks::RuntimeFilterContribution {
         participant_id: 3,
-        contribution_digest: vec![0; 32],
         ..Default::default()
     })
     .expect("valid contribution");

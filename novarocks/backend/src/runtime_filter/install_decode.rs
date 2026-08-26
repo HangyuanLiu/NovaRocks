@@ -35,8 +35,6 @@ use novarocks_proto::lifecycle::{QueryExecutionId, RuntimeFilterContribution};
 use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, filter, plan};
 use novarocks_types::UniqueId;
-use prost::Message;
-use sha2::Digest;
 
 use crate::fragment::decode::type_decode::decode_type;
 use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
@@ -76,9 +74,15 @@ pub(crate) struct DecodedRuntimeFilterContribution {
 
 type CodecResult<T> = Result<T, ProtocolError>;
 
-const CONTRIBUTION_DIGEST_DOMAIN: &[u8] =
-    b"novarocks.query-lifecycle.runtime-filter-contribution.v1\0";
-
+/// Rebuild the participant-local install envelope from the manifest
+/// contribution and the admitted execution identity, then decode it.
+///
+/// The contribution carries content only. Its integrity is covered by the
+/// enclosing participant manifest, whose identity both roles derive by
+/// descriptor traversal and reconcile across `InitQueryResponse`; the
+/// execution identity used here is the admitted one, not a restated copy.
+/// Every structural and cross-field rejection below therefore still runs on
+/// the exact bytes that were admitted.
 pub(crate) fn decode_runtime_filter_contribution(
     execution_id: QueryExecutionId,
     contribution: &RuntimeFilterContribution,
@@ -94,15 +98,6 @@ pub(crate) fn decode_runtime_filter_contribution(
         lifecycle: wire.lifecycle,
         install: wire.install.clone(),
     };
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(CONTRIBUTION_DIGEST_DOMAIN);
-    hasher.update(request.encode_to_vec());
-    if hasher.finalize().as_slice() != contribution.digest() {
-        return Err(QueryLifecycleError::new(
-            QueryLifecycleErrorCode::InvalidManifest,
-            "runtime filter contribution digest does not match install DTO",
-        ));
-    }
     let decoded = decode_participant_install(&request).map_err(|error| {
         QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
     })?;
@@ -1757,10 +1752,8 @@ pub(crate) fn validate_participant_install(
 }
 #[cfg(test)]
 mod tests {
-    use super::{
-        CONTRIBUTION_DIGEST_DOMAIN, decode_runtime_filter_contribution,
-        validate_participant_install,
-    };
+    use super::{decode_runtime_filter_contribution, validate_participant_install};
+    use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
     use crate::runtime_filter::{
         domain::{
             BackendChannelInstall, BackendChannelLifecycle, BackendMaterializationPolicy,
@@ -1769,10 +1762,8 @@ mod tests {
         test_support::BackendRuntimeFilterFixture,
     };
     use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId, RuntimeFilterContribution};
-    use novarocks_proto_models::{common, filter, novarocks as proto_novarocks};
+    use novarocks_proto_models::{filter, novarocks as proto_novarocks};
     use novarocks_types::QueryId;
-    use prost::Message;
-    use sha2::Digest;
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
@@ -1782,8 +1773,8 @@ mod tests {
         .expect("nonzero execution id")
     }
 
-    fn valid_empty_contribution(execution_id: QueryExecutionId) -> RuntimeFilterContribution {
-        let lifecycle = filter::RuntimeFilterQueryLifecycleOptions {
+    fn lifecycle_options() -> filter::RuntimeFilterQueryLifecycleOptions {
+        filter::RuntimeFilterQueryLifecycleOptions {
             delivery_expire_ms: 1,
             query_expire_ms: 1,
             transport_retry_interval_ms: 1,
@@ -1791,34 +1782,43 @@ mod tests {
             transport_deadline_ms: 1,
             transport_max_pending_entries: 1,
             transport_max_pending_bytes: 1,
-        };
-        let install = filter::RuntimeFilterParticipantInstall::default();
-        let envelope = filter::InstallRuntimeFilterDeploymentRequest {
-            query_id: Some(common::UniqueId {
-                hi: execution_id.query_id().high(),
-                lo: execution_id.query_id().low(),
-            }),
-            deployment_epoch: execution_id.attempt_id().get(),
+        }
+    }
+
+    fn empty_contribution_wire() -> proto_novarocks::RuntimeFilterContribution {
+        proto_novarocks::RuntimeFilterContribution {
             participant_id: 3,
-            lifecycle: Some(lifecycle),
-            install: Some(install.clone()),
-        };
-        let mut digest = sha2::Sha256::new();
-        digest.update(CONTRIBUTION_DIGEST_DOMAIN);
-        digest.update(envelope.encode_to_vec());
-        RuntimeFilterContribution::parse(proto_novarocks::RuntimeFilterContribution {
-            participant_id: 3,
-            lifecycle: Some(lifecycle),
-            install: Some(install),
-            contribution_digest: digest.finalize().to_vec(),
-        })
-        .expect("valid opaque contribution fixture")
+            lifecycle: Some(lifecycle_options()),
+            install: Some(filter::RuntimeFilterParticipantInstall::default()),
+        }
+    }
+
+    fn valid_empty_contribution() -> RuntimeFilterContribution {
+        RuntimeFilterContribution::parse(empty_contribution_wire())
+            .expect("valid opaque contribution fixture")
+    }
+
+    /// Assert the boundary rejection without pinning the protocol-error
+    /// rendering: the load-bearing facts are the lifecycle error code, the
+    /// rejected field path, and the reason.
+    fn assert_invalid_manifest(error: &QueryLifecycleError, path: &str, reason: &str) {
+        assert_eq!(error.code(), QueryLifecycleErrorCode::InvalidManifest);
+        assert!(
+            error.detail().contains(path),
+            "rejection must name {path}, got {}",
+            error.detail()
+        );
+        assert!(
+            error.detail().contains(reason),
+            "rejection must explain {reason}, got {}",
+            error.detail()
+        );
     }
 
     #[test]
-    fn decodes_backend_participant_domain_only_after_digest_validation() {
+    fn decodes_backend_participant_domain_from_the_admitted_execution_identity() {
         let execution_id = execution_id();
-        let contribution = valid_empty_contribution(execution_id);
+        let contribution = valid_empty_contribution();
 
         let decoded = decode_runtime_filter_contribution(execution_id, &contribution)
             .expect("backend decodes the valid participant install");
@@ -1829,19 +1829,140 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_digest_before_constructing_participant_domain() {
-        let execution_id = execution_id();
-        let contribution = valid_empty_contribution(execution_id);
-        let mut wire = contribution.as_proto().clone();
-        wire.contribution_digest[0] ^= 0x01;
-        let malformed = RuntimeFilterContribution::parse(wire)
-            .expect("length remains a generic carrier invariant");
+    fn rejects_a_contribution_without_lifecycle_options() {
+        let mut wire = empty_contribution_wire();
+        wire.lifecycle = None;
+        let malformed =
+            RuntimeFilterContribution::parse(wire).expect("carrier shape stays structurally valid");
 
-        let error = decode_runtime_filter_contribution(execution_id, &malformed)
-            .expect_err("bad digest is rejected before service installation");
+        let error = decode_runtime_filter_contribution(execution_id(), &malformed)
+            .expect_err("a lifecycle-less contribution cannot be installed");
+        assert_invalid_manifest(
+            &error,
+            "install_runtime_filter_deployment_request.lifecycle",
+            "lifecycle options are required",
+        );
+    }
+
+    #[test]
+    fn rejects_a_contribution_whose_lifecycle_option_is_zero() {
+        let mut wire = empty_contribution_wire();
+        wire.lifecycle
+            .as_mut()
+            .expect("lifecycle fixture")
+            .query_expire_ms = 0;
+        let malformed =
+            RuntimeFilterContribution::parse(wire).expect("carrier shape stays structurally valid");
+
+        let error = decode_runtime_filter_contribution(execution_id(), &malformed)
+            .expect_err("a zero lifecycle bound cannot be installed");
+        assert_invalid_manifest(
+            &error,
+            "install_runtime_filter_deployment_request.lifecycle.query_expire_ms",
+            "query expiry must be nonzero",
+        );
+    }
+
+    #[test]
+    fn rejects_a_contribution_without_a_participant_install() {
+        let mut wire = empty_contribution_wire();
+        wire.install = None;
+        let malformed =
+            RuntimeFilterContribution::parse(wire).expect("carrier shape stays structurally valid");
+
+        let error = decode_runtime_filter_contribution(execution_id(), &malformed)
+            .expect_err("an install-less contribution cannot be installed");
+        assert_invalid_manifest(
+            &error,
+            "install_runtime_filter_deployment_request.install",
+            "participant install is required",
+        );
+    }
+
+    #[test]
+    fn rejects_a_contribution_whose_install_is_structurally_invalid() {
+        let mut wire = empty_contribution_wire();
+        wire.install
+            .as_mut()
+            .expect("install fixture")
+            .core_channels
+            .push(filter::RuntimeFilterChannelDeployment::default());
+        let malformed =
+            RuntimeFilterContribution::parse(wire).expect("carrier shape stays structurally valid");
+
+        let error = decode_runtime_filter_contribution(execution_id(), &malformed)
+            .expect_err("an unaddressed core channel cannot be installed");
+        assert_invalid_manifest(
+            &error,
+            "install_runtime_filter_deployment_request.install.core_channels[0].channel_id",
+            "channel id must be nonzero",
+        );
+    }
+
+    fn relay_role() -> filter::RuntimeFilterRouteRole {
+        filter::RuntimeFilterRouteRole {
+            role: Some(filter::runtime_filter_route_role::Role::Relay(true)),
+        }
+    }
+
+    fn route_endpoint(participant_id: u32) -> filter::RuntimeFilterRouteEndpointView {
+        filter::RuntimeFilterRouteEndpointView {
+            participant_id,
+            role: Some(relay_role()),
+        }
+    }
+
+    #[test]
+    fn rejects_a_routing_edge_that_disagrees_with_the_contribution_participant() {
+        let mut wire = empty_contribution_wire();
+        wire.install
+            .as_mut()
+            .expect("install fixture")
+            .routing_channels
+            .push(filter::RuntimeFilterChannelRoutingView {
+                channel_id: 1,
+                local_roles: vec![relay_role()],
+                producer_instances: Vec::new(),
+                inbound_edges: Vec::new(),
+                outbound_edges: vec![filter::RuntimeFilterRoutingEdgeView {
+                    route_edge_id: 1,
+                    // The contribution addresses participant 3, so an outbound
+                    // edge sourced at participant 9 is self-inconsistent.
+                    source: Some(route_endpoint(9)),
+                    target: Some(route_endpoint(4)),
+                    peer: Some(filter::RuntimeFilterRoutePeer {
+                        peer: Some(filter::runtime_filter_route_peer::Peer::Remote(
+                            filter::RuntimeFilterRemotePeer {
+                                participant_id: 4,
+                                endpoint: "127.0.0.1:19040".to_string(),
+                            },
+                        )),
+                    }),
+                    allowed_kinds: vec![filter::RuntimeFilterEnvelopeKind::Contribution as i32],
+                }],
+            });
+        let malformed =
+            RuntimeFilterContribution::parse(wire).expect("carrier shape stays structurally valid");
+
+        let error = decode_runtime_filter_contribution(execution_id(), &malformed)
+            .expect_err("a self-inconsistent routing edge cannot be installed");
+        assert_invalid_manifest(
+            &error,
+            "install_runtime_filter_deployment_request.install.routing_channels[0].outbound_edges",
+            "outbound edge source does not match request participant",
+        );
+    }
+
+    #[test]
+    fn rejects_an_unaddressed_contribution_at_the_manifest_carrier() {
+        let mut wire = empty_contribution_wire();
+        wire.participant_id = 0;
+
+        let error = RuntimeFilterContribution::parse(wire)
+            .expect_err("participant id remains a carrier invariant");
         assert_eq!(
-            error.to_string(),
-            "InvalidManifest: runtime filter contribution digest does not match install DTO"
+            error.detail(),
+            "runtime filter participant id must be nonzero"
         );
     }
 
