@@ -34,7 +34,7 @@ pub(crate) enum MvBackgroundEngineErrorKind {
     TargetGone,
     TransientUnavailable,
     InvalidDefinition,
-    RecoveryRequired,
+    TerminalFailure,
     Corruption,
     InvariantViolation,
     #[allow(

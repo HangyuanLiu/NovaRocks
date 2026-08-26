@@ -136,6 +136,7 @@ pub(crate) fn query_lifecycle_fault_step_guard(
     let armed = meta.drop_next_init_ack_be_index.is_some()
         || meta.stop_query_control_heartbeat_be_index.is_some()
         || meta.kill_fe_after_control_ready_count.is_some()
+        || meta.kill_fe_after_mv_known_committed_before_projector_cas
         || meta.restart_be_after_init_ack_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
         || meta.kill_query_after_be_log_contains.is_some()
@@ -186,6 +187,7 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.drop_next_init_ack_be_index.is_some()
         || meta.stop_query_control_heartbeat_be_index.is_some()
         || meta.kill_fe_after_control_ready_count.is_some()
+        || meta.kill_fe_after_mv_known_committed_before_projector_cas
         || meta.restart_be_after_init_ack_index.is_some()
         || meta.kill_query_after_control_ready_count.is_some()
         || meta.kill_query_after_be_log_contains.is_some()
@@ -221,7 +223,9 @@ fn configured_query_lifecycle_faults(
 /// process is restarted. They are not execution resources and must therefore
 /// be checked against their published limits rather than a pre-fault zero.
 pub(crate) fn permits_terminal_retention(meta: &QueryMeta) -> bool {
-    meta.kill_fe_after_control_ready_count.is_some() || meta.kill_fe_at_lifecycle_phase.is_some()
+    meta.kill_fe_after_control_ready_count.is_some()
+        || meta.kill_fe_after_mv_known_committed_before_projector_cas
+        || meta.kill_fe_at_lifecycle_phase.is_some()
 }
 
 pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -> Result<()> {
@@ -246,6 +250,7 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         meta.drop_next_init_ack_be_index.is_some(),
         meta.stop_query_control_heartbeat_be_index.is_some(),
         meta.kill_fe_after_control_ready_count.is_some(),
+        meta.kill_fe_after_mv_known_committed_before_projector_cas,
         meta.restart_be_after_init_ack_index.is_some(),
         meta.kill_query_after_control_ready_count.is_some(),
         meta.kill_query_after_be_log_contains.is_some(),
@@ -397,6 +402,9 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     if let Some(count) = meta.kill_fe_after_control_ready_count {
         server.arm_fe_crash_after_control_ready(count)?;
     }
+    if meta.kill_fe_after_mv_known_committed_before_projector_cas {
+        server.arm_mv_known_committed_before_projector_cas()?;
+    }
     if let Some(index) = meta.restart_be_after_init_ack_index {
         server.arm_be_restart_after_init_ack(index)?;
     }
@@ -477,6 +485,7 @@ where
         KillBackend(usize),
         ReleaseFragmentFailure(usize),
         KillFrontendAfterControlReady(usize),
+        KillFrontendAfterMvKnownCommittedBeforeProjectorCas,
         RestartBackendAfterInitAck(usize),
         KillQueryAfterControlReady {
             ready_count: usize,
@@ -516,6 +525,9 @@ where
             fe_crash: bool,
             marker_count: u64,
         },
+        MvKnownCommittedBeforeProjectorCas {
+            marker_count: u64,
+        },
         BeLogPattern {
             pattern: String,
             counts: Vec<usize>,
@@ -529,6 +541,8 @@ where
             .map(PostQueryFault::ReleaseFragmentFailure),
         meta.kill_fe_after_control_ready_count
             .map(PostQueryFault::KillFrontendAfterControlReady),
+        meta.kill_fe_after_mv_known_committed_before_projector_cas
+            .then_some(PostQueryFault::KillFrontendAfterMvKnownCommittedBeforeProjectorCas),
         meta.restart_be_after_init_ack_index
             .map(PostQueryFault::RestartBackendAfterInitAck),
         meta.kill_query_after_control_ready_count
@@ -666,6 +680,11 @@ where
                     )? as u64,
                 }
             }
+            PostQueryFault::KillFrontendAfterMvKnownCommittedBeforeProjectorCas => {
+                FaultBaseline::MvKnownCommittedBeforeProjectorCas {
+                    marker_count: server.fe_log_count("NOVAROCKS_MV_PROJECTOR_PHASE")? as u64,
+                }
+            }
         }
     };
     let fault_state = Arc::new(ActiveQueryFaultState::new());
@@ -744,6 +763,10 @@ where
                         marker_count,
                     } => {
                         lifecycle_phase_marker_count(&server.fe_log_contents()?, *phase, *fe_crash)?
+                            > *marker_count as usize
+                    }
+                    FaultBaseline::MvKnownCommittedBeforeProjectorCas { marker_count } => {
+                        server.fe_log_count("NOVAROCKS_MV_PROJECTOR_PHASE")?
                             > *marker_count as usize
                     }
                     FaultBaseline::BeLogPattern { pattern, counts } => (0..server.be_count())
@@ -862,6 +885,14 @@ where
                         PostQueryFault::KillFrontendAtLifecyclePhase(phase) => {
                             server.kill_fe()?;
                             server.release_query_lifecycle_phase_fault(phase, true)?;
+                            server.restart_fe_until(deadline)?;
+                        }
+                        PostQueryFault::KillFrontendAfterMvKnownCommittedBeforeProjectorCas => {
+                            println!(
+                                "MV known-committed projector barrier PASS: lake package observed, projector CAS not entered"
+                            );
+                            server.kill_fe()?;
+                            server.clear_query_lifecycle_faults()?;
                             server.restart_fe_until(deadline)?;
                         }
                         PostQueryFault::KillBackendAtLifecyclePhase { index, phase } => {

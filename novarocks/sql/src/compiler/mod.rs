@@ -21,7 +21,7 @@
 //! Application admission, connector execution preparation, native encoding,
 //! and query lifecycle orchestration remain outside this boundary.
 // Design: ADR-0073 (docs/adr/ADR-0073-sql-compilation-freezes-statistics-after-analysis.md)
-// Design: ADR-0036 (docs/adr/ADR-0036-sql-compiler-dependency-inversion.md)
+// Design: ADR-0040 (docs/adr/ADR-0040-sql-compiler-dependency-inversion.md)
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;

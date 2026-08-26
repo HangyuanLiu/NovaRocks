@@ -30,6 +30,7 @@ use crate::common::backend_topology::BackendTopologyService;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::repository::MvRepository;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::service::QueryExecutionService;
@@ -64,7 +65,7 @@ pub struct SystemTableQueryKernel {
     catalog_service: Arc<QueryCatalogService>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     system_catalog: Arc<dyn SystemCatalog>,
-    mv_repository: Arc<dyn MvRepository>,
+    mv_readiness: Arc<MvReadinessPort>,
 }
 
 impl SystemTableQueryKernel {
@@ -72,13 +73,13 @@ impl SystemTableQueryKernel {
         catalog_service: Arc<QueryCatalogService>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         system_catalog: Arc<dyn SystemCatalog>,
-        mv_repository: Arc<dyn MvRepository>,
+        mv_readiness: Arc<MvReadinessPort>,
     ) -> Self {
         Self {
             catalog_service,
             connector_control,
             system_catalog,
-            mv_repository,
+            mv_readiness,
         }
     }
 
@@ -96,8 +97,8 @@ impl SystemTableQueryKernel {
         &self.system_catalog
     }
 
-    pub fn mv_repository(&self) -> &Arc<dyn MvRepository> {
-        &self.mv_repository
+    pub(crate) fn mv_readiness(&self) -> &Arc<MvReadinessPort> {
+        &self.mv_readiness
     }
 }
 
@@ -241,7 +242,7 @@ pub struct CatalogCommandKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    mv_repository: Arc<dyn MvRepository>,
+    mv_readiness: Arc<MvReadinessPort>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     view_service: Arc<dyn ViewService>,
 }
@@ -252,7 +253,7 @@ impl CatalogCommandKernel {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        mv_repository: Arc<dyn MvRepository>,
+        mv_readiness: Arc<MvReadinessPort>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         view_service: Arc<dyn ViewService>,
     ) -> Self {
@@ -260,7 +261,7 @@ impl CatalogCommandKernel {
             catalog_service,
             catalog_application,
             connector_control,
-            mv_repository,
+            mv_readiness,
             mv_storage_observation,
             view_service,
         }
@@ -278,8 +279,8 @@ impl CatalogCommandKernel {
         &self.connector_control
     }
 
-    pub(crate) fn mv_repository(&self) -> &Arc<dyn MvRepository> {
-        &self.mv_repository
+    pub(crate) fn mv_readiness(&self) -> &Arc<MvReadinessPort> {
+        &self.mv_readiness
     }
 
     pub(crate) fn mv_storage_observation(&self) -> &Arc<dyn MvStorageObservationPort> {

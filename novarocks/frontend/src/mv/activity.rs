@@ -59,8 +59,12 @@ impl CanonicalMvTarget {
 /// The application path currently holding, or waiting to hold, an MV gate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MvActivityOwner {
+    Create,
+    Alter,
+    Drop,
     ManualRefresh,
     ScheduledRefresh,
+    Repartition,
     AutomaticMaintenance,
 }
 
@@ -359,6 +363,71 @@ mod tests {
         drop(manual_lease);
         assert!(
             maintenance
+                .try_acquire()
+                .expect("gate is running")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn ddl_refresh_and_repartition_share_one_fifo_target_queue() {
+        let gate = MvActivityGate::new();
+        let mut create = gate
+            .request(target("mv"), MvActivityOwner::Create)
+            .expect("create ticket");
+        let mut refresh = gate
+            .request(target("mv"), MvActivityOwner::ManualRefresh)
+            .expect("refresh ticket");
+        let mut repartition = gate
+            .request(target("mv"), MvActivityOwner::Repartition)
+            .expect("repartition ticket");
+        let mut drop_ticket = gate
+            .request(target("mv"), MvActivityOwner::Drop)
+            .expect("drop ticket");
+
+        let create_lease = create
+            .try_acquire()
+            .expect("gate is running")
+            .expect("first DDL ticket acquires");
+        assert!(refresh.try_acquire().expect("gate is running").is_none());
+        assert!(
+            repartition
+                .try_acquire()
+                .expect("gate is running")
+                .is_none()
+        );
+        assert!(
+            drop_ticket
+                .try_acquire()
+                .expect("gate is running")
+                .is_none()
+        );
+
+        drop(create_lease);
+        let refresh_lease = refresh
+            .try_acquire()
+            .expect("gate is running")
+            .expect("refresh acquires after create");
+        assert!(
+            repartition
+                .try_acquire()
+                .expect("gate is running")
+                .is_none()
+        );
+        drop(refresh_lease);
+        let repartition_lease = repartition
+            .try_acquire()
+            .expect("gate is running")
+            .expect("repartition acquires after refresh");
+        assert!(
+            drop_ticket
+                .try_acquire()
+                .expect("gate is running")
+                .is_none()
+        );
+        drop(repartition_lease);
+        assert!(
+            drop_ticket
                 .try_acquire()
                 .expect("gate is running")
                 .is_some()

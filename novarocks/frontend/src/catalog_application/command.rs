@@ -37,7 +37,7 @@ use crate::catalog_application::statement::{
     execute_typed_create_table_statement,
 };
 use crate::catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
-use crate::mv::domain::repository::MvRepository;
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::runtime::query_result::QueryResultColumn;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::{CatalogStatement, LiteralKind};
@@ -57,7 +57,7 @@ pub struct CatalogCommandExecutor {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    mv_repository: Arc<dyn MvRepository>,
+    mv_readiness: Arc<MvReadinessPort>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
 }
 
@@ -78,8 +78,8 @@ impl CatalogDropContext for CatalogCommandExecutor {
         self.connector_control.as_ref()
     }
 
-    fn mv_repository(&self) -> &dyn MvRepository {
-        self.mv_repository.as_ref()
+    fn mv_readiness(&self) -> &MvReadinessPort {
+        self.mv_readiness.as_ref()
     }
 
     fn mv_storage_observation(&self) -> &dyn MvStorageObservationPort {
@@ -98,14 +98,14 @@ impl CatalogCommandExecutor {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        mv_repository: Arc<dyn MvRepository>,
+        mv_readiness: Arc<MvReadinessPort>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
         Self {
             catalog_service,
             catalog_application,
             connector_control,
-            mv_repository,
+            mv_readiness,
             mv_storage_observation,
         }
     }
@@ -387,8 +387,8 @@ fn execute_alter_iceberg_schema(
     if let crate::catalog_application::statement::IcebergSchemaChange::DropColumn { path } =
         &statement.change
     {
-        crate::mv::domain::iceberg_guard::reject_drop_column_mv_dependencies_with_repository(
-            executor.mv_repository.as_ref(),
+        crate::mv::domain::iceberg_guard::reject_drop_column_mv_dependencies_with_readiness(
+            executor.mv_readiness.as_ref(),
             &target,
             path,
         )?;

@@ -309,6 +309,9 @@ pub struct QueryMeta {
     pub drop_next_init_ack_be_index: Option<usize>,
     pub stop_query_control_heartbeat_be_index: Option<usize>,
     pub kill_fe_after_control_ready_count: Option<usize>,
+    /// Kill and restart FE after an MV lake publication is known committed but
+    /// before the Accelerator projector can CAS its local projection.
+    pub kill_fe_after_mv_known_committed_before_projector_cas: bool,
     pub restart_be_after_init_ack_index: Option<usize>,
     /// Execute KILL QUERY from a separate client after this query's Nth ControlReady.
     pub kill_query_after_control_ready_count: Option<usize>,
@@ -372,6 +375,10 @@ pub struct QueryMeta {
     /// `Package`) — i.e. its lake-native metadata is sufficient to reproduce
     /// current contents without relying on in-process incremental state.
     pub imv_stateless_rebuild: Option<ImvStatelessDirective>,
+    /// Test-only destructive Accelerator wipe followed immediately by a
+    /// runner-owned cold FE restart. This is intentionally distinct from the
+    /// in-process `full` stateless rebuild check.
+    pub imv_accelerator_wipe_restart: Option<ImvStatelessDirective>,
     /// Require a substring to occur in at least one runner-owned BE log.
     pub be_log_contains: Vec<String>,
     /// Reject a substring if it occurs in any runner-owned BE log after this step began.
@@ -424,6 +431,8 @@ pub use novarocks_cluster_harness::QueryLifecyclePhase;
 pub enum PublicationCatalogAction {
     StageCreate,
     TableCommit,
+    NamespaceList,
+    TableLoad,
 }
 
 impl PublicationCatalogAction {
@@ -431,6 +440,8 @@ impl PublicationCatalogAction {
         match self {
             Self::StageCreate => "stage-create",
             Self::TableCommit => "table-commit",
+            Self::NamespaceList => "namespace-list",
+            Self::TableLoad => "table-load",
         }
     }
 }
@@ -442,6 +453,10 @@ pub enum PublicationCatalogFault {
     /// Hold the downstream-successful response until the runner has killed
     /// the frontend while the issuing statement is still in flight.
     AfterCommitHoldForFrontendKill,
+    /// Fail exactly one standard namespace enumeration read.
+    IncompleteDiscovery,
+    /// Return malformed bytes for exactly one standard table package read.
+    CorruptPackage,
 }
 
 impl PublicationCatalogFault {
@@ -450,6 +465,8 @@ impl PublicationCatalogFault {
             Self::BeforeDispatch => "before-dispatch",
             Self::AfterCommitBeforeResponse => "after-commit-before-response",
             Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
+            Self::IncompleteDiscovery => "incomplete-discovery",
+            Self::CorruptPackage => "corrupt-package",
         }
     }
 

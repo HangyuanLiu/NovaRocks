@@ -1,0 +1,24 @@
+{
+  "type": "record",
+  "name": "StoredMvAcceleratorDependencyV1",
+  "namespace": "org.apache.novarocks.mv.accelerator",
+  "fields": [
+    { "name": "downstream_mv_id", "type": "long" },
+    { "name": "upstream", "type": {
+      "type": "record", "name": "MvDependencyObjectRefV1", "fields": [
+        { "name": "catalog", "type": ["null", "string"] },
+        { "name": "database_or_namespace", "type": "string" },
+        { "name": "name", "type": "string" },
+        { "name": "object_type", "type": {
+          "type": "enum", "name": "MvDependencyObjectTypeV1",
+          "symbols": ["TABLE", "MATERIALIZED_VIEW"]
+        } },
+        { "name": "storage_engine", "type": {
+          "type": "enum", "name": "MvDependencyStorageEngineV1",
+          "symbols": ["STAR_ROCKS", "ICEBERG", "EXTERNAL_TABLE"]
+        } }
+      ]
+    } },
+    { "name": "created_at_ms", "type": "long" }
+  ]
+}

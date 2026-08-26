@@ -2,9 +2,9 @@
 id: ADR-0061
 title: "MV repartition uses one provider-managed atomic write commit"
 domain: [provider-spi, frontend-mv]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0112
 date: 2026-08-12
 provenance:
   - "discussion: 2026-08-12 MV repartition atomicity and recovery contract"

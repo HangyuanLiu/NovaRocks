@@ -33,6 +33,7 @@ use novarocks_proto::lifecycle::QueryOptions;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
 use crate::catalog_application::query_materializer::build_catalog_service_provider;
+#[cfg(test)]
 use crate::mv::domain::repository::MvRepository;
 pub use novarocks_sql::planning::catalog::TableLookupMode;
 use novarocks_types::naming::normalize_identifier;
@@ -76,11 +77,11 @@ pub fn query_catalog_service_snapshot(
 /// candidates; it never gains connector-control access directly.
 pub fn freeze_query_mv_rewrite_definition_index(
     query_kernel: &domain::QueryPreparationKernel,
-    repository: &dyn MvRepository,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
 ) -> Result<novarocks_sql::compiler::MvRewriteDefinitionIndex, String> {
     crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-        repository,
+        readiness,
         query_kernel.connector_control().as_ref(),
         storage_observation,
     )
@@ -1064,7 +1065,7 @@ impl TestQueryCompiler {
                     current_catalog,
                     current_database,
                     &self.query,
-                    self.mv_repository.as_ref(),
+                    self.system_tables.mv_readiness().as_ref(),
                     self.mv_storage_observation.as_ref(),
                     &connector_context,
                     request_context.execution(),
@@ -1087,7 +1088,7 @@ impl TestQueryCompiler {
             novarocks_parser::ast::Statement::Query(query) => {
                 if let Some(result) =
                     crate::catalog_application::information_schema::try_query_materialized_views(
-                        self.system_tables.mv_repository().as_ref(),
+                        self.system_tables.mv_readiness().as_ref(),
                         &query,
                     )?
                 {
@@ -1136,7 +1137,7 @@ impl TestQueryCompiler {
                     current_catalog,
                     current_database,
                     &self.query,
-                    self.mv_repository.as_ref(),
+                    self.system_tables.mv_readiness().as_ref(),
                     self.mv_storage_observation.as_ref(),
                     &connector_context,
                     query_opts,
@@ -1189,7 +1190,7 @@ impl TestQueryCompiler {
                 current_catalog,
                 current_database,
                 &self.query,
-                self.mv_repository.as_ref(),
+                self.system_tables.mv_readiness().as_ref(),
                 self.mv_storage_observation.as_ref(),
                 connector_context,
                 Some(query_options_for_explain_analyze(query_opts)),
@@ -2154,7 +2155,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     current_catalog: Option<&str>,
     current_database: &str,
     query_kernel: &domain::QueryPreparationKernel,
-    mv_repository: &dyn crate::mv::domain::repository::MvRepository,
+    mv_readiness: &crate::mv::domain::readiness::MvReadinessPort,
     mv_storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     query_opts: Option<QueryOptions>,
@@ -2178,18 +2179,17 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     // MV rewrite is an optional SQL optimization. An application composition
     // without an MV repository supplies no snapshot; a repository that is
     // available but fails to freeze remains a planning error.
-    let mv_definitions =
-        if allow_mv_rewrite_candidates && mv_repository.availability().is_available() {
-            Some(
-                crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-                    mv_repository,
-                    query_kernel.connector_control().as_ref(),
-                    mv_storage_observation,
-                )?,
-            )
-        } else {
-            None
-        };
+    let mv_definitions = if allow_mv_rewrite_candidates {
+        Some(
+            crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
+                mv_readiness,
+                query_kernel.connector_control().as_ref(),
+                mv_storage_observation,
+            )?,
+        )
+    } else {
+        None
+    };
     let distributed_intent = match &intent {
         novarocks_sql::compiler::SqlCompileIntent::Explain { analyze: true, .. } => {
             crate::query_execution::contract::DistributedQueryIntent::Profile
@@ -2268,7 +2268,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     current_catalog: Option<&str>,
     current_database: &str,
     query_kernel: &domain::QueryPreparationKernel,
-    mv_repository: &dyn crate::mv::domain::repository::MvRepository,
+    mv_readiness: &crate::mv::domain::readiness::MvReadinessPort,
     mv_storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
@@ -2283,7 +2283,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     let mv_definitions =
         crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-            mv_repository,
+            mv_readiness,
             query_kernel.connector_control().as_ref(),
             mv_storage_observation,
         )?;

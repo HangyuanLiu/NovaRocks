@@ -4,7 +4,7 @@ title: "Durable statistics job target binding"
 domain: [provider-spi]
 status: superseded
 supersedes: []
-superseded-by: ADR-0109
+superseded-by: ADR-0111
 date: 2026-08-18
 provenance:
   - "discussion: 2026-08-18 durable statistics job target binding acceptance"

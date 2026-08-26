@@ -22,6 +22,7 @@
 //! no Iceberg values, catalog clients, or application-owned MV types.
 
 use std::collections::{BTreeMap, HashMap};
+use std::str::FromStr;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -29,11 +30,10 @@ use serde::Deserialize;
 
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableMetadata, ConnectorTableObjectId,
+    ConnectorTableMetadata, ConnectorTableObjectId, LakePublicationId,
 };
 
-use crate::commit::mv_refresh_ref::{MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP};
-use crate::commit::{MvProvenanceV1, RefreshTechnique};
+use crate::commit::{MV_PUBLICATION_ID_PROP, MvPublicationProvenanceV2, RefreshTechnique};
 use crate::iceberg::spec::{FormatVersion, TableMetadata, Transform};
 use crate::scan_model::IcebergTableInfo;
 
@@ -151,13 +151,12 @@ pub struct IcebergStorageRefreshTargetObservation {
 /// The MV refresh identity a snapshot's provenance records.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergStorageRefreshMarker {
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    pub token: String,
+    pub publication_id: LakePublicationId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergStorageLakePackageObservation {
+    pub target_object_id: ConnectorTableObjectId,
     pub descriptor_properties: BTreeMap<String, String>,
     /// The exact current target snapshot from the same decoded metadata value
     /// as the descriptor and publication facts. This is intentionally distinct
@@ -182,9 +181,7 @@ pub enum IcebergStorageLakePublication {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergStoragePublishedFacts {
     pub target_snapshot_id: i64,
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    pub token: String,
+    pub publication_id: LakePublicationId,
     pub technique: IcebergStorageRefreshTechnique,
     pub bases: Vec<IcebergStoragePublishedBaseFact>,
     pub definition_fingerprint: String,
@@ -474,9 +471,9 @@ fn refresh_target_observation(
             .and_then(|snapshot| snapshot.parent_snapshot_id());
     }
 
-    // Markers for the snapshots MV reconciliation can reach: `main`'s current
-    // snapshot and every ref tip. Core compares these identities against its own
-    // ledger; it never parses the provider's provenance encoding.
+    // Markers for `main`'s current snapshot and every ref tip. The opaque
+    // application boundary receives only the one UUIDv7 publication identity;
+    // it never parses the provider's provenance encoding.
     let mut snapshot_markers = BTreeMap::new();
     for snapshot_id in current_snapshot_id
         .into_iter()
@@ -488,31 +485,14 @@ fn refresh_target_observation(
         let Some(snapshot) = table.snapshot_by_id(snapshot_id) else {
             continue;
         };
-        // The refresh marker is three discrete snapshot-summary properties, a
-        // different encoding from the MvProvenanceV1 blob that publication facts
-        // use. A staging snapshot carries the marker before it ever carries full
-        // provenance, so decoding the wrong one silently loses the match.
         let props = &snapshot.summary().additional_properties;
-        let (Some(refresh_id), Some(mv_id), Some(token)) = (
-            props
-                .get(MV_REFRESH_ID_PROP)
-                .and_then(|value| value.parse::<i64>().ok()),
-            props
-                .get(MV_ID_PROP)
-                .and_then(|value| value.parse::<i64>().ok()),
-            props.get(MV_REFRESH_TOKEN_PROP),
-        ) else {
+        let Some(publication_id) = props
+            .get(MV_PUBLICATION_ID_PROP)
+            .and_then(|value| LakePublicationId::from_str(value).ok())
+        else {
             continue;
         };
-        reserve(context, &mut budget, token)?;
-        snapshot_markers.insert(
-            snapshot_id,
-            IcebergStorageRefreshMarker {
-                refresh_id,
-                mv_id,
-                token: token.clone(),
-            },
-        );
+        snapshot_markers.insert(snapshot_id, IcebergStorageRefreshMarker { publication_id });
     }
 
     let field_ids: Vec<i32> = schema
@@ -652,18 +632,21 @@ fn lake_package_observation(
         });
     let publication = match current_snapshot {
         None => IcebergStorageLakePublication::NeverPublished,
-        Some(snapshot) => match MvProvenanceV1::from_snapshot_summary(snapshot).map_err(corrupt)? {
-            None => IcebergStorageLakePublication::NeverPublished,
-            Some(provenance) => IcebergStorageLakePublication::Published(published_facts(
-                snapshot.snapshot_id(),
-                provenance,
-                context,
-                &mut budget,
-            )?),
-        },
+        Some(snapshot) => {
+            match MvPublicationProvenanceV2::from_snapshot_summary(snapshot).map_err(corrupt)? {
+                None => IcebergStorageLakePublication::NeverPublished,
+                Some(provenance) => IcebergStorageLakePublication::Published(published_facts(
+                    snapshot.snapshot_id(),
+                    provenance,
+                    context,
+                    &mut budget,
+                )?),
+            }
+        }
     };
     validate_context(context)?;
     Ok(Some(IcebergStorageLakePackageObservation {
+        target_object_id: iceberg_object_id_from_uuid(table.uuid().to_string())?,
         descriptor_properties,
         current_target_snapshot,
         publication,
@@ -728,7 +711,7 @@ fn decoded_table(
 
 fn published_facts(
     target_snapshot_id: i64,
-    provenance: MvProvenanceV1,
+    provenance: MvPublicationProvenanceV2,
     context: &ConnectorRequestContext,
     budget: &mut usize,
 ) -> Result<IcebergStoragePublishedFacts, ConnectorError> {
@@ -737,7 +720,6 @@ fn published_facts(
             "Iceberg MV provenance exceeds the inspection base limit",
         ));
     }
-    reserve(context, budget, &provenance.token)?;
     reserve(context, budget, &provenance.definition_fingerprint)?;
     let provenance_hash = provenance.content_hash().map_err(corrupt)?;
     let waterline_hash = provenance.waterline_hash().map_err(corrupt)?;
@@ -759,9 +741,7 @@ fn published_facts(
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     Ok(IcebergStoragePublishedFacts {
         target_snapshot_id,
-        refresh_id: provenance.refresh_id,
-        mv_id: provenance.mv_id,
-        token: provenance.token,
+        publication_id: provenance.publication_id,
         technique: match provenance.technique {
             RefreshTechnique::Incremental => IcebergStorageRefreshTechnique::Incremental,
             RefreshTechnique::Full => IcebergStorageRefreshTechnique::Full,
@@ -1012,6 +992,10 @@ mod tests {
         let package = lake_package_observation(&table, &context(4096))
             .expect("lake package observation")
             .expect("MV package");
+        assert_eq!(
+            package.target_object_id.as_bytes().as_ref(),
+            table.uuid().to_string().as_bytes()
+        );
         assert_eq!(
             package.current_target_snapshot,
             Some(IcebergStorageLakeTargetSnapshotObservation {

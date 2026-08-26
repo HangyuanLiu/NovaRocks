@@ -1,5 +1,5 @@
 ---
-id: ADR-0109
+id: ADR-0111
 title: "Frontend maintenance and statistics jobs are process runtime; GC observation is an accelerator"
 domain: [table-maintenance, provider-spi]
 status: active
@@ -30,7 +30,7 @@ attempt；它们不是 lake 上可见的业务事实。
 
 把这些运行账持久化会制造第二条 effect-capable authority：新进程能够 claim、takeover、reconcile 或解释旧
 attempt 的未知响应。即使它不重放普通工作，historical maintenance recovery 也会让新 generation 依据旧
-evidence继续 mutation。该路径与 ADR-0104 的 crash-only publication contract 不兼容：`CommitUnknown` 的
+evidence继续 mutation。该路径与 ADR-0110 的 crash-only publication contract 不兼容：`CommitUnknown` 的
 正确后果是停止 mutation，而不是为旧 attempt 寻找自动出口。
 
 owned-ref GC 的 first-observation 不同。它只记当前 provider 已证明的 exact
@@ -73,7 +73,7 @@ owner。
    都必须 fail closed；可安全的退化只有延迟删除。clone target 在启用前必须 wipe 该 family，不能继承 source
    maturity。
 
-ADR-0104 继续拥有 publication outcome、target OCC 与安全年龄窗的上位契约。ADR-0085 继续拥有
+ADR-0110 继续拥有 publication outcome、target OCC 与安全年龄窗的上位契约。ADR-0085 继续拥有
 physical object capture/rebind；statistics 仍在每个 current attempt 使用它，但不再把 target binding 写成
 可恢复 job record。
 
@@ -95,7 +95,7 @@ GC reset 和 clone wipe 会额外保留垃圾至少一个完整安全年龄窗�
 - 如果产品需要跨 FE/跨 restart 的 job history、cancel 或进度，必须先定义一个只读 observability contract，
   并证明它不能反向驱动 publication、retry、takeover 或 recovery。
 - 如果 Catalog/provider 不能把 current attempt 的外部结果可靠地表达为三态 outcome，不能以 durable reconcile
-  绕过；应先扩展 ADR-0104 下的 typed publication contract。
+  绕过；应先扩展 ADR-0110 下的 typed publication contract。
 - 如果多 FE 的重复工作成为可量化成本瓶颈，应提出独立的 designation/sharding 设计，并证明它不是 publication
   correctness authority。
 - 如果 GC record 的安全年龄需要跨 deployment 复制，必须先定义显式 clone protocol 与 source identity；在此之前

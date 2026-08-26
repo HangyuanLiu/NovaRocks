@@ -23,8 +23,8 @@
 
 use std::sync::Arc;
 
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::definition::parse_mv_select_query;
-use crate::mv::domain::repository::MvRepository;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::compiler::{
     MvRewriteDefinitionIndex, SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts,
@@ -33,18 +33,19 @@ use novarocks_sql::compiler::{
 /// Freeze rewrite candidates from the caller's leaf ports.  The frozen index
 /// remains request-local.
 pub fn freeze_mv_rewrite_definition_index_with_ports(
-    repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
 ) -> Result<MvRewriteDefinitionIndex, String> {
-    let definitions = repository
-        .list_definitions()
+    let definitions = readiness
+        .list_ready_projections()
         .map_err(|error| format!("list mv definitions: {error}"))?;
 
     MvRewriteDefinitionIndex::try_new(
         definitions
             .into_iter()
-            .map(|definition| {
+            .map(|projection| {
+                let definition = projection.definition;
                 freeze_mv_rewrite_definition(connector_control, storage_observation, definition)
             })
             .collect::<Result<Vec<_>, _>>()?,

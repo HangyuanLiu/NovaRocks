@@ -28,11 +28,9 @@ use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest};
 use crate::mv::domain::model::{MvStorageEngine, MvTarget};
-use crate::mv::domain::persistence::definition::{
-    StoredMvDefinition, StoredMvRefreshPolicy, UpdateMvRefreshMetadataRequest,
-};
+use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
-use crate::mv::domain::repository::MvRepository;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::Visit;
 use novarocks_types::naming::normalize_identifier;
@@ -64,11 +62,11 @@ fn storage_engine_for_create(stmt: &MvCreateStatement) -> Result<MvStorageEngine
 }
 
 fn existing_mv_storage_engine_by_target(
-    repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     target: &IcebergMvTarget,
 ) -> Result<Option<MvStorageEngine>, String> {
-    let Some(definition) = repository
-        .find_by_target(&MvTarget {
+    let Some(definition) = readiness
+        .load_ready(&MvTarget {
             catalog: Some(target.catalog.clone()),
             database: target.namespace.clone(),
             name: target.table.clone(),
@@ -77,15 +75,15 @@ fn existing_mv_storage_engine_by_target(
     else {
         return Ok(None);
     };
-    MvStorageEngine::from_sql_str(&definition.storage_engine).map(Some)
+    MvStorageEngine::from_sql_str(&definition.definition.storage_engine).map(Some)
 }
 
-fn stored_refresh_policy(policy: &MvCreateRefreshPolicy) -> (StoredMvRefreshPolicy, Option<i64>) {
+fn stored_refresh_policy(policy: &MvCreateRefreshPolicy) -> (MvDesiredRefreshPolicy, Option<i64>) {
     match policy {
-        MvCreateRefreshPolicy::Manual => (StoredMvRefreshPolicy::Manual, None),
-        MvCreateRefreshPolicy::AsyncOnChange => (StoredMvRefreshPolicy::AsyncOnChange, None),
+        MvCreateRefreshPolicy::Manual => (MvDesiredRefreshPolicy::Manual, None),
+        MvCreateRefreshPolicy::AsyncOnChange => (MvDesiredRefreshPolicy::AsyncOnChange, None),
         MvCreateRefreshPolicy::AsyncInterval { interval_ms } => {
-            (StoredMvRefreshPolicy::AsyncInterval, Some(*interval_ms))
+            (MvDesiredRefreshPolicy::AsyncInterval, Some(*interval_ms))
         }
     }
 }
@@ -103,56 +101,18 @@ pub(crate) fn initial_refresh_configuration_for_create(
         paused: false,
         interval_ms,
         max_staleness_ms: None,
-        next_refresh_after_ms: None,
-    }
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn refresh_metadata_request_for_create(
-    mv_id: i64,
-    policy: &MvCreateRefreshPolicy,
-) -> UpdateMvRefreshMetadataRequest {
-    let initial = initial_refresh_configuration_for_create(policy);
-    UpdateMvRefreshMetadataRequest {
-        mv_id,
-        refresh_policy: initial.policy,
-        refresh_paused: false,
-        refresh_interval_ms: initial.interval_ms,
-        max_staleness_ms: initial.max_staleness_ms,
-        last_scheduler_error: None,
-        next_refresh_after_ms: None,
-    }
-}
-
-fn refresh_metadata_request_for_policy(
-    definition: &StoredMvDefinition,
-    policy: &MvCreateRefreshPolicy,
-    refresh_paused: bool,
-) -> UpdateMvRefreshMetadataRequest {
-    let (refresh_policy, refresh_interval_ms) = stored_refresh_policy(policy);
-    UpdateMvRefreshMetadataRequest {
-        mv_id: definition.mv_id,
-        refresh_policy,
-        refresh_paused,
-        refresh_interval_ms,
-        max_staleness_ms: definition.max_staleness_ms,
-        last_scheduler_error: None,
-        next_refresh_after_ms: None,
     }
 }
 
 fn load_definition_for_alter(
-    repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     current_catalog: Option<&str>,
     db: &str,
     name_parts: &[String],
 ) -> Result<StoredMvDefinition, String> {
     let target = resolve_refresh_target(current_catalog, db, name_parts)?;
-    let Some(definition) = repository
-        .find_by_target(&MvTarget {
+    let Some(definition) = readiness
+        .load_ready(&MvTarget {
             catalog: Some(target.catalog.clone()),
             database: target.namespace.clone(),
             name: target.table.clone(),
@@ -164,6 +124,7 @@ fn load_definition_for_alter(
             target.catalog, target.namespace, target.table
         ));
     };
+    let definition = definition.definition;
     if MvStorageEngine::from_sql_str(&definition.storage_engine)? != MvStorageEngine::Iceberg {
         return Err(
             "ALTER MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
@@ -222,9 +183,10 @@ pub fn create_mv_with_ports(
     Ok(StatementResult::Ok)
 }
 
-/// Drop an MV from the durable MV repository and the injected MV backend.
+/// Drop an MV through the readiness-aware Accelerator view and the injected
+/// MV backend.
 pub fn drop_mv_with_ports(
-    repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     mv_backend: &IcebergMvBackend,
     current_catalog: Option<&str>,
     db: &str,
@@ -233,7 +195,7 @@ pub fn drop_mv_with_ports(
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
     let target = resolve_refresh_target(current_catalog, db, &stmt.name_parts)?;
-    if let Some(engine) = existing_mv_storage_engine_by_target(repository, &target)?
+    if let Some(engine) = existing_mv_storage_engine_by_target(readiness, &target)?
         && engine != MvStorageEngine::Iceberg
     {
         return Err(
@@ -273,7 +235,7 @@ pub fn alter_mv_with_ports(
             "ALTER MATERIALIZED VIEW requires current Iceberg catalog".to_string()
         })?;
         let target = resolve_refresh_target(Some(current_catalog), db, &stmt.name_parts)?;
-        let engine = existing_mv_storage_engine_by_target(ports.repository().as_ref(), &target)?
+        let engine = existing_mv_storage_engine_by_target(ports.readiness().as_ref(), &target)?
             .ok_or_else(|| {
                 format!(
                     "materialized view {}.{}.{} not found",
@@ -314,58 +276,56 @@ pub fn alter_mv_with_ports(
             },
             connector_context.clone(),
         )?;
+        crate::mv::domain::iceberg_refresh::reobserve_and_project_iceberg_mv_with_ports(
+            ports,
+            &target,
+            connector_context.clone(),
+        )
+        .map_err(|error| format!("reobserve Iceberg MV after property update failed: {error}"))?;
         return Ok(StatementResult::Ok);
     }
     let definition = load_definition_for_alter(
-        ports.repository().as_ref(),
+        ports.readiness().as_ref(),
         current_catalog,
         db,
         &stmt.name_parts,
     )?;
-    let req = match &stmt.action {
+    let (refresh_policy, refresh_paused, refresh_interval_ms) = match &stmt.action {
         MvAlterAction::SetRefresh(policy) => {
-            refresh_metadata_request_for_policy(&definition, policy, definition.refresh_paused)
+            let (policy, interval_ms) = stored_refresh_policy(policy);
+            (policy, definition.refresh_paused, interval_ms)
         }
-        MvAlterAction::PauseRefresh => UpdateMvRefreshMetadataRequest {
-            mv_id: definition.mv_id,
-            refresh_policy: definition.refresh_policy.clone(),
-            refresh_paused: true,
-            refresh_interval_ms: definition.refresh_interval_ms,
-            max_staleness_ms: definition.max_staleness_ms,
-            last_scheduler_error: definition.last_scheduler_error.clone(),
-            next_refresh_after_ms: definition.next_refresh_after_ms,
-        },
-        MvAlterAction::ResumeRefresh => UpdateMvRefreshMetadataRequest {
-            mv_id: definition.mv_id,
-            refresh_policy: definition.refresh_policy.clone(),
-            refresh_paused: false,
-            refresh_interval_ms: definition.refresh_interval_ms,
-            max_staleness_ms: definition.max_staleness_ms,
-            last_scheduler_error: definition.last_scheduler_error.clone(),
-            next_refresh_after_ms: definition.next_refresh_after_ms,
-        },
+        MvAlterAction::PauseRefresh => (
+            definition.refresh_policy.clone(),
+            true,
+            definition.refresh_interval_ms,
+        ),
+        MvAlterAction::ResumeRefresh => (
+            definition.refresh_policy.clone(),
+            false,
+            definition.refresh_interval_ms,
+        ),
         MvAlterAction::Repartition(_) | MvAlterAction::SetProperties(_) => {
             unreachable!("repartition and properties returned before metadata update")
         }
     };
-    // SET REFRESH, PAUSE and RESUME are user-owned configuration, not a refresh
-    // lifecycle transition, so they go through the definition-DDL write. Using
-    // the lifecycle write would put them inside the refresh fence domain and
-    // fail closed whenever another frontend happened to own the active refresh.
-    ports
-        .repository()
-        .update_definition_refresh_metadata(req.clone())
-        .map_err(|e| format!("update MV refresh metadata failed: {e}"))?;
     crate::mv::domain::iceberg_refresh::sync_iceberg_mv_descriptor_with_ports(
         ports,
         &definition,
-        &req.refresh_policy,
-        req.refresh_paused,
-        req.refresh_interval_ms,
+        &refresh_policy,
+        refresh_paused,
+        refresh_interval_ms,
         None,
         connector_context,
     )
     .map_err(|e| format!("sync Iceberg MV descriptor refresh metadata failed: {e}"))?;
+    let target = resolve_refresh_target(current_catalog, db, &stmt.name_parts)?;
+    crate::mv::domain::iceberg_refresh::reobserve_and_project_iceberg_mv_with_ports(
+        ports,
+        &target,
+        connector_context.clone(),
+    )
+    .map_err(|error| format!("reobserve Iceberg MV after descriptor update failed: {error}"))?;
     Ok(StatementResult::Ok)
 }
 

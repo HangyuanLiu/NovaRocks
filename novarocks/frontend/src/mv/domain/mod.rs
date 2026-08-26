@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod accelerator;
 pub mod analysis;
 pub mod analysis_adapter;
 pub mod application;
@@ -33,6 +34,8 @@ pub(crate) mod metadata_consistency;
 pub mod model;
 pub(crate) mod partition;
 pub mod persistence;
+pub(crate) mod projector;
+pub mod readiness;
 pub(crate) mod ref_flow;
 pub mod refresh;
 pub mod refresh_io;

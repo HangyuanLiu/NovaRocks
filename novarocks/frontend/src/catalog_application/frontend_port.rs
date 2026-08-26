@@ -44,7 +44,6 @@ use crate::catalog_attachment::{
     CatalogAttachmentRepository,
 };
 use crate::connector::ConnectorControlHost;
-use crate::mv::repository::CatalogAttachmentObservationSource;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LocalProjection {
@@ -600,56 +599,6 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
     }
 }
 
-impl CatalogAttachmentObservationSource for FrontendCatalogApplicationPort {
-    fn capture(
-        &self,
-        catalogs: &std::collections::BTreeSet<String>,
-    ) -> Result<Vec<crate::catalog_attachment::CatalogAttachmentVersioned>, MvRepositoryError> {
-        let repository = self.repository().map_err(mv_repository_error)?;
-        let mut observations = Vec::with_capacity(catalogs.len());
-        for catalog in catalogs {
-            let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| {
-                MvRepositoryError::new(MvRepositoryErrorKind::InvalidRequest, error.to_string())
-            })?;
-            match self.admit_catalog(&instance_id) {
-                CatalogAdmission::Ready(observation) => {
-                    let versioned = self
-                        .block_on(repository.get(&instance_id))
-                        .map_err(mv_repository_error)?
-                        .ok_or_else(|| {
-                            MvRepositoryError::new(
-                                MvRepositoryErrorKind::Conflict,
-                                "catalog attachment disappeared during MV admission",
-                            )
-                        })?;
-                    if versioned.attachment.attachment_id != observation.attachment_id
-                        || versioned.attachment.provider_id != observation.provider_id
-                    {
-                        return Err(MvRepositoryError::new(
-                            MvRepositoryErrorKind::Conflict,
-                            "catalog attachment changed during MV admission",
-                        ));
-                    }
-                    observations.push(versioned);
-                }
-                CatalogAdmission::Absent => {
-                    return Err(MvRepositoryError::new(
-                        MvRepositoryErrorKind::Conflict,
-                        "materialized view references a catalog attachment that is absent",
-                    ));
-                }
-                CatalogAdmission::Unavailable { reason } => {
-                    return Err(MvRepositoryError::new(
-                        MvRepositoryErrorKind::Unavailable,
-                        format!("materialized view catalog admission is unavailable: {reason}"),
-                    ));
-                }
-            }
-        }
-        Ok(observations)
-    }
-}
-
 fn provider_id_from_properties(
     properties: &[(String, String)],
 ) -> Result<ConnectorProviderId, CatalogApplicationError> {
@@ -723,10 +672,6 @@ fn mv_repository_error(error: CatalogApplicationError) -> MvRepositoryError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
-    use crate::catalog_application::CatalogRuntimeProjection;
-
     use super::*;
 
     #[test]
@@ -752,20 +697,5 @@ mod tests {
                 .as_str(),
             "iceberg"
         );
-    }
-
-    #[tokio::test]
-    async fn mv_observation_source_rejects_catalogs_without_a_durable_frontend_attachment() {
-        let port = FrontendCatalogApplicationPort::unavailable(
-            Arc::new(ConnectorControlHost::new()),
-            CatalogRuntimeProjection::new().publisher(),
-            tokio::runtime::Handle::current(),
-        );
-        let error = CatalogAttachmentObservationSource::capture(
-            &port,
-            &BTreeSet::from(["catalog.analytics".to_string()]),
-        )
-        .expect_err("an unavailable attachment repository cannot freeze an MV dependency");
-        assert_eq!(error.kind(), MvRepositoryErrorKind::Unavailable);
     }
 }

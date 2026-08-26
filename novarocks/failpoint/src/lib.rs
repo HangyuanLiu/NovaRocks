@@ -29,6 +29,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const QUERY_LIFECYCLE_FAULT_DIR_ENV: &str = "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR";
 pub const CLEANUP_FAULT_DIR_ENV: &str = "NOVAROCKS_SQL_TEST_CLEANUP_FAULT_DIR";
+/// Runner-owned, debug-only MV publication barrier. Its name describes the
+/// durable MV boundary rather than a distributed query-lifecycle phase.
+pub const MV_KNOWN_COMMITTED_BEFORE_PROJECTOR_CAS_TRIGGER: &str =
+    "mv-known-committed-before-projector-cas.trigger";
+pub const MV_KNOWN_COMMITTED_BEFORE_PROJECTOR_CAS_MARKER: &str =
+    "mv-known-committed-before-projector-cas.marker";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum QueryLifecycleFaultKind {
@@ -144,6 +150,14 @@ pub fn runner_rfo_kind_names() -> impl Iterator<Item = &'static str> {
 
 pub fn configured_root() -> Option<PathBuf> {
     std::env::var_os(QUERY_LIFECYCLE_FAULT_DIR_ENV).map(PathBuf::from)
+}
+
+pub fn mv_known_committed_before_projector_cas_trigger_path(root: &Path) -> PathBuf {
+    root.join(MV_KNOWN_COMMITTED_BEFORE_PROJECTOR_CAS_TRIGGER)
+}
+
+pub fn mv_known_committed_before_projector_cas_marker_path(root: &Path) -> PathBuf {
+    root.join(MV_KNOWN_COMMITTED_BEFORE_PROJECTOR_CAS_MARKER)
 }
 
 pub fn arm_path(root: &Path, backend_index: usize, kind: QueryLifecycleFaultKind) -> PathBuf {

@@ -2,9 +2,9 @@
 id: ADR-0096
 title: "MV refresh ownership is fenced per target and inside each transaction"
 domain: [frontend-mv, cluster-membership]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0112
 date: 2026-08-13
 provenance:
   - "discussion: 2026-08-10 MV refresh active-active recalibration"

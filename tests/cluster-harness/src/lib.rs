@@ -20,7 +20,9 @@ use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
 use novarocks_failpoint::{
     QueryLifecycleFaultKind, arm_path as lifecycle_arm_path, cleanup_trigger_path,
-    parse_cleanup_fault_directive, parse_runner_rfo_kind,
+    mv_known_committed_before_projector_cas_marker_path,
+    mv_known_committed_before_projector_cas_trigger_path, parse_cleanup_fault_directive,
+    parse_runner_rfo_kind,
 };
 use novarocks_native_trust::{
     AutomaticTlsMaterial, DeploymentId, NativeCallerSubject, NativeEndpointConnector,
@@ -2020,6 +2022,9 @@ pub trait ServerHandle: Send {
             phase.as_str()
         )
     }
+    fn arm_mv_known_committed_before_projector_cas(&mut self) -> Result<()> {
+        bail!("MV known-committed projector barrier is unsupported by this server mode")
+    }
     /// Arms the existing FE-owned phase barrier for a runner-owned BE kill.
     /// The trigger is released by `release_be_kill_at_lifecycle_phase` after
     /// the harness has killed its selected BE process.
@@ -2398,6 +2403,14 @@ impl QueryLifecycleFaultFiles {
             .join(format!("fe-crash-at-{}.trigger", phase.as_str()))
     }
 
+    fn mv_known_committed_before_projector_cas_trigger_path(&self) -> PathBuf {
+        mv_known_committed_before_projector_cas_trigger_path(&self.root)
+    }
+
+    fn mv_known_committed_before_projector_cas_marker_path(&self) -> PathBuf {
+        mv_known_committed_before_projector_cas_marker_path(&self.root)
+    }
+
     fn hold_start_until_early_ingress_path(&self) -> PathBuf {
         self.root.join("hold-start-until-early-ingress.trigger")
     }
@@ -2482,6 +2495,24 @@ impl QueryLifecycleFaultFiles {
             self.be_count,
             "phase",
             phase.as_str(),
+        )
+    }
+
+    fn publish_mv_known_committed_before_projector_cas(&self) -> Result<String> {
+        let marker = self.mv_known_committed_before_projector_cas_marker_path();
+        if marker.exists() {
+            remove_fragment_failure_file(&marker).with_context(|| {
+                format!(
+                    "clear stale MV projector barrier marker {}",
+                    marker.display()
+                )
+            })?;
+        }
+        self.publish_fields(
+            self.mv_known_committed_before_projector_cas_trigger_path(),
+            self.be_count,
+            "phase",
+            "known-committed-before-projector-cas",
         )
     }
 
@@ -3411,6 +3442,19 @@ impl ServerHandle for CrossProcessServerHandle {
             phase.as_str(),
             self.query_lifecycle_fault_files
                 .fe_crash_at_phase_path(phase)
+                .display()
+        );
+        Ok(())
+    }
+
+    fn arm_mv_known_committed_before_projector_cas(&mut self) -> Result<()> {
+        let token = self
+            .query_lifecycle_fault_files
+            .publish_mv_known_committed_before_projector_cas()?;
+        println!(
+            "armed MV known-committed projector barrier token={token} trigger={}",
+            self.query_lifecycle_fault_files
+                .mv_known_committed_before_projector_cas_trigger_path()
                 .display()
         );
         Ok(())

@@ -80,6 +80,7 @@ pub(crate) enum StatelessLevel {
     Package,
     Provenance,
     Full,
+    Wipe,
 }
 
 impl StatelessLevel {
@@ -89,8 +90,9 @@ impl StatelessLevel {
             "package" => Ok(Self::Package),
             "provenance" => Ok(Self::Provenance),
             "full" => Ok(Self::Full),
+            "wipe" => Ok(Self::Wipe),
             other => Err(format!(
-                "unknown stateless rebuild level `{other}`; expected one of baseline, package, provenance, full"
+                "unknown stateless rebuild level `{other}`; expected one of baseline, package, provenance, full, wipe"
             )),
         }
     }
@@ -101,6 +103,7 @@ impl StatelessLevel {
             Self::Package => "package",
             Self::Provenance => "provenance",
             Self::Full => "full",
+            Self::Wipe => "wipe",
         }
     }
 }
@@ -237,6 +240,7 @@ pub fn execute_typed_novarocks_imv_stateless_rebuild(
     connector_control: &dyn ConnectorControlResolver,
     mv_storage_observation: &dyn MvStorageObservationPort,
     mv_repository: &dyn MvRepository,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
     statement: &CallStatement,
     current_database: &str,
     connector_context: ConnectorRequestContext,
@@ -246,6 +250,11 @@ pub fn execute_typed_novarocks_imv_stateless_rebuild(
         return Ok(None);
     };
     ensure_stateless_rebuild_enabled(std::env::var(TEST_ENABLE_ENV).ok().as_deref())?;
+    if req.required_level == StatelessLevel::Wipe {
+        readiness
+            .ensure_no_active_publications()
+            .map_err(|error| error.to_string())?;
+    }
     execute_request_with_context(
         connector_control,
         mv_storage_observation,
@@ -321,6 +330,23 @@ fn execute_request_with_context(
 
     let descriptor_hash = package.descriptor.content_hash()?;
     let (provenance_hash, waterline_hash, available) = publication_level(&package.publication);
+
+    // `wipe` is deliberately not a rebuild level. It proves the exact lake
+    // package exists, clears only the closed current Accelerator family, and
+    // returns while the old FE remains alive. The runner must then kill/restart
+    // that FE; startup observation is the only permitted rebuild path.
+    if req.required_level == StatelessLevel::Wipe {
+        mv_repository
+            .wipe_accelerator(uuid::Uuid::now_v7())
+            .map_err(|error| format!("wipe MV Accelerator family: {error}"))?;
+        return Ok(StatementResult::Query(build_rebuild_result(
+            StatelessLevel::Wipe,
+            &descriptor_hash,
+            provenance_hash.as_deref(),
+            waterline_hash.as_deref(),
+            "accelerator-wiped",
+        )?));
+    }
 
     // W4 `full`: the levels above only *read* the lake to prove the descriptor
     // (and, for `provenance`, the current-snapshot provenance) can be
@@ -420,14 +446,14 @@ fn clear_sqlite_and_rebuild_from_lake(
             package.table.table
         ));
     };
-    let before = equivalence_snapshot(&existing, package)?;
+    let before = equivalence_snapshot(&existing.definition, package)?;
 
     // 2. Clear only rebuildable accelerator records. Historical refresh
     // records remain intact, and the repository rejects an active refresh.
     // The lake MV table is untouched — exactly the "SQLite forgot, lake
     // remembers" state.
     let dropped = mv_repository
-        .wipe_rebuildable_projection_by_target(&target)
+        .wipe_projection_by_target(uuid::Uuid::now_v7(), &target)
         .map_err(|e| format!("clear MV repository definition for full rebuild failed: {e}"))?;
     if !dropped {
         return Err(format!(
@@ -457,7 +483,7 @@ fn clear_sqlite_and_rebuild_from_lake(
             package.table.table
         ));
     };
-    let after = equivalence_snapshot(&rebuilt, package)?;
+    let after = equivalence_snapshot(&rebuilt.definition, package)?;
     if before != after {
         return Err(format!(
             "{PROCEDURE_NAME} full level: rebuilt accelerator semantics differ from the pre-wipe projection"
@@ -569,9 +595,7 @@ mod tests {
         MvLakePublication::Published(
             MvPublishedLakeFacts::try_new(
                 201,
-                1,
-                1,
-                "token-1".to_string(),
+                novarocks_spi::connector::LakePublicationId::new_v7(),
                 MvPublishedRefreshTechnique::Full,
                 vec![MvPublishedBaseFact {
                     table_fqn: "ice.sales.orders".to_string(),
@@ -615,6 +639,7 @@ mod tests {
             ("Package", StatelessLevel::Package),
             ("PROVENANCE", StatelessLevel::Provenance),
             ("Full", StatelessLevel::Full),
+            ("wipe", StatelessLevel::Wipe),
         ] {
             let parsed = StatelessLevel::from_sql(input).unwrap();
             assert_eq!(parsed, expected);

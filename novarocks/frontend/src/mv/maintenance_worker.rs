@@ -37,7 +37,8 @@ use super::background::{MvBackgroundEngine, MvBackgroundEngineError, MvBackgroun
 use crate::common::query_cancellation::QueryCancellationSource;
 use crate::maintenance::MaintenanceTarget;
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
-use crate::mv::domain::repository::{MvRepository, MvRepositoryError};
+use crate::mv::domain::readiness::MvReadinessPort;
+use crate::mv::domain::repository::MvRepositoryError;
 use crate::query_execution::maintenance::{
     AutomaticMaintenanceContext, MaintenanceActionOutcome, MaintenanceActionRequest,
     OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
@@ -53,7 +54,7 @@ use super::maintenance::{
 /// recovery, provider binding and table-maintenance recovery.
 #[derive(Clone)]
 pub(crate) struct FrontendMaintenanceWorkerDependencies {
-    pub(crate) repository: Arc<dyn MvRepository>,
+    pub(crate) readiness: Arc<MvReadinessPort>,
     pub(crate) background_engine: Arc<dyn MvBackgroundEngine>,
     pub(crate) table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     pub(crate) table_maintenance_service: Arc<dyn TableMaintenanceService>,
@@ -149,7 +150,13 @@ impl FrontendMaintenanceWorker {
         &self,
         now_ms: i64,
     ) -> Result<FrontendMaintenancePassReport, MvRepositoryError> {
-        let definitions = self.dependencies.repository.list_definitions()?;
+        let definitions = self
+            .dependencies
+            .readiness
+            .list_ready_projections()?
+            .into_iter()
+            .map(|projection| projection.definition)
+            .collect::<Vec<_>>();
         let pass = Mutex::new(FrontendMaintenancePassReport::default());
         // Admission is synchronized inside `MaintenanceCoordinator`, but the
         // durable operations run outside that lock.  The coordinator's active
@@ -340,7 +347,7 @@ impl FrontendMaintenanceWorker {
 
 /// Narrow adapter from automatic policy actions to the existing frontend
 /// durable table-maintenance service.  Any opaque service error is treated as
-/// `RecoveryRequired`, not parsed as text and not retried as a guessed
+/// `TerminalFailure`, not parsed as text and not retried as a guessed
 /// transient failure, because a durable external mutation may be unknown.
 struct TableMaintenanceAutomaticRunner {
     engine: Arc<dyn TableMaintenanceEngine>,
@@ -391,7 +398,7 @@ fn canonical_target(definition: &StoredMvDefinition) -> Option<MaintenanceTarget
 
 fn durable_service_error(error: String) -> MvBackgroundEngineError {
     MvBackgroundEngineError::new(
-        MvBackgroundEngineErrorKind::RecoveryRequired,
+        MvBackgroundEngineErrorKind::TerminalFailure,
         format!("automatic maintenance durable lifecycle returned an opaque error: {error}"),
     )
 }

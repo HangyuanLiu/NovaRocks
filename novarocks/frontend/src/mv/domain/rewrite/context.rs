@@ -1151,7 +1151,6 @@ pub(crate) mod tests_support {
             target_table: Some("mv".to_string()),
             schema_contract: Some(make_schema_contract()),
             partition_spec: None,
-            partition_state_complete: false,
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: [("ice.db.b".to_string(), 11i64)].into_iter().collect(),
@@ -1159,16 +1158,17 @@ pub(crate) mod tests_support {
                 .into_iter()
                 .collect(),
             last_refreshed_iceberg_snapshot_id: Some(99),
-            refresh_in_progress: false,
-            active_refresh_id: None,
-            refresh_target_snapshots: Default::default(),
             refresh_policy: Default::default(),
             refresh_paused: false,
             refresh_interval_ms: None,
             max_staleness_ms: None,
-            last_scheduler_error: None,
-            next_refresh_after_ms: None,
             created_at_ms: 0,
+            source_revision:
+                crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision {
+                    target_object_id: object_id("target-object"),
+                    descriptor_content_hash: "test-descriptor".to_string(),
+                    current_target_snapshot_id: Some(99),
+                },
         }
     }
 

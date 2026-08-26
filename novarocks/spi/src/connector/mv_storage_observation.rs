@@ -331,9 +331,7 @@ pub enum MvLakePublicationObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvPublishedRefreshObservation {
     pub target_snapshot_id: i64,
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    pub token: String,
+    pub publication_id: super::LakePublicationId,
     pub technique: MvPublishedRefreshTechnique,
     pub bases: Vec<MvPublishedBaseObservation>,
     pub definition_fingerprint: String,
@@ -361,9 +359,7 @@ impl MvPublishedRefreshObservation {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         target_snapshot_id: i64,
-        refresh_id: i64,
-        mv_id: i64,
-        token: String,
+        publication_id: super::LakePublicationId,
         technique: MvPublishedRefreshTechnique,
         bases: Vec<MvPublishedBaseObservation>,
         definition_fingerprint: String,
@@ -373,10 +369,9 @@ impl MvPublishedRefreshObservation {
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_context(context)?;
-        if target_snapshot_id < 0 || refresh_id < 0 || mv_id < 0 || rows < 0 {
+        if target_snapshot_id < 0 || rows < 0 {
             return corrupt("published MV lake facts contain a negative value");
         }
-        require_non_empty(&token, "published MV refresh token")?;
         require_non_empty(
             &definition_fingerprint,
             "published MV definition fingerprint",
@@ -388,10 +383,7 @@ impl MvPublishedRefreshObservation {
         }
         let mut names = HashSet::with_capacity(bases.len());
         let mut object_ids = HashSet::with_capacity(bases.len());
-        let mut used = token.len()
-            + definition_fingerprint.len()
-            + provenance_hash.len()
-            + waterline_hash.len();
+        let mut used = definition_fingerprint.len() + provenance_hash.len() + waterline_hash.len();
         for base in &bases {
             require_non_empty(&base.table_fqn, "published MV base table FQN")?;
             if base.to_snapshot < 0 || base.from_snapshot.is_some_and(|id| id < 0) {
@@ -413,9 +405,7 @@ impl MvPublishedRefreshObservation {
         }
         Ok(Self {
             target_snapshot_id,
-            refresh_id,
-            mv_id,
-            token,
+            publication_id,
             technique,
             bases,
             definition_fingerprint,
@@ -431,6 +421,7 @@ impl MvPublishedRefreshObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvLakePackageObservation {
     table: ConnectorTableIdentity,
+    target_object_id: ConnectorTableObjectId,
     descriptor: MvLakeDescriptorProjection,
     current_target_snapshot: Option<MvLakeTargetSnapshotObservation>,
     publication: MvLakePublicationObservation,
@@ -468,6 +459,7 @@ impl MvLakeTargetSnapshotObservation {
 impl MvLakePackageObservation {
     pub fn try_new(
         table: ConnectorTableIdentity,
+        target_object_id: ConnectorTableObjectId,
         descriptor: MvLakeDescriptorProjection,
         current_target_snapshot: Option<MvLakeTargetSnapshotObservation>,
         publication: MvLakePublicationObservation,
@@ -475,6 +467,7 @@ impl MvLakePackageObservation {
         validate_table(&table, "MV lake package")?;
         Ok(Self {
             table,
+            target_object_id,
             descriptor,
             current_target_snapshot,
             publication,
@@ -482,6 +475,9 @@ impl MvLakePackageObservation {
     }
     pub const fn table(&self) -> &ConnectorTableIdentity {
         &self.table
+    }
+    pub const fn target_object_id(&self) -> &ConnectorTableObjectId {
+        &self.target_object_id
     }
     pub const fn descriptor(&self) -> &MvLakeDescriptorProjection {
         &self.descriptor
@@ -491,6 +487,67 @@ impl MvLakePackageObservation {
     }
     pub const fn publication(&self) -> &MvLakePublicationObservation {
         &self.publication
+    }
+}
+
+/// A catalog discovery result is either complete or explicitly incomplete.
+/// An implementation must never represent an unreadable candidate as an
+/// absent MV package in a complete catalog result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvLakeCatalogDiscovery {
+    Complete(Vec<MvLakePackageOutcome>),
+    Incomplete(MvLakeCatalogIncompleteReason),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvLakeCatalogIncompleteReason {
+    PaginationGap,
+    GenerationDrift,
+    DeadlineExceeded,
+    BudgetExceeded,
+    EnumerationFailed(ConnectorError),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvLakePackageOutcome {
+    Observed(MvLakePackageObservation),
+    Failed(MvLakePackageFailure),
+}
+
+/// A package failure keeps its logical target and, when it was observed before
+/// decoding failed, its opaque immutable identity so consumers can quarantine
+/// exactly that target without treating the entire catalog as complete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvLakePackageFailure {
+    table: ConnectorTableIdentity,
+    target_object_id: Option<ConnectorTableObjectId>,
+    error: ConnectorError,
+}
+
+impl MvLakePackageFailure {
+    pub fn try_new(
+        table: ConnectorTableIdentity,
+        target_object_id: Option<ConnectorTableObjectId>,
+        error: ConnectorError,
+    ) -> Result<Self, ConnectorError> {
+        validate_table(&table, "MV lake package failure")?;
+        Ok(Self {
+            table,
+            target_object_id,
+            error,
+        })
+    }
+
+    pub const fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
+    }
+
+    pub const fn target_object_id(&self) -> Option<&ConnectorTableObjectId> {
+        self.target_object_id.as_ref()
+    }
+
+    pub const fn error(&self) -> &ConnectorError {
+        &self.error
     }
 }
 
@@ -534,9 +591,7 @@ impl MvRefreshBaseObservation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvObservedRefreshMarker {
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    pub token: String,
+    pub publication_id: super::LakePublicationId,
 }
 
 /// Exact target facts required by refresh application.
@@ -609,14 +664,13 @@ impl MvRefreshTargetObservation {
             }
             reserve(&mut used, 8, context, "MV refresh target lineage")?;
         }
-        for (snapshot_id, marker) in &snapshot_markers {
-            if *snapshot_id < 0 || marker.refresh_id < 0 || marker.mv_id < 0 {
-                return corrupt("MV refresh target marker has a negative ID");
+        for snapshot_id in snapshot_markers.keys() {
+            if *snapshot_id < 0 {
+                return corrupt("MV refresh target marker has a negative snapshot ID");
             }
-            require_non_empty(&marker.token, "MV refresh target marker token")?;
             reserve(
                 &mut used,
-                MARKER_FIXED_BYTES + marker.token.len(),
+                MARKER_FIXED_BYTES,
                 context,
                 "MV refresh target markers",
             )?;
@@ -1015,6 +1069,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use bytes::Bytes;
+
     use super::*;
     use crate::connector::{ConnectorCancellation, ConnectorInstanceId};
 
@@ -1045,6 +1101,10 @@ mod tests {
             namespace: Arc::from("db"),
             table: Arc::from("mv"),
         }
+    }
+    fn target_object_id() -> ConnectorTableObjectId {
+        ConnectorTableObjectId::try_new(Bytes::from_static(b"target-uuid"))
+            .expect("bounded target object ID")
     }
     fn fields() -> Vec<MvObservedField> {
         vec![MvObservedField::new(1, "id".into(), "bigint".into(), false)]
@@ -1134,6 +1194,7 @@ mod tests {
         let snapshot = MvLakeTargetSnapshotObservation::try_new(42, 1_700_000_042_000).unwrap();
         let package = MvLakePackageObservation::try_new(
             table(),
+            target_object_id(),
             descriptor,
             Some(snapshot),
             MvLakePublicationObservation::NeverPublished,
@@ -1141,6 +1202,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(package.current_target_snapshot(), Some(snapshot));
+        assert_eq!(package.target_object_id(), &target_object_id());
         assert_eq!(snapshot.snapshot_id(), 42);
         assert_eq!(snapshot.timestamp_ms(), 1_700_000_042_000);
         assert_eq!(
@@ -1155,6 +1217,26 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::CorruptData
         );
+    }
+
+    #[test]
+    fn discovery_keeps_catalog_incomplete_distinct_from_one_package_failure() {
+        let failure = MvLakePackageFailure::try_new(
+            table(),
+            Some(target_object_id()),
+            ConnectorError::new(ConnectorErrorKind::CorruptData, "bad descriptor"),
+        )
+        .expect("stable package failure");
+        let complete =
+            MvLakeCatalogDiscovery::Complete(vec![MvLakePackageOutcome::Failed(failure.clone())]);
+        assert!(matches!(complete, MvLakeCatalogDiscovery::Complete(_)));
+        assert_eq!(failure.target_object_id(), Some(&target_object_id()));
+        let incomplete =
+            MvLakeCatalogDiscovery::Incomplete(MvLakeCatalogIncompleteReason::GenerationDrift);
+        assert!(matches!(
+            incomplete,
+            MvLakeCatalogDiscovery::Incomplete(MvLakeCatalogIncompleteReason::GenerationDrift)
+        ));
     }
 
     #[test]

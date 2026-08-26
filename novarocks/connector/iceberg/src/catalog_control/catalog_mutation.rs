@@ -1753,6 +1753,7 @@ fn execute_metadata_only_mv_stage(
     provenance: &ConnectorMvMetadataOnlyProvenance,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
     ensure_owner(provider, &table.instance_id)?;
+    ensure_mv_publication_staging_ref(staging_branch, provenance.publication_id)?;
     let expected_uuid = uuid::Uuid::parse_str(expected_table_uuid).map_err(|error| {
         invalid(format!(
             "metadata-only MV staging has invalid target table UUID: {error}"
@@ -1796,11 +1797,9 @@ fn execute_metadata_only_mv_stage(
         })?
         .ok_or_else(|| invalid("metadata-only MV staging requires parent total-records"))?;
     let snapshot_id = crate::commit::helpers::generate_snapshot_id();
-    let provenance = crate::commit::MvProvenanceV1 {
-        provenance_version: crate::commit::MV_PROVENANCE_VERSION,
-        refresh_id: provenance.refresh_id,
-        mv_id: provenance.materialization_id,
-        token: provenance.marker_token.to_string(),
+    let provenance = crate::commit::MvPublicationProvenanceV2 {
+        provenance_version: crate::commit::MV_PUBLICATION_PROVENANCE_VERSION,
+        publication_id: provenance.publication_id,
         technique: crate::commit::RefreshTechnique::MetadataOnly,
         bases: provenance
             .bases
@@ -1815,6 +1814,7 @@ fn execute_metadata_only_mv_stage(
             })
             .collect::<Result<Vec<_>, ConnectorError>>()?,
         definition_fingerprint: provenance.definition_fingerprint.to_string(),
+        descriptor_properties_digest_base64: None,
         rows: i64::try_from(inherited_rows)
             .map_err(|_| invalid("metadata-only MV inherited row count exceeds i64"))?,
     };
@@ -2122,14 +2122,13 @@ fn execute_guarded_publication(
             "guarded Iceberg publication must publish a staging branch to main",
         )));
     }
+    ensure_mv_publication_staging_ref(source_branch, guard.publication_id())?;
     let loaded = provider
         .runtime()
         .load_table(&table.namespace, &table.table)
         .map_err(unavailable)?;
-    let marker = crate::commit::MvRefreshSnapshotMarker {
-        refresh_id: guard.refresh_id(),
-        mv_id: guard.materialized_view_id(),
-        token: guard.token().to_string(),
+    let marker = crate::commit::MvPublicationSnapshotMarker {
+        publication_id: guard.publication_id(),
     };
     let metadata = loaded.table.metadata();
     let expected_table_uuid = uuid::Uuid::parse_str(expected_table_uuid).map_err(|error| {
@@ -2162,7 +2161,7 @@ fn execute_guarded_publication(
             "guarded Iceberg publication staging snapshot does not exist",
         )));
     };
-    if !crate::commit::snapshot_matches_refresh_marker(source_snapshot, &marker) {
+    if !crate::commit::snapshot_matches_publication_marker(source_snapshot, &marker) {
         return Ok(known_uncommitted(invalid(
             "guarded Iceberg publication staging snapshot marker does not match",
         )));
@@ -2238,6 +2237,23 @@ fn execute_guarded_publication(
             })
         }
     }
+}
+
+fn ensure_mv_publication_staging_ref(
+    staging_ref: &str,
+    publication_id: novarocks_spi::connector::LakePublicationId,
+) -> Result<(), ConnectorError> {
+    let expected = format!(
+        "{}{}",
+        crate::commit::MV_PUBLICATION_STAGING_REF_PREFIX,
+        publication_id
+    );
+    if staging_ref != expected {
+        return Err(invalid(
+            "Iceberg MV staging ref does not match the exact publication identity",
+        ));
+    }
+    Ok(())
 }
 
 fn mutation_evidence(
@@ -2588,23 +2604,9 @@ fn reconcile_evidence(
                 Some(_) => ambiguous("Iceberg bootstrap target has a different snapshot marker"),
             }
         }
-        IcebergMutationEvidenceTarget::MvMetadataOnlyStage {
-            namespace,
-            table,
-            table_uuid,
-            staging_branch,
-            staging_snapshot_id,
-            provenance_hash,
-        } => reconcile_metadata_only_mv_stage(
-            provider,
-            &evidence,
-            &namespace,
-            &table,
-            &table_uuid,
-            &staging_branch,
-            staging_snapshot_id,
-            &provenance_hash,
-        ),
+        IcebergMutationEvidenceTarget::MvMetadataOnlyStage { .. } => Err(unsupported(
+            "metadata-only MV publication is crash-only and cannot be reconciled after CommitUnknown",
+        )),
         IcebergMutationEvidenceTarget::Ref {
             namespace,
             table,
@@ -2620,26 +2622,9 @@ fn reconcile_evidence(
             &ref_name,
             expected_snapshot_id,
         ),
-        IcebergMutationEvidenceTarget::GuardedFastForward {
-            namespace,
-            table,
-            table_uuid,
-            source_branch,
-            target_branch,
-            source_snapshot_id,
-            guard_digest,
-            ..
-        } => reconcile_guarded_ref(
-            provider,
-            &evidence,
-            &namespace,
-            &table,
-            &table_uuid,
-            &source_branch,
-            &target_branch,
-            source_snapshot_id,
-            guard_digest,
-        ),
+        IcebergMutationEvidenceTarget::GuardedFastForward { .. } => Err(unsupported(
+            "MV staging publication is crash-only and cannot be reconciled after CommitUnknown",
+        )),
     }
 }
 
@@ -2659,186 +2644,6 @@ fn metadata_only_base_uuid(
         ));
     }
     Ok(value.to_string())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn reconcile_metadata_only_mv_stage(
-    provider: &IcebergControlProvider,
-    evidence: &ExternalMutationEvidence,
-    namespace: &str,
-    table: &str,
-    table_uuid: &str,
-    staging_branch: &str,
-    staging_snapshot_id: i64,
-    provenance_hash: &str,
-) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-    let identity = ConnectorTableIdentity {
-        instance_id: provider.descriptor().instance_id.clone(),
-        namespace: namespace.into(),
-        table: table.into(),
-    };
-    let Some(current) = load_optional_table(provider.runtime(), &identity)? else {
-        return Ok(known_uncommitted(not_found(
-            "Iceberg MV target table does not exist during metadata-only staging reconciliation",
-        )));
-    };
-    let metadata = current.table.metadata();
-    if metadata.uuid().to_string() != table_uuid {
-        return Ok(ExternalMutationOutcome::CommitUnknown {
-            failure: ConnectorMutationFailure::new(
-                ConnectorMutationFailureKind::Conflict,
-                "Iceberg MV target incarnation changed during metadata-only staging reconciliation",
-            ),
-            evidence: evidence.clone(),
-        });
-    }
-    let matches = metadata
-        .refs()
-        .get(staging_branch)
-        .is_some_and(|reference| {
-            reference.is_branch() && reference.snapshot_id == staging_snapshot_id
-        })
-        && metadata
-            .snapshot_by_id(staging_snapshot_id)
-            .is_some_and(|snapshot| {
-                crate::commit::MvProvenanceV1::from_snapshot_summary(snapshot)
-                    .and_then(|provenance| {
-                        provenance.ok_or_else(|| {
-                            "metadata-only staging snapshot has no V1 provenance".to_string()
-                        })
-                    })
-                    .and_then(|provenance| provenance.content_hash())
-                    .is_ok_and(|actual| actual == provenance_hash)
-            });
-    if !matches {
-        return Ok(ExternalMutationOutcome::CommitUnknown {
-            failure: ConnectorMutationFailure::new(
-                ConnectorMutationFailureKind::Unavailable,
-                "Iceberg metadata-only staging marker is not visible",
-            ),
-            evidence: evidence.clone(),
-        });
-    }
-    let rows = metadata
-        .snapshot_by_id(staging_snapshot_id)
-        .and_then(|snapshot| {
-            snapshot
-                .summary()
-                .additional_properties
-                .get("total-records")
-        })
-        .ok_or_else(|| invalid("metadata-only staging snapshot has no total-records"))?
-        .parse::<u64>()
-        .map_err(|error| {
-            invalid(format!(
-                "metadata-only staging snapshot has invalid total-records: {error}"
-            ))
-        })?;
-    let version = ConnectorCommittedVersion::try_new(
-        Bytes::from(format!("iceberg/metadata-only/v1/{staging_snapshot_id}")),
-        Some(staging_snapshot_id),
-    )?;
-    Ok(ExternalMutationOutcome::KnownCommitted {
-        effect: ExternalMutationEffect::Applied,
-        receipt: ConnectorCatalogMutationReceipt::try_new_with_committed_facts(
-            provider.descriptor().clone(),
-            provider.incarnation(),
-            evidence.operation_id(),
-            evidence.operation_kind(),
-            current
-                .table
-                .metadata_location()
-                .map(|value| Bytes::copy_from_slice(value.as_bytes())),
-            version,
-            rows,
-        )?,
-        finalization: ExternalMutationFinalization::Complete,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn reconcile_guarded_ref(
-    provider: &IcebergControlProvider,
-    evidence: &ExternalMutationEvidence,
-    namespace: &str,
-    table: &str,
-    table_uuid: &str,
-    source_branch: &str,
-    target_branch: &str,
-    source_snapshot_id: i64,
-    guard_digest: [u8; 32],
-) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-    let identity = ConnectorTableIdentity {
-        instance_id: provider.descriptor().instance_id.clone(),
-        namespace: namespace.into(),
-        table: table.into(),
-    };
-    let Some(current) = load_optional_table(provider.runtime(), &identity)? else {
-        return Ok(known_uncommitted(not_found(
-            "Iceberg table does not exist during guarded publication reconciliation",
-        )));
-    };
-    if current.table.metadata().uuid().to_string() != table_uuid {
-        return Ok(ExternalMutationOutcome::CommitUnknown {
-            failure: ConnectorMutationFailure::new(
-                ConnectorMutationFailureKind::Conflict,
-                "Iceberg table incarnation changed during guarded publication reconciliation",
-            ),
-            evidence: evidence.clone(),
-        });
-    }
-    let metadata = current.table.metadata();
-    let source_ref_matches = metadata.refs().get(source_branch).is_some_and(|reference| {
-        reference.is_branch() && reference.snapshot_id == source_snapshot_id
-    });
-    let target_matches = metadata.refs().get(target_branch).is_some_and(|reference| {
-        reference.is_branch() && reference.snapshot_id == source_snapshot_id
-    });
-    let marker_matches = metadata
-        .snapshot_by_id(source_snapshot_id)
-        .and_then(|snapshot| {
-            let properties = &snapshot.summary().additional_properties;
-            Some(
-                novarocks_spi::connector::ConnectorRefreshPublicationGuard::try_new(
-                    properties
-                        .get(crate::commit::MV_REFRESH_ID_PROP)?
-                        .parse()
-                        .ok()?,
-                    properties.get(crate::commit::MV_ID_PROP)?.parse().ok()?,
-                    properties
-                        .get(crate::commit::MV_REFRESH_TOKEN_PROP)?
-                        .as_str(),
-                )
-                .ok()?
-                .digest()
-                    == guard_digest,
-            )
-        })
-        .unwrap_or(false);
-    if source_ref_matches && target_matches && marker_matches {
-        Ok(ExternalMutationOutcome::KnownCommitted {
-            effect: ExternalMutationEffect::Applied,
-            receipt: receipt_with_version(
-                provider,
-                evidence.operation_id(),
-                evidence.operation_kind(),
-                current.table.metadata_location(),
-            )?,
-            finalization: ExternalMutationFinalization::Complete,
-        })
-    } else if source_ref_matches && marker_matches {
-        Ok(known_uncommitted(invalid(
-            "Iceberg guarded publication target ref did not advance",
-        )))
-    } else {
-        Ok(ExternalMutationOutcome::CommitUnknown {
-            failure: ConnectorMutationFailure::new(
-                ConnectorMutationFailureKind::Conflict,
-                "Iceberg guarded publication state diverged during reconciliation",
-            ),
-            evidence: evidence.clone(),
-        })
-    }
 }
 
 fn reconcile_ref(
@@ -3123,6 +2928,10 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
 
 fn not_found(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::NotFound, message.into())
+}
+
+fn unsupported(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::Unsupported, message.into())
 }
 
 fn already_exists(message: impl Into<String>) -> ConnectorError {
@@ -3894,5 +3703,45 @@ mod tests {
                 .to_string()
                 .contains("decode Iceberg mutation evidence")
         );
+    }
+
+    #[test]
+    fn mv_commit_unknown_reconcile_fails_before_any_catalog_read() {
+        let (_executor, _warehouse, provider) = provider();
+        let targets = [
+            IcebergMutationEvidenceTarget::MvMetadataOnlyStage {
+                namespace: "missing".to_string(),
+                table: "mv".to_string(),
+                table_uuid: uuid::Uuid::from_u128(1).to_string(),
+                staging_branch: "__novarocks_mv_publication_01890f3c-4e70-7cc0-8000-000000000001"
+                    .to_string(),
+                staging_snapshot_id: 7,
+                provenance_hash: "provenance".to_string(),
+            },
+            IcebergMutationEvidenceTarget::GuardedFastForward {
+                namespace: "missing".to_string(),
+                table: "mv".to_string(),
+                table_uuid: uuid::Uuid::from_u128(1).to_string(),
+                before_metadata_location: None,
+                source_branch: "__novarocks_mv_publication_01890f3c-4e70-7cc0-8000-000000000001"
+                    .to_string(),
+                target_branch: "main".to_string(),
+                source_snapshot_id: 7,
+                expected_target_snapshot_id: None,
+                guard_digest: [3; 32],
+            },
+        ];
+        for target in targets {
+            let operation_id = ConnectorMutationOperationId::new();
+            let evidence =
+                evidence(&provider, operation_id, "mv-publication", target).expect("MV evidence");
+            let error = provider
+                .reconcile(ConnectorCatalogMutationReconcileRequest {
+                    evidence,
+                    context: context(),
+                })
+                .expect_err("MV reconcile is crash-only");
+            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        }
     }
 }

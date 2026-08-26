@@ -93,7 +93,7 @@ pub(crate) fn execute_with_ports(
     let mutation_lease = exact_lease
         .derive_mutation_lease()
         .map_err(|error| error.to_string())?;
-    let outcome = crate::connector::mutation::resolve_catalog_mutation_with_lease(
+    let outcome = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
         &mutation_lease,
         novarocks_spi::connector::ConnectorMutationOperationId::new(),
         ConnectorCatalogMutationOperation::AlterRef {

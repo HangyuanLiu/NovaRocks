@@ -26,7 +26,7 @@ pub use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::ClusterRole;
 
 /// Startup-frozen temporal boundary shared by every lake publication attempt.
-// Design: ADR-0104 (docs/adr/ADR-0104-lake-publication-crash-only-contract.md)
+// Design: ADR-0110 (docs/adr/ADR-0110-lake-publication-crash-only-contract.md)
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LakePublicationRuntimePolicy {
     max_attempt_duration: Duration,

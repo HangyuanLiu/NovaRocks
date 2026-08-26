@@ -35,12 +35,13 @@ use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::descriptor::DescriptorDependency;
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::repository::{
-    InitialMvRefreshConfiguration, RebuildMvRepositoryRequest, RebuiltMvPublicationProjection,
-    RebuiltMvPublishedWaterline,
+    InitialMvRefreshConfiguration, MvPublishedProjection, MvPublishedWaterline,
 };
 use crate::mv::domain::storage_observation::{
-    MvLakePackageObservation, MvLakePublishedProjection, discover_mv_lake_packages,
+    MvLakeCatalogDiscovery, MvLakePackageObservation, MvLakePackageOutcome,
+    MvLakePublishedProjection, discover_mv_lake_packages,
 };
 
 /// Output of [`rebuild_mv_definition_from_lake`]: the complete definition,
@@ -49,7 +50,7 @@ use crate::mv::domain::storage_observation::{
 pub(crate) struct RebuiltMvDefinition {
     pub create_request: CreateMvDefinitionRequest,
     pub refresh: InitialMvRefreshConfiguration,
-    pub publication: RebuiltMvPublicationProjection,
+    pub publication: MvPublishedProjection,
 }
 
 /// Reconstruct an MV's repository definition-create inputs purely from its lake
@@ -86,20 +87,19 @@ pub(crate) fn rebuild_mv_definition_from_lake(
         paused: descriptor.refresh.paused,
         interval_ms: descriptor.refresh.interval_ms,
         max_staleness_ms: descriptor.refresh.max_staleness_ms,
-        next_refresh_after_ms: None,
     };
     let publication = match package
         .published_projection()
         .map_err(|error| format!("derive MV lake publication projection: {error}"))?
     {
-        MvLakePublishedProjection::NeverPublished => RebuiltMvPublicationProjection::NeverPublished,
+        MvLakePublishedProjection::NeverPublished => MvPublishedProjection::NeverPublished,
         MvLakePublishedProjection::Published {
             last_refresh_ms,
             last_refresh_rows,
             last_refreshed_iceberg_snapshot_id,
             base_snapshots,
             base_table_object_ids,
-        } => RebuiltMvPublicationProjection::Published(RebuiltMvPublishedWaterline {
+        } => MvPublishedProjection::Published(MvPublishedWaterline {
             last_refresh_ms,
             last_refresh_rows,
             last_refreshed_iceberg_snapshot_id,
@@ -118,18 +118,15 @@ pub(crate) fn rebuild_mv_definition_from_lake(
 /// Rebuild any lake-native Iceberg MV definitions that are present on the lake
 /// but missing from the MV repository, making them visible and refreshable.
 ///
-/// For every admitted Iceberg catalog we
-/// enumerate its namespaces, discover the MV packages each namespace carries
-/// (MV-table inline descriptor), and for each MV whose target is not already
-/// recorded in the repository we
-/// reconstruct its definition-create inputs with
-/// [`rebuild_mv_definition_from_lake`] and persist them (definition, desired
-/// refresh configuration, publication waterline, and dependencies) through
-/// the repository's atomic rebuild path.
+/// For every admitted Iceberg catalog we enumerate its namespaces and
+/// discover the MV packages each namespace carries (MV-table inline
+/// descriptor). Each exact package then enters the common source-aware
+/// projector, which atomically converges definition, desired refresh
+/// configuration, publication waterline, and dependency indexes.
 ///
-/// Idempotent: MVs already present in the repository (matched by target
-/// `catalog.namespace.table`) are skipped, so calling this at startup
-/// when all admitted packages are present is a no-op.
+/// Idempotence is decided by the complete source revision rather than a
+/// logical target-name hit, so a later lake snapshot cannot be hidden by a
+/// retained Accelerator row.
 ///
 /// The state a lake rebuild reads, named explicitly rather than reached through
 /// aggregate engine state.
@@ -145,7 +142,7 @@ pub struct LakeRebuildContext<'a> {
     pub catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
     pub connector_control: &'a dyn novarocks_spi::connector::ConnectorControlRegistry,
     pub mv_storage_observation: &'a dyn novarocks_spi::connector::MvStorageObservationPort,
-    pub mv_repository: &'a dyn crate::mv::domain::repository::MvRepository,
+    pub readiness: &'a MvReadinessPort,
 }
 
 pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), String> {
@@ -169,25 +166,114 @@ pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), S
         })
         .map(|observation| observation.instance_id)
         .collect::<Vec<_>>();
-    let packages = discover_mv_lake_packages(
-        ctx.connector_control,
-        instance_ids,
-        ctx.mv_storage_observation,
-        context,
-    )
-    .map_err(|error| format!("discover lake MV packages failed: {error}"))?;
-    for package in packages {
-        // Startup rediscovery is opportunistic. A package on the lake whose
-        // referenced catalogs are not all attached to this cluster is not ours
-        // to rebuild: persisting it would create a durable MV definition that
-        // references an absent attachment, which the MV writer's attachment
-        // assertion correctly refuses. Skipping keeps a foreign or
-        // already-dropped package from failing frontend startup, while the
-        // targeted rebuild procedure still fails closed on the same condition.
-        if !package_catalogs_are_admitted(ctx.catalog_application, &package)? {
-            continue;
+    for instance_id in instance_ids {
+        let discovery = match discover_mv_lake_packages(
+            ctx.connector_control,
+            [instance_id.clone()],
+            ctx.mv_storage_observation,
+            context.clone(),
+        ) {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                let reason = format!("lake MV catalog discovery failed: {error}");
+                if let Err(quarantine_error) = ctx
+                    .readiness
+                    .quarantine_catalog(instance_id.as_str(), reason.clone())
+                {
+                    tracing::warn!(
+                        catalog = instance_id.as_str(),
+                        error = %quarantine_error,
+                        "failed to quarantine MV projections after catalog discovery failure"
+                    );
+                }
+                tracing::warn!(
+                    catalog = instance_id.as_str(),
+                    error = %error,
+                    "skipping MV startup rebuild for failed catalog discovery"
+                );
+                continue;
+            }
+        };
+        let outcomes = match discovery {
+            MvLakeCatalogDiscovery::Complete(outcomes) => outcomes,
+            MvLakeCatalogDiscovery::Incomplete(reason) => {
+                ctx.readiness
+                    .quarantine_catalog(
+                        instance_id.as_str(),
+                        format!("lake MV catalog discovery is incomplete: {reason:?}"),
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "quarantine incomplete MV catalog {} failed: {error}",
+                            instance_id.as_str()
+                        )
+                    })?;
+                continue;
+            }
+        };
+        for outcome in outcomes {
+            let package = match outcome {
+                MvLakePackageOutcome::Observed(package) => package,
+                MvLakePackageOutcome::Failed(failure) => {
+                    ctx.readiness.quarantine(
+                        crate::mv::activity::CanonicalMvTarget::from_parts(
+                            Some(failure.table().instance_id.as_str()),
+                            &failure.table().namespace,
+                            &failure.table().table,
+                        ),
+                        format!("lake MV package observation failed: {}", failure.error()),
+                    );
+                    continue;
+                }
+            };
+            // Startup rediscovery is opportunistic. A package on the lake whose
+            // referenced catalogs are not all attached to this cluster is not ours
+            // to rebuild: persisting it would create a durable MV definition that
+            // references an absent attachment, which the MV writer's attachment
+            // assertion correctly refuses. Skipping keeps a foreign or
+            // already-dropped package from failing frontend startup, while the
+            // targeted rebuild procedure still fails closed on the same condition.
+            let target = crate::mv::activity::CanonicalMvTarget::from_parts(
+                Some(package.table.instance_id.as_str()),
+                &package.table.namespace,
+                &package.table.table,
+            );
+            let admitted = match package_catalogs_are_admitted(ctx.catalog_application, &package) {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    ctx.readiness.quarantine(
+                        target,
+                        format!("verify lake MV package catalog admission failed: {error}"),
+                    );
+                    tracing::warn!(
+                        catalog = instance_id.as_str(),
+                        mv_target = %package.table.table,
+                        error = %error,
+                        "skipping MV startup rebuild after package admission failure"
+                    );
+                    continue;
+                }
+            };
+            if !admitted {
+                ctx.readiness.quarantine(
+                    target,
+                    "a referenced catalog attachment is not admitted here".to_string(),
+                );
+                continue;
+            }
+            if let Err(error) = rebuild_one_lake_package_if_missing(ctx, &package) {
+                ctx.readiness.quarantine(
+                    target,
+                    format!("project lake MV package into Accelerator failed: {error}"),
+                );
+                tracing::warn!(
+                    catalog = instance_id.as_str(),
+                    mv_target = %package.table.table,
+                    error = %error,
+                    "skipping failed MV startup rebuild package"
+                );
+            }
         }
-        rebuild_one_lake_package_if_missing(ctx, &package)?;
     }
     Ok(())
 }
@@ -226,9 +312,11 @@ fn package_catalogs_are_admitted(
     Ok(true)
 }
 
-/// Persist a single observed lake package's definition if it is not already
-/// present in the MV repository. The MV is keyed by its target `catalog.namespace.table`
-/// (the same key the create path registers via `find_by_target`).
+/// Converge one exact lake package through the common source-aware projector.
+///
+/// A desired-definition match alone is not sufficient: the lake package also
+/// carries publication waterline and immutable target revision facts, so every
+/// startup sweep must let the projector compare the complete source revision.
 ///
 /// Exposed to the crate so the W0 stateless-rebuild harness
 /// (`stateless_rebuild::execute_request`) can drive a *targeted* single-MV
@@ -238,7 +326,16 @@ pub(crate) fn rebuild_one_lake_package_if_missing(
     ctx: &LakeRebuildContext<'_>,
     package: &MvLakePackageObservation,
 ) -> Result<(), String> {
-    rebuild_one_lake_package_if_missing_with_repository(ctx.mv_repository, package)
+    rebuild_one_lake_package_if_missing_with_readiness(ctx.readiness, package)
+}
+
+fn rebuild_one_lake_package_if_missing_with_readiness(
+    readiness: &MvReadinessPort,
+    package: &MvLakePackageObservation,
+) -> Result<(), String> {
+    readiness
+        .project_observed(uuid::Uuid::now_v7(), package)
+        .map_err(|error| format!("project iceberg MV lake observation failed: {error}"))
 }
 
 /// Targeted lake-package rebuild with the only capability it actually needs:
@@ -262,7 +359,8 @@ pub(crate) fn rebuild_one_lake_package_if_missing_with_repository(
         })
         .map_err(|e| format!("look up MV definition during lake rebuild failed: {e}"))?;
     if let Some(existing) = existing {
-        if !stored_definition_matches_rebuilt_request(&existing, &rebuilt.create_request) {
+        if !stored_definition_matches_rebuilt_request(&existing.definition, &rebuilt.create_request)
+        {
             return Err(format!(
                 "lake MV package definition conflicts with the existing repository definition for target {}.{}.{}",
                 package.table.instance_id.as_str(),
@@ -273,23 +371,12 @@ pub(crate) fn rebuild_one_lake_package_if_missing_with_repository(
         return Ok(());
     }
 
-    let created_at_ms = rebuilt.create_request.created_at_ms;
-    let dependencies =
-        dependency_requests_from_descriptor(&package.descriptor.base_dependencies, created_at_ms)?;
-
-    repository
-        .rebuild(
-            uuid::Uuid::new_v4(),
-            RebuildMvRepositoryRequest {
-                create: crate::mv::domain::repository::CreateMvRepositoryRequest {
-                    definition: rebuilt.create_request,
-                    refresh: rebuilt.refresh,
-                    dependencies,
-                },
-                publication: rebuilt.publication,
-            },
-        )
-        .map_err(|e| format!("rebuild iceberg MV repository metadata failed: {e}"))?;
+    crate::mv::domain::projector::project_observed_repository(
+        repository,
+        uuid::Uuid::now_v7(),
+        package,
+    )
+    .map_err(|e| format!("project iceberg MV lake observation failed: {e}"))?;
     Ok(())
 }
 
@@ -312,7 +399,7 @@ fn stored_definition_matches_rebuilt_request(
 /// Map the descriptor's `base_dependencies` back into the repository
 /// `CreateMvDependencyRequest` shape used by `replace_dependencies_for_mv`.
 /// This is the inverse of `iceberg_refresh::descriptor_dependency_from_request`.
-fn dependency_requests_from_descriptor(
+pub(crate) fn dependency_requests_from_descriptor(
     dependencies: &[DescriptorDependency],
     created_at_ms: i64,
 ) -> Result<Vec<CreateMvDependencyRequest>, String> {
@@ -357,7 +444,7 @@ fn parse_dependency_storage_engine(value: &str) -> Result<MvDependencyStorageEng
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::persistence::definition::StoredMvRefreshPolicy;
+    use crate::mv::domain::persistence::definition::MvDesiredRefreshPolicy;
     use crate::mv::domain::persistence::descriptor::{DescriptorDependency, MvDescriptorV3};
     use crate::mv::domain::persistence::schema::{
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
@@ -366,10 +453,14 @@ mod tests {
         TargetContract, TargetVisibleColumn,
     };
     use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
+    use crate::mv::domain::readiness::MvReadinessPort;
+    use crate::mv::domain::repository::MvRepository;
     use crate::mv::domain::storage_observation::{
         MvLakePackageObservation, MvLakePublication, MvLakeTargetSnapshot, MvPublishedBaseFact,
         MvPublishedLakeFacts, MvPublishedRefreshTechnique,
     };
+    use crate::mv::domain::test_repository::InMemoryMvRepository;
+    use crate::mv::process_runtime::ProcessRuntime;
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableObjectId,
     };
@@ -466,7 +557,7 @@ mod tests {
             primary_key_columns: vec!["id".to_string()],
             schema_contract: sample_contract(),
             refresh: MvRefreshDesiredConfiguration::new(
-                StoredMvRefreshPolicy::AsyncInterval,
+                MvDesiredRefreshPolicy::AsyncInterval,
                 true,
                 Some(60_000),
                 Some(300_000),
@@ -485,6 +576,7 @@ mod tests {
                 namespace: Arc::from("analytics"),
                 table: Arc::from("mv_orders"),
             },
+            object_id(b"mv-orders-object-id"),
             descriptor,
             current_target_snapshot,
             publication,
@@ -492,13 +584,26 @@ mod tests {
         .expect("valid lake package")
     }
 
+    fn sample_package_for_catalog(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+    ) -> MvLakePackageObservation {
+        let mut package = sample_package(sample_publication());
+        package.table.instance_id = ConnectorInstanceId::parse(catalog).expect("instance ID");
+        package.table.namespace = Arc::from(namespace);
+        package.table.table = Arc::from(table);
+        package.descriptor.package_id = format!("{namespace}.{table}");
+        package.descriptor.schema_contract.target.table_fqn =
+            format!("{catalog}.{namespace}.{table}");
+        package
+    }
+
     fn sample_publication() -> MvLakePublication {
         MvLakePublication::Published(
             MvPublishedLakeFacts::try_new(
                 300,
-                7,
-                1,
-                "token-7".to_string(),
+                novarocks_spi::connector::LakePublicationId::new_v7(),
                 MvPublishedRefreshTechnique::Incremental,
                 vec![MvPublishedBaseFact {
                     table_fqn: "ice.sales.orders".to_string(),
@@ -551,14 +656,16 @@ mod tests {
         assert_eq!(partition.fields.len(), 1);
         assert_eq!(partition.fields[0].partition_field_name, "id_bucket");
 
-        assert_eq!(rebuilt.refresh.policy, StoredMvRefreshPolicy::AsyncInterval);
+        assert_eq!(
+            rebuilt.refresh.policy,
+            MvDesiredRefreshPolicy::AsyncInterval
+        );
         assert!(rebuilt.refresh.paused);
         assert_eq!(rebuilt.refresh.interval_ms, Some(60_000));
         assert_eq!(rebuilt.refresh.max_staleness_ms, Some(300_000));
-        assert_eq!(rebuilt.refresh.next_refresh_after_ms, None);
         assert_eq!(
             rebuilt.publication,
-            RebuiltMvPublicationProjection::Published(RebuiltMvPublishedWaterline {
+            MvPublishedProjection::Published(MvPublishedWaterline {
                 last_refresh_ms: 1_700_000_000_300,
                 last_refresh_rows: 42,
                 last_refreshed_iceberg_snapshot_id: 300,
@@ -577,16 +684,83 @@ mod tests {
 
         let rebuilt = rebuild_mv_definition_from_lake(&package).expect("rebuild succeeds");
 
-        assert_eq!(
-            rebuilt.publication,
-            RebuiltMvPublicationProjection::NeverPublished
-        );
+        assert_eq!(rebuilt.publication, MvPublishedProjection::NeverPublished);
         // The create request is still fully valid even with no refresh history.
         assert_eq!(
             rebuilt.create_request.query_definition.raw_query_source,
             "SELECT id FROM ice.sales.orders"
         );
         assert!(rebuilt.create_request.schema_contract.is_some());
+    }
+
+    #[test]
+    fn incomplete_catalog_quarantine_hides_retained_projection_from_consumers() {
+        let repository = Arc::new(InMemoryMvRepository::default());
+        let repository_port: Arc<dyn MvRepository> = repository;
+        let readiness = MvReadinessPort::new(
+            Arc::clone(&repository_port),
+            Arc::new(ProcessRuntime::default()),
+        );
+        let package = sample_package(sample_publication());
+
+        readiness
+            .project_observed(uuid::Uuid::now_v7(), &package)
+            .expect("project observed package");
+        assert_eq!(
+            readiness
+                .list_ready_projections()
+                .expect("list ready projections")
+                .len(),
+            1
+        );
+
+        readiness
+            .quarantine_catalog("ice", "namespace pagination gap".to_string())
+            .expect("quarantine catalog");
+        assert!(
+            readiness
+                .list_ready_projections()
+                .expect("list ready projections")
+                .is_empty(),
+            "a retained StateStore row must not outlive incomplete lake discovery"
+        );
+    }
+
+    #[test]
+    fn incomplete_catalog_quarantine_preserves_other_catalog_projections() {
+        let repository = Arc::new(InMemoryMvRepository::default());
+        let repository_port: Arc<dyn MvRepository> = repository;
+        let readiness = MvReadinessPort::new(
+            Arc::clone(&repository_port),
+            Arc::new(ProcessRuntime::default()),
+        );
+        let affected = sample_package_for_catalog("ice_a", "analytics_a", "mv_orders_a");
+        let unaffected = sample_package_for_catalog("ice_b", "analytics_b", "mv_orders_b");
+
+        readiness
+            .project_observed(uuid::Uuid::now_v7(), &affected)
+            .expect("project affected package");
+        readiness
+            .project_observed(uuid::Uuid::now_v7(), &unaffected)
+            .expect("project unaffected package");
+
+        readiness
+            .quarantine_catalog("ice_a", "namespace enumeration failed".to_string())
+            .expect("quarantine affected catalog");
+
+        let ready = readiness
+            .list_ready_projections()
+            .expect("list ready projections");
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].definition.target_catalog.as_deref(), Some("ice_b"));
+        assert_eq!(
+            ready[0].definition.target_namespace,
+            Some("analytics_b".to_string())
+        );
+        assert_eq!(
+            ready[0].definition.target_table,
+            Some("mv_orders_b".to_string())
+        );
     }
 
     struct FixedAdmission(crate::catalog_application::CatalogAdmission);
