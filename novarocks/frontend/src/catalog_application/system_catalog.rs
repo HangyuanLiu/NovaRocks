@@ -32,6 +32,12 @@ pub struct SystemCatalogInputs<'a> {
     /// One entry per schema/namespace row: sorted+deduped local database names,
     /// or the external catalog's namespaces.
     pub schema_names: &'a [String],
+    /// One `(schema, table)` pair per table row.
+    ///
+    /// Empty unless the resolved provider needs it: enumerating every table in
+    /// every schema is a real catalog read per schema, and `schemata` must not
+    /// pay for it.
+    pub table_names: &'a [(String, String)],
 }
 
 /// Columns + materialized rows for a resolved system table.
@@ -80,6 +86,7 @@ mod tests {
         let inputs = SystemCatalogInputs {
             catalog_name: "default_catalog",
             schema_names: &names,
+            table_names: &[],
         };
         assert!(
             EmptySystemCatalog

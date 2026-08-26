@@ -52,6 +52,7 @@ impl VirtualTableRegistry {
             providers: HashMap::new(),
         };
         registry.register(Arc::new(SchemataProvider));
+        registry.register(Arc::new(TablesProvider));
         registry
     }
 
@@ -122,6 +123,86 @@ fn build_schemata_batch(catalog: &str, databases: &[String]) -> Result<Vec<Recor
     )
     .map_err(|e| format!("build information_schema.schemata batch failed: {e}"))?;
     Ok(vec![batch])
+}
+
+const TABLES_COLUMNS: &[(&str, bool)] = &[
+    ("table_catalog", false),
+    ("table_schema", false),
+    ("table_name", false),
+    ("table_type", false),
+];
+
+fn tables_columns() -> Vec<ColumnDef> {
+    TABLES_COLUMNS
+        .iter()
+        .map(|(name, nullable)| ColumnDef {
+            name: (*name).to_string(),
+            data_type: DataType::Utf8,
+            nullable: *nullable,
+            write_default: None,
+            logical_type: None,
+        })
+        .collect()
+}
+
+/// One row per table, so a namespace's contents are knowable to SQL.
+///
+/// Without this a caller can only drop children it can already name, which is
+/// no help to anyone who did not create them -- and on a catalog that cannot
+/// enumerate views, `DROP DATABASE ... FORCE` is refused, so naming them is the
+/// only way through.
+fn build_tables_batch(
+    catalog: &str,
+    tables: &[(String, String)],
+) -> Result<Vec<RecordBatch>, String> {
+    let row_count = tables.len();
+    let table_catalog = StringArray::from(vec![catalog; row_count]);
+    let table_schema =
+        StringArray::from_iter_values(tables.iter().map(|(schema, _)| schema.as_str()));
+    let table_name = StringArray::from_iter_values(tables.iter().map(|(_, name)| name.as_str()));
+    // Every row is a base table: this listing comes from the catalog's table
+    // enumeration, and a catalog that also holds views reports those through
+    // the view metadata surface instead.
+    let table_type = StringArray::from(vec!["BASE TABLE"; row_count]);
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("table_catalog", DataType::Utf8, false),
+        Field::new("table_schema", DataType::Utf8, false),
+        Field::new("table_name", DataType::Utf8, false),
+        Field::new("table_type", DataType::Utf8, false),
+    ]));
+
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(table_catalog) as ArrayRef,
+            Arc::new(table_schema) as ArrayRef,
+            Arc::new(table_name) as ArrayRef,
+            Arc::new(table_type) as ArrayRef,
+        ],
+    )
+    .map_err(|e| format!("build information_schema.tables batch failed: {e}"))?;
+    Ok(vec![batch])
+}
+
+struct TablesProvider;
+
+impl VirtualTableProvider for TablesProvider {
+    fn database(&self) -> &str {
+        INFORMATION_SCHEMA_DB
+    }
+
+    fn table(&self) -> &str {
+        "tables"
+    }
+
+    fn columns(&self) -> Vec<ColumnDef> {
+        tables_columns()
+    }
+
+    fn scan(&self, inputs: &SystemCatalogInputs<'_>) -> Result<Vec<RecordBatch>, String> {
+        build_tables_batch(inputs.catalog_name, inputs.table_names)
+    }
 }
 
 struct SchemataProvider;
