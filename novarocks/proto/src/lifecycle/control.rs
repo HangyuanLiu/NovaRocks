@@ -535,7 +535,9 @@ fn parse_init_outcome(raw: i32) -> Result<QueryInitOutcome, ProtocolError> {
             | QueryInitOutcome::QueryInitRejectedStaleBackend
             | QueryInitOutcome::QueryInitRejectedCapacity
             | QueryInitOutcome::QueryInitRejectedInvalidManifest
-            | QueryInitOutcome::QueryInitRejectedTerminated),
+            | QueryInitOutcome::QueryInitRejectedTerminated
+            | QueryInitOutcome::QueryInitRejectedBackendDraining
+            | QueryInitOutcome::QueryInitRejectedBackendProcessMismatch),
         ) => Ok(outcome),
         Ok(QueryInitOutcome::Unspecified) | Err(_) => Err(ProtocolError::new(
             FieldPath::root("init_query_response").field("outcome"),
@@ -617,9 +619,13 @@ mod tests {
         novarocks::ParticipantManifest {
             execution_id: Some(execution_id()),
             backend: Some(novarocks::ParticipantBackendIdentity {
-                backend_id: 3,
                 endpoint: Some(endpoint(9030)),
-                start_epoch: 11,
+                process_id: Some(novarocks::BackendProcessId {
+                    value: vec![
+                        0x01, 0x9c, 0x98, 0xa9, 0x33, 0x90, 0x75, 0x76, 0x97, 0x7b, 0x33, 0xd1,
+                        0x88, 0xad, 0x1f, 0x06,
+                    ],
+                }),
             }),
             participant_roles: vec![1],
             expected_fragment_instance_ids: vec![id(11, 12)],

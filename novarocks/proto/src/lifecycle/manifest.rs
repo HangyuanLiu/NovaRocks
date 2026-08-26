@@ -10,8 +10,10 @@ use std::time::Duration;
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
 use super::query_options::QueryOptions;
 use crate::canonical;
+use crate::membership::BackendProcessId;
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, novarocks};
+use novarocks_types::BackendProcessId as DomainBackendProcessId;
 
 const PARTICIPANT_MANIFEST_V1_DOMAIN: &[u8] =
     b"novarocks.query-lifecycle.participant-manifest.v1\0";
@@ -84,14 +86,12 @@ impl ParticipantBackendIdentity {
     /// Constructs a validated generated backend identity without a Core
     /// mirror value.
     pub fn new(
-        backend_id: u64,
+        process_id: DomainBackendProcessId,
         endpoint: QueryControlEndpoint,
-        start_epoch: u64,
     ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::ParticipantBackendIdentity {
-            backend_id,
             endpoint: Some(endpoint.as_proto().clone()),
-            start_epoch,
+            process_id: Some(BackendProcessId::from_domain(process_id).as_proto().clone()),
         })
     }
 
@@ -108,12 +108,18 @@ impl ParticipantBackendIdentity {
                 error,
             )
         })?;
-        if raw.start_epoch == 0 {
-            return Err(invalid(
-                FieldPath::root("participant_backend_identity").field("start_epoch"),
-                "backend start epoch must be nonzero",
-            ));
-        }
+        let process_id = raw.process_id.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("participant_backend_identity").field("process_id"),
+                "backend process id is required",
+            )
+        })?;
+        BackendProcessId::parse(process_id).map_err(|error| {
+            prefix_path(
+                FieldPath::root("participant_backend_identity").field("process_id"),
+                error,
+            )
+        })?;
         Ok(Self { raw })
     }
 
@@ -121,8 +127,14 @@ impl ParticipantBackendIdentity {
         &self.raw
     }
 
-    pub const fn backend_id(&self) -> u64 {
-        self.raw.backend_id
+    pub fn process_id(&self) -> Result<DomainBackendProcessId, ProtocolError> {
+        let raw = self.raw.process_id.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("participant_backend_identity").field("process_id"),
+                "backend process id is required",
+            )
+        })?;
+        BackendProcessId::parse(raw)?.domain()
     }
 
     pub fn endpoint(&self) -> Result<QueryControlEndpoint, ProtocolError> {
@@ -130,10 +142,6 @@ impl ParticipantBackendIdentity {
             &self.raw.endpoint,
             "participant backend endpoint is required",
         )
-    }
-
-    pub const fn start_epoch(&self) -> u64 {
-        self.raw.start_epoch
     }
 }
 
@@ -679,9 +687,13 @@ mod tests {
 
     fn backend() -> novarocks::ParticipantBackendIdentity {
         novarocks::ParticipantBackendIdentity {
-            backend_id: 3,
             endpoint: Some(endpoint(9030)),
-            start_epoch: 11,
+            process_id: Some(novarocks::BackendProcessId {
+                value: vec![
+                    0x01, 0x9c, 0x98, 0xa9, 0x33, 0x90, 0x75, 0x76, 0x97, 0x7b, 0x33, 0xd1, 0x88,
+                    0xad, 0x1f, 0x06,
+                ],
+            }),
         }
     }
 
@@ -739,7 +751,7 @@ mod tests {
             parsed.execution_id().expect("execution id").query_id(),
             QueryId::new(5, 6)
         );
-        assert_eq!(parsed.backend().expect("backend").backend_id(), 3);
+        assert!(parsed.backend().expect("backend").process_id().is_ok());
         assert_eq!(
             parsed.roles().expect("roles"),
             vec![ParticipantRole::FragmentExecutor]

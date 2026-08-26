@@ -27,6 +27,7 @@ use std::time::Duration;
 use hyper_util::rt::TokioIo;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_native_trust::{NativeClientAuthInterceptor, NativeTrust};
+use novarocks_proto::membership::BackendAnnounceResult;
 use novarocks_proto_models::{filter, novarocks as proto};
 use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::UniqueId;
@@ -49,6 +50,13 @@ pub(crate) struct BackendRpcClient {
 }
 
 impl BackendRpcClient {
+    pub(crate) fn new_native_endpoint(
+        runtime: BackendDataRuntime,
+        endpoint: NativeEndpoint,
+    ) -> Self {
+        Self { runtime, endpoint }
+    }
+
     pub(crate) fn new_runtime_endpoint(
         runtime: BackendDataRuntime,
         endpoint: &RuntimeEndpoint,
@@ -152,6 +160,34 @@ impl BackendRpcClient {
                 })?
                 .map(|response| response.into_inner())
                 .map_err(|error| format!("report_query_terminal rpc failed: {error}"))
+        })
+    }
+
+    pub(crate) fn blocking_announce_backend_with_timeout(
+        &self,
+        request: proto::AnnounceBackendRequest,
+        timeout: Duration,
+    ) -> Result<BackendAnnounceResult, String> {
+        self.runtime.block_on(async {
+            let deadline_at = tokio::time::Instant::now() + timeout;
+            let mut client = self
+                .make_deadline_async_client("announce_backend", deadline_at)
+                .await?;
+            let remaining = deadline_at.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(
+                    "announce_backend deadline exceeded before unary RPC submission".to_string(),
+                );
+            }
+            let mut request = Request::new(request);
+            request.set_timeout(remaining);
+            let response = tokio::time::timeout_at(deadline_at, client.announce_backend(request))
+                .await
+                .map_err(|_| "announce_backend deadline exceeded during unary RPC".to_string())?
+                .map_err(|error| format!("announce_backend rpc failed: {error}"))?
+                .into_inner();
+            BackendAnnounceResult::from_proto(response)
+                .map_err(|error| format!("announce_backend response invalid: {error}"))
         })
     }
 

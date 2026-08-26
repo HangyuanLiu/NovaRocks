@@ -2368,6 +2368,7 @@ dependencies = [
  "novarocks-failpoint",
  "novarocks-parser",
  "novarocks-sql",
+ "novarocks-types",
  "opendal",
  "rayon",
  "regex",
@@ -2399,6 +2400,7 @@ dependencies = [
  "ryu",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

@@ -102,14 +102,18 @@ SQL client
    registry, never hardcoded or defaulted to "single-process = 1 node". Tests
    must never pass only in standalone while failing under 1FE+3BE.
 
-6. **Frontend owns durable backend membership**
-   In `role=fe`, StateStore is required and `ClusterBackendService` is the sole
-   durable membership owner. `[cluster].backends` are additive seeds; SQL
-   `ADD BACKEND` / `DROP BACKEND` persist across FE restart. Heartbeat, live
-   state, generation, and fragment activity are runtime observations, not a
-   second durable catalog. Core consumes `BackendTopologyPort` only: do not add
-   a metadata bridge, global registry, in-memory fallback, or direct-call path.
-   `role=be` does not create frontend membership or StateStore services.
+6. **External orchestration owns backend desired membership**
+   In `role=fe`, `ClusterBackendService` is an in-memory, rebuildable runtime
+   projection. A BE mints one UUIDv7 process identity per start and can enter
+   new-query scheduling only after its authenticated announce and the FE-pull
+   exact heartbeat agree on the immutable descriptor. StateStore is never a
+   backend-membership source; `[cluster].backends` and SQL `ADD BACKEND` /
+   `DROP BACKEND` are removed. Heartbeat/announce loss affects future admission,
+   not an existing attempt; only lifecycle/control/transport evidence or exact
+   process replacement decides that attempt's fate. Core consumes the read-only
+   `BackendTopologyPort` only: do not add a metadata bridge, global registry,
+   in-memory fallback, or direct-call production path. `role=be` never creates
+   frontend membership or StateStore services.
 
 7. **Language policy**
    - User interaction and design docs: Chinese

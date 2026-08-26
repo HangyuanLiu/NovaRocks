@@ -39,16 +39,20 @@ impl QueryTerminalSet {
         snapshots.sort_by_key(|snapshot| {
             (
                 snapshot.execution_id(),
-                snapshot.backend().backend_id(),
-                snapshot.backend().start_epoch(),
+                snapshot
+                    .backend()
+                    .process_id()
+                    .expect("validated terminal snapshot always has a backend process id"),
             )
         });
         let mut identities = BTreeSet::new();
         for snapshot in &snapshots {
             let identity = (
                 snapshot.execution_id(),
-                snapshot.backend().backend_id(),
-                snapshot.backend().start_epoch(),
+                snapshot
+                    .backend()
+                    .process_id()
+                    .expect("validated terminal snapshot always has a backend process id"),
             );
             if !identities.insert(identity) {
                 return Err(QueryLifecycleError::new(

@@ -100,6 +100,13 @@ impl FrontendDataRuntime {
             .expect("frontend native channel cache lock")
             .insert(endpoint, channel);
     }
+
+    pub(crate) fn invalidate_channel(&self, endpoint: &NativeEndpoint) {
+        self.channels
+            .lock()
+            .expect("frontend native channel cache lock")
+            .remove(endpoint);
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +168,8 @@ mod tests {
         let endpoint = NativeEndpoint::from_host_port("be.example", 19040).expect("endpoint");
         first.cache_channel(endpoint.clone(), channel);
         assert!(first.cached_channel(&endpoint).is_some());
+        first.invalidate_channel(&endpoint);
+        assert!(first.cached_channel(&endpoint).is_none());
 
         let next_generation = data_runtime(runtime.handle().clone());
         assert!(next_generation.cached_channel(&endpoint).is_none());

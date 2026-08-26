@@ -267,6 +267,7 @@ pub use write::{
     ConnectorManagedPartitionTransform, ConnectorManagedPublicationEmptyInputDisposition,
     ConnectorManagedPublicationIntent, ConnectorManagedPublicationTarget,
     ConnectorManagedPublicationTechnique, ConnectorOpenWriterRequest,
+    ConnectorPreReadyWritePlanningProof, ConnectorPreReadyWritePlanningRequest,
     ConnectorSealedWriteCohortSet, ConnectorStagedReport, ConnectorStagedReportFrame,
     ConnectorStagedReportSummary, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
     ConnectorWriteActivation, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,

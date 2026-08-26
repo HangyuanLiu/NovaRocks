@@ -71,7 +71,6 @@ pub(crate) fn launch_server(
                 child_environment: Default::default(),
                 config_overlay: Default::default(),
                 native_trust_fixture: Default::default(),
-                initial_backend_seeds: None,
             },
         )?)),
     }

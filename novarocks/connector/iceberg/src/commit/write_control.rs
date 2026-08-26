@@ -42,15 +42,16 @@ use novarocks_spi::connector::{
     ConnectorManagedPartitionSpecPreviewRequest, ConnectorManagedPartitionSpecReplacement,
     ConnectorManagedPartitionTransform, ConnectorManagedPublicationEmptyInputDisposition,
     ConnectorManagedPublicationTechnique, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorRowMutationActivationRequest,
-    ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationExecutionPlan,
-    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorTableObjectId, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
-    ConnectorWriteActivation, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
-    ConnectorWriteActivationSource, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
-    ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteInputShape,
-    ConnectorWriteOperationCompletion, ConnectorWriteOperationId, ConnectorWritePlan,
-    ConnectorWritePlanningRequest, ConnectorWritePreparationOutcome,
+    ConnectorMutationOperationId, ConnectorPreReadyWritePlanningProof,
+    ConnectorPreReadyWritePlanningRequest, ConnectorRequestContext,
+    ConnectorRowMutationActivationRequest, ConnectorRowMutationCohortRecipeBody,
+    ConnectorRowMutationExecutionPlan, ConnectorRowMutationPreparationOutcome,
+    ConnectorRowMutationPreparationRequest, ConnectorTableObjectId, ConnectorWriteAbortOutcome,
+    ConnectorWriteAbortRequest, ConnectorWriteActivation, ConnectorWriteActivationIntent,
+    ConnectorWriteActivationRequest, ConnectorWriteActivationSource, ConnectorWriteCohortId,
+    ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteExecutionId,
+    ConnectorWriteInputShape, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
+    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparationOutcome,
     ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
     ConnectorWriterHandle, ExternalMutationEffect, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationFamily,
@@ -1799,6 +1800,19 @@ impl ConnectorWriteControl for IcebergWriteControl {
                 Ok(activation)
             }
         }
+    }
+
+    fn certify_pre_ready_write_planning(
+        &self,
+        request: ConnectorPreReadyWritePlanningRequest,
+    ) -> Result<ConnectorPreReadyWritePlanningProof, ConnectorError> {
+        // Iceberg activation and placement planning below only reserve and
+        // update generation-local control-memory state. Writer opening,
+        // staging/object creation, catalog publication, and all unknown
+        // provider boundaries occur after ControlReady and are therefore not
+        // covered by this proof.
+        validate_context(&request.activation().context)?;
+        ConnectorPreReadyWritePlanningProof::try_issue(self.key.clone(), &request)
     }
 
     fn plan_write(
@@ -3863,13 +3877,13 @@ mod tests {
     use novarocks_spi::connector::{
         CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorInstanceId,
         ConnectorManagedDescriptorProperties, ConnectorManagedPublicationIntent,
-        ConnectorManagedPublicationTarget, ConnectorProviderId, ConnectorSealedWriteCohortSet,
-        ConnectorStagedPublicationBaseFact, ConnectorStagedReport, ConnectorStagedReportSummary,
-        ConnectorTableHandle, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
-        ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteFieldBinding,
-        ConnectorWriteFieldToken, ConnectorWriteIntent, ConnectorWriteOperationCompletion,
-        ConnectorWritePreparation, ConnectorWriteTargetRef, ConnectorWriterIdentity,
-        ConnectorWriterTerminalState,
+        ConnectorManagedPublicationTarget, ConnectorPreReadyWritePlanningRequest,
+        ConnectorProviderId, ConnectorSealedWriteCohortSet, ConnectorStagedPublicationBaseFact,
+        ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorTableHandle,
+        ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion, ConnectorWriteCohortCompletion,
+        ConnectorWriteCohortDescriptor, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+        ConnectorWriteIntent, ConnectorWriteOperationCompletion, ConnectorWritePreparation,
+        ConnectorWriteTargetRef, ConnectorWriterIdentity, ConnectorWriterTerminalState,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -4313,6 +4327,24 @@ mod tests {
     }
 
     #[test]
+    fn effect_free_pre_ready_proof_binds_the_exact_activation_request() {
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let request = ConnectorPreReadyWritePlanningRequest::new(activation_request(
+            &owner,
+            ConnectorWriteOperationId::new(),
+            1,
+        ));
+
+        let proof = control
+            .certify_pre_ready_write_planning(request.clone())
+            .expect("Iceberg control proves its pre-ready control-memory path");
+        proof
+            .validates(&owner, &request)
+            .expect("proof retains exact owner and activation semantics");
+    }
+
+    #[test]
     fn routed_payloads_bind_to_sorted_terminal_fragments() {
         let (_executor, control) = control();
         let owner = control.binding_key().clone();
@@ -4539,7 +4571,7 @@ mod tests {
     fn operation_marker_accepts_materialized_view_refresh_family() {
         let (_executor, control) = control();
         let owner = control.binding_key().clone();
-        let operation_id = ConnectorWriteOperationId::from_bytes([32; 16]);
+        let operation_id = ConnectorWriteOperationId::new();
         let mut request = activation_request(&owner, operation_id, 1);
         request.intent = ConnectorWriteActivationIntent::Publication(
             LakePublicationFamily::MaterializedViewRefresh,
@@ -4554,7 +4586,9 @@ mod tests {
             };
             active.clone()
         };
-        let marker = control.operation_marker(operation_id, &active, [4; 32], [5; 32]);
+        let marker = control
+            .operation_marker(operation_id, &active, [4; 32], [5; 32])
+            .expect("operation marker");
         let snapshot =
             snapshot_with_operation_marker(9, serde_json::to_string(&marker).expect("marker JSON"));
 

@@ -43,10 +43,11 @@ use crate::query_execution::statistics::{
 use crate::query_execution::terminal_set::QueryTerminalSet;
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
 use bytes::Bytes;
-use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
+use novarocks_proto::membership::BackendProcessDescriptor;
 use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
+use novarocks_types::BackendProcessId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -271,15 +272,23 @@ fn query_control_typestate_initializes_before_native_assembly() {
         novarocks_proto_models::novarocks::QueryOptions::default(),
     )
     .expect("valid protocol query options");
-    let endpoint = RuntimeEndpoint::parse("127.0.0.1:19031").expect("valid endpoint");
+    let endpoint = "127.0.0.1:19031".parse().expect("valid endpoint");
+    let descriptor = BackendProcessDescriptor::new(
+        BackendProcessId::new_v7(),
+        novarocks_proto::lifecycle::QueryControlEndpoint::new("127.0.0.1", 19031)
+            .expect("valid endpoint"),
+        "test-deployment",
+        "test-build",
+    )
+    .expect("valid test descriptor");
     let mut draft = FragmentScheduleDraft::new();
     draft
         .freeze_live_backends(vec![
-            crate::common::backend_topology::LiveBackendTarget::new(3, endpoint.clone(), 11),
+            crate::common::backend_topology::LiveBackendTarget::new(3, descriptor.clone()),
         ])
         .expect("freeze live topology");
     draft
-        .assign_fragment(7, vec![BackendPlacement::new(3, endpoint.clone())])
+        .assign_fragment(7, vec![BackendPlacement::new(3, endpoint)])
         .expect("assign fragment");
     let schedule =
         ValidatedFragmentSchedule::validate(parts.artifacts.scheduling_view(), execution_id, draft)
@@ -287,7 +296,7 @@ fn query_control_typestate_initializes_before_native_assembly() {
     let options = QueryInitOptions::new(
         protocol_execution_id,
         vec![crate::common::backend_topology::LiveBackendTarget::new(
-            3, endpoint, 11,
+            3, descriptor,
         )],
         &parts.options,
         wire_query_options,

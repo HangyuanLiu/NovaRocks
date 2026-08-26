@@ -1244,6 +1244,9 @@ fn test_request_context_with_role(
     };
     use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
     use crate::common::query_cancellation::QueryCancellationSource;
+    use novarocks_proto::lifecycle::QueryControlEndpoint;
+    use novarocks_proto::membership::BackendProcessDescriptor;
+    use novarocks_types::BackendProcessId;
 
     let cancellation = QueryCancellationSource::new();
     RequestContext::new(
@@ -1261,8 +1264,14 @@ fn test_request_context_with_role(
                 0,
                 vec![LiveBackendTarget::new(
                     0,
-                    "127.0.0.1:9030".parse().expect("loopback test backend"),
-                    1,
+                    BackendProcessDescriptor::new(
+                        BackendProcessId::new_v7(),
+                        QueryControlEndpoint::new("127.0.0.1", 9030)
+                            .expect("valid loopback endpoint"),
+                        "test-deployment",
+                        "test-build",
+                    )
+                    .expect("valid test descriptor"),
                 )],
             )
             .expect("non-empty test topology"),
@@ -1645,24 +1654,43 @@ impl PreparedDmlWriteAssembly {
         &self.encoding
     }
 
-    pub(crate) fn finish(
+    /// Consume this one-shot assembly into its exact distributed write
+    /// request. The caller may submit it directly or hand it to the
+    /// statement-owned raw retry controller; in either case the native bundle
+    /// must match this round's encoding provenance.
+    pub(crate) fn into_request(
         self,
         native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    ) -> Result<
+        (
+            crate::query_execution::service::QueryExecutionService,
+            crate::query_execution::contract::DistributedQueryRequest,
+        ),
+        String,
+    > {
         if !self.encoding.matches_native_attachment(&native_bundle) {
             return Err(
                 "native fragment bundle does not match the sealed DML encoding input".into(),
             );
         }
         let (_, prepared) = self.encoding.into_parts();
-        execute_distributed_write_with_execution(
+        let request = build_distributed_write_request(
             &self.query_execution,
             prepared,
             native_bundle,
             self.query_options,
             &self.execution,
             self.connector_write,
-        )
+        )?;
+        Ok((self.query_execution, request))
+    }
+
+    pub(crate) fn finish(
+        self,
+        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
+    ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+        let (query_execution, request) = self.into_request(native_bundle)?;
+        execute_distributed_write_request(&query_execution, request)
     }
 }
 
@@ -2382,6 +2410,25 @@ fn execute_distributed_write_with_execution(
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     connector_write: Option<DistributedConnectorWrite>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    let request = build_distributed_write_request(
+        query_execution,
+        prepared,
+        native_bundle,
+        query_options,
+        execution,
+        connector_write,
+    )?;
+    execute_distributed_write_request(query_execution, request)
+}
+
+fn build_distributed_write_request(
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
+    query_options: Option<QueryOptions>,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    connector_write: Option<DistributedConnectorWrite>,
+) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
@@ -2416,6 +2463,13 @@ fn execute_distributed_write_with_execution(
         }
         None => request,
     };
+    Ok(request)
+}
+
+fn execute_distributed_write_request(
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    request: crate::query_execution::contract::DistributedQueryRequest,
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let (query_result, write_commit, write_abort, connector_completion) = query_execution
         .execute(request)
         .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)

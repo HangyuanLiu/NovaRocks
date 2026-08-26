@@ -51,16 +51,13 @@ pub(super) fn materialize(
         })?;
         let target = QueryLifecycleTarget::new(
             backend_idx,
-            RuntimeEndpoint::new(
-                endpoint.host().to_string(),
-                i32::try_from(endpoint.port()).map_err(|_| {
-                    contract_error(format!(
-                        "query lifecycle backend {backend_idx} endpoint port is invalid"
-                    ))
-                })?,
-            )
-            .map_err(contract_error)?,
-            backend.start_epoch(),
+            RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port()))
+                .map_err(|error| contract_error(error.to_string()))?,
+            backend.process_id().map_err(|error| {
+                contract_error(format!(
+                    "query lifecycle backend {backend_idx} process id is invalid: {error}"
+                ))
+            })?,
         );
         let fragment_participant = manifest
             .roles()

@@ -78,7 +78,6 @@ async fn open_host(
 fn backend_config() -> ClusterBackendOpenConfig {
     ClusterBackendOpenConfig::new(
         novarocks_types::ClusterRole::Fe,
-        Vec::new(),
         Duration::from_secs(1),
         1,
         Duration::from_secs(1),
@@ -89,7 +88,6 @@ fn backend_config() -> ClusterBackendOpenConfig {
 fn fe_backend_config() -> ClusterBackendOpenConfig {
     ClusterBackendOpenConfig::new(
         novarocks_types::ClusterRole::Fe,
-        Vec::new(),
         Duration::from_secs(1),
         1,
         Duration::from_secs(1),
@@ -250,7 +248,7 @@ async fn sqlite_host_bootstraps_once_and_preserves_reconciling_mode() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fe_without_state_store_fails_before_frontend_services_open() {
+async fn fe_without_state_store_fails_before_durable_services_open() {
     let error = match FrontendApplicationHost::open(
         None,
         execution_config(),
@@ -263,15 +261,12 @@ async fn fe_without_state_store_fails_before_frontend_services_open() {
     {
         Ok(host) => {
             host.shutdown().await.expect("shutdown unexpected FE host");
-            panic!("role=fe must not open without StateStore membership authority");
+            panic!("role=fe must not open durable services without StateStore");
         }
         Err(error) => error,
     };
 
-    assert_eq!(
-        error.kind(),
-        FrontendApplicationErrorKind::ClusterBackendOpen
-    );
+    assert_eq!(error.kind(), FrontendApplicationErrorKind::MvServiceOpen);
     assert!(error.to_string().contains("requires StateStore"), "{error}");
 }
 

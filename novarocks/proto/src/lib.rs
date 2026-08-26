@@ -19,3 +19,6 @@ pub mod provider;
 
 /// Validated neutral values used by the native query lifecycle.
 pub mod lifecycle;
+
+/// Validated membership and backend process wire values.
+pub mod membership;

@@ -760,8 +760,8 @@ fn profiler_for_native_fragment(root_plan_node_id: i32) -> Profiler {
 
 #[cfg(test)]
 fn test_lifecycle_registry(controls: Arc<FragmentControlRegistry>) -> Arc<QueryLifecycleRegistry> {
-    let registry = QueryLifecycleRegistry::new_unbound(
-        1,
+    QueryLifecycleRegistry::new_with_process_id(
+        novarocks_types::BackendProcessId::new_v7(),
         Arc::new(
             crate::query_lifecycle::NativeQueryLifecycleLocalRuntime::new(
                 controls,
@@ -790,11 +790,7 @@ fn test_lifecycle_registry(controls: Arc<FragmentControlRegistry>) -> Arc<QueryL
             4_096,
             256 * 1024 * 1024,
         ),
-    );
-    registry
-        .bind_backend_identity(7)
-        .expect("test lifecycle backend identity");
-    registry
+    )
 }
 
 #[cfg(test)]
@@ -976,9 +972,8 @@ mod tests {
         let manifest = ParticipantManifest::new(
             execution_id,
             ParticipantBackendIdentity::new(
-                7,
+                service.lifecycle.local_process_id(),
                 QueryControlEndpoint::new("127.0.0.1", 19030).expect("control endpoint"),
-                1,
             )
             .expect("backend identity"),
             [ParticipantRole::FragmentExecutor],

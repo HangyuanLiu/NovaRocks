@@ -62,7 +62,6 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         child_environment: launch_config.child_environment,
         config_overlay: launch_config.config_overlay,
         native_trust_fixture: launch_config.native_trust_fixture,
-        initial_backend_seeds: launch_config.initial_backend_seeds,
     })
     .with_context(|| format!("launch system scenario {}", scenario.name()))?;
     let mut context = ScenarioContext::new(scenario.name(), handle, scenario_root, config.timeout);

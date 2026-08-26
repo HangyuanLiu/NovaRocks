@@ -21,17 +21,25 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::catalog_application::information_schema;
-use crate::catalog_application::query_materializer::build_catalog_service_provider;
+use crate::catalog_application::query_bindings::QueryTableBindingStore;
+use crate::catalog_application::query_materializer::{
+    build_catalog_service_provider,
+    build_catalog_service_provider_with_bindings_and_query_local_overlays,
+};
 use crate::catalog_application::virtual_table;
-use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
+use crate::common::admitted_query_context::{
+    QueryExecutionContext, RequestContext, StatementAdmissionContext,
+};
+use crate::common::statement_effect::StatementEffectTracker;
 use crate::connector::connector_request_context_for_query;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
-use crate::query_execution::PreparedQueryOperation;
 use crate::query_execution::compiler::{
     TableLookupMode, freeze_query_mv_rewrite_definition_index, query_catalog_service_snapshot,
     query_statistics_snapshot,
 };
+use crate::query_execution::completion::{PreReadyRetryBoundary, PreparedDistributedRoundFactory};
+use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::kernels::{
     QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
 };
@@ -40,6 +48,7 @@ use crate::query_execution::planning::time_travel::{
     TimeTravelRewriteError, has_time_travel_refs, rewrite_time_travel_refs,
 };
 use crate::query_execution::post_compile::{PostCompileIntent, prepare_compiled_distributed_query};
+use crate::query_execution::{PreparedQueryDistributedOperation, PreparedQueryOperation};
 use crate::view::ViewRequestContext;
 use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
 use novarocks_proto::lifecycle::QueryOptions;
@@ -90,6 +99,172 @@ pub(crate) struct FrontendQueryCompiler {
     system_tables: SystemTableQueryKernel,
     mv_readiness: Arc<MvReadinessPort>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+}
+
+enum RetryCompletionTemplate {
+    Result,
+    Profile {
+        planning_started_at: std::time::Instant,
+    },
+}
+
+impl RetryCompletionTemplate {
+    fn from_first_round(intent: &PostCompileIntent) -> Self {
+        match intent {
+            PostCompileIntent::Result => Self::Result,
+            PostCompileIntent::Profile {
+                planning_elapsed, ..
+            } => Self::Profile {
+                planning_started_at: std::time::Instant::now() - *planning_elapsed,
+            },
+        }
+    }
+
+    fn next_round_intent(&self) -> PostCompileIntent {
+        match self {
+            Self::Result => PostCompileIntent::Result,
+            Self::Profile {
+                planning_started_at,
+            } => PostCompileIntent::Profile {
+                planning_elapsed: planning_started_at.elapsed(),
+                execution_started_at: std::time::Instant::now(),
+            },
+        }
+    }
+}
+
+/// Owns only statement-stable SQL admission facts. Each call to `replan`
+/// reconstructs analysis, optimizer, fragments, split assignment, and native
+/// attachment from a new frozen topology; it has no old distributed artifact
+/// to clone or patch.
+struct FrontendDistributedRoundFactory {
+    compiler: FrontendQueryCompiler,
+    query: Query,
+    statement: StatementAdmissionContext,
+    current_catalog: Option<String>,
+    current_database: String,
+    query_options: Option<QueryOptions>,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog_service: crate::catalog_application::query_catalog::QueryCatalogService,
+    bindings: Arc<QueryTableBindingStore>,
+    mv_definitions: Option<novarocks_sql::compiler::MvRewriteDefinitionIndex>,
+    intent: SqlCompileIntent,
+    completion: RetryCompletionTemplate,
+    effect_tracker: StatementEffectTracker,
+}
+
+impl FrontendDistributedRoundFactory {
+    fn error(error: FrontendQueryCompilerError) -> DistributedQueryError {
+        let message = match error {
+            FrontendQueryCompilerError::Engine(message) => message,
+            FrontendQueryCompilerError::Analyze(error) => error.to_string(),
+        };
+        DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
+    }
+}
+
+impl PreparedDistributedRoundFactory for FrontendDistributedRoundFactory {
+    fn replan(
+        &mut self,
+        topology: crate::common::backend_topology::BackendTopologySnapshot,
+    ) -> Result<PreparedQueryDistributedOperation, DistributedQueryError> {
+        if !self.bindings.is_sealed_for_topology_replan() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "topology replan requires a sealed first-round semantic binding store",
+            ));
+        }
+        let execution = self.statement.for_topology(topology);
+        let materializer = build_catalog_service_provider_with_bindings_and_query_local_overlays(
+            self.current_catalog.as_deref(),
+            &self.catalog_service,
+            self.compiler.query.connector_control().as_ref(),
+            self.connector_context.clone(),
+            Arc::clone(&self.bindings),
+            Vec::new(),
+            self.compiler.query.catalog_application().map(Arc::as_ref),
+        );
+        let analyzed = SqlCompiler::analyze(
+            self.compiler
+                .analyze_request(
+                    &self.query,
+                    self.current_catalog.as_deref(),
+                    &self.current_database,
+                    execution.execution(),
+                    &materializer,
+                    self.mv_definitions.as_ref(),
+                    self.intent.clone(),
+                )
+                .map_err(|error| {
+                    DistributedQueryError::new(DistributedQueryErrorKind::Failed, error)
+                })?,
+        )
+        .map_err(|error| {
+            FrontendDistributedRoundFactory::error(FrontendQueryCompilerError::from_compile(error))
+        })?
+        .into_pending()
+        .map_err(|error| {
+            FrontendDistributedRoundFactory::error(FrontendQueryCompilerError::from_compile(error))
+        })?;
+        let statistics =
+            query_statistics_snapshot(&self.compiler.query, &materializer, &self.connector_context)
+                .map_err(|error| {
+                    DistributedQueryError::new(DistributedQueryErrorKind::Failed, error)
+                })?;
+        let distributed_plan =
+            SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
+                .map_err(|error| {
+                    FrontendDistributedRoundFactory::error(
+                        FrontendQueryCompilerError::from_compile(error),
+                    )
+                })?
+                .into_distributed_plan()
+                .map_err(|error| {
+                    FrontendDistributedRoundFactory::error(
+                        FrontendQueryCompilerError::from_compile(error),
+                    )
+                })?;
+        let (assembly, completion) = prepare_compiled_distributed_query(
+            distributed_plan,
+            &self.compiler.query,
+            &materializer,
+            &self.connector_context,
+            self.query_options.clone(),
+            execution.execution(),
+            self.completion.next_round_intent(),
+        )
+        .map_err(|error| DistributedQueryError::new(DistributedQueryErrorKind::Failed, error))?;
+        let native_bundle = encode_native_fragment_bundle(assembly.encoding().encoding_view())
+            .map_err(|error| {
+                DistributedQueryError::new(DistributedQueryErrorKind::Failed, error)
+            })?;
+        let request = assembly.finish(native_bundle).map_err(|error| {
+            DistributedQueryError::new(DistributedQueryErrorKind::Failed, error)
+        })?;
+        Ok(PreparedQueryDistributedOperation::new(request, completion))
+    }
+}
+
+impl PreReadyRetryBoundary for FrontendDistributedRoundFactory {
+    fn permit_pre_ready_retry(&self) -> Result<(), DistributedQueryError> {
+        self.effect_tracker
+            .issue_topology_retry_permit()
+            .map(|_| ())
+            .map_err(|error| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::Rejected,
+                    format!("topology retry is not effect-free: {error:?}"),
+                )
+            })
+    }
+
+    fn close_after_control_ready(&self) {
+        self.effect_tracker.close_after_control_ready();
+    }
+
+    fn close_after_stage_or_start(&self) {
+        self.effect_tracker.close_after_stage_or_start();
+    }
 }
 
 impl FrontendQueryCompiler {
@@ -238,12 +413,17 @@ impl FrontendQueryCompiler {
         completion_intent: PostCompileIntent,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
         let catalog_service = query_catalog_service_snapshot(&self.query);
-        let materializer = build_catalog_service_provider(
+        let bindings = Arc::new(
+            QueryTableBindingStore::try_new()
+                .expect("query table binding scope allocation must not fail"),
+        );
+        let materializer = build_catalog_service_provider_with_bindings_and_query_local_overlays(
             current_catalog,
             &catalog_service,
             self.query.connector_control().as_ref(),
             connector_context.clone(),
-            TableLookupMode::SchemaOnly,
+            Arc::clone(&bindings),
+            Vec::new(),
             self.query.catalog_application().map(Arc::as_ref),
         );
         let mv_definitions = if allow_mv_rewrite_candidates {
@@ -262,7 +442,7 @@ impl FrontendQueryCompiler {
             execution,
             &materializer,
             mv_definitions.as_ref(),
-            intent,
+            intent.clone(),
         )?)
         .map_err(FrontendQueryCompilerError::from_compile)?
         .into_pending()
@@ -273,17 +453,51 @@ impl FrontendQueryCompiler {
                 .map_err(FrontendQueryCompilerError::from_compile)?
                 .into_distributed_plan()
                 .map_err(FrontendQueryCompilerError::from_compile)?;
+        let retry_completion = RetryCompletionTemplate::from_first_round(&completion_intent);
         let (assembly, completion) = prepare_compiled_distributed_query(
             distributed_plan,
             &self.query,
             &materializer,
             &connector_context,
-            query_options,
+            query_options.clone(),
             execution,
             completion_intent,
         )?;
+        // Semantic admission is complete before native request construction.
+        // A future topology-only round must reuse these exact bindings or fail
+        // closed; it may never materialize a newer `Current` table here.
+        materializer
+            .query_table_bindings()
+            .seal_for_topology_replan();
         let native_bundle = encode_native_fragment_bundle(assembly.encoding().encoding_view())?;
-        Ok(assembly.into_operation(native_bundle, completion)?)
+        let request = assembly.finish(native_bundle)?;
+        drop(materializer);
+        let factory = FrontendDistributedRoundFactory {
+            compiler: self.clone(),
+            query: query.clone(),
+            statement: StatementAdmissionContext::new(
+                current_catalog.map(str::to_string),
+                current_database.to_string(),
+                execution.role(),
+                execution.deadline(),
+                execution.cancellation().clone(),
+                execution.optimizer_settings().clone(),
+            ),
+            current_catalog: current_catalog.map(str::to_string),
+            current_database: current_database.to_string(),
+            query_options,
+            connector_context,
+            catalog_service,
+            bindings,
+            mv_definitions,
+            intent: intent.clone(),
+            completion: retry_completion,
+            effect_tracker: StatementEffectTracker::read_only(),
+        };
+        Ok(PreparedQueryOperation::Distributed(
+            PreparedQueryDistributedOperation::new(request, completion)
+                .with_round_factory(Box::new(factory)),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]

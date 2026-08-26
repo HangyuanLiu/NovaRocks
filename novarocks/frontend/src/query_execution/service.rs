@@ -19,12 +19,16 @@
 
 use std::sync::Arc;
 
+use crate::query_execution::completion::{
+    PreparedDistributedQuery, PreparedRetriableDistributedRequest,
+};
 use crate::query_execution::contract::{
     ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
     DistributedQueryOutcome, DistributedQueryRequest,
 };
 use crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
+use crate::runtime::statement_result::StatementResult;
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan, ConnectorRequestContext,
     ConnectorWriteLease,
@@ -46,6 +50,25 @@ impl QueryExecutionService {
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.coordinator.execute(request)
+    }
+
+    /// Submit one statement-owned distributed operation. Production may
+    /// replace a pre-ready round, but only through a factory that returns a
+    /// complete new request and matching completion formatter.
+    pub(crate) fn execute_prepared(
+        &self,
+        operation: PreparedDistributedQuery,
+    ) -> Result<StatementResult, DistributedQueryError> {
+        self.coordinator.execute_prepared(operation)
+    }
+
+    /// Submit a statement-owned operation whose caller must retain the raw
+    /// distributed outcome, including write terminal handles.
+    pub(crate) fn execute_prepared_raw(
+        &self,
+        operation: PreparedRetriableDistributedRequest,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        self.coordinator.execute_prepared_raw(operation)
     }
 
     /// Seal every cohort against the application-retained exact control lease

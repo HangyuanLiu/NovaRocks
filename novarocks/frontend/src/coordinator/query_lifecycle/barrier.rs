@@ -20,7 +20,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::common::query_cancellation::QueryCancellationView;
-use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use crate::native::query_lifecycle::QueryLifecycleTransportErrorKind;
+use crate::query_execution::contract::{
+    DistributedQueryError, DistributedQueryErrorKind, PreReadyTopologyOutcome,
+};
 use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch};
 use crate::query_execution::lifecycle_plan::{
     QueryInitBarrier, QueryInitPlan, QueryLifecycleLease,
@@ -127,7 +130,7 @@ impl FrontendQueryLifecycleConfig {
         self.heartbeat_timeout
     }
 
-    pub(super) const fn init_rpc_timeout(self) -> Duration {
+    pub(crate) const fn init_rpc_timeout(self) -> Duration {
         self.init_rpc_timeout
     }
 
@@ -307,7 +310,7 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             .map(|participant| {
                 (
                     participant.target.backend_idx(),
-                    participant.target.start_epoch(),
+                    participant.target.process_id(),
                 )
             })
             .collect::<Vec<_>>();
@@ -317,7 +320,7 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             .registry
             .extend_attempt_backend_ownership(execution_id.query_id(), &ownership)
         {
-            if error.is_backend_epoch_mismatch() {
+            if error.is_backend_process_mismatch() {
                 self.metrics.backend_epoch_mismatch();
             }
             let error = error.into_error();
@@ -352,8 +355,8 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             self.metrics.as_ref(),
         );
         if let Some(primary) = init_errors.into_iter().next() {
-            let message = control.abort_before_ready(primary);
-            return Err(failed(message));
+            let message = control.abort_before_ready(primary.message.clone());
+            return Err(primary.into_error(message));
         }
         if let Some(reason) = self.cancellation_message() {
             return Err(failed(control.abort_before_ready(reason)));
@@ -706,7 +709,7 @@ fn init_all(
     participants: &[MaterializedParticipant],
     config: FrontendQueryLifecycleConfig,
     metrics: &FrontendLifecycleMetrics,
-) -> Vec<String> {
+) -> Vec<InitFailure> {
     std::thread::scope(|scope| {
         let handles = participants
             .iter()
@@ -741,14 +744,14 @@ fn init_all(
                         query_id_high = participant_execution_id(participant).query_id().high(),
                         query_id_low = participant_execution_id(participant).query_id().low(),
                         attempt_id = participant_execution_id(participant).attempt_id().get(),
-                        backend_id = participant.target.backend_idx(),
-                        backend_start_epoch = participant.target.start_epoch(),
+                        backend_idx = participant.target.backend_idx(),
+                        backend_process_id = %participant.target.process_id(),
                         participant_digest = %hex::encode(participant.digest.as_bytes()),
                         outcome = ?result,
                         latency_micros = latency.as_micros() as u64,
                         "frontend query lifecycle InitQuery completed"
                     );
-                    result.map(|_| ()).map_err(|error| error.message)
+                    result.map(|_| ())
                 })
             })
             .collect::<Vec<_>>();
@@ -757,7 +760,9 @@ fn init_all(
             .filter_map(|handle| match handle.join() {
                 Ok(Ok(())) => None,
                 Ok(Err(error)) => Some(error),
-                Err(_) => Some("query lifecycle InitQuery worker panicked".to_string()),
+                Err(_) => Some(InitFailure::failed(
+                    "query lifecycle InitQuery worker panicked",
+                )),
             })
             .collect()
     })
@@ -769,6 +774,8 @@ struct InitFailure {
     uncertain_cleanup: bool,
     manifest_conflict: bool,
     backend_epoch_mismatch: bool,
+    pre_ready_topology: Option<PreReadyTopologyOutcome>,
+    await_topology_observation: bool,
 }
 
 impl InitFailure {
@@ -778,6 +785,8 @@ impl InitFailure {
             uncertain_cleanup: false,
             manifest_conflict: false,
             backend_epoch_mismatch: false,
+            pre_ready_topology: None,
+            await_topology_observation: false,
         }
     }
 
@@ -787,6 +796,8 @@ impl InitFailure {
             uncertain_cleanup: true,
             manifest_conflict: false,
             backend_epoch_mismatch: false,
+            pre_ready_topology: None,
+            await_topology_observation: false,
         }
     }
 
@@ -796,15 +807,43 @@ impl InitFailure {
             uncertain_cleanup,
             manifest_conflict: true,
             backend_epoch_mismatch: false,
+            pre_ready_topology: None,
+            await_topology_observation: false,
         }
     }
 
-    fn backend_epoch_mismatch(message: impl Into<String>) -> Self {
+    fn pre_ready_topology(message: impl Into<String>, outcome: PreReadyTopologyOutcome) -> Self {
         Self {
             message: message.into(),
             uncertain_cleanup: false,
             manifest_conflict: false,
-            backend_epoch_mismatch: true,
+            backend_epoch_mismatch: matches!(
+                outcome,
+                PreReadyTopologyOutcome::BackendProcessMismatch { .. }
+            ),
+            pre_ready_topology: Some(outcome),
+            await_topology_observation: false,
+        }
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            uncertain_cleanup: false,
+            manifest_conflict: false,
+            backend_epoch_mismatch: false,
+            pre_ready_topology: None,
+            await_topology_observation: true,
+        }
+    }
+
+    fn into_error(self, message: String) -> DistributedQueryError {
+        match self.pre_ready_topology {
+            Some(outcome) => DistributedQueryError::pre_ready_topology(outcome, message),
+            None if self.await_topology_observation => {
+                DistributedQueryError::pre_ready_topology_observation(message)
+            }
+            None => DistributedQueryError::new(DistributedQueryErrorKind::Failed, message),
         }
     }
 }
@@ -834,10 +873,17 @@ fn init_one(
                 ))
             })?,
         Err(error) => {
-            return Err(InitFailure::failed(format!(
+            let message = format!(
                 "backend {} InitQuery failed: {error}",
                 participant.target.backend_idx()
-            )));
+            );
+            return Err(
+                if error.kind() == QueryLifecycleTransportErrorKind::Unavailable {
+                    InitFailure::unavailable(message)
+                } else {
+                    InitFailure::failed(message)
+                },
+            );
         }
     };
     let expected_execution_id = participant_execution_id(participant);
@@ -882,8 +928,24 @@ fn init_one(
             | QueryInitOutcome::QueryInitRejectedInvalidManifest => {
                 Err(InitFailure::manifest_conflict(message, false))
             }
-            QueryInitOutcome::QueryInitRejectedStaleBackend => {
-                Err(InitFailure::backend_epoch_mismatch(message))
+            QueryInitOutcome::QueryInitRejectedStaleBackend
+            | QueryInitOutcome::QueryInitRejectedBackendProcessMismatch => {
+                Err(InitFailure::pre_ready_topology(
+                    message,
+                    PreReadyTopologyOutcome::BackendProcessMismatch {
+                        backend_idx: participant.target.backend_idx(),
+                        process_id: participant.target.process_id(),
+                    },
+                ))
+            }
+            QueryInitOutcome::QueryInitRejectedBackendDraining => {
+                Err(InitFailure::pre_ready_topology(
+                    message,
+                    PreReadyTopologyOutcome::BackendDraining {
+                        backend_idx: participant.target.backend_idx(),
+                        process_id: participant.target.process_id(),
+                    },
+                ))
             }
             _ => Err(InitFailure::failed(message)),
         };
@@ -912,8 +974,8 @@ pub(super) fn attach_all(
                         query_id_high = participant_execution_id(participant).query_id().high(),
                         query_id_low = participant_execution_id(participant).query_id().low(),
                         attempt_id = participant_execution_id(participant).attempt_id().get(),
-                        backend_id = participant.target.backend_idx(),
-                        backend_start_epoch = participant.target.start_epoch(),
+                        backend_idx = participant.target.backend_idx(),
+                        backend_process_id = %participant.target.process_id(),
                         participant_digest = %hex::encode(participant.digest.as_bytes()),
                         ready = outcome.is_ok(),
                         latency_micros = latency.as_micros() as u64,

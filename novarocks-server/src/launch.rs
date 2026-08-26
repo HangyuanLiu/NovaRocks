@@ -416,7 +416,10 @@ mod tests {
         let mysql = mysql
             .map(|port| format!("\n[standalone_server]\nmysql_port = {port}\n"))
             .unwrap_or_default();
-        std::fs::write(path, format!("{extra}\n[native_trust]\ndeployment_id = \"test-deployment\"\nshared_secret = \"0123456789abcdef0123456789abcdef\"\n\n[server]\nhost = \"{host}\"\ngrpc_port = {grpc}\nhttp_port = {http}\n\n[cluster]\nrole = \"{role}\"\n{mysql}")).expect("write config");
+        let frontend_endpoint = (role == "be")
+            .then_some("frontend_endpoint = \"127.0.0.1:19080\"\n")
+            .unwrap_or_default();
+        std::fs::write(path, format!("{extra}\n[native_trust]\ndeployment_id = \"test-deployment\"\nshared_secret = \"0123456789abcdef0123456789abcdef\"\n\n[server]\nhost = \"{host}\"\ngrpc_port = {grpc}\nhttp_port = {http}\n\n[cluster]\nrole = \"{role}\"\n{frontend_endpoint}{mysql}")).expect("write config");
     }
 
     fn args(values: &[&str]) -> Vec<String> {

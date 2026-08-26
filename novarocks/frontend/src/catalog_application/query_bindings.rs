@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::connector::backend::ResolvedTableStatisticsPin;
@@ -363,6 +363,10 @@ pub struct QueryTableBindingStore {
     allocator: Mutex<SqlTableBindingAllocator>,
     entries: Mutex<HashMap<QueryTableBindingKey, Result<StoredBinding, String>>>,
     by_id: Mutex<HashMap<SqlTableBindingId, Arc<QueryTableBinding>>>,
+    /// Once a statement enters a topology-only replan, an unknown lookup must
+    /// not materialize a newer catalog/connector `Current` state. Existing
+    /// request-local bindings remain readable and keep their exact leases.
+    sealed_for_topology_replan: AtomicBool,
 }
 
 impl QueryTableBindingStore {
@@ -380,6 +384,7 @@ impl QueryTableBindingStore {
             allocator: Mutex::new(SqlTableBindingAllocator::try_new(scope)?),
             entries: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
+            sealed_for_topology_replan: AtomicBool::new(false),
         })
     }
 
@@ -396,7 +401,24 @@ impl QueryTableBindingStore {
             ),
             entries: Mutex::new(HashMap::new()),
             by_id: Mutex::new(HashMap::new()),
+            sealed_for_topology_replan: AtomicBool::new(false),
         }
+    }
+
+    /// Freeze this request-local materializer after the first statement round
+    /// has admitted its semantic bindings. A later distributed topology round
+    /// may only reuse already-captured keys; it must fail closed rather than
+    /// loading a newer table, snapshot, or connector incarnation.
+    pub fn seal_for_topology_replan(&self) {
+        // Serialize with `resolve_or_insert_with_id`, which keeps `entries`
+        // locked across the one permitted first-load callback.
+        let _entries = self.entries.lock().expect("query table binding lock");
+        self.sealed_for_topology_replan
+            .store(true, Ordering::Release);
+    }
+
+    pub fn is_sealed_for_topology_replan(&self) -> bool {
+        self.sealed_for_topology_replan.load(Ordering::Acquire)
     }
 
     /// Stable, redacted identity material for one admitted binding set.
@@ -467,6 +489,12 @@ impl QueryTableBindingStore {
         let mut entries = self.entries.lock().expect("query table binding lock");
         if let Some(entry) = entries.get(&key) {
             return entry.as_ref().map(|stored| stored.id).map_err(Clone::clone);
+        }
+        if self.sealed_for_topology_replan.load(Ordering::Acquire) {
+            return Err(
+                "topology replan attempted to materialize a binding absent from the first admitted semantic snapshot"
+                    .to_string(),
+            );
         }
 
         let result = self.allocate_id().and_then(|id| {
@@ -821,6 +849,36 @@ mod tests {
             "default_catalog.db.orders"
         );
         assert!(second.binding(first_token).is_err());
+    }
+
+    #[test]
+    fn topology_replan_seal_reuses_known_bindings_and_rejects_new_materialization() {
+        let store = QueryTableBindingStore::try_new().expect("store");
+        let known_key = QueryTableBindingKey::strict_base("ice", "db", "orders");
+        let known = store
+            .resolve_or_insert(known_key.clone(), || Ok(local_binding()))
+            .expect("first admission");
+        store.seal_for_topology_replan();
+
+        let reused = store
+            .resolve_or_insert(known_key, || {
+                Err("must not reload admitted binding".to_string())
+            })
+            .expect("topology replan reuses first admission");
+        assert_eq!(reused, known);
+
+        let loads = AtomicUsize::new(0);
+        let error = store
+            .resolve_or_insert(
+                QueryTableBindingKey::strict_base("ice", "db", "new_current"),
+                || {
+                    loads.fetch_add(1, Ordering::Relaxed);
+                    Ok(local_binding())
+                },
+            )
+            .expect_err("topology replan must not read an unknown current binding");
+        assert!(error.contains("absent from the first admitted semantic snapshot"));
+        assert_eq!(loads.load(Ordering::Relaxed), 0);
     }
 
     #[test]

@@ -10,9 +10,13 @@ use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
 use crate::coordinator::QueryTerminalIngress;
+use crate::topology::ClusterBackendService;
 use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_proto::lifecycle::{
     ParticipantTerminalOutcome, QueryTerminalReportAck, QueryTerminalReportOutcome,
+};
+use novarocks_proto::membership::{
+    BackendAnnounceRejectionReason, BackendAnnounceRequest, BackendAnnounceResult,
 };
 use novarocks_proto::{ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{filter, novarocks as proto};
@@ -138,8 +142,7 @@ struct RuntimeFilterParticipantTerminalDebug {
 
 #[derive(serde::Serialize)]
 struct RuntimeFilterParticipantDebug {
-    backend_id: u64,
-    start_epoch: u64,
+    process_id: String,
 }
 
 #[derive(serde::Serialize)]
@@ -424,8 +427,7 @@ fn runtime_filter_participant_debug(
     participant: RuntimeFilterParticipantTerminalTelemetry,
 ) -> RuntimeFilterParticipantTerminalDebug {
     let participant_identity = RuntimeFilterParticipantDebug {
-        backend_id: participant.participant.backend_id,
-        start_epoch: participant.participant.start_epoch,
+        process_id: participant.participant.process_id.to_string(),
     };
     let telemetry = match participant.telemetry {
         RuntimeFilterParticipantTerminalTelemetryValue::Available(details) => {
@@ -712,6 +714,8 @@ fn lifecycle_metric_map(
 #[derive(Clone)]
 struct FrontendReportService {
     ingress: Arc<dyn QueryTerminalIngress>,
+    membership: Arc<ClusterBackendService>,
+    deployment_id: String,
 }
 
 impl FrontendReportService {
@@ -738,6 +742,38 @@ impl NovaRocksGrpc for FrontendReportService {
                 + 'static,
         >,
     >;
+
+    async fn announce_backend(
+        &self,
+        request: tonic::Request<proto::AnnounceBackendRequest>,
+    ) -> Result<tonic::Response<proto::AnnounceBackendResponse>, tonic::Status> {
+        let announce = BackendAnnounceRequest::parse(request.into_inner())
+            .map_err(status_from_contract_error)?;
+        let descriptor = announce.descriptor().map_err(status_from_contract_error)?;
+        let result = if descriptor.deployment_id() != self.deployment_id {
+            BackendAnnounceResult::rejected(
+                BackendAnnounceRejectionReason::DeploymentMismatch,
+                "backend deployment does not match frontend deployment",
+            )
+        } else {
+            self.membership
+                .record_announce(
+                    descriptor,
+                    announce
+                        .reported_state()
+                        .map_err(status_from_contract_error)?,
+                )
+                .map(|()| BackendAnnounceResult::accepted(self.membership.announce_lease_ttl_ms()))
+                .unwrap_or_else(|error| {
+                    BackendAnnounceResult::rejected(
+                        BackendAnnounceRejectionReason::DescriptorConflict,
+                        error,
+                    )
+                })
+        }
+        .map_err(status_from_contract_error)?;
+        Ok(tonic::Response::new(result.to_proto()))
+    }
 
     async fn exchange(
         &self,
@@ -903,6 +939,7 @@ mod tests {
         RuntimeFilterTerminalRollup, RuntimeFilterTerminalTotals,
         RuntimeFilterTerminalTotalsTelemetry, RuntimeFilterTerminalTotalsUnavailable,
     };
+    use crate::topology::ClusterBackendService;
     use novarocks_native_trust::{
         DeploymentId, NativeCallerSubject, NativeClientAuthInterceptor, NativeTransportMode,
         NativeTrust, ValidatedSharedSecret,
@@ -955,12 +992,15 @@ mod tests {
         )
         .expect("execution id");
         let backend = ParticipantBackendIdentity::parse(proto::ParticipantBackendIdentity {
-            backend_id: 7,
             endpoint: Some(proto::QueryControlEndpoint {
                 host: "127.0.0.1".into(),
                 port: 9030,
             }),
-            start_epoch: 11,
+            process_id: Some(proto::BackendProcessId {
+                value: novarocks_types::BackendProcessId::new_v7()
+                    .to_bytes()
+                    .to_vec(),
+            }),
         })
         .expect("backend identity");
         let attestation = NegativeAttestation::parse(proto::NegativeAttestation {
@@ -1008,8 +1048,7 @@ mod tests {
         RuntimeFilterTerminalRollup {
             participants: vec![RuntimeFilterParticipantTerminalTelemetry {
                 participant: RuntimeFilterTerminalParticipant {
-                    backend_id: 7,
-                    start_epoch: 11,
+                    process_id: novarocks_types::BackendProcessId::new_v7(),
                 },
                 telemetry: RuntimeFilterParticipantTerminalTelemetryValue::Available(
                     RuntimeFilterParticipantTerminalDetails {
@@ -1106,9 +1145,10 @@ mod tests {
         assert_eq!(value["query_local_sequence"], 52);
         assert_eq!(value["query_attempt_id"], 1);
         assert_eq!(value["runtime_filter"]["kind"], "available");
-        assert_eq!(
-            value["runtime_filter"]["participants"][0]["participant"]["backend_id"],
-            7
+        assert!(
+            value["runtime_filter"]["participants"][0]["participant"]["process_id"]
+                .as_str()
+                .is_some()
         );
         assert_eq!(
             value["runtime_filter"]["participants"][0]["telemetry"]["channels"][0]["terminal_state"],
@@ -1200,6 +1240,7 @@ mod tests {
             let mut server = FrontendReportServerHandle::start(
                 SocketAddr::from(([127, 0, 0, 1], 0)),
                 ingress,
+                Arc::new(ClusterBackendService::new_transient_for_test(1)),
                 convergence_reader,
                 Arc::clone(&trust),
                 FrontendNativeTransport::plaintext(),
@@ -1245,6 +1286,7 @@ mod tests {
         let mut server = FrontendReportServerHandle::start(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             ingress,
+            Arc::new(ClusterBackendService::new_transient_for_test(1)),
             Arc::new(EmptyConvergenceReader),
             Arc::clone(&trust),
             FrontendNativeTransport::plaintext(),
@@ -1299,6 +1341,7 @@ mod tests {
         let mut server = FrontendReportServerHandle::start(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             ingress,
+            Arc::new(ClusterBackendService::new_transient_for_test(1)),
             convergence_reader,
             trust,
             FrontendNativeTransport::plaintext(),
@@ -1368,6 +1411,7 @@ impl FrontendReportServerHandle {
     pub(crate) fn start(
         address: SocketAddr,
         ingress: Arc<dyn QueryTerminalIngress>,
+        membership: Arc<ClusterBackendService>,
         _convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
@@ -1434,9 +1478,13 @@ impl FrontendReportServerHandle {
                                 }
                             }
                         });
-                        let service = NovaRocksGrpcServer::new(FrontendReportService { ingress })
-                            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+                        let service = NovaRocksGrpcServer::new(FrontendReportService {
+                            ingress,
+                            membership,
+                            deployment_id: native_trust.deployment_id().as_str().to_string(),
+                        })
+                        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
                         let serve = tonic::transport::Server::builder()
                             .layer(
                                 NativeServerAdmission::new(native_trust.as_ref().clone())
@@ -1494,6 +1542,7 @@ impl FrontendReportServerHandle {
         host: &str,
         port: u16,
         ingress: Arc<dyn QueryTerminalIngress>,
+        membership: Arc<ClusterBackendService>,
         convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
@@ -1501,6 +1550,7 @@ impl FrontendReportServerHandle {
         Self::start(
             parse_bind_addr(host, port)?,
             ingress,
+            membership,
             convergence_reader,
             native_trust,
             native_transport,

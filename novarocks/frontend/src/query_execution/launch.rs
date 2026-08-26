@@ -71,8 +71,8 @@ impl StageParticipantBinding {
         })
     }
 
-    pub fn target(&self) -> QueryLifecycleTarget {
-        self.target.clone()
+    pub const fn target(&self) -> &QueryLifecycleTarget {
+        &self.target
     }
 
     pub const fn init_digest(&self) -> ParticipantManifestDigest {
@@ -186,7 +186,7 @@ mod tests {
     use novarocks_proto::lifecycle::AttemptId;
     use novarocks_proto_models::common;
     use novarocks_proto_models::{novarocks, plan};
-    use novarocks_types::QueryId;
+    use novarocks_types::{BackendProcessId, QueryId};
 
     use super::*;
 
@@ -202,8 +202,8 @@ mod tests {
         StageParticipantBinding::new(
             QueryLifecycleTarget::new(
                 4,
-                RuntimeEndpoint::parse("127.0.0.1:19040").expect("endpoint"),
-                9,
+                RuntimeEndpoint::parse("127.0.0.1:19040").expect("test endpoint"),
+                BackendProcessId::new_v7(),
             ),
             ParticipantManifestDigest::new([3; 32]),
             [ParticipantRole::FragmentExecutor],

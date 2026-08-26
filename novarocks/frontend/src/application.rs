@@ -33,9 +33,7 @@ use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogControll
 use crate::common::admitted_query_context::LakePublicationRuntimePolicy;
 use crate::connector::ConnectorControlHost;
 use crate::coordination::FrontendCoordinationRuntime;
-use crate::coordinator::{
-    BackendQueryActivity, FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader,
-};
+use crate::coordinator::{FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader};
 use crate::dml::DmlService;
 use crate::mv::maintenance::MaintenanceCoordinatorConfig;
 use crate::mv::scheduler::FrontendMvSchedulerConfig;
@@ -469,13 +467,8 @@ impl FrontendApplicationHost {
             }
             host.catalog_controller = Some(controller);
         }
-        match ClusterBackendService::open(
-            backend,
-            host.state_store(),
-            tokio::runtime::Handle::current(),
-            data_runtime,
-        )
-        .await
+        match ClusterBackendService::open(backend, tokio::runtime::Handle::current(), data_runtime)
+            .await
         {
             Ok(topology) => host.topology = Some(topology),
             Err(error) => {
@@ -773,6 +766,10 @@ impl FrontendApplicationHost {
         )
     }
 
+    pub(crate) fn backend_membership_ingress(&self) -> Arc<ClusterBackendService> {
+        Arc::clone(self.topology())
+    }
+
     pub fn start_report_server(
         &self,
         bind_addr: std::net::SocketAddr,
@@ -783,6 +780,7 @@ impl FrontendApplicationHost {
         crate::native::report_server::FrontendReportServerHandle::start(
             bind_addr,
             self.terminal_ingress(),
+            self.backend_membership_ingress(),
             self.lifecycle_convergence_reader(),
             native_trust,
             native_transport,
@@ -802,6 +800,7 @@ impl FrontendApplicationHost {
             host,
             port,
             self.terminal_ingress(),
+            self.backend_membership_ingress(),
             self.lifecycle_convergence_reader(),
             native_trust,
             native_transport,
@@ -835,19 +834,6 @@ impl FrontendApplicationHost {
                 .as_ref(),
             request,
         )
-    }
-
-    pub fn backend_query_activity(&self) -> BackendQueryActivity {
-        self.coordinator
-            .as_ref()
-            .expect("frontend coordinator is installed before host open returns")
-            .backend_query_activity()
-    }
-
-    pub fn backend_query_event_sink(
-        &self,
-    ) -> Arc<dyn crate::common::backend_topology::BackendQueryEventSink> {
-        Arc::new(self.backend_query_activity())
     }
 
     pub fn coordinator_report_endpoint_sink(
@@ -905,8 +891,6 @@ impl FrontendApplicationHost {
             )
             .map_err(FrontendApplicationError::server)?,
         );
-        self.topology()
-            .attach_query_events(Arc::new(coordinator.backend_query_activity()));
         self.query_execution = Some(QueryExecutionService::new(coordinator.clone()));
         self.coordinator = Some(coordinator);
         Ok(())
@@ -954,9 +938,6 @@ impl FrontendApplicationHost {
             .as_ref()
             .map(|topology| topology.stop_heartbeat_manager())
             .transpose();
-        if let Some(topology) = self.topology.as_ref() {
-            topology.detach_query_events();
-        }
         self.topology.take();
         primary_error = heartbeat_result.err();
         if let Some(statistics_worker_error) = statistics_worker_error {
@@ -1115,7 +1096,6 @@ mod tests {
         let registry = test_state_store_registry();
         let backend = crate::topology::ClusterBackendOpenConfig::new(
             novarocks_types::ClusterRole::Fe,
-            Vec::new(),
             Duration::from_secs(1),
             1,
             Duration::from_secs(1),

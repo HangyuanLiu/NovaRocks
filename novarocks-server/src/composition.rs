@@ -416,6 +416,13 @@ pub fn compose_backend_server_config(
         host: native_trust.advertised_endpoint().host().to_string(),
         port: native_trust.advertised_endpoint().port(),
     };
+    let frontend_endpoint = config
+        .cluster
+        .frontend_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("role=be requires [cluster].frontend_endpoint"))?
+        .parse::<novarocks_types::NativeEndpoint>()
+        .map_err(|error| anyhow::anyhow!("parse [cluster].frontend_endpoint: {error}"))?;
     Ok(BackendServerConfig {
         bind_host: config.server.host.clone(),
         grpc_port: config.server.grpc_port,
@@ -423,6 +430,14 @@ pub fn compose_backend_server_config(
         advertise_endpoint,
         native_trust: std::sync::Arc::clone(native_trust.trust()),
         native_transport: backend_native_transport(native_trust.transport()),
+        frontend_endpoint,
+        announce_interval: Duration::from_millis(config.cluster.backend_announce_interval_ms()),
+        announce_initial_backoff: Duration::from_millis(
+            config.cluster.backend_announce_initial_backoff_ms(),
+        ),
+        announce_max_backoff: Duration::from_millis(
+            config.cluster.backend_announce_max_backoff_ms(),
+        ),
         query_lifecycle_sweep_interval: Duration::from_millis(
             runtime_config.query_control_heartbeat_interval_ms,
         ),
@@ -531,22 +546,11 @@ pub fn compose_frontend_server_config(
             ),
         );
     }
-    let backend_seeds = config
-        .cluster
-        .backends
-        .iter()
-        .map(|endpoint| {
-            endpoint.parse().map_err(|error| {
-                anyhow::anyhow!("parse configured backend endpoint '{endpoint}' failed: {error}")
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let backend_open = ClusterBackendOpenConfig::new(
         config.cluster.role,
-        backend_seeds,
-        Duration::from_millis(config.cluster.heartbeat_interval_ms),
-        config.cluster.heartbeat_timeout_retries,
-        Duration::from_secs(config.cluster.decommission_timeout_secs),
+        Duration::from_millis(config.cluster.heartbeat_interval_ms()),
+        config.cluster.heartbeat_timeout_retries(),
+        Duration::from_millis(config.cluster.backend_announce_lease_ttl_ms()),
     )
     .map_err(|error| anyhow::anyhow!("open frontend backend cluster configuration: {error}"))?;
     let mysql_listener = novarocks_frontend::resolve_mysql_listener_settings(

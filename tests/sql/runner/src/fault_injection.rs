@@ -518,7 +518,7 @@ where
         BackendInit {
             index: usize,
             token: String,
-            start_epoch: u64,
+            process_id: novarocks_types::BackendProcessId,
         },
         FrontendPhase {
             phase: crate::types::QueryLifecyclePhase,
@@ -664,7 +664,7 @@ where
                     token: server
                         .armed_query_lifecycle_fault_token(index, "restart-after-init-ack")?
                         .context("restart-after-InitAck fault has no armed token")?,
-                    start_epoch: server.backend_start_epoch(index)?,
+                    process_id: server.backend_process_id(index)?,
                 }
             }
             PostQueryFault::KillQueryAtLifecyclePhase { phase, .. }
@@ -824,7 +824,7 @@ where
                         }
                         PostQueryFault::RestartBackendAfterInitAck(index) => {
                             let FaultBaseline::BackendInit {
-                                token, start_epoch, ..
+                                token, process_id, ..
                             } = &baseline
                             else {
                                 unreachable!("BE restart fault has BackendInit baseline")
@@ -839,34 +839,39 @@ where
                                 })
                                 .and_then(|line| marker_field(line, "execution_id"))
                                 .context("restart marker is missing execution_id")?;
-                            let backend_id = old_log
+                            let observed_process_id = old_log
                                 .lines()
                                 .rev()
                                 .find(|line| {
                                     line.contains("NOVAROCKS_QUERY_INIT_ACK_OBSERVED")
                                         && line.contains(&format!("token={token}"))
                                 })
-                                .and_then(|line| marker_field(line, "backend_id"))
-                                .context("restart marker is missing backend_id")?
-                                .parse::<u64>()
-                                .context("restart marker has invalid backend_id")?;
-                            server.restart_be_until(index, deadline)?;
-                            let new_epoch = server.backend_start_epoch(index)?;
-                            if new_epoch == *start_epoch {
+                                .and_then(|line| marker_field(line, "process_id"))
+                                .context("restart marker is missing process_id")?
+                                .parse::<novarocks_types::BackendProcessId>()
+                                .context("restart marker has invalid process_id")?;
+                            if observed_process_id != *process_id {
                                 bail!(
-                                    "BE[{index}] restart did not change start epoch: old={start_epoch} new={new_epoch}"
+                                    "restart marker process identity differs from SHOW BACKENDS: expected={process_id} observed={observed_process_id}"
+                                );
+                            }
+                            server.restart_be_until(index, deadline)?;
+                            let new_process_id = server.backend_process_id(index)?;
+                            if new_process_id == *process_id {
+                                bail!(
+                                    "BE[{index}] restart did not replace process identity: old={process_id} new={new_process_id}"
                                 );
                             }
                             let new_log = server.be_current_log_contents(index)?;
-                            validate_restart_nonrestore_status(
+                            validate_restarted_process_has_no_old_execution(
                                 &new_log,
                                 &old_execution,
-                                backend_id,
-                                new_epoch,
+                                *process_id,
+                                new_process_id,
                             )?;
                             evidence_execution = Some(old_execution.clone());
                             println!(
-                                "query lifecycle BE restart proof PASS: backend_index={index} backend_id={backend_id} token={token} old_execution={old_execution} old_epoch={start_epoch} new_epoch={new_epoch} control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 lifecycle_entries=0 lifecycle_tombstones=0 pre_init_tombstones=0 tombstone_index=0 restored=false"
+                                "query lifecycle BE restart proof PASS: backend_index={index} old_process_id={process_id} new_process_id={new_process_id} token={token} old_execution={old_execution} no_old_execution_restored=true"
                             );
                         }
                         PostQueryFault::KillQueryAfterControlReady { connection_id, .. } => {
@@ -1203,12 +1208,17 @@ fn terminal_cleanup_on_all_backends(
     Ok(true)
 }
 
-fn validate_restart_nonrestore_status(
+fn validate_restarted_process_has_no_old_execution(
     new_log: &str,
     old_execution: &str,
-    backend_id: u64,
-    new_epoch: u64,
+    old_process_id: novarocks_types::BackendProcessId,
+    new_process_id: novarocks_types::BackendProcessId,
 ) -> Result<()> {
+    if old_process_id == new_process_id {
+        bail!(
+            "restarted BE retained process identity {old_process_id} instead of receiving a new BackendProcessId"
+        );
+    }
     for forbidden in [
         "NOVAROCKS_QUERY_CONTROL_READY",
         "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
@@ -1219,43 +1229,16 @@ fn validate_restart_nonrestore_status(
                 && marker_field(line, "execution_id").as_deref() == Some(old_execution)
         }) {
             bail!(
-                "BE backend_id={backend_id} epoch={new_epoch} restored old execution {old_execution}: found {forbidden}"
+                "BE process_id={new_process_id} restored old execution {old_execution}: found {forbidden}"
             );
         }
     }
-    let marker = new_log
-        .lines()
-        .find(|line| {
-            line.contains("NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS")
-                && marker_field(line, "backend_id")
-                    .and_then(|value| value.parse::<u64>().ok())
-                    == Some(backend_id)
-                && marker_field(line, "start_epoch")
-                    .and_then(|value| value.parse::<u64>().ok())
-                    == Some(new_epoch)
-        })
-        .with_context(|| {
-            format!(
-                "new BE has no restoration-status marker for backend_id={backend_id} start_epoch={new_epoch}"
-            )
-        })?;
-    for (field, expected) in [
-        ("control_ready", "0"),
-        ("active_lifecycle", "0"),
-        ("fragment_admissions", "0"),
-        ("fragment_acceptances", "0"),
-        ("lifecycle_entries", "0"),
-        ("lifecycle_tombstones", "0"),
-        ("pre_init_tombstones", "0"),
-        ("tombstone_index", "0"),
-        ("restored", "false"),
-    ] {
-        let actual = marker_field(marker, field);
-        if actual.as_deref() != Some(expected) {
-            bail!(
-                "new BE restoration status for old execution {old_execution} backend_id={backend_id} start_epoch={new_epoch} requires {field}={expected}, found {actual:?}"
-            );
-        }
+    if new_log.lines().any(|line| {
+        line.contains("NOVAROCKS_QUERY_")
+            && marker_field(line, "process_id").as_deref()
+                == Some(old_process_id.to_string().as_str())
+    }) {
+        bail!("restarted BE emitted lifecycle evidence with retired process_id={old_process_id}");
     }
     Ok(())
 }
@@ -2296,7 +2279,7 @@ mod tests {
                 .expect("kill-query state")
                 .control_ready_count;
             Ok((0..count)
-                .map(|_| "NOVAROCKS_QUERY_CONTROL_READY execution_id=10:20:1 backend_id=1\n")
+                .map(|_| "NOVAROCKS_QUERY_CONTROL_READY execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789abd\n")
                 .collect())
         }
 
@@ -2310,7 +2293,7 @@ mod tests {
                 .is_some();
             Ok(if killed {
                 format!(
-                    "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id=10:20:1 backend_id={index} reason=CoordinatorAbort\nNOVAROCKS_QUERY_LIFECYCLE_CLEANUP execution_id=10:20:1 backend_id={index} active=false tombstone=true reason=CoordinatorAbort\n"
+                    "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789ab{index:x} reason=CoordinatorAbort\nNOVAROCKS_QUERY_LIFECYCLE_CLEANUP execution_id=10:20:1 process_id=018f3d8a-2b4c-7d6e-8f90-123456789ab{index:x} active=false tombstone=true reason=CoordinatorAbort\n"
                 )
             } else {
                 String::new()
@@ -2429,62 +2412,50 @@ mod tests {
         );
     }
 
-    #[test]
-    fn restart_nonrestore_proof_requires_all_restoration_relevant_state_fields() {
-        let complete = "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id=7 start_epoch=42 control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 lifecycle_entries=0 lifecycle_tombstones=0 pre_init_tombstones=0 tombstone_index=0 restored=false\n";
-        validate_restart_nonrestore_status(complete, "10:20:1", 7, 42)
-            .expect("complete fresh-process state proves non-restoration");
-
-        for field in [
-            "control_ready=0",
-            "active_lifecycle=0",
-            "fragment_admissions=0",
-            "fragment_acceptances=0",
-            "lifecycle_entries=0",
-            "lifecycle_tombstones=0",
-            "pre_init_tombstones=0",
-            "tombstone_index=0",
-            "restored=false",
-        ] {
-            let incomplete = complete.replace(field, "");
-            let error = validate_restart_nonrestore_status(&incomplete, "10:20:1", 7, 42)
-                .expect_err("missing restoration field must fail");
-            assert!(error.to_string().contains(field.split('=').next().unwrap()));
-        }
+    fn restart_process_id(seed: &str) -> novarocks_types::BackendProcessId {
+        seed.parse().expect("fixture UUIDv7 backend process id")
     }
 
     #[test]
-    fn restart_nonrestore_proof_rejects_nonzero_retained_execution_indexes() {
-        let complete = "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id=7 start_epoch=42 control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 lifecycle_entries=0 lifecycle_tombstones=0 pre_init_tombstones=0 tombstone_index=0 restored=false\n";
+    fn restart_nonrestore_proof_accepts_a_distinct_process_without_old_execution() {
+        let old = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
+        let new = restart_process_id("018f3d8a-2b4c-7d6f-8f90-123456789abc");
+        validate_restarted_process_has_no_old_execution("", "10:20:1", old, new)
+            .expect("a distinct fresh process with no old execution is valid");
+    }
 
-        for field in [
-            "lifecycle_entries",
-            "lifecycle_tombstones",
-            "pre_init_tombstones",
-            "tombstone_index",
-        ] {
-            let retained = complete.replace(&format!("{field}=0"), &format!("{field}=1"));
-            let error = validate_restart_nonrestore_status(&retained, "10:20:1", 7, 42)
-                .expect_err("nonzero retained execution index must reject restart proof");
-            assert!(
-                error.to_string().contains(field),
-                "error must identify retained field {field}: {error:#}"
-            );
-        }
+    #[test]
+    fn restart_nonrestore_proof_rejects_same_process_identity() {
+        let process_id = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
+        let error =
+            validate_restarted_process_has_no_old_execution("", "10:20:1", process_id, process_id)
+                .expect_err("restart must install a new BackendProcessId");
+        assert!(error.to_string().contains("retained process identity"));
     }
 
     #[test]
     fn restart_nonrestore_proof_rejects_old_execution_control_or_fragment_state() {
-        let status = "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id=7 start_epoch=42 control_ready=0 active_lifecycle=0 fragment_admissions=0 fragment_acceptances=0 lifecycle_entries=0 lifecycle_tombstones=0 pre_init_tombstones=0 tombstone_index=0 restored=false\n";
+        let old = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
+        let new = restart_process_id("018f3d8a-2b4c-7d6f-8f90-123456789abc");
         for marker in [
             "NOVAROCKS_QUERY_CONTROL_READY",
             "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
             "NOVAROCKS_QUERY_INIT_APPLIED",
         ] {
-            let log = format!("{status}{marker} execution_id=10:20:1 backend_id=7\n");
-            let error = validate_restart_nonrestore_status(&log, "10:20:1", 7, 42)
+            let log = format!("{marker} execution_id=10:20:1 process_id={new}\n");
+            let error = validate_restarted_process_has_no_old_execution(&log, "10:20:1", old, new)
                 .expect_err("old execution state must fail");
             assert!(error.to_string().contains(marker));
         }
+    }
+
+    #[test]
+    fn restart_nonrestore_proof_rejects_retired_process_identity() {
+        let old = restart_process_id("018f3d8a-2b4c-7d6e-8f90-123456789abc");
+        let new = restart_process_id("018f3d8a-2b4c-7d6f-8f90-123456789abc");
+        let log = format!("NOVAROCKS_QUERY_CONTROL_READY execution_id=other process_id={old}\n");
+        let error = validate_restarted_process_has_no_old_execution(&log, "10:20:1", old, new)
+            .expect_err("new process must not emit retired identity");
+        assert!(error.to_string().contains("retired process_id"));
     }
 }

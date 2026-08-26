@@ -46,6 +46,7 @@ novarocks-cluster-harness = { path = "../../cluster-harness" }
 novarocks-failpoint = { path = "../../../novarocks/failpoint", default-features = false }
 novarocks-parser = { path = "../../../novarocks/parser" }
 novarocks-sql = { path = "../../../novarocks/sql" }
+novarocks-types = { path = "../../../novarocks/types" }
 rayon = "1.10"
 regex = "1.10"
 serde = { version = "1", features = ["derive"] }

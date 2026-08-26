@@ -48,7 +48,7 @@ openssl rand -base64 32
 empty、malformed 或非 UTF-8 的值都会在 listener bind 之前失败，错误和日志不得回显 secret。
 
 JWT 只证明 caller 知道该 deployment secret。它不是 SQL authorization、backend membership、
-topology generation、query identity 或 protobuf message MAC；DROP BACKEND 不会撤销已泄露的
+topology generation、query identity 或 protobuf message MAC；终止或移除一个 Backend 也不会撤销已泄露的
 deployment secret。
 
 ## 传输模式
@@ -142,7 +142,7 @@ secret/certificate hot reload、old/new secret overlap、rolling upgrade 或 per
 | `Unauthenticated` Native RPC | 检查所有 role 是否使用同一 deployment secret、时钟是否合理、没有重复/格式错误 authorization metadata；不要以 subject 做 membership 或 authorization 判断。 |
 | automatic TLS handshake failure | 检查 advertise/peer endpoint 不是 wildcard，IP/DNS reference 与 automatic SAN 精确匹配，且所有 role 都为 `automatic`。 |
 | PEM TLS handshake failure | 检查 cert/key match、chain、显式 roots、serverAuth EKU、有效期与 exact IP/DNS SAN；不要依赖系统 roots 或 CN fallback。 |
-| 想立即拒绝已移除/泄露的节点 | DROP BACKEND 只改变 topology。轮换 deployment secret 并 homogeneous restart 才是当前完整 transport-trust revoke。 |
+| 想立即拒绝已移除/泄露的节点 | Backend drain/终止只改变 future admission。轮换 deployment secret 并 homogeneous restart 才是当前完整 transport-trust revoke。 |
 
 NWT-3 只保护 Native gRPC surface。MySQL SQL entrypoint、management HTTP、metrics 和现有 debug route
 不读取这个 JWT/TLS config；它们需要各自的网络隔离、proxy 或后续安全设计。不要把 Native JWT 的存在解释为

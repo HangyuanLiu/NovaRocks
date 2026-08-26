@@ -4994,8 +4994,9 @@ mod tests {
             runtime_filter: harness::RuntimeFilterTerminalRollup::Available {
                 participants: vec![harness::RuntimeFilterParticipantTerminalTelemetry {
                     participant: harness::RuntimeFilterTerminalParticipant {
-                        backend_id: 7,
-                        start_epoch: 11,
+                        process_id: "018f3d8a-2b4c-7d6e-8f90-123456789abc"
+                            .parse()
+                            .expect("fixture UUIDv7 backend process id"),
                     },
                     telemetry: harness::RuntimeFilterParticipantTerminalTelemetryValue::Available(
                         harness::RuntimeFilterParticipantTerminalDetails {

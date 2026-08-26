@@ -1,5 +1,6 @@
 use crate::scenario::Scenario;
 
+mod backend_membership;
 mod catalog_state;
 mod connector;
 mod mv_recovery;
@@ -10,6 +11,7 @@ mod table_maintenance;
 
 pub fn all() -> Vec<Box<dyn Scenario>> {
     let mut scenarios = Vec::new();
+    scenarios.extend(backend_membership::scenarios());
     scenarios.extend(query_lifecycle::scenarios());
     scenarios.extend(runtime_filter::scenarios());
     scenarios.extend(runtime_filter::native_trust_directional_scenarios());

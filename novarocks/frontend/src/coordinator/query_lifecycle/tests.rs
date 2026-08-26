@@ -27,10 +27,9 @@ use crate::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
 };
 use crate::native::transport::new_query_lifecycle_transport;
-use crate::query_execution::contract::DistributedQueryIntent;
+use crate::query_execution::contract::{DistributedQueryIntent, PreReadyTopologyOutcome};
 use crate::query_execution::lifecycle_plan::{QueryInitBarrier, QueryInitPlan};
 use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
-use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::lifecycle as protocol_lifecycle;
 use novarocks_proto::lifecycle::{
     AttemptId, FragmentLiveObservation, ParticipantBackendIdentity, ParticipantManifest,
@@ -39,9 +38,9 @@ use novarocks_proto::lifecycle::{
     QueryInitOutcome, QueryInitRequest, QueryOptions, QueryTerminationAck, QueryTerminationReason,
     RuntimeFilterContribution,
 };
+use novarocks_proto::membership::BackendProcessDescriptor;
 use novarocks_proto_models::{common as proto_common, filter, novarocks as proto};
-use novarocks_types::QueryId;
-use novarocks_types::UniqueId;
+use novarocks_types::{BackendProcessId, QueryId, UniqueId};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -375,12 +374,6 @@ fn protocol_fragment_observation(
 /// Production ownership is in `novarocks-backend`; this peer deliberately
 /// avoids adding a Frontend-to-Backend test dependency.
 trait QueryLifecycleIngress: Send + Sync + 'static {
-    #[allow(
-        dead_code,
-        reason = "Retained for generated FE client lifecycle contract coverage."
-    )]
-    fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError>;
-
     fn init_query(
         &self,
         request: protocol_lifecycle::QueryInitRequest,
@@ -882,16 +875,46 @@ fn proto_id(id: UniqueId) -> proto_common::UniqueId {
     }
 }
 
+fn fixture_process_id() -> BackendProcessId {
+    BackendProcessId::new_v7()
+}
+
+fn fixture_descriptor(endpoint: std::net::SocketAddr) -> BackendProcessDescriptor {
+    BackendProcessDescriptor::new(
+        fixture_process_id(),
+        QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port())
+            .expect("fixture backend endpoint"),
+        "test-deployment",
+        "test-build",
+    )
+    .expect("fixture backend descriptor")
+}
+
+fn live_backend(backend_idx: usize, endpoint: std::net::SocketAddr) -> LiveBackendTarget {
+    LiveBackendTarget::new(backend_idx, fixture_descriptor(endpoint))
+}
+
+fn lifecycle_target(backend: &LiveBackendTarget) -> QueryLifecycleTarget {
+    QueryLifecycleTarget::new(
+        backend.backend_idx(),
+        backend.endpoint().expect("validated live backend endpoint"),
+        backend
+            .process_id()
+            .expect("validated live backend process id"),
+    )
+}
+
 fn protocol_backend_from_live(backend: LiveBackendTarget) -> ParticipantBackendIdentity {
-    let endpoint = backend.endpoint();
+    let endpoint = backend.endpoint().expect("validated live backend endpoint");
     ParticipantBackendIdentity::new(
-        backend.backend_idx() as u64,
+        backend
+            .process_id()
+            .expect("validated live backend process id"),
         QueryControlEndpoint::new(
             endpoint.host().to_string(),
-            u16::try_from(endpoint.port()).expect("runtime endpoint port"),
+            endpoint.port().try_into().expect("valid endpoint port"),
         )
         .expect("live backend endpoint"),
-        backend.start_epoch(),
     )
     .expect("live backend identity")
 }
@@ -903,9 +926,8 @@ fn manifest(
 ) -> ParticipantManifest {
     let endpoint = QueryControlEndpoint::new("127.0.0.1", 18_000 + backend_idx as u16)
         .expect("fixture backend endpoint");
-    let backend =
-        ParticipantBackendIdentity::new(backend_idx as u64, endpoint, 90 + backend_idx as u64)
-            .expect("fixture backend identity");
+    let backend = ParticipantBackendIdentity::new(fixture_process_id(), endpoint)
+        .expect("fixture backend identity");
     let (roles, fragments, runtime_filter) = if service_only {
         (
             BTreeSet::from([ParticipantRole::RuntimeFilterService]),
@@ -1808,6 +1830,43 @@ fn frontend_query_lifecycle_business_rejection_is_not_retried() {
 }
 
 #[test]
+fn frontend_query_lifecycle_draining_rejection_preserves_typed_pre_ready_evidence() {
+    let plan = query_init_plan(None);
+    let participant = plan.participant(1).expect("participant one");
+    let backend_idx = participant.backend_idx();
+    let process_id = participant
+        .backend()
+        .process_id()
+        .expect("validated participant process identity");
+    let digest = participant.digest();
+    let execution_id = plan.execution_id();
+    let (transport, _) = RecordingTransport::ready(&plan);
+    transport.state.lock().unwrap().init_results.insert(
+        1,
+        VecDeque::from([Ok(QueryInitAck::new(
+            execution_id,
+            digest,
+            QueryInitOutcome::QueryInitRejectedBackendDraining,
+        ))]),
+    );
+    let (registry, _query) = registry_for(&plan);
+    let barrier = FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, config());
+
+    let error = match barrier.initialize_all(plan) {
+        Ok(_) => panic!("draining backend must reject InitQuery before ControlReady"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.pre_ready_topology_outcome(),
+        Some(PreReadyTopologyOutcome::BackendDraining {
+            backend_idx,
+            process_id,
+        })
+    );
+}
+
+#[test]
 fn frontend_query_lifecycle_manifest_conflict_is_classified() {
     let plan = query_init_plan(None);
     let digest = plan.participant(1).unwrap().digest();
@@ -2003,9 +2062,9 @@ fn frontend_query_lifecycle_epoch_mismatch_is_classified_before_init() {
     registry.replace_live_backends(
         1,
         &[
-            LiveBackendTarget::new(0, RuntimeEndpoint::parse("127.0.0.1:18000").unwrap(), 90),
-            LiveBackendTarget::new(1, RuntimeEndpoint::parse("127.0.0.1:18001").unwrap(), 999),
-            LiveBackendTarget::new(2, RuntimeEndpoint::parse("127.0.0.1:18002").unwrap(), 92),
+            live_backend(0, "127.0.0.1:18000".parse().unwrap()),
+            live_backend(1, "127.0.0.1:18001".parse().unwrap()),
+            live_backend(2, "127.0.0.1:18002".parse().unwrap()),
         ],
     );
     let barrier =
@@ -2479,6 +2538,12 @@ fn frontend_query_lifecycle_query_registry_service_only_backend_loss_aborts_atte
     let query_id = plan.execution_id().query_id();
     let (transport, sessions) = RecordingTransport::ready(&plan);
     let (registry, _query) = registry_for(&plan);
+    let service_only_process_id = plan
+        .participant(2)
+        .expect("service-only participant")
+        .backend()
+        .process_id()
+        .expect("fixture process id");
     let barrier =
         FrontendQueryLifecycleBarrier::new(Arc::new(transport), Arc::clone(&registry), config());
     let lease = barrier
@@ -2486,7 +2551,10 @@ fn frontend_query_lifecycle_query_registry_service_only_backend_loss_aborts_atte
         .expect("all participants ready");
 
     assert_eq!(
-        registry.backend_failed(2, "service-only backend unavailable".to_string()),
+        registry.backend_failed(
+            service_only_process_id,
+            "service-only backend unavailable".to_string(),
+        ),
         vec![query_id]
     );
     for session in sessions.values() {
@@ -2590,9 +2658,8 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
     let ingress = Arc::new(LiveLifecycleIngress::default());
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
 
-    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
-    let backend = LiveBackendTarget::new(7, endpoint.clone(), 77);
-    let request = live_init_request(backend.clone(), 801);
+    let backend = live_backend(7, endpoint);
+    let request = live_init_request(&backend, 801);
     let execution_id = request
         .manifest()
         .expect("live manifest")
@@ -2628,7 +2695,7 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
         .expect("Finalize crosses the same control stream");
     let abort_ack = transport
         .abort_query(
-            QueryLifecycleTarget::new(7, endpoint.clone(), 77),
+            lifecycle_target(&backend),
             protocol_abort_for(execution_id, digest, "idempotent cleanup"),
             Duration::from_secs(2),
         )
@@ -2660,10 +2727,9 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
         ..Default::default()
     });
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress).await;
-    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
-    let backend = LiveBackendTarget::new(7, endpoint.clone(), 88);
-    let target = QueryLifecycleTarget::new(7, endpoint, 88);
-    let request = live_init_request(backend.clone(), 802);
+    let backend = live_backend(7, endpoint);
+    let target = lifecycle_target(&backend);
+    let request = live_init_request(&backend, 802);
     let execution_id = request
         .manifest()
         .expect("manifest")
@@ -2682,7 +2748,7 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
         .expect("InitQuery");
     let session = transport
         .attach_control(
-            target,
+            target.clone(),
             protocol_attach_for(execution_id, digest, 9),
             Duration::from_secs(2),
         )
@@ -2721,10 +2787,9 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
 async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal_is_observed() {
     let ingress = Arc::new(LiveLifecycleIngress::default());
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
-    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
-    let backend = LiveBackendTarget::new(7, endpoint.clone(), 89);
-    let target = QueryLifecycleTarget::new(7, endpoint, 89);
-    let request = live_init_request(backend.clone(), 803);
+    let backend = live_backend(7, endpoint);
+    let target = lifecycle_target(&backend);
+    let request = live_init_request(&backend, 803);
     let execution_id = request
         .manifest()
         .expect("manifest")
@@ -2797,10 +2862,9 @@ async fn frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_c
         ..Default::default()
     });
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
-    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
-    let backend = LiveBackendTarget::new(7, endpoint.clone(), 90);
-    let target = QueryLifecycleTarget::new(7, endpoint, 90);
-    let request = live_init_request(backend.clone(), 804);
+    let backend = live_backend(7, endpoint);
+    let target = lifecycle_target(&backend);
+    let request = live_init_request(&backend, 804);
     let execution_id = request
         .manifest()
         .expect("manifest")
@@ -2889,10 +2953,9 @@ async fn frontend_query_lifecycle_live_transport_rejects_mismatched_terminal_ack
         ..Default::default()
     });
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
-    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
-    let backend = LiveBackendTarget::new(7, endpoint.clone(), 91);
-    let target = QueryLifecycleTarget::new(7, endpoint, 91);
-    let request = live_init_request(backend.clone(), 805);
+    let backend = live_backend(7, endpoint);
+    let target = lifecycle_target(&backend);
+    let request = live_init_request(&backend, 805);
     let execution_id = request
         .manifest()
         .expect("manifest")
@@ -2946,10 +3009,9 @@ async fn frontend_query_lifecycle_live_transport_accepts_finalized_abort_replay_
         ..Default::default()
     });
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
-    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
-    let backend = LiveBackendTarget::new(7, endpoint.clone(), 93);
-    let target = QueryLifecycleTarget::new(7, endpoint, 93);
-    let request = live_init_request(backend.clone(), 807);
+    let backend = live_backend(7, endpoint);
+    let target = lifecycle_target(&backend);
+    let request = live_init_request(&backend, 807);
     let execution_id = request
         .manifest()
         .expect("manifest")
@@ -2968,7 +3030,7 @@ async fn frontend_query_lifecycle_live_transport_accepts_finalized_abort_replay_
         .expect("InitQuery");
     let session = transport
         .attach_control(
-            target,
+            target.clone(),
             protocol_attach_for(execution_id, digest, 14),
             Duration::from_secs(2),
         )
@@ -3017,16 +3079,14 @@ async fn frontend_query_lifecycle_live_transport_accepts_finalized_abort_replay_
 async fn frontend_query_lifecycle_live_transport_pre_submission_timeout_is_definite() {
     let ingress = Arc::new(LiveLifecycleIngress::default());
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress).await;
-    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
-    let backend = LiveBackendTarget::new(7, endpoint.clone(), 92);
-    let target = QueryLifecycleTarget::new(7, endpoint, 92);
-    let request = live_init_request(backend.clone(), 806);
-    let transport =
-        new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
-            .expect("production lifecycle transport");
+    let backend = live_backend(7, endpoint);
+    let target = lifecycle_target(&backend);
+    let request = live_init_request(&backend, 806);
+    let transport = new_query_lifecycle_transport(&[backend], frontend_data_runtime_for_test())
+        .expect("production lifecycle transport");
 
     let error = transport
-        .init_query(target.clone(), request, Duration::ZERO)
+        .init_query(target, request, Duration::ZERO)
         .expect_err("channel acquisition deadline is a definite pre-submission failure");
     assert_eq!(error.kind(), QueryLifecycleTransportErrorKind::Unavailable);
     assert!(!error.is_unknown_init_outcome());
@@ -3039,9 +3099,8 @@ async fn frontend_query_lifecycle_live_transport_pre_submission_timeout_is_defin
 async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unknown() {
     let ingress = Arc::new(LiveLifecycleIngress::default());
     let (endpoint, shutdown_tx, server) = spawn_frontend_live_server(ingress.clone()).await;
-    let endpoint = RuntimeEndpoint::from_socket_addr(endpoint);
-    let backend = LiveBackendTarget::new(7, endpoint.clone(), 93);
-    let target = QueryLifecycleTarget::new(7, endpoint, 93);
+    let backend = live_backend(7, endpoint);
+    let target = lifecycle_target(&backend);
     let transport =
         new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
             .expect("production lifecycle transport");
@@ -3049,7 +3108,7 @@ async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unkn
     transport
         .init_query(
             target.clone(),
-            live_init_request(backend.clone(), 807),
+            live_init_request(&backend, 807),
             Duration::from_secs(2),
         )
         .expect("warm the channel before the delayed request");
@@ -3057,7 +3116,7 @@ async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unkn
     let error = transport
         .init_query(
             target,
-            live_init_request(backend, 808),
+            live_init_request(&backend, 808),
             Duration::from_millis(20),
         )
         .expect_err("submitted InitQuery must time out while the server is handling it");
@@ -3073,7 +3132,7 @@ async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unkn
 }
 
 fn live_init_request(
-    backend: LiveBackendTarget,
+    backend: &LiveBackendTarget,
     finst_high: i64,
 ) -> protocol_lifecycle::QueryInitRequest {
     let execution_id = query_execution_id();
@@ -3130,6 +3189,13 @@ impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
 {
     type ExchangeStream = EmptyExchangeStream;
     type QueryControlStreamStream = LifecycleResponseStream;
+
+    async fn announce_backend(
+        &self,
+        _request: Request<proto::AnnounceBackendRequest>,
+    ) -> Result<Response<proto::AnnounceBackendResponse>, Status> {
+        Err(Self::rejected("AnnounceBackend"))
+    }
 
     async fn exchange(
         &self,
@@ -3356,10 +3422,6 @@ impl LiveLifecycleIngress {
 }
 
 impl QueryLifecycleIngress for LiveLifecycleIngress {
-    fn bind_backend_identity(&self, _backend_id: u64) -> Result<(), QueryLifecycleError> {
-        Ok(())
-    }
-
     fn init_query(
         &self,
         request: protocol_lifecycle::QueryInitRequest,

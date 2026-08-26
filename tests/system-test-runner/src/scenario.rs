@@ -28,7 +28,6 @@ pub struct ScenarioLaunchConfig {
     pub child_environment: CrossProcessChildEnvironment,
     pub config_overlay: CrossProcessConfigOverlay,
     pub native_trust_fixture: NativeTrustFixture,
-    pub initial_backend_seeds: Option<Vec<usize>>,
 }
 
 pub struct ScenarioContext {

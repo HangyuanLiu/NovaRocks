@@ -796,7 +796,6 @@ mod tests {
     fn frontend_backend_open_config() -> ClusterBackendOpenConfig {
         ClusterBackendOpenConfig::new(
             novarocks_types::ClusterRole::Fe,
-            Vec::new(),
             Duration::from_secs(1),
             3,
             Duration::from_secs(1),
