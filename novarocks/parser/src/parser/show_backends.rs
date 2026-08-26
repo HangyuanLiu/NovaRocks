@@ -28,8 +28,8 @@ pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<State
     if !parser.current_is_word("SHOW") {
         return Ok(None);
     }
-    if !parser.peek_word(1, "BACKENDS") {
-        if [
+    if !parser.peek_word(1, "BACKENDS")
+        && [
             "ANALYZE",
             "TABLE",
             "CREATE",
@@ -40,9 +40,8 @@ pub(super) fn parse(parser: &mut StatementParser<'_, '_>) -> Result<Option<State
         ]
         .iter()
         .any(|word| parser.peek_word(1, word))
-        {
-            return Ok(None);
-        }
+    {
+        return Ok(None);
     }
     let start = parser.current_span().start();
     parser.advance(); // SHOW
