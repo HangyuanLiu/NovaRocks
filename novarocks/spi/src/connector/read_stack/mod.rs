@@ -39,7 +39,9 @@ pub mod split_source;
 pub mod system_table;
 pub mod value;
 
-pub use dynamic_filter::{CompleteAllDynamicFilter, DynamicFilter, DynamicFilterSnapshot};
+pub use dynamic_filter::{
+    BoundsMatch, ColumnValueBounds, CompleteAllDynamicFilter, DynamicFilter, DynamicFilterSnapshot,
+};
 pub use handle::{
     ColumnHandle, ConnectorMergeTableHandle, ConnectorTableExecuteHandle,
     ConnectorTableFunctionHandle, ConnectorTableHandle, ConnectorTransactionHandle,

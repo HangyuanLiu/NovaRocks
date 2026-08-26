@@ -25,6 +25,34 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 
 use super::predicate::TupleDomain;
+use super::value::ConnectorValue;
+
+/// What one column's statistics say about a row group, page, or file.
+///
+/// Every field is optional because a writer may omit any of them, and the
+/// consumer has to stay correct when it does.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ColumnValueBounds {
+    pub min: Option<ConnectorValue>,
+    pub max: Option<ConnectorValue>,
+    pub null_count: Option<u64>,
+    pub value_count: Option<u64>,
+    /// Whether the min/max are known to be exact and comparable. A deprecated
+    /// or unknown-sort-order statistic must set this to false.
+    pub bounds_are_exact: bool,
+}
+
+/// The answer to "can anything in these bounds satisfy the filter".
+///
+/// `Unknown` is the safe answer and the default: a filter that cannot decide
+/// must never cause a prune, because a wrong prune silently returns fewer rows
+/// while a wrong keep only costs work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundsMatch {
+    Possible,
+    Impossible,
+    Unknown,
+}
 
 /// An immutable observation of a dynamic filter at one instant.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,6 +109,23 @@ pub trait DynamicFilter<C: Ord + Clone + Debug>: Send + Sync {
     fn snapshot(&self) -> DynamicFilterSnapshot<C> {
         DynamicFilterSnapshot::new(self.current_predicate(), self.is_complete())
     }
+
+    /// Ask whether any value within these bounds could satisfy the filter.
+    ///
+    /// This exists because a runtime filter is not always an enumerable set.
+    /// NovaRocks' runtime-filter artifact is a predicate oracle that can answer
+    /// this question exactly but cannot produce the values behind it, so a
+    /// filter that reported only [`Self::current_predicate`] would have to
+    /// widen every column to "all" and could never prune. Asking the question
+    /// directly keeps the pruning capability without turning the artifact into
+    /// an enumerable domain.
+    ///
+    /// The default never prunes, which is what an unconstrained filter should
+    /// do.
+    fn bounds_may_match(&self, column: &C, bounds: &ColumnValueBounds) -> BoundsMatch {
+        let _ = (column, bounds);
+        BoundsMatch::Unknown
+    }
 }
 
 /// The truthful filter used where no runtime feedback is produced.
@@ -119,6 +164,15 @@ impl<C: Ord + Clone + Debug + Send + Sync> DynamicFilter<C> for CompleteAllDynam
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_filter_that_cannot_decide_never_prunes() {
+        let filter = CompleteAllDynamicFilter::new(BTreeSet::from([1_u32]));
+        assert_eq!(
+            filter.bounds_may_match(&1, &ColumnValueBounds::default()),
+            BoundsMatch::Unknown
+        );
+    }
 
     #[test]
     fn the_no_feedback_filter_is_truthful_and_never_awaitable() {
