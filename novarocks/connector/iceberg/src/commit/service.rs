@@ -121,6 +121,16 @@ impl RecoveryEvidence {
     }
 }
 
+/// Marker a commit producer stamps into its message when it can prove the
+/// publication did not happen.
+///
+/// This exists because the classifier below is a substring matcher, and a
+/// failure it cannot recognise is reported as an unknown publication -- correct
+/// as a default, but wrong for a local precondition check that never reached the
+/// catalog. Rather than teach the matcher yet another wording, the code that
+/// knows the answer says so.
+pub const PROVEN_UNCOMMITTED_MARKER: &str = "[proven-uncommitted]";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommitServiceError {
     KnownUncommitted {
@@ -239,6 +249,14 @@ pub fn classify_commit_error(error: &str) -> CommitFailureKind {
         return CommitFailureKind::FinalizeFailedKnownCommitted;
     }
 
+    // Producer-asserted verdict. Unlike every other entry below, this one is not
+    // a guess at how a catalog words its rejection: it is set by the code that
+    // knows the request was never dispatched, or that the catalog definitively
+    // refused it. The rest of the list remains what it was -- pattern matching on
+    // wording -- and anything unmatched stays Unknown, which is the safe answer.
+    if lower.contains(PROVEN_UNCOMMITTED_MARKER) {
+        return CommitFailureKind::KnownUncommitted;
+    }
     let definite_signals = [
         "conflict",
         "assertrefsnapshotid",
