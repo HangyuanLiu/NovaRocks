@@ -441,8 +441,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             }
         }
         let catalog = Arc::clone(self.runtime.catalog());
-        ensure_hadoop_registration(&self.runtime, &table)
-            .map_err(connector_error_as_pre_dispatch)?;
+        anchor_committed_write(&self.runtime, &table).map_err(connector_error_as_pre_dispatch)?;
         let marker_value = canonical_json(marker, "Iceberg data mutation marker")
             .map_err(connector_error_as_pre_dispatch)?;
         let snapshot_properties = BTreeMap::from([(
@@ -1136,30 +1135,52 @@ fn build_abort_cleanup(
     Ok((fs, Some(mapper)))
 }
 
-fn ensure_hadoop_registration(
+/// Make a committed write reachable through this generation's catalog.
+///
+/// This used to be `ensure_hadoop_registration`, and it decided what to do by
+/// asking `uses_remote_catalog()` — a catalog-kind branch living outside the
+/// factory, in the DML publication path. The catalog answers now: one that owns
+/// its metadata pointer no-ops, and a filesystem catalog anchors.
+///
+/// It also created the namespace with `let _ =`, so a namespace that failed to
+/// appear surfaced later as a confusing registration failure rather than as the
+/// thing that actually went wrong. That error is no longer swallowed.
+fn anchor_committed_write(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
 ) -> Result<(), ConnectorError> {
-    if runtime.control_state().uses_remote_catalog() {
-        return Ok(());
-    }
-    let namespace = table.identifier().namespace().clone();
-    let ident = table.identifier().clone();
     let metadata_location = table
         .metadata_location()
         .ok_or_else(|| corrupt("Iceberg table has no metadata location"))?
         .to_string();
-    let catalog = Arc::clone(runtime.catalog());
-    runtime
+    let ident = table.identifier();
+    let name = crate::catalog::CatalogTableName::new(
+        ident.namespace().to_url_string(),
+        ident.name().to_string(),
+    );
+    let catalog = Arc::clone(runtime.novarocks_catalog());
+    let outcome = runtime
         .resources()
         .catalog_runtime()
         .block_on(async move {
-            let _ = catalog.create_namespace(&namespace, HashMap::new()).await;
-            catalog.register_table(&ident, metadata_location).await
+            catalog
+                .anchor_written_metadata(name, Arc::from(metadata_location))
+                .await
         })
-        .map_err(|error| internal(format!("Iceberg registration runtime: {error}")))?
-        .map(|_| ())
-        .map_err(|error| map_provider_error(error.to_string()))
+        .map_err(|error| internal(format!("Iceberg catalog runtime bridge: {error}")))?;
+    match outcome {
+        crate::catalog::error::CatalogOutcome::KnownCommitted { .. } => Ok(()),
+        crate::catalog::error::CatalogOutcome::Unsupported(reason) => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            reason.message().to_string(),
+        )),
+        crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
+            Err(map_provider_error(failure.to_string()))
+        }
+        crate::catalog::error::CatalogOutcome::CommitUnknown { failure, .. } => Err(
+            ConnectorError::new(ConnectorErrorKind::Unavailable, failure.to_string()),
+        ),
+    }
 }
 
 fn target_snapshot_id(

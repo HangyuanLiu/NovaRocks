@@ -169,6 +169,19 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         self.delegate.register_table(table, metadata_location).await
     }
 
+    async fn anchor_written_metadata(
+        &self,
+        table: CatalogTableName,
+        _metadata_location: Arc<str>,
+    ) -> CatalogOutcome<CatalogTableName> {
+        // This catalog owns its own metadata pointer, so a committed write is
+        // already reachable through it.
+        CatalogOutcome::committed(
+            table,
+            novarocks_spi::connector::ExternalMutationEffect::NoOp,
+        )
+    }
+
     async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
         super::start_update_table_transaction(&self.delegate, request)
     }

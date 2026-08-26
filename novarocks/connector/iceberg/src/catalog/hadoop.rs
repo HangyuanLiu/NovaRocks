@@ -164,6 +164,43 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         self.delegate.register_table(table, metadata_location).await
     }
 
+    async fn anchor_written_metadata(
+        &self,
+        table: CatalogTableName,
+        metadata_location: Arc<str>,
+    ) -> CatalogOutcome<CatalogTableName> {
+        // The namespace has to exist before the table can be anchored under it.
+        // The previous helper created it with `let _ =`, so a namespace that
+        // failed to appear surfaced later as a confusing registration failure
+        // instead of the thing that actually went wrong.
+        let namespace = CatalogNamespaceName::new(Arc::clone(&table.namespace));
+        match self.delegate.namespace_exists(&namespace).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let created = self.delegate.create_namespace(namespace).await;
+                if !matches!(created, CatalogOutcome::KnownCommitted { .. }) {
+                    return match created {
+                        CatalogOutcome::KnownCommitted { .. } => unreachable!(),
+                        CatalogOutcome::Unsupported(reason) => CatalogOutcome::Unsupported(reason),
+                        CatalogOutcome::KnownUncommitted { failure } => {
+                            CatalogOutcome::KnownUncommitted { failure }
+                        }
+                        CatalogOutcome::CommitUnknown { failure, evidence } => {
+                            CatalogOutcome::CommitUnknown { failure, evidence }
+                        }
+                    };
+                }
+            }
+            Err(error) => {
+                return CatalogOutcome::uncommitted(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                    error.to_string(),
+                );
+            }
+        }
+        self.delegate.register_table(table, metadata_location).await
+    }
+
     async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
         super::start_update_table_transaction(&self.delegate, request)
     }

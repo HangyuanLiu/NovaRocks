@@ -154,6 +154,11 @@ impl IcebergCatalogControlState {
         self.configuration.object_store_config.is_some()
     }
 
+    /// Whether this configuration names a remote catalog.
+    ///
+    /// Diagnostics only. This is a catalog-kind branch, and no operation may
+    /// decide behavior from it: ask the catalog owner instead, which is the
+    /// one place that knows what a specific request can do.
     pub fn uses_remote_catalog(&self) -> bool {
         matches!(
             self.configuration.kind,

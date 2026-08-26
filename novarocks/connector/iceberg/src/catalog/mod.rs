@@ -288,10 +288,23 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt>;
 
     /// Anchor an already-written metadata file into the catalog.
-    ///
-    /// Only the Hadoop implementation needs this today; catalogs that track
-    /// metadata locations themselves answer `Unsupported`.
     async fn register_table(
+        &self,
+        table: CatalogTableName,
+        metadata_location: Arc<str>,
+    ) -> CatalogOutcome<CatalogTableName>;
+
+    /// Make a write's freshly published metadata reachable through this
+    /// catalog.
+    ///
+    /// Catalogs that track metadata locations themselves have nothing to do and
+    /// answer with a no-op. A filesystem catalog, whose entry *is* the metadata
+    /// pointer, has to anchor it.
+    ///
+    /// This exists so the write path stops asking "is this a remote catalog?".
+    /// That question was answered outside the factory, by a helper that also
+    /// swallowed the errors from the namespace it created along the way.
+    async fn anchor_written_metadata(
         &self,
         table: CatalogTableName,
         metadata_location: Arc<str>,

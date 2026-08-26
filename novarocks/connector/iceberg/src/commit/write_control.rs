@@ -1391,13 +1391,23 @@ impl IcebergWriteControl {
                 .transpose()
                 .map_err(CommitServiceError::invalid_input)?,
         };
+        // The bridge wraps the commit, so a bridge failure -- a thread that
+        // could not spawn, or one that panicked while polling -- says nothing
+        // about whether the catalog request went out. Calling it
+        // known_uncommitted, as this once did, hands the caller a definite
+        // "nothing was published" without proof, and that verdict authorizes
+        // abort cleanup of files a committed snapshot may already reference.
+        let bridge_evidence = super::service::RecoveryEvidence::from_collector(&input.collector);
         let result = self
             .runtime
             .resources()
             .catalog_runtime()
             .block_on(async move { run_iceberg_commit(input).await })
             .map_err(|error| {
-                CommitServiceError::known_uncommitted(error, super::CleanupAttempt::not_attempted())
+                CommitServiceError::unknown(
+                    format!("Iceberg commit runtime bridge: {error}"),
+                    bridge_evidence,
+                )
             })??;
         let resulting_row_count = if matches!(
             active.activation_intent,
