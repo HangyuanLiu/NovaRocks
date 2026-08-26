@@ -252,11 +252,24 @@ fn validate_context(
     Ok(())
 }
 
+/// Run the operations whose result is an effect and nothing more.
+///
+/// Creating a table is deliberately not one of them, and the arm below says so
+/// rather than offering a weaker second create. A create publishes through a
+/// transaction and reports a three-state outcome carrying a receipt, which this
+/// return type cannot express; `execute_create_table` handles it before this is
+/// ever reached. Keeping a create path here is what let `IF NOT EXISTS` quietly
+/// diverge once, and one create path is the point of the owner.
 fn execute_operation(
     provider: &IcebergMetadata,
     operation: &ConnectorCatalogMutationOperation,
 ) -> Result<ExternalMutationEffect, ConnectorError> {
     match operation {
+        ConnectorCatalogMutationOperation::CreateTable { .. } => Err(ConnectorError::new(
+            ConnectorErrorKind::Internal,
+            "Iceberg CREATE TABLE is published through the create-table transaction, \
+             so it must not reach the effect-only mutation path",
+        )),
         ConnectorCatalogMutationOperation::CreateNamespace { namespace, policy } => {
             ensure_owner(provider, &namespace.instance_id)?;
             let exists = provider
@@ -307,22 +320,6 @@ fn execute_operation(
                 .map_err(map_iceberg)?;
             Ok(ExternalMutationEffect::Applied)
         }
-        ConnectorCatalogMutationOperation::CreateTable {
-            table,
-            columns,
-            key,
-            partitioning,
-            properties,
-            policy,
-        } => create_table(
-            provider,
-            table,
-            columns,
-            key.as_ref(),
-            partitioning,
-            properties,
-            *policy,
-        ),
         ConnectorCatalogMutationOperation::DropTable {
             table,
             policy,
@@ -464,51 +461,6 @@ fn view_properties(
     Ok(validated.into_iter().collect())
 }
 
-fn create_table(
-    provider: &IcebergMetadata,
-    table: &ConnectorTableIdentity,
-    columns: &[ConnectorColumnDefinition],
-    key: Option<&ConnectorTableKey>,
-    partitioning: &[ConnectorPartitionTransform],
-    properties: &[(Arc<str>, Arc<str>)],
-    policy: CreatePolicy,
-) -> Result<ExternalMutationEffect, ConnectorError> {
-    ensure_owner(provider, &table.instance_id)?;
-    if provider
-        .runtime()
-        .table_exists(&table.namespace, &table.table)
-        .map_err(unavailable)?
-    {
-        return if policy == CreatePolicy::NoOpIfExists {
-            Ok(ExternalMutationEffect::NoOp)
-        } else {
-            Err(already_exists("Iceberg table already exists"))
-        };
-    }
-    if !provider
-        .runtime()
-        .namespace_exists(&table.namespace)
-        .map_err(unavailable)?
-    {
-        return Err(not_found("Iceberg table namespace does not exist"));
-    }
-    let (namespace, creation) =
-        prepare_table_creation(table, columns, key, partitioning, properties)?;
-    let catalog = provider.runtime().novarocks_catalog().vendored_client();
-    provider
-        .runtime()
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { catalog.create_table(&namespace, creation).await })
-        .map_err(unavailable)?
-        .map_err(map_iceberg)?;
-    provider
-        .runtime()
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(ExternalMutationEffect::Applied)
-}
-
 /// Build the neutral request's table definition.
 ///
 /// It no longer takes the provider: the one thing it used it for was asking
@@ -575,6 +527,34 @@ fn execute_create_table(
     policy: CreatePolicy,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
     ensure_owner(provider, &table.instance_id)?;
+    // An existing target is settled here, before anything is dispatched.
+    // `CreatePolicy` is the caller's statement about what an existing table
+    // means -- `IF NOT EXISTS` makes it a no-op, a plain create makes it a
+    // conflict -- and the transaction constructor has no way to know which was
+    // asked for. Answering it first is also what keeps the answer exact: a
+    // catalog that reports an already-existing table as a dispatch failure
+    // would otherwise only be able to say the create did not happen, not why.
+    if provider
+        .runtime()
+        .table_exists(&table.namespace, &table.table)
+        .map_err(unavailable)?
+    {
+        return match policy {
+            CreatePolicy::NoOpIfExists => Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                receipt: receipt(provider, request.operation_id, request.operation.kind())?,
+                finalization: ExternalMutationFinalization::Complete,
+            }),
+            // Stated directly rather than through a ConnectorError, which has
+            // no already-exists kind and would flatten this to InvalidRequest.
+            _ => Ok(ExternalMutationOutcome::KnownUncommitted {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::AlreadyExists,
+                    "Iceberg table already exists",
+                ),
+            }),
+        };
+    }
     if !provider
         .runtime()
         .namespace_exists(&table.namespace)
@@ -3364,7 +3344,7 @@ mod tests {
             namespace: "guarded".into(),
             table: "orders".into(),
         };
-        create_table(
+        create_table_fixture(
             provider,
             &table,
             &[ConnectorColumnDefinition {
@@ -3419,6 +3399,57 @@ mod tests {
             .block_on(async move { catalog.create_namespace(&namespace, HashMap::new()).await })
             .expect("namespace runtime")
             .expect("create namespace");
+    }
+
+    /// Create a table for a fixture through the production create path.
+    ///
+    /// It deliberately does not reimplement the create. A second create path
+    /// existing at all is what let `CREATE TABLE IF NOT EXISTS` lose its no-op
+    /// once, so fixtures go through the same transaction production does.
+    fn create_table_fixture(
+        provider: &IcebergMetadata,
+        table: &ConnectorTableIdentity,
+        columns: &[ConnectorColumnDefinition],
+        key: Option<&ConnectorTableKey>,
+        partitioning: &[ConnectorPartitionTransform],
+        properties: &[(Arc<str>, Arc<str>)],
+        policy: CreatePolicy,
+    ) -> Result<ExternalMutationEffect, ConnectorError> {
+        let request = ConnectorCatalogMutationRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            target: ConnectorExecutionBindingKey {
+                instance_id: provider.descriptor().instance_id.clone(),
+                incarnation: provider.incarnation(),
+            },
+            operation: ConnectorCatalogMutationOperation::CreateTable {
+                table: table.clone(),
+                columns: columns.to_vec(),
+                key: key.cloned(),
+                partitioning: partitioning.to_vec(),
+                properties: properties.to_vec(),
+                policy,
+            },
+            context: context(),
+        };
+        match execute_create_table(
+            provider,
+            &request,
+            table,
+            columns,
+            key,
+            partitioning,
+            properties,
+            policy,
+        )? {
+            ExternalMutationOutcome::KnownCommitted { effect, .. } => Ok(effect),
+            ExternalMutationOutcome::KnownUncommitted { failure } => {
+                Err(map_mutation_failure(&failure))
+            }
+            ExternalMutationOutcome::CommitUnknown { failure, .. } => Err(ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                failure.to_string(),
+            )),
+        }
     }
 
     fn create_request(
@@ -3701,7 +3732,7 @@ mod tests {
             ConnectorDropTableDataDisposition::Purge,
         )
         .expect("drop captured Iceberg table");
-        create_table(
+        create_table_fixture(
             &provider,
             &table,
             &[ConnectorColumnDefinition {

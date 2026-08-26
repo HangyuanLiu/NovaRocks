@@ -18,6 +18,18 @@
   durable CTAS saga never classifies REST dispatch certainty from strings or
   the generic `Unexpected` error kind.
 
+- Gave `Catalog::create_table` and `Catalog::load_table` the error kinds their
+  status codes prove, instead of the generic `Unexpected`. Upstream 0.9.0 maps
+  create's 409 and 404 and load's 404 to `Unexpected`, while `register_table`
+  in the same file already maps the identical statuses to `TableAlreadyExists`
+  and `NamespaceNotFound` -- so this is an internal inconsistency, not a
+  deliberate upstream choice. It matters because a *received* 409 proves the
+  create did not happen and a received 404 proves the table is absent: with
+  `Unexpected`, a definitively refused create is reported as dispatch-unknown,
+  and adjudication can never prove absence, so it can never settle a lost
+  response. Now `create_table` returns `TableAlreadyExists` / `NamespaceNotFound`
+  and `load_table` returns `TableNotFound`.
+
 ## Validation
 
 This extracted crate's manifest resolves `iceberg = "0.9.0"` from crates.io
