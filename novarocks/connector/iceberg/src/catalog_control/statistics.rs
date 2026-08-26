@@ -532,7 +532,7 @@ impl StatisticsCollection for IcebergMetadata {
             );
         };
         let table_for_commit = physical.table.clone();
-        let catalog = Arc::clone(self.runtime().catalog());
+        let catalog = self.runtime().novarocks_catalog().vendored_client();
         let committed = self
             .runtime()
             .resources()

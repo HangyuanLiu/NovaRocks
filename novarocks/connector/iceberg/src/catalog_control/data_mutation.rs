@@ -440,7 +440,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 );
             }
         }
-        let catalog = Arc::clone(self.runtime.catalog());
+        let catalog = self.runtime.novarocks_catalog().vendored_client();
         anchor_committed_write(&self.runtime, &table).map_err(connector_error_as_pre_dispatch)?;
         let marker_value = canonical_json(marker, "Iceberg data mutation marker")
             .map_err(connector_error_as_pre_dispatch)?;
@@ -1497,7 +1497,7 @@ mod tests {
             )
             .expect("control runtime"),
         );
-        let catalog = Arc::clone(runtime.catalog());
+        let catalog = runtime.novarocks_catalog().vendored_client();
         executor.block_on(async move {
             let namespace = NamespaceIdent::new("db".to_string());
             catalog

@@ -271,7 +271,7 @@ fn execute_operation(
             }
             let namespace =
                 NamespaceIdent::new(normalize_identifier(&namespace.namespace).map_err(invalid)?);
-            let catalog = provider.runtime().catalog().clone();
+            let catalog = provider.runtime().novarocks_catalog().vendored_client();
             provider
                 .runtime()
                 .resources()
@@ -296,7 +296,7 @@ fn execute_operation(
             }
             let namespace =
                 NamespaceIdent::new(normalize_identifier(&namespace.namespace).map_err(invalid)?);
-            let catalog = provider.runtime().catalog().clone();
+            let catalog = provider.runtime().novarocks_catalog().vendored_client();
             provider
                 .runtime()
                 .resources()
@@ -419,7 +419,7 @@ fn execute_operation(
                 &table.table,
                 provider.descriptor().instance_id.as_str(),
             )?;
-            let catalog = provider.runtime().catalog().clone();
+            let catalog = provider.runtime().novarocks_catalog().vendored_client();
             let outcome = provider
                 .runtime()
                 .resources()
@@ -493,7 +493,7 @@ fn create_table(
     }
     let (namespace, creation) =
         prepare_table_creation(provider, table, columns, key, partitioning, properties)?;
-    let catalog = provider.runtime().catalog().clone();
+    let catalog = provider.runtime().novarocks_catalog().vendored_client();
     provider
         .runtime()
         .resources()
@@ -1696,7 +1696,7 @@ fn update_table(
     commit: TableCommit,
     action: &str,
 ) -> Result<crate::iceberg::table::Table, ConnectorError> {
-    let catalog = runtime.catalog().clone();
+    let catalog = runtime.novarocks_catalog().vendored_client();
     runtime
         .resources()
         .catalog_runtime()
@@ -1788,7 +1788,7 @@ fn execute_bootstrap(
     )?;
     validate_context(&request.context)?;
     let ident = table_ident(table).map_err(invalid)?;
-    let catalog = provider.runtime().catalog().clone();
+    let catalog = provider.runtime().novarocks_catalog().vendored_client();
     let committed = provider
         .runtime()
         .resources()
@@ -1956,7 +1956,7 @@ fn execute_metadata_only_mv_stage(
     let snapshot_properties = provenance.to_summary_properties().map_err(invalid)?;
     validate_context(&request.context)?;
     let ident = table_ident(table).map_err(invalid)?;
-    let catalog = provider.runtime().catalog().clone();
+    let catalog = provider.runtime().novarocks_catalog().vendored_client();
     let branch = staging_branch.to_string();
     let committed = provider
         .runtime()
@@ -2167,7 +2167,7 @@ fn execute_guarded_properties(
         ])
         .updates(updates)
         .build();
-    let catalog = provider.runtime().catalog().clone();
+    let catalog = provider.runtime().novarocks_catalog().vendored_client();
     let committed = provider
         .runtime()
         .resources()
@@ -2315,7 +2315,7 @@ fn execute_guarded_publication(
         marker,
     };
     validate_context(&request.context)?;
-    let catalog = provider.runtime().catalog().clone();
+    let catalog = provider.runtime().novarocks_catalog().vendored_client();
     let result = provider
         .runtime()
         .resources()
@@ -3322,7 +3322,7 @@ mod tests {
 
     fn guarded_table(provider: &IcebergMetadata) -> ConnectorTableIdentity {
         let namespace = NamespaceIdent::new("guarded".to_string());
-        let catalog = provider.runtime().catalog().clone();
+        let catalog = provider.runtime().novarocks_catalog().vendored_client();
         provider
             .runtime()
             .resources()
@@ -3382,7 +3382,7 @@ mod tests {
 
     fn create_namespace(provider: &IcebergMetadata, name: &str) {
         let namespace = NamespaceIdent::new(name.to_string());
-        let catalog = provider.runtime().catalog().clone();
+        let catalog = provider.runtime().novarocks_catalog().vendored_client();
         provider
             .runtime()
             .resources()

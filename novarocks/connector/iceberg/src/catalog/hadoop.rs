@@ -333,7 +333,52 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     ) -> CatalogTransactionStart {
         match request.intent {
             CatalogCreateIntent::EmptyTable => {
-                super::start_create_table_transaction(&self.delegate, request)
+                // This catalog's create is a conditional metadata write, not a
+                // catalog call, so the transaction is built around that
+                // primitive rather than around `create_table`.
+                let target = request.target.clone();
+                let namespace = CatalogNamespaceName::new(Arc::clone(&target.namespace));
+                let prepared = self
+                    .prepare_conditional_create(super::ConditionalCreateRequest {
+                        namespace,
+                        creation: request.creation,
+                        operation_id: Arc::from(request.identity.hex()),
+                    })
+                    .await;
+                let Some((attempt, _effect, _witness)) = prepared.into_known_committed() else {
+                    // Preparation sends nothing, so a failure here is proven
+                    // uncommitted; report it without inventing a transaction.
+                    return CatalogTransactionStart::KnownUncommitted {
+                        failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                            novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
+                            "conditional create could not be prepared",
+                        ),
+                    };
+                };
+                let evidence = super::ConditionalCreateEvidence {
+                    namespace: Arc::clone(&target.namespace),
+                    table: Arc::clone(&target.name),
+                    expected_table_uuid: Arc::clone(&attempt.facts.table_uuid),
+                    metadata_location: Arc::clone(&attempt.facts.metadata_location),
+                    metadata_digest: Arc::clone(&attempt.facts.metadata_digest),
+                };
+                let commit_evidence =
+                    super::error::CatalogCommitEvidence::for_target(target.canonical())
+                        .with_target_uuid(Arc::clone(&attempt.facts.table_uuid))
+                        .with_metadata_location(Arc::clone(&attempt.facts.metadata_location));
+                CatalogTransactionStart::Ready(Box::new(super::transaction::Transaction::new(
+                    request.identity,
+                    target,
+                    super::transaction::TransactionShape::Create(request.intent),
+                    commit_evidence,
+                    Arc::new(super::dispatch::ConditionalCreateDispatch::new(
+                        Arc::clone(&self.client),
+                        attempt
+                            .into_hadoop()
+                            .expect("this catalog prepared the attempt"),
+                        evidence,
+                    )),
+                )))
             }
             CatalogCreateIntent::CreateTableAsSelect => match self.admit_create(request.intent) {
                 Ok(()) => super::start_create_table_transaction(&self.delegate, request),

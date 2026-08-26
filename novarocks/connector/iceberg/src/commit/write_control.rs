@@ -1364,7 +1364,7 @@ impl IcebergWriteControl {
                 .map(|file| file.operator_relative_path().to_string())
                 .unwrap_or_else(|_| path.to_string())
         }) as super::CleanupPathMapper);
-        let catalog = Arc::clone(self.runtime.catalog());
+        let catalog = self.runtime.novarocks_catalog().vendored_client();
         let input = RunInput {
             collector,
             catalog,
@@ -2316,7 +2316,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
             unknown.active.target.table.as_str(),
         ])
         .map_err(|error| invalid(format!("build Iceberg table identity: {error}")))?;
-        let catalog = Arc::clone(self.runtime.catalog());
+        let catalog = self.runtime.novarocks_catalog().vendored_client();
         let table = self
             .runtime
             .resources()
@@ -3259,7 +3259,7 @@ fn table_snapshot_row_count(
     let ident =
         crate::iceberg::TableIdent::from_strs([target.namespace.as_str(), target.table.as_str()])
             .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?;
-    let catalog = Arc::clone(runtime.catalog());
+    let catalog = runtime.novarocks_catalog().vendored_client();
     let table = runtime
         .resources()
         .catalog_runtime()
@@ -3817,7 +3817,7 @@ mod tests {
             ConnectorInstanceIncarnation::from_bytes([7; 16]),
             Arc::clone(&runtime),
         );
-        let catalog = Arc::clone(runtime.catalog());
+        let catalog = runtime.novarocks_catalog().vendored_client();
         let table = executor.block_on(async move {
             let namespace = NamespaceIdent::new("db".to_string());
             catalog

@@ -383,7 +383,7 @@ impl IcebergMetadataMaintenanceAdapter {
         self.runtime
             .control_state()
             .invalidate_table_cache(&payload.namespace, &payload.table);
-        let catalog = Arc::clone(self.runtime.catalog());
+        let catalog = self.runtime.novarocks_catalog().vendored_client();
         let loaded = self
             .runtime
             .load_table(&payload.namespace, &payload.table)

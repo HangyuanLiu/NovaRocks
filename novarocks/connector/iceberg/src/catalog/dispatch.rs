@@ -222,3 +222,130 @@ impl CatalogCommitDispatch for CreateTableDispatch {
         }
     }
 }
+
+/// Publishes a prepared conditional create with exactly one storage request.
+///
+/// The attempt is consumed on first dispatch, so a second commit cannot resend
+/// it even if the transaction's own guard were bypassed.
+#[derive(Debug)]
+pub(super) struct ConditionalCreateDispatch {
+    /// The filesystem client that owns the conditional-create primitive. It
+    /// stays inside this module, which is the whole point of the boundary.
+    client: Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>,
+    attempt: std::sync::Mutex<Option<crate::hadoop_catalog::HadoopCreateAttempt>>,
+    evidence: super::ConditionalCreateEvidence,
+}
+
+impl ConditionalCreateDispatch {
+    pub(super) fn new(
+        client: Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>,
+        attempt: crate::hadoop_catalog::HadoopCreateAttempt,
+        evidence: super::ConditionalCreateEvidence,
+    ) -> Self {
+        Self {
+            client,
+            attempt: std::sync::Mutex::new(Some(attempt)),
+            evidence,
+        }
+    }
+}
+
+#[async_trait]
+impl CatalogCommitDispatch for ConditionalCreateDispatch {
+    async fn dispatch_once(
+        &self,
+        _staged: StagedCommit,
+    ) -> Result<CommitProof, crate::iceberg::Error> {
+        let attempt = self
+            .attempt
+            .lock()
+            .map_err(|_| {
+                crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::Unexpected,
+                    "conditional-create dispatch state was poisoned",
+                )
+            })?
+            .take()
+            .ok_or_else(|| {
+                crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::Unexpected,
+                    "conditional-create dispatch was already consumed",
+                )
+            })?;
+        match self.client.publish_create_attempt(attempt).await {
+            Ok(result) => Ok(CommitProof {
+                snapshot_id: None,
+                table_uuid: Some(Arc::from(result.authoritative_table_uuid)),
+                effect: match result.disposition {
+                    crate::hadoop_catalog::HadoopCreateDisposition::Created => {
+                        novarocks_spi::connector::ExternalMutationEffect::Applied
+                    }
+                    crate::hadoop_catalog::HadoopCreateDisposition::Existing => {
+                        novarocks_spi::connector::ExternalMutationEffect::NoOp
+                    }
+                },
+            }),
+            // Map onto kinds `proves_uncommitted` recognises so the
+            // transaction's own classification keeps each verdict: only
+            // `Unknown` may leave the outcome unknown.
+            Err(failure) => Err(match failure.kind {
+                crate::hadoop_catalog::HadoopCreateFailureKind::Unsupported => {
+                    crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::FeatureUnsupported,
+                        failure.message,
+                    )
+                }
+                crate::hadoop_catalog::HadoopCreateFailureKind::Invalid => {
+                    crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::DataInvalid,
+                        failure.message,
+                    )
+                }
+                crate::hadoop_catalog::HadoopCreateFailureKind::Uncommitted => {
+                    crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::PreconditionFailed,
+                        failure.message,
+                    )
+                }
+                crate::hadoop_catalog::HadoopCreateFailureKind::Unknown => {
+                    crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::Unexpected,
+                        failure.message,
+                    )
+                }
+            }),
+        }
+    }
+
+    async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
+        let verdict = self
+            .client
+            .reconcile_create_attempt(
+                &self.evidence.namespace,
+                &self.evidence.table,
+                &self.evidence.expected_table_uuid,
+                &self.evidence.metadata_location,
+                &self.evidence.metadata_digest,
+            )
+            .await
+            .map_err(|error| {
+                ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                    error,
+                )
+            })?;
+        match verdict {
+            crate::hadoop_catalog::HadoopCreateReconciliation::Committed { .. } => {
+                Ok(Some(CommitProof {
+                    snapshot_id: None,
+                    table_uuid: Some(Arc::clone(&self.evidence.expected_table_uuid)),
+                    effect: novarocks_spi::connector::ExternalMutationEffect::Applied,
+                }))
+            }
+            // Absent proves nothing, and a foreign target proves this attempt is
+            // not what is there -- neither upgrades the verdict.
+            crate::hadoop_catalog::HadoopCreateReconciliation::Absent
+            | crate::hadoop_catalog::HadoopCreateReconciliation::Foreign => Ok(None),
+        }
+    }
+}

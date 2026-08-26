@@ -34,11 +34,14 @@ use crate::resources::IcebergMetadataResources;
 
 /// Everything one Iceberg control generation owns.
 ///
-/// The generation freezes a single catalog, and every operation family reaches
-/// it through [`IcebergMetadataContext::novarocks_catalog`]. The generic and
-/// optional-concrete handles beside it are migration residue: the families move
-/// onto the single owner one at a time, and the single-authority cut removes
-/// the rest. Nothing new should reach for them.
+/// The generation holds exactly one catalog, and every operation family reaches
+/// it through [`IcebergMetadataContext::novarocks_catalog`]. There is no second
+/// handle and no concrete-kind slot: a generation that held two clients would
+/// have two pieces of in-memory state that disagree about the same lake.
+///
+/// Callers that need the vendored client -- the commit machinery, which submits
+/// through `Catalog::update_table` -- derive it from the owner rather than from
+/// a field of their own.
 #[derive(Clone)]
 pub struct IcebergMetadataContext {
     control_state: IcebergCatalogControlState,
@@ -48,7 +51,6 @@ pub struct IcebergMetadataContext {
     /// Proven-committed drops awaiting collection. Generation-local and
     /// bounded; retired with the generation.
     drop_cleanup: Arc<crate::catalog_control::drop_cleanup::DropCleanupQueue>,
-    catalog: Arc<dyn crate::iceberg::Catalog>,
     write_activations: Arc<crate::write_activation::IcebergWriteActivationReservations>,
 }
 
@@ -77,13 +79,11 @@ impl IcebergMetadataContext {
             control_state.configuration(),
             &catalog,
         )?;
-        let legacy_client = novarocks_catalog.vendored_client();
         Ok(Self {
             control_state,
             resources,
             novarocks_catalog,
             drop_cleanup: Arc::new(crate::catalog_control::drop_cleanup::DropCleanupQueue::new()),
-            catalog: legacy_client,
             write_activations: Arc::new(
                 crate::write_activation::IcebergWriteActivationReservations::default(),
             ),
@@ -104,10 +104,6 @@ impl IcebergMetadataContext {
         &self,
     ) -> &Arc<crate::catalog_control::drop_cleanup::DropCleanupQueue> {
         &self.drop_cleanup
-    }
-
-    pub(crate) fn catalog(&self) -> &Arc<dyn crate::iceberg::Catalog> {
-        &self.catalog
     }
 
     pub(crate) fn resources(&self) -> &IcebergMetadataResources {
@@ -147,7 +143,7 @@ impl IcebergMetadataContext {
         }
         let ident = TableIdent::from_strs([namespace.as_str(), table.as_str()])
             .map_err(|error| invalid_request(format!("build Iceberg table identity: {error}")))?;
-        let catalog = Arc::clone(&self.catalog);
+        let catalog = self.novarocks_catalog().vendored_client();
         let loaded = self
             .resources
             .catalog_runtime()
@@ -169,7 +165,7 @@ impl IcebergMetadataContext {
     }
 
     pub(crate) fn list_namespaces(&self) -> Result<Vec<String>, String> {
-        let catalog = Arc::clone(&self.catalog);
+        let catalog = self.novarocks_catalog().vendored_client();
         let mut namespaces = self
             .resources
             .catalog_runtime()
@@ -192,7 +188,7 @@ impl IcebergMetadataContext {
     pub(crate) fn namespace_exists(&self, namespace: &str) -> Result<bool, String> {
         let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
         let namespace_label = namespace.to_string();
-        let catalog = Arc::clone(&self.catalog);
+        let catalog = self.novarocks_catalog().vendored_client();
         self.resources
             .catalog_runtime()
             .block_on(async move { catalog.namespace_exists(&namespace).await })?
@@ -202,7 +198,7 @@ impl IcebergMetadataContext {
     pub(crate) fn list_tables(&self, namespace: &str) -> Result<Vec<String>, String> {
         let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
         let namespace_label = namespace.to_string();
-        let catalog = Arc::clone(&self.catalog);
+        let catalog = self.novarocks_catalog().vendored_client();
         let mut tables = self
             .resources
             .catalog_runtime()
@@ -222,7 +218,7 @@ impl IcebergMetadataContext {
             normalize_identifier(table)?,
         );
         let ident_label = ident.to_string();
-        let catalog = Arc::clone(&self.catalog);
+        let catalog = self.novarocks_catalog().vendored_client();
         self.resources
             .catalog_runtime()
             .block_on(async move { catalog.table_exists(&ident).await })?
@@ -315,19 +311,18 @@ mod tests {
         .expect("generation runtime");
 
         assert_eq!(generation.control_state().properties().len(), 2);
-        assert!(Arc::strong_count(generation.catalog()) >= 1);
         assert!(Arc::strong_count(generation.write_activation_reservations()) >= 1);
 
-        // The legacy handle and the owner are the same allocation, not two
-        // clients built from the same configuration. Two would have separate
-        // in-memory state and disagree about the same lake: a table dropped
-        // through one would still resolve through the other. This held once
-        // during development and cost a passing test to find.
+        // Every vendored handle the generation hands out is the same
+        // allocation. Two clients built from one configuration would have
+        // separate in-memory state and disagree about the same lake -- a table
+        // dropped through one would still resolve through the other. That held
+        // once during development and cost a passing test to find, which is why
+        // the context now has no second handle to get wrong.
+        let first = generation.novarocks_catalog().vendored_client();
+        let second = generation.novarocks_catalog().vendored_client();
         assert!(
-            Arc::ptr_eq(
-                generation.catalog(),
-                &generation.novarocks_catalog().vendored_client()
-            ),
+            Arc::ptr_eq(&first, &second),
             "a generation must hold exactly one catalog client"
         );
     }

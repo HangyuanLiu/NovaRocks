@@ -919,7 +919,7 @@ fn execute_owned_ref(
             Some("owned ref provenance changed before exact retirement".to_string()),
         );
     }
-    let catalog = Arc::clone(runtime.catalog());
+    let catalog = runtime.novarocks_catalog().vendored_client();
     let namespace = payload.namespace.clone();
     let table = payload.table.clone();
     let table_uuid = payload.table_uuid.clone();

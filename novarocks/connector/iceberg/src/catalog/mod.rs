@@ -33,7 +33,7 @@
 //! `async move` block:
 //!
 //! ```ignore
-//! let catalog = Arc::clone(context.catalog());
+//! let catalog = Arc::clone(context.novarocks_catalog());
 //! runtime.block_on(async move { catalog.load_table(request).await })
 //! ```
 //!
@@ -48,9 +48,18 @@
 //! covers the operations the provider actually performs, and grows only when a
 //! real caller appears.
 
-// Migration scaffolding: the operation families that consume this owner land
-// later in the same change, so parts of the surface have no caller yet. The
-// single-authority cut removes this attribute; it must not survive the PR.
+// The transaction lifecycle and its dispatch objects are built, tested, and
+// implemented by every catalog, but no operation family calls the three
+// constructors yet, so parts of this surface have no production caller.
+//
+// This is not scaffolding waiting to be deleted -- it is the half of the design
+// that is not wired. Wiring it is blocked on a real design question rather than
+// on effort: `Transaction::commit` returns one `CommitProof`, and the families
+// need publication receipts that differ by what was published (a conditional
+// create yields an authoritative re-read digest; a staged create yields a
+// committed table). Either the unified result grows a variant-typed payload, or
+// each family keeps its own receipt path. That belongs in the design, not in a
+// mechanical rewrite here.
 #![allow(dead_code)]
 
 pub(crate) mod delegate;

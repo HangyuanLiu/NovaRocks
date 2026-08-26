@@ -395,7 +395,8 @@ mod tests {
                 .iter()
                 .all(|(key, _)| !credential_like_property(key))
         );
-        assert!(Arc::strong_count(unpublished.runtime().catalog()) >= 1);
+        let client = unpublished.runtime().novarocks_catalog().vendored_client();
+        assert!(Arc::strong_count(&client) >= 1);
     }
 
     #[test]

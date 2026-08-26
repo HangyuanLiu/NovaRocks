@@ -176,7 +176,7 @@ pub(crate) fn create_view(
             source_format.to_string(),
         ),
     ]);
-    let catalog = runtime.catalog().clone();
+    let catalog = runtime.novarocks_catalog().vendored_client();
 
     if replace {
         let current = runtime
@@ -277,7 +277,7 @@ pub(crate) fn load_view(
     view: &str,
 ) -> Result<LoadedIcebergView, String> {
     let (_, ident) = view_ident(namespace, view)?;
-    let catalog = runtime.catalog().clone();
+    let catalog = runtime.novarocks_catalog().vendored_client();
     let metadata = runtime
         .resources()
         .catalog_runtime()
@@ -295,7 +295,7 @@ pub(crate) fn drop_view(
     view: &str,
 ) -> Result<(), String> {
     let (_, ident) = view_ident(namespace, view)?;
-    let catalog = runtime.catalog().clone();
+    let catalog = runtime.novarocks_catalog().vendored_client();
     runtime
         .resources()
         .catalog_runtime()

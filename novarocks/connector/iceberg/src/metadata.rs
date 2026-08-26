@@ -2731,7 +2731,7 @@ mod staged_publication_recovery_tests {
             ConnectorInstanceIncarnation::from_bytes([7; 16]),
             Arc::clone(&runtime),
         );
-        let catalog = Arc::clone(runtime.catalog());
+        let catalog = runtime.novarocks_catalog().vendored_client();
         let table = executor.block_on(async move {
             let namespace = NamespaceIdent::new("db".to_string());
             catalog

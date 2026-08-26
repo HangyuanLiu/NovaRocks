@@ -44,9 +44,8 @@
 //! catalog reported but never owned — and a prefix delete cannot tell the
 //! difference.
 
-// Migration scaffolding: the drop path that fills this queue and the pass that
-// drains it land later in the same change. The single-authority cut removes
-// this attribute; it must not survive the PR.
+// The queue is filled by the drop path and drained by the collection pass. The
+// drain side is not wired yet, so its accessors have no production caller.
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
