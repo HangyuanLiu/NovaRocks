@@ -664,7 +664,9 @@ where
                     token: server
                         .armed_query_lifecycle_fault_token(index, "restart-after-init-ack")?
                         .context("restart-after-InitAck fault has no armed token")?,
-                    process_id: server.backend_process_id(index)?,
+                    process_id: parse_backend_process_id(
+                        &server.backend_process_id(index)?,
+                    )?,
                 }
             }
             PostQueryFault::KillQueryAtLifecyclePhase { phase, .. }
@@ -856,7 +858,8 @@ where
                                 );
                             }
                             server.restart_be_until(index, deadline)?;
-                            let new_process_id = server.backend_process_id(index)?;
+                            let new_process_id =
+                                parse_backend_process_id(&server.backend_process_id(index)?)?;
                             if new_process_id == *process_id {
                                 bail!(
                                     "BE[{index}] restart did not replace process identity: old={process_id} new={new_process_id}"
@@ -2458,4 +2461,16 @@ mod tests {
             .expect_err("new process must not emit retired identity");
         assert!(error.to_string().contains("retired process_id"));
     }
+}
+
+/// Parse the harness's textual backend process identity into the typed form the
+/// failpoint scopes carry.
+///
+/// The harness reports the identity as it appears in `SHOW BACKENDS`, while the
+/// fault scopes hold a validated `BackendProcessId`; converting here keeps the
+/// comparison and the evidence on the typed value instead of on formatting.
+fn parse_backend_process_id(value: &str) -> Result<novarocks_types::BackendProcessId> {
+    value
+        .parse::<novarocks_types::BackendProcessId>()
+        .map_err(|error| anyhow::anyhow!("backend process identity {value} is invalid: {error}"))
 }
