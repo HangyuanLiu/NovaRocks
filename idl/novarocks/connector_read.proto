@@ -27,6 +27,7 @@ syntax = "proto3";
 // Owner: produced by the FE native plan/assignment encoder, validated by
 // novarocks-proto, and consumed by the BE native decode adapter. Provider
 // semantics belong to the provider that produced the variant.
+// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
 package novarocks.connector_read;
 
 // ---------------------------------------------------------------------------

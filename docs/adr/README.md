@@ -70,6 +70,9 @@ code-anchors:
 - ADR-0076 — Runtime Filter terminal observation 为何由 Backend participant 有界聚合、并仅经 typed QLC contribution 出域（superseded → ADR-0078）
 - ADR-0078 — Runtime Filter terminal observation 为何只作观测，且以 P0/P1/P2 查询终止契约交付（superseded → ADR-0106）
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
+- ADR-0053 — MV snapshot change window 复用 exact-generation scan planning（superseded → ADR-0114）
+- ADR-0039 — scan unit 的 immutable、bounded physical domain facts（superseded → ADR-0114）
+- ADR-0034 — cluster composite split 与 Backend local scan unit 的两级生命周期（superseded → ADR-0114）
 
 ### join-execution
 
@@ -98,14 +101,11 @@ code-anchors:
 - ADR-0024 — 无需 BE staging 的 data mutation 为何使用 FE-only frozen plan 与 marker-only reconcile（active）
 - ADR-0028 — metadata maintenance 为何由 FE 以 exact lease、durable plan 与 marker reconcile 执行（active）
 - ADR-0029 — distributed rewrite 为何以 frozen groups、C1 cohorts 与 FE aggregate commit 实现单 snapshot（active）
-- ADR-0034 — cluster composite split 与 Backend local scan unit 为何采用冻结、认证、再调度的两级生命周期（active）
-- ADR-0039 — scan unit为何以immutable、bounded的physical domain facts服务后续执行侧（active）
 - ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（active）
 - ADR-0104 — Connector execution binding 为何使用 SPI domain declaration、sealed Host 与可重放失败状态机（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0051 — distributed write 为何在 preparation 与 planning 之间强制 exact-generation Provider activation（active）
 - ADR-0052 — SHOW CREATE 为何以 exact lease 的有界 table-definition facts 取代 concrete table decode（active）
-- ADR-0053 — MV snapshot change window 为何复用 exact-generation scan planning 并返回 sealed neutral admission（active）
 - ADR-0055 — row-DML 调用方为何只读 Provider 签发的 strategy，而 SQL 谓词合法性为何留在 Core（active）
 - ADR-0056 — 摘除 Core 对 provider 的测试依赖时，无法用冻结 SPI facts 表达的断言为何归位到实现旁而非复刻或删除（active）
 - ADR-0063 — Copy-on-Write row mutation 的match与rewrite读源为何由Provider按exact base签发（active）
@@ -119,6 +119,7 @@ code-anchors:
 - ADR-0089 — Predicate-driven Parquet page pruning 为何只在 FS reader-open 按实际 physical leaf 计算（active）
 - ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0112 — MV 运行态为何只属于当前进程、StateStore为何只保留 lake-source Accelerator（active）
+- ADR-0114 — Connector read 为何改用 Trino 对齐的 typed handle/split/page-source 与运行时 split 投递（active）
 
 #### 历史
 

@@ -4,6 +4,7 @@
 //! trait objects, hands it protocol-validated carriers, and receives generic
 //! SPI values back. The provider is the only side that matches its own closed
 //! variant, so no engine code downcasts and no opaque payload crosses here.
+// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
 
 use std::collections::BTreeSet;
 

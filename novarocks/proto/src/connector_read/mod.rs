@@ -5,6 +5,7 @@
 //! cross-field consistency, and canonical bytes for replay comparison. It does
 //! not own connector semantics: a provider variant is carried and validated
 //! structurally, and only the provider that produced it interprets it.
+// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
 
 mod control;
 mod execution;

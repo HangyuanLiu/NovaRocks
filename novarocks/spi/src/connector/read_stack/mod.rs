@@ -22,10 +22,11 @@
 //! enumeration, page production, dynamic filters, and system relations.
 //!
 //! It deliberately contains no provider name, no generated wire DTO, no
-//! opaque payload, and no downcast. Concrete provider facts that must cross
-//! the FE/BE boundary live in [`super::read_wire`], following the same closed
-//! provider-variant rule as `ConnectorExecutionDeclaration` (ADR-0104,
-//! ADR-0105); their DTO conversion is owned by `novarocks-proto`.
+//! opaque payload, and no downcast. Concrete provider facts that cross the
+//! FE/BE boundary are carried by the central IDL's closed per-category
+//! `oneof`s, validated by `novarocks-proto`, and converted to concrete domain
+//! types only inside the provider that produced them.
+// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
 
 pub mod dynamic_filter;
 pub mod handle;

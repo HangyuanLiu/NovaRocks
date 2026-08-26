@@ -40,6 +40,7 @@
 //! their sequence, plan node, canonical bytes, and retained size. It never
 //! inspects a provider variant, so this file compiles with no provider crate in
 //! the dependency graph.
+// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
