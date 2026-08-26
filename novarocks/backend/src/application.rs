@@ -322,6 +322,26 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
         }
     }
 
+    fn task_update(
+        &self,
+        request: crate::query_lifecycle::task_update::TaskUpdateRequest,
+    ) -> crate::query_lifecycle::task_update::TaskUpdateAck {
+        // Admission and delivery are deliberately separate: the lifecycle
+        // decides whether this exact attempt may still receive work, and the
+        // fragment runtime owns the queue the work lands in.
+        if let Err(error) = self
+            .registry
+            .admit_task_update(request.execution_id(), request.fragment_instance_id())
+        {
+            return crate::query_lifecycle::task_update::rejection_from_lifecycle_error(&error);
+        }
+        self.fragments.deliver_split_assignments(
+            request.execution_id(),
+            request.fragment_instance_id(),
+            request.assignments(),
+        )
+    }
+
     fn start_prepared_query(&self, request: QueryStartRequest) -> QueryStartAck {
         self.registry.start_prepared_query(request)
     }

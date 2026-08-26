@@ -125,6 +125,10 @@ pub struct NativeFragmentService {
     execution_runtime: Arc<ExecutionRuntime>,
     commit_port: Arc<dyn FragmentCommitPort>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
+    /// Runtime split delivery for admitted tasks. It is keyed by execution id
+    /// and fragment instance, so a replaced attempt gets a fresh queue set and
+    /// can never inherit a sequence space.
+    split_queues: Arc<novarocks_execution::connector::SplitQueueRegistry>,
     lifecycle_observer: Option<LifecycleObserver>,
     #[cfg(test)]
     after_lifecycle_admission: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -189,6 +193,7 @@ impl NativeFragmentService {
             execution_runtime,
             commit_port: Arc::new(BackendSinkCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
+            split_queues: Arc::new(novarocks_execution::connector::SplitQueueRegistry::new()),
             lifecycle_observer: None,
             #[cfg(test)]
             after_lifecycle_admission: None,
@@ -268,6 +273,81 @@ impl NativeFragmentService {
     /// Materializes a complete fragment bundle without starting its drivers.
     /// Every spawned worker waits on the query-owned gate; gate abort is a
     /// pure cleanup path and never calls `DormantFragmentHandle::start`.
+    /// Release the split queues of one finished or cancelled task.
+    ///
+    /// Closing wakes every parked scan exactly once so a terminated task never
+    /// leaves a driver waiting for splits that will not arrive.
+    pub(crate) fn close_split_queues(
+        &self,
+        execution_id: QueryExecutionId,
+        fragment_instance_id: novarocks_types::UniqueId,
+    ) {
+        self.split_queues
+            .close_attempt(novarocks_execution::connector::TaskAttemptKey::new(
+                execution_id,
+                fragment_instance_id,
+            ));
+    }
+
+    /// Deliver one admitted task update into the per-plan-node split queues.
+    ///
+    /// The lifecycle owner has already decided this attempt may receive work;
+    /// this only enqueues it. A queue set is opened lazily because a task scan
+    /// may legitimately start before its first split arrives.
+    pub(crate) fn deliver_split_assignments(
+        &self,
+        execution_id: QueryExecutionId,
+        fragment_instance_id: novarocks_types::UniqueId,
+        assignments: &[novarocks_proto::connector_read::SplitAssignment],
+    ) -> crate::query_lifecycle::task_update::TaskUpdateAck {
+        use crate::query_lifecycle::task_update::{
+            TaskUpdateAcceptedNode, TaskUpdateAck, TaskUpdateRejectionReason,
+        };
+        use novarocks_execution::connector::{SplitQueueErrorKind, TaskAttemptKey};
+
+        let key = TaskAttemptKey::new(execution_id, fragment_instance_id);
+        let attempt = self.split_queues.open_attempt(
+            key,
+            novarocks_execution::connector::SplitQueueConfig::default(),
+        );
+        let mut accepted = Vec::with_capacity(assignments.len());
+        for assignment in assignments {
+            match attempt.offer(assignment) {
+                Ok(outcome) => accepted.push(TaskUpdateAcceptedNode {
+                    plan_node_id: assignment.plan_node_id(),
+                    accepted_through_sequence: outcome.max_accepted_sequence.unwrap_or_default(),
+                    no_more_splits: outcome.no_more_splits,
+                    queued_splits: attempt
+                        .existing_queue(assignment.plan_node_id())
+                        .map(|queue| queue.stats().queued_splits as u64)
+                        .unwrap_or_default(),
+                }),
+                Err(error) => {
+                    // A partially applied update is still reported: the queue
+                    // itself is all-or-nothing per assignment, so the sender
+                    // needs to know exactly how far it got.
+                    let reason = match error.kind() {
+                        SplitQueueErrorKind::PlanNodeMismatch => {
+                            TaskUpdateRejectionReason::UnknownPlanNode
+                        }
+                        SplitQueueErrorKind::SequenceConflict => {
+                            TaskUpdateRejectionReason::SequenceConflict
+                        }
+                        SplitQueueErrorKind::AfterNoMoreSplits => {
+                            TaskUpdateRejectionReason::AfterNoMoreSplits
+                        }
+                        SplitQueueErrorKind::Closed => TaskUpdateRejectionReason::Terminated,
+                        SplitQueueErrorKind::ResourceExhausted => {
+                            TaskUpdateRejectionReason::ResourceExhausted
+                        }
+                    };
+                    return TaskUpdateAck::rejected(reason, error.to_string());
+                }
+            }
+        }
+        TaskUpdateAck::Accepted(accepted)
+    }
+
     pub(crate) fn stage_fragments(
         &self,
         execution_id: QueryExecutionId,
@@ -389,6 +469,7 @@ impl NativeFragmentService {
         let control_handle: Arc<dyn FragmentControlHandle> = pending_control.clone();
         let token = reservation.publish(control_handle);
         let queries = self.queries.clone();
+        let split_queues = Arc::clone(&self.split_queues);
         let lifecycle = Arc::clone(&self.lifecycle);
         let observer = self.lifecycle_observer.clone();
         std::thread::Builder::new()
@@ -398,6 +479,7 @@ impl NativeFragmentService {
             ))
             .spawn(move || {
                 if gate.wait() != crate::query_lifecycle::stage::StartGateState::Released {
+                    close_task_split_queues(&split_queues, execution_id, fragment_instance_id);
                     queries.unregister_fragment_execution(execution_id, fragment_instance_id);
                     queries.finish_fragment(execution_id);
                     token.complete();
@@ -439,6 +521,7 @@ impl NativeFragmentService {
                     running,
                     token,
                     queries,
+                    split_queues,
                     lifecycle,
                     execution_id,
                     backend_num,
@@ -541,6 +624,7 @@ impl NativeFragmentService {
         let token = reservation.publish(control_handle);
         let (start_tx, start_rx) = mpsc::sync_channel::<()>(0);
         let queries = self.queries.clone();
+        let split_queues = Arc::clone(&self.split_queues);
         let lifecycle = Arc::clone(&self.lifecycle);
         let observer = self.lifecycle_observer.clone();
         #[cfg(test)]
@@ -560,6 +644,7 @@ impl NativeFragmentService {
                 if start_rx.recv().is_err() {
                     let error = "native fragment start signal was dropped".to_string();
                     error!(target: "novarocks_execution", finst_id = %fragment_instance_id, %error, "native fragment start signal was dropped");
+                    close_task_split_queues(&split_queues, execution_id, fragment_instance_id);
                     queries.unregister_fragment_execution(execution_id, fragment_instance_id);
                     queries.finish_fragment(execution_id);
                     token.complete();
@@ -602,6 +687,7 @@ impl NativeFragmentService {
                     running,
                     token,
                     queries,
+                    split_queues,
                     lifecycle,
                     execution_id,
                     backend_num,
@@ -725,10 +811,23 @@ impl FragmentControlHandle for RunningFragmentControl {
     }
 }
 
+/// Close a task's split queues so every parked scan wakes exactly once.
+fn close_task_split_queues(
+    split_queues: &novarocks_execution::connector::SplitQueueRegistry,
+    execution_id: QueryExecutionId,
+    fragment_instance_id: novarocks_types::UniqueId,
+) {
+    split_queues.close_attempt(novarocks_execution::connector::TaskAttemptKey::new(
+        execution_id,
+        fragment_instance_id,
+    ));
+}
+
 fn consume_terminal_fact(
     running: RunningFragmentHandle,
     token: super::control::FragmentControlToken,
     queries: NativeFragmentQueryRuntime,
+    split_queues: Arc<novarocks_execution::connector::SplitQueueRegistry>,
     lifecycle: Arc<QueryLifecycleRegistry>,
     execution_id: QueryExecutionId,
     backend_num: i32,
@@ -742,6 +841,7 @@ fn consume_terminal_fact(
         .with_connector_staged_report_frames(running.take_connector_staged_report_frames());
     // QLC terminal facts are transferred before local runtime cleanup.
     lifecycle.record_fragment_terminal_fact(execution_id, fact, backend_num, sink);
+    close_task_split_queues(&split_queues, execution_id, fragment_instance_id);
     queries.unregister_fragment_execution(execution_id, fragment_instance_id);
     queries.finish_fragment(execution_id);
     // Publish the terminal report before this fact can fail-close the local
@@ -1410,6 +1510,7 @@ mod tests {
             failed,
             failed_token,
             service.queries.clone(),
+            Arc::clone(&service.split_queues),
             Arc::clone(&service.lifecycle),
             execution_id,
             0,
