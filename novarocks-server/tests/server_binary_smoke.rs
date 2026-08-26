@@ -109,6 +109,10 @@ impl ConfigPair {
                 r#"
 sys_log_dir = "{}"
 
+[native_trust]
+deployment_id = "server-binary-smoke"
+shared_secret = "0123456789abcdef0123456789abcdef"
+
 [server]
 host = "127.0.0.1"
 http_port = {fe_http_port}
@@ -140,6 +144,10 @@ deployment_owner = "server-binary-smoke-fe"
             &format!(
                 r#"
 sys_log_dir = "{}"
+
+[native_trust]
+deployment_id = "server-binary-smoke"
+shared_secret = "0123456789abcdef0123456789abcdef"
 
 [server]
 host = "127.0.0.1"
@@ -313,15 +321,33 @@ fn scrape_metrics(port: u16) -> String {
 }
 
 fn assert_native_rejects_management(port: u16, path: &str) {
-    let response = http_request(port, "GET", path);
-    assert!(
-        response.contains("grpc-status: 12"),
-        "native response: {response}"
-    );
-    assert!(
-        !response.contains("novarocks_"),
-        "native listener must not render management data: {response}"
-    );
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect native listener");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("set native listener read timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+    )
+    .expect("write unauthenticated native request");
+    let mut response = String::new();
+    match stream.read_to_string(&mut response) {
+        Ok(_) => {
+            assert!(
+                response.contains("grpc-status: 16"),
+                "native response: {response}"
+            );
+            assert!(
+                !response.contains("novarocks_"),
+                "native listener must not render management data: {response}"
+            );
+        }
+        Err(error) => assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset,
+            "native listener must reject unauthenticated HTTP/1 traffic: {error}"
+        ),
+    }
 }
 
 fn assert_role_scoped_surfaces(pair: &ConfigPair, lifecycle_debug_enabled: bool) {
@@ -542,6 +568,10 @@ fn all_in_one_preflight_conflict_has_no_startup_side_effects() {
             r#"
 sys_log_dir = "{}"
 
+[native_trust]
+deployment_id = "server-binary-smoke"
+shared_secret = "0123456789abcdef0123456789abcdef"
+
 [server]
 host = "127.0.0.1"
 http_port = {}
@@ -560,6 +590,10 @@ role = "be"
         &format!(
             r#"
 sys_log_dir = "{}"
+
+[native_trust]
+deployment_id = "server-binary-smoke"
+shared_secret = "0123456789abcdef0123456789abcdef"
 
 [server]
 host = "127.0.0.1"

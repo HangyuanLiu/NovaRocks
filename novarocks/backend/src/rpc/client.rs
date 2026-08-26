@@ -21,24 +21,31 @@
 //! calls and the BE-to-FE terminal fallback.  It shares no transport facade
 //! with Frontend or Core.
 
+use std::io;
 use std::time::Duration;
 
+use hyper_util::rt::TokioIo;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+use novarocks_native_trust::{NativeClientAuthInterceptor, NativeTrust};
 use novarocks_proto_models::{filter, novarocks as proto};
-use novarocks_types::format_host_for_url;
+use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::UniqueId;
 use tonic::Request;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
+use tower::service_fn;
 
 use super::runtime::BackendDataRuntime;
 use super::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+type AuthenticatedNovaRocksGrpcClient =
+    NovaRocksGrpcClient<InterceptedService<Channel, NativeClientAuthInterceptor>>;
+
 pub(crate) struct BackendRpcClient {
     runtime: BackendDataRuntime,
-    host: String,
-    port: u16,
+    endpoint: NativeEndpoint,
 }
 
 impl BackendRpcClient {
@@ -46,9 +53,10 @@ impl BackendRpcClient {
         runtime: BackendDataRuntime,
         endpoint: &RuntimeEndpoint,
     ) -> Result<Self, String> {
-        let port = u16::try_from(endpoint.port())
-            .map_err(|_| format!("invalid runtime filter endpoint port {}", endpoint.port()))?;
-        Self::new_host_port(runtime, endpoint.host().to_string(), port)
+        Ok(Self {
+            runtime,
+            endpoint: endpoint.native_endpoint().clone(),
+        })
     }
 
     pub(crate) fn new_host_port(
@@ -56,37 +64,38 @@ impl BackendRpcClient {
         host: String,
         port: u16,
     ) -> Result<Self, String> {
-        channel_endpoint(&host, port)
-            .map_err(|error| format!("invalid BE endpoint {host}:{port}: {error}"))?;
-        Ok(Self {
-            runtime,
-            host,
-            port,
-        })
+        let endpoint = NativeEndpoint::from_host_port(&host, port)
+            .map_err(|error| format!("invalid BE endpoint: {error}"))?;
+        channel_endpoint(&endpoint)
+            .map_err(|error| format!("invalid BE endpoint {endpoint}: {error}"))?;
+        Ok(Self { runtime, endpoint })
     }
 
-    fn make_client(&self) -> Result<NovaRocksGrpcClient<Channel>, String> {
-        let host = self.host.clone();
-        let port = self.port;
+    fn make_client(&self) -> Result<AuthenticatedNovaRocksGrpcClient, String> {
+        let endpoint = self.endpoint.clone();
         let runtime = self.runtime.clone();
+        let channel_runtime = runtime.clone();
         let channel = runtime
             .clone()
-            .block_on(async move { get_or_create_channel(&runtime, &host, port).await })?;
-        Ok(client_from_channel(channel))
+            .block_on(async move { get_or_create_channel(&channel_runtime, endpoint).await })?;
+        Ok(client_from_channel(
+            channel,
+            runtime.native_trust().as_ref(),
+        ))
     }
 
     async fn make_deadline_async_client(
         &self,
         operation: &str,
         deadline_at: tokio::time::Instant,
-    ) -> Result<NovaRocksGrpcClient<Channel>, String> {
+    ) -> Result<AuthenticatedNovaRocksGrpcClient, String> {
         tokio::time::timeout_at(
             deadline_at,
-            get_or_create_channel(&self.runtime, &self.host, self.port),
+            get_or_create_channel(&self.runtime, self.endpoint.clone()),
         )
         .await
         .map_err(|_| format!("{operation} deadline exceeded during channel acquisition"))?
-        .map(client_from_channel)
+        .map(|channel| client_from_channel(channel, self.runtime.native_trust().as_ref()))
         .map_err(|error| format!("{operation} channel acquisition failed: {error}"))
     }
 
@@ -194,11 +203,10 @@ impl BackendRpcClient {
         &self,
         request: filter::LookupRequest,
     ) -> Result<filter::LookupResponse, String> {
-        let host = self.host.clone();
-        let port = self.port;
+        let endpoint = self.endpoint.clone();
         let mut client = self
             .make_client()
-            .map_err(|error| format!("lookup connect failed: dest={host}:{port} error={error}"))?;
+            .map_err(|error| format!("lookup connect failed: dest={endpoint} error={error}"))?;
         self.runtime
             .block_on(async move {
                 client
@@ -206,7 +214,7 @@ impl BackendRpcClient {
                     .await
                     .map(|response| response.into_inner())
                     .map_err(|error| {
-                        format!("lookup request failed: dest={host}:{port} error={error}")
+                        format!("lookup request failed: dest={endpoint} error={error}")
                     })
             })
             .map_err(|error| format!("lookup runtime execution failed: {error}"))
@@ -214,34 +222,44 @@ impl BackendRpcClient {
 }
 
 fn channel_endpoint(
-    host: &str,
-    port: u16,
+    endpoint: &NativeEndpoint,
 ) -> Result<tonic::transport::Endpoint, tonic::transport::Error> {
-    format!("http://{}:{port}", format_host_for_url(host)).parse()
+    format!("http://{endpoint}").parse()
 }
 
-fn client_from_channel(channel: Channel) -> NovaRocksGrpcClient<Channel> {
-    NovaRocksGrpcClient::new(channel)
+fn client_from_channel(channel: Channel, trust: &NativeTrust) -> AuthenticatedNovaRocksGrpcClient {
+    NovaRocksGrpcClient::with_interceptor(channel, trust.client_interceptor())
         .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES)
         .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
 }
 
 async fn get_or_create_channel(
     runtime: &BackendDataRuntime,
-    host: &str,
-    port: u16,
+    endpoint: NativeEndpoint,
 ) -> Result<Channel, String> {
-    let key = format!("{}:{port}", format_host_for_url(host));
     if let Some(channel) = runtime
         .channels()
         .lock()
         .expect("native channel cache lock")
-        .get(&key)
+        .get(&endpoint)
         .cloned()
     {
         return Ok(channel);
     }
-    let channel = channel_endpoint(host, port)
+    let connector = runtime.native_transport().connector_for(endpoint.clone())?;
+    let connector = service_fn(move |_| {
+        let connector = connector.clone();
+        async move {
+            connector
+                .connect()
+                .await
+                .map(TokioIo::new)
+                .map_err(|failure| {
+                    io::Error::other(format!("native transport connector failed: {failure}"))
+                })
+        }
+    });
+    let channel = channel_endpoint(&endpoint)
         .map_err(|error| format!("invalid endpoint: {error}"))?
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .timeout(Duration::from_secs(600))
@@ -249,14 +267,14 @@ async fn get_or_create_channel(
         .http2_adaptive_window(true)
         .initial_stream_window_size(Some(32 * 1024 * 1024))
         .initial_connection_window_size(Some(128 * 1024 * 1024))
-        .connect()
+        .connect_with_connector(connector)
         .await
         .map_err(|error| format!("connect exchange endpoint failed: {error}"))?;
     runtime
         .channels()
         .lock()
         .expect("native channel cache lock")
-        .insert(key, channel.clone());
+        .insert(endpoint, channel.clone());
     Ok(channel)
 }
 
@@ -267,14 +285,14 @@ mod tests {
     #[test]
     fn channel_endpoint_formats_ipv4_and_ipv6_hosts() {
         assert_eq!(
-            channel_endpoint("127.0.0.1", 9070)
+            channel_endpoint(&"127.0.0.1:9070".parse().expect("IPv4 endpoint"))
                 .expect("IPv4 endpoint")
                 .uri()
                 .to_string(),
             "http://127.0.0.1:9070/"
         );
         assert_eq!(
-            channel_endpoint("::1", 9070)
+            channel_endpoint(&"[::1]:9070".parse().expect("IPv6 endpoint"))
                 .expect("IPv6 endpoint")
                 .uri()
                 .to_string(),

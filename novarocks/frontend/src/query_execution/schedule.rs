@@ -155,7 +155,7 @@ impl FragmentLifecycleProjection {
                     ),
                 ));
             }
-            if !endpoints.insert(target.endpoint()) {
+            if !endpoints.insert(target.endpoint().clone()) {
                 return Err(DistributedQueryError::new(
                     DistributedQueryErrorKind::ContractViolation,
                     format!(
@@ -164,17 +164,15 @@ impl FragmentLifecycleProjection {
                     ),
                 ));
             }
+            let backend_idx = target.backend_idx();
             if self
                 .frozen_live_backends
-                .insert(target.backend_idx(), target)
+                .insert(backend_idx, target)
                 .is_some()
             {
                 return Err(DistributedQueryError::new(
                     DistributedQueryErrorKind::ContractViolation,
-                    format!(
-                        "lifecycle projection repeats backend {}",
-                        target.backend_idx()
-                    ),
+                    format!("lifecycle projection repeats backend {}", backend_idx),
                 ));
             }
         }
@@ -185,7 +183,7 @@ impl FragmentLifecycleProjection {
                     format!("scheduled backend {backend_idx} is absent from frozen topology"),
                 )
             })?;
-            if RuntimeEndpoint::from_socket_addr(target.endpoint()) != *endpoint {
+            if target.endpoint() != endpoint {
                 return Err(DistributedQueryError::new(
                     DistributedQueryErrorKind::ContractViolation,
                     format!(

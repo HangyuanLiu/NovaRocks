@@ -315,11 +315,10 @@ impl<'a> QueryPreparationContext<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
     use super::*;
     use crate::common::backend_topology::LiveBackendTarget;
     use crate::common::query_cancellation::QueryCancellationSource;
+    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 
     #[test]
     fn lake_publication_policy_requires_a_strict_gc_age_and_clamps_deadlines() {
@@ -361,7 +360,7 @@ mod tests {
             9,
             vec![LiveBackendTarget::new(
                 7,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9030),
+                RuntimeEndpoint::parse("127.0.0.1:9030").expect("endpoint"),
                 2,
             )],
         )

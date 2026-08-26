@@ -463,11 +463,11 @@ fn stage_one(
 ) -> Result<(), (usize, String)> {
     let target = batch.binding().target();
     let request = batch.request();
-    let first = transport.stage_fragments(target, request, config.stage_rpc_timeout());
+    let first = transport.stage_fragments(target.clone(), request, config.stage_rpc_timeout());
     let ack = match first {
         Ok(ack) => ack,
         Err(error) if error.is_unknown_stage_or_start_outcome() => transport
-            .stage_fragments(target, request, config.stage_rpc_timeout())
+            .stage_fragments(target.clone(), request, config.stage_rpc_timeout())
             .map_err(|retry| {
                 (
                     target.backend_idx(),
@@ -497,11 +497,12 @@ fn start_one(
 ) -> Result<(), (usize, String)> {
     let target = batch.binding().target();
     let request = batch.start_request();
-    let first = transport.start_prepared_query(target, &request, config.start_rpc_timeout());
+    let first =
+        transport.start_prepared_query(target.clone(), &request, config.start_rpc_timeout());
     let ack = match first {
         Ok(ack) => ack,
         Err(error) if error.is_unknown_stage_or_start_outcome() => transport
-            .start_prepared_query(target, &request, config.start_rpc_timeout())
+            .start_prepared_query(target.clone(), &request, config.start_rpc_timeout())
             .map_err(|retry| (target.backend_idx(), format!(
                 "backend {} StartPreparedQuery retry failed after unknown outcome ({error}): {retry}",
                 target.backend_idx()
@@ -813,11 +814,19 @@ fn init_one(
     participant: &MaterializedParticipant,
     timeout: Duration,
 ) -> Result<QueryInitOutcome, InitFailure> {
-    let first = transport.init_query(participant.target, participant.request.clone(), timeout);
+    let first = transport.init_query(
+        participant.target.clone(),
+        participant.request.clone(),
+        timeout,
+    );
     let ack = match first {
         Ok(ack) => ack,
         Err(error) if error.is_unknown_init_outcome() => transport
-            .init_query(participant.target, participant.request.clone(), timeout)
+            .init_query(
+                participant.target.clone(),
+                participant.request.clone(),
+                timeout,
+            )
             .map_err(|retry| {
                 InitFailure::uncertain(format!(
                     "backend {} InitQuery retry failed after unknown outcome ({error}): {retry}",
@@ -963,7 +972,7 @@ fn attach_one(
     })
     .map_err(|error| (None, error.to_string()))?;
     let session = transport
-        .attach_control(participant.target, attach, config.attach_timeout())
+        .attach_control(participant.target.clone(), attach, config.attach_timeout())
         .map_err(|error| {
             (
                 None,
@@ -973,7 +982,7 @@ fn attach_one(
                 ),
             )
         })?;
-    let active = ActiveSession::new(participant.target, participant.digest, session);
+    let active = ActiveSession::new(participant.target.clone(), participant.digest, session);
     match active.recv(config.attach_timeout()) {
         Ok(event)
             if matches!(

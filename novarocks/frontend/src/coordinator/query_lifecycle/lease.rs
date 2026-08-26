@@ -104,7 +104,7 @@ impl AbortCleanupFailure {
         detail: impl Into<String>,
     ) -> Self {
         Self {
-            target: participant.target,
+            target: participant.target.clone(),
             digest: participant.digest,
             kind,
             detail: detail.into(),
@@ -1059,7 +1059,11 @@ impl AttemptControl {
             })?;
         let ack = self
             .transport
-            .abort_query(participant.target, request, self.config.attach_timeout())
+            .abort_query(
+                participant.target.clone(),
+                request,
+                self.config.attach_timeout(),
+            )
             .map_err(|error| {
                 AbortCleanupFailure::new(
                     participant,

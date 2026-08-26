@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
 
 use crate::common::backend_topology::LiveBackendTarget;
 use crate::query_execution::artifact::{
@@ -24,19 +23,20 @@ use crate::query_execution::artifact::{
     SchedulingStreamKind, ValidatedFragmentSchedule,
 };
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 #[cfg(debug_assertions)]
 use novarocks_failpoint::{QueryLifecycleFaultKind, arm_path, configured_root};
 use novarocks_proto::lifecycle::QueryExecutionId;
 
 #[derive(Clone)]
 pub struct FrontendBackendSnapshot {
-    entries: Vec<(usize, SocketAddr)>,
+    entries: Vec<(usize, RuntimeEndpoint)>,
     generations: BTreeMap<usize, u64>,
 }
 
 impl FrontendBackendSnapshot {
     #[cfg(test)]
-    pub fn for_test(entries: Vec<(usize, SocketAddr)>) -> Result<Self, DistributedQueryError> {
+    pub fn for_test(entries: Vec<(usize, RuntimeEndpoint)>) -> Result<Self, DistributedQueryError> {
         let generations = entries
             .iter()
             .map(|(backend_idx, _)| {
@@ -56,7 +56,7 @@ impl FrontendBackendSnapshot {
     ) -> Result<Self, DistributedQueryError> {
         let entries = targets
             .iter()
-            .map(|target| (target.backend_idx(), target.endpoint()))
+            .map(|target| (target.backend_idx(), target.endpoint().clone()))
             .collect();
         let generations = targets
             .into_iter()
@@ -66,7 +66,7 @@ impl FrontendBackendSnapshot {
     }
 
     fn validate(
-        entries: Vec<(usize, SocketAddr)>,
+        entries: Vec<(usize, RuntimeEndpoint)>,
         generations: BTreeMap<usize, u64>,
     ) -> Result<Self, DistributedQueryError> {
         if entries.is_empty() {
@@ -94,7 +94,7 @@ impl FrontendBackendSnapshot {
         })
     }
 
-    pub fn entries(&self) -> &[(usize, SocketAddr)] {
+    pub fn entries(&self) -> &[(usize, RuntimeEndpoint)] {
         &self.entries
     }
 
@@ -105,8 +105,12 @@ impl FrontendBackendSnapshot {
     fn live_targets(&self) -> Vec<LiveBackendTarget> {
         self.entries
             .iter()
-            .map(|&(backend_idx, endpoint)| {
-                LiveBackendTarget::new(backend_idx, endpoint, self.generations[&backend_idx])
+            .map(|(backend_idx, endpoint)| {
+                LiveBackendTarget::new(
+                    *backend_idx,
+                    endpoint.clone(),
+                    self.generations[backend_idx],
+                )
             })
             .collect()
     }
@@ -122,7 +126,7 @@ impl FrontendFragmentScheduler {
         Self { backends }
     }
 
-    pub fn backend_entries(&self) -> &[(usize, SocketAddr)] {
+    pub fn backend_entries(&self) -> &[(usize, RuntimeEndpoint)] {
         self.backends.entries()
     }
 
@@ -272,8 +276,8 @@ impl FrontendFragmentScheduler {
                     } else {
                         (preferred + instance_index) % backend_count
                     };
-                    let (backend_idx, endpoint) = self.backends.entries[live_index];
-                    BackendPlacement::new(backend_idx, endpoint)
+                    let (backend_idx, endpoint) = &self.backends.entries[live_index];
+                    BackendPlacement::new(*backend_idx, endpoint.clone())
                 })
                 .collect();
             draft.assign_fragment(fragment_id, placements)?;

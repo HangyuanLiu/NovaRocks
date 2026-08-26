@@ -19,6 +19,7 @@
 
 use crate::query_execution::kernels::BackendManagementKernel;
 use crate::runtime::statement_result::StatementResult;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_parser::ast::{BackendStatement, LiteralKind};
 use novarocks_types::ClusterRole;
 
@@ -50,8 +51,7 @@ impl BackendCommandExecutor {
             BackendStatement::AddBackend(statement) => {
                 require_backend_management_role("ADD BACKEND", role)?;
                 let address = string_literal(&statement.address)?;
-                let endpoint = address
-                    .parse()
+                let endpoint = RuntimeEndpoint::parse(address)
                     .map_err(|error| format!("invalid backend address '{address}': {error}"))?;
                 self.kernel.topology().add_backend(endpoint)?;
                 Ok(StatementResult::Ok)
@@ -59,8 +59,7 @@ impl BackendCommandExecutor {
             BackendStatement::DropBackend(statement) => {
                 require_backend_management_role("DROP BACKEND", role)?;
                 let address = string_literal(&statement.address)?;
-                let endpoint = address
-                    .parse()
+                let endpoint = RuntimeEndpoint::parse(address)
                     .map_err(|error| format!("invalid backend address '{address}': {error}"))?;
                 self.kernel
                     .topology()

@@ -74,6 +74,7 @@ pub use mysql::{
     run_mysql_server_until_shutdown,
 };
 pub use native::report_server::FrontendReportServerHandle;
+pub use native::transport::FrontendNativeTransport;
 pub use query::FrontendQueryService;
 pub use query_lifecycle_error::{QueryLifecycleError, QueryLifecycleErrorCode};
 pub use server::{

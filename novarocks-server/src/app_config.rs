@@ -24,6 +24,7 @@ use crate::state_store_config::{
     StateStoreConfig, StateStoreProviderConfig,
 };
 use crate::state_store_limits::StateStoreLimitOverrides;
+use novarocks_native_trust::NativeTransportMode;
 use novarocks_secret::SecretValue;
 use novarocks_types::ClusterRole;
 use uuid::Uuid;
@@ -443,6 +444,9 @@ pub struct NovaRocksConfig {
 
     #[serde(default)]
     pub cluster: ClusterConfig,
+
+    #[serde(default, deserialize_with = "deserialize_native_trust_config")]
+    pub native_trust: Option<NativeTrustConfig>,
 }
 
 impl NovaRocksConfig {
@@ -483,8 +487,99 @@ impl NovaRocksConfig {
             .validate()
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("validate [cluster]: {}", path.display()))?;
+        if cfg.native_trust.is_none() {
+            bail!(
+                "config {}: missing required [native_trust] table",
+                path.display()
+            );
+        }
         Ok(cfg)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeTrustConfig {
+    pub deployment_id: String,
+    pub shared_secret: SecretValue,
+    pub transport: NativeTrustTransportConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeTrustTransportConfig {
+    pub mode: NativeTransportMode,
+    pub certificate_chain_path: Option<PathBuf>,
+    pub private_key_path: Option<PathBuf>,
+    pub trust_roots_path: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeTrustConfigWire {
+    deployment_id: String,
+    shared_secret: String,
+    #[serde(default)]
+    transport: NativeTrustTransportConfigWire,
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NativeTrustTransportConfigWire {
+    mode: Option<String>,
+    certificate_chain_path: Option<PathBuf>,
+    private_key_path: Option<PathBuf>,
+    trust_roots_path: Option<PathBuf>,
+}
+
+impl Default for NativeTrustTransportConfigWire {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            certificate_chain_path: None,
+            private_key_path: None,
+            trust_roots_path: None,
+        }
+    }
+}
+
+fn deserialize_native_trust_config<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<NativeTrustConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let wire = Option::<NativeTrustConfigWire>::deserialize(deserializer)?;
+    wire.map(|wire| {
+        let mode = match wire.transport.mode.as_deref().unwrap_or("disabled") {
+            "disabled" => NativeTransportMode::Disabled,
+            "automatic" => NativeTransportMode::Automatic,
+            "pem" => NativeTransportMode::Pem,
+            _ => return Err(serde::de::Error::custom("native_trust.transport.mode must be disabled, automatic, or pem")),
+        };
+        let transport = NativeTrustTransportConfig {
+            mode,
+            certificate_chain_path: wire.transport.certificate_chain_path,
+            private_key_path: wire.transport.private_key_path,
+            trust_roots_path: wire.transport.trust_roots_path,
+        };
+        let has_pem_paths = transport.certificate_chain_path.is_some()
+            || transport.private_key_path.is_some()
+            || transport.trust_roots_path.is_some();
+        if mode == NativeTransportMode::Pem {
+            if transport.certificate_chain_path.is_none()
+                || transport.private_key_path.is_none()
+                || transport.trust_roots_path.is_none()
+            {
+                return Err(serde::de::Error::custom("native_trust.transport.mode=pem requires certificate_chain_path, private_key_path, and trust_roots_path"));
+            }
+        } else if has_pem_paths {
+            return Err(serde::de::Error::custom("native_trust PEM paths are only valid when transport.mode=pem"));
+        }
+        Ok(NativeTrustConfig {
+            deployment_id: wire.deployment_id,
+            shared_secret: SecretValue::new(wire.shared_secret),
+            transport,
+        })
+    }).transpose()
 }
 
 fn load_resolved_config_value(path: &Path) -> Result<toml::Value> {
@@ -550,6 +645,7 @@ impl Default for NovaRocksConfig {
             connector: ConnectorConfig::default(),
             spill: SpillStorageConfig::default(),
             cluster: ClusterConfig::default(),
+            native_trust: None,
         }
     }
 }

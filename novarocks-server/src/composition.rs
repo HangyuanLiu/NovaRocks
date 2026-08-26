@@ -19,7 +19,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::app_config::NovaRocksConfig;
-use crate::network;
+use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
 #[cfg(feature = "mysql-state-store-provider")]
 use crate::state_store_config::MySqlTlsMode;
 use crate::state_store_config::{
@@ -411,21 +411,21 @@ pub fn compose_backend_execution_installers(
 /// Frontend, StateStore, or connector wire sections.
 pub fn compose_backend_server_config(
     config: &NovaRocksConfig,
+    native_trust: &NativeTrustSnapshot,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<BackendServerConfig> {
     let runtime_config = &config.runtime;
-    let advertise_endpoint = network::standalone_advertise_endpoint(
-        &config.server.host,
-        &config.server.priority_networks,
-        &config.cluster.advertise_host,
-        config.server.grpc_port,
-    )
-    .map_err(|error| anyhow::anyhow!("resolve backend advertise endpoint: {error}"))?;
+    let advertise_endpoint = novarocks_types::AdvertiseEndpoint {
+        host: native_trust.advertised_endpoint().host().to_string(),
+        port: native_trust.advertised_endpoint().port(),
+    };
     Ok(BackendServerConfig {
         bind_host: config.server.host.clone(),
         grpc_port: config.server.grpc_port,
         metrics_http_port: config.server.http_port,
         advertise_endpoint,
+        native_trust: std::sync::Arc::clone(native_trust.trust()),
+        native_transport: backend_native_transport(native_trust.transport()),
         query_lifecycle_sweep_interval: Duration::from_millis(
             runtime_config.query_control_heartbeat_interval_ms,
         ),
@@ -466,17 +466,11 @@ pub fn compose_backend_server_config(
 /// Resolve every Frontend startup input from the application wire configuration.
 pub fn compose_frontend_server_config(
     config: &NovaRocksConfig,
+    native_trust: &NativeTrustSnapshot,
     port_override: Option<u16>,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<FrontendServerConfig> {
     let runtime_config = &config.runtime;
-    let advertised = network::standalone_advertise_endpoint(
-        &config.server.host,
-        &config.server.priority_networks,
-        &config.cluster.advertise_host,
-        config.server.grpc_port,
-    )
-    .map_err(|error| anyhow::anyhow!("resolve frontend advertise endpoint: {error}"))?;
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
     let failure_backoff_ms = config
@@ -484,8 +478,8 @@ pub fn compose_frontend_server_config(
         .as_ref()
         .map(|standalone| standalone.mv_refresh_scheduler_failure_backoff_ms.max(1));
     let mut execution = FrontendExecutionConfig::new(
-        advertised.host,
-        advertised.port,
+        native_trust.advertised_endpoint().host().to_string(),
+        native_trust.advertised_endpoint().port(),
         runtime_filter_worker_count,
     )
     .with_lake_publication_runtime_policy(
@@ -583,7 +577,37 @@ pub fn compose_frontend_server_config(
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
         state_store_input,
         state_store_provider_registry,
+        native_trust: std::sync::Arc::clone(native_trust.trust()),
+        native_transport: frontend_native_transport(native_trust.transport()),
     })
+}
+
+fn backend_native_transport(
+    transport: &NativeTrustTransport,
+) -> novarocks_backend::BackendNativeTransport {
+    match transport {
+        NativeTrustTransport::Plaintext => novarocks_backend::BackendNativeTransport::Plaintext,
+        NativeTrustTransport::Automatic(material) => {
+            novarocks_backend::BackendNativeTransport::Automatic(material.clone())
+        }
+        NativeTrustTransport::Pem(material) => {
+            novarocks_backend::BackendNativeTransport::Pem(material.clone())
+        }
+    }
+}
+
+fn frontend_native_transport(
+    transport: &NativeTrustTransport,
+) -> novarocks_frontend::FrontendNativeTransport {
+    match transport {
+        NativeTrustTransport::Plaintext => novarocks_frontend::FrontendNativeTransport::plaintext(),
+        NativeTrustTransport::Automatic(material) => {
+            novarocks_frontend::FrontendNativeTransport::automatic(material.clone())
+        }
+        NativeTrustTransport::Pem(material) => {
+            novarocks_frontend::FrontendNativeTransport::pem(material.clone())
+        }
+    }
 }
 
 fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntimeConfig {

@@ -26,6 +26,7 @@ libc = "0.2"
 novarocks-fs = { path = "../fs" }
 novarocks-execution = { path = "../execution" }
 novarocks-failpoint = { path = "../failpoint" }
+novarocks-native-trust = { path = "../native-trust" }
 novarocks-proto = { path = "../proto" }
 novarocks-proto-models = { path = "../proto-models" }
 novarocks-parser = { path = "../parser" }
@@ -49,6 +50,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 
 [dev-dependencies]
 novarocks-connector-starrocks = { path = "../connector/starrocks" }
+novarocks-secret = { path = "../secret" }
 novarocks-spi = { path = "../spi", features = ["state-store-conformance"] }
 novarocks-sql = { path = "../sql", features = ["test-support"] }
 tempfile = "3"

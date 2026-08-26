@@ -1,15 +1,30 @@
 use std::net::TcpListener;
+use std::sync::Arc;
 
 use std::time::Duration;
 
 use novarocks_backend::{
-    BackendApplicationErrorKind, BackendApplicationHost, BackendDataRuntime, BackendServerConfig,
-    QueryLifecycleRegistryConfig,
+    BackendApplicationErrorKind, BackendApplicationHost, BackendDataRuntime,
+    BackendNativeTransport, BackendServerConfig, QueryLifecycleRegistryConfig,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
+use novarocks_native_trust::{
+    DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
+};
+use novarocks_secret::SecretValue;
 use novarocks_types::AdvertiseEndpoint;
+
+fn test_native_trust() -> Arc<NativeTrust> {
+    Arc::new(NativeTrust::new(
+        DeploymentId::parse("backend-test").expect("valid deployment"),
+        ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))
+            .expect("valid secret"),
+        NativeCallerSubject::parse("be@127.0.0.1:9070").expect("valid subject"),
+        NativeTransportMode::Disabled,
+    ))
+}
 
 fn unused_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -30,6 +45,8 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
             host: "127.0.0.1".to_string(),
             port: advertise_port,
         },
+        native_trust: test_native_trust(),
+        native_transport: BackendNativeTransport::Plaintext,
         query_lifecycle_sweep_interval: Duration::from_millis(1_000),
         query_lifecycle_config: QueryLifecycleRegistryConfig::new(
             4_096,
@@ -91,7 +108,11 @@ fn host_rejects_an_unsealed_connector_installer_set() {
         .expect("build Backend application host runtime");
     let error = BackendApplicationHost::open(
         backend_config(grpc_port, grpc_port),
-        BackendDataRuntime::new(runtime.handle().clone()),
+        BackendDataRuntime::new(
+            runtime.handle().clone(),
+            test_native_trust(),
+            BackendNativeTransport::Plaintext,
+        ),
     )
     .expect_err("unsealed connector installer set must fail startup");
     assert_eq!(error.kind(), BackendApplicationErrorKind::Configuration);

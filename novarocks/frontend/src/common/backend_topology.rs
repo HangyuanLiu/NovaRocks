@@ -18,7 +18,6 @@
 //! Neutral frontend-facing backend topology and lifecycle boundary.
 
 use std::fmt;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
@@ -40,9 +39,9 @@ pub trait BackendTopologyPort: Send + Sync + 'static {
     /// are visible to lifecycle accounting without inflating fragment counts.
     fn record_successful_stage(&self, backend_idx: usize, fragment_count: usize);
 
-    fn add_backend(&self, endpoint: SocketAddr) -> Result<(), String>;
+    fn add_backend(&self, endpoint: RuntimeEndpoint) -> Result<(), String>;
 
-    fn drop_backend(&self, endpoint: SocketAddr, force: bool) -> Result<(), String>;
+    fn drop_backend(&self, endpoint: RuntimeEndpoint, force: bool) -> Result<(), String>;
 
     fn show_backends(&self) -> Result<crate::runtime::query_result::QueryResult, String>;
 }
@@ -173,19 +172,19 @@ pub fn publish_backend_topology_metrics(snapshot: BackendTopologyMetricsSnapshot
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveBackendSnapshot {
-    entries: Vec<(usize, SocketAddr)>,
+    entries: Vec<(usize, RuntimeEndpoint)>,
 }
 
 impl LiveBackendSnapshot {
-    pub fn new(entries: Vec<(usize, SocketAddr)>) -> Self {
+    pub fn new(entries: Vec<(usize, RuntimeEndpoint)>) -> Self {
         Self { entries }
     }
 
-    pub fn from_endpoints(backends: Vec<SocketAddr>) -> Self {
+    pub fn from_endpoints(backends: Vec<RuntimeEndpoint>) -> Self {
         Self::new(backends.into_iter().enumerate().collect())
     }
 
-    pub fn entries(&self) -> &[(usize, SocketAddr)] {
+    pub fn entries(&self) -> &[(usize, RuntimeEndpoint)] {
         &self.entries
     }
 }
@@ -224,7 +223,7 @@ impl CoordinatorReportEndpoint {
         })
     }
 
-    pub fn from_socket_addr(endpoint: SocketAddr) -> Self {
+    pub fn from_socket_addr(endpoint: std::net::SocketAddr) -> Self {
         Self {
             endpoint: RuntimeEndpoint::from_socket_addr(endpoint),
         }
@@ -248,15 +247,15 @@ pub enum BackendQueryEvent {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LiveBackendTarget {
     backend_idx: usize,
-    endpoint: SocketAddr,
+    endpoint: RuntimeEndpoint,
     start_epoch: u64,
 }
 
 impl LiveBackendTarget {
-    pub fn new(backend_idx: usize, endpoint: SocketAddr, start_epoch: u64) -> Self {
+    pub fn new(backend_idx: usize, endpoint: RuntimeEndpoint, start_epoch: u64) -> Self {
         Self {
             backend_idx,
             endpoint,
@@ -264,15 +263,15 @@ impl LiveBackendTarget {
         }
     }
 
-    pub const fn backend_idx(self) -> usize {
+    pub const fn backend_idx(&self) -> usize {
         self.backend_idx
     }
 
-    pub const fn endpoint(self) -> SocketAddr {
-        self.endpoint
+    pub fn endpoint(&self) -> &RuntimeEndpoint {
+        &self.endpoint
     }
 
-    pub const fn start_epoch(self) -> u64 {
+    pub const fn start_epoch(&self) -> u64 {
         self.start_epoch
     }
 }
@@ -330,7 +329,7 @@ impl BackendTopologySnapshot {
         self.targets
             .binary_search_by_key(&backend_idx, |target| target.backend_idx())
             .ok()
-            .map(|index| self.targets[index])
+            .map(|index| self.targets[index].clone())
     }
 }
 
@@ -413,11 +412,11 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
 
     fn record_successful_stage(&self, _backend_idx: usize, _fragment_count: usize) {}
 
-    fn add_backend(&self, _endpoint: SocketAddr) -> Result<(), String> {
+    fn add_backend(&self, _endpoint: RuntimeEndpoint) -> Result<(), String> {
         Err("backend topology port is not installed".to_string())
     }
 
-    fn drop_backend(&self, _endpoint: SocketAddr, _force: bool) -> Result<(), String> {
+    fn drop_backend(&self, _endpoint: RuntimeEndpoint, _force: bool) -> Result<(), String> {
         Err("backend topology port is not installed".to_string())
     }
 
@@ -428,11 +427,10 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
     use super::{
         BackendTopologyError, BackendTopologySnapshot, CoordinatorReportEndpoint, LiveBackendTarget,
     };
+    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 
     #[test]
     fn coordinator_report_endpoint_accepts_advertised_dns_hostnames() {
@@ -442,11 +440,11 @@ mod tests {
 
     #[test]
     fn topology_snapshot_sorts_targets_by_backend_id() {
-        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9030);
+        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9030").expect("endpoint");
         let snapshot = BackendTopologySnapshot::try_new(
             7,
             vec![
-                LiveBackendTarget::new(9, endpoint, 1),
+                LiveBackendTarget::new(9, endpoint.clone(), 1),
                 LiveBackendTarget::new(2, endpoint, 3),
             ],
         )
@@ -465,12 +463,12 @@ mod tests {
 
     #[test]
     fn topology_snapshot_rejects_duplicate_backend_ids() {
-        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9030);
+        let endpoint = RuntimeEndpoint::parse("127.0.0.1:9030").expect("endpoint");
         assert_eq!(
             BackendTopologySnapshot::try_new(
                 7,
                 vec![
-                    LiveBackendTarget::new(2, endpoint, 1),
+                    LiveBackendTarget::new(2, endpoint.clone(), 1),
                     LiveBackendTarget::new(2, endpoint, 2),
                 ],
             ),

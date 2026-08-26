@@ -25,7 +25,6 @@ pub use native_submission::{
 };
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -374,7 +373,7 @@ impl ScheduleBoundDistributedQuery {
                 .values()
                 .map(|target| RuntimeFilterBackendTopologyEntry {
                     backend_idx: target.backend_idx(),
-                    endpoint: target.endpoint(),
+                    endpoint: target.endpoint().clone(),
                     start_epoch: target.start_epoch(),
                 })
                 .collect(),
@@ -576,23 +575,23 @@ impl<'a> RuntimeFilterScheduledView<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeFilterBackendTopologyEntry {
     backend_idx: usize,
-    endpoint: SocketAddr,
+    endpoint: RuntimeEndpoint,
     start_epoch: u64,
 }
 
 impl RuntimeFilterBackendTopologyEntry {
-    pub const fn backend_idx(self) -> usize {
+    pub const fn backend_idx(&self) -> usize {
         self.backend_idx
     }
 
-    pub const fn endpoint(self) -> SocketAddr {
-        self.endpoint
+    pub fn endpoint(&self) -> &RuntimeEndpoint {
+        &self.endpoint
     }
 
-    pub const fn start_epoch(self) -> u64 {
+    pub const fn start_epoch(&self) -> u64 {
         self.start_epoch
     }
 }
@@ -977,11 +976,11 @@ impl SchedulingEdgeView<'_> {
 /// remains core-private.
 pub struct BackendPlacement {
     backend_idx: usize,
-    endpoint: SocketAddr,
+    endpoint: RuntimeEndpoint,
 }
 
 impl BackendPlacement {
-    pub const fn new(backend_idx: usize, endpoint: SocketAddr) -> Self {
+    pub fn new(backend_idx: usize, endpoint: RuntimeEndpoint) -> Self {
         Self {
             backend_idx,
             endpoint,
@@ -1026,16 +1025,17 @@ impl FragmentScheduleDraft {
                     target.backend_idx()
                 )));
             }
-            if !endpoints.insert(target.endpoint()) {
+            if !endpoints.insert(target.endpoint().clone()) {
                 return Err(contract_error(format!(
                     "frontend schedule live topology repeats endpoint {}",
                     target.endpoint()
                 )));
             }
-            if by_backend.insert(target.backend_idx(), target).is_some() {
+            let backend_idx = target.backend_idx();
+            if by_backend.insert(backend_idx, target).is_some() {
                 return Err(contract_error(format!(
                     "frontend schedule live topology repeats backend {}",
-                    target.backend_idx()
+                    backend_idx
                 )));
             }
         }
@@ -1124,7 +1124,7 @@ impl ValidatedFragmentSchedule {
                                 placement.backend_idx
                             ))
                         })?;
-                    if frozen.endpoint() != placement.endpoint {
+                    if frozen.endpoint() != &placement.endpoint {
                         return Err(contract_error(format!(
                             "frontend schedule placement backend {} endpoint {} differs from frozen topology endpoint {}",
                             placement.backend_idx, placement.endpoint, frozen.endpoint()
@@ -1139,7 +1139,7 @@ impl ValidatedFragmentSchedule {
                             instance_index,
                         )?,
                         backend_idx: placement.backend_idx,
-                        endpoint: RuntimeEndpoint::from_socket_addr(placement.endpoint),
+                        endpoint: placement.endpoint.clone(),
                         scan_ranges: BTreeMap::new(),
                         connector_splits: BTreeMap::new(),
                         destinations: Vec::new(),

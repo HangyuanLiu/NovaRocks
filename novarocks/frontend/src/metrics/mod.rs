@@ -24,8 +24,8 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 pub(crate) mod dml_publication;
@@ -110,6 +110,19 @@ static FRONTEND_QUERY_LIFECYCLE_LATENCY: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("register novarocks_frontend_query_lifecycle_latency_micros")
 });
 
+/// Bounded, role-local Native transport rejections. The label names the FE
+/// listener family and never contains a caller, endpoint, token, or error.
+static NATIVE_TRUST_TRANSPORT_REJECTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "novarocks_native_trust_transport_rejections_total",
+            "Native listener connections rejected before Frontend RPC dispatch.",
+        ),
+        &["listener"],
+    )
+    .expect("register novarocks_native_trust_transport_rejections_total")
+});
+
 /// Explicit collector registry owned by one Frontend management host.
 ///
 /// This keeps FE's metrics surface role-local even when a process supervises
@@ -131,6 +144,7 @@ impl FrontendMetricsRegistry {
             Box::new(FRONTEND_QUERY_LIFECYCLE_INIT.clone()),
             Box::new(FRONTEND_QUERY_LIFECYCLE_CONTROL.clone()),
             Box::new(FRONTEND_QUERY_LIFECYCLE_LATENCY.clone()),
+            Box::new(NATIVE_TRUST_TRANSPORT_REJECTIONS.clone()),
         ] {
             registry
                 .register(collector)
@@ -154,6 +168,12 @@ pub(crate) fn observe_fragments_scheduled(count: usize) {
 /// heartbeat transport to Core's former gRPC client implementation.
 pub fn observe_backend_heartbeat_rtt(duration: Duration) {
     Lazy::force(&HEARTBEAT_RTT_SECONDS).observe(duration.as_secs_f64());
+}
+
+pub(crate) fn observe_native_trust_transport_rejection(listener: &'static str) {
+    NATIVE_TRUST_TRANSPORT_REJECTIONS
+        .with_label_values(&[listener])
+        .inc();
 }
 /// Publishes already-counted backend registry states as neutral scalars.
 ///

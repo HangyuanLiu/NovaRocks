@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ptr;
 
-use novarocks_types::AdvertiseEndpoint;
+use novarocks_types::{AdvertiseEndpoint, NativeEndpoint, NativeReferenceHost};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Cidr {
@@ -49,6 +49,53 @@ pub fn standalone_advertise_endpoint(
         host,
         port: grpc_port,
     })
+}
+
+/// Resolve the advertised Native RPC identity without resolving a configured
+/// DNS name. The returned reference host is the identity later used by TLS
+/// verification and channel caching.
+pub fn standalone_native_advertise_endpoint(
+    bind_host: &str,
+    priority_networks: &str,
+    configured_advertise_host: &str,
+    configured_advertise_port: u16,
+    grpc_port: u16,
+) -> Result<NativeEndpoint, String> {
+    let port = if configured_advertise_port == 0 {
+        grpc_port
+    } else {
+        configured_advertise_port
+    };
+    if !configured_advertise_host.is_empty() {
+        if configured_advertise_host.trim() != configured_advertise_host {
+            return Err(
+                "native advertised reference host must not contain surrounding whitespace"
+                    .to_string(),
+            );
+        }
+        let endpoint = NativeEndpoint::from_host_port(configured_advertise_host, port)?;
+        if matches!(endpoint.reference_host(), NativeReferenceHost::Ip(address) if address.is_unspecified())
+        {
+            return Err(
+                "native advertised endpoint must not use an unspecified IP address".to_string(),
+            );
+        }
+        return Ok(endpoint);
+    }
+    let endpoint = standalone_advertise_endpoint(
+        bind_host,
+        priority_networks,
+        configured_advertise_host,
+        port,
+    )?;
+    let endpoint = NativeEndpoint::from_host_port(&endpoint.host, endpoint.port)?;
+    if matches!(endpoint.reference_host(), NativeReferenceHost::Ip(address) if address.is_unspecified())
+    {
+        return Err(
+            "native advertised endpoint must not use an unspecified IP address".to_string(),
+        );
+    }
+    Ok(endpoint)
 }
 
 fn choose_advertise_host(
@@ -233,7 +280,10 @@ fn mask_v6(addr: Ipv6Addr, prefix_len: u8) -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalAddress, choose_advertise_host, standalone_advertise_endpoint};
+    use super::{
+        LocalAddress, choose_advertise_host, standalone_advertise_endpoint,
+        standalone_native_advertise_endpoint,
+    };
     use std::net::IpAddr;
 
     fn addr(ip: &str, is_loopback: bool) -> LocalAddress {
@@ -320,5 +370,29 @@ mod tests {
             .expect("resolve endpoint");
         assert_eq!(endpoint.host, "be.example.com");
         assert_eq!(endpoint.port, 19080);
+    }
+
+    #[test]
+    fn native_advertise_endpoint_preserves_dns_identity_and_configured_port() {
+        let endpoint = standalone_native_advertise_endpoint(
+            "0.0.0.0",
+            "",
+            "BE.Example.Internal",
+            19081,
+            19080,
+        )
+        .expect("resolve native endpoint");
+
+        assert_eq!(endpoint.as_host_port(), "be.example.internal:19081");
+    }
+
+    #[test]
+    fn native_advertise_endpoint_rejects_whitespace_and_unspecified_ip() {
+        for host in [" be.example", "0.0.0.0", "::"] {
+            assert!(
+                standalone_native_advertise_endpoint("0.0.0.0", "", host, 0, 19080).is_err(),
+                "{host}"
+            );
+        }
     }
 }
