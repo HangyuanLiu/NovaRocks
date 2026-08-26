@@ -3801,15 +3801,15 @@ fn validate_publication_catalog_directives(
             if step.meta.publication_catalog_fault.is_none() {
                 continue;
             }
-            if suite_name != "lake-publication" {
+            if !matches!(suite_name, "lake-publication" | "lnp-3d-mv-accelerator") {
                 bail!(
-                    "@publication_catalog_fault is acceptance-only and is only valid in lake-publication (found in {suite_name}/{})",
+                    "@publication_catalog_fault is acceptance-only and is only valid in lake-publication or lnp-3d-mv-accelerator (found in {suite_name}/{})",
                     case.case_id
                 );
             }
             if !case.sequential {
                 bail!(
-                    "@publication_catalog_fault requires file-level @sequential=true (lake-publication/{})",
+                    "@publication_catalog_fault requires file-level @sequential=true ({suite_name}/{})",
                     case.case_id
                 );
             }
@@ -4717,18 +4717,18 @@ fn start_publication_catalog_fixture(
     runner_config: &mut RunnerConfig,
     selected_suites: &[String],
 ) -> Result<Option<publication_catalog::FixtureHandle>> {
-    if !selected_suites
-        .iter()
-        .any(|suite| suite == "lake-publication")
+    if !selected_suites.iter().any(|suite| {
+        matches!(suite.as_str(), "lake-publication" | "lnp-3d-mv-accelerator")
+    })
     {
         return Ok(None);
     }
     if let Some(disallowed) = selected_suites
         .iter()
-        .find(|suite| suite.as_str() != "lake-publication")
+        .find(|suite| !matches!(suite.as_str(), "lake-publication" | "lnp-3d-mv-accelerator"))
     {
         bail!(
-            "publication catalog fixture is acceptance-only; selected suite {disallowed} cannot run with lake-publication"
+            "publication catalog fixture is acceptance-only; selected suite {disallowed} cannot run with a lake publication acceptance suite"
         );
     }
     let downstream = runner_config
@@ -4737,7 +4737,7 @@ fn start_publication_catalog_fixture(
         .cloned()
         .or_else(|| std::env::var("NOVAROCKS_ICEBERG_REST_URI").ok())
         .filter(|uri| !uri.trim().is_empty())
-        .context("lake-publication requires iceberg_rest_uri")?;
+        .context("lake publication acceptance requires iceberg_rest_uri")?;
     let fixture = publication_catalog::FixtureHandle::start(downstream)?;
     runner_config
         .values

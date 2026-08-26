@@ -115,8 +115,10 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
     let action = match action.trim() {
         "stage-create" => PublicationCatalogAction::StageCreate,
         "table-commit" => PublicationCatalogAction::TableCommit,
+        "namespace-list" => PublicationCatalogAction::NamespaceList,
+        "table-load" => PublicationCatalogAction::TableLoad,
         other => anyhow::bail!(
-            "invalid @publication_catalog_fault action `{other}`; expected stage-create, table-commit"
+            "invalid @publication_catalog_fault action `{other}`; expected stage-create, table-commit, namespace-list, table-load"
         ),
     };
     let fault = match fault.trim() {
@@ -125,10 +127,34 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
         "after-commit-hold-for-frontend-kill" => {
             PublicationCatalogFault::AfterCommitHoldForFrontendKill
         }
+        "incomplete-discovery" => PublicationCatalogFault::IncompleteDiscovery,
+        "corrupt-package" => PublicationCatalogFault::CorruptPackage,
         other => anyhow::bail!(
-            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, after-commit-before-response, after-commit-hold-for-frontend-kill"
+            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, after-commit-before-response, after-commit-hold-for-frontend-kill, incomplete-discovery, corrupt-package"
         ),
     };
+    let compatible = matches!(
+        (action, fault),
+        (
+            PublicationCatalogAction::StageCreate | PublicationCatalogAction::TableCommit,
+            PublicationCatalogFault::BeforeDispatch
+                | PublicationCatalogFault::AfterCommitBeforeResponse
+                | PublicationCatalogFault::AfterCommitHoldForFrontendKill
+        ) | (
+            PublicationCatalogAction::NamespaceList,
+            PublicationCatalogFault::IncompleteDiscovery
+        ) | (
+            PublicationCatalogAction::TableLoad,
+            PublicationCatalogFault::CorruptPackage
+        )
+    );
+    if !compatible {
+        anyhow::bail!(
+            "invalid @publication_catalog_fault action/fault combination `{}` / `{}`",
+            action.as_str(),
+            fault.as_str()
+        );
+    }
     Ok(PublicationCatalogFaultDirective { action, fault })
 }
 
@@ -1383,6 +1409,37 @@ mod opt5_directive_tests {
                 fault: PublicationCatalogFault::AfterCommitBeforeResponse,
             })
         );
+    }
+
+    #[test]
+    fn parse_meta_parses_catalog_discovery_and_package_read_faults() {
+        let re = meta_re();
+        for (directive, expected) in [
+            (
+                "-- @publication_catalog_fault=namespace-list,incomplete-discovery",
+                PublicationCatalogFaultDirective {
+                    action: PublicationCatalogAction::NamespaceList,
+                    fault: PublicationCatalogFault::IncompleteDiscovery,
+                },
+            ),
+            (
+                "-- @publication_catalog_fault=table-load,corrupt-package",
+                PublicationCatalogFaultDirective {
+                    action: PublicationCatalogAction::TableLoad,
+                    fault: PublicationCatalogFault::CorruptPackage,
+                },
+            ),
+        ] {
+            let meta = parse_meta(&[directive.to_string()], &re)
+                .expect("parse catalog observation fault");
+            assert_eq!(meta.publication_catalog_fault, Some(expected));
+        }
+        let error = parse_meta(
+            &["-- @publication_catalog_fault=namespace-list,corrupt-package".to_string()],
+            &re,
+        )
+        .expect_err("crossed catalog observation fault must be rejected");
+        assert!(error.to_string().contains("action/fault combination"));
     }
 
     #[test]

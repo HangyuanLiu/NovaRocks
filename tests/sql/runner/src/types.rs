@@ -431,6 +431,8 @@ pub use novarocks_cluster_harness::QueryLifecyclePhase;
 pub enum PublicationCatalogAction {
     StageCreate,
     TableCommit,
+    NamespaceList,
+    TableLoad,
 }
 
 impl PublicationCatalogAction {
@@ -438,6 +440,8 @@ impl PublicationCatalogAction {
         match self {
             Self::StageCreate => "stage-create",
             Self::TableCommit => "table-commit",
+            Self::NamespaceList => "namespace-list",
+            Self::TableLoad => "table-load",
         }
     }
 }
@@ -449,6 +453,10 @@ pub enum PublicationCatalogFault {
     /// Hold the downstream-successful response until the runner has killed
     /// the frontend while the issuing statement is still in flight.
     AfterCommitHoldForFrontendKill,
+    /// Return a syntactically valid but incomplete standard namespace listing.
+    IncompleteDiscovery,
+    /// Return malformed bytes for exactly one standard table package read.
+    CorruptPackage,
 }
 
 impl PublicationCatalogFault {
@@ -457,6 +465,8 @@ impl PublicationCatalogFault {
             Self::BeforeDispatch => "before-dispatch",
             Self::AfterCommitBeforeResponse => "after-commit-before-response",
             Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
+            Self::IncompleteDiscovery => "incomplete-discovery",
+            Self::CorruptPackage => "corrupt-package",
         }
     }
 
