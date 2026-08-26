@@ -32,7 +32,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::membership::{BackendProcessDescriptor, BackendReportedState};
-use novarocks_types::{BackendProcessId, ClusterRole};
+use novarocks_types::{BackendProcessId, ClusterRole, NativeEndpoint};
 use novarocks_version::native_build_identity;
 use tokio::runtime::Handle;
 
@@ -166,6 +166,7 @@ pub(crate) struct ClusterBackendService {
     heartbeat_interval: Duration,
     announce_lease_ttl: Duration,
     heartbeat_probe: Arc<HeartbeatProbe>,
+    channel_invalidator: Arc<dyn Fn(&NativeEndpoint) + Send + Sync>,
     heartbeat_thread: Mutex<Option<JoinHandle<()>>>,
     heartbeat_round: Mutex<()>,
     heartbeat_signal: Mutex<HeartbeatSignal>,
@@ -191,9 +192,12 @@ impl ClusterBackendService {
         if config.role() == ClusterRole::Be {
             return Err("role=be must not open ClusterBackendService".to_string());
         }
-        let service = Arc::new(Self::new(&config, move |endpoint, process_id| {
-            native_heartbeat(&data_runtime, process_id, endpoint)
-        }));
+        let heartbeat_runtime = data_runtime.clone();
+        let service = Arc::new(Self::new(
+            &config,
+            move |endpoint, process_id| native_heartbeat(&heartbeat_runtime, process_id, endpoint),
+            move |endpoint| data_runtime.invalidate_channel(endpoint),
+        ));
         let _ = runtime;
         // Only a BE can create its immutable ProcessId descriptor through
         // AnnounceBackend.
@@ -201,9 +205,10 @@ impl ClusterBackendService {
         Ok(service)
     }
 
-    fn new<F>(config: &ClusterBackendOpenConfig, probe: F) -> Self
+    fn new<F, I>(config: &ClusterBackendOpenConfig, probe: F, invalidate_channel: I) -> Self
     where
         F: Fn(RuntimeEndpoint, BackendProcessId) -> HeartbeatOutcome + Send + Sync + 'static,
+        I: Fn(&NativeEndpoint) + Send + Sync + 'static,
     {
         Self {
             state: Mutex::new(TopologyState {
@@ -217,6 +222,7 @@ impl ClusterBackendService {
             heartbeat_interval: config.heartbeat_interval(),
             announce_lease_ttl: config.announce_lease_ttl(),
             heartbeat_probe: Arc::new(probe),
+            channel_invalidator: Arc::new(invalidate_channel),
             heartbeat_thread: Mutex::new(None),
             heartbeat_round: Mutex::new(()),
             heartbeat_signal: Mutex::new(HeartbeatSignal {
@@ -247,9 +253,11 @@ impl ClusterBackendService {
         );
         let handle = runtime.handle().clone();
         let data_runtime = FrontendDataRuntime::new(handle);
-        let mut service = Self::new(&config, move |endpoint, process_id| {
-            native_heartbeat(&data_runtime, process_id, endpoint)
-        });
+        let mut service = Self::new(
+            &config,
+            move |endpoint, process_id| native_heartbeat(&data_runtime, process_id, endpoint),
+            |_| {},
+        );
         service._test_runtime_owner = Some(runtime);
         service
     }
@@ -552,6 +560,7 @@ impl ClusterBackendService {
         let old_owner = transfer
             .then(|| state.endpoint_owners.get(&endpoint).copied())
             .flatten();
+        let replaced = transfer && old_owner.is_some_and(|old| old != process_id);
         if transfer {
             state.pending_endpoint_owners.remove(&endpoint);
             state.endpoint_owners.insert(endpoint.clone(), process_id);
@@ -576,6 +585,9 @@ impl ClusterBackendService {
         }
         let changed = advance_if_eligible_changed(&mut state, before).unwrap_or(false);
         drop(state);
+        if replaced {
+            (self.channel_invalidator)(endpoint.native_endpoint());
+        }
         if changed {
             self.publish_snapshot();
         }
