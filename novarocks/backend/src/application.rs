@@ -153,6 +153,7 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
             crate::query_lifecycle::StageBuildDecision::Build(permit) => {
                 let execution_id = request.execution_id();
                 let fragments = request.fragments();
+                let stage_digest = permit.digest();
                 let build = self
                     .fragments
                     .stage_fragments(execution_id, &fragments, permit.gate());
@@ -161,7 +162,7 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
                     Err(error) => QueryStageAck::new(
                         request.execution_id(),
                         request.digest_version(),
-                        request.digest(),
+                        stage_digest,
                         QueryStageOutcome::RejectedLocalFailure,
                         error.to_string(),
                     )

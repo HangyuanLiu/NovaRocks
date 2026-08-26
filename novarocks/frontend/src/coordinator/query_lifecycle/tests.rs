@@ -393,7 +393,12 @@ trait QueryLifecycleIngress: Send + Sync + 'static {
         protocol_lifecycle::QueryStageAck::new(
             request.execution_id(),
             request.digest_version(),
-            request.digest(),
+            protocol_lifecycle::StageDigest::compute_v1(
+                request.execution_id(),
+                request.init_digest(),
+                &request.fragments(),
+            )
+            .expect("validated stage request derives a digest"),
             protocol_lifecycle::QueryStageOutcome::RejectedInvalidState,
             "StageFragments is not supported by this lifecycle ingress",
         )

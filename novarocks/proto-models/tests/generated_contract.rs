@@ -146,9 +146,10 @@ fn retired_request_self_attestation_fields_remain_reserved() {
     // Each entry named a digest whose derivation inputs were entirely present in
     // the same message. The receiver derives the identity instead; other
     // messages keep carrying it as a cross-message reference.
-    for (message_name, field_number, field_name) in
-        [("novarocks.InitQueryRequest", 2, "init_digest")]
-    {
+    for (message_name, field_number, field_name) in [
+        ("novarocks.InitQueryRequest", 2, "init_digest"),
+        ("novarocks.StageFragmentsRequest", 4, "stage_digest"),
+    ] {
         let message = pool
             .get_message_by_name(message_name)
             .unwrap_or_else(|| panic!("{message_name} descriptor"));

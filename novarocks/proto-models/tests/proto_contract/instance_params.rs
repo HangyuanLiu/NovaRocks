@@ -270,7 +270,6 @@ fn stage_fragment_request_carries_native_fields_only() {
         }),
         init_digest: vec![1; 32],
         stage_digest_version: 1,
-        stage_digest: vec![2; 32],
         fragments: vec![novarocks::StageFragment {
             plan: Some(plan::PlanFragment::default()),
             instance_params: Some(novarocks::InstanceParams {

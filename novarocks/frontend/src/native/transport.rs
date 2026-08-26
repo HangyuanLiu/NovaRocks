@@ -598,12 +598,11 @@ impl QueryLifecycleTransport for LifecycleTransport {
         let ack = QueryStageAck::parse(response).map_err(invalid)?;
         if ack.execution_id() != request.execution_id()
             || ack.digest_version() != request.digest_version()
-            || ack.digest() != request.digest()
         {
-            return Err(invalid(
-                "StageFragments acknowledgement identity or digest mismatch",
-            ));
+            return Err(invalid("StageFragments acknowledgement identity mismatch"));
         }
+        // The acknowledged stage identity is compared by the coordinator
+        // against the value its StageBatch retained when the batch was frozen.
         Ok(ack)
     }
     fn start_prepared_query(

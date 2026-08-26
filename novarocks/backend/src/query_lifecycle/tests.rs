@@ -1089,16 +1089,8 @@ fn stage_request(
         .copied()
         .map(|instance| stage_fragment(instance, digest_byte))
         .collect::<Vec<_>>();
-    let digest = StageDigest::compute_v1(execution_id, init_digest, &fragments)
-        .expect("valid test Stage digest");
-    QueryStageRequest::new(
-        execution_id,
-        init_digest,
-        StageDigestVersion::V1,
-        digest,
-        fragments,
-    )
-    .expect("valid stage request")
+    QueryStageRequest::new(execution_id, init_digest, StageDigestVersion::V1, fragments)
+        .expect("valid stage request")
 }
 
 fn protocol_execution_id(execution_id: QueryExecutionId) -> QueryExecutionId {
@@ -1111,11 +1103,20 @@ fn protocol_manifest_digest(
     digest
 }
 
+fn stage_digest(stage: &QueryStageRequest) -> StageDigest {
+    StageDigest::compute_v1(
+        stage.execution_id(),
+        stage.init_digest(),
+        &stage.fragments(),
+    )
+    .expect("valid test Stage digest")
+}
+
 fn start_request(request: &QueryInitRequest, stage: &QueryStageRequest) -> QueryStartRequest {
     QueryStartRequest::new(
         protocol_execution_id(request.manifest().execution_id()),
         StageDigestVersion::V1,
-        stage.digest(),
+        stage_digest(stage),
     )
     .expect("valid test Start request")
 }
@@ -1200,16 +1201,6 @@ fn stage_requires_matching_manifest_exact_set_and_control_attachment() {
         protocol_execution_id(request.manifest().execution_id()),
         novarocks_proto::lifecycle::ParticipantManifestDigest::new([7; 32]),
         StageDigestVersion::V1,
-        StageDigest::compute_v1(
-            protocol_execution_id(request.manifest().execution_id()),
-            novarocks_proto::lifecycle::ParticipantManifestDigest::new([7; 32]),
-            &expected
-                .iter()
-                .copied()
-                .map(|instance| stage_fragment(instance, 1))
-                .collect::<Vec<_>>(),
-        )
-        .expect("well formed mismatched stage digest"),
         expected
             .iter()
             .copied()

@@ -80,7 +80,7 @@ use novarocks_proto::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
     QueryInitOutcome, QueryInitRequest, QueryStageAck, QueryStageOutcome, QueryStageRequest,
     QueryStartAck, QueryStartOutcome, QueryStartRequest, QueryTerminationAck,
-    QueryTerminationReason,
+    QueryTerminationReason, StageDigest,
 };
 #[cfg(test)]
 use novarocks_proto_models::novarocks as protocol;
@@ -527,7 +527,12 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         QueryStageAck::new(
             request.execution_id(),
             request.digest_version(),
-            request.digest(),
+            StageDigest::compute_v1(
+                request.execution_id(),
+                request.init_digest(),
+                &request.fragments(),
+            )
+            .map_err(protocol_contract_error)?,
             QueryStageOutcome::Applied,
             "test participant staged",
         )

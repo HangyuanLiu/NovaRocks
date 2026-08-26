@@ -191,13 +191,16 @@ message StageFragment {
 }
 
 // The immutable complete fragment set prepared by one lifecycle participant.
-// The digest is over the canonical semantic projection, never the outer RPC
-// wire bytes. An empty fragment list is valid for service-only participants.
+// The stage identity is derived from this content by both roles rather than
+// carried here; `stage_digest_version` selects the derivation projection, and
+// the Start fence and acknowledgements reference the derived value. An empty
+// fragment list is valid for service-only participants.
 message StageFragmentsRequest {
   QueryExecutionId execution_id = 1;
   bytes init_digest = 2;
   uint32 stage_digest_version = 3;
-  bytes stage_digest = 4;
+  reserved 4;
+  reserved "stage_digest";
   repeated StageFragment fragments = 5;
 }
 

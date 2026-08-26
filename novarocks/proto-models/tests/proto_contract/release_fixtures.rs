@@ -331,7 +331,6 @@ fn release_stage_fragments_request() -> novarocks::StageFragmentsRequest {
         }),
         init_digest: vec![0x11; 32],
         stage_digest_version: 1,
-        stage_digest: vec![0x22; 32],
         fragments: vec![novarocks::StageFragment {
             plan: Some(release_plan_fragment()),
             instance_params: Some(novarocks::InstanceParams {

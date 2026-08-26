@@ -487,7 +487,7 @@ fn stage_one(
             ))
         }
     };
-    validate_stage_ack(target.backend_idx(), request, &ack)
+    validate_stage_ack(target.backend_idx(), batch, &ack)
 }
 
 fn start_one(
@@ -516,12 +516,13 @@ fn start_one(
 
 fn validate_stage_ack(
     backend_idx: usize,
-    request: &QueryStageRequest,
+    batch: &StageBatch,
     ack: &QueryStageAck,
 ) -> Result<(), (usize, String)> {
+    let request = batch.request();
     if ack.execution_id() != request.execution_id()
         || ack.digest_version() != request.digest_version()
-        || ack.digest() != request.digest()
+        || ack.digest() != batch.digest()
     {
         return Err((
             backend_idx,

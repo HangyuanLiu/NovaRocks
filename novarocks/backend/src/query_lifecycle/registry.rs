@@ -4356,6 +4356,12 @@ impl StageBuildPermit {
         Arc::clone(&self.gate)
     }
 
+    /// The stage identity derived once when the build was reserved. Callers
+    /// acknowledge with this value instead of deriving it again.
+    pub(crate) const fn digest(&self) -> StageDigest {
+        self.digest
+    }
+
     pub(crate) fn commit(mut self) -> QueryStageAck {
         let mut state = self.entry.state.lock().expect("query lifecycle entry lock");
         let (outcome, detail) = if state.termination_reason.is_some()
