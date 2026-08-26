@@ -138,13 +138,15 @@ hash4="${hash:0:4}"
 offset=$((16#$hash4 % 1000))
 mysql_port_start="${NOVA_ENV_MYSQL_PORT_START:-9030}"
 mysql_port_range="${NOVA_ENV_MYSQL_PORT_RANGE:-200}"
-grpc_port_start="${NOVA_ENV_GRPC_PORT_START:-9080}"
-grpc_port_range="${NOVA_ENV_GRPC_PORT_RANGE:-200}"
-# The metrics listener defaults to a fixed 8040 in the server, so a worktree
-# that leaves it unset makes every other worktree's server fail to bind. Range
-# chosen clear of the REST fixture (8181) and of that default.
-http_port_start="${NOVA_ENV_HTTP_PORT_START:-8240}"
-http_port_range="${NOVA_ENV_HTTP_PORT_RANGE:-200}"
+fe_grpc_port_start="${NOVA_ENV_FE_GRPC_PORT_START:-9080}"
+fe_grpc_port_range="${NOVA_ENV_FE_GRPC_PORT_RANGE:-200}"
+be_grpc_port_start="${NOVA_ENV_BE_GRPC_PORT_START:-9280}"
+be_grpc_port_range="${NOVA_ENV_BE_GRPC_PORT_RANGE:-200}"
+# Management ports use distinct ranges from Native gRPC and the REST fixture.
+fe_http_port_start="${NOVA_ENV_FE_HTTP_PORT_START:-8240}"
+fe_http_port_range="${NOVA_ENV_FE_HTTP_PORT_RANGE:-200}"
+be_http_port_start="${NOVA_ENV_BE_HTTP_PORT_START:-8440}"
+be_http_port_range="${NOVA_ENV_BE_HTTP_PORT_RANGE:-200}"
 configured_compose_project="${NOVA_ENV_SHARED_COMPOSE_PROJECT:-nr-iceberg-rest}"
 configured_minio_port="${NOVA_ENV_MINIO_PORT:-9000}"
 configured_minio_console_port="${NOVA_ENV_MINIO_CONSOLE_PORT:-9001}"
@@ -169,8 +171,10 @@ if [[ -f "$exports_file" ]]; then
     spark_ui_port="${NOVA_ENV_SPARK_UI_PORT:-4040}"
   fi
   mysql_port="${NOVA_ENV_MYSQL_PORT}"
-  grpc_port="${NOVA_ENV_GRPC_PORT:-$(choose_port_in_range "$grpc_port_start" "$grpc_port_range" "$offset")}"
-  http_port="${NOVA_ENV_HTTP_PORT:-$(choose_port_in_range "$http_port_start" "$http_port_range" "$offset")}"
+  fe_grpc_port="${NOVA_ENV_FE_GRPC_PORT:-$(choose_port_in_range "$fe_grpc_port_start" "$fe_grpc_port_range" "$offset")}"
+  be_grpc_port="${NOVA_ENV_BE_GRPC_PORT:-$(choose_port_in_range "$be_grpc_port_start" "$be_grpc_port_range" "$offset")}"
+  fe_http_port="${NOVA_ENV_FE_HTTP_PORT:-$(choose_port_in_range "$fe_http_port_start" "$fe_http_port_range" "$offset")}"
+  be_http_port="${NOVA_ENV_BE_HTTP_PORT:-$(choose_port_in_range "$be_http_port_start" "$be_http_port_range" "$offset")}"
 else
   if [[ "$shared_docker" == "true" ]]; then
     minio_port="$configured_minio_port"
@@ -178,16 +182,20 @@ else
     rest_port="$configured_rest_port"
     spark_ui_port="$configured_spark_ui_port"
     mysql_port="$(choose_port_in_range "$mysql_port_start" "$mysql_port_range" "$offset")"
-    grpc_port="$(choose_port_in_range "$grpc_port_start" "$grpc_port_range" "$offset")"
-    http_port="$(choose_port_in_range "$http_port_start" "$http_port_range" "$offset")"
+    fe_grpc_port="$(choose_port_in_range "$fe_grpc_port_start" "$fe_grpc_port_range" "$offset")"
+    be_grpc_port="$(choose_port_in_range "$be_grpc_port_start" "$be_grpc_port_range" "$offset")"
+    fe_http_port="$(choose_port_in_range "$fe_http_port_start" "$fe_http_port_range" "$offset")"
+    be_http_port="$(choose_port_in_range "$be_http_port_start" "$be_http_port_range" "$offset")"
   else
     minio_port="$(choose_port $((19000 + offset)))"
     minio_console_port="$(choose_port $((20000 + offset)))"
     rest_port="$(choose_port $((21000 + offset)))"
     spark_ui_port="$(choose_port $((22000 + offset)))"
     mysql_port="$(choose_port $((23000 + offset)))"
-    grpc_port="$(choose_port $((24000 + offset)))"
-    http_port="$(choose_port $((25000 + offset)))"
+    fe_grpc_port="$(choose_port $((24000 + offset)))"
+    be_grpc_port="$(choose_port $((25000 + offset)))"
+    fe_http_port="$(choose_port $((26000 + offset)))"
+    be_http_port="$(choose_port $((27000 + offset)))"
   fi
 fi
 shared_docker="${NOVA_ENV_SHARED_DOCKER:-$shared_docker}"
@@ -358,42 +366,15 @@ NOVA_ENV_SPARK_VERSION=$spark_version
 NOVA_ENV_ICEBERG_VERSION=$iceberg_version
 EOF
 
-cat > "$runtime_dir/standalone.toml" <<EOF
+cat > "$runtime_dir/fe.toml" <<EOF
 [server]
 host = "127.0.0.1"
-http_port = $http_port
-grpc_port = $grpc_port
+http_port = $fe_http_port
+grpc_port = $fe_grpc_port
 
-[runtime]
-exchange_wait_ms = 300000
-
-[state_store]
-provider = "sqlite"
-path = "$runtime_dir/frontend-state.sqlite"
-cluster_id = "$env_id"
-deployment_owner = "fe-1"
-
-[standalone_server]
-mysql_port = $mysql_port
-user = "root"
-
-[connector.object_store]
-endpoint = "$minio_endpoint"
-access_key_id = "\${ENV:AWS_S3_ACCESS_KEY_ID}"
-access_key_secret = "\${ENV:AWS_S3_SECRET_ACCESS_KEY}"
-# Every generated and suite-owned CREATE EXTERNAL CATALOG statement declares
-# aws.s3.region, and the Iceberg control factory rejects a catalog whose
-# object-store credentials differ from this server-composed binding, so the
-# region has to be stated on both sides.
-region = "us-east-1"
-enable_path_style_access = true
-EOF
-
-cat > "$runtime_dir/standalone-scheduler.toml" <<EOF
-[server]
-host = "127.0.0.1"
-http_port = $http_port
-grpc_port = $grpc_port
+[cluster]
+role = "fe"
+backends = ["127.0.0.1:$be_grpc_port"]
 
 [runtime]
 exchange_wait_ms = 300000
@@ -412,6 +393,31 @@ mv_refresh_scheduler_interval_ms = 200
 mv_refresh_scheduler_max_concurrent = 1
 mv_refresh_scheduler_failure_backoff_ms = 500
 mv_refresh_scheduler_max_failure_backoff_ms = 2000
+
+[connector.object_store]
+endpoint = "$minio_endpoint"
+access_key_id = "\${ENV:AWS_S3_ACCESS_KEY_ID}"
+access_key_secret = "\${ENV:AWS_S3_SECRET_ACCESS_KEY}"
+# Every generated and suite-owned CREATE EXTERNAL CATALOG statement declares
+# aws.s3.region, and the Iceberg control factory rejects a catalog whose
+# object-store credentials differ from this server-composed binding, so the
+# region has to be stated on both sides.
+region = "us-east-1"
+enable_path_style_access = true
+EOF
+
+cat > "$runtime_dir/be.toml" <<EOF
+[server]
+host = "127.0.0.1"
+http_port = $be_http_port
+grpc_port = $be_grpc_port
+
+[cluster]
+role = "be"
+advertise_host = "127.0.0.1"
+
+[runtime]
+exchange_wait_ms = 300000
 
 [connector.object_store]
 endpoint = "$minio_endpoint"
@@ -538,8 +544,10 @@ export NOVA_ENV_MINIO_CONSOLE_PORT="$minio_console_port"
 export NOVA_ENV_REST_PORT="$rest_port"
 export NOVA_ENV_SPARK_UI_PORT="$spark_ui_port"
 export NOVA_ENV_MYSQL_PORT="$mysql_port"
-export NOVA_ENV_GRPC_PORT="$grpc_port"
-export NOVA_ENV_HTTP_PORT="$http_port"
+export NOVA_ENV_FE_GRPC_PORT="$fe_grpc_port"
+export NOVA_ENV_FE_HTTP_PORT="$fe_http_port"
+export NOVA_ENV_BE_GRPC_PORT="$be_grpc_port"
+export NOVA_ENV_BE_HTTP_PORT="$be_http_port"
 export AWS_S3_ENDPOINT="$minio_endpoint"
 export AWS_S3_ACCESS_KEY_ID="$minio_user"
 export AWS_S3_SECRET_ACCESS_KEY="$minio_password"
@@ -552,8 +560,8 @@ export NOVA_ENV_SHARED_REST_WAREHOUSE_URI="$shared_rest_warehouse"
 export NOVA_ENV_REST_SERVER_WAREHOUSE_URI="$compose_rest_warehouse"
 export NOVA_ENV_REST_WAREHOUSE_URI="$rest_warehouse"
 export NOVAROCKS_ICEBERG_REST_WAREHOUSE="$rest_warehouse"
-export NOVAROCKS_STANDALONE_CONFIG="$runtime_dir/standalone.toml"
-export NOVAROCKS_STANDALONE_SCHEDULER_CONFIG="$runtime_dir/standalone-scheduler.toml"
+export NOVAROCKS_FE_CONFIG="$runtime_dir/fe.toml"
+export NOVAROCKS_BE_CONFIG="$runtime_dir/be.toml"
 export NOVAROCKS_STATE_STORE_PATH="$runtime_dir/frontend-state.sqlite"
 export NOVAROCKS_SQL_TEST_CONFIG="$runtime_dir/sql-test.toml"
 export NOVAROCKS_ICE_REST_CATALOG_SQL="$runtime_dir/ice-rest-catalog.sql"
@@ -604,9 +612,12 @@ cat > "$manifest_file" <<EOF
   },
   "novarocks": {
     "mysql_port": $mysql_port,
-    "grpc_port": $grpc_port,
-    "standalone_config": "$runtime_dir/standalone.toml",
-    "standalone_scheduler_config": "$runtime_dir/standalone-scheduler.toml",
+    "fe_grpc_port": $fe_grpc_port,
+    "fe_http_port": $fe_http_port,
+    "be_grpc_port": $be_grpc_port,
+    "be_http_port": $be_http_port,
+    "fe_config": "$runtime_dir/fe.toml",
+    "be_config": "$runtime_dir/be.toml",
     "state_store_path": "$runtime_dir/frontend-state.sqlite",
     "sql_test_config": "$runtime_dir/sql-test.toml",
     "ice_rest_catalog_sql": "$runtime_dir/ice-rest-catalog.sql",
@@ -637,11 +648,14 @@ Do not guess ports.
 - REST server default warehouse: \`$compose_rest_warehouse\`
 - Spark UI: \`http://127.0.0.1:$spark_ui_port\`
 - NovaRocks MySQL port: \`$mysql_port\`
-- NovaRocks gRPC port: \`$grpc_port\`
+- NovaRocks FE Native gRPC port: \`$fe_grpc_port\`
+- NovaRocks FE management HTTP port: \`$fe_http_port\`
+- NovaRocks BE Native gRPC port: \`$be_grpc_port\`
+- NovaRocks BE management HTTP port: \`$be_http_port\`
 - Manifest: \`$manifest_file\`
 - Env exports: \`$exports_file\`
-- Standalone config: \`$runtime_dir/standalone.toml\`
-- Scheduler-enabled standalone config: \`$runtime_dir/standalone-scheduler.toml\`
+- FE config: \`$runtime_dir/fe.toml\`
+- BE config: \`$runtime_dir/be.toml\`
 - Frontend StateStore: \`$runtime_dir/frontend-state.sqlite\`
 - SQL test config: \`$runtime_dir/sql-test.toml\`
 - Additional Iceberg test warehouse: \`$iceberg_test_warehouse\`
@@ -649,7 +663,7 @@ Do not guess ports.
 - Spark defaults: \`$spark_defaults_file\`
 - Spark v3 smoke SQL: \`$spark_v3_smoke_sql\`
 
-Both standalone configs use this worktree-local StateStore. Frontend
+The generated FE config uses this worktree-local StateStore. Frontend
 \`ALTER TABLE ... OPTIMIZE\` job history is durable across restarts only while
 the same runtime entry and StateStore path are retained.
 
@@ -658,8 +672,8 @@ Use:
 \`\`\`bash
 source "$current_link/env.sh"
 docker/iceberg-rest/up.sh  # start or reuse shared Docker services when needed
-cargo run -p novarocks-server -- standalone --config "\$NOVAROCKS_STANDALONE_CONFIG"
-cargo run -p novarocks-server -- standalone --config "\$NOVAROCKS_STANDALONE_SCHEDULER_CONFIG"
+cargo run -p novarocks-server -- standalone --role all-in-one \\
+  --fe-config "\$NOVAROCKS_FE_CONFIG" --be-config "\$NOVAROCKS_BE_CONFIG"
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-mv-scheduler --mode verify
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify
@@ -726,8 +740,8 @@ $docker_state
 Use:
   source "$current_link/env.sh"
 $docker_start_hint
-  cargo run -p novarocks-server -- standalone --config "\$NOVAROCKS_STANDALONE_CONFIG"
-  cargo run -p novarocks-server -- standalone --config "\$NOVAROCKS_STANDALONE_SCHEDULER_CONFIG"
+  cargo run -p novarocks-server -- standalone --role all-in-one \\
+    --fe-config "\$NOVAROCKS_FE_CONFIG" --be-config "\$NOVAROCKS_BE_CONFIG"
   cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg --mode verify
   cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-mv-scheduler --mode verify
   cargo run --manifest-path tests/sql/runner/Cargo.toml -- --config "\$NOVAROCKS_SQL_TEST_CONFIG" --suite iceberg-compatibility --mode verify

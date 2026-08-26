@@ -10,11 +10,9 @@ use std::thread::JoinHandle;
 
 use crate::coordinator::QueryTerminalIngress;
 use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
-use axum::Json;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
 use novarocks_proto::lifecycle::{
     ParticipantTerminalOutcome, QueryTerminalReportAck, QueryTerminalReportOutcome,
 };
@@ -41,9 +39,9 @@ use super::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServe
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
-const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
+pub(crate) const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
 
-fn lifecycle_convergence_debug_enabled() -> bool {
+pub(crate) fn lifecycle_convergence_debug_enabled() -> bool {
     cfg!(debug_assertions)
         && std::env::var_os(novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV).is_some()
 }
@@ -263,13 +261,11 @@ struct RuntimeFilterScanNotEvaluatedDebug {
     snapshot_not_published: u64,
 }
 
-async fn latest_lifecycle_convergence_snapshot(
-    reader: Arc<dyn QueryLifecycleConvergenceReader>,
-) -> axum::response::Response {
-    let Some(snapshot) = reader.latest_convergence_snapshot() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    Json(lifecycle_convergence_debug_snapshot(snapshot)).into_response()
+pub(crate) fn lifecycle_convergence_debug_json(
+    snapshot: QueryLifecycleConvergenceSnapshot,
+) -> serde_json::Value {
+    serde_json::to_value(lifecycle_convergence_debug_snapshot(snapshot))
+        .expect("frontend lifecycle convergence debug snapshot is serializable")
 }
 
 fn lifecycle_convergence_debug_snapshot(
@@ -849,7 +845,9 @@ fn report_response_from_ack(
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
     use std::net::SocketAddr;
+    use std::net::TcpStream;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1175,6 +1173,41 @@ mod tests {
             server.stop().expect("stop frontend report server");
         }
     }
+
+    #[test]
+    fn report_listener_rejects_management_metrics_path_through_grpc_fallback() {
+        let ingress = Arc::new(FixedIngress {
+            ack: QueryTerminalReportAck::new(QueryTerminalReportOutcome::Accepted, "unused")
+                .expect("valid report acknowledgement"),
+        });
+        let convergence_reader: Arc<dyn QueryLifecycleConvergenceReader> =
+            Arc::new(EmptyConvergenceReader);
+        let mut server = FrontendReportServerHandle::start(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            ingress,
+            convergence_reader,
+        )
+        .expect("start frontend report server");
+
+        let mut stream = TcpStream::connect(server.bound_addr()).expect("connect report listener");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("set report read timeout");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .expect("write management probe");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read report response");
+        assert!(response.contains("grpc-status: 12"), "{response}");
+        assert!(
+            !response.contains("novarocks_fragment_scheduled_total"),
+            "native report listener must not render management metrics: {response}"
+        );
+
+        server.stop().expect("stop frontend report server");
+    }
 }
 
 fn status_from_lifecycle_error(error: QueryLifecycleError) -> tonic::Status {
@@ -1223,7 +1256,7 @@ impl FrontendReportServerHandle {
     pub(crate) fn start(
         address: SocketAddr,
         ingress: Arc<dyn QueryTerminalIngress>,
-        convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
+        _convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
     ) -> Result<Self, String> {
         let listener = TcpListener::bind(address).map_err(|error| {
             format!("bind frontend report endpoint on {address} failed: {error}")
@@ -1263,19 +1296,7 @@ impl FrontendReportServerHandle {
                         );
                         let app = Router::new()
                             .route_service(&grpc_path, AxumGrpcService::new(service))
-                            .route("/metrics", get(crate::metrics::handle_metrics))
                             .fallback(grpc_unimplemented_fallback);
-                        let app = if lifecycle_convergence_debug_enabled() {
-                            let debug_reader = Arc::clone(&convergence_reader);
-                            app.route(
-                                LIFECYCLE_CONVERGENCE_DEBUG_PATH,
-                                get(move || {
-                                    latest_lifecycle_convergence_snapshot(Arc::clone(&debug_reader))
-                                }),
-                            )
-                        } else {
-                            app
-                        };
                         let mut shutdown_rx = shutdown_rx;
                         let serve = axum::serve(listener, app).into_future();
                         tokio::pin!(serve);

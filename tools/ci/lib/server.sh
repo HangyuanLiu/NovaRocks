@@ -35,24 +35,28 @@ ci_novarocks_binary_path() {
   esac
 }
 
-ci_start_standalone_server() {
-  local config_path="$1"
-  local log_path="$2"
-  local timeout_seconds="$3"
-  local cargo_profile="${4:-dev-opt}"
+ci_start_all_in_one_server() {
+  local fe_config_path="$1"
+  local be_config_path="$2"
+  local log_path="$3"
+  local timeout_seconds="$4"
+  local cargo_profile="${5:-dev-opt}"
   local binary_path
   local i
 
   binary_path="$(ci_novarocks_binary_path "$cargo_profile")"
 
   {
-    printf "+ NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1 NO_PROXY=127.0.0.1,localhost %q standalone --config %q\n" \
+    printf "+ NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1 NO_PROXY=127.0.0.1,localhost %q standalone --role all-in-one --fe-config %q --be-config %q\n" \
       "$binary_path" \
-      "$config_path"
+      "$fe_config_path" \
+      "$be_config_path"
     NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1 \
     NO_PROXY=127.0.0.1,localhost \
       "$binary_path" standalone \
-        --config "$config_path"
+        --role all-in-one \
+        --fe-config "$fe_config_path" \
+        --be-config "$be_config_path"
   } >"$log_path" 2>&1 &
   CI_SERVER_PID=$!
 
@@ -80,7 +84,7 @@ ci_start_standalone_server() {
   return 2
 }
 
-ci_stop_standalone_server() {
+ci_stop_all_in_one_server() {
   if [ -n "$CI_SERVER_PID" ] && kill -0 "$CI_SERVER_PID" 2>/dev/null; then
     kill "$CI_SERVER_PID" 2>/dev/null || true
     wait "$CI_SERVER_PID" 2>/dev/null || true

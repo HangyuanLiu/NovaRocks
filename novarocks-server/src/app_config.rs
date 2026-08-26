@@ -261,7 +261,7 @@ fn default_decommission_timeout_secs() -> u64 {
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
-            role: ClusterRole::default(),
+            role: ClusterRole::Fe,
             backends: Vec::new(),
             advertise_host: String::new(),
             advertise_port: 0,
@@ -292,14 +292,6 @@ impl ClusterConfig {
                 if !self.backends.is_empty() {
                     return Err(format!(
                         "role=be must not configure [cluster].backends (got {} entries)",
-                        self.backends.len()
-                    ));
-                }
-            }
-            ClusterRole::AllInOne => {
-                if !self.backends.is_empty() {
-                    return Err(format!(
-                        "role=all-in-one must not configure [cluster].backends (got {} entries)",
                         self.backends.len()
                     ));
                 }
@@ -456,23 +448,65 @@ pub struct NovaRocksConfig {
 impl NovaRocksConfig {
     // Design: ADR-0107 (docs/adr/ADR-0107-static-startup-secret-resolution.md)
     pub fn load_from_file(path: &Path) -> Result<Self> {
-        let s = std::fs::read_to_string(path)
-            .with_context(|| format!("read config file: {}", path.display()))?;
-        let mut value: toml::Value =
-            toml::from_str(&s).with_context(|| format!("parse config TOML: {}", path.display()))?;
-        resolve_env_references(&mut value).with_context(|| {
-            format!("resolve config environment references: {}", path.display())
-        })?;
-        let cfg: NovaRocksConfig = value
-            .try_into()
-            .with_context(|| format!("deserialize config TOML: {}", path.display()))?;
-        validate_state_store_configuration(&cfg)?;
-        validate_query_control_config(&cfg.runtime)?;
-        validate_lake_publication_runtime_policy(&cfg.runtime)?;
-        #[cfg(not(debug_assertions))]
-        reject_fault_injection_environment()?;
+        deserialize_loaded_config(path, load_resolved_config_value(path)?)
+    }
+
+    /// Load a deployable role configuration. Unlike the generic deserializer
+    /// used by in-process test builders, a server config must name its role
+    /// explicitly and may only describe one application role.
+    pub fn load_deployable_from_file(path: &Path) -> Result<Self> {
+        let document = load_resolved_config_value(path)?;
+        let cluster = document
+            .get("cluster")
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "config {}: missing required [cluster] table",
+                    path.display()
+                )
+            })?;
+        let role = cluster
+            .get("role")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!("config {}: missing required [cluster].role", path.display())
+            })?;
+        if !matches!(role, "fe" | "be") {
+            bail!(
+                "config {}: [cluster].role must be `fe` or `be`, got `{role}`",
+                path.display()
+            );
+        }
+
+        let cfg = deserialize_loaded_config(path, document)?;
+        cfg.cluster
+            .validate()
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("validate [cluster]: {}", path.display()))?;
         Ok(cfg)
     }
+}
+
+fn load_resolved_config_value(path: &Path) -> Result<toml::Value> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("read config file: {}", path.display()))?;
+    let mut value: toml::Value = toml::from_str(&source)
+        .with_context(|| format!("parse config TOML: {}", path.display()))?;
+    resolve_env_references(&mut value)
+        .with_context(|| format!("resolve config environment references: {}", path.display()))?;
+    Ok(value)
+}
+
+fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRocksConfig> {
+    let cfg: NovaRocksConfig = value
+        .try_into()
+        .with_context(|| format!("deserialize config TOML: {}", path.display()))?;
+    validate_state_store_configuration(&cfg)?;
+    validate_query_control_config(&cfg.runtime)?;
+    validate_lake_publication_runtime_policy(&cfg.runtime)?;
+    #[cfg(not(debug_assertions))]
+    reject_fault_injection_environment()?;
+    Ok(cfg)
 }
 
 /// Reject runner-owned fault-injection environment variables in release builds.
@@ -2361,13 +2395,13 @@ mem_limit = "0"
     }
 
     #[test]
-    fn test_cluster_default_is_all_in_one() {
+    fn test_cluster_builder_default_is_frontend_only() {
         let toml = r#"
 [server]
 host = "127.0.0.1"
 "#;
         let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse default");
-        assert_eq!(cfg.cluster.role, super::ClusterRole::AllInOne);
+        assert_eq!(cfg.cluster.role, super::ClusterRole::Fe);
         assert!(cfg.cluster.backends.is_empty());
     }
 
@@ -2462,59 +2496,6 @@ role = "leader"
 "#;
         let result: Result<NovaRocksConfig, _> = toml::from_str(toml);
         assert!(result.is_err(), "invalid role string should fail parse");
-    }
-
-    #[test]
-    fn test_all_in_one_rejects_non_empty_backends() {
-        // I2: role=all-in-one with non-empty backends must be rejected.
-        let toml = r#"
-[cluster]
-role = "all-in-one"
-backends = ["127.0.0.1:9070"]
-"#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse all-in-one with backends");
-        let err = cfg
-            .cluster
-            .validate()
-            .expect_err("all-in-one with backends should fail");
-        assert!(
-            err.contains("all-in-one") && err.contains("backends"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn test_all_in_one_with_no_backends_passes_validation() {
-        // Default all-in-one with no backends must still pass.
-        let toml = r#"
-[cluster]
-role = "all-in-one"
-"#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse all-in-one");
-        cfg.cluster
-            .validate()
-            .expect("all-in-one with no backends should pass");
-    }
-
-    #[test]
-    fn test_all_in_one_rejects_multiple_backends() {
-        // I2: multiple backends should also be rejected for all-in-one.
-        let toml = r#"
-[cluster]
-role = "all-in-one"
-backends = ["127.0.0.1:9070", "127.0.0.1:9071"]
-"#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
-        let err = cfg
-            .cluster
-            .validate()
-            .expect_err("all-in-one with 2 backends should fail");
-        assert!(
-            err.contains("all-in-one") && err.contains("backends"),
-            "unexpected error: {err}"
-        );
-        // Error message should contain the count.
-        assert!(err.contains('2'), "expected count 2 in error: {err}");
     }
 
     #[test]

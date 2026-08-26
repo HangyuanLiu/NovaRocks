@@ -73,14 +73,15 @@ Important generated files (under the runtime entry):
 - `env.sh` — shell exports for this workspace.
 - `manifest.json` — machine-readable ports, endpoints, compose project, and config paths.
 - `README.md` — human-readable summary of the active environment.
-- `standalone.toml` — NovaRocks standalone config.
-- `standalone-scheduler.toml` — the same fixture with the MV refresh scheduler enabled.
+- `fe.toml` — deployable FE config with StateStore, an additive BE seed, and
+  the FE Native/management listeners.
+- `be.toml` — deployable BE config with the BE Native/management listeners.
 - `sql-test.toml` — SQL test runner config.
 - `ice-rest-catalog.sql` — REST catalog DDL for this workspace.
 - `spark-defaults.conf` — Spark catalog config for REST Catalog + MinIO.
 - `spark-iceberg-v3-smoke.sql` — Spark SQL that creates and writes a format-v3 Iceberg row-lineage table.
 
-Both standalone configs use the same per-worktree SQLite StateStore at
+The generated FE config uses the per-worktree SQLite StateStore at
 `runtime/<env-id>/frontend-state.sqlite`, with `<env-id>` as the cluster ID and
 `fe-1` as the deployment owner. The frontend maintenance service stores
 asynchronous `ALTER TABLE ... OPTIMIZE` jobs there, so terminal job history
@@ -102,7 +103,8 @@ Use the generated configs:
 source docker/iceberg-rest/runtime/current/env.sh
 
 NO_PROXY=127.0.0.1,localhost \
-cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
 
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
@@ -220,10 +222,12 @@ designed to be safe to call from CI:
   allocated NovaRocks port if `env.sh` already exists.
 - Docker service ports come from `shared.env` and default to `9000`, `9001`,
   `8181`, and `4040`.
-- The NovaRocks standalone MySQL port is allocated per worktree from
+- The NovaRocks FE MySQL port is allocated per worktree from
   `NOVA_ENV_MYSQL_PORT_START` / `NOVA_ENV_MYSQL_PORT_RANGE`.
-- The NovaRocks standalone gRPC port is allocated per worktree from
-  `NOVA_ENV_GRPC_PORT_START` / `NOVA_ENV_GRPC_PORT_RANGE`.
+- The four NovaRocks listener ports are allocated per worktree from
+  `NOVA_ENV_FE_GRPC_PORT_START`, `NOVA_ENV_FE_HTTP_PORT_START`,
+  `NOVA_ENV_BE_GRPC_PORT_START`, and `NOVA_ENV_BE_HTTP_PORT_START` (with their
+  corresponding `_RANGE` settings).
 - `down.sh --runtime-only --purge` removes only the per-worktree runtime
   directory.
 - The runtime directory (`docker/iceberg-rest/runtime/`) is gitignored.
@@ -238,7 +242,9 @@ trap "docker/iceberg-rest/down.sh --runtime-only --purge" EXIT
 SERVER_LOG=/tmp/novarocks-server.log
 NO_PROXY=127.0.0.1,localhost \
 cargo run --release -p novarocks-server -- standalone \
-  --config "$NOVAROCKS_STANDALONE_CONFIG" >"$SERVER_LOG" 2>&1 &
+  --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" \
+  --be-config "$NOVAROCKS_BE_CONFIG" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 trap "kill $SERVER_PID; docker/iceberg-rest/down.sh --runtime-only --purge" EXIT
 

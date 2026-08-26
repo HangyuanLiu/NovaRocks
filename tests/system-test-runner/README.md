@@ -29,8 +29,9 @@ No Docker fixture is required. Every registered scenario builds its Iceberg
 warehouse on the local filesystem under the harness runtime directory, so
 `tools/ci/fixtures/system-scenarios-base.toml` — SQLite StateStore, no
 `[connector.object_store]` — is enough. A worktree's generated
-`$NOVAROCKS_STANDALONE_CONFIG` also works if you have one; it just carries
-object-store settings the scenarios never read.
+The generated `$NOVAROCKS_FE_CONFIG` / `$NOVAROCKS_BE_CONFIG` pair also works
+when started through the exact `--role all-in-one --fe-config ... --be-config
+...` command; it only adds object-store settings the scenarios never read.
 
 Scenarios run sequentially. On failure the runner prints action history,
 process diagnostics, the retained runtime/log directory and an exact rerun

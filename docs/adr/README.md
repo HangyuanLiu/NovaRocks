@@ -185,7 +185,12 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 混入 native lifecycle。StarRocks 仅是只读 Connector：RPC 覆盖所有拓扑，direct
 永久只支持 shared-data。
 
-- ADR-0026 — 为何退役 StarRocks-compatible backend runtime role，并把 StarRocks 限定为外部 Connector（active）
+
+- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
+
+#### 历史
+
+- ADR-0026 — 为何退役 StarRocks-compatible backend runtime role，并把 StarRocks 限定为外部 Connector（superseded → ADR-0108）
 
 ### backend-architecture
 
@@ -202,13 +207,14 @@ frontend 的 `ClusterBackendService` 通过 StateStore 成为唯一 membership a
 `BackendTopologyPort`，不保留 metadata bridge、global registry 或内存 durable fallback。配置的 backend 是 additive
 seeds，动态 ADD/DROP 的结果跨 FE 重启恢复；单 FE writer 与未来多 FE fencing/takeover 分阶段裁决。
 
-- ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（active）
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（active）
+- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
 
 #### 历史
 
 - ADR-0103 — 中央 Provider wire authority 与同构 Native build admission 为何统一由 Protocol 和 Frontend topology 拥有（superseded → ADR-0105）
 - ADR-0105 — Provider wire authority 为何与 SPI domain carrier 分离、但仍保持单一 Protocol digest（superseded → ADR-0106）
+- ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（superseded → ADR-0108）
 
 ### catalog-attachment
 
@@ -299,13 +305,14 @@ fallback 模糊 owner 和故障语义。
 - ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active）
 - ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active）
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（active）
-- ADR-0099 — 聚合 Core 退场后为何按真实 owner 物理切断依赖（active）
 - ADR-0093 — StateStore provider 为何作为 leaf crate、Frontend 直接拥有 consumer runtime（active）
 - ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
+- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
 
 #### 历史
 
 - ADR-0098 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（superseded → ADR-0106）
+- ADR-0099 — 聚合 Core 退场后为何按真实 owner 物理切断依赖（superseded → ADR-0108）
 
 ### configuration
 
@@ -313,13 +320,14 @@ fallback 模糊 owner 和故障语义。
 各 owner 的 resolved typed input；domain crate 不重复解析 TOML，也不接收完整根配置。不存在进程级 `config()` 单例，
 debug/test 开关归启动进程环境。跨域 wire section 不因名字相似而整体归某一 kernel crate，Core 不拥有 application schema。
 
-- ADR-0072 — 完整应用配置 wire 为何由 Server 唯一拥有，并投影为各 domain 的 resolved typed input（active）
 - ADR-0087 — 进程 data runtime 为何由 Server 创建并经 role-local adapter 注入 FE/BE（active）
 - ADR-0107 — 静态 startup secret 为何由 Server exact resolve，并向 provider 投影 direct credential（active）
+- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
 
 #### 历史
 
 - ADR-0059 — 配置为何由组合根注入，而不从进程全局读取（superseded → ADR-0072）
+- ADR-0072 — 完整应用配置 wire 为何由 Server 唯一拥有，并投影为各 domain 的 resolved typed input（superseded → ADR-0108）
 
 ### error-contracts
 

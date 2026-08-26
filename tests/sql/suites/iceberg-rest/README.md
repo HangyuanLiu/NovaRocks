@@ -51,7 +51,8 @@ docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 
 NO_PROXY=127.0.0.1,localhost \
-cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG" &
+cargo run -p novarocks-server -- standalone --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG" &
 until nc -z 127.0.0.1 "$NOVA_ENV_MYSQL_PORT"; do sleep 1; done
 
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \

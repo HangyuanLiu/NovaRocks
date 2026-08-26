@@ -37,9 +37,8 @@ materialized-view
 session
 
 # The suites below are not part of default daily mode yet.
-# iceberg-mv-scheduler passes 4/4 but only when the standalone-server runs with the MV-refresh
-#   scheduler config ($NOVAROCKS_STANDALONE_SCHEDULER_CONFIG, mv_refresh_scheduler_enabled=true);
-#   the default daily server uses the non-scheduler config, and the async cases remain timing
-#   -sensitive — excluded until the runner wires the scheduler config for unattended daily runs.
+# iceberg-mv-scheduler uses the canonical FE/BE pair. The generated FE config
+#   enables the MV-refresh scheduler, but the async cases remain timing-sensitive
+#   and are excluded from the default daily run.
 # decimal tests DECIMAL256 (precision 39-76); the standalone Arrow engine caps at Decimal128
 #   (precision 38), so it fails on native too. Excluded until DECIMAL256 is supported.

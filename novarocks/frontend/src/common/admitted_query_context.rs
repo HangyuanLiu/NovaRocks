@@ -401,7 +401,7 @@ mod tests {
         let context = RequestContext::new(
             RequestSessionContext::new(None, "db1".to_string(), admitted_settings.clone()),
             QueryExecutionContext::new(
-                ClusterRole::AllInOne,
+                ClusterRole::Fe,
                 BackendTopologySnapshot::empty(4),
                 Some(deadline),
                 QueryCancellationSource::new().view(),

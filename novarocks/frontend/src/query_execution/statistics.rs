@@ -1953,7 +1953,7 @@ mod tests {
             )
             .expect("prepared native facts");
         let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
-            novarocks_types::ClusterRole::AllInOne,
+            novarocks_types::ClusterRole::Fe,
             BackendTopologySnapshot::empty(17),
             Some(Instant::now() + Duration::from_secs(60)),
             crate::common::query_cancellation::QueryCancellationSource::new().view(),

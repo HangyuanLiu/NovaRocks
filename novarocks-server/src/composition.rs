@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::future::Future;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -28,10 +27,7 @@ use crate::state_store_config::{
     SQLITE_STATE_STORE_PROVIDER_ID, StateStoreProviderConfig,
 };
 use crate::state_store_limits::resolve_state_store_limits;
-use anyhow::Context;
-use novarocks_backend::{
-    BackendApplicationHost, BackendDataRuntime, BackendServerConfig, QueryLifecycleRegistryConfig,
-};
+use novarocks_backend::{BackendServerConfig, QueryLifecycleRegistryConfig};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::control_factory::IcebergControlFactory;
 use novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller;
@@ -47,7 +43,6 @@ use novarocks_execution::runtime::execution_runtime::{
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendExecutionConfig, FrontendQueryControlTimeouts,
     FrontendServerConfig, LakePublicationRuntimePolicy,
-    common::backend_topology::BackendTopologyPort,
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
     },
@@ -68,8 +63,6 @@ use novarocks_spi::state_store::{
     MAX_KEY_BYTES, StateStoreProviderAccessMode, StateStoreProviderDescriptor,
 };
 use novarocks_state_store_sqlite::SqliteStateStoreContribution;
-
-const BACKEND_SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IcebergMvStorageObservationAdapter {
@@ -828,277 +821,10 @@ pub fn state_store_provider_registry(
     Ok(registry)
 }
 
-pub fn run_all_in_one(
-    config: NovaRocksConfig,
-    port_override: Option<u16>,
-    data_runtime: tokio::runtime::Handle,
-) -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
-        .build()
-        .context("build all-in-one Tokio runtime")?;
-
-    runtime.block_on(run_all_in_one_until(
-        config,
-        port_override,
-        runtime.handle().clone(),
-        data_runtime,
-        async {
-            tokio::signal::ctrl_c()
-                .await
-                .map_err(|error| format!("Ctrl-C listener failed: {error}"))
-        },
-    ))
-}
-
-fn all_in_one_report_bind_addr(backend_endpoint: std::net::SocketAddr) -> std::net::SocketAddr {
-    match backend_endpoint.ip() {
-        std::net::IpAddr::V4(_) => std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
-        std::net::IpAddr::V6(_) => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
-    }
-}
-
-async fn run_all_in_one_until<F>(
-    config: NovaRocksConfig,
-    port_override: Option<u16>,
-    application_runtime: tokio::runtime::Handle,
-    data_runtime: tokio::runtime::Handle,
-    shutdown: F,
-) -> anyhow::Result<()>
-where
-    F: Future<Output = Result<(), String>> + Send,
-{
-    let frontend_config =
-        compose_frontend_server_config(&config, port_override, application_runtime.clone())?;
-    let frontend = novarocks_frontend::open_frontend_application_for_server(
-        &frontend_config,
-        data_runtime.clone(),
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!("open all-in-one frontend application failed: {error}"))?;
-    let backend_config = compose_backend_server_config(&config, application_runtime)?;
-    let mut backend =
-        match BackendApplicationHost::open(backend_config, BackendDataRuntime::new(data_runtime)) {
-            Ok(backend) => backend,
-            Err(error) => {
-                let frontend_cleanup = frontend.shutdown().await;
-                return Err(anyhow::anyhow!(
-                    "open all-in-one backend application failed: {error}; frontend cleanup: {:?}",
-                    frontend_cleanup.err()
-                ));
-            }
-        };
-    let endpoint = backend.connectable_native_endpoint();
-    let report_bind_addr = all_in_one_report_bind_addr(endpoint);
-    let mut report_server = match frontend.start_report_server(report_bind_addr) {
-        Ok(report_server) => report_server,
-        Err(error) => {
-            let backend_cleanup = backend.shutdown();
-            let frontend_cleanup = frontend.shutdown().await;
-            return Err(anyhow::anyhow!(
-                "open all-in-one frontend report endpoint failed: {error}; backend cleanup: {:?}; frontend cleanup: {:?}",
-                backend_cleanup.err(),
-                frontend_cleanup.err()
-            ));
-        }
-    };
-    let report_port = report_server.bound_addr().port();
-    frontend
-        .coordinator_report_endpoint_sink()
-        .set_bound_port(report_port);
-    let topology = frontend.backend_topology_port();
-    if let Err(error) = topology.add_backend(endpoint) {
-        let report_cleanup = report_server.stop();
-        let backend_cleanup = backend.shutdown();
-        let frontend_cleanup = frontend.shutdown().await;
-        return Err(anyhow::anyhow!(
-            "register all-in-one backend {endpoint}: {error}; report cleanup: {:?}; backend cleanup: {:?}; frontend cleanup: {:?}",
-            report_cleanup.err(),
-            backend_cleanup.err(),
-            frontend_cleanup.err()
-        ));
-    }
-    if let Err(error) = wait_for_live_backend(topology.as_ref(), endpoint).await {
-        let report_cleanup = report_server.stop();
-        let backend_cleanup = backend.shutdown();
-        let frontend_cleanup = frontend.shutdown().await;
-        return Err(anyhow::anyhow!(
-            "wait for all-in-one backend {endpoint}: {error}; report cleanup: {:?}; backend cleanup: {:?}; frontend cleanup: {:?}",
-            report_cleanup.err(),
-            backend_cleanup.err(),
-            frontend_cleanup.err()
-        ));
-    }
-    let client_connections =
-        std::sync::Arc::new(novarocks_frontend::MysqlClientConnectionRegistry::new());
-    let client_connection_control: std::sync::Arc<
-        dyn novarocks_frontend::ClientConnectionControlPort,
-    > = client_connections.clone();
-    let session_factory = match novarocks_frontend::build_frontend_query_session_factory(
-        &frontend,
-        std::sync::Arc::new(novarocks_frontend::SystemCatalogService::with_defaults()),
-        report_port,
-        std::sync::Arc::clone(&frontend_config.mv_storage_observation),
-        client_connection_control,
-    ) {
-        Ok(session_factory) => session_factory,
-        Err(error) => {
-            let report_cleanup = report_server.stop();
-            let backend_cleanup = backend.shutdown();
-            let frontend_cleanup = frontend.shutdown().await;
-            return Err(anyhow::anyhow!(
-                "build all-in-one frontend SQL capabilities failed: {error}; report cleanup: {:?}; backend cleanup: {:?}; frontend cleanup: {:?}",
-                report_cleanup.err(),
-                backend_cleanup.err(),
-                frontend_cleanup.err()
-            ));
-        }
-    };
-
-    let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
-    let listener = novarocks_frontend::resolve_mysql_listener_settings(
-        config
-            .standalone_server
-            .as_ref()
-            .map(|server| server.mysql_port),
-        config
-            .standalone_server
-            .as_ref()
-            .map(|server| server.user.as_str()),
-        port_override,
-    )
-    .map_err(anyhow::Error::msg)?;
-    let server = novarocks_frontend::run_mysql_server_until_shutdown(
-        listener,
-        session_factory,
-        client_connections,
-        async move {
-            let _ = server_shutdown_rx.await;
-        },
-    );
-    tokio::pin!(server);
-    tokio::pin!(shutdown);
-
-    let mut server_completed = false;
-    let primary = loop {
-        tokio::select! {
-            server_result = &mut server => {
-                server_completed = true;
-                break server_result;
-            }
-            shutdown_result = &mut shutdown => break shutdown_result,
-            _ = tokio::time::sleep(BACKEND_SUPERVISION_POLL_INTERVAL) => {
-                match backend.poll_failure() {
-                    Ok(Some(error)) | Err(error) => break Err(error.to_string()),
-                    Ok(None) => {}
-                }
-            }
-        }
-    };
-
-    let server_cleanup = if server_completed {
-        Ok(())
-    } else {
-        let _ = server_shutdown_tx.send(());
-        server.await
-    };
-    let backend_cleanup = backend.shutdown().map_err(|error| error.to_string());
-    let report_cleanup = report_server.stop().map_err(|error| error.to_string());
-    let frontend_cleanup = frontend.shutdown().await.map_err(|error| error.to_string());
-    combine_primary_and_cleanup(primary, server_cleanup, backend_cleanup, report_cleanup)
-        .and(frontend_cleanup)
-        .map_err(anyhow::Error::msg)
-}
-
-async fn wait_for_live_backend(
-    topology: &dyn BackendTopologyPort,
-    endpoint: std::net::SocketAddr,
-) -> anyhow::Result<()> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if topology
-            .snapshot()
-            .map_err(|error| anyhow::anyhow!("read all-in-one backend topology: {error}"))?
-            .targets()
-            .iter()
-            .copied()
-            .any(|backend| backend.endpoint() == endpoint)
-        {
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "all-in-one backend {endpoint} did not become Live before startup timeout"
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
-fn combine_primary_and_cleanup(
-    primary: Result<(), String>,
-    server_cleanup: Result<(), String>,
-    backend_cleanup: Result<(), String>,
-    frontend_cleanup: Result<(), String>,
-) -> Result<(), String> {
-    let cleanup_errors = [
-        server_cleanup.err(),
-        backend_cleanup.err(),
-        frontend_cleanup.err(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>();
-
-    match (primary, cleanup_errors.is_empty()) {
-        (Ok(()), true) => Ok(()),
-        (Ok(()), false) => Err(format!("cleanup failed: {}", cleanup_errors.join("; "))),
-        (Err(primary), true) => Err(primary),
-        (Err(primary), false) => Err(format!(
-            "{primary}; cleanup failed: {}",
-            cleanup_errors.join("; ")
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        all_in_one_report_bind_addr, combine_primary_and_cleanup,
-        compose_backend_execution_installers, compose_frontend_control_factories,
-        run_all_in_one_until,
-    };
+    use super::{compose_backend_execution_installers, compose_frontend_control_factories};
     use novarocks_spi::connector::ConnectorExecutionProviderKind;
-
-    #[test]
-    fn all_in_one_report_listener_preserves_the_backend_address_family() {
-        for backend in [
-            std::net::SocketAddr::from(([127, 0, 0, 1], 19000)),
-            std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 19000)),
-        ] {
-            let report = all_in_one_report_bind_addr(backend);
-            assert_eq!(report.is_ipv4(), backend.is_ipv4());
-            assert!(report.ip().is_loopback());
-            assert_eq!(report.port(), 0);
-        }
-    }
-
-    #[test]
-    fn primary_failure_remains_primary_when_all_cleanup_steps_fail() {
-        let error = combine_primary_and_cleanup(
-            Err("backend failed".to_string()),
-            Err("server cleanup failed".to_string()),
-            Err("backend cleanup failed".to_string()),
-            Err("frontend cleanup failed".to_string()),
-        )
-        .expect_err("backend failure must be returned");
-
-        assert!(error.contains("backend failed"), "{error}");
-        assert!(error.contains("server cleanup failed"), "{error}");
-        assert!(error.contains("frontend cleanup failed"), "{error}");
-        assert!(error.contains("backend cleanup failed"), "{error}");
-    }
 
     #[test]
     fn frontend_and_backend_compose_distinct_iceberg_role_capabilities() {
@@ -1147,40 +873,5 @@ mod tests {
                 .contains("object-store credentials missing aws.s3.access_key"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn all_in_one_can_open_shutdown_and_open_again_with_one_data_runtime() {
-        let application_runtime = tokio::runtime::Runtime::new().expect("application runtime");
-        let data_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("novarocks-data-runtime")
-            .build()
-            .expect("data runtime");
-        let mut config = crate::app_config::NovaRocksConfig::default();
-        let grpc_listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .expect("reserve gRPC port");
-        config.server.grpc_port = grpc_listener
-            .local_addr()
-            .expect("gRPC listener address")
-            .port();
-        drop(grpc_listener);
-        config.server.http_port = 0;
-        config.standalone_server = Some(crate::app_config::StandaloneServerConfig {
-            mysql_port: 0,
-            ..Default::default()
-        });
-
-        for _ in 0..2 {
-            application_runtime
-                .block_on(run_all_in_one_until(
-                    config.clone(),
-                    Some(0),
-                    application_runtime.handle().clone(),
-                    data_runtime.handle().clone(),
-                    async { Ok(()) },
-                ))
-                .expect("all-in-one open and shutdown");
-        }
     }
 }

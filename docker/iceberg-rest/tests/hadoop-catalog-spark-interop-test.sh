@@ -174,7 +174,9 @@ log "phase=novarocks-start"
 cd "$repo_root"
 cargo build -p novarocks-server 2>&1 | tee -a "$artifact"
 NO_PROXY=127.0.0.1,localhost target/debug/novarocks standalone \
-    --config "$NOVAROCKS_STANDALONE_CONFIG" >"$server_log" 2>&1 &
+    --role all-in-one \
+    --fe-config "$NOVAROCKS_FE_CONFIG" \
+    --be-config "$NOVAROCKS_BE_CONFIG" >"$server_log" 2>&1 &
 server_pid=$!
 for _ in $(seq 1 60); do
     if grep -q '^NOVAROCKS_READY ' "$server_log"; then

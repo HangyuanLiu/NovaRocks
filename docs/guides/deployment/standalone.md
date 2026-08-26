@@ -17,153 +17,96 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# standalone部署
+# all-in-one 本地部署
 
-standalone 部署使用一个 NovaRocks 进程提供 MySQL 兼容 SQL 入口，并在同一进程内完成 SQL 解析、优化和执行。它不依赖 StarRocks FE，适合本地试用、功能验证、SQL 回归测试和单机开发环境。
+all-in-one 是 `novarocks-server` 的本地组合启动方式：一个进程并发监督完整的
+FE 与 BE role runner。它不是第三种 application role，也不提供单配置或 direct-call
+快捷路径。它适合本地试用、功能验证和 SQL 回归；生产拓扑仍使用独立 FE 与 BE。
 
-## 前提条件
-
-- 已获取 NovaRocks 源码或构建产物。
-- 机器上可以运行 NovaRocks 二进制文件。
-- 已安装 MySQL 客户端，用于连接 NovaRocks 的 MySQL 协议端口。
-- 如果要访问 S3、OSS、MinIO、HDFS 或 Iceberg REST Catalog，需要提前准备对应服务和访问凭据。
-
-## 编译 NovaRocks
-
-本地验证或开发调试时，可以直接使用 debug 构建：
+## 编译
 
 ```bash
-cargo build
+cargo build -p novarocks-server
 ```
 
-启动时使用对应的 debug 产物：
+## 准备一对角色配置
 
-```bash
-NO_PROXY=127.0.0.1,localhost \
-./target/debug/novarocks standalone --config ./novarocks.toml
-```
+从仓库根目录的 `novarocks-fe.toml.example` 和
+`novarocks-be.toml.example` 开始。两份 deployable TOML 都必须显式写入
+`[cluster].role`：前者是 `fe`，后者是 `be`。
 
-生产或准生产部署建议使用 release 构建：
+FE 配置必须包括：
 
-```bash
-cargo build --release -p novarocks-server
-```
+- `[standalone_server].mysql_port`；
+- FE Native gRPC 的 `[server].grpc_port`；
+- FE management HTTP 的 `[server].http_port`；
+- durable `[state_store]`；
+- 指向 BE Native gRPC endpoint 的 `[cluster].backends` additive seed。
 
-## 准备配置文件
+BE 配置必须包括自身不同的 Native gRPC 与 management HTTP 端口，以及本地
+connector object-store binding。两份配置在同一进程共享 logging 与 data-runtime
+sizing，其他 role-local 字段各自生效。
 
-NovaRocks 按以下顺序查找配置：
+同一 address family 内，任意两个 listener 不能重叠：相同地址/端口冲突，wildcard
+地址也与同端口具体地址冲突。启动会在 logging、runtime、StateStore 或 listener
+创建之前拒绝冲突和不兼容的 process-owned 配置。
 
-1. 命令行 `--config <path>`。
-2. 环境变量 `NOVAROCKS_CONFIG=<path>`。
-3. 当前目录下的 `./novarocks.toml`。
-
-最小 standalone 配置如下：
-
-```toml
-[server]
-grpc_port = 9080
-
-[state_store]
-provider = "sqlite"
-path = "meta/frontend-state.sqlite"
-cluster_id = "local-cluster"
-deployment_owner = "fe-1"
-
-[standalone_server]
-mysql_port = 9030
-user = "root"
-
-[connector.object_store]
-endpoint = "http://127.0.0.1:9000"
-access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"
-access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
-enable_path_style_access = true
-```
-
-说明：
-
-- `mysql_port` 是客户端连接 NovaRocks 的端口。
-- `[server].grpc_port` 是 NovaRocksGrpc 端口。`role=be` 和 `role=all-in-one` 由 BE host 提供完整 fragment/exchange 服务；`role=fe` 只提供 coordinator report 服务。`all-in-one` 仍通过该 gRPC 边界调度本机 BE，不使用 direct-call shortcut。默认值为 `9080`。
-- `user` 当前只支持 `root`。
-- `[state_store]` 是 FE durable control-plane state 的唯一持久化入口；不要配置第二套 metadata store。
-- native 持久表必须属于显式创建的 external Iceberg catalog；NovaRocks 不创建内部 StarRocks 类型表。
-- `[connector.object_store]` 为 connector execution 提供进程本地对象存储凭据；它本身不创建 catalog 或内表。
-- `password`、`tls_password`、`access_key_id` 与 `access_key_secret` 可使用 literal 或 exact `${ENV:VAR}`；Server 只在启动加载时解析一次，变更后必须重启相关进程。Provider 不读取环境变量。
-
-## 启动服务
-
-使用源码启动：
+## 启动
 
 ```bash
 NO_PROXY=127.0.0.1,localhost \
-cargo run -p novarocks-server -- standalone --config ./novarocks.toml
+./target/debug/novarocks standalone --role all-in-one \
+  --fe-config ./novarocks-fe.toml \
+  --be-config ./novarocks-be.toml
 ```
 
-使用已构建的二进制启动：
-
-```bash
-NO_PROXY=127.0.0.1,localhost \
-./target/release/novarocks standalone --config ./novarocks.toml
-```
-
-也可以临时覆盖 MySQL 端口：
-
-```bash
-NO_PROXY=127.0.0.1,localhost \
-./target/release/novarocks standalone --role all-in-one --config ./novarocks.toml
-```
-
-启动成功后，标准输出会出现类似以下 readiness 标记：
+任一 role runner 返回时，supervisor 会请求另一侧 shutdown、等待双方完成清理，并
+保留 primary error。成功启动后，FE 会打印 MySQL readiness marker：
 
 ```text
 NOVAROCKS_READY mysql_port=9030 pid=<pid>
 ```
 
-看到该标记后再连接客户端。
-
-## 连接并验证
+看到 marker 后再连接客户端：
 
 ```bash
 mysql -h 127.0.0.1 -P 9030 -uroot
 ```
 
-执行基础 SQL：
+## 四个 listener surface
 
-```sql
-SELECT 1;
-SHOW DATABASES;
-```
+| Role | Native listener | Management listener |
+| --- | --- | --- |
+| FE | `[server].grpc_port`：仅 coordinator-report gRPC | `[server].http_port`：FE-scoped metrics 与现有 gated lifecycle debug |
+| BE | `[server].grpc_port`：仅 fragment/exchange Native gRPC | `[server].http_port`：BE-scoped metrics |
 
-配置 external Iceberg catalog 后，可以继续创建 database 和 table。Native 不提供内部 StarRocks 表类型；未来 StarRocks 数据源也必须通过 external connector 接入。Iceberg v3 的快速验证流程见 [Iceberg v3 快速上手](../iceberg-v3/quickstart.md)。
+Native listener 不安装 management HTTP route；management listener 不承载 Native
+gRPC service。metrics 也按 role-local registry 收集，因此同进程的 all-in-one 不会
+把 FE 与 BE metrics 混在一个 endpoint。
 
-## 使用本地 Iceberg REST 环境
-
-仓库内置了 Iceberg REST Catalog、MinIO 和 Spark 的本地测试环境：
+## 本地 Iceberg REST 环境
 
 ```bash
 docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 
 NO_PROXY=127.0.0.1,localhost \
-cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" \
+  --be-config "$NOVAROCKS_BE_CONFIG"
 ```
 
-该环境会生成当前工作区专用的 NovaRocks 配置、SQL test 配置和端口。不要假设固定端口，优先使用 `docker/iceberg-rest/runtime/current/env.sh` 中导出的变量。
+该 fixture 为当前工作区生成一对正常 FE/BE 配置和四个不冲突 listener port；不要
+猜测端口或重用旧的 standalone config 环境变量。
 
-## 停止服务
+## 停止与排障
 
-前台运行时按 `Ctrl-C` 停止。后台运行时请记录启动进程的 PID，并优先发送 `SIGTERM`：
-
-```bash
-kill <pid>
-```
-
-## 常见问题
+前台运行时按 `Ctrl-C`。后台运行时记录 PID 并优先发送 `SIGTERM`。
 
 | 现象 | 处理方式 |
 | --- | --- |
-| 客户端连不上 `9030` | 确认服务已打印 `NOVAROCKS_READY`，并检查 `--port` 或 `[standalone_server].mysql_port` 是否被改过。 |
-| `9080` 端口冲突 | 修改 `[server].grpc_port`。该端口不影响 MySQL 客户端连接端口。 |
-| 对象存储访问失败 | 检查 endpoint、access key、secret、path-style 设置和 `NO_PROXY`。 |
-| 多个工作区端口冲突 | 使用不同 `mysql_port`，或通过 `docker/iceberg-rest/runtime/current/env.sh` 获取自动分配端口。 |
-| 登录失败 | 当前 standalone server 只支持 `root` 用户，默认空密码。 |
+| 启动前报 endpoint overlap | 为 FE MySQL、FE/BE Native gRPC、FE/BE management HTTP 分配不同端口；也检查 wildcard bind。 |
+| 启动前报 process configuration mismatch | 两份配置的 logging 与 data-runtime sizing 必须相同。 |
+| FE 提示缺少 StateStore | 为 FE 配置 durable `[state_store]`；不要以 transient/in-memory membership 替代。 |
+| 访问 `/metrics` 得到 Native 协议错误或 404 | 改访问对应 role 的 management HTTP port，而不是 Native gRPC port。 |
+| 连接 MySQL 失败 | 等待 `NOVAROCKS_READY`，然后确认 FE 的 `[standalone_server].mysql_port`。 |

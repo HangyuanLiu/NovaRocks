@@ -33,7 +33,6 @@ fn require_backend_management_role(statement: &str, role: ClusterRole) -> Result
         ClusterRole::Be => Err(format!(
             "{statement} is not available in role=be; backend management is owned by StarRocks FE"
         )),
-        ClusterRole::AllInOne => Err(format!("{statement} requires role=fe")),
     }
 }
 
@@ -108,7 +107,7 @@ mod tests {
     #[test]
     fn typed_backend_statement_reaches_the_topology_owner() {
         let topology: crate::common::backend_topology::BackendTopologyService =
-            Arc::new(crate::topology::ClusterBackendService::new_transient_for_test(1));
+            Arc::new(crate::topology::ClusterBackendService::new_for_test(1));
         let executor =
             BackendCommandExecutor::new(BackendManagementKernel::new(Arc::clone(&topology)));
 

@@ -1,7 +1,8 @@
 use std::fmt;
 use std::future::Future;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
@@ -20,7 +21,7 @@ use crate::fragment::{
     NativeFragmentService, grpc_exchange_transmitter, grpc_fragment_lookup_client,
     native_result_writer,
 };
-use crate::metrics::MetricsHttpServer;
+use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
 use crate::query_lifecycle::{
     NativeQueryLifecycleLocalRuntime, QueryControlAttachment, QueryLifecycleError,
     QueryLifecycleIngress, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
@@ -184,29 +185,62 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
 
 struct QueryLifecycleSweepTask {
     stop_tx: Option<std::sync::mpsc::Sender<()>>,
+    failure_rx: mpsc::Receiver<String>,
     join_handle: Option<std::thread::JoinHandle<()>>,
+    stop_requested: Arc<AtomicBool>,
 }
 
 impl QueryLifecycleSweepTask {
     fn start(registry: Arc<QueryLifecycleRegistry>, interval: Duration) -> Result<Self, String> {
         let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let (failure_tx, failure_rx) = mpsc::channel();
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let thread_stop_requested = Arc::clone(&stop_requested);
         let join_handle = std::thread::Builder::new()
             .name("query-lifecycle-sweep".to_string())
             .spawn(move || {
-                while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
-                    stop_rx.recv_timeout(interval)
-                {
-                    registry.sweep_expired(Instant::now());
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        stop_rx.recv_timeout(interval)
+                    {
+                        registry.sweep_expired(Instant::now());
+                    }
+                }));
+                if thread_stop_requested.load(Ordering::Acquire) {
+                    return;
                 }
+                let error = match outcome {
+                    Ok(()) => "query lifecycle sweep task exited unexpectedly".to_string(),
+                    Err(payload) => payload
+                        .downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| {
+                            payload
+                                .downcast_ref::<&str>()
+                                .map(|value| (*value).to_string())
+                        })
+                        .unwrap_or_else(|| "query lifecycle sweep task panicked".to_string()),
+                };
+                let _ = failure_tx.send(error);
             })
             .map_err(|error| format!("spawn query lifecycle sweep task: {error}"))?;
         Ok(Self {
             stop_tx: Some(stop_tx),
+            failure_rx,
             join_handle: Some(join_handle),
+            stop_requested,
         })
     }
 
+    fn poll_failure(&mut self) -> Result<Option<String>, String> {
+        match self.failure_rx.try_recv() {
+            Ok(error) => Ok(Some(error)),
+            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => Ok(None),
+        }
+    }
+
     fn stop(&mut self) -> Result<(), String> {
+        self.stop_requested.store(true, Ordering::Release);
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
         }
@@ -334,16 +368,28 @@ impl BackendApplicationHost {
     pub fn poll_failure(
         &mut self,
     ) -> Result<Option<BackendApplicationError>, BackendApplicationError> {
-        self.grpc_server
-            .poll_failure()
-            .map_err(|error| {
-                BackendApplicationError::new(BackendApplicationErrorKind::Supervision, error)
-            })
-            .map(|failure| {
-                failure.map(|error| {
-                    BackendApplicationError::new(BackendApplicationErrorKind::Supervision, error)
-                })
-            })
+        for failure in [
+            self.grpc_server.poll_failure(),
+            self.metrics_http_server.poll_failure(),
+            self.query_lifecycle_sweep.poll_failure(),
+        ] {
+            match failure {
+                Ok(Some(error)) => {
+                    return Ok(Some(BackendApplicationError::new(
+                        BackendApplicationErrorKind::Supervision,
+                        error,
+                    )));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(BackendApplicationError::new(
+                        BackendApplicationErrorKind::Supervision,
+                        error,
+                    ));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
@@ -391,23 +437,33 @@ impl BackendApplicationHost {
             write_commit_evidence_limits,
             &execution_installers,
         )?;
-        let metrics_http_server = if metrics_http_port == grpc_port {
-            MetricsHttpServer::shared_with_grpc()
-        } else {
-            MetricsHttpServer::start(&bind_host, metrics_http_port).map_err(|error| {
-                BackendApplicationError::new(BackendApplicationErrorKind::Start, error)
-            })?
-        };
+        let metrics_registry = Arc::new(BackendMetricsRegistry::new().map_err(|error| {
+            BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
+        })?);
+        let metrics_http_server =
+            MetricsHttpServer::start(&bind_host, metrics_http_port, metrics_registry).map_err(
+                |error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error),
+            )?;
         let native_fragment_service = Arc::clone(&services.native_fragment_service);
-        let mut query_lifecycle_sweep = QueryLifecycleSweepTask::start(
+        let mut query_lifecycle_sweep = match QueryLifecycleSweepTask::start(
             Arc::clone(&services.query_lifecycle_registry),
             query_lifecycle_sweep_interval,
-        )
-        .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error))?;
+        ) {
+            Ok(sweep) => sweep,
+            Err(error) => {
+                let metrics_result = metrics_http_server.stop();
+                let primary =
+                    BackendApplicationError::new(BackendApplicationErrorKind::Start, error);
+                return Err(match metrics_result {
+                    Ok(()) => primary,
+                    Err(cleanup_error) => primary.with_cleanup_context(cleanup_error),
+                });
+            }
+        };
 
         let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
             services.query_lifecycle_registry.clone();
-        let mut grpc_server = BackendRpcServerHandle::start(
+        let mut grpc_server = match BackendRpcServerHandle::start(
             &bind_host,
             grpc_port,
             BackendRpcService::new(
@@ -416,27 +472,34 @@ impl BackendApplicationHost {
                 runtime_filter_ingress,
                 Arc::clone(&services.exchange_receiver_port),
             ),
-        )
-        .map_err(|error| {
-            let _ = query_lifecycle_sweep.stop();
-            BackendApplicationError::new(
-                BackendApplicationErrorKind::Start,
-                format!("start native backend gRPC server on {bind_host}:{grpc_port}: {error}"),
-            )
-        })?;
+        ) {
+            Ok(server) => server,
+            Err(error) => {
+                let sweep_result = query_lifecycle_sweep.stop();
+                let metrics_result = metrics_http_server.stop();
+                let primary = BackendApplicationError::new(
+                    BackendApplicationErrorKind::Start,
+                    format!("start native backend gRPC server on {bind_host}:{grpc_port}: {error}"),
+                );
+                return Err(append_cleanup_results(
+                    primary,
+                    [sweep_result, metrics_result],
+                ));
+            }
+        };
 
         if let Err(error) = wait_for_tcp_ready(readiness_addr, readiness_timeout) {
             let listener_result = grpc_server.stop();
-            let _ = query_lifecycle_sweep.stop();
-            let _ = metrics_http_server.stop();
+            let sweep_result = query_lifecycle_sweep.stop();
+            let metrics_result = metrics_http_server.stop();
             let primary = BackendApplicationError::new(
                 BackendApplicationErrorKind::Readiness,
                 format!("advertised endpoint readiness failed: {error}"),
             );
-            return Err(match listener_result {
-                Ok(()) => primary,
-                Err(cleanup_error) => primary.with_cleanup_context(cleanup_error),
-            });
+            return Err(append_cleanup_results(
+                primary,
+                [listener_result, sweep_result, metrics_result],
+            ));
         }
 
         Ok(Self {
@@ -566,6 +629,18 @@ fn combine_primary_and_shutdown(
     }
 }
 
+fn append_cleanup_results(
+    mut primary: BackendApplicationError,
+    cleanup_results: impl IntoIterator<Item = Result<(), String>>,
+) -> BackendApplicationError {
+    for cleanup_result in cleanup_results {
+        if let Err(cleanup_error) = cleanup_result {
+            primary = primary.with_cleanup_context(cleanup_error);
+        }
+    }
+    primary
+}
+
 fn combine_shutdown_results(
     listener: Result<(), String>,
     sweep: Result<(), String>,
@@ -614,6 +689,7 @@ fn wait_for_tcp_ready(addr: SocketAddr, timeout: Duration) -> Result<(), String>
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, LazyLock, Mutex};
     use std::time::Duration;
@@ -686,6 +762,24 @@ mod tests {
         crate::rpc::runtime::test_backend_data_runtime()
     }
 
+    fn http_get(port: u16, path: &str) -> String {
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect HTTP listener");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("set HTTP read timeout");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write HTTP request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("read HTTP response");
+        response
+    }
+
     fn query_lifecycle_registry_config(
         heartbeat_timeout: Duration,
     ) -> QueryLifecycleRegistryConfig {
@@ -717,7 +811,7 @@ mod tests {
         BackendServerConfig {
             bind_host: "127.0.0.1".to_string(),
             grpc_port,
-            metrics_http_port: grpc_port,
+            metrics_http_port: unused_port(),
             advertise_endpoint: AdvertiseEndpoint {
                 host: "127.0.0.1".to_string(),
                 port: advertise_port,
@@ -1185,6 +1279,27 @@ mod tests {
             .await
             .expect_err("malformed AbortQuery must be a transport-visible error");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+
+        host.shutdown().expect("native backend shutdown");
+    }
+
+    #[test]
+    fn application_exposes_metrics_only_on_the_management_listener() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let grpc_port = unused_port();
+        let metrics_port = unused_port();
+        let mut config = backend_config(grpc_port, grpc_port);
+        config.metrics_http_port = metrics_port;
+        let host = BackendApplicationHost::open(config, test_data_runtime())
+            .expect("native backend host starts");
+
+        let native_response = http_get(grpc_port, "/metrics");
+        assert!(native_response.contains("grpc-status: 12"));
+        assert!(!native_response.contains("novarocks_backend_query_lifecycle_entries"));
+
+        let management_response = http_get(metrics_port, "/metrics");
+        assert!(management_response.starts_with("HTTP/1.1 200"));
+        assert!(management_response.contains("novarocks_backend_query_lifecycle_entries"));
 
         host.shutdown().expect("native backend shutdown");
     }

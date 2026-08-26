@@ -28,12 +28,10 @@ use std::sync::{Arc, mpsc};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
-use crate::metrics::handle_metrics;
 use crate::rpc::data_plane::BackendDataPlane;
 use axum::Router;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_proto_models::{filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -415,7 +413,6 @@ impl BackendRpcServerHandle {
                         );
                         let app = Router::new()
                             .route_service(&grpc_path, AxumGrpcService::new(service))
-                            .route("/metrics", get(handle_metrics))
                             .fallback(grpc_unimplemented_fallback);
                         axum::serve(listener, app)
                             .with_graceful_shutdown(async move {

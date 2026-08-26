@@ -62,7 +62,7 @@ pub(crate) fn launch_server(
         ClusterMode::CrossProcess => Ok(Box::new(CrossProcessServerHandle::launch(
             CrossProcessClusterOptions {
                 binary: discover_novarocks_binary(repo_root)?,
-                base_config_path: resolve_base_app_config_path(repo_root, runner_config)?,
+                base_config_path: resolve_base_frontend_config_path(repo_root, runner_config)?,
                 runtime_root: repo_root.join("tests/sql/.runtime/cluster"),
                 cluster_size,
                 query_lifecycle_faults_enabled,
@@ -126,14 +126,17 @@ pub(crate) fn discover_novarocks_binary_with_override(
     )
 }
 
-fn resolve_base_app_config_path(repo_root: &Path, runner_config: &RunnerConfig) -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("NOVAROCKS_STANDALONE_CONFIG") {
+fn resolve_base_frontend_config_path(
+    repo_root: &Path,
+    runner_config: &RunnerConfig,
+) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("NOVAROCKS_FE_CONFIG") {
         let path = PathBuf::from(path);
         if path.is_file() {
             return Ok(path);
         }
         bail!(
-            "NOVAROCKS_STANDALONE_CONFIG points to {}, but the file does not exist",
+            "NOVAROCKS_FE_CONFIG points to {}, but the file does not exist",
             path.display()
         );
     }
@@ -146,7 +149,7 @@ fn resolve_base_app_config_path(repo_root: &Path, runner_config: &RunnerConfig) 
     }
 
     bail!(
-        "failed to locate standalone config for cross-process mode under {}",
+        "failed to locate frontend config for cross-process mode under {}",
         repo_root.display()
     )
 }

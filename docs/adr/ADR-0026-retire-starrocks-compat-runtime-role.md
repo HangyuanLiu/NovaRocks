@@ -2,9 +2,9 @@
 id: ADR-0026
 title: "Retire StarRocks-compatible backend as a runtime role"
 domain: [runtime-role]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0108
 date: 2026-08-02
 provenance:
   - "discussion: 2026-08-02 native runtime role and external Connector boundary"

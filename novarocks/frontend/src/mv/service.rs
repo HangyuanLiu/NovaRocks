@@ -90,7 +90,7 @@ impl FrontendMvService {
             scheduler_config: FrontendMvSchedulerConfig::default(),
             maintenance_config: MaintenanceCoordinatorConfig::default(),
             table_maintenance_service: None,
-            execution_role: novarocks_types::ClusterRole::AllInOne,
+            execution_role: novarocks_types::ClusterRole::Fe,
             topology: None,
             optimizer_query_mem_limit_bytes: 2 * 1024 * 1024 * 1024,
             attempt_timeout: MV_WORKER_ATTEMPT_TIMEOUT,

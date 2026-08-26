@@ -40,8 +40,9 @@ Its production runtime is the native NovaRocks FE/BE role model:
   - `role=fe` owns the MySQL SQL entrypoint, statement admission, planning, and
     distributed coordination.
   - `role=be` owns local fragment execution and the native gRPC boundary.
-  - `role=all-in-one` preserves the FE/BE application boundary for local
-    testing; it is not a separate production topology.
+  - `all-in-one` is a server-owned local supervisor that reads one normal FE
+    config and one normal BE config. It preserves the FE/BE application
+    boundary and is not an application role or separate production topology.
 
 - **StarRocks external Connector**
   - StarRocks is read-only external data, never an inbound server protocol.
@@ -91,11 +92,12 @@ SQL client
    Connectors own external-system facts. Do not mix those owners through
    process-global state, direct calls, or transport fallback.
 
-5. **Distributed deployment is the source of truth; standalone is test-only**
+5. **Distributed deployment is the source of truth; all-in-one is test-only**
    The real, user-facing deployment is NovaRocks distributed (1 NovaRocks FE +
-   N BE; CI baseline 1FE+3BE). The single-process all-in-one form ("standalone")
-   is only a testing convenience. Do NOT model for, or add special-case branches
-   for, the single-process form. Cluster-topology quantities (broadcast fanout,
+   N BE; CI baseline 1FE+3BE). The single-process all-in-one form is only a
+   testing convenience. It starts normal FE and BE role runners with a pair of
+   deployable configs. Do NOT model for, or add special-case branches for, the
+   single-process form. Cluster-topology quantities (broadcast fanout,
    backend count, per-node budgets) must be read dynamically from the live BE
    registry, never hardcoded or defaulted to "single-process = 1 node". Tests
    must never pass only in standalone while failing under 1FE+3BE.
@@ -107,8 +109,7 @@ SQL client
    state, generation, and fragment activity are runtime observations, not a
    second durable catalog. Core consumes `BackendTopologyPort` only: do not add
    a metadata bridge, global registry, in-memory fallback, or direct-call path.
-   `role=all-in-one` keeps loopback membership transient, while `role=be` does
-   not create frontend membership or StateStore services.
+   `role=be` does not create frontend membership or StateStore services.
 
 7. **Language policy**
    - User interaction and design docs: Chinese
@@ -433,7 +434,7 @@ Important environment variables after sourcing `env.sh`:
 - `AWS_S3_ENDPOINT`, `AWS_S3_ACCESS_KEY_ID`, `AWS_S3_SECRET_ACCESS_KEY`
 - `NOVAROCKS_ICEBERG_REST_URI`
 - `NOVAROCKS_ICEBERG_REST_WAREHOUSE`
-- `NOVAROCKS_STANDALONE_CONFIG`
+- `NOVAROCKS_FE_CONFIG`, `NOVAROCKS_BE_CONFIG`
 - `NOVAROCKS_SQL_TEST_CONFIG`
 - `NOVAROCKS_ICE_REST_CATALOG_SQL`
 - `NOVAROCKS_SPARK_DEFAULTS`
@@ -452,7 +453,8 @@ Start standalone against the generated config:
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
-cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
 ```
 
 When backgrounding the server (e.g. inside an automated test driver), wait
@@ -462,8 +464,8 @@ process that already owned the port:
 
 ```bash
 LOG=/tmp/novarocks-server.log
-NO_PROXY=127.0.0.1,localhost target/debug/novarocks standalone \
-  --config "$NOVAROCKS_STANDALONE_CONFIG" >"$LOG" 2>&1 &
+NO_PROXY=127.0.0.1,localhost target/debug/novarocks standalone --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG" >"$LOG" 2>&1 &
 SRV_PID=$!
 # Wait up to 60 s for the server to bind. If bind fails the line never
 # appears, the process exits with code 1, and `wait` surfaces the failure.
@@ -591,10 +593,12 @@ entry exists.
 
 ```bash
 # Debug: fast compile, slow query (for fix verification)
-NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --role all-in-one
+NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --role all-in-one \
+  --fe-config ./novarocks-fe.toml --be-config ./novarocks-be.toml
 
 # Release: slow compile, fast query (for suite testing)
-NO_PROXY=127.0.0.1,localhost cargo run --release -p novarocks-server -- standalone --role all-in-one
+NO_PROXY=127.0.0.1,localhost cargo run --release -p novarocks-server -- standalone --role all-in-one \
+  --fe-config ./novarocks-fe.toml --be-config ./novarocks-be.toml
 ```
 
 When the local test environment is active:
@@ -602,7 +606,8 @@ When the local test environment is active:
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 NO_PROXY=127.0.0.1,localhost \
-cargo run -p novarocks-server -- standalone --config "$NOVAROCKS_STANDALONE_CONFIG"
+cargo run -p novarocks-server -- standalone --role all-in-one \
+  --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
 ```
 
 When starting a server manually inside a Codex worktree, prefer the generated

@@ -939,9 +939,7 @@ impl FrontendApplicationHost {
             .report_endpoint_sink()
     }
 
-    /// Frontend composition-time topology leaf.  The all-in-one server uses it
-    /// only to register its separately owned backend endpoint before it builds
-    /// the same ready SQL session factory as role=fe.
+    /// Frontend composition-time topology leaf used by FE-owned services.
     pub fn backend_topology_port(&self) -> crate::common::backend_topology::BackendTopologyService {
         Arc::clone(self.topology()) as crate::common::backend_topology::BackendTopologyService
     }
@@ -1232,13 +1230,13 @@ mod tests {
         let state_store = test_state_store_input("catalog-controller-host-test");
         let registry = test_state_store_registry();
         let backend = crate::topology::ClusterBackendOpenConfig::new(
-            novarocks_types::ClusterRole::AllInOne,
+            novarocks_types::ClusterRole::Fe,
             Vec::new(),
             Duration::from_secs(1),
             1,
             Duration::from_secs(1),
         )
-        .expect("valid all-in-one backend config");
+        .expect("valid frontend backend config");
         let host = FrontendApplicationHost::open_with_factories_and_state_store_registry(
             Some(state_store),
             &registry,

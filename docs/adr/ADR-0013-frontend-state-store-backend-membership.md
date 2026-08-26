@@ -2,9 +2,9 @@
 id: ADR-0013
 title: "Frontend StateStore owns durable backend membership"
 domain: [cluster-membership]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0108
 date: 2026-07-29
 provenance:
   - "discussion: 2026-07-29 frontend backend membership authority"

@@ -247,9 +247,6 @@ fn query_lifecycle_structured_snapshot_from_fe(
     port: u16,
 ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
     let response = reqwest::blocking::Client::builder()
-        // The FE report listener is the native h2c lifecycle endpoint. Force
-        // h2c here instead of treating an HTTP/1 timeout as an absent snapshot.
-        .http2_prior_knowledge()
         .timeout(TOPOLOGY_MYSQL_IO_TIMEOUT_CAP)
         .build()
         .context("build FE lifecycle snapshot client")?
@@ -2807,7 +2804,7 @@ impl ServerHandle for CrossProcessServerHandle {
     fn query_lifecycle_structured_snapshot(
         &mut self,
     ) -> Result<Option<QueryLifecycleStructuredSnapshot>> {
-        query_lifecycle_structured_snapshot_from_fe(self.runtime.fe_grpc_port)
+        query_lifecycle_structured_snapshot_from_fe(self.runtime.fe_http_port)
     }
 
     fn be_count(&self) -> usize {
