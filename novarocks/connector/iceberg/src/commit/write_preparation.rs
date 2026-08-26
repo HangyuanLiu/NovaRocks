@@ -220,6 +220,17 @@ fn write_support_denial(
         )));
     }
 
+    if matches!(request.intent, ConnectorWriteIntent::PartitionOverwrite)
+        && metadata.format_version() != FormatVersion::V3
+    {
+        return Some(invalid(format!(
+            "INSERT OVERWRITE PARTITIONS requires an Iceberg v3 row-lineage table; \
+             table {} is v{}",
+            target_fqn,
+            metadata.format_version() as u8,
+        )));
+    }
+
     // Branch writes carry row-lineage semantics, which are Iceberg v3 only.
     if request.target_ref.as_str() != "main" {
         let format_version = metadata.format_version();
@@ -731,6 +742,28 @@ mod tests {
             error.to_string(),
             "InvalidRequest: INSERT OVERWRITE PARTITIONS requires a partitioned table; \
              table ice.db.t is unpartitioned (use OVERWRITE without PARTITIONS)",
+        );
+    }
+
+    #[test]
+    fn partition_overwrite_on_a_pre_v3_partitioned_table_is_denied_before_commit() {
+        let owner = owner();
+        let metadata = partitioned_metadata(false); // FormatVersion::V2
+        let payload = table_payload(Some(table_info(&metadata)));
+        let mut request = data_request(
+            &owner,
+            &payload,
+            ConnectorWriteAdmissionPurpose::OrdinaryDml,
+        );
+        request.intent = ConnectorWriteIntent::PartitionOverwrite;
+
+        let error =
+            expect_denied(prepare_write(request, &owner).expect("prepare v2 partition overwrite"));
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(
+            error.to_string(),
+            "InvalidRequest: INSERT OVERWRITE PARTITIONS requires an Iceberg v3 row-lineage table; \
+             table ice.db.t is v2",
         );
     }
 
