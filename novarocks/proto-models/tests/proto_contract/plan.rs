@@ -271,9 +271,12 @@ fn node_from_proto(proto: &plan::DistributedNode) -> Result<INode, String> {
                 plan::plan_node::Kind::Scan(scan) => {
                     let table = scan.table.as_ref().ok_or("ScanNode.table missing")?;
                     let source = table.source.as_ref().ok_or("TableDef.source missing")?;
-                    let plan::scan_source::Kind::ConnectorRead(source) =
-                        source.kind.as_ref().ok_or("ScanSource.kind missing")?;
-                    let file_count = source.splits.len();
+                    let file_count = match source.kind.as_ref().ok_or("ScanSource.kind missing")? {
+                        plan::scan_source::Kind::ConnectorRead(source) => source.splits.len(),
+                        // The typed scan source never embeds splits: they
+                        // arrive at runtime through TaskUpdate.
+                        plan::scan_source::Kind::TypedConnectorRead(_) => 0,
+                    };
                     IPayload::Scan {
                         database: scan.database.clone(),
                         table: table.name.clone(),

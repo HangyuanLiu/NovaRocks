@@ -60,6 +60,15 @@ pub(crate) fn lower_scan_node(
     let source_path = path.clone().field("table").field("source");
     let output_columns = common::decode_scan_output_columns(scan, path.clone())?;
     match source {
+        // MIGRATION(NCP-2A): the typed scan adapter lands with the frontend
+        // semantic lowering. Refusing here keeps the boundary fail-closed
+        // instead of silently reading an unbound relation.
+        plan::scan_source::Kind::TypedConnectorRead(_) => {
+            Err(NativeFragmentDecodeError::unsupported(
+                source_path.field("typed_connector_read"),
+                "typed connector scan sources are not admitted yet",
+            ))
+        }
         plan::scan_source::Kind::ConnectorRead(source) => {
             let variant_path_plan = variant_path::parse_native_scan_variant_path_columns(
                 scan,

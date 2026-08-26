@@ -178,6 +178,20 @@ pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
         .expect("existing validated Start request has a valid acknowledgement projection")
     }
 
+    /// Admits one runtime split assignment for an already staged task. The
+    /// default refuses rather than silently dropping an assignment, so an
+    /// ingress that does not own task queues cannot look like it accepted one.
+    fn task_update(
+        &self,
+        request: super::task_update::TaskUpdateRequest,
+    ) -> super::task_update::TaskUpdateAck {
+        let _ = request;
+        super::task_update::TaskUpdateAck::rejected(
+            super::task_update::TaskUpdateRejectionReason::NotAdmitted,
+            "TaskUpdate is not supported by this lifecycle ingress",
+        )
+    }
+
     fn abort_query(
         &self,
         request: QueryAbortRequest,

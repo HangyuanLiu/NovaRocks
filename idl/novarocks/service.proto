@@ -26,6 +26,7 @@ syntax = "proto3";
 package novarocks;
 
 import "common.proto";
+import "connector_read.proto";
 import "filter.proto";
 import "plan.proto";
 
@@ -58,6 +59,10 @@ service NovaRocksGrpc {
   rpc StageFragments(StageFragmentsRequest) returns (StageFragmentsResponse);
   rpc StartPreparedQuery(StartPreparedQueryRequest)
       returns (StartPreparedQueryResponse);
+  // Coordinator delivers runtime split assignments to one admitted task.
+  // Producer: the FE per-round split-assignment driver. Consumer: the BE
+  // query lifecycle task-update owner.
+  rpc TaskUpdate(TaskUpdateRequest) returns (TaskUpdateResponse);
   rpc AbortQuery(AbortQueryRequest) returns (AbortQueryResponse);
   rpc QueryControlStream(stream QueryControlRequest)
       returns (stream QueryControlResponse);
@@ -871,6 +876,55 @@ message EnsureConnectorExecutionBindingRejection {
   bool retryable_before_progress = 2;
   string safe_detail = 3;  // <= 512 bytes, redacted by the producing owner
   optional string safe_field_path = 4;  // <= 256 bytes when present
+}
+
+// Runtime split delivery for one admitted task attempt. It never creates a
+// lifecycle entry, never extends retention, and is admissible only after the
+// participant is staged.
+message TaskUpdateRequest {
+  QueryExecutionId execution_id = 1;
+  novarocks.common.UniqueId fragment_instance_id = 2;
+  repeated novarocks.connector_read.SplitAssignment assignments = 3;  // <= 64.
+}
+
+message TaskUpdateResponse {
+  oneof outcome {
+    TaskUpdateAccepted accepted = 1;
+    TaskUpdateRejection rejection = 2;
+  }
+}
+
+// Per plan node, the highest sequence the task has durably accepted, and
+// whether that plan node has seen its terminal no-more marker. The sender uses
+// this for backpressure and for deciding what to retransmit.
+message TaskUpdateAcceptedNode {
+  int32 plan_node_id = 1;
+  uint64 accepted_through_sequence = 2;
+  bool no_more_splits = 3;
+  uint64 queued_splits = 4;
+}
+
+message TaskUpdateAccepted {
+  repeated TaskUpdateAcceptedNode nodes = 1;
+}
+
+enum TaskUpdateRejectionReason {
+  TASK_UPDATE_REJECTION_REASON_UNSPECIFIED = 0;
+  TASK_UPDATE_REJECTION_REASON_UNKNOWN_EXECUTION = 1;
+  TASK_UPDATE_REJECTION_REASON_UNKNOWN_TASK = 2;
+  TASK_UPDATE_REJECTION_REASON_NOT_ADMITTED = 3;
+  TASK_UPDATE_REJECTION_REASON_TERMINATED = 4;
+  TASK_UPDATE_REJECTION_REASON_SEQUENCE_CONFLICT = 5;
+  TASK_UPDATE_REJECTION_REASON_AFTER_NO_MORE_SPLITS = 6;
+  TASK_UPDATE_REJECTION_REASON_UNKNOWN_PLAN_NODE = 7;
+  TASK_UPDATE_REJECTION_REASON_INVALID_ASSIGNMENT = 8;
+  TASK_UPDATE_REJECTION_REASON_RESOURCE_EXHAUSTED = 9;
+}
+
+message TaskUpdateRejection {
+  TaskUpdateRejectionReason reason = 1;
+  string safe_detail = 2;               // <= 512 bytes, redacted by the producer.
+  optional string safe_field_path = 3;  // <= 256 bytes when present.
 }
 
 message RetireConnectorExecutionBindingRequest {

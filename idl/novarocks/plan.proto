@@ -25,6 +25,7 @@ syntax = "proto3";
 package novarocks.plan;
 
 import "common.proto";
+import "connector_read.proto";
 import "expr.proto";
 
 // Whole-query distributed plan.
@@ -1065,6 +1066,9 @@ message ColumnDef {
 message ScanSource {
   oneof kind {
     ConnectorReadSource connector_read = 8; // provider-owned opaque scan and splits.
+    // Typed connector scan: closed handle oneof, ordered assignments, and
+    // predicates. Splits arrive at runtime through TaskUpdate, never here.
+    novarocks.connector_read.ConnectorTableScanSource typed_connector_read = 9;
   }
   reserved 1, 2, 3, 4, 5, 6, 7;
   reserved "iceberg_data_files";

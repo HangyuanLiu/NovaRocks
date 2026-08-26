@@ -55,7 +55,7 @@ use crate::fragment::ingress::NativeFragmentIngress;
 use crate::query_lifecycle::QueryLifecycleIngress;
 use crate::query_lifecycle::rpc::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
-    handle_stage_fragments, handle_start_prepared_query,
+    handle_stage_fragments, handle_start_prepared_query, handle_task_update,
 };
 use crate::rpc::runtime::BackendNativeTransport;
 use crate::runtime_filter::rpc::{
@@ -222,6 +222,21 @@ impl NovaRocksGrpc for BackendRpcService {
                 .map_err(|error| {
                     tonic::Status::internal(format!("fetch_result handler panicked: {error}"))
                 })?;
+        Ok(tonic::Response::new(response))
+    }
+
+    async fn task_update(
+        &self,
+        request: tonic::Request<proto::TaskUpdateRequest>,
+    ) -> Result<tonic::Response<proto::TaskUpdateResponse>, tonic::Status> {
+        let ingress = Arc::clone(&self.query_lifecycle_ingress);
+        let response = tokio::task::spawn_blocking(move || {
+            handle_task_update(ingress.as_ref(), request.into_inner())
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!("task_update handler panicked: {error}"))
+        })?;
         Ok(tonic::Response::new(response))
     }
 

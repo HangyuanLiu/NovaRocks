@@ -160,6 +160,19 @@ pub(crate) fn handle_stage_fragments(
     Ok(response.as_proto().clone())
 }
 
+/// A malformed or refused task update is a typed rejection on the response,
+/// not a transport error: the sender needs the reason to decide whether to
+/// retransmit, stop, or fail the query.
+pub(crate) fn handle_task_update(
+    ingress: &dyn QueryLifecycleIngress,
+    request: proto::TaskUpdateRequest,
+) -> proto::TaskUpdateResponse {
+    match super::task_update::TaskUpdateRequest::parse(request) {
+        Ok(request) => ingress.task_update(request).to_proto(),
+        Err(error) => super::task_update::rejection_from_contract_error(&error).to_proto(),
+    }
+}
+
 #[expect(
     clippy::result_large_err,
     reason = "The tonic service boundary must preserve Status without changing its generated signature."
