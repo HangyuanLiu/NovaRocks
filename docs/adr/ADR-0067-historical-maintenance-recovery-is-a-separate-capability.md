@@ -2,9 +2,9 @@
 id: ADR-0067
 title: "Recovering a dead generation's maintenance is a separate provider capability, not a relaxed exact-generation reconcile"
 domain: [table-maintenance]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0109
 date: 2026-08-13
 provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/888"

@@ -2,9 +2,9 @@
 id: ADR-0065
 title: "A per-table lease attempt is the single dispatch authority for frontend table maintenance"
 domain: [table-maintenance]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0109
 date: 2026-08-13
 provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/862"
