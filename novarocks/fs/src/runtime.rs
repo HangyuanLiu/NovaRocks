@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::task::JoinHandle;
 
 use crate::{FileError, FileResult};
@@ -113,11 +113,11 @@ impl TokioFileIoRuntime {
 
 impl FileIoRuntime for TokioFileIoRuntime {
     fn block_on_bytes(&self, future: FileBytesFuture) -> FileResult<Bytes> {
-        block_on(&self.handle, future)
+        block_on(&self.handle, future)?
     }
 
     fn block_on_u64(&self, future: FileU64Future) -> FileResult<u64> {
-        block_on(&self.handle, future)
+        block_on(&self.handle, future)?
     }
 }
 
@@ -125,11 +125,17 @@ impl FileIoRuntime for TokioFileIoRuntime {
 /// operations are asynchronous. Production data runtimes are multi-threaded;
 /// yield the worker before driving the explicitly injected handle so a reader
 /// reached from that runtime never nests `Handle::block_on` and panics.
-fn block_on<T>(handle: &Handle, future: impl Future<Output = T>) -> T {
-    if Handle::try_current().is_ok() {
-        return tokio::task::block_in_place(|| handle.block_on(future));
+fn block_on<T>(handle: &Handle, future: impl Future<Output = T>) -> FileResult<T> {
+    match Handle::try_current() {
+        Ok(current) if current.runtime_flavor() == RuntimeFlavor::CurrentThread => {
+            Err(FileError::new(
+                crate::FileErrorKind::Internal,
+                "filesystem I/O cannot synchronously bridge from a current-thread Tokio runtime",
+            ))
+        }
+        Ok(_) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
+        Err(_) => Ok(handle.block_on(future)),
     }
-    handle.block_on(future)
 }
 
 #[derive(Clone)]
@@ -171,5 +177,15 @@ mod tests {
                 .expect("u64 bridge"),
             7
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_io_runtime_rejects_a_current_thread_runtime_without_panicking() {
+        let runtime = TokioFileIoRuntime::new(Handle::current());
+
+        let error = runtime
+            .block_on_u64(Box::pin(async { Ok(7_u64) }))
+            .expect_err("current-thread bridge must fail closed");
+        assert_eq!(error.kind(), crate::FileErrorKind::Internal);
     }
 }
