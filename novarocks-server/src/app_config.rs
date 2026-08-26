@@ -26,7 +26,7 @@ use crate::state_store_config::{
 use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_secret::SecretValue;
-use novarocks_types::ClusterRole;
+use novarocks_types::{ClusterRole, NativeEndpoint};
 use uuid::Uuid;
 
 pub use crate::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
@@ -281,8 +281,8 @@ impl ClusterConfig {
                 let mut seen = std::collections::HashSet::new();
                 for b in &self.backends {
                     let canonical = b
-                        .parse::<std::net::SocketAddr>()
-                        .map_err(|e| format!("invalid backend addr '{}': {}", b, e))?
+                        .parse::<NativeEndpoint>()
+                        .map_err(|e| format!("invalid backend addr '{b}': {e}"))?
                         .to_string();
                     if !seen.insert(canonical) {
                         return Err(format!("duplicate backend in [cluster].backends: {}", b));
@@ -2539,6 +2539,19 @@ backends = ["10.0.0.1:9070", "10.0.0.2:9070", "10.0.0.3:9070"]
         cfg.cluster
             .validate()
             .expect("3 backends should pass D2 validate");
+    }
+
+    #[test]
+    fn test_cluster_role_fe_accepts_canonical_dns_backend() {
+        let toml = r#"
+[cluster]
+role = "fe"
+backends = ["localhost:9070"]
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse DNS backend");
+        cfg.cluster
+            .validate()
+            .expect("canonical DNS backend should pass validation");
     }
 
     #[test]
