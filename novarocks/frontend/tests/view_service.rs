@@ -16,12 +16,10 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, StringArray};
-use bytes::Bytes;
 use novarocks_frontend::FrontendViewService;
 use novarocks_frontend::common::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
@@ -35,17 +33,7 @@ use novarocks_parser::{
     ast::{Ident, ObjectName, Query, SetExpr, Statement as ParsedStatement, TypeName},
     printer::print_query,
 };
-use novarocks_spi::{
-    connector::{ConnectorCancellation, ConnectorRequestContext},
-    state_store::{FeDeploymentView, StateStore},
-};
-mod common;
-use common::state_store_fixture as state_store_test;
-use state_store_test::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
-    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
-};
-use tempfile::TempDir;
+use novarocks_spi::connector::{ConnectorCancellation, ConnectorRequestContext};
 
 #[derive(Default)]
 struct FakeViewEngine {
@@ -336,43 +324,9 @@ fn query_rows_at(
         .collect()
 }
 
-async fn open_sqlite_store(
-    path: &std::path::Path,
-) -> (StateStoreHost, std::sync::Arc<dyn StateStore>) {
-    let registry = builtin_state_store_provider_registry().unwrap();
-    let host = StateStoreHost::open(
-        &registry,
-        StateStoreHostConfig {
-            state_store: StateStoreAppConfig {
-                store: StateStoreConfig {
-                    cluster_id: format!("view-service-test-{}", path.display()),
-                    limits: StateStoreLimitOverrides::default(),
-                    provider: StateStoreProviderConfig::Sqlite {
-                        path: path.to_path_buf(),
-                        deployment_owner: "view-service-fe".to_string(),
-                    },
-                },
-                mysql_client: None,
-            },
-            foundationdb_client: None,
-        },
-        FeDeploymentView {
-            active_fe_count: NonZeroUsize::new(1).unwrap(),
-            topology_revision: Bytes::from_static(b"view-service-topology"),
-        },
-        Instant::now() + Duration::from_secs(5),
-    )
-    .await
-    .unwrap();
-    let store = host.state_store().unwrap();
-    (host, store)
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn session_view_ddl_show_and_rewrite_preserve_existing_behavior() {
-    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
+#[test]
+fn session_view_ddl_show_and_rewrite_preserve_existing_behavior() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default();
     let ctx = context(None, "db");
 
@@ -419,11 +373,9 @@ async fn session_view_ddl_show_and_rewrite_preserve_existing_behavior() {
     assert_eq!(print_query(&dropped), "SELECT * FROM v1");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn default_catalog_one_two_and_three_part_names_share_session_registry() {
-    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
+#[test]
+fn default_catalog_one_two_and_three_part_names_share_session_registry() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default();
 
     service
@@ -460,11 +412,9 @@ async fn default_catalog_one_two_and_three_part_names_share_session_registry() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn session_view_rewrite_uses_its_frozen_creation_database() {
-    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
+#[test]
+fn session_view_rewrite_uses_its_frozen_creation_database() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default();
 
     service
@@ -485,11 +435,9 @@ async fn session_view_rewrite_uses_its_frozen_creation_database() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
-    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
+#[test]
+fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     let shadow = ViewTarget {
         catalog: "ice".to_string(),
@@ -559,11 +507,9 @@ async fn iceberg_ddl_routes_names_and_freezes_alias_and_table_shadow_rules() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
-    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
+#[test]
+fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     let target = ViewTarget {
         catalog: "ice".to_string(),
@@ -622,11 +568,9 @@ async fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
     assert_eq!(query_rows(&show), vec!["a", "v"]);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn rewrite_is_session_first_and_preserves_external_resolution_rules() {
-    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
+#[test]
+fn rewrite_is_session_first_and_preserves_external_resolution_rules() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     service
         .try_handle_statement(
@@ -688,11 +632,9 @@ async fn rewrite_is_session_first_and_preserves_external_resolution_rules() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn session_cte_shadows_a_same_named_session_view() {
-    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
+#[test]
+fn session_cte_shadows_a_same_named_session_view() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default();
     service
         .try_handle_statement(
@@ -712,11 +654,9 @@ async fn session_cte_shadows_a_same_named_session_view() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn session_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
-    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
+#[test]
+fn session_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default();
     for view in ["nested", "first", "second"] {
         service
@@ -747,11 +687,9 @@ async fn session_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn external_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
-    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
+#[test]
+fn external_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     for view in ["nested", "first", "second"] {
         engine.insert_view(
@@ -784,11 +722,9 @@ async fn external_cte_scope_flows_into_nested_queries_and_recursive_bodies() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn external_view_qualification_preserves_ctes_inside_nested_queries() {
-    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
+#[test]
+fn external_view_qualification_preserves_ctes_inside_nested_queries() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     engine.insert_view(
         ViewTarget {
@@ -810,11 +746,9 @@ async fn external_view_qualification_preserves_ctes_inside_nested_queries() {
     assert!(rendered.contains("FROM nested"), "got: {rendered}");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn spi5b_rewrite_resolves_table_view_and_admission_failure_with_one_control_result() {
-    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
+#[test]
+fn spi5b_rewrite_resolves_table_view_and_admission_failure_with_one_control_result() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     let table = ViewTarget {
         catalog: "ice".to_string(),
@@ -871,11 +805,9 @@ async fn spi5b_rewrite_resolves_table_view_and_admission_failure_with_one_contro
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn dropping_external_database_does_not_remove_default_catalog_views() {
-    let service = FrontendViewService::open(None, tokio::runtime::Handle::current())
-        .await
-        .unwrap();
+#[test]
+fn dropping_external_database_does_not_remove_default_catalog_views() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default();
     service
         .try_handle_statement(
@@ -902,16 +834,12 @@ async fn dropping_external_database_does_not_remove_default_catalog_views() {
     assert!(query_rows(&show).is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn configured_service_restores_durable_views_and_never_publishes_failed_replace() {
-    let temp = TempDir::new().unwrap();
-    let (_host, store) = open_sqlite_store(&temp.path().join("state.sqlite")).await;
-    let service = FrontendViewService::open(
-        Some(std::sync::Arc::clone(&store)),
-        tokio::runtime::Handle::current(),
-    )
-    .await
-    .unwrap();
+#[test]
+fn local_views_do_not_exist_on_a_new_service_instance() {
+    // The durable half of this case retired with `ViewRepository`. A local view
+    // is process runtime state, so the observable contract is the opposite one:
+    // a new service instance starts from an empty registry.
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default();
     service
         .try_handle_statement(
@@ -920,44 +848,34 @@ async fn configured_service_restores_durable_views_and_never_publishes_failed_re
             context(None, "db"),
         )
         .unwrap();
-
-    let oversized = format!(
-        "CREATE OR REPLACE VIEW v AS SELECT '{}' AS a",
-        "x".repeat(70 * 1024)
-    );
-    assert!(
-        service
-            .try_handle_statement(&engine, &oversized, context(None, "db"))
-            .unwrap_err()
-            .contains("encode frontend view database default_catalog.db failed")
-    );
-    let mut unchanged = parse_query("SELECT * FROM v");
+    let mut visible = parse_query("SELECT * FROM v");
     service
-        .rewrite_query(&engine, &mut unchanged, context(None, "db"))
+        .rewrite_query(&engine, &mut visible, context(None, "db"))
         .unwrap();
-    assert_eq!(print_query(&unchanged), "SELECT * FROM (SELECT 1 AS a) v");
+    assert_eq!(print_query(&visible), "SELECT * FROM (SELECT 1 AS a) v");
     drop(service);
 
-    let reopened = FrontendViewService::open(Some(store), tokio::runtime::Handle::current())
-        .await
+    let restarted = FrontendViewService::new();
+    let mut absent = parse_query("SELECT * FROM v");
+    restarted
+        .rewrite_query(&engine, &mut absent, context(None, "db"))
         .unwrap();
-    let mut restored = parse_query("SELECT * FROM v");
-    reopened
-        .rewrite_query(&engine, &mut restored, context(None, "db"))
-        .unwrap();
-    assert_eq!(print_query(&restored), "SELECT * FROM (SELECT 1 AS a) v");
+    assert_eq!(
+        print_query(&absent),
+        "SELECT * FROM v",
+        "a local view must not outlive the frontend incarnation that defined it"
+    );
+    let show = query_result(
+        restarted
+            .try_handle_statement(&engine, "SHOW VIEWS", context(None, "db"))
+            .unwrap(),
+    );
+    assert!(query_rows(&show).is_empty());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn starrocks_view_sql_uses_the_same_parser_before_and_after_restart() {
-    let temp = TempDir::new().unwrap();
-    let (_host, store) = open_sqlite_store(&temp.path().join("state.sqlite")).await;
-    let service = FrontendViewService::open(
-        Some(std::sync::Arc::clone(&store)),
-        tokio::runtime::Handle::current(),
-    )
-    .await
-    .unwrap();
+#[test]
+fn starrocks_view_sql_uses_the_same_parser_for_local_and_external_views() {
+    let service = FrontendViewService::new();
     let engine = FakeViewEngine::default().with_rest_catalog("ice");
     service
         .try_handle_statement(
@@ -967,13 +885,8 @@ async fn starrocks_view_sql_uses_the_same_parser_before_and_after_restart() {
             context(None, "db"),
         )
         .unwrap();
-    drop(service);
-
-    let reopened = FrontendViewService::open(Some(store), tokio::runtime::Handle::current())
-        .await
-        .unwrap();
     let mut query = parse_query("SELECT * FROM dialect_view");
-    reopened
+    service
         .rewrite_query(&engine, &mut query, context(None, "db"))
         .unwrap();
     let rendered = print_query(&query);
@@ -986,13 +899,16 @@ async fn starrocks_view_sql_uses_the_same_parser_before_and_after_restart() {
         ViewTarget {
             catalog: "ice".to_string(),
             database: "db".to_string(),
-            view: "dialect_view".to_string(),
+            view: "external_dialect_view".to_string(),
         },
         "SELECT first_value(a IGNORE NULLS) OVER () AS x FROM t",
         "db",
     );
-    let mut external = parse_query("SELECT * FROM dialect_view");
-    reopened
+    // Deliberately a different name from the local view above. Sharing one
+    // name let the local expansion satisfy this assertion, so the external
+    // path - now the only durable view mechanism - was never exercised.
+    let mut external = parse_query("SELECT * FROM external_dialect_view");
+    service
         .rewrite_query(&engine, &mut external, context(Some("ice"), "db"))
         .unwrap();
     let rendered = print_query(&external);

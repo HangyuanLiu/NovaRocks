@@ -16,7 +16,6 @@
 // under the License.
 
 use bytes::Bytes;
-use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
     ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
@@ -346,7 +345,7 @@ async fn shared_test_provider_allows_multiple_live_hosts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configured_host_restores_views_through_its_service_after_reopen() {
+async fn configured_host_does_not_restore_local_views_after_reopen() {
     let temp = TempDir::new().expect("temporary SQLite deployment");
     let config = sqlite_config(&temp);
     let host = open_host(Some(config.clone()))
@@ -355,112 +354,33 @@ async fn configured_host_restores_views_through_its_service_after_reopen() {
     execute_view_statement(
         host.view_service().as_ref(),
         &SessionViewEngine,
-        "CREATE VIEW durable_view AS SELECT 42 AS answer",
+        "CREATE VIEW local_view AS SELECT 42 AS answer",
         view_context(),
     )
-    .expect("host view service must persist the view");
+    .expect("host view service must register the view");
+    let mut visible = parse_query("SELECT * FROM local_view");
+    host.view_service()
+        .rewrite_query(&SessionViewEngine, &mut visible, view_context())
+        .expect("the defining host must expand its own view");
+    assert_eq!(
+        print_query(&visible),
+        "SELECT * FROM (SELECT 42 AS answer) local_view"
+    );
     host.shutdown().await.expect("first host shutdown");
 
+    // A local view is process runtime state even when the host has a
+    // StateStore: the frontend is its only authority, so the view ends with the
+    // incarnation that defined it. Durable views live in an external catalog.
     let reopened = open_host(Some(config))
         .await
         .expect("configured host must reopen");
-    let mut query = parse_query("SELECT * FROM durable_view");
+    let mut query = parse_query("SELECT * FROM local_view");
     reopened
         .view_service()
         .rewrite_query(&SessionViewEngine, &mut query, view_context())
-        .expect("reopened host must restore the view");
-    assert_eq!(
-        print_query(&query),
-        "SELECT * FROM (SELECT 42 AS answer) durable_view"
-    );
+        .expect("reopened host must rewrite without the local view");
+    assert_eq!(print_query(&query), "SELECT * FROM local_view");
     reopened.shutdown().await.expect("reopened host shutdown");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn corrupt_view_record_fails_host_open_at_the_view_service_boundary() {
-    let temp = TempDir::new().expect("temporary SQLite deployment");
-    let config = sqlite_config(&temp);
-    let host = open_host(Some(config.clone()))
-        .await
-        .expect("configured host must open");
-    let store = host.state_store().expect("configured host state store");
-    let mut transaction = store
-        .begin_write(
-            TransactionId::from(Uuid::now_v7()),
-            "seed corrupt frontend view record",
-        )
-        .await
-        .expect("begin corrupt record write");
-    transaction
-        .put(
-            database_key("default_catalog", "db").expect("view database key"),
-            Value::try_from(Bytes::from_static(b"not-json")).expect("corrupt value"),
-            Precondition::Absent,
-        )
-        .await
-        .expect("stage corrupt record");
-    assert!(matches!(
-        transaction.commit().await,
-        CommitOutcome::Committed(_)
-    ));
-    drop(store);
-    host.shutdown().await.expect("seed host shutdown");
-
-    let error = match open_host(Some(config)).await {
-        Ok(_) => panic!("corrupt durable view metadata must reject host open"),
-        Err(error) => error,
-    };
-    assert_eq!(error.kind(), FrontendApplicationErrorKind::ViewServiceOpen);
-    assert!(error.to_string().contains("decode frontend view database"));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn view_open_failure_precedes_table_maintenance_open_failure() {
-    let temp = TempDir::new().expect("temporary SQLite deployment");
-    let config = sqlite_config(&temp);
-    let host = open_host(Some(config.clone()))
-        .await
-        .expect("configured host must open");
-    let store = host.state_store().expect("configured host state store");
-    let mut transaction = store
-        .begin_write(
-            TransactionId::from(Uuid::now_v7()),
-            "seed corrupt frontend application records",
-        )
-        .await
-        .expect("begin corrupt record write");
-    transaction
-        .put(
-            database_key("default_catalog", "db").expect("view database key"),
-            Value::try_from(Bytes::from_static(b"not-json")).expect("corrupt view value"),
-            Precondition::Absent,
-        )
-        .await
-        .expect("stage corrupt view record");
-    transaction
-        .put(
-            Key::try_from(Bytes::from_static(
-                b"novarocks/frontend/table-maintenance/v1/jobs/0000000000000001",
-            ))
-            .expect("maintenance job key"),
-            Value::try_from(Bytes::from_static(b"not-json")).expect("corrupt maintenance value"),
-            Precondition::Absent,
-        )
-        .await
-        .expect("stage corrupt maintenance record");
-    assert!(matches!(
-        transaction.commit().await,
-        CommitOutcome::Committed(_)
-    ));
-    drop(store);
-    host.shutdown().await.expect("seed host shutdown");
-
-    let error = match open_host(Some(config)).await {
-        Ok(_) => panic!("corrupt durable application metadata must reject host open"),
-        Err(error) => error,
-    };
-    assert_eq!(error.kind(), FrontendApplicationErrorKind::ViewServiceOpen);
-    assert!(error.to_string().contains("decode frontend view database"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

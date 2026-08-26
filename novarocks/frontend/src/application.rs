@@ -523,17 +523,9 @@ impl FrontendApplicationHost {
         host.statistics_service = Some(Arc::new(FrontendStatisticsService::new()));
         let statistics = host.statistics_service();
         host.dml_service = Some(Arc::new(DmlService::new(statistics)));
-        match FrontendViewService::open(host.state_store(), tokio::runtime::Handle::current()).await
-        {
-            Ok(view_service) => host.view_service = Some(Arc::new(view_service)),
-            Err(error) => {
-                let error = FrontendApplicationError::new(
-                    FrontendApplicationErrorKind::ViewServiceOpen,
-                    error,
-                );
-                return Err(host.cleanup_open_error(error).await);
-            }
-        }
+        // Local views are process runtime state, so this service has nothing to
+        // load and no store to fail against.
+        host.view_service = Some(Arc::new(FrontendViewService::new()));
         let table_maintenance_open = FrontendTableMaintenanceService::open(
             host.state_store(),
             tokio::runtime::Handle::current(),

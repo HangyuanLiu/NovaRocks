@@ -18,7 +18,6 @@
 //! Frontend-owned view DDL, metadata, and query rewrite service.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::common::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
@@ -31,15 +30,12 @@ use novarocks_parser::{
     ast::{CreateView, Query, Statement, ViewStatement},
     printer,
 };
-use novarocks_spi::state_store::StateStore;
 use novarocks_types::SlotId;
 use novarocks_types::naming::normalize_identifier;
-use tokio::runtime::Handle;
 
 pub(crate) mod command;
 pub mod engine;
 mod iceberg;
-pub mod repository;
 mod rewrite;
 
 pub use engine::{
@@ -47,8 +43,6 @@ pub use engine::{
     ViewColumnDefinition, ViewEngine, ViewRequestContext, ViewService, ViewStatementResult,
     ViewTarget,
 };
-
-use repository::{DatabaseMutation, StoredDatabaseViewsV2, ViewRepository};
 
 const DEFAULT_CATALOG: &str = "default_catalog";
 
@@ -65,73 +59,46 @@ struct StoredView {
     query: Box<Query>,
 }
 
+/// Local (non-external catalog) views, for as long as this frontend runs.
+///
+/// The in-process registry is the whole authority. Local views are the
+/// [`StateFamily::LocalViewRegistry`] family, classified `ProcessRuntime`: no
+/// external system defines them, so no external system could rebuild them, and
+/// the manifest resolves that by ending their lifetime with the frontend
+/// incarnation rather than by making the frontend a durable metadata authority.
+/// The family therefore owns no persistent key prefix, and a restart starts
+/// from an empty registry.
+///
+/// That is a capability ceiling, not a rejection: `CREATE VIEW`, `DROP VIEW`
+/// and `SHOW VIEWS` behave as before within one process. A deployment that
+/// needs durable views defines them in an external catalog, whose provider owns
+/// them as its own truth (`view/iceberg.rs`).
+///
+/// [`StateFamily::LocalViewRegistry`]: crate::state_family::StateFamily::LocalViewRegistry
 pub struct FrontendViewService {
     registry: RwLock<HashMap<SessionViewKey, StoredView>>,
+    /// Serialises view DDL against other view DDL, so that a create and a drop
+    /// of the same name keep statement order instead of interleaving their
+    /// check-then-write halves.
     mutation: Mutex<()>,
-    repository: Option<ViewRepository>,
-    runtime: Handle,
 }
 
 impl FrontendViewService {
-    pub async fn open(store: Option<Arc<dyn StateStore>>, runtime: Handle) -> Result<Self, String> {
-        let repository = match store {
-            Some(store) => Some(ViewRepository::open(store, runtime.clone()).await?),
-            None => None,
-        };
-        let records = match &repository {
-            Some(repository) => repository.load_all().await?,
-            None => Vec::new(),
-        };
-        let service = Self {
+    pub fn new() -> Self {
+        Self {
             registry: RwLock::new(HashMap::new()),
             mutation: Mutex::new(()),
-            repository,
-            runtime,
-        };
-        service.replace_all_records(records)?;
-        Ok(service)
-    }
-
-    fn replace_all_records(&self, records: Vec<StoredDatabaseViewsV2>) -> Result<(), String> {
-        let mut replacement = HashMap::new();
-        for record in records {
-            append_record_views(&mut replacement, &record)?;
-        }
-        *self
-            .registry
-            .write()
-            .map_err(|error| format!("frontend view registry write lock: {error}"))? = replacement;
-        Ok(())
-    }
-
-    fn replace_database_record(&self, record: &StoredDatabaseViewsV2) -> Result<(), String> {
-        let mut parsed = HashMap::new();
-        append_record_views(&mut parsed, record)?;
-        let mut registry = self
-            .registry
-            .write()
-            .map_err(|error| format!("frontend view registry write lock: {error}"))?;
-        registry.retain(|key, _| key.catalog != record.catalog || key.database != record.database);
-        registry.extend(parsed);
-        Ok(())
-    }
-
-    fn recover_cache_after_mutation_error(&self) -> Result<(), String> {
-        let Some(repository) = &self.repository else {
-            return Ok(());
-        };
-        let records = self.block_on(repository.load_all())?;
-        self.replace_all_records(records)
-    }
-
-    fn block_on<F: Future>(&self, future: F) -> F::Output {
-        if Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.runtime.block_on(future))
-        } else {
-            self.runtime.block_on(future)
         }
     }
+}
 
+impl Default for FrontendViewService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrontendViewService {
     fn create_session_view(
         &self,
         key: SessionViewKey,
@@ -143,38 +110,18 @@ impl FrontendViewService {
             .mutation
             .lock()
             .map_err(|error| format!("frontend view mutation lock: {error}"))?;
-        if let Some(repository) = &self.repository {
-            let mutation = DatabaseMutation::Create {
-                view: key.view.clone(),
-                definition: definition.clone(),
-                or_replace,
-            };
-            match self.block_on(repository.mutate_database(&key.catalog, &key.database, mutation)) {
-                Ok(record) => self.replace_database_record(&record),
-                Err(error) => {
-                    let recovery = self.recover_cache_after_mutation_error();
-                    match recovery {
-                        Ok(()) => Err(error),
-                        Err(recovery_error) => Err(format!(
-                            "{error}; reload frontend view cache failed: {recovery_error}"
-                        )),
-                    }
-                }
-            }
-        } else {
-            let mut registry = self
-                .registry
-                .write()
-                .map_err(|error| format!("frontend view registry write lock: {error}"))?;
-            if registry.contains_key(&key) && !or_replace {
-                return Err(format!(
-                    "view already exists: {}.{}",
-                    key.database, key.view
-                ));
-            }
-            registry.insert(key, StoredView { definition, query });
-            Ok(())
+        let mut registry = self
+            .registry
+            .write()
+            .map_err(|error| format!("frontend view registry write lock: {error}"))?;
+        if registry.contains_key(&key) && !or_replace {
+            return Err(format!(
+                "view already exists: {}.{}",
+                key.database, key.view
+            ));
         }
+        registry.insert(key, StoredView { definition, query });
+        Ok(())
     }
 
     fn drop_session_view(&self, key: &SessionViewKey) -> Result<(), String> {
@@ -182,32 +129,11 @@ impl FrontendViewService {
             .mutation
             .lock()
             .map_err(|error| format!("frontend view mutation lock: {error}"))?;
-        if let Some(repository) = &self.repository {
-            match self.block_on(repository.mutate_database(
-                &key.catalog,
-                &key.database,
-                DatabaseMutation::DropView {
-                    view: key.view.clone(),
-                },
-            )) {
-                Ok(record) => self.replace_database_record(&record),
-                Err(error) => {
-                    let recovery = self.recover_cache_after_mutation_error();
-                    match recovery {
-                        Ok(()) => Err(error),
-                        Err(recovery_error) => Err(format!(
-                            "{error}; reload frontend view cache failed: {recovery_error}"
-                        )),
-                    }
-                }
-            }
-        } else {
-            self.registry
-                .write()
-                .map_err(|error| format!("frontend view registry write lock: {error}"))?
-                .remove(key);
-            Ok(())
-        }
+        self.registry
+            .write()
+            .map_err(|error| format!("frontend view registry write lock: {error}"))?
+            .remove(key);
+        Ok(())
     }
 
     fn handle_create(
@@ -222,12 +148,8 @@ impl FrontendViewService {
         }
         let key = session_view_key(&create_view.name, context.current_database)?;
         let definition = query_definition(&printer::print_query(&create_view.query), context)?;
-        self.create_session_view(
-            key,
-            definition.clone(),
-            parse_query(&definition.raw_query_source)?,
-            create_view.or_replace,
-        )?;
+        let query = parse_query(&definition.raw_query_source)?;
+        self.create_session_view(key, definition, query, create_view.or_replace)?;
         Ok(ViewStatementResult::Ok)
     }
 
@@ -335,52 +257,12 @@ impl ViewService for FrontendViewService {
             .mutation
             .lock()
             .map_err(|error| format!("frontend view mutation lock: {error}"))?;
-        if let Some(repository) = &self.repository {
-            match self.block_on(repository.mutate_database(
-                &catalog,
-                &database,
-                DatabaseMutation::DropDatabase,
-            )) {
-                Ok(record) => self.replace_database_record(&record),
-                Err(error) => {
-                    let recovery = self.recover_cache_after_mutation_error();
-                    match recovery {
-                        Ok(()) => Err(error),
-                        Err(recovery_error) => Err(format!(
-                            "{error}; reload frontend view cache failed: {recovery_error}"
-                        )),
-                    }
-                }
-            }
-        } else {
-            self.registry
-                .write()
-                .map_err(|error| format!("frontend view registry write lock: {error}"))?
-                .retain(|key, _| key.catalog != catalog || key.database != database);
-            Ok(())
-        }
+        self.registry
+            .write()
+            .map_err(|error| format!("frontend view registry write lock: {error}"))?
+            .retain(|key, _| key.catalog != catalog || key.database != database);
+        Ok(())
     }
-}
-
-fn append_record_views(
-    registry: &mut HashMap<SessionViewKey, StoredView>,
-    record: &StoredDatabaseViewsV2,
-) -> Result<(), String> {
-    for (view, stored) in &record.views {
-        stored.definition.validate()?;
-        registry.insert(
-            SessionViewKey {
-                catalog: record.catalog.clone(),
-                database: record.database.clone(),
-                view: view.clone(),
-            },
-            StoredView {
-                definition: stored.definition.clone(),
-                query: parse_query(&stored.definition.raw_query_source)?,
-            },
-        );
-    }
-    Ok(())
 }
 
 fn parse_query(sql: &str) -> Result<Box<Query>, String> {
