@@ -15,8 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Process-neutral fragment execution contracts.
-pub mod connector;
-pub mod exec;
-pub mod runtime;
-pub mod runtime_filter;
+//! Coordinator-side runtime split assignment.
+//!
+//! One driver exists per execution round. It owns its split sources, its
+//! sequence spaces, and its senders; aborting a round closes all of them, and
+//! a replacement round rebuilds them from scratch under a new attempt id. No
+//! state survives a round.
+
+mod driver;
+mod transport;
+
+pub(crate) use driver::{
+    AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError, SplitSourceHandle,
+};
+pub(crate) use transport::{TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError};
