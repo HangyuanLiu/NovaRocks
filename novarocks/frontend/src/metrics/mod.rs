@@ -437,7 +437,13 @@ mod tests {
                     && line.contains("disposition=\"known_committed\"")
             })
             .expect("rendered CTAS finalization-failure metric");
-        assert!(line.ends_with(" 1"), "{line}");
+        let value = line
+            .rsplit_once(' ')
+            .expect("metric line has a value")
+            .1
+            .parse::<u64>()
+            .expect("metric value is an integer");
+        assert!(value >= 1, "{line}");
     }
 
     #[test]

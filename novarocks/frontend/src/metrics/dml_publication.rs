@@ -121,7 +121,13 @@ mod tests {
         let rendered = String::from_utf8(rendered).expect("metrics are utf-8");
         let line = rendered
             .lines()
-            .find(|line| line.starts_with("novarocks_dml_publication_terminal_total"))
+            .find(|line| {
+                line.starts_with("novarocks_dml_publication_terminal_total")
+                    && line.contains("family=\"write\"")
+                    && line.contains("phase=\"dispatch_possible\"")
+                    && line.contains("disposition=\"commit_unknown\"")
+                    && line.contains("finalization=\"not_applicable\"")
+            })
             .expect("DML publication metric line");
 
         assert!(line.contains("family=\"write\""), "{line}");
