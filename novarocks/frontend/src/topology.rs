@@ -683,20 +683,54 @@ impl BackendTopologyPort for ClusterBackendService {
         let current = self
             .snapshot_inner()
             .map_err(BackendTopologyValidationError::Unavailable)?;
+        if current == *expected {
+            return Ok(());
+        }
+        // A revision advance is not sufficient evidence to retry an attempt.
+        // Preserve the exact captured process evidence when a planned target
+        // disappeared or was replaced, so the pre-ready coordinator can make
+        // its one bounded whole-round retry decision without parsing a
+        // transport error.
+        for expected_target in expected.targets() {
+            let expected_process_id = expected_target.process_id().map_err(|_| {
+                BackendTopologyValidationError::ContentChangedWithoutRevision {
+                    revision: expected.revision(),
+                }
+            })?;
+            let Some(current_target) = current.target(expected_target.backend_idx()) else {
+                return Err(BackendTopologyValidationError::TargetMissing {
+                    backend_idx: expected_target.backend_idx(),
+                    captured_generation: expected_process_id,
+                    captured_revision: expected.revision(),
+                    current_revision: current.revision(),
+                });
+            };
+            let current_process_id = current_target.process_id().map_err(|_| {
+                BackendTopologyValidationError::ContentChangedWithoutRevision {
+                    revision: current.revision(),
+                }
+            })?;
+            if current_process_id != expected_process_id {
+                return Err(BackendTopologyValidationError::GenerationChanged {
+                    backend_idx: expected_target.backend_idx(),
+                    captured_generation: expected_process_id,
+                    current_generation: current_process_id,
+                    captured_revision: expected.revision(),
+                    current_revision: current.revision(),
+                });
+            }
+        }
         if current.revision() != expected.revision() {
             return Err(BackendTopologyValidationError::RevisionChanged {
                 captured_revision: expected.revision(),
                 current_revision: current.revision(),
             });
         }
-        if current != *expected {
-            return Err(
-                BackendTopologyValidationError::ContentChangedWithoutRevision {
-                    revision: current.revision(),
-                },
-            );
-        }
-        Ok(())
+        Err(
+            BackendTopologyValidationError::ContentChangedWithoutRevision {
+                revision: current.revision(),
+            },
+        )
     }
     fn wait_for_eligible_after(
         &self,
@@ -1041,6 +1075,35 @@ mod tests {
                 .unwrap(),
             new.process_id().unwrap()
         );
+    }
+
+    #[test]
+    fn replacement_reports_the_captured_process_generation_not_only_revision_drift() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let endpoint = "127.0.0.1:9070".parse().unwrap();
+        let old = descriptor(endpoint);
+        service
+            .record_announce(old.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &old);
+        let captured = service.snapshot().unwrap();
+
+        let replacement = descriptor(endpoint);
+        service
+            .record_announce(replacement.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &replacement);
+
+        assert!(matches!(
+            service.validate_snapshot(&captured),
+            Err(crate::common::backend_topology::BackendTopologyValidationError::GenerationChanged {
+                backend_idx: 0,
+                captured_generation,
+                current_generation,
+                ..
+            }) if captured_generation == old.process_id().unwrap()
+                && current_generation == replacement.process_id().unwrap()
+        ));
     }
     #[test]
     fn heartbeat_loss_never_sends_unavailable() {

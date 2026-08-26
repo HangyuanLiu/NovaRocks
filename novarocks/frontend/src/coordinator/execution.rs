@@ -26,7 +26,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::common::backend_topology::{BackendTopologyValidationError, LiveBackendTarget};
+use crate::common::backend_topology::{
+    BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, LiveBackendTarget,
+};
 use crate::native::fragment_transport::{FetchOutcome, FragmentDispatcher};
 use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::artifact::{
@@ -1114,7 +1116,19 @@ impl FrontendDistributedQueryCoordinator {
             }),
         );
         let connector_binding_ready = runtime_filter_ready
-            .initialize_query(init_options, &lifecycle_barrier)?
+            .initialize_query(init_options, &lifecycle_barrier)
+            .map_err(|error| {
+                reclassify_pre_ready_lifecycle_failure(
+                    self.backend_topology.as_ref(),
+                    &parts.topology,
+                    error,
+                    statement_deadline.min(
+                        Instant::now()
+                            .checked_add(self.lifecycle_config.init_rpc_timeout())
+                            .unwrap_or(statement_deadline),
+                    ),
+                )
+            })?
             .prepare_connector_bindings(&connector_bindings)?;
         if let Some(retry_boundary) = retry_boundary {
             retry_boundary.close_after_control_ready();
@@ -1630,6 +1644,94 @@ fn pre_ready_topology_validation_error(
             error.to_string(),
         ),
         other => failed(other.to_string()),
+    }
+}
+
+/// A lifecycle transport failure remains terminal unless the FE-owned
+/// membership authority can independently prove that a captured participant
+/// process was replaced or is no longer eligible. This runs before
+/// `ControlReady`, after the guarded old round has been aborted, and never
+/// derives retryability from transport text.
+fn reclassify_pre_ready_lifecycle_failure(
+    topology: &dyn BackendTopologyPort,
+    captured: &BackendTopologySnapshot,
+    original: DistributedQueryError,
+    observation_deadline: Instant,
+) -> DistributedQueryError {
+    if original.pre_ready_topology_outcome().is_some() {
+        return original;
+    }
+    if !original.requires_pre_ready_topology_observation() {
+        return original;
+    }
+
+    // The failed Init RPC itself is not retry evidence.  It can, however,
+    // race the registered replacement's announce/heartbeat publication. Wait
+    // for at most the already-budgeted Init RPC window, and only elevate the
+    // failure if the membership owner independently proves one of the
+    // captured processes became unavailable.
+    let mut observed_revision = captured.revision();
+    loop {
+        let current = match topology.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => return original,
+        };
+        observed_revision = observed_revision.max(current.revision());
+        // A transport loss has no BE-provided draining disposition.  Do not
+        // reinterpret the transient N-1 snapshot as an intentional scale-down
+        // and replan onto it. Explicit `BackendDraining` evidence takes the
+        // separate typed path above; this observer waits only for a replacement
+        // that restores the captured participation capacity.
+        if current.targets().len() < captured.targets().len() {
+            if Instant::now() >= observation_deadline {
+                return original;
+            }
+            let snapshot =
+                match topology.wait_for_eligible_after(observed_revision, observation_deadline) {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => return original,
+                };
+            observed_revision = snapshot.revision();
+            continue;
+        }
+        match topology.validate_snapshot(captured) {
+            Err(
+                error @ (BackendTopologyValidationError::GenerationChanged { .. }
+                | BackendTopologyValidationError::TargetMissing { .. }),
+            ) => {
+                let observed = pre_ready_topology_validation_error(error);
+                let outcome = observed
+                    .pre_ready_topology_outcome()
+                    .expect("exact topology replacement is typed pre-ready evidence");
+                tracing::info!(
+                    original_error = %original,
+                    observed_topology = %observed,
+                    ?outcome,
+                    "frontend reclassified a pre-ready lifecycle failure from exact backend topology evidence"
+                );
+                return DistributedQueryError::pre_ready_topology(
+                    outcome,
+                    format!(
+                        "{original}; observed captured backend topology invalid before ControlReady: {observed}"
+                    ),
+                );
+            }
+            Err(BackendTopologyValidationError::ContentChangedWithoutRevision { .. })
+            | Err(BackendTopologyValidationError::Unavailable(_)) => return original,
+            Err(BackendTopologyValidationError::RevisionChanged {
+                current_revision, ..
+            }) => observed_revision = current_revision,
+            Ok(()) => {}
+        }
+        if Instant::now() >= observation_deadline {
+            return original;
+        }
+        let snapshot =
+            match topology.wait_for_eligible_after(observed_revision, observation_deadline) {
+                Ok(snapshot) => snapshot,
+                Err(_) => return original,
+            };
+        observed_revision = snapshot.revision();
     }
 }
 

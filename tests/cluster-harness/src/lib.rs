@@ -100,8 +100,7 @@ struct RuntimeFilterParticipantTerminalWire {
 
 #[derive(serde::Deserialize)]
 struct RuntimeFilterParticipantWire {
-    backend_id: u64,
-    start_epoch: u64,
+    process_id: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -767,10 +766,9 @@ pub enum RuntimeFilterTerminalRollupUnavailable {
 }
 
 /// One participant identity prefixes every detail in its terminal telemetry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RuntimeFilterTerminalParticipant {
-    pub backend_id: u64,
-    pub start_epoch: u64,
+    pub process_id: String,
 }
 
 /// One participant's complete Runtime Filter terminal telemetry.
@@ -1006,8 +1004,7 @@ fn decode_runtime_filter_participant(
     wire: RuntimeFilterParticipantTerminalWire,
 ) -> Result<RuntimeFilterParticipantTerminalTelemetry> {
     let participant = RuntimeFilterTerminalParticipant {
-        backend_id: wire.participant.backend_id,
-        start_epoch: wire.participant.start_epoch,
+        process_id: wire.participant.process_id,
     };
     let telemetry = match wire.telemetry {
         RuntimeFilterParticipantTelemetryWire::Available {
@@ -4404,7 +4401,7 @@ mod tests {
             "runtime_filter": {
                 "kind": "available",
                 "participants": [{
-                    "participant": { "backend_id": 7, "start_epoch": 11 },
+                    "participant": { "process_id": "018f8bcb-0000-7000-8000-000000000001" },
                     "telemetry": {
                         "kind": "available",
                         "channels": [{
@@ -4515,8 +4512,10 @@ mod tests {
         assert_eq!(snapshot.local_sequence, 12);
         assert_eq!(snapshot.attempt_id, 13);
         assert_eq!(participants.len(), 1);
-        assert_eq!(participants[0].participant.backend_id, 7);
-        assert_eq!(participants[0].participant.start_epoch, 11);
+        assert_eq!(
+            participants[0].participant.process_id,
+            "018f8bcb-0000-7000-8000-000000000001"
+        );
         let RuntimeFilterParticipantTerminalTelemetryValue::Available(details) =
             &participants[0].telemetry
         else {

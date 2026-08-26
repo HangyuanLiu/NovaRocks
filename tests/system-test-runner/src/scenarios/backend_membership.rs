@@ -311,6 +311,20 @@ impl Scenario for PreReadyDmlReplan {
                 anyhow::anyhow!("pre-ready DML did not return before deadline: {error}")
             })??;
 
+        // The lifecycle debug surface reports the latest distributed statement.
+        // Read the retried DML terminal before the verification SELECT creates
+        // its own distributed execution record.
+        let deadline = context.deadline();
+        let terminal = context
+            .handle()
+            .await_query_lifecycle_structured_snapshot_after(before_execution.as_deref(), deadline)
+            .context("read terminal snapshot for re-planned DML statement")?;
+        ensure!(
+            terminal.attempt_id == 2,
+            "pre-ready DML replacement must complete as statement attempt 2, got attempt {}",
+            terminal.attempt_id
+        );
+
         let mut verify = mysql_actor::connect(
             context.mysql_user(),
             context.mysql_port(),
@@ -322,16 +336,6 @@ impl Scenario for PreReadyDmlReplan {
         ensure!(
             rows == vec![(1, 10), (2, 20)],
             "pre-ready DML retry must publish one result set, got {rows:?}"
-        );
-        let deadline = context.deadline();
-        let terminal = context
-            .handle()
-            .await_query_lifecycle_structured_snapshot_after(before_execution.as_deref(), deadline)
-            .context("read terminal snapshot for re-planned DML statement")?;
-        ensure!(
-            terminal.attempt_id == 2,
-            "pre-ready DML replacement must complete as statement attempt 2, got attempt {}",
-            terminal.attempt_id
         );
         context.action(format!(
             "replaced BE[{target}] after DML InitAck and observed one Iceberg write result with successful statement attempt=2 completion; new_process_id={replacement_process_id}"

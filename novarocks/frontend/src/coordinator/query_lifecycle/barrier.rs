@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::common::query_cancellation::QueryCancellationView;
+use crate::native::query_lifecycle::QueryLifecycleTransportErrorKind;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, PreReadyTopologyOutcome,
 };
@@ -129,7 +130,7 @@ impl FrontendQueryLifecycleConfig {
         self.heartbeat_timeout
     }
 
-    pub(super) const fn init_rpc_timeout(self) -> Duration {
+    pub(crate) const fn init_rpc_timeout(self) -> Duration {
         self.init_rpc_timeout
     }
 
@@ -774,6 +775,7 @@ struct InitFailure {
     manifest_conflict: bool,
     backend_epoch_mismatch: bool,
     pre_ready_topology: Option<PreReadyTopologyOutcome>,
+    await_topology_observation: bool,
 }
 
 impl InitFailure {
@@ -784,6 +786,7 @@ impl InitFailure {
             manifest_conflict: false,
             backend_epoch_mismatch: false,
             pre_ready_topology: None,
+            await_topology_observation: false,
         }
     }
 
@@ -794,6 +797,7 @@ impl InitFailure {
             manifest_conflict: false,
             backend_epoch_mismatch: false,
             pre_ready_topology: None,
+            await_topology_observation: false,
         }
     }
 
@@ -804,6 +808,7 @@ impl InitFailure {
             manifest_conflict: true,
             backend_epoch_mismatch: false,
             pre_ready_topology: None,
+            await_topology_observation: false,
         }
     }
 
@@ -817,12 +822,27 @@ impl InitFailure {
                 PreReadyTopologyOutcome::BackendProcessMismatch { .. }
             ),
             pre_ready_topology: Some(outcome),
+            await_topology_observation: false,
+        }
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            uncertain_cleanup: false,
+            manifest_conflict: false,
+            backend_epoch_mismatch: false,
+            pre_ready_topology: None,
+            await_topology_observation: true,
         }
     }
 
     fn into_error(self, message: String) -> DistributedQueryError {
         match self.pre_ready_topology {
             Some(outcome) => DistributedQueryError::pre_ready_topology(outcome, message),
+            None if self.await_topology_observation => {
+                DistributedQueryError::pre_ready_topology_observation(message)
+            }
             None => DistributedQueryError::new(DistributedQueryErrorKind::Failed, message),
         }
     }
@@ -853,10 +873,17 @@ fn init_one(
                 ))
             })?,
         Err(error) => {
-            return Err(InitFailure::failed(format!(
+            let message = format!(
                 "backend {} InitQuery failed: {error}",
                 participant.target.backend_idx()
-            )));
+            );
+            return Err(
+                if error.kind() == QueryLifecycleTransportErrorKind::Unavailable {
+                    InitFailure::unavailable(message)
+                } else {
+                    InitFailure::failed(message)
+                },
+            );
         }
     };
     let expected_execution_id = participant_execution_id(participant);

@@ -845,6 +845,7 @@ pub struct DistributedQueryError {
     message: String,
     connector_binding_rejection: Option<EnsureConnectorExecutionBindingRejection>,
     pre_ready_topology_outcome: Option<PreReadyTopologyOutcome>,
+    pre_ready_topology_observation: bool,
 }
 
 impl DistributedQueryError {
@@ -854,6 +855,7 @@ impl DistributedQueryError {
             message: message.into(),
             connector_binding_rejection: None,
             pre_ready_topology_outcome: None,
+            pre_ready_topology_observation: false,
         }
     }
 
@@ -879,6 +881,7 @@ impl DistributedQueryError {
             ),
             connector_binding_rejection: Some(rejection),
             pre_ready_topology_outcome: None,
+            pre_ready_topology_observation: false,
         }
     }
 
@@ -894,6 +897,21 @@ impl DistributedQueryError {
             message: message.into(),
             connector_binding_rejection: None,
             pre_ready_topology_outcome: Some(outcome),
+            pre_ready_topology_observation: false,
+        }
+    }
+
+    /// A pre-ControlReady lifecycle transport loss can wait briefly for the
+    /// membership authority to prove an exact captured-process replacement.
+    /// It is not retry evidence by itself and must never be constructed from
+    /// display text or after ControlReady.
+    pub(crate) fn pre_ready_topology_observation(message: impl Into<String>) -> Self {
+        Self {
+            kind: DistributedQueryErrorKind::Failed,
+            message: message.into(),
+            connector_binding_rejection: None,
+            pre_ready_topology_outcome: None,
+            pre_ready_topology_observation: true,
         }
     }
 
@@ -910,6 +928,7 @@ impl DistributedQueryError {
             message: message.into(),
             connector_binding_rejection: None,
             pre_ready_topology_outcome: Some(outcome),
+            pre_ready_topology_observation: false,
         }
     }
 
@@ -927,6 +946,10 @@ impl DistributedQueryError {
 
     pub(crate) const fn pre_ready_topology_outcome(&self) -> Option<PreReadyTopologyOutcome> {
         self.pre_ready_topology_outcome
+    }
+
+    pub(crate) const fn requires_pre_ready_topology_observation(&self) -> bool {
+        self.pre_ready_topology_observation
     }
 }
 

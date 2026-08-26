@@ -623,7 +623,7 @@ fn assert_complete_nonduplicated_rollup(
     );
     let identities = participants
         .iter()
-        .map(|participant| participant.participant)
+        .map(|participant| participant.participant.clone())
         .collect::<BTreeSet<_>>();
     ensure!(
         identities.len() == participants.len(),
