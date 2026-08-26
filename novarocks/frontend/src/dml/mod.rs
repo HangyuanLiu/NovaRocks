@@ -15,58 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend DML application owner.
-//!
-//! Establishes the statement-agnostic Iceberg write-transaction foundation:
-//! a typed operation model + state machine, an operation-journal repository
-//! port, a runner lifecycle with an executor seam, and a commit/abort/reconcile
-//! contract. DML-1 ships the runner + fake-backed tests; the real executor and
-//! SQL routing land in DML-2.
+//! Frontend DML statement-family facade.
 
 pub mod add_files;
-mod coordination;
+pub(crate) mod attempt;
 pub mod ctas;
 mod delete;
 pub mod error;
 pub mod insert;
-pub mod journal;
-pub mod model;
 pub mod mutation;
-pub mod reconcile;
-pub(crate) mod recovery;
+pub(crate) mod observability;
 pub mod runner;
 pub mod service;
-pub mod state_store_journal;
 pub mod truncate;
 
 pub use error::{DmlError, DmlErrorKind};
 pub use insert::{InsertCommand, InsertCommandSource, convert_insert_command, reorder_insert_rows};
-pub use journal::{
-    DmlIntentAdmissionValidator, DmlMutationAuthority, DmlMutationAuthorityValidator,
-    OperationJournal, dml_operation_resource_key,
+pub use runner::{
+    CoordinatedWriteReport, WriteExecutor, WriteTarget, WriteTransactionOutcome,
+    WriteTransactionSpec,
 };
-pub use model::{
-    AddFilesArtifact, AddFilesArtifactDescriptor, AddFilesArtifactKind, AddFilesDispatchCertainty,
-    AddFilesLifecyclePhase, AddFilesLifecycleRecord, AddFilesMutationRequest, AddFilesSourceAction,
-    ConnectorWriteFailureKind, ConnectorWriteFailureRecord, ConnectorWriteFinalizationRecord,
-    ConnectorWriteLifecycleRecord, ConnectorWriteReceiptWire, CreatePreparingRequest,
-    CreateStatementOperationRequest, CtasSagaPhase, CtasSagaRecord, DmlCoordinationClaimRequest,
-    DmlCoordinationProvenance, DmlFencingTokenV1, DmlOperationId, DmlRecoveryCandidate,
-    DmlRecoveryDueRescheduleRequest, DurableExternalFact, DurableMutationSummary,
-    ExternalFactOutcome, ExternalMutationEvidenceWire, OperationFact, OperationKind,
-    OperationMutationRequest, OperationPayload, OperationState, OperationTarget,
-    SourceScopeOwnership, StatementNextAction, StoredOperation, TruncateLifecyclePhase,
-    TruncateLifecycleRecord, WriteTransactionOutcome, WriteTransactionSpec,
-};
-pub use runner::{CoordinatedWriteReport, WriteExecutor};
 pub use service::DmlService;
-pub use state_store_journal::StateStoreOperationJournal;
-
-/// Current wall-clock time in Unix milliseconds, used for operation timestamps.
-pub(crate) fn now_unix_millis() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or(0)
-}

@@ -214,6 +214,19 @@ pub trait DeleteEngine: Send + Sync {
     > {
         Err("DELETE engine does not expose a connector terminal outcome".to_string())
     }
+    fn adjudicate_delete_publication(
+        &self,
+        _prepared: &dyn DeletePrepared,
+        _commit: &dyn DeleteCommit,
+        _evidence: novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        Err("DELETE engine does not expose same-session publication adjudication".to_string())
+    }
     fn finalize_delete(&self, prepared: &dyn DeletePrepared) -> Result<(), String>;
 }
 
@@ -286,6 +299,32 @@ impl DeleteEngine for DmlExecutionKernel {
             .downcast_ref::<CoreDeleteCommit>()
             .ok_or_else(|| "foreign DELETE commit handle".to_string())?;
         prepared.execution.commit_terminal(&commit.completion)
+    }
+
+    fn adjudicate_delete_publication(
+        &self,
+        prepared: &dyn DeletePrepared,
+        commit: &dyn DeleteCommit,
+        evidence: novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        let _prepared = downcast_prepared(prepared)?;
+        let commit = commit
+            .as_any()
+            .downcast_ref::<CoreDeleteCommit>()
+            .ok_or_else(|| "foreign DELETE commit handle".to_string())?;
+        commit
+            .completion
+            .session()
+            .adjudicate_publication(
+                evidence,
+                commit.completion.session().request_context().clone(),
+            )
+            .map_err(|error| error.to_string())
     }
 
     fn finalize_delete(&self, prepared: &dyn DeletePrepared) -> Result<(), String> {

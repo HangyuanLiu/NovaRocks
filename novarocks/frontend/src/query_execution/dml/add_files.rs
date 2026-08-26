@@ -18,10 +18,10 @@
 //! Transitional reverse port for frontend-owned `ALTER TABLE … ADD FILES`.
 //!
 //! The opaque prepared handle owns the one exact-generation
-//! [`DataMutationSession`].  In particular, it keeps the original connector
-//! request context and lease alive through the frontend's durable evidence
-//! barrier.  This module intentionally exposes only provider-neutral durable
-//! facts, never a catalog client, table handle, or private manifest.
+//! [`DataMutationSession`]. In particular, it keeps the original connector
+//! request context and lease alive for one same-statement, read-only
+//! adjudication. This module intentionally exposes only provider-neutral
+//! stack facts, never a catalog client, table handle, or private manifest.
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
@@ -136,9 +136,9 @@ pub struct AddFilesPlanSummary {
     pub total_bytes: u64,
 }
 
-/// Provider-neutral facts that the frontend must durably persist before it
-/// fences dispatch. `public_plan_wire` is the canonical SPI wire, whose
-/// provider payload remains opaque to the frontend.
+/// Provider-neutral facts retained only by this statement. `public_plan_wire`
+/// is the canonical SPI wire, whose provider payload remains opaque to the
+/// frontend.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AddFilesPlanFacts {
     pub catalog: String,
@@ -172,7 +172,7 @@ pub enum AddFilesEffect {
     NoOp,
 }
 
-/// The canonical SPI receipt wire is preserved as an opaque durable artifact.
+/// The canonical SPI receipt wire stays on the statement stack.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AddFilesReceipt {
     pub provider_id: String,
@@ -193,8 +193,8 @@ pub enum AddFilesFinalization {
     Failed(AddFilesFailure),
 }
 
-/// Lossless SPI-owned evidence encoding. Frontend stores and returns these
-/// bytes unchanged; decoding is only an exact-session safety check here.
+/// Lossless SPI-owned evidence encoding retained for exact-session
+/// adjudication only.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AddFilesEvidence {
     pub schema_version: u16,
@@ -232,7 +232,7 @@ pub trait AddFilesEngine: Send + Sync {
 
     fn execute_add_files(&self, prepared: &dyn AddFilesPrepared) -> AddFilesOutcome;
 
-    fn reconcile_add_files(
+    fn adjudicate_add_files(
         &self,
         prepared: &dyn AddFilesPrepared,
         evidence: &AddFilesEvidence,
@@ -355,7 +355,7 @@ impl AddFilesEngine for DmlExecutionKernel {
         project_outcome(session.execute_once(self))
     }
 
-    fn reconcile_add_files(
+    fn adjudicate_add_files(
         &self,
         prepared: &dyn AddFilesPrepared,
         evidence: &AddFilesEvidence,
@@ -384,7 +384,7 @@ impl AddFilesEngine for DmlExecutionKernel {
             Ok(session) => session,
             Err(_) => return poisoned_session(),
         };
-        project_outcome(session.reconcile_once(evidence, self))
+        project_outcome(session.adjudicate_once(evidence, self))
     }
 }
 

@@ -11,7 +11,9 @@ provenance:
   - "discussion: 2026-08-25 lake publication contract"
 code-anchors:
   - "novarocks/spi/src/connector/external_mutation.rs (ExternalMutationOutcome)"
-  - "novarocks/frontend/src/dml/model.rs (DmlOperationId)"
+  - "novarocks/frontend/src/dml/attempt.rs (DmlPublicationAttempt)"
+  - "novarocks/frontend/src/dml/runner.rs (StatementWriteTransactionRunner)"
+  - "tests/sql/suites/lake-publication/sql/standard_rest_ctas.sql (native REST publication acceptance)"
   - "novarocks/connector/iceberg/src/catalog_control/cleanup_maintenance.rs (IcebergCleanupMaintenance)"
 ---
 

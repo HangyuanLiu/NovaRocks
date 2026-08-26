@@ -595,6 +595,17 @@ impl ConnectorWriteOperationSession {
         self.inner.lease.control().reconcile(request)
     }
 
+    /// One same-session, read-only publication adjudication for ordinary DML.
+    /// `reconcile` remains for non-DML recovery callers; this name makes the
+    /// DML boundary explicit without widening the capability.
+    pub fn adjudicate_publication(
+        &self,
+        evidence: ExternalMutationEvidence,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        self.reconcile(evidence, context)
+    }
+
     /// Restore an opaque provider-durable attempt solely so operation-wide
     /// abort can clean up staged files after FE recovery.  Recovery sessions
     /// become abort-only; they cannot plan, accept, supersede or commit new

@@ -17,7 +17,6 @@
 
 //! Frontend-owned UPDATE and MERGE application use cases.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::common::admitted_query_context::RequestContext;
@@ -29,9 +28,9 @@ use novarocks_parser::ast::{DmlStatement, MergeClause, MutationSource};
 use novarocks_proto::lifecycle::QueryOptions;
 
 use crate::dml::error::{AdmitError, DmlError};
-use crate::dml::model::{OperationKind, OperationTarget, WriteTransactionSpec};
 use crate::dml::runner::{
-    ActiveWriteTransactionRunner, CoordinatedWriteReport, WriteExecutor, preparing_request,
+    CoordinatedWriteReport, StatementWriteTransactionRunner, WriteExecutor, WriteTarget,
+    WriteTransactionSpec,
 };
 use crate::dml::service::DmlService;
 use novarocks_spi::connector::{LakePublicationFamily, LakePublicationId};
@@ -102,26 +101,39 @@ impl WriteExecutor for MutationWriteExecutor<'_> {
             .commit_mutation_terminal(self.prepared.handle.as_ref(), handle.as_ref())
     }
 
+    fn adjudicate_publication(
+        &self,
+        _spec: &WriteTransactionSpec,
+        handle: &Self::CommitHandle,
+        evidence: novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        self.engine.adjudicate_mutation_publication(
+            self.prepared.handle.as_ref(),
+            handle.as_ref(),
+            evidence,
+        )
+    }
+
     fn finalize(&self, _spec: &WriteTransactionSpec) -> Result<(), String> {
         self.engine.finalize_mutation(self.prepared.handle.as_ref())
     }
 }
 
-fn write_transaction_spec(prepared: &PreparedMutation, subkind: &str) -> WriteTransactionSpec {
+fn write_transaction_spec(prepared: &PreparedMutation, _subkind: &str) -> WriteTransactionSpec {
     let operation = &prepared.operation;
     WriteTransactionSpec {
         publication_id: operation.publication_id,
-        target: OperationTarget {
+        target: WriteTarget {
             catalog: operation.catalog.clone(),
             namespace: operation.namespace.clone(),
             table: operation.table.clone(),
-            ref_name: (operation.target_ref != "main").then(|| operation.target_ref.clone()),
+            reference: (operation.target_ref != "main").then(|| operation.target_ref.clone()),
         },
-        operation_kind: OperationKind::RowDelta,
-        operation_subkind: Some(subkind.to_string()),
-        attempt_id: operation.attempt_id.clone(),
-        base_snapshot_id: operation.base_snapshot_id,
-        base_snapshot_map: BTreeMap::new(),
     }
 }
 
@@ -155,28 +167,15 @@ impl DmlService {
                 execution: context.execution().clone(),
             })
             .map_err(DmlError::executor)?;
-        // Preparation is deliberately inert. The admitted and claimed intent
-        // below precedes matching, cohort registration and all staging side
-        // effects.
-        self.require_journal()?;
+        // Preparation is inert; the statement-local attempt owns the later
+        // staging and publication boundary without durable DML admission.
         let executor = MutationWriteExecutor {
             engine,
             prepared: &prepared,
         };
         let spec = write_transaction_spec(&prepared, subkind);
-        let operation = self.begin_write_operation(preparing_request(&spec))?;
-        let target = spec.target.clone();
-        ActiveWriteTransactionRunner::new(operation, &executor)
-            .run(spec)
-            .map_err(|error| {
-                error.with_publication_context(
-                    LakePublicationFamily::DataMutation,
-                    target.catalog,
-                    target.namespace,
-                    target.table,
-                    target.ref_name,
-                )
-            })?;
+        StatementWriteTransactionRunner::new(&executor, LakePublicationFamily::DataMutation)
+            .run(spec)?;
         Ok(())
     }
 }
@@ -304,160 +303,5 @@ fn admit_mutation(
                 "typed mutation entry requires UPDATE or MERGE",
             ),
         )),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::any::Any;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-
-    use crate::common::admitted_query_context::{
-        RequestAdmission, RequestContext, SessionOptimizerSettings,
-    };
-    use crate::common::backend_topology::BackendTopologySnapshot;
-    use crate::common::query_cancellation::QueryCancellationSource;
-    use crate::query_execution::dml::mutation::{
-        MutationEngine, MutationPrepared, MutationStageOutcome, PrepareMutationRequest,
-        PreparedMutation,
-    };
-    use novarocks_types::ClusterRole;
-
-    use super::*;
-    use crate::dml::OperationJournal;
-    use crate::dml::journal::testing::InMemoryOperationJournal;
-    use crate::dml::model::OperationState;
-
-    struct TestPrepared;
-
-    impl MutationPrepared for TestPrepared {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    struct RecordingMutationEngine {
-        journal: Arc<InMemoryOperationJournal>,
-        events: Mutex<Vec<&'static str>>,
-    }
-
-    impl MutationEngine for RecordingMutationEngine {
-        fn prepare_mutation(
-            &self,
-            request: PrepareMutationRequest<'_>,
-        ) -> Result<PreparedMutation, String> {
-            self.events.lock().expect("events").push("prepare");
-            Ok(PreparedMutation {
-                operation: crate::query_execution::dml::mutation::MutationOperation {
-                    publication_id: request.publication_id,
-                    kind: match request.statement {
-                        DmlStatement::Update(_) => MutationStatementKind::Update,
-                        DmlStatement::Merge(_) => MutationStatementKind::Merge,
-                        _ => panic!("test engine received a non-mutation statement"),
-                    },
-                    catalog: "ice".to_string(),
-                    namespace: "db".to_string(),
-                    table: "t".to_string(),
-                    target_ref: "main".to_string(),
-                    attempt_id: request.publication_id.to_string(),
-                    base_snapshot_id: Some(7),
-                },
-                handle: Arc::new(TestPrepared),
-                sql_source: request.source.to_string(),
-            })
-        }
-
-        fn stage_mutation(
-            &self,
-            _prepared: &dyn MutationPrepared,
-        ) -> Result<MutationStageOutcome, crate::dml::error::DmlExecutionError> {
-            let operations = self.journal.list_operations().unwrap();
-            assert_eq!(operations.len(), 1);
-            assert_eq!(operations[0].state, OperationState::Writing);
-            self.events.lock().expect("events").push("stage");
-            Ok(MutationStageOutcome::NoOp)
-        }
-
-        fn finalize_mutation(&self, _prepared: &dyn MutationPrepared) -> Result<(), String> {
-            unreachable!("no-op mutation must not finalize")
-        }
-    }
-
-    fn context() -> RequestContext {
-        let cancellation = QueryCancellationSource::new();
-        RequestContext::admit(RequestAdmission::new(
-            Some("ice".to_string()),
-            "db".to_string(),
-            ClusterRole::Fe,
-            BackendTopologySnapshot::empty(11),
-            Some(Instant::now() + Duration::from_secs(30)),
-            cancellation.view(),
-            SessionOptimizerSettings::default(),
-        ))
-    }
-
-    fn typed_mutation(source: &str) -> DmlStatement {
-        let parsed = novarocks_parser::parse(source).expect("parse mutation test input");
-        let [novarocks_parser::ast::Statement::Dml(statement)] = parsed.as_slice() else {
-            panic!("expected mutation statement: {source}");
-        };
-        statement.clone()
-    }
-
-    /// The durable intent is still published before anything reaches the
-    /// mutation engine, and the statement subkind is still recorded. Ordinary
-    /// data mutations stage without an external fence and rely on the exact
-    /// base-state catalog commit for publication.
-    #[test]
-    fn update_intent_is_durable_and_stages_without_an_external_fence() {
-        let journal = Arc::new(InMemoryOperationJournal::default());
-        let service = DmlService::new(journal.clone());
-        let engine = RecordingMutationEngine {
-            journal: journal.clone(),
-            events: Mutex::new(Vec::new()),
-        };
-
-        service
-            .try_execute_typed_mutation(
-                &engine,
-                &typed_mutation("UPDATE t SET k = 1"),
-                "UPDATE t SET k = 1",
-                &context(),
-                None,
-            )
-            .expect("ordinary UPDATE stages without an external fence");
-
-        assert_eq!(*engine.events.lock().unwrap(), ["prepare", "stage"]);
-        let record = journal.list_operations().unwrap().pop().unwrap();
-        assert_eq!(record.operation_subkind.as_deref(), Some("UPDATE"));
-        assert_eq!(record.state, OperationState::Finalized);
-    }
-
-    #[test]
-    fn merge_intent_is_durable_and_stages_without_an_external_fence() {
-        let journal = Arc::new(InMemoryOperationJournal::default());
-        let service = DmlService::new(journal.clone());
-        let engine = RecordingMutationEngine {
-            journal: journal.clone(),
-            events: Mutex::new(Vec::new()),
-        };
-
-        service
-            .try_execute_typed_mutation(
-                &engine,
-                &typed_mutation(
-                    "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET k = s.k",
-                ),
-                "MERGE INTO t USING s ON t.k = s.k WHEN MATCHED THEN UPDATE SET k = s.k",
-                &context(),
-                None,
-            )
-            .expect("ordinary MERGE stages without an external fence");
-
-        assert_eq!(*engine.events.lock().unwrap(), ["prepare", "stage"]);
-        let record = journal.list_operations().unwrap().pop().unwrap();
-        assert_eq!(record.operation_subkind.as_deref(), Some("MERGE"));
-        assert_eq!(record.state, OperationState::Finalized);
     }
 }

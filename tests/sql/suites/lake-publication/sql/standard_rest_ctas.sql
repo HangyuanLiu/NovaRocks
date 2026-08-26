@@ -42,21 +42,32 @@ CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch AS
 
 -- query 3
 -- The single standard NotExist table commit succeeded at the Catalog but its
--- response was lost. The frontend must surface CommitUnknown and perform no
--- recovery mutation before or after its restart.
+-- response was lost. The current statement may use its one same-session,
+-- read-only adjudication to observe the exact marker and report committed;
+-- the following restart must not replay or mutate the completed attempt.
 -- @publication_catalog_fault=table-commit,after-commit-before-response
--- @expect_error_code=CommitUnknown
+-- @skip_result_check=true
 -- @restart_fe_after_step=true
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.response_lost AS
   SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
 -- query 4
+-- The table commit has succeeded in the real Catalog, but the proxy keeps its
+-- response open. The runner must kill and restart the only FE while this SQL
+-- client is still blocked, then a later read proves there was no durable DML
+-- recovery/replay owner.
+-- @publication_catalog_fault=table-commit,after-commit-hold-for-frontend-kill
+-- @skip_result_check=true
+CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.inflight_fe_kill AS
+  SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
+
+-- query 5
 -- The external-state observation is the authority, not the prior error text.
 -- @retry_count=30
 -- @retry_interval_ms=1000
-SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.response_lost ORDER BY id;
+SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.inflight_fe_kill ORDER BY id;
 
--- query 5
+-- query 6
 -- Success followed by an FE restart exercises the finalization boundary. The
 -- restart must not resume a completed CTAS as a second Catalog mutation.
 -- @skip_result_check=true
@@ -64,10 +75,10 @@ SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.response_lost 
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.restart_after_success AS
   SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
--- query 6
+-- query 7
 SELECT COUNT(*) AS n
   FROM lake_publication_${suite_uuid0}.ns_${uuid0}.restart_after_success;
 
--- query 7
+-- query 8
 -- @skip_result_check=true
 DROP DATABASE lake_publication_${suite_uuid0}.ns_${uuid0} FORCE;

@@ -231,6 +231,23 @@ pub trait InsertEngine: Send + Sync {
         Err("Iceberg INSERT engine does not expose a connector terminal outcome".to_string())
     }
 
+    fn adjudicate_iceberg_write_publication(
+        &self,
+        _prepared: &dyn IcebergPreparedInsert,
+        _commit: &dyn IcebergInsertCommit,
+        _evidence: novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        Err(
+            "Iceberg INSERT engine does not expose same-session publication adjudication"
+                .to_string(),
+        )
+    }
+
     fn finalize_iceberg_write(&self, prepared: &dyn IcebergPreparedInsert) -> Result<(), String>;
 }
 
@@ -399,6 +416,32 @@ impl InsertEngine for DmlExecutionKernel {
             .downcast_ref::<CoreIcebergInsertCommit>()
             .ok_or_else(|| "foreign Iceberg INSERT commit handle".to_string())?;
         prepared.prepared.commit_terminal(&commit.completion)
+    }
+
+    fn adjudicate_iceberg_write_publication(
+        &self,
+        prepared: &dyn IcebergPreparedInsert,
+        commit: &dyn IcebergInsertCommit,
+        evidence: novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        let _prepared = downcast_prepared(prepared)?;
+        let commit = commit
+            .as_any()
+            .downcast_ref::<CoreIcebergInsertCommit>()
+            .ok_or_else(|| "foreign Iceberg INSERT commit handle".to_string())?;
+        commit
+            .completion
+            .session()
+            .adjudicate_publication(
+                evidence,
+                commit.completion.session().request_context().clone(),
+            )
+            .map_err(|error| error.to_string())
     }
 
     fn finalize_iceberg_write(&self, prepared: &dyn IcebergPreparedInsert) -> Result<(), String> {

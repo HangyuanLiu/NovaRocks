@@ -28,6 +28,7 @@ use prometheus::{
     TextEncoder,
 };
 
+pub(crate) mod dml_publication;
 mod http;
 mod management;
 pub mod query_lifecycle;
@@ -136,6 +137,7 @@ impl FrontendMetricsRegistry {
                 .map_err(|error| format!("register frontend metric collector failed: {error}"))?;
         }
         crate::catalog_projection_metrics::register_collectors(&registry)?;
+        dml_publication::register_collectors(&registry)?;
         Ok(Arc::new(Self { registry }))
     }
 
@@ -345,6 +347,7 @@ fn refresh_frontend_gauges() {
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_INIT);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_CONTROL);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_LATENCY);
+    dml_publication::ensure_label_families();
     ensure_frontend_metric_label_families();
 }
 
@@ -407,6 +410,40 @@ mod tests {
         assert!(body.contains("novarocks_heartbeat_rtt_seconds"));
         assert!(body.contains("novarocks_live_backends"));
         assert!(body.contains("novarocks_backends"));
+    }
+
+    #[test]
+    fn frontend_registry_renders_dml_publication_collectors() {
+        dml_publication::observe_terminal(
+            novarocks_spi::connector::LakePublicationFamily::Ctas,
+            crate::dml::attempt::DmlPublicationPhase::DispatchPossible,
+            novarocks_spi::connector::LakePublicationDisposition::KnownCommitted,
+            crate::dml::attempt::DmlPublicationFinalization::Failed,
+        );
+
+        let registry = frontend_registry();
+        let body = render_metrics(registry.as_ref()).expect("render metrics");
+        assert!(
+            body.contains("novarocks_dml_publication_terminal_total"),
+            "{body}"
+        );
+        let line = body
+            .lines()
+            .find(|line| {
+                line.starts_with("novarocks_dml_publication_terminal_total")
+                    && line.contains("family=\"ctas\"")
+                    && line.contains("finalization=\"failed\"")
+                    && line.contains("phase=\"dispatch_possible\"")
+                    && line.contains("disposition=\"known_committed\"")
+            })
+            .expect("rendered CTAS finalization-failure metric");
+        let value = line
+            .rsplit_once(' ')
+            .expect("metric line has a value")
+            .1
+            .parse::<u64>()
+            .expect("metric value is an integer");
+        assert!(value >= 1, "{line}");
     }
 
     #[test]

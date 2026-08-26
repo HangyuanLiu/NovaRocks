@@ -198,25 +198,14 @@ async fn host_exposes_one_dml_service_identity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sqlite_host_reopens_dml_journal_after_shutdown() {
+async fn sqlite_host_reopens_without_a_dml_recovery_surface() {
     let config = state_store_input();
     let host = open_host(Some(config.clone())).await.expect("first host");
-    assert!(
-        host.dml_service()
-            .list_unfinished_operations()
-            .expect("first DML journal")
-            .is_empty()
-    );
+    let first = host.dml_service();
     host.shutdown().await.expect("first shutdown");
 
     let reopened = open_host(Some(config)).await.expect("reopened host");
-    assert!(
-        reopened
-            .dml_service()
-            .list_unfinished_operations()
-            .expect("reopened DML journal")
-            .is_empty()
-    );
+    assert!(!Arc::ptr_eq(&first, &reopened.dml_service()));
     reopened.shutdown().await.expect("reopened shutdown");
 }
 

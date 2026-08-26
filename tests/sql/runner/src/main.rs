@@ -1620,6 +1620,159 @@ fn execute_target_query_with_fault(
     result
 }
 
+struct InflightPublicationFrontendKill<'a> {
+    meta: &'a QueryMeta,
+    server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
+    session_config: ConnectionConfig,
+    session_to_reconnect: &'a mut MysqlSession,
+    query_timeout: u64,
+    sql: String,
+    db: Option<String>,
+    fault_guard: &'a mut publication_catalog::FixtureFaultGuard,
+    fault_deadline: Option<Instant>,
+    log: &'a mut String,
+}
+
+fn execute_target_query_with_inflight_publication_frontend_kill(
+    request: InflightPublicationFrontendKill<'_>,
+) -> (bool, Option<QueryExecution>, String) {
+    let InflightPublicationFrontendKill {
+        meta,
+        server_handle,
+        session_config,
+        session_to_reconnect,
+        query_timeout,
+        sql,
+        db,
+        fault_guard,
+        fault_deadline,
+        log,
+    } = request;
+    let deadline = fault_deadline
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(query_timeout.saturating_add(10)));
+    let be_count = match server_handle.lock() {
+        Ok(server) => server.be_count(),
+        Err(_) => {
+            return (
+                false,
+                None,
+                "FAIL (runner publication hold): server handle mutex is poisoned".to_string(),
+            );
+        }
+    };
+    if be_count == 0 {
+        return (
+            false,
+            None,
+            "FAIL (runner publication hold): requires a runner-owned cross-process frontend"
+                .to_string(),
+        );
+    }
+
+    let thread_meta = meta.clone();
+    let thread_server = Arc::clone(server_handle);
+    let query_timeout = bounded_fault_query_timeout(query_timeout, Some(deadline));
+    let query_thread = std::thread::spawn(move || match MysqlSession::new(&session_config) {
+        Ok(mut session) => execute_target_query_with_fault(
+            &thread_meta,
+            &thread_server,
+            &mut session,
+            query_timeout,
+            &sql,
+            db.as_deref(),
+            Some(deadline),
+        ),
+        Err(error) => (
+            false,
+            None,
+            format!("FAIL (runner publication hold): open query session: {error:#}"),
+        ),
+    });
+
+    if let Err(error) = fault_guard.wait_until_entered(deadline) {
+        let _ = fault_guard.release();
+        let _ = query_thread.join();
+        return (
+            false,
+            None,
+            fault_timeout_diagnostics(
+                server_handle,
+                &format!("publication downstream-successful hold was not observed: {error:#}"),
+            ),
+        );
+    }
+    let _ = writeln!(
+        log,
+        "    @publication_catalog_fault downstream-successful hold reached"
+    );
+
+    let restart_result = server_handle
+        .lock()
+        .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))
+        .and_then(|mut server| {
+            server.kill_fe().context("kill frontend during publication response hold")?;
+            server
+                .restart_fe_until(deadline)
+                .context("restart frontend after in-flight publication kill")
+        });
+    if let Err(error) = restart_result {
+        let _ = fault_guard.release();
+        let _ = query_thread.join();
+        return (
+            false,
+            None,
+            fault_timeout_diagnostics(
+                server_handle,
+                &format!("publication in-flight frontend kill failed: {error:#}"),
+            ),
+        );
+    }
+    let _ = writeln!(log, "    @publication_catalog_fault in-flight FE kill/restart PASS");
+
+    let (query_ok, query_execution, query_error) = match query_thread.join() {
+        Ok(result) => result,
+        Err(_) => {
+            return (
+                false,
+                None,
+                "FAIL (runner publication hold): query thread panicked".to_string(),
+            );
+        }
+    };
+    if query_ok || query_execution.is_some() {
+        return (
+            false,
+            None,
+            "FAIL (runner publication hold): statement unexpectedly survived frontend kill"
+                .to_string(),
+        );
+    }
+    if let Err(error) = session_to_reconnect.reconnect() {
+        return (
+            false,
+            None,
+            fault_timeout_diagnostics(
+                server_handle,
+                &format!("reconnect runner session after in-flight frontend kill: {error:#}"),
+            ),
+        );
+    }
+    let _ = writeln!(
+        log,
+        "    @publication_catalog_fault client disconnect observed and runner session reconnected"
+    );
+    (
+        true,
+        Some(QueryExecution {
+            text_output: String::new(),
+            header: Vec::new(),
+            rows: Vec::new(),
+            elapsed: Duration::ZERO,
+        }),
+        query_error,
+    )
+}
+
 fn fault_timeout_diagnostics(
     server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
     message: &str,
@@ -2134,7 +2287,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             }
             None => None,
         };
-        let publication_catalog_fault_guard = match step.meta.publication_catalog_fault {
+        let mut publication_catalog_fault_guard = match step.meta.publication_catalog_fault {
             Some(directive) => match ctx.publication_catalog_control.as_ref() {
                 Some(control) => {
                     match control.arm_next(directive.action.as_str(), directive.fault.as_str()) {
@@ -2200,6 +2353,28 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 for attempt in 0..retry_count {
                     let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
                         shell::execute_shell_step(&step.sql)
+                    } else if step
+                        .meta
+                        .publication_catalog_fault
+                        .is_some_and(|directive| directive.fault.requires_inflight_frontend_kill())
+                    {
+                        let Some(fault_guard) = publication_catalog_fault_guard.as_mut() else {
+                            unreachable!("in-flight publication kill requires an armed fixture guard");
+                        };
+                        execute_target_query_with_inflight_publication_frontend_kill(
+                            InflightPublicationFrontendKill {
+                                meta: &step.meta,
+                                server_handle: &ctx.server_handle,
+                                session_config: case_target_conn.clone(),
+                                session_to_reconnect: &mut target_session,
+                                query_timeout: ctx.query_timeout,
+                                sql: step.sql.clone(),
+                                db: step.meta.db.clone(),
+                                fault_guard,
+                                fault_deadline: be_log_snapshot.evidence_deadline(),
+                                log: &mut log,
+                            },
+                        )
                     } else {
                         execute_target_query_with_fault(
                             &step.meta,
@@ -3543,6 +3718,7 @@ fn validate_publication_catalog_directives(
     suite_name: &str,
     cases: &[SqlCase],
     fixture_available: bool,
+    cluster_mode: ClusterMode,
 ) -> Result<()> {
     for case in cases {
         for step in &case.steps {
@@ -3564,6 +3740,16 @@ fn validate_publication_catalog_directives(
             if !fixture_available {
                 bail!(
                     "@publication_catalog_fault requires the runner-owned publication catalog fixture"
+                );
+            }
+            if step
+                .meta
+                .publication_catalog_fault
+                .is_some_and(|directive| directive.fault.requires_inflight_frontend_kill())
+                && cluster_mode != ClusterMode::CrossProcess
+            {
+                bail!(
+                    "@publication_catalog_fault=table-commit,after-commit-hold-for-frontend-kill requires --cluster-mode cross-process"
                 );
             }
         }
@@ -4131,6 +4317,7 @@ fn run() -> Result<i32> {
                 &suite.name,
                 &cases,
                 publication_catalog_control.is_some(),
+                selected_cluster_mode,
             ) {
                 println!("❌ ERROR: suite {}: {error}", suite.name);
                 return Ok(1);

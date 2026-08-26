@@ -153,6 +153,20 @@ pub trait MutationEngine: Send + Sync {
         Err("mutation engine does not expose a connector terminal commit outcome".to_string())
     }
 
+    fn adjudicate_mutation_publication(
+        &self,
+        _prepared: &dyn MutationPrepared,
+        _commit: &dyn MutationCommit,
+        _evidence: novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        Err("mutation engine does not expose same-session publication adjudication".to_string())
+    }
+
     fn finalize_mutation(&self, prepared: &dyn MutationPrepared) -> Result<(), String>;
 }
 
@@ -173,6 +187,7 @@ struct CoreMutationCommit {
     kind: MutationStatementKind,
     attempt_id: String,
     execution: Arc<dyn crate::query_execution::dml::mutation_flow::MutationExecution>,
+    session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
     completion: Mutex<Option<crate::query_execution::ConnectorWriteCompletion>>,
 }
 
@@ -592,6 +607,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                             kind: prepared.operation.kind,
                             attempt_id: prepared.operation.attempt_id.clone(),
                             execution,
+                            session: completion.session().clone(),
                             completion: Mutex::new(Some(completion)),
                         },
                     ))),
@@ -623,6 +639,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                             kind: prepared.operation.kind,
                             attempt_id: prepared.operation.attempt_id.clone(),
                             execution,
+                            session: completion.session().clone(),
                             completion: Mutex::new(Some(completion)),
                         },
                     ))),
@@ -688,6 +705,25 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
             .take()
             .ok_or_else(|| "mutation commit completion was already consumed".to_string())?;
         commit.execution.commit_terminal(&completion)
+    }
+
+    fn adjudicate_mutation_publication(
+        &self,
+        prepared: &dyn MutationPrepared,
+        commit: &dyn MutationCommit,
+        evidence: novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        let _prepared = prepared_handle(prepared)?;
+        let commit = commit_handle(commit)?;
+        commit
+            .session
+            .adjudicate_publication(evidence, commit.session.request_context().clone())
+            .map_err(|error| error.to_string())
     }
 
     fn finalize_mutation(&self, prepared: &dyn MutationPrepared) -> Result<(), String> {

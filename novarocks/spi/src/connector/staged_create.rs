@@ -355,38 +355,18 @@ pub enum ConnectorStagedCreateAbortOutcome {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorStagedCreateReconcilePhase {
-    Prepare,
-    Publish,
-    Abort,
-}
-
 #[derive(Clone)]
-pub struct ConnectorStagedCreateReconcileRequest {
+pub struct ConnectorStagedCreatePublicationAdjudicationRequest {
     pub target_operation_id: ConnectorStagedCreateOperationId,
-    pub phase: ConnectorStagedCreateReconcilePhase,
     pub evidence: ExternalMutationEvidence,
     pub context: ConnectorRequestContext,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ConnectorStagedCreateReconcileOutcome {
-    Prepared {
-        handle: ConnectorStagedTableHandle,
-        receipt: ConnectorStagedCreateReceipt,
-        finalization: ExternalMutationFinalization,
-    },
+pub enum ConnectorStagedCreatePublicationAdjudicationOutcome {
     Published {
         receipt: ConnectorStagedCreateReceipt,
         finalization: ExternalMutationFinalization,
-    },
-    Aborted {
-        receipt: ConnectorStagedCreateReceipt,
-        finalization: ExternalMutationFinalization,
-    },
-    KnownUncommitted {
-        failure: ConnectorMutationFailure,
     },
     CommitUnknown {
         failure: ConnectorMutationFailure,
@@ -427,10 +407,12 @@ pub trait ConnectorStagedCreate: Send + Sync {
         request: ConnectorStagedCreateAbortRequest,
     ) -> Result<ConnectorStagedCreateAbortOutcome, ConnectorError>;
 
-    fn reconcile(
+    /// Read one exact previously-unknown publication frontier. This method
+    /// cannot prepare, abort, clean up, or reopen a staged target.
+    fn adjudicate_publication(
         &self,
-        request: ConnectorStagedCreateReconcileRequest,
-    ) -> Result<ConnectorStagedCreateReconcileOutcome, ConnectorError>;
+        request: ConnectorStagedCreatePublicationAdjudicationRequest,
+    ) -> Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError>;
 }
 
 /// Provenance frozen by CTAS staging and re-checked by unanchored cleanup.
@@ -690,10 +672,13 @@ enum LeaseOperationState {
     Published,
     Aborted,
     Unknown {
-        phase: Option<ConnectorStagedCreateReconcilePhase>,
-        evidence_digest: Option<[u8; 32]>,
         handle_digest: Option<[u8; 32]>,
         bound_write: Option<BoundWriteProof>,
+    },
+    PublicationUnknown {
+        evidence_digest: [u8; 32],
+        handle_digest: [u8; 32],
+        bound_write: BoundWriteProof,
     },
 }
 
@@ -766,8 +751,6 @@ impl ConnectorStagedCreateLease {
                 self.record_after_dispatch(
                     operation_id,
                     Some(LeaseOperationState::Unknown {
-                        phase: None,
-                        evidence_digest: None,
                         handle_digest: None,
                         bound_write: None,
                     }),
@@ -779,8 +762,6 @@ impl ConnectorStagedCreateLease {
             self.record_after_dispatch(
                 operation_id,
                 Some(LeaseOperationState::Unknown {
-                    phase: None,
-                    evidence_digest: None,
                     handle_digest: None,
                     bound_write: None,
                 }),
@@ -794,10 +775,8 @@ impl ConnectorStagedCreateLease {
                     bound_write: None,
                 })
             }
-            ConnectorStagedCreatePrepareOutcome::CommitUnknown { evidence, .. } => {
+            ConnectorStagedCreatePrepareOutcome::CommitUnknown { .. } => {
                 Some(LeaseOperationState::Unknown {
-                    phase: Some(ConnectorStagedCreateReconcilePhase::Prepare),
-                    evidence_digest: Some(evidence.digest()),
                     handle_digest: None,
                     bound_write: None,
                 })
@@ -829,8 +808,6 @@ impl ConnectorStagedCreateLease {
             self.record_after_dispatch(
                 target_operation_id,
                 Some(LeaseOperationState::Unknown {
-                    phase: None,
-                    evidence_digest: None,
                     handle_digest: Some(handle.digest()),
                     bound_write: Some(proof),
                 }),
@@ -939,11 +916,10 @@ impl ConnectorStagedCreateLease {
                 }
             }
             ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. } => {
-                LeaseOperationState::Unknown {
-                    phase: Some(ConnectorStagedCreateReconcilePhase::Publish),
-                    evidence_digest: Some(evidence.digest()),
-                    handle_digest: Some(handle_digest),
-                    bound_write: Some(bound_write),
+                LeaseOperationState::PublicationUnknown {
+                    evidence_digest: evidence.digest(),
+                    handle_digest,
+                    bound_write,
                 }
             }
         };
@@ -967,7 +943,10 @@ impl ConnectorStagedCreateLease {
                 handle_digest,
                 bound_write,
             }) if handle_digest == &handle.digest() => *bound_write,
-            Some(LeaseOperationState::Unknown { .. }) => {
+            Some(
+                LeaseOperationState::Unknown { .. }
+                | LeaseOperationState::PublicationUnknown { .. },
+            ) => {
                 return Err(invalid(
                     "staged table operation is unresolved; publish and abort are forbidden",
                 ));
@@ -981,8 +960,6 @@ impl ConnectorStagedCreateLease {
         operations.insert(
             handle.operation_id(),
             LeaseOperationState::Unknown {
-                phase: None,
-                evidence_digest: None,
                 handle_digest: Some(handle.digest()),
                 bound_write,
             },
@@ -1014,8 +991,6 @@ impl ConnectorStagedCreateLease {
                 .map_err(|error| invalid(format!("staged-create lease lock: {error}")))?;
             match operations.get(&target_operation_id) {
                 Some(LeaseOperationState::Unknown {
-                    phase: None,
-                    evidence_digest: None,
                     handle_digest: Some(handle_digest),
                     bound_write,
                 }) if *handle_digest == handle.digest()
@@ -1031,8 +1006,6 @@ impl ConnectorStagedCreateLease {
             self.record_after_dispatch(
                 target_operation_id,
                 Some(LeaseOperationState::Unknown {
-                    phase: None,
-                    evidence_digest: None,
                     handle_digest: Some(handle.digest()),
                     bound_write: Some(proof),
                 }),
@@ -1086,10 +1059,8 @@ impl ConnectorStagedCreateLease {
                     bound_write,
                 }
             }
-            ConnectorStagedCreateAbortOutcome::CommitUnknown { evidence, .. } => {
+            ConnectorStagedCreateAbortOutcome::CommitUnknown { .. } => {
                 LeaseOperationState::Unknown {
-                    phase: Some(ConnectorStagedCreateReconcilePhase::Abort),
-                    evidence_digest: Some(evidence.digest()),
                     handle_digest: Some(handle_digest),
                     bound_write,
                 }
@@ -1099,17 +1070,19 @@ impl ConnectorStagedCreateLease {
         Ok(outcome)
     }
 
-    pub fn reconcile(
+    /// Consume the one retained exact publication observation for a prior
+    /// publish-unknown outcome. Any result other than an exact published
+    /// receipt permanently closes this lease to further mutation or reads.
+    pub fn adjudicate_publication(
         &self,
-        request: ConnectorStagedCreateReconcileRequest,
-    ) -> Result<ConnectorStagedCreateReconcileOutcome, ConnectorError> {
+        request: ConnectorStagedCreatePublicationAdjudicationRequest,
+    ) -> Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError> {
         let operation_id = request.target_operation_id;
         let dispatch_operation_id = request.evidence.operation_id();
-        let unresolved_evidence_digest = request.evidence.digest();
         self.validate_evidence_for(
             &request.evidence,
             dispatch_operation_id,
-            operation_kind(request.phase),
+            "staged-create-publish",
         )?;
         let (unresolved_handle_digest, unresolved_bound_write) = {
             let operations = self
@@ -1117,132 +1090,60 @@ impl ConnectorStagedCreateLease {
                 .lock()
                 .map_err(|error| invalid(format!("staged-create lease lock: {error}")))?;
             match operations.get(&operation_id) {
-                Some(LeaseOperationState::Unknown {
-                    phase: Some(phase),
-                    evidence_digest: Some(digest),
+                Some(LeaseOperationState::PublicationUnknown {
+                    evidence_digest,
                     handle_digest,
                     bound_write,
-                }) if *phase == request.phase && *digest == request.evidence.digest() => {
+                }) if *evidence_digest == request.evidence.digest() => {
                     (*handle_digest, *bound_write)
                 }
                 _ => {
                     return Err(invalid(
-                        "staged-create reconcile requires the exact unresolved operation evidence",
+                        "staged-create publication adjudication requires the exact publish-unknown evidence",
                     ));
                 }
             }
         };
-        let phase = request.phase;
-        let unresolved_state = LeaseOperationState::Unknown {
-            phase: Some(phase),
-            evidence_digest: Some(unresolved_evidence_digest),
-            handle_digest: unresolved_handle_digest,
-            bound_write: unresolved_bound_write,
-        };
-        let outcome = match self.capability.reconcile(request) {
+        let outcome = match self.capability.adjudicate_publication(request) {
             Ok(outcome) => outcome,
             Err(error) => {
-                self.record_after_dispatch(operation_id, Some(unresolved_state));
-                return Err(error);
-            }
-        };
-        let state = (|| -> Result<Option<LeaseOperationState>, ConnectorError> {
-            let state = match &outcome {
-                ConnectorStagedCreateReconcileOutcome::Prepared {
-                    handle, receipt, ..
-                } => {
-                    if phase != ConnectorStagedCreateReconcilePhase::Prepare {
-                        return Err(invalid(
-                            "staged-create reconcile returned Prepared for the wrong phase",
-                        ));
-                    }
-                    self.validate_handle(handle, operation_id)?;
-                    self.validate_receipt(
-                        receipt,
-                        dispatch_operation_id,
-                        ConnectorStagedCreateReceiptPhase::Prepared,
-                    )?;
-                    Some(LeaseOperationState::Unpublished {
-                        handle_digest: handle.digest(),
-                        bound_write: unresolved_bound_write,
-                    })
-                }
-                ConnectorStagedCreateReconcileOutcome::Published { receipt, .. } => {
-                    if phase != ConnectorStagedCreateReconcilePhase::Publish {
-                        return Err(invalid(
-                            "staged-create reconcile returned Published for the wrong phase",
-                        ));
-                    }
-                    self.validate_receipt(
-                        receipt,
-                        dispatch_operation_id,
-                        ConnectorStagedCreateReceiptPhase::Published,
-                    )?;
-                    Some(LeaseOperationState::Published)
-                }
-                ConnectorStagedCreateReconcileOutcome::Aborted { receipt, .. } => {
-                    if phase != ConnectorStagedCreateReconcilePhase::Abort {
-                        return Err(invalid(
-                            "staged-create reconcile returned Aborted for the wrong phase",
-                        ));
-                    }
-                    self.validate_receipt(
-                        receipt,
-                        dispatch_operation_id,
-                        ConnectorStagedCreateReceiptPhase::Aborted,
-                    )?;
-                    Some(LeaseOperationState::Aborted)
-                }
-                ConnectorStagedCreateReconcileOutcome::KnownUncommitted { .. } => match phase {
-                    ConnectorStagedCreateReconcilePhase::Prepare => None,
-                    ConnectorStagedCreateReconcilePhase::Publish => {
-                        let handle_digest = unresolved_handle_digest.ok_or_else(|| {
-                        invalid(
-                            "staged-create reconcile cannot restore an unpublished operation without its exact handle",
-                        )
-                    })?;
-                        Some(LeaseOperationState::Unpublished {
-                            handle_digest,
-                            bound_write: unresolved_bound_write,
-                        })
-                    }
-                    ConnectorStagedCreateReconcilePhase::Abort => {
-                        // An abort reconcile attempt that did not itself dispatch
-                        // cannot disprove possible progress from the original
-                        // abort. Preserve the exact unknown lease and evidence;
-                        // only a provider-confirmed Aborted receipt may reopen it.
-                        Some(LeaseOperationState::Unknown {
-                            phase: Some(phase),
-                            evidence_digest: Some(unresolved_evidence_digest),
-                            handle_digest: unresolved_handle_digest,
-                            bound_write: unresolved_bound_write,
-                        })
-                    }
-                },
-                ConnectorStagedCreateReconcileOutcome::CommitUnknown { evidence, .. } => {
-                    self.validate_evidence_for(
-                        evidence,
-                        dispatch_operation_id,
-                        operation_kind(phase),
-                    )?;
+                // The sole observation attempt was consumed once the provider
+                // call began. Do not retain evidence that could authorize a
+                // second adjudication after a transport failure.
+                self.record_after_dispatch(
+                    operation_id,
                     Some(LeaseOperationState::Unknown {
-                        phase: Some(phase),
-                        evidence_digest: Some(evidence.digest()),
-                        handle_digest: unresolved_handle_digest,
-                        bound_write: unresolved_bound_write,
-                    })
-                }
-            };
-            Ok(state)
-        })();
-        let state = match state {
-            Ok(state) => state,
-            Err(error) => {
-                self.record_after_dispatch(operation_id, Some(unresolved_state));
+                        handle_digest: Some(unresolved_handle_digest),
+                        bound_write: Some(unresolved_bound_write),
+                    }),
+                );
                 return Err(error);
             }
         };
-        self.record_after_dispatch(operation_id, state);
+        let state = match &outcome {
+            ConnectorStagedCreatePublicationAdjudicationOutcome::Published { receipt, .. } => {
+                self.validate_receipt(
+                    receipt,
+                    dispatch_operation_id,
+                    ConnectorStagedCreateReceiptPhase::Published,
+                )?;
+                LeaseOperationState::Published
+            }
+            ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
+                evidence, ..
+            } => {
+                self.validate_evidence_for(
+                    evidence,
+                    dispatch_operation_id,
+                    "staged-create-publish",
+                )?;
+                LeaseOperationState::Unknown {
+                    handle_digest: Some(unresolved_handle_digest),
+                    bound_write: Some(unresolved_bound_write),
+                }
+            }
+        };
+        self.record_after_dispatch(operation_id, Some(state));
         Ok(outcome)
     }
 
@@ -1263,7 +1164,10 @@ impl ConnectorStagedCreateLease {
             {
                 Ok(())
             }
-            Some(LeaseOperationState::Unknown { .. }) => Err(invalid(
+            Some(
+                LeaseOperationState::Unknown { .. }
+                | LeaseOperationState::PublicationUnknown { .. },
+            ) => Err(invalid(
                 "staged table operation is unresolved; publish and abort are forbidden",
             )),
             Some(LeaseOperationState::Published) => Err(invalid(
@@ -1339,8 +1243,6 @@ impl ConnectorStagedCreateLease {
         self.record_after_dispatch(
             operation_id,
             Some(LeaseOperationState::Unknown {
-                phase: None,
-                evidence_digest: None,
                 handle_digest,
                 bound_write,
             }),
@@ -1387,12 +1289,9 @@ impl ConnectorStagedCreateLease {
                     ConnectorStagedCreateReceiptPhase::Prepared,
                 )
             }
-            ConnectorStagedCreatePrepareOutcome::CommitUnknown { evidence, .. } => self
-                .validate_evidence_for(
-                    evidence,
-                    operation_id,
-                    operation_kind(ConnectorStagedCreateReconcilePhase::Prepare),
-                ),
+            ConnectorStagedCreatePrepareOutcome::CommitUnknown { evidence, .. } => {
+                self.validate_evidence_for(evidence, operation_id, "staged-create-prepare")
+            }
             ConnectorStagedCreatePrepareOutcome::Conflict { .. }
             | ConnectorStagedCreatePrepareOutcome::KnownUncommitted { .. } => Ok(()),
         }
@@ -1410,12 +1309,9 @@ impl ConnectorStagedCreateLease {
                 operation_id,
                 ConnectorStagedCreateReceiptPhase::Published,
             ),
-            ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. } => self
-                .validate_evidence_for(
-                    evidence,
-                    operation_id,
-                    operation_kind(ConnectorStagedCreateReconcilePhase::Publish),
-                ),
+            ConnectorStagedCreatePublishOutcome::CommitUnknown { evidence, .. } => {
+                self.validate_evidence_for(evidence, operation_id, "staged-create-publish")
+            }
             ConnectorStagedCreatePublishOutcome::Conflict { .. }
             | ConnectorStagedCreatePublishOutcome::KnownUncommitted { .. } => Ok(()),
         }
@@ -1432,12 +1328,9 @@ impl ConnectorStagedCreateLease {
                 operation_id,
                 ConnectorStagedCreateReceiptPhase::Aborted,
             ),
-            ConnectorStagedCreateAbortOutcome::CommitUnknown { evidence, .. } => self
-                .validate_evidence_for(
-                    evidence,
-                    operation_id,
-                    operation_kind(ConnectorStagedCreateReconcilePhase::Abort),
-                ),
+            ConnectorStagedCreateAbortOutcome::CommitUnknown { evidence, .. } => {
+                self.validate_evidence_for(evidence, operation_id, "staged-create-abort")
+            }
             ConnectorStagedCreateAbortOutcome::KnownUncommitted { .. } => Ok(()),
         }
     }
@@ -1486,14 +1379,6 @@ impl ConnectorStagedCreateLease {
             ));
         }
         Ok(())
-    }
-}
-
-fn operation_kind(phase: ConnectorStagedCreateReconcilePhase) -> &'static str {
-    match phase {
-        ConnectorStagedCreateReconcilePhase::Prepare => "staged-create-prepare",
-        ConnectorStagedCreateReconcilePhase::Publish => "staged-create-publish",
-        ConnectorStagedCreateReconcilePhase::Abort => "staged-create-abort",
     }
 }
 
@@ -1606,7 +1491,6 @@ mod tests {
         malformed_prepare: bool,
         noop_publish: bool,
         unknown_abort: bool,
-        known_uncommitted_reconcile: bool,
         binds: AtomicUsize,
         publishes: AtomicUsize,
     }
@@ -1763,19 +1647,19 @@ mod tests {
                 finalization: ExternalMutationFinalization::Complete,
             })
         }
-        fn reconcile(
+        fn adjudicate_publication(
             &self,
-            _: ConnectorStagedCreateReconcileRequest,
-        ) -> Result<ConnectorStagedCreateReconcileOutcome, ConnectorError> {
-            if self.known_uncommitted_reconcile {
-                return Ok(ConnectorStagedCreateReconcileOutcome::KnownUncommitted {
+            request: ConnectorStagedCreatePublicationAdjudicationRequest,
+        ) -> Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError> {
+            Ok(
+                ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
-                        super::super::ConnectorMutationFailureKind::Internal,
-                        "current abort reconcile was not dispatched",
+                        super::super::ConnectorMutationFailureKind::Unavailable,
+                        "publication remains unresolved",
                     ),
-                });
-            }
-            unreachable!("not used by these conformance tests")
+                    evidence: request.evidence,
+                },
+            )
         }
     }
 
@@ -1847,11 +1731,11 @@ mod tests {
             self.inner.abort(request)
         }
 
-        fn reconcile(
+        fn adjudicate_publication(
             &self,
-            request: ConnectorStagedCreateReconcileRequest,
-        ) -> Result<ConnectorStagedCreateReconcileOutcome, ConnectorError> {
-            self.inner.reconcile(request)
+            request: ConnectorStagedCreatePublicationAdjudicationRequest,
+        ) -> Result<ConnectorStagedCreatePublicationAdjudicationOutcome, ConnectorError> {
+            self.inner.adjudicate_publication(request)
         }
     }
 
@@ -1966,7 +1850,6 @@ mod tests {
             malformed_prepare: false,
             noop_publish: false,
             unknown_abort: false,
-            known_uncommitted_reconcile: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
@@ -2031,7 +1914,6 @@ mod tests {
             malformed_prepare: false,
             noop_publish: false,
             unknown_abort: false,
-            known_uncommitted_reconcile: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
@@ -2103,7 +1985,6 @@ mod tests {
             malformed_prepare: false,
             noop_publish: false,
             unknown_abort: false,
-            known_uncommitted_reconcile: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
@@ -2156,7 +2037,6 @@ mod tests {
             malformed_prepare: false,
             noop_publish: false,
             unknown_abort: false,
-            known_uncommitted_reconcile: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
@@ -2194,7 +2074,6 @@ mod tests {
             malformed_prepare: false,
             noop_publish: false,
             unknown_abort: false,
-            known_uncommitted_reconcile: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
@@ -2233,7 +2112,6 @@ mod tests {
             malformed_prepare: false,
             noop_publish: false,
             unknown_abort: false,
-            known_uncommitted_reconcile: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
@@ -2273,7 +2151,6 @@ mod tests {
             malformed_prepare: true,
             noop_publish: false,
             unknown_abort: false,
-            known_uncommitted_reconcile: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
@@ -2313,7 +2190,6 @@ mod tests {
             malformed_prepare: false,
             noop_publish: false,
             unknown_abort: false,
-            known_uncommitted_reconcile: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
@@ -2373,7 +2249,6 @@ mod tests {
             malformed_prepare: false,
             noop_publish: true,
             unknown_abort: false,
-            known_uncommitted_reconcile: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
@@ -2424,75 +2299,6 @@ mod tests {
     }
 
     #[test]
-    fn abort_reconcile_known_uncommitted_preserves_prior_unknown() {
-        let (descriptor, incarnation) = owner();
-        let capability = Arc::new(FakeCapability {
-            descriptor: descriptor.clone(),
-            incarnation,
-            aborts: AtomicUsize::new(0),
-            prepares: AtomicUsize::new(0),
-            unknown_prepare: false,
-            fail_prepare: false,
-            malformed_prepare: false,
-            noop_publish: false,
-            unknown_abort: true,
-            known_uncommitted_reconcile: true,
-            binds: AtomicUsize::new(0),
-            publishes: AtomicUsize::new(0),
-        });
-        let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
-                instance_id: descriptor.instance_id.clone(),
-                incarnation,
-            },
-            capability.clone(),
-            || {},
-        )
-        .unwrap();
-        let operation_id = ConnectorMutationOperationId::new();
-        let ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. } = lease
-            .prepare(prepare_request(lease.owner().clone(), operation_id))
-            .unwrap()
-        else {
-            panic!("expected prepared target")
-        };
-        let ConnectorStagedCreateAbortOutcome::CommitUnknown { evidence, .. } = lease
-            .abort(ConnectorStagedCreateAbortRequest {
-                operation_id: ConnectorMutationOperationId::new(),
-                handle: handle.clone(),
-                completion: None,
-                context: context(),
-            })
-            .unwrap()
-        else {
-            panic!("expected unknown abort")
-        };
-        let outcome = lease
-            .reconcile(ConnectorStagedCreateReconcileRequest {
-                target_operation_id: operation_id,
-                phase: ConnectorStagedCreateReconcilePhase::Abort,
-                evidence,
-                context: context(),
-            })
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            ConnectorStagedCreateReconcileOutcome::KnownUncommitted { .. }
-        ));
-        assert!(
-            lease
-                .abort(ConnectorStagedCreateAbortRequest {
-                    operation_id: ConnectorMutationOperationId::new(),
-                    handle,
-                    completion: None,
-                    context: context(),
-                })
-                .is_err()
-        );
-        assert_eq!(capability.aborts.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
     fn post_dispatch_recording_recovers_poisoned_lease_state() {
         let (descriptor, incarnation) = owner();
         let capability = Arc::new(FakeCapability {
@@ -2505,7 +2311,6 @@ mod tests {
             malformed_prepare: false,
             noop_publish: false,
             unknown_abort: false,
-            known_uncommitted_reconcile: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
@@ -2549,7 +2354,6 @@ mod tests {
                 malformed_prepare: false,
                 noop_publish: false,
                 unknown_abort: false,
-                known_uncommitted_reconcile: false,
                 binds: AtomicUsize::new(0),
                 publishes: AtomicUsize::new(0),
             },
@@ -2610,7 +2414,6 @@ mod tests {
                 malformed_prepare: false,
                 noop_publish: false,
                 unknown_abort: false,
-                known_uncommitted_reconcile: false,
                 binds: AtomicUsize::new(0),
                 publishes: AtomicUsize::new(0),
             },
@@ -2650,19 +2453,18 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_rejects_foreign_operation_kind_and_digest() {
+    fn publication_adjudication_consumes_exact_unknown_once() {
         let (descriptor, incarnation) = owner();
         let capability = Arc::new(FakeCapability {
             descriptor: descriptor.clone(),
             incarnation,
             aborts: AtomicUsize::new(0),
             prepares: AtomicUsize::new(0),
-            unknown_prepare: true,
+            unknown_prepare: false,
             fail_prepare: false,
             malformed_prepare: false,
             noop_publish: false,
             unknown_abort: false,
-            known_uncommitted_reconcile: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
         });
@@ -2671,51 +2473,54 @@ mod tests {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
             },
-            capability,
+            capability.clone(),
             || {},
         )
         .unwrap();
-        let operation_id = ConnectorMutationOperationId::new();
-        let ConnectorStagedCreatePrepareOutcome::CommitUnknown { evidence, .. } = lease
-            .prepare(prepare_request(lease.owner().clone(), operation_id))
-            .unwrap()
-        else {
-            panic!("expected unknown")
-        };
-        let wrong_kind = ExternalMutationEvidence::try_new(
-            1,
-            descriptor.clone(),
-            incarnation,
-            operation_id,
-            "staged-create-publish",
-            evidence.provider_payload().clone(),
-        )
-        .unwrap();
+        let target_operation_id = ConnectorMutationOperationId::new();
+        let dispatch_operation_id = ConnectorMutationOperationId::new();
+        let evidence = capability.evidence_for(dispatch_operation_id, "staged-create-publish");
+        lease.operations.lock().unwrap().insert(
+            target_operation_id,
+            LeaseOperationState::PublicationUnknown {
+                evidence_digest: evidence.digest(),
+                handle_digest: [7; 32],
+                bound_write: BoundWriteProof {
+                    operation_id: ConnectorWriteOperationId::new(),
+                    aggregate_digest: [8; 32],
+                },
+            },
+        );
+
+        let wrong_evidence =
+            capability.evidence_for(dispatch_operation_id, "staged-create-prepare");
         assert!(
             lease
-                .reconcile(ConnectorStagedCreateReconcileRequest {
-                    target_operation_id: operation_id,
-                    phase: ConnectorStagedCreateReconcilePhase::Prepare,
-                    evidence: wrong_kind,
+                .adjudicate_publication(ConnectorStagedCreatePublicationAdjudicationRequest {
+                    target_operation_id,
+                    evidence: wrong_evidence,
                     context: context(),
                 })
                 .is_err()
         );
-        let wrong_payload = ExternalMutationEvidence::try_new(
-            1,
-            descriptor,
-            incarnation,
-            operation_id,
-            "staged-create-prepare",
-            Bytes::from_static(b"different"),
-        )
-        .unwrap();
+
+        let outcome = lease
+            .adjudicate_publication(ConnectorStagedCreatePublicationAdjudicationRequest {
+                target_operation_id,
+                evidence,
+                context: context(),
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown { .. }
+        ));
         assert!(
             lease
-                .reconcile(ConnectorStagedCreateReconcileRequest {
-                    target_operation_id: operation_id,
-                    phase: ConnectorStagedCreateReconcilePhase::Prepare,
-                    evidence: wrong_payload,
+                .adjudicate_publication(ConnectorStagedCreatePublicationAdjudicationRequest {
+                    target_operation_id,
+                    evidence: capability
+                        .evidence_for(dispatch_operation_id, "staged-create-publish"),
                     context: context(),
                 })
                 .is_err()

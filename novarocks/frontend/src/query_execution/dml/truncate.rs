@@ -18,8 +18,8 @@
 //! Transitional reverse port for frontend-owned `TRUNCATE TABLE` routing.
 //!
 //! The opaque prepared handle retains the exact SPI-4C2 lease, plan and
-//! request context. Execute and reconcile are separate calls so the frontend
-//! can durably record unknown evidence before reconciliation.
+//! request context. Execute and one-shot read-only adjudication are separate
+//! calls; the frontend never persists or replays this prepared session.
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
@@ -209,7 +209,7 @@ pub trait TruncateEngine: Send + Sync {
 
     fn execute_truncate(&self, prepared: &dyn TruncatePrepared) -> TruncateOutcome;
 
-    fn reconcile_truncate(
+    fn adjudicate_truncate(
         &self,
         prepared: &dyn TruncatePrepared,
         evidence: &TruncateEvidence,
@@ -320,7 +320,7 @@ impl TruncateEngine for DmlExecutionKernel {
         project_outcome(session.execute_once(self))
     }
 
-    fn reconcile_truncate(
+    fn adjudicate_truncate(
         &self,
         prepared: &dyn TruncatePrepared,
         evidence: &TruncateEvidence,
@@ -349,7 +349,7 @@ impl TruncateEngine for DmlExecutionKernel {
             Ok(session) => session,
             Err(_) => return poisoned_session(),
         };
-        project_outcome(session.reconcile_once(evidence, self))
+        project_outcome(session.adjudicate_once(evidence, self))
     }
 }
 
