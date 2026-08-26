@@ -328,8 +328,9 @@ impl TypedConnectorSplitIter {
                 &self.shared.session,
                 self.shared.scan.table(),
                 split.split(),
+                split.sequence_id(),
                 self.shared.scan.assignments(),
-                self.shared.dynamic_filter.as_ref(),
+                &self.shared.dynamic_filter,
             )
             .map_err(|error| {
                 format!(
@@ -745,8 +746,9 @@ pub(crate) mod test_support {
             _session: &novarocks_spi::connector::read_stack::ConnectorSession,
             _table: &novarocks_proto::connector_read::CatalogTableHandle,
             _split: &novarocks_proto::connector_read::ValidatedConnectorSplit,
+            _scheduled_split_sequence_id: u64,
             _columns: &[novarocks_proto::connector_read::ScanAssignment],
-            _dynamic_filter: &novarocks_proto::connector_read::WireDynamicFilter,
+            _dynamic_filter: &std::sync::Arc<novarocks_proto::connector_read::WireDynamicFilter>,
         ) -> Result<
             Box<dyn novarocks_spi::connector::read_stack::ConnectorPageSource>,
             novarocks_spi::connector::ConnectorError,
@@ -999,8 +1001,9 @@ mod tests {
             _session: &ConnectorSession,
             _table: &CatalogTableHandle,
             _split: &ValidatedConnectorSplit,
+            _scheduled_split_sequence_id: u64,
             _columns: &[ScanAssignment],
-            _dynamic_filter: &WireDynamicFilter,
+            _dynamic_filter: &Arc<WireDynamicFilter>,
         ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
             if self.fail_open {
                 return Err(ConnectorError::new(
@@ -1035,8 +1038,9 @@ mod tests {
             _session: &ConnectorSession,
             _table: &CatalogTableHandle,
             _split: &ValidatedConnectorSplit,
+            _scheduled_split_sequence_id: u64,
             _columns: &[ScanAssignment],
-            dynamic_filter: &WireDynamicFilter,
+            dynamic_filter: &Arc<WireDynamicFilter>,
         ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
             *self.observed.lock().expect("observed lock") =
                 Some(dynamic_filter.columns_covered().len());

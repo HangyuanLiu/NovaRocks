@@ -113,8 +113,9 @@ impl TypedConnectorPageSourceProvider for IcebergPageSourceProvider {
         _session: &ConnectorSession,
         table: &CatalogTableHandle,
         split: &ValidatedConnectorSplit,
+        scheduled_split_sequence_id: u64,
         columns: &[ScanAssignment],
-        dynamic_filter: &WireDynamicFilter,
+        dynamic_filter: &Arc<WireDynamicFilter>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
         let table_handle = iceberg_table_handle(table)?;
         let split = iceberg_data_split(split)?;
@@ -130,7 +131,8 @@ impl TypedConnectorPageSourceProvider for IcebergPageSourceProvider {
             context: self.context.clone(),
             budget: self.options.budget,
             reader_options: self.options.reader_options,
-            dynamic_filter: DynamicFilterObservation::observe(dynamic_filter),
+            scheduled_split_sequence_id,
+            dynamic_filter: Arc::clone(dynamic_filter),
         })
     }
 }

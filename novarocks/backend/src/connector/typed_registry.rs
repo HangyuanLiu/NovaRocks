@@ -353,8 +353,9 @@ mod tests {
             _session: &ConnectorSession,
             _table: &CatalogTableHandle,
             _split: &ValidatedConnectorSplit,
+            _scheduled_split_sequence_id: u64,
             _columns: &[ScanAssignment],
-            _dynamic_filter: &WireDynamicFilter,
+            _dynamic_filter: &Arc<WireDynamicFilter>,
         ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
             Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,

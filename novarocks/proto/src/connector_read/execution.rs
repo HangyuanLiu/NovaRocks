@@ -67,13 +67,21 @@ pub trait TypedConnectorSplitManager: Send + Sync {
 /// fragment instance and scan node, so a footer cache and delete manager can be
 /// shared across the splits of one scan without any process-global state.
 pub trait TypedConnectorPageSourceProvider: Send + Sync {
+    /// `scheduled_split_sequence_id` names this split within its task attempt.
+    /// It is the only scheduling identity a page source may use, and it is what
+    /// lets a row-group observation be attributed without a membership digest.
+    ///
+    /// The dynamic filter arrives as a shared handle rather than a borrow: the
+    /// returned page source outlives this call and must be able to re-read the
+    /// filter before each row group it has not read yet.
     fn create_page_source(
         &self,
         session: &ConnectorSession,
         table: &CatalogTableHandle,
         split: &ValidatedConnectorSplit,
+        scheduled_split_sequence_id: u64,
         columns: &[ScanAssignment],
-        dynamic_filter: &WireDynamicFilter,
+        dynamic_filter: &Arc<WireDynamicFilter>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
 }
 

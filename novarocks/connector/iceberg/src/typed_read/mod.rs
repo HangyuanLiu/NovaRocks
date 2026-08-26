@@ -40,6 +40,7 @@ pub mod page_source_provider;
 pub mod schema_binding;
 pub mod split;
 pub mod split_source;
+pub mod system_page_source;
 pub mod system_table;
 pub mod table_execute;
 pub mod table_handle;
@@ -86,6 +87,11 @@ pub use split::{
 pub use split_source::{
     DEFAULT_TARGET_SPLIT_SIZE_BYTES, IcebergDeleteFileFacts, IcebergPlannedDataFile,
     IcebergSplitSource, IcebergSplitSourceOptions, READ_SPLIT_TARGET_SIZE_PROPERTY,
+};
+pub use system_page_source::{
+    IcebergSystemPageSource, IcebergSystemTableProvider, bounds_row_type,
+    iceberg_system_table_reference, partition_row_type, partitions_view_schema,
+    project_system_relation_columns, system_relation_schema,
 };
 pub use system_table::{
     FilesTableSplit, FilesTableSplitParams, FilesTableSplitSource, FilesTableSplitSourceParams,

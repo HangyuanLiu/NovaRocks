@@ -92,11 +92,9 @@ pub enum DynamicFilterVerdict {
 
 /// What one live dynamic filter looked like when the page source was built.
 ///
-/// `createPageSource` hands out a borrowed filter while a page source is a
-/// `'static` boxed trait object, so the live handle cannot be retained yet.
-/// The observation is therefore taken once and is truthful about that: it
-/// records what the filter said, and the seam below never claims to have acted
-/// on it.
+/// One reading of the live filter, taken fresh at each checkpoint rather than
+/// once at open, so a filter that arrives mid-split is seen by the row groups
+/// that have not been read yet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DynamicFilterObservation {
     covered_columns: usize,
@@ -137,17 +135,65 @@ impl DynamicFilterObservation {
     }
 }
 
-/// The single seam where a live backend dynamic filter will prune this split.
+/// The live filter this split consults, plus the scheduling identity a
+/// row-group decision is attributed to.
 ///
-/// It is deliberately the only place any dynamic-filter decision is made, so a
-/// later task adds runtime-filter pruning here and nowhere else. Today it
-/// prunes nothing: reporting a row group as skipped that was in fact read --
-/// or the reverse -- would silently change what the scan returns, and the
-/// engine keeps its own filter regardless.
-const fn consult_dynamic_filter(
-    _observation: &DynamicFilterObservation,
+/// The filter is a shared handle rather than a snapshot so it can be re-read;
+/// the sequence id is the split's position in its task attempt, which is the
+/// only scheduling identity there is.
+#[derive(Clone)]
+pub struct LiveDynamicFilter {
+    filter: Arc<WireDynamicFilter>,
+    scheduled_split_sequence_id: u64,
+}
+
+impl LiveDynamicFilter {
+    pub fn new(filter: Arc<WireDynamicFilter>, scheduled_split_sequence_id: u64) -> Self {
+        Self {
+            filter,
+            scheduled_split_sequence_id,
+        }
+    }
+
+    pub const fn scheduled_split_sequence_id(&self) -> u64 {
+        self.scheduled_split_sequence_id
+    }
+
+    /// Read the filter as it stands right now.
+    pub fn observe(&self) -> DynamicFilterObservation {
+        DynamicFilterObservation::observe(self.filter.as_ref())
+    }
+}
+
+impl std::fmt::Debug for LiveDynamicFilter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveDynamicFilter")
+            .field(
+                "scheduled_split_sequence_id",
+                &self.scheduled_split_sequence_id,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// The single seam where a live backend dynamic filter prunes this split.
+///
+/// It is deliberately the only place any dynamic-filter decision is made. The
+/// filter is re-read here rather than at open, so a filter that arrives
+/// mid-split still prunes the row groups that follow.
+///
+/// Today it prunes nothing. The backend's runtime-filter artifact is a
+/// predicate oracle, not an enumerable domain (ADR-0043), so the pruning
+/// question is "could this row group's bounds match", asked through that
+/// oracle -- a hook this split does not yet carry. Reporting a row group as
+/// skipped that was in fact read, or the reverse, would silently change what
+/// the scan returns.
+fn consult_dynamic_filter(
+    live: &LiveDynamicFilter,
     _checkpoint: DynamicFilterCheckpoint,
 ) -> DynamicFilterVerdict {
+    let _observation = live.observe();
     DynamicFilterVerdict::ReadEverything
 }
 
@@ -271,7 +317,9 @@ pub struct IcebergPageSourceRequest<'a> {
     pub context: FileReadContext,
     pub budget: FileReadBudget,
     pub reader_options: FileReaderOptions,
-    pub dynamic_filter: DynamicFilterObservation,
+    /// Names this split within its task attempt; the only scheduling identity.
+    pub scheduled_split_sequence_id: u64,
+    pub dynamic_filter: Arc<WireDynamicFilter>,
 }
 
 /// Build the page source for one Iceberg data split.
@@ -338,7 +386,10 @@ pub fn create_iceberg_page_source(
         footers: request.footers,
         budget: request.budget,
         reader_options: request.reader_options,
-        dynamic_filter: request.dynamic_filter,
+        dynamic_filter: LiveDynamicFilter::new(
+            request.dynamic_filter,
+            request.scheduled_split_sequence_id,
+        ),
         state: ReaderState::NotOpened,
         row_window: ReaderPageSourceWithRowPositions::default(),
         completed_bytes: 0,
@@ -611,7 +662,7 @@ pub struct IcebergParquetPageSource {
     footers: Arc<ParquetFooterCache>,
     budget: FileReadBudget,
     reader_options: FileReaderOptions,
-    dynamic_filter: DynamicFilterObservation,
+    dynamic_filter: LiveDynamicFilter,
     state: ReaderState,
     row_window: ReaderPageSourceWithRowPositions,
     completed_bytes: u64,
@@ -1325,7 +1376,12 @@ mod tests {
                     max_bytes: NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero"),
                 },
                 reader_options: FileReaderOptions::default(),
-                dynamic_filter: DynamicFilterObservation::complete_all(),
+                scheduled_split_sequence_id: 0,
+                dynamic_filter: Arc::new(
+                    novarocks_spi::connector::read_stack::CompleteAllDynamicFilter::new(
+                        std::collections::BTreeSet::new(),
+                    ),
+                ) as Arc<WireDynamicFilter>,
             })
         }
     }

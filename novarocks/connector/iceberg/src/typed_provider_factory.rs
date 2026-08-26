@@ -28,12 +28,13 @@ use novarocks_proto::connector_read::{
     TypedConnectorPageSourceProvider, TypedConnectorProviderFactory,
     TypedConnectorSystemTableProvider,
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorRequestContext};
+use novarocks_spi::connector::{ConnectorError, ConnectorRequestContext};
 
 use crate::access_binding::IcebergReadBinding;
 use crate::typed_read::page_source_provider::{
     IcebergPageSourceProvider, IcebergPageSourceProviderOptions,
 };
+use crate::typed_read::system_page_source::IcebergSystemTableProvider;
 
 /// Builds Iceberg worker readers for one installed execution binding.
 #[derive(Clone)]
@@ -76,15 +77,18 @@ impl TypedConnectorProviderFactory for IcebergTypedProviderFactory {
 
     fn create_system_table_provider(
         &self,
-        _request: &ConnectorRequestContext,
+        request: &ConnectorRequestContext,
     ) -> Result<Arc<dyn TypedConnectorSystemTableProvider>, ConnectorError> {
-        // MIGRATION: the selected-backend system page source lands with the
-        // exact metadata-relation schemas. Refusing here keeps the boundary
-        // fail-closed rather than returning an empty relation that would look
-        // like a table with no rows.
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "iceberg system relations are not served through the typed page source yet",
-        ))
+        let context = self
+            .binding
+            .file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
+        // A system relation shares the fragment's page-row budget but neither
+        // its footer cache nor its delete manager: it opens metadata files, not
+        // data files, so there is nothing for those two to hold.
+        Ok(Arc::new(IcebergSystemTableProvider::new(
+            self.binding.clone(),
+            context,
+            self.options.budget.max_rows,
+        )))
     }
 }
