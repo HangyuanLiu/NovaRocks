@@ -420,14 +420,14 @@ fn clear_sqlite_and_rebuild_from_lake(
             package.table.table
         ));
     };
-    let before = equivalence_snapshot(&existing, package)?;
+    let before = equivalence_snapshot(&existing.definition, package)?;
 
     // 2. Clear only rebuildable accelerator records. Historical refresh
     // records remain intact, and the repository rejects an active refresh.
     // The lake MV table is untouched — exactly the "SQLite forgot, lake
     // remembers" state.
     let dropped = mv_repository
-        .wipe_rebuildable_projection_by_target(&target)
+        .wipe_projection_by_target(uuid::Uuid::now_v7(), &target)
         .map_err(|e| format!("clear MV repository definition for full rebuild failed: {e}"))?;
     if !dropped {
         return Err(format!(
@@ -457,7 +457,7 @@ fn clear_sqlite_and_rebuild_from_lake(
             package.table.table
         ));
     };
-    let after = equivalence_snapshot(&rebuilt, package)?;
+    let after = equivalence_snapshot(&rebuilt.definition, package)?;
     if before != after {
         return Err(format!(
             "{PROCEDURE_NAME} full level: rebuilt accelerator semantics differ from the pre-wipe projection"
@@ -569,9 +569,7 @@ mod tests {
         MvLakePublication::Published(
             MvPublishedLakeFacts::try_new(
                 201,
-                1,
-                1,
-                "token-1".to_string(),
+                novarocks_spi::connector::LakePublicationId::new_v7(),
                 MvPublishedRefreshTechnique::Full,
                 vec![MvPublishedBaseFact {
                     table_fqn: "ice.sales.orders".to_string(),

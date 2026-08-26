@@ -39,6 +39,7 @@ pub fn load_iceberg_mv_definition_by_target(
             name: target.table.clone(),
         })
         .map_err(|e| format!("load iceberg mv definition failed: {e}"))?
+        .map(|projection| projection.definition)
         .ok_or_else(|| {
             format!(
                 "iceberg materialized view {}.{}.{} has no MV definition",

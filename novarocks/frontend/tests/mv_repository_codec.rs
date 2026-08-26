@@ -1,3 +1,22 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use std::collections::{BTreeMap, BTreeSet};
+
 use bytes::Bytes;
 use novarocks_frontend::common::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
@@ -6,36 +25,63 @@ use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use novarocks_frontend::mv::domain::persistence::definition::{
-    StoredMvDefinition, StoredMvRefreshPolicy,
-};
-use novarocks_frontend::mv::domain::persistence::refresh::{
-    FrontendMvRefreshAction, FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
-    FrontendMvRefreshCommittedVersion, FrontendMvRefreshEvidence, FrontendMvRefreshLedger,
-    FrontendMvRefreshRecoveryLedger, MvRefreshLifecycleOwner, MvRefreshState, StoredMvRefresh,
+    MvAcceleratorSourceRevision, MvDesiredRefreshPolicy, StoredMvDefinition,
 };
 use novarocks_frontend::mv::domain::repository::MvTargetLookup;
 use novarocks_frontend::mv::repository::catalog::schema_catalog;
 use novarocks_frontend::mv::repository::codec::{
-    DecodedMvRecord, MvRecordKind, MvSequence, decode_definition, decode_record, encode_definition,
+    DecodedMvRecord, MvRecordKind, MvSequence, decode_projection, decode_record, encode_projection,
     encode_record,
 };
 use novarocks_frontend::mv::repository::key::{
-    MvKeyKind, decode_key, definition_by_id_key, dependency_by_downstream_key,
-    dependency_by_upstream_key, partition_by_mv_key, sequence_key, target_lookup_key,
+    MvKeyKind, decode_key, dependency_by_downstream_key, dependency_by_upstream_key,
+    projection_by_id_key, sequence_key, target_lookup_key,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_spi::state_store::{Key, Value};
-use std::collections::BTreeMap;
 use uuid::Uuid;
-
-fn sha256_bytes(payload: &[u8]) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-
-    Sha256::digest(payload).to_vec()
-}
 
 fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {
     ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes)).expect("bounded object ID")
+}
+
+fn projection() -> StoredMvDefinition {
+    StoredMvDefinition {
+        mv_id: 7,
+        query_definition: PersistedQueryDefinition::new(
+            "SELECT * FROM ice.sales.orders",
+            PersistedQueryDialect::StarRocks,
+            "ice",
+            "sales",
+        )
+        .unwrap(),
+        base_table_refs: vec!["ice.sales.orders".to_string()],
+        primary_key_columns: vec![],
+        storage_engine: "iceberg".to_string(),
+        target_catalog: Some("ice".to_string()),
+        target_namespace: Some("sales".to_string()),
+        target_table: Some("orders_mv".to_string()),
+        schema_contract: None,
+        partition_spec: None,
+        last_refresh_ms: Some(10),
+        last_refresh_rows: Some(20),
+        last_refresh_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
+        last_refresh_table_object_ids: BTreeMap::from([(
+            "ice.sales.orders".to_string(),
+            object_id(b"base-object"),
+        )]),
+        last_refreshed_iceberg_snapshot_id: Some(11),
+        refresh_policy: MvDesiredRefreshPolicy::Manual,
+        refresh_paused: false,
+        refresh_interval_ms: None,
+        max_staleness_ms: None,
+        created_at_ms: 1,
+        source_revision: MvAcceleratorSourceRevision {
+            target_object_id: object_id(b"target-object"),
+            descriptor_content_hash: "descriptor-digest".to_string(),
+            current_target_snapshot_id: Some(11),
+        },
+    }
 }
 
 fn upstream() -> MvDependencyObjectRef {
@@ -49,360 +95,107 @@ fn upstream() -> MvDependencyObjectRef {
 }
 
 #[test]
-fn keys_are_canonical_range_ordered_and_round_trip() {
-    let low = definition_by_id_key(9).expect("low definition key");
-    let high = definition_by_id_key(10).expect("high definition key");
-    assert!(
-        low < high,
-        "fixed-width hexadecimal IDs must preserve order"
-    );
+fn current_key_classifier_is_closed_and_rejects_legacy_runtime_families() {
+    let projection = projection_by_id_key(9).expect("projection key");
     assert_eq!(
-        std::str::from_utf8(low.as_bytes()).expect("key UTF-8"),
-        "novarocks/frontend/mv/v1/definition/by-id/0000000000000009"
+        std::str::from_utf8(projection.as_bytes()).unwrap(),
+        "novarocks/frontend/mv/accelerator/v1/projection/by-id/0000000000000009"
     );
+    assert_eq!(decode_key(&projection).unwrap().kind, MvKeyKind::Projection);
     assert_eq!(
-        decode_key(&low).expect("decode key").kind,
-        MvKeyKind::Definition
-    );
-
-    let target = target_lookup_key("`ICE`", " Sales ", "Orders").expect("target key");
-    assert_eq!(
-        std::str::from_utf8(target.as_bytes()).expect("key UTF-8"),
-        "novarocks/frontend/mv/v1/definition/by-target/696365/73616c6573/6f7264657273"
-    );
-    assert_eq!(
-        decode_key(&target).expect("decode target").kind,
+        decode_key(&target_lookup_key("ICE", "Sales", "Orders").unwrap())
+            .unwrap()
+            .kind,
         MvKeyKind::TargetLookup
     );
 
-    let partition = partition_by_mv_key(10, "spec=7;region=s:us/east").expect("partition key");
-    assert_eq!(
-        decode_key(&partition).expect("decode partition").kind,
-        MvKeyKind::Partition
-    );
-}
-
-#[test]
-fn dependency_indexes_share_canonical_identity_and_reject_separator() {
-    let dependency = upstream();
-    let downstream = dependency_by_downstream_key(7, &dependency).expect("downstream key");
-    let upstream_key = dependency_by_upstream_key(&dependency, 7).expect("upstream key");
-    let downstream_key = std::str::from_utf8(downstream.as_bytes()).expect("UTF-8");
-    let upstream_key = std::str::from_utf8(upstream_key.as_bytes()).expect("UTF-8");
-    assert!(
-        downstream_key.ends_with("696365626572677c7461626c657c6963657c73616c65737c6f7264657273")
-    );
-    assert!(upstream_key.contains("696365626572677c7461626c657c6963657c73616c65737c6f7264657273"));
-
-    let mut invalid = dependency;
-    invalid.name = "orders|bad".to_string();
-    let error = dependency_by_downstream_key(7, &invalid).expect_err("separator must fail");
-    assert!(error.contains("must not contain '|'"));
-}
-
-#[test]
-fn malformed_and_noncanonical_keys_fail_loudly() {
     for raw in [
-        "novarocks/frontend/mv/v1/definition/by-id/9",
-        "novarocks/frontend/mv/v1/definition/by-id/0000000000000000",
-        "novarocks/frontend/mv/v1/definition/by-id/000000000000000A",
-        "novarocks/frontend/mv/v1/definition/by-target/not-hex/73616c6573/6f7264657273",
-        "novarocks/frontend/mv/v1/refresh/by-id/0000000000000001/extra",
+        "novarocks/frontend/mv/v1/definition/by-id/0000000000000001",
+        "novarocks/frontend/mv/v1/refresh/by-id/0000000000000001",
+        "novarocks/frontend/mv/v1/partition/by-mv/0000000000000001/61",
+        "novarocks/frontend/mv/accelerator/v1/refresh/by-id/0000000000000001",
+        "novarocks/frontend/mv/accelerator/v1/unknown/value",
     ] {
-        let key = Key::try_from(Bytes::from(raw)).expect("SPI accepts bounded raw key");
-        assert!(decode_key(&key).is_err(), "{raw} must fail");
+        let key = Key::try_from(Bytes::from(raw)).unwrap();
+        assert!(decode_key(&key).is_err(), "{raw} must remain unreachable");
     }
 }
 
 #[test]
-fn key_limit_is_enforced_by_spi_constructor() {
-    let oversized = "x".repeat(512);
-    let error = partition_by_mv_key(1, &oversized).expect_err("512-byte MV key limit");
-    assert!(error.contains("512-byte limit"));
+fn dependency_indexes_share_one_canonical_identity() {
+    let downstream = dependency_by_downstream_key(7, &upstream()).unwrap();
+    let upstream = dependency_by_upstream_key(&upstream(), 7).unwrap();
+    assert_eq!(
+        decode_key(&downstream).unwrap().kind,
+        MvKeyKind::DependencyDownstream
+    );
+    assert_eq!(
+        decode_key(&upstream).unwrap().kind,
+        MvKeyKind::DependencyUpstream
+    );
 }
 
 #[test]
-fn envelope_round_trips_and_rejects_corruption() {
-    let key = target_lookup_key("ice", "sales", "orders").expect("target key");
+fn projection_codec_round_trips_complete_source_revision_and_waterline() {
+    let expected = projection();
+    let key = projection_by_id_key(expected.mv_id).unwrap();
+    let operation_id = Uuid::now_v7();
+    let value = encode_projection(operation_id, &expected).unwrap();
+    let decoded = decode_projection(&key, &value).unwrap();
+    assert_eq!(decoded.operation_id, operation_id);
+    assert_eq!(decoded.value, expected);
+}
+
+#[test]
+fn envelope_rejects_wrong_kind_unknown_schema_and_corruption() {
     let operation_id = Uuid::now_v7();
     let value = encode_record(
         MvRecordKind::TargetLookup,
         operation_id,
-        &MvTargetLookup { mv_id: 42 },
+        &MvTargetLookup { mv_id: 7 },
     )
-    .expect("encode record");
-    let decoded: DecodedMvRecord<MvTargetLookup> =
-        decode_record(&key, &value).expect("decode record");
-    assert_eq!(decoded.operation_id, operation_id);
-    assert_eq!(decoded.value, MvTargetLookup { mv_id: 42 });
+    .unwrap();
+    let wrong_key = projection_by_id_key(7).unwrap();
+    assert!(decode_record::<MvTargetLookup>(&wrong_key, &value).is_err());
 
-    let mut bytes = value.into_bytes().to_vec();
-    bytes[0] = b'X';
-    let malformed = Value::try_from(Bytes::from(bytes)).expect("bounded malformed value");
-    assert!(decode_record::<MvTargetLookup>(&key, &malformed).is_err());
+    let target = target_lookup_key("ice", "sales", "orders").unwrap();
+    let mut unknown_schema = value.clone().into_bytes().to_vec();
+    unknown_schema[6..10].copy_from_slice(&999_i32.to_be_bytes());
+    let unknown_schema = Value::try_from(Bytes::from(unknown_schema)).unwrap();
+    assert!(decode_record::<MvTargetLookup>(&target, &unknown_schema).is_err());
+
+    let mut malformed = value.into_bytes().to_vec();
+    malformed[0] = b'X';
+    let malformed = Value::try_from(Bytes::from(malformed)).unwrap();
+    assert!(decode_record::<MvTargetLookup>(&target, &malformed).is_err());
 }
 
 #[test]
-fn sequence_v2_round_trips_the_frontend_refresh_high_water_mark() {
-    let key = sequence_key().expect("sequence key");
+fn sequence_contains_only_the_internal_mv_id_high_water_mark() {
+    let key = sequence_key().unwrap();
     let sequence = MvSequence {
         last_allocated_id: 42,
-        last_refresh_id: 99,
     };
-    let value = encode_record(MvRecordKind::Sequence, Uuid::now_v7(), &sequence)
-        .expect("encode sequence v2");
-    let decoded: DecodedMvRecord<MvSequence> = decode_record(&key, &value).expect("decode v2");
+    let value = encode_record(MvRecordKind::Sequence, Uuid::now_v7(), &sequence).unwrap();
+    let decoded: DecodedMvRecord<MvSequence> = decode_record(&key, &value).unwrap();
     assert_eq!(decoded.value, sequence);
 }
 
 #[test]
-fn envelope_rejects_key_kind_unknown_schema_and_trailing_bytes() {
-    let operation_id = Uuid::now_v7();
-    let value = encode_record(
-        MvRecordKind::TargetLookup,
-        operation_id,
-        &MvTargetLookup { mv_id: 7 },
-    )
-    .expect("encode record");
-    let wrong_key = definition_by_id_key(7).expect("definition key");
-    assert!(decode_record::<MvTargetLookup>(&wrong_key, &value).is_err());
-
-    let target = target_lookup_key("ice", "sales", "orders").expect("target key");
-    let mut unknown_schema = value.clone().into_bytes().to_vec();
-    unknown_schema[6..10].copy_from_slice(&999_i32.to_be_bytes());
-    let unknown_schema = Value::try_from(Bytes::from(unknown_schema)).expect("bounded value");
-    assert!(decode_record::<MvTargetLookup>(&target, &unknown_schema).is_err());
-
-    let mut trailing = value.into_bytes().to_vec();
-    trailing.push(0);
-    let trailing = Value::try_from(Bytes::from(trailing)).expect("bounded value");
-    assert!(decode_record::<MvTargetLookup>(&target, &trailing).is_err());
-}
-
-#[test]
-fn envelope_rejects_version_kind_fingerprint_and_payload_length_corruption() {
-    let key = target_lookup_key("ice", "sales", "orders").expect("target key");
-    let value = encode_record(
-        MvRecordKind::TargetLookup,
-        Uuid::now_v7(),
-        &MvTargetLookup { mv_id: 7 },
-    )
-    .expect("encode record");
-    let source = value.into_bytes().to_vec();
-
-    let mut version = source.clone();
-    version[4] = 2;
-    let version = Value::try_from(Bytes::from(version)).expect("bounded value");
-    assert!(decode_record::<MvTargetLookup>(&key, &version).is_err());
-
-    let mut kind = source.clone();
-    kind[5] = 255;
-    let kind = Value::try_from(Bytes::from(kind)).expect("bounded value");
-    assert!(decode_record::<MvTargetLookup>(&key, &kind).is_err());
-
-    let mut fingerprint = source.clone();
-    fingerprint[12] = b'0';
-    let fingerprint = Value::try_from(Bytes::from(fingerprint)).expect("bounded value");
-    assert!(decode_record::<MvTargetLookup>(&key, &fingerprint).is_err());
-
-    let mut payload_length = source;
-    let fingerprint_len =
-        u16::from_be_bytes(payload_length[10..12].try_into().expect("length")) as usize;
-    let length_offset = 12 + fingerprint_len + 16;
-    let length = u32::from_be_bytes(
-        payload_length[length_offset..length_offset + 4]
-            .try_into()
-            .expect("payload length"),
-    );
-    payload_length[length_offset..length_offset + 4].copy_from_slice(&(length + 1).to_be_bytes());
-    let payload_length = Value::try_from(Bytes::from(payload_length)).expect("bounded value");
-    assert!(decode_record::<MvTargetLookup>(&key, &payload_length).is_err());
-}
-
-#[test]
-fn mv_catalog_exposes_only_the_current_incompatible_base_identity_schemas() {
-    let catalog = schema_catalog().expect("MV-only schema catalog");
-    catalog.validate_unique_entries().expect("unique entries");
-    catalog
-        .validate_full_transitive()
-        .expect("current catalog is internally compatible");
+fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
+    let catalog = schema_catalog().expect("MV Accelerator schema catalog");
+    catalog.validate_unique_entries().unwrap();
+    catalog.validate_full_transitive().unwrap();
     assert_eq!(
-        catalog
-            .latest("mv.definition")
-            .expect("definition schema")
-            .id(),
-        4
+        catalog.subjects().collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "mv.accelerator_dependency",
+            "mv.accelerator_projection",
+            "mv.accelerator_sequence",
+            "mv.accelerator_target_lookup",
+        ])
     );
-    assert_eq!(
-        catalog.latest("mv.refresh").expect("refresh schema").id(),
-        5
-    );
-    assert_eq!(
-        catalog.latest("mv.sequence").expect("sequence schema").id(),
-        2
-    );
-    assert!(catalog.entry("mv.definition", 2).is_err());
-    assert!(catalog.entry("mv.definition", 3).is_err());
-    assert!(catalog.entry("mv.refresh", 4).is_err());
-}
-
-#[test]
-fn refresh_v5_round_trips_frontend_owned_opaque_ledger_recovery_and_binary_base_identity() {
-    let request_id = Uuid::now_v7().into_bytes().to_vec();
-    let staging_create_operation_id = Uuid::now_v7().into_bytes().to_vec();
-    let write_operation_id = Uuid::now_v7().into_bytes().to_vec();
-    let publication_operation_id = Uuid::now_v7().into_bytes().to_vec();
-    let staging_drop_operation_id = Uuid::now_v7().into_bytes().to_vec();
-    let committed_payload = b"provider-version".to_vec();
-    let evidence_payload = b"provider-evidence".to_vec();
-    let refresh = StoredMvRefresh {
-        refresh_id: 7,
-        mv_id: 3,
-        operation_id: None,
-        state: MvRefreshState::IntentCreated,
-        target_catalog: Some("ice".to_string()),
-        target_namespace: Some("sales".to_string()),
-        target_table: Some("daily".to_string()),
-        staging_branch: Some("mv-7".to_string()),
-        expected_main_snapshot_id: Some(11),
-        staging_snapshot_id: None,
-        published_snapshot_id: None,
-        target_snapshots: BTreeMap::new(),
-        base_table_object_ids: BTreeMap::from([(
-            "ice.sales.orders".to_string(),
-            object_id(b"\x00orders\xff"),
-        )]),
-        rows: None,
-        marker: None,
-        external_outcome: None,
-        lifecycle_owner: MvRefreshLifecycleOwner::FrontendCurrent,
-        frontend_ledger: Some(FrontendMvRefreshLedger {
-            request_id,
-            provider_id: "iceberg".to_string(),
-            instance_id: "rest".to_string(),
-            incarnation: Uuid::now_v7().into_bytes().to_vec(),
-            expected_target_version: Some(
-                FrontendMvRefreshCommittedVersion::try_new(committed_payload.clone(), Some(12))
-                    .expect("committed version"),
-            ),
-            staging_create_operation_id: staging_create_operation_id.clone(),
-            write_operation_id: write_operation_id.clone(),
-            publication_operation_id: publication_operation_id.clone(),
-            staging_drop_operation_id: staging_drop_operation_id.clone(),
-            cohort_ids: vec!["cohort-a".to_string()],
-            actions: vec![
-                FrontendMvRefreshAction {
-                    phase: FrontendMvRefreshActionPhase::StagingCreate,
-                    state: FrontendMvRefreshActionState::Prepared,
-                    operation_id: staging_create_operation_id,
-                    receipt: None,
-                    committed_version: None,
-                    external_evidence: None,
-                    provider_finalized: false,
-                },
-                FrontendMvRefreshAction {
-                    phase: FrontendMvRefreshActionPhase::Write,
-                    state: FrontendMvRefreshActionState::KnownCommitted,
-                    operation_id: write_operation_id,
-                    receipt: Some(FrontendMvRefreshEvidence {
-                        payload: evidence_payload.clone(),
-                        digest: sha256_bytes(&evidence_payload),
-                    }),
-                    committed_version: Some(
-                        FrontendMvRefreshCommittedVersion::try_new(
-                            committed_payload.clone(),
-                            Some(12),
-                        )
-                        .expect("committed version"),
-                    ),
-                    external_evidence: None,
-                    provider_finalized: false,
-                },
-                FrontendMvRefreshAction {
-                    phase: FrontendMvRefreshActionPhase::Publication,
-                    state: FrontendMvRefreshActionState::Prepared,
-                    operation_id: publication_operation_id,
-                    receipt: None,
-                    committed_version: None,
-                    external_evidence: None,
-                    provider_finalized: false,
-                },
-                FrontendMvRefreshAction {
-                    phase: FrontendMvRefreshActionPhase::StagingDrop,
-                    state: FrontendMvRefreshActionState::Prepared,
-                    operation_id: staging_drop_operation_id,
-                    receipt: None,
-                    committed_version: None,
-                    external_evidence: None,
-                    provider_finalized: false,
-                },
-            ],
-            cleanup_pending: false,
-        }),
-        frontend_recovery: Some(
-            FrontendMvRefreshRecoveryLedger::pending(Uuid::now_v7().into_bytes().to_vec())
-                .expect("recovery ledger"),
-        ),
-    };
-    let key = Key::try_from(Bytes::from_static(
-        b"novarocks/frontend/mv/v1/refresh/by-id/0000000000000007",
-    ))
-    .expect("refresh key");
-    let encoded =
-        encode_record(MvRecordKind::Refresh, Uuid::now_v7(), &refresh).expect("encode v5 refresh");
-    let decoded: DecodedMvRecord<StoredMvRefresh> =
-        decode_record(&key, &encoded).expect("decode v5 refresh");
-    assert_eq!(decoded.value, refresh);
-}
-
-#[test]
-fn definition_uses_frontend_private_avro_projection() {
-    let definition = StoredMvDefinition {
-        mv_id: 9,
-        query_definition: PersistedQueryDefinition::new(
-            "SELECT 1",
-            PersistedQueryDialect::StarRocks,
-            "ice",
-            "sales",
-        )
-        .unwrap(),
-        base_table_refs: Vec::new(),
-        primary_key_columns: Vec::new(),
-        storage_engine: "iceberg".to_string(),
-        target_catalog: Some("ice".to_string()),
-        target_namespace: Some("sales".to_string()),
-        target_table: Some("daily".to_string()),
-        schema_contract: None,
-        partition_spec: None,
-        partition_state_complete: false,
-        last_refresh_ms: None,
-        last_refresh_rows: None,
-        last_refresh_snapshots: BTreeMap::new(),
-        last_refresh_table_object_ids: BTreeMap::from([(
-            "ice.sales.orders".to_string(),
-            object_id(b"\x00orders\xff"),
-        )]),
-        last_refreshed_iceberg_snapshot_id: None,
-        refresh_in_progress: false,
-        active_refresh_id: None,
-        refresh_target_snapshots: BTreeMap::new(),
-        refresh_policy: StoredMvRefreshPolicy::Manual,
-        refresh_paused: false,
-        refresh_interval_ms: None,
-        max_staleness_ms: None,
-        last_scheduler_error: None,
-        next_refresh_after_ms: None,
-        created_at_ms: 1,
-    };
-    let operation_id = Uuid::now_v7();
-    let key = definition_by_id_key(definition.mv_id).expect("definition key");
-    let encoded = encode_definition(operation_id, &definition).expect("encode definition");
-    let decoded = decode_definition(&key, &encoded).expect("decode definition");
-    assert_eq!(decoded.operation_id, operation_id);
-    assert_eq!(decoded.value, definition);
-
-    let mut legacy_schema = encoded.as_bytes().to_vec();
-    legacy_schema[6..10].copy_from_slice(&2_i32.to_be_bytes());
-    let legacy_schema = Value::try_from(Bytes::from(legacy_schema)).expect("bounded value");
-    assert!(decode_definition(&key, &legacy_schema).is_err());
+    assert!(catalog.entry("mv.definition", 4).is_err());
+    assert!(catalog.entry("mv.refresh", 5).is_err());
+    assert!(catalog.entry("mv.partition_state", 1).is_err());
 }

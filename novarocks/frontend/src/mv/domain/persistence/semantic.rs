@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::common::persisted_query_definition::PersistedQueryDefinition;
-use crate::mv::domain::persistence::definition::StoredMvRefreshPolicy;
+use crate::mv::domain::persistence::definition::MvDesiredRefreshPolicy;
 use crate::mv::domain::persistence::descriptor::DescriptorDependency;
 use crate::mv::domain::persistence::schema::MvSchemaContract;
 use novarocks_types::naming::normalize_identifier;
@@ -32,7 +32,7 @@ use novarocks_types::naming::normalize_identifier;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MvRefreshDesiredConfiguration {
-    pub policy: StoredMvRefreshPolicy,
+    pub policy: MvDesiredRefreshPolicy,
     pub paused: bool,
     pub interval_ms: Option<i64>,
     pub max_staleness_ms: Option<i64>,
@@ -40,7 +40,7 @@ pub struct MvRefreshDesiredConfiguration {
 
 impl MvRefreshDesiredConfiguration {
     pub fn new(
-        policy: StoredMvRefreshPolicy,
+        policy: MvDesiredRefreshPolicy,
         paused: bool,
         interval_ms: Option<i64>,
         max_staleness_ms: Option<i64>,
@@ -57,7 +57,7 @@ impl MvRefreshDesiredConfiguration {
 
     pub fn validate(&self) -> Result<(), String> {
         match self.policy {
-            StoredMvRefreshPolicy::Manual | StoredMvRefreshPolicy::AsyncOnChange
+            MvDesiredRefreshPolicy::Manual | MvDesiredRefreshPolicy::AsyncOnChange
                 if self.interval_ms.is_some() =>
             {
                 return Err(format!(
@@ -65,7 +65,7 @@ impl MvRefreshDesiredConfiguration {
                     self.policy.as_sql_str()
                 ));
             }
-            StoredMvRefreshPolicy::AsyncInterval
+            MvDesiredRefreshPolicy::AsyncInterval
                 if self.interval_ms.is_none_or(|value| value <= 0) =>
             {
                 return Err(
@@ -227,16 +227,20 @@ mod tests {
 
     #[test]
     fn refresh_configuration_rejects_interval_for_manual() {
-        let error =
-            MvRefreshDesiredConfiguration::new(StoredMvRefreshPolicy::Manual, false, Some(1), None)
-                .unwrap_err();
+        let error = MvRefreshDesiredConfiguration::new(
+            MvDesiredRefreshPolicy::Manual,
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap_err();
         assert!(error.contains("must not carry interval_ms"));
     }
 
     #[test]
     fn refresh_configuration_requires_positive_interval_and_staleness() {
         let error = MvRefreshDesiredConfiguration::new(
-            StoredMvRefreshPolicy::AsyncInterval,
+            MvDesiredRefreshPolicy::AsyncInterval,
             false,
             Some(0),
             None,
@@ -245,7 +249,7 @@ mod tests {
         assert!(error.contains("positive interval_ms"));
 
         let error = MvRefreshDesiredConfiguration::new(
-            StoredMvRefreshPolicy::AsyncOnChange,
+            MvDesiredRefreshPolicy::AsyncOnChange,
             true,
             None,
             Some(0),

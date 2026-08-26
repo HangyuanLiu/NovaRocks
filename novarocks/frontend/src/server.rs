@@ -127,6 +127,7 @@ pub fn build_frontend_query_session_factory(
     let mv_repository = host.mv_repository();
     let mv_application = host.mv_application_service();
     let mv_service = host.mv_service();
+    let mv_readiness = mv_service.readiness_port();
     let view_service = host.view_service();
     let statistics_application = host.statistics_application_port();
     let maintenance_service = host.table_maintenance_service();
@@ -150,6 +151,7 @@ pub fn build_frontend_query_session_factory(
                 topology.clone(),
                 exchange_port,
                 Arc::clone(&mv_repository),
+                Arc::clone(&mv_readiness),
                 Arc::clone(&mv_storage_observation),
             ),
         )
@@ -162,14 +164,7 @@ pub fn build_frontend_query_session_factory(
         Arc::clone(&catalog_application),
         Arc::clone(&mv_storage_observation),
         Arc::clone(&mv_repository),
-        {
-            let service = Arc::clone(&mv_service);
-            Box::new(move || {
-                service
-                    .recover_startup_mv_refreshes()
-                    .map_err(|error| format!("frontend MV startup recovery failed: {error}"))
-            })
-        },
+        mv_service.readiness_port(),
     );
     crate::mv::domain::startup_restore::run_mv_startup_restore(&startup_restore)
         .map_err(FrontendApplicationError::server)?;
@@ -232,6 +227,7 @@ pub fn build_frontend_query_session_factory(
                 Some(Arc::clone(&catalog_application)),
                 Arc::clone(&connector_control),
                 Arc::clone(&mv_repository),
+                Arc::clone(&mv_readiness),
                 Arc::clone(&mv_storage_observation),
             ),
             Arc::clone(&maintenance_engine),
@@ -259,7 +255,7 @@ pub fn build_frontend_query_session_factory(
             exchange_port,
             view_service.clone(),
             system_catalog,
-            Arc::clone(&mv_repository),
+            Arc::clone(&mv_readiness),
             Arc::clone(&mv_storage_observation),
         ));
     let session_catalog_resolver =

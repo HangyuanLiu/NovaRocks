@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::Bytes;
-use novarocks_frontend::mv::domain::repository::MvRepositoryErrorKind;
-use novarocks_frontend::mv::repository::key::definition_by_id_key;
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationErrorKind, FrontendApplicationHost,
     FrontendExecutionConfig, FrontendNativeTransport,
@@ -26,12 +23,10 @@ use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
 };
 use novarocks_secret::SecretValue;
-use novarocks_spi::state_store::{CommitOutcome, Precondition, TransactionId, Value};
 mod common;
 use common::state_store_fixture;
 use std::time::Duration;
 use tempfile::TempDir;
-use uuid::Uuid;
 
 fn test_native_trust() -> std::sync::Arc<NativeTrust> {
     std::sync::Arc::new(NativeTrust::new(
@@ -87,7 +82,7 @@ async fn configured_sqlite_opens_and_reopens_mv_repository() {
     let host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open its MV repository");
-    assert!(host.mv_repository().availability().is_available());
+    assert!(host.mv_repository().list_projections().is_ok());
     let repository = host.mv_repository();
     drop(repository);
     host.shutdown()
@@ -97,7 +92,7 @@ async fn configured_sqlite_opens_and_reopens_mv_repository() {
     let reopened = open_host(Some(config))
         .await
         .expect("same SQLite store must reopen its MV repository");
-    assert!(reopened.mv_repository().availability().is_available());
+    assert!(reopened.mv_repository().list_projections().is_ok());
     reopened.shutdown().await.expect("reopened host shutdown");
 }
 
@@ -114,68 +109,4 @@ async fn absent_state_store_rejects_frontend_before_mv_services_open() {
         error.kind(),
         FrontendApplicationErrorKind::ClusterBackendOpen
     );
-}
-
-#[tokio::test]
-async fn current_thread_runtime_rejects_sync_mv_repository_calls_without_panicking() {
-    let temp = TempDir::new().expect("temporary SQLite deployment");
-    let host = open_host(Some(state_store_input(&temp)))
-        .await
-        .expect("configured host");
-    let repository = host.mv_repository();
-
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        repository.list_definitions()
-    }));
-    let error = result
-        .expect("current-thread repository call must not panic")
-        .expect_err("current-thread repository call must return an error");
-    assert_eq!(error.kind(), MvRepositoryErrorKind::InvalidRequest);
-    assert!(error.message().contains("current-thread Tokio runtime"));
-
-    drop(repository);
-    host.shutdown().await.expect("host shutdown");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn corrupt_mv_record_fails_open_and_releases_provider_for_retry() {
-    let temp = TempDir::new().expect("temporary SQLite deployment");
-    let config = state_store_input(&temp);
-    let host = open_host(Some(config.clone()))
-        .await
-        .expect("configured host");
-    let store = host.state_store().expect("configured StateStore");
-    let mut transaction = store
-        .begin_write(
-            TransactionId::from(Uuid::now_v7()),
-            "seed corrupt MV record",
-        )
-        .await
-        .expect("begin corrupt MV write");
-    transaction
-        .put(
-            definition_by_id_key(1).expect("MV definition key"),
-            Value::try_from(Bytes::from_static(b"not-an-mv-envelope")).expect("value"),
-            Precondition::Absent,
-        )
-        .await
-        .expect("stage corrupt MV record");
-    assert!(matches!(
-        transaction.commit().await,
-        CommitOutcome::Committed(_)
-    ));
-    drop(store);
-    host.shutdown().await.expect("seed host shutdown");
-
-    let error = match open_host(Some(config.clone())).await {
-        Ok(_) => panic!("corrupt MV metadata must reject host open"),
-        Err(error) => error,
-    };
-    assert_eq!(error.kind(), FrontendApplicationErrorKind::MvServiceOpen);
-
-    let retry = match open_host(Some(config)).await {
-        Ok(_) => panic!("retry must reach MV validation instead of retaining provider lock"),
-        Err(error) => error,
-    };
-    assert_eq!(retry.kind(), FrontendApplicationErrorKind::MvServiceOpen);
 }

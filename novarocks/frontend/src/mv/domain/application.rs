@@ -21,10 +21,10 @@ use std::fmt;
 
 use uuid::Uuid;
 
+use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
+use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::descriptor::MvDescriptorV3;
-use crate::mv::domain::repository::{
-    CreateMvRepositoryRequest, MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvTarget,
-};
+use crate::mv::domain::repository::{InitialMvRefreshConfiguration, MvRepository, MvTarget};
 use crate::runtime::query_result::QueryResult;
 use novarocks_parser::ast::{
     LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
@@ -396,16 +396,26 @@ pub struct PrepareMvCreateRequest<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedMvCreate {
     pub target: MvTarget,
-    pub repository_request: CreateMvRepositoryRequest,
+    pub projection_seed: MvCreateProjectionSeed,
 }
 
 impl PreparedMvCreate {
-    pub fn new(target: MvTarget, repository_request: CreateMvRepositoryRequest) -> Self {
+    pub fn new(target: MvTarget, projection_seed: MvCreateProjectionSeed) -> Self {
         Self {
             target,
-            repository_request,
+            projection_seed,
         }
     }
+}
+
+/// CREATE-only facts used to assemble the lake descriptor. This is not a
+/// StateStore command: durable projection is constructed only from a later
+/// exact lake observation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvCreateProjectionSeed {
+    pub definition: CreateMvDefinitionRequest,
+    pub refresh: InitialMvRefreshConfiguration,
+    pub dependencies: Vec<CreateMvDependencyRequest>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -416,7 +426,6 @@ pub struct CreatedMvTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedMvDefinition {
-    pub repository_request: CreateMvRepositoryRequest,
     /// The complete lake authority assembled only after exact target
     /// observation. It must commit before the StateStore projection exists.
     pub descriptor: MvDescriptorV3,
@@ -456,27 +465,13 @@ pub trait MvEngine: Send + Sync {
         descriptor: &MvDescriptorV3,
     ) -> Result<(), MvEngineError>;
 
+    fn project_created_target(
+        &self,
+        target: &CreatedMvTarget,
+        operation_id: Uuid,
+    ) -> Result<(), MvEngineError>;
+
     fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError>;
 
     fn drop_created_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError>;
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub struct UnavailableMvApplicationService;
-
-impl MvApplicationService for UnavailableMvApplicationService {
-    fn try_handle_statement(
-        &self,
-        _engine: &dyn MvEngine,
-        statement: &MvApplicationStatement,
-        _context: MvRequestContext<'_>,
-    ) -> Result<Option<MvStatementResult>, MvApplicationError> {
-        if matches!(statement, MvApplicationStatement::Create(_)) {
-            return Err(MvApplicationError::new(
-                MvApplicationErrorKind::Unavailable,
-                MV_REPOSITORY_UNAVAILABLE_MESSAGE,
-            ));
-        }
-        Ok(None)
-    }
 }

@@ -19,9 +19,7 @@ use crate::mv::domain::application::{
     MvApplicationError, MvApplicationErrorKind, MvCreateStatement, MvEngine, MvEngineError,
     MvRequestContext, MvStatementResult, PrepareMvCreateRequest,
 };
-use crate::mv::domain::repository::{
-    MV_REPOSITORY_UNAVAILABLE_MESSAGE, MvRepository, MvRepositoryError, MvRepositoryErrorKind,
-};
+use crate::mv::domain::repository::MvRepository;
 use uuid::Uuid;
 
 pub(super) fn handle_create(
@@ -30,13 +28,6 @@ pub(super) fn handle_create(
     statement: &MvCreateStatement,
     context: MvRequestContext<'_>,
 ) -> Result<MvStatementResult, MvApplicationError> {
-    if !repository.availability().is_available() {
-        return Err(MvApplicationError::new(
-            MvApplicationErrorKind::Unavailable,
-            MV_REPOSITORY_UNAVAILABLE_MESSAGE,
-        ));
-    }
-
     let plan = engine
         .prepare_create(PrepareMvCreateRequest { statement, context }, repository)
         .map_err(engine_error)?;
@@ -59,18 +50,9 @@ pub(super) fn handle_create(
         // cannot be purged after this authority-boundary attempt.
         return Err(engine_error(error));
     }
-    match repository.create(operation_id, definition.repository_request) {
-        Ok(_) => {}
-        Err(error) if error.kind() == MvRepositoryErrorKind::CommitUnknown => {
-            return Err(repository_error(error));
-        }
-        Err(error) => {
-            return Err(MvApplicationError::new(
-                MvApplicationErrorKind::KnownCommittedFinalizeFailed,
-                error.to_string(),
-            ));
-        }
-    };
+    engine
+        .project_created_target(&target, operation_id)
+        .map_err(known_committed_finalize_error)?;
     engine
         .register_target(&target)
         .map_err(known_committed_finalize_error)?;
@@ -79,18 +61,6 @@ pub(super) fn handle_create(
 
 fn engine_error(error: MvEngineError) -> MvApplicationError {
     MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
-}
-
-fn repository_error(error: MvRepositoryError) -> MvApplicationError {
-    let kind = match error.kind() {
-        MvRepositoryErrorKind::Unavailable => MvApplicationErrorKind::Unavailable,
-        MvRepositoryErrorKind::CommitUnknown => MvApplicationErrorKind::CommitUnknown,
-        MvRepositoryErrorKind::KnownCommittedFinalizeFailed => {
-            MvApplicationErrorKind::KnownCommittedFinalizeFailed
-        }
-        _ => MvApplicationErrorKind::Repository,
-    };
-    MvApplicationError::new(kind, error.to_string())
 }
 
 fn known_committed_finalize_error(error: MvEngineError) -> MvApplicationError {

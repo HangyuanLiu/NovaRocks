@@ -15,127 +15,70 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+mod mv_repository_definition;
 
-use novarocks_frontend::common::persisted_query_definition::{
-    PersistedQueryDefinition, PersistedQueryDialect,
-};
-use novarocks_frontend::mv::domain::dependency::model::{
-    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
-};
-use novarocks_frontend::mv::domain::persistence::definition::CreateMvDefinitionRequest;
-use novarocks_frontend::mv::domain::persistence::partition::ReplaceMvPartitionStatesRequest;
-use novarocks_frontend::mv::domain::persistence::refresh::MvRefreshFinalizeRequest;
 use novarocks_frontend::mv::domain::repository::{
-    CreateMvDependencyRequest, CreateMvRepositoryRequest, InitialMvRefreshConfiguration,
-    MvRepository, MvTarget,
+    DeleteMvProjectionRequest, MvRepository, MvRepositoryErrorKind, ReplaceMvProjectionRequest,
 };
 use novarocks_frontend::mv::domain::test_repository::InMemoryMvRepository;
-use uuid::Uuid;
-
-fn target() -> MvTarget {
-    MvTarget {
-        catalog: Some("ice".to_string()),
-        database: "analytics".to_string(),
-        name: "orders_mv".to_string(),
-    }
-}
-
-fn dependency() -> MvDependencyObjectRef {
-    MvDependencyObjectRef {
-        catalog: Some("ice".to_string()),
-        database_or_namespace: "sales".to_string(),
-        name: "orders".to_string(),
-        object_type: MvDependencyObjectType::Table,
-        storage_engine: MvDependencyStorageEngine::Iceberg,
-    }
-}
 
 #[test]
-fn provider_neutral_repository_preserves_create_refresh_partition_and_dependency_contracts() {
+fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_delete() {
     let repository = InMemoryMvRepository::default();
-    let definition = repository
-        .create(
-            Uuid::now_v7(),
-            CreateMvRepositoryRequest {
-                definition: CreateMvDefinitionRequest {
-                    query_definition: PersistedQueryDefinition::new(
-                        "SELECT id FROM ice.sales.orders",
-                        PersistedQueryDialect::StarRocks,
-                        "ice",
-                        "sales",
-                    )
-                    .unwrap(),
-                    base_table_refs: vec!["ice.sales.orders".to_string()],
-                    primary_key_columns: vec!["id".to_string()],
-                    storage_engine: "iceberg".to_string(),
-                    target_catalog: target().catalog,
-                    target_namespace: Some("analytics".to_string()),
-                    target_table: Some("orders_mv".to_string()),
-                    schema_contract: None,
-                    partition_spec: None,
-                    created_at_ms: 1,
-                },
-                refresh: InitialMvRefreshConfiguration::default(),
-                dependencies: vec![CreateMvDependencyRequest {
-                    upstream: dependency(),
-                    created_at_ms: 1,
-                }],
-            },
+    let created = repository
+        .create_projection(
+            uuid::Uuid::now_v7(),
+            mv_repository_definition::projection_request(
+                "orders_mv",
+                b"target-object",
+                61,
+                "orders",
+            ),
         )
-        .expect("create definition through port");
-
-    assert_eq!(
-        repository.find_by_target(&target()).expect("find"),
-        Some(definition.clone())
-    );
+        .expect("create projection through port");
     assert_eq!(
         repository
-            .list_dependencies_by_downstream(definition.mv_id)
-            .expect("dependencies")
-            .len(),
-        1
+            .find_by_target(&mv_repository_definition::target("orders_mv"))
+            .unwrap(),
+        Some(created.clone())
     );
 
-    let refresh = repository
-        .begin_refresh_intent(definition.mv_id, BTreeMap::new())
-        .expect("begin refresh through port");
+    let replaced = repository
+        .replace_projection(
+            uuid::Uuid::now_v7(),
+            ReplaceMvProjectionRequest {
+                mv_id: created.definition.mv_id,
+                expected_version: created.version.clone(),
+                projection: mv_repository_definition::projection_request(
+                    "orders_mv",
+                    b"target-object",
+                    62,
+                    "customers",
+                ),
+            },
+        )
+        .unwrap();
+    let stale_delete = repository
+        .delete_projection(
+            uuid::Uuid::now_v7(),
+            DeleteMvProjectionRequest {
+                mv_id: created.definition.mv_id,
+                expected_version: created.version,
+                expected_source_revision: created.definition.source_revision,
+            },
+        )
+        .expect_err("stale root version must not delete the replacement");
+    assert_eq!(stale_delete.kind(), MvRepositoryErrorKind::Conflict);
+
     repository
-        .finalize_refresh_with_partitions(
-            novarocks_frontend::mv::domain::repository::FinalizeMvRefreshWithPartitionsRequest {
-                refresh: MvRefreshFinalizeRequest {
-                    refresh_id: refresh.refresh_id,
-                    last_refresh_ms: 2,
-                    rows: 3,
-                    base_snapshots: BTreeMap::new(),
-                    base_table_object_ids: BTreeMap::new(),
-                    target_snapshot_id: Some(7),
-                    partition_spec: None,
-                },
-                partitions: Some(ReplaceMvPartitionStatesRequest {
-                    mv_id: definition.mv_id,
-                    partition_keys: BTreeSet::from(["spec=0".to_string()]),
-                    last_refresh_ms: 2,
-                    base_snapshots: BTreeMap::new(),
-                    target_snapshot_id: Some(7),
-                    last_refresh_id: refresh.refresh_id,
-                    max_entries: 10,
-                }),
+        .delete_projection(
+            uuid::Uuid::now_v7(),
+            DeleteMvProjectionRequest {
+                mv_id: replaced.definition.mv_id,
+                expected_version: replaced.version,
+                expected_source_revision: replaced.definition.source_revision,
             },
         )
-        .expect("finalize through port");
-
-    assert_eq!(
-        repository
-            .list_partition_states(definition.mv_id)
-            .expect("partitions")
-            .len(),
-        1
-    );
-    assert!(
-        repository
-            .load_refresh(refresh.refresh_id)
-            .expect("refresh")
-            .is_some()
-    );
+        .expect("exact guarded delete");
+    assert!(repository.list_projections().unwrap().is_empty());
 }

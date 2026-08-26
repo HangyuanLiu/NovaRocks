@@ -23,10 +23,11 @@
 
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorManagedPublicationEmptyInputDisposition,
-    ConnectorManagedPublicationIntent, ConnectorManagedPublicationTechnique,
-    ConnectorRequestContext, ConnectorStagedPublicationBaseFact, ConnectorTableIdentity,
-    ConnectorTableResolution, ConnectorWriteActivationIntent, ConnectorWriteInputRequest,
-    ConnectorWriteLease, ConnectorWriteOperationId,
+    ConnectorManagedPublicationIntent, ConnectorManagedPublicationTarget,
+    ConnectorManagedPublicationTechnique, ConnectorRequestContext,
+    ConnectorStagedPublicationBaseFact, ConnectorTableIdentity, ConnectorTableResolution,
+    ConnectorWriteActivationIntent, ConnectorWriteInputRequest, ConnectorWriteLease,
+    ConnectorWriteOperationId,
 };
 
 use crate::common::admitted_query_context::QueryExecutionContext;
@@ -103,13 +104,13 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
         MvRefreshCommittedFacts::from_write_receipt(intent, receipt)
     }
 
-    fn observe_published_projection(
+    fn observe_published_package(
         &self,
         planning_lease: &ConnectorControlPlanningLease,
         table: &ConnectorTableIdentity,
         expected_snapshot_id: i64,
         connector_context: &ConnectorRequestContext,
-    ) -> Result<MvLakePublishedProjection, String> {
+    ) -> Result<novarocks_spi::connector::MvLakePackageObservation, String> {
         if planning_lease.binding().descriptor().instance_id != table.instance_id {
             return Err(
                 "MV publication observation table belongs to a different connector generation"
@@ -130,55 +131,25 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
                     .to_string(),
             );
         }
-        let package = observe_lake_package(
-            self.ports.storage_observation(),
-            planning_lease,
-            &metadata,
-            connector_context.clone(),
-        )
-        .map_err(|error| format!("observe MV publication lake package: {error}"))?
-        .ok_or_else(|| "MV publication target has no lake package observation".to_string())?;
-        if package.table != *table {
+        let package = self
+            .ports
+            .storage_observation()
+            .observe_lake_package(planning_lease, &metadata, connector_context.clone())
+            .map_err(|error| format!("observe MV publication lake package: {error}"))?
+            .ok_or_else(|| "MV publication target has no lake package observation".to_string())?;
+        let local = crate::mv::domain::storage_observation::lake_package_from_spi(package.clone())
+            .map_err(|error| format!("validate MV publication lake package: {error}"))?;
+        if local.table != *table {
             return Err(
                 "MV publication observer returned a package for a different target table"
                     .to_string(),
             );
         }
-        let projection = package
+        let projection = local
             .published_projection()
             .map_err(|error| format!("project MV publication lake package: {error}"))?;
-        require_exact_published_projection(projection, expected_snapshot_id)
-    }
-
-    fn sync_repartition_descriptor(
-        &self,
-        mv_id: i64,
-        partition_spec: crate::mv::domain::persistence::schema::MvPartitionContract,
-        committed_partitioning: novarocks_spi::connector::ConnectorCommittedPartitioning,
-        connector_context: &ConnectorRequestContext,
-    ) -> Result<(), String> {
-        let mut definition = self
-            .ports
-            .repository()
-            .load_by_id(mv_id)
-            .map_err(|error| format!("load MV definition for descriptor projection: {error}"))?
-            .ok_or_else(|| {
-                format!("materialized view {mv_id} is absent during descriptor projection")
-            })?;
-        let schema = definition.schema_contract.as_mut().ok_or_else(|| {
-            format!("materialized view {mv_id} has no schema contract during descriptor projection")
-        })?;
-        schema.target.partition = Some(partition_spec.clone());
-        definition.partition_spec = Some(partition_spec);
-        crate::mv::domain::iceberg_refresh::sync_iceberg_mv_descriptor_with_ports(
-            &self.ports,
-            &definition,
-            &definition.refresh_policy,
-            definition.refresh_paused,
-            definition.refresh_interval_ms,
-            Some(committed_partitioning),
-            connector_context,
-        )
+        require_exact_published_projection(projection, expected_snapshot_id)?;
+        Ok(package)
     }
 }
 
@@ -295,9 +266,12 @@ pub(crate) fn managed_publication_activation_intent(
     empty_input: ConnectorManagedPublicationEmptyInputDisposition,
 ) -> Result<ConnectorManagedPublicationIntent, String> {
     let arguments = (
-        publication.refresh_id(),
-        publication.mv_id(),
-        publication.marker_token(),
+        publication.publication_id(),
+        ConnectorManagedPublicationTarget::try_new(
+            publication.target_object_id().clone(),
+            publication.expected_target_snapshot_id(),
+        )
+        .map_err(|error| format!("build managed MV publication target: {error}"))?,
         match publication.technique() {
             MvRefreshPublicationTechnique::Full => ConnectorManagedPublicationTechnique::Full,
             MvRefreshPublicationTechnique::Incremental => {
@@ -321,6 +295,7 @@ pub(crate) fn managed_publication_activation_intent(
             .collect(),
         publication.definition_fingerprint(),
         empty_input,
+        publication.descriptor_properties().clone(),
     );
     match publication.partition_spec_replacement() {
         Some(replacement) => {
@@ -331,8 +306,8 @@ pub(crate) fn managed_publication_activation_intent(
                 arguments.3,
                 arguments.4,
                 arguments.5,
-                arguments.6,
                 replacement.clone(),
+                arguments.6,
             )
         }
         None => ConnectorManagedPublicationIntent::try_new(

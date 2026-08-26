@@ -30,6 +30,7 @@ use crate::common::backend_topology::BackendTopologyService;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::repository::MvRepository;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::service::QueryExecutionService;
@@ -64,7 +65,7 @@ pub struct SystemTableQueryKernel {
     catalog_service: Arc<QueryCatalogService>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     system_catalog: Arc<dyn SystemCatalog>,
-    mv_repository: Arc<dyn MvRepository>,
+    mv_readiness: Arc<MvReadinessPort>,
 }
 
 impl SystemTableQueryKernel {
@@ -72,13 +73,13 @@ impl SystemTableQueryKernel {
         catalog_service: Arc<QueryCatalogService>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         system_catalog: Arc<dyn SystemCatalog>,
-        mv_repository: Arc<dyn MvRepository>,
+        mv_readiness: Arc<MvReadinessPort>,
     ) -> Self {
         Self {
             catalog_service,
             connector_control,
             system_catalog,
-            mv_repository,
+            mv_readiness,
         }
     }
 
@@ -96,8 +97,8 @@ impl SystemTableQueryKernel {
         &self.system_catalog
     }
 
-    pub fn mv_repository(&self) -> &Arc<dyn MvRepository> {
-        &self.mv_repository
+    pub(crate) fn mv_readiness(&self) -> &Arc<MvReadinessPort> {
+        &self.mv_readiness
     }
 }
 

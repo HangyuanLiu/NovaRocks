@@ -530,51 +530,7 @@ impl FrontendApplicationHost {
         }
         match host.state_store() {
             Some(store) => {
-                // The MV repository must observe the exact attachment version an
-                // admitted catalog was resolved from, so a durable MV definition
-                // can never outlive the attachment it references.
-                let attachment_observations = host.catalog_application_port.as_ref().map(|port| {
-                    Arc::clone(port)
-                        as Arc<dyn crate::mv::repository::CatalogAttachmentObservationSource>
-                });
-                // Cluster-wide refresh ownership. The refresh path registers with
-                // this registry before creating durable state, so installing it as
-                // the repository's fence source below makes every durable refresh
-                // transition prove ownership inside its own transaction.
-                let ownership = match crate::mv::coordination::MvRefreshOwnershipContext::open(
-                    Arc::clone(&store),
-                )
-                .await
-                {
-                    Ok(ownership) => Some(ownership),
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "frontend MV refresh ownership coordination unavailable; \
-                             refreshes remain single-owner"
-                        );
-                        None
-                    }
-                };
-                // Installing the registry as the repository's fence source is what
-                // makes ownership binding: every durable refresh transition then
-                // proves ownership inside its own transaction, so a superseded
-                // owner's write fails at commit rather than racing.
-                //
-                // This must land together with the refresh path's acquisition, and
-                // it does -- the registry is fail-closed for unregistered targets,
-                // so installing it without acquisition refuses every refresh in the
-                // cluster. `installing_a_fence_source_without_registration_stops_\
-                // every_refresh` guards that combination.
-                let refresh_fence = ownership.as_ref().map(|context| context.registry());
-                match StateStoreMvRepository::open_with_observations_and_refresh_fence(
-                    store,
-                    tokio::runtime::Handle::current(),
-                    attachment_observations,
-                    refresh_fence,
-                )
-                .await
-                {
+                match StateStoreMvRepository::open(store, tokio::runtime::Handle::current()).await {
                     Ok(repository) => {
                         let repository: Arc<dyn crate::mv::domain::repository::MvRepository> =
                             repository;
@@ -583,30 +539,28 @@ impl FrontendApplicationHost {
                         let service = Arc::new(FrontendMvService::with_refresh_dependencies(
                             Arc::clone(&repository),
                             host.query_execution_service(),
-                            host.connector_control_registry(),
+                            Arc::clone(&host.connector_control)
+                                as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
                             Arc::clone(&provider_activation),
                             host.execution_role,
                             host.backend_topology_port(),
                             execution.mv_scheduler.clone(),
                             execution.mv_maintenance.clone(),
                             host.table_maintenance_service(),
-                            execution.optimizer_query_mem_limit_bytes(),
-                            execution
-                                .lake_publication_runtime_policy()
-                                .max_attempt_duration(),
-                            ownership,
+                            host.optimizer_query_mem_limit_bytes,
+                            Duration::from_secs(30 * 60),
                         ));
-                        host.mv_background_engine_sink = Some(
-                            FrontendMvService::background_engine_sink(Arc::clone(&service)),
-                        );
                         let application_service: Arc<
                             dyn crate::mv::domain::application::MvApplicationService,
                         > = Arc::clone(&service)
                             as Arc<dyn crate::mv::domain::application::MvApplicationService>;
+                        host.mv_background_engine_sink = Some(
+                            FrontendMvService::background_engine_sink(Arc::clone(&service)),
+                        );
+                        host.mv_refresh_provider_activation = Some(provider_activation);
                         host.mv_application_service = Some(application_service);
                         host.mv_service = Some(service);
                         host.mv_repository = Some(repository);
-                        host.mv_refresh_provider_activation = Some(provider_activation);
                     }
                     Err(error) => {
                         return Err(host
@@ -619,16 +573,12 @@ impl FrontendApplicationHost {
                 }
             }
             None => {
-                let repository: Arc<dyn crate::mv::domain::repository::MvRepository> =
-                    Arc::new(crate::mv::domain::repository::UnavailableMvRepository);
-                let service = Arc::new(FrontendMvService::new(Arc::clone(&repository)));
-                let application_service: Arc<
-                    dyn crate::mv::domain::application::MvApplicationService,
-                > = Arc::clone(&service)
-                    as Arc<dyn crate::mv::domain::application::MvApplicationService>;
-                host.mv_repository = Some(repository);
-                host.mv_application_service = Some(application_service);
-                host.mv_service = Some(service);
+                return Err(host
+                    .cleanup_open_error(FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::MvServiceOpen,
+                        "frontend MV Accelerator requires StateStore",
+                    ))
+                    .await);
             }
         }
         if let Err(error) = host.topology().start_heartbeat_manager().map_err(|error| {

@@ -25,14 +25,12 @@
 
 use novarocks_proto::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
-    ConnectorCommittedPartitioning, ConnectorControlPlanningLease, ConnectorRequestContext,
-    ConnectorTableIdentity, ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId,
-    ConnectorWriteReceipt,
+    ConnectorControlPlanningLease, ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWriteReceipt,
+    MvLakePackageObservation,
 };
 
 use crate::common::admitted_query_context::QueryExecutionContext;
-use crate::mv::domain::persistence::schema::MvPartitionContract;
-use crate::mv::domain::storage_observation::MvLakePublishedProjection;
 use crate::query_execution::contract::ConnectorWriteOperationRegistration;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvRefreshCommittedFacts, MvRefreshPublicationIntent,
@@ -126,30 +124,17 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         receipt: &ConnectorWriteReceipt,
     ) -> Result<MvRefreshCommittedFacts, String>;
 
-    /// Observe the lake-owned projection after a known publication. The caller
-    /// supplies the retained exact lease and the snapshot identity it already
-    /// proved; implementations must reject a missing, stale, or advanced head.
-    fn observe_published_projection(
+    /// Reobserve the complete lake-owned package after a known publication.
+    /// The caller supplies the retained exact lease and snapshot identity it
+    /// already proved; implementations reject a missing, stale, or advanced
+    /// head before returning the package for Accelerator convergence.
+    fn observe_published_package(
         &self,
         planning_lease: &ConnectorControlPlanningLease,
         table: &ConnectorTableIdentity,
         expected_snapshot_id: i64,
         connector_context: &ConnectorRequestContext,
-    ) -> Result<MvLakePublishedProjection, String>;
-
-    /// Project a provider-committed repartition contract into the lake-owned
-    /// MV descriptor. The atomic table commit is already durable when this is
-    /// called; a failure therefore leaves the frontend refresh fenced for
-    /// recovery and must be safe to retry. `committed_partitioning` is the
-    /// provider-produced exact CAS guard and must be forwarded unchanged, not
-    /// reconstructed from the application partition contract.
-    fn sync_repartition_descriptor(
-        &self,
-        mv_id: i64,
-        partition_spec: MvPartitionContract,
-        committed_partitioning: ConnectorCommittedPartitioning,
-        connector_context: &ConnectorRequestContext,
-    ) -> Result<(), String>;
+    ) -> Result<MvLakePackageObservation, String>;
 }
 
 /// Composition sink installed before the activation adapter exists. The

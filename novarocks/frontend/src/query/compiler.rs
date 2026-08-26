@@ -25,7 +25,7 @@ use crate::catalog_application::query_materializer::build_catalog_service_provid
 use crate::catalog_application::virtual_table;
 use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
 use crate::connector::connector_request_context_for_query;
-use crate::mv::domain::repository::MvRepository;
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use crate::query_execution::PreparedQueryOperation;
 use crate::query_execution::compiler::{
@@ -88,7 +88,7 @@ pub(crate) struct FrontendQueryCompiler {
     query: QueryPreparationKernel,
     view: ViewExecutionKernel,
     system_tables: SystemTableQueryKernel,
-    mv_repository: Arc<dyn MvRepository>,
+    mv_readiness: Arc<MvReadinessPort>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
 }
 
@@ -97,14 +97,14 @@ impl FrontendQueryCompiler {
         query: QueryPreparationKernel,
         view: ViewExecutionKernel,
         system_tables: SystemTableQueryKernel,
-        mv_repository: Arc<dyn MvRepository>,
+        mv_readiness: Arc<MvReadinessPort>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
         Self {
             query,
             view,
             system_tables,
-            mv_repository,
+            mv_readiness,
             mv_storage_observation,
         }
     }
@@ -145,7 +145,7 @@ impl FrontendQueryCompiler {
                 } else {
                     Some(freeze_query_mv_rewrite_definition_index(
                         &self.query,
-                        self.mv_repository.as_ref(),
+                        self.mv_readiness.as_ref(),
                         self.mv_storage_observation.as_ref(),
                     )?)
                 };
@@ -195,7 +195,7 @@ impl FrontendQueryCompiler {
             ),
             Statement::Query(query) => {
                 if let Some(result) = information_schema::try_query_materialized_views(
-                    self.system_tables.mv_repository().as_ref(),
+                    self.system_tables.mv_readiness().as_ref(),
                     query,
                 )? {
                     return Ok(PreparedQueryOperation::immediate(result));
@@ -246,16 +246,15 @@ impl FrontendQueryCompiler {
             TableLookupMode::SchemaOnly,
             self.query.catalog_application().map(Arc::as_ref),
         );
-        let mv_definitions =
-            if allow_mv_rewrite_candidates && self.mv_repository.availability().is_available() {
-                Some(freeze_query_mv_rewrite_definition_index(
-                    &self.query,
-                    self.mv_repository.as_ref(),
-                    self.mv_storage_observation.as_ref(),
-                )?)
-            } else {
-                None
-            };
+        let mv_definitions = if allow_mv_rewrite_candidates {
+            Some(freeze_query_mv_rewrite_definition_index(
+                &self.query,
+                self.mv_readiness.as_ref(),
+                self.mv_storage_observation.as_ref(),
+            )?)
+        } else {
+            None
+        };
         let analyzed = SqlCompiler::analyze(self.analyze_request(
             query,
             current_catalog,

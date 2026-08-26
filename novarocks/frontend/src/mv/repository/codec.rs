@@ -27,13 +27,17 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::common::persisted_query_definition::PersistedQueryDefinition;
-use crate::mv::domain::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
+use crate::mv::domain::persistence::definition::{
+    MV_ACCELERATOR_PROJECTION_SUBJECT, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
+    StoredMvDefinition,
+};
+use crate::mv::domain::persistence::dependency::MV_ACCELERATOR_DEPENDENCY_SUBJECT;
 use crate::mv::domain::persistence::schema::{MvPartitionContract, MvSchemaContract};
 
 use super::catalog::schema_catalog;
 use super::key::{MvKeyKind, expected_record_kind};
 
-const MAGIC: &[u8; 4] = b"NRMV";
+const MAGIC: &[u8; 4] = b"NRMA";
 const ENVELOPE_VERSION: u8 = 1;
 const HEADER_BYTES_BEFORE_FINGERPRINT: usize = 12;
 const OPERATION_ID_BYTES: usize = 16;
@@ -42,44 +46,36 @@ const PAYLOAD_LENGTH_BYTES: usize = 4;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum MvRecordKind {
-    Definition = 1,
+    Projection = 1,
     TargetLookup = 2,
-    Refresh = 3,
-    Partition = 4,
-    Dependency = 5,
-    Sequence = 6,
+    Dependency = 3,
+    Sequence = 4,
 }
 
 impl MvRecordKind {
     fn from_byte(value: u8) -> Result<Self, String> {
         match value {
-            1 => Ok(Self::Definition),
+            1 => Ok(Self::Projection),
             2 => Ok(Self::TargetLookup),
-            3 => Ok(Self::Refresh),
-            4 => Ok(Self::Partition),
-            5 => Ok(Self::Dependency),
-            6 => Ok(Self::Sequence),
-            _ => Err(format!("unknown MV record kind {value}")),
+            3 => Ok(Self::Dependency),
+            4 => Ok(Self::Sequence),
+            _ => Err(format!("unknown MV Accelerator record kind {value}")),
         }
     }
 
     fn subject(self) -> &'static str {
         match self {
-            Self::Definition => "mv.definition",
-            Self::TargetLookup => "mv.target_lookup",
-            Self::Refresh => "mv.refresh",
-            Self::Partition => "mv.partition_state",
-            Self::Dependency => "mv.dependency",
-            Self::Sequence => "mv.sequence",
+            Self::Projection => MV_ACCELERATOR_PROJECTION_SUBJECT,
+            Self::TargetLookup => "mv.accelerator_target_lookup",
+            Self::Dependency => MV_ACCELERATOR_DEPENDENCY_SUBJECT,
+            Self::Sequence => "mv.accelerator_sequence",
         }
     }
 
     fn matches_key(self, key_kind: MvKeyKind) -> bool {
         match self {
-            Self::Definition => key_kind == MvKeyKind::Definition,
+            Self::Projection => key_kind == MvKeyKind::Projection,
             Self::TargetLookup => key_kind == MvKeyKind::TargetLookup,
-            Self::Refresh => key_kind == MvKeyKind::Refresh,
-            Self::Partition => key_kind == MvKeyKind::Partition,
             Self::Dependency => matches!(
                 key_kind,
                 MvKeyKind::DependencyDownstream | MvKeyKind::DependencyUpstream
@@ -98,12 +94,8 @@ pub struct DecodedMvRecord<T> {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MvSequence {
     pub last_allocated_id: i64,
-    #[serde(default)]
-    pub last_refresh_id: i64,
 }
 
-/// Frontend-owned Avro wire representation. The core definition remains a
-/// provider-neutral domain DTO and never carries StateStore serialization.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct StoredMvDefinitionAvro {
     mv_id: i64,
@@ -116,23 +108,17 @@ struct StoredMvDefinitionAvro {
     target_table: Option<String>,
     schema_contract: Option<String>,
     partition_spec: Option<String>,
-    #[serde(default)]
-    partition_state_complete: bool,
     last_refresh_ms: Option<i64>,
     last_refresh_rows: Option<i64>,
     last_refresh_snapshots: BTreeMap<String, i64>,
     last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
     last_refreshed_iceberg_snapshot_id: Option<i64>,
-    refresh_in_progress: bool,
-    active_refresh_id: Option<i64>,
-    refresh_target_snapshots: BTreeMap<String, i64>,
-    refresh_policy: StoredMvRefreshPolicy,
+    refresh_policy: MvDesiredRefreshPolicy,
     refresh_paused: bool,
     refresh_interval_ms: Option<i64>,
     max_staleness_ms: Option<i64>,
-    last_scheduler_error: Option<String>,
-    next_refresh_after_ms: Option<i64>,
     created_at_ms: i64,
+    source_revision: MvAcceleratorSourceRevision,
 }
 
 impl TryFrom<&StoredMvDefinition> for StoredMvDefinitionAvro {
@@ -160,22 +146,17 @@ impl TryFrom<&StoredMvDefinition> for StoredMvDefinitionAvro {
                 .map(serde_json::to_string)
                 .transpose()
                 .map_err(|error| format!("encode MV partition contract failed: {error}"))?,
-            partition_state_complete: value.partition_state_complete,
             last_refresh_ms: value.last_refresh_ms,
             last_refresh_rows: value.last_refresh_rows,
             last_refresh_snapshots: value.last_refresh_snapshots.clone(),
             last_refresh_table_object_ids: value.last_refresh_table_object_ids.clone(),
             last_refreshed_iceberg_snapshot_id: value.last_refreshed_iceberg_snapshot_id,
-            refresh_in_progress: value.refresh_in_progress,
-            active_refresh_id: value.active_refresh_id,
-            refresh_target_snapshots: value.refresh_target_snapshots.clone(),
             refresh_policy: value.refresh_policy.clone(),
             refresh_paused: value.refresh_paused,
             refresh_interval_ms: value.refresh_interval_ms,
             max_staleness_ms: value.max_staleness_ms,
-            last_scheduler_error: value.last_scheduler_error.clone(),
-            next_refresh_after_ms: value.next_refresh_after_ms,
             created_at_ms: value.created_at_ms,
+            source_revision: value.source_revision.clone(),
         })
     }
 }
@@ -205,27 +186,22 @@ impl TryFrom<StoredMvDefinitionAvro> for StoredMvDefinition {
                 .map(serde_json::from_str::<MvPartitionContract>)
                 .transpose()
                 .map_err(|error| format!("decode MV partition contract failed: {error}"))?,
-            partition_state_complete: value.partition_state_complete,
             last_refresh_ms: value.last_refresh_ms,
             last_refresh_rows: value.last_refresh_rows,
             last_refresh_snapshots: value.last_refresh_snapshots,
             last_refresh_table_object_ids: value.last_refresh_table_object_ids,
             last_refreshed_iceberg_snapshot_id: value.last_refreshed_iceberg_snapshot_id,
-            refresh_in_progress: value.refresh_in_progress,
-            active_refresh_id: value.active_refresh_id,
-            refresh_target_snapshots: value.refresh_target_snapshots,
             refresh_policy: value.refresh_policy,
             refresh_paused: value.refresh_paused,
             refresh_interval_ms: value.refresh_interval_ms,
             max_staleness_ms: value.max_staleness_ms,
-            last_scheduler_error: value.last_scheduler_error,
-            next_refresh_after_ms: value.next_refresh_after_ms,
             created_at_ms: value.created_at_ms,
+            source_revision: value.source_revision,
         })
     }
 }
 
-pub fn encode_definition(
+pub fn encode_projection(
     operation_id: Uuid,
     definition: &StoredMvDefinition,
 ) -> Result<Value, String> {
@@ -234,13 +210,13 @@ pub fn encode_definition(
         .validate()
         .map_err(|error| format!("invalid persisted MV query definition: {error}"))?;
     encode_record(
-        MvRecordKind::Definition,
+        MvRecordKind::Projection,
         operation_id,
         &StoredMvDefinitionAvro::try_from(definition)?,
     )
 }
 
-pub fn decode_definition(
+pub fn decode_projection(
     key: &Key,
     value: &Value,
 ) -> Result<DecodedMvRecord<StoredMvDefinition>, String> {
@@ -262,20 +238,20 @@ where
 {
     let catalog = schema_catalog()?;
     let entry = catalog.latest(kind.subject())?;
-    let datum =
-        to_value(value).map_err(|error| format!("convert MV record to Avro failed: {error}"))?;
+    let datum = to_value(value)
+        .map_err(|error| format!("convert MV Accelerator record failed: {error}"))?;
     let payload = to_avro_datum(entry.schema(), datum).map_err(|error| {
         format!(
-            "encode MV Avro payload for {} schema {} failed: {error}",
+            "encode MV Accelerator Avro payload for {} schema {} failed: {error}",
             entry.subject(),
             entry.id()
         )
     })?;
     let fingerprint = entry.fingerprint().as_bytes();
     let fingerprint_len = u16::try_from(fingerprint.len())
-        .map_err(|_| "MV Avro fingerprint is too large".to_string())?;
-    let payload_len =
-        u32::try_from(payload.len()).map_err(|_| "MV Avro payload is too large".to_string())?;
+        .map_err(|_| "MV Accelerator Avro fingerprint is too large".to_string())?;
+    let payload_len = u32::try_from(payload.len())
+        .map_err(|_| "MV Accelerator Avro payload is too large".to_string())?;
     let mut envelope = Vec::with_capacity(
         HEADER_BYTES_BEFORE_FINGERPRINT
             + fingerprint.len()
@@ -293,7 +269,7 @@ where
     envelope.extend_from_slice(&payload_len.to_be_bytes());
     envelope.extend_from_slice(&payload);
     Value::try_from(Bytes::from(envelope))
-        .map_err(|error| format!("encode MV StateStore value failed: {error}"))
+        .map_err(|error| format!("encode MV Accelerator StateStore value failed: {error}"))
 }
 
 pub fn decode_record<T>(key: &Key, value: &Value) -> Result<DecodedMvRecord<T>, String>
@@ -302,19 +278,22 @@ where
 {
     let bytes = value.as_bytes();
     if bytes.len() < HEADER_BYTES_BEFORE_FINGERPRINT + OPERATION_ID_BYTES + PAYLOAD_LENGTH_BYTES {
-        return Err("MV envelope is truncated".to_string());
+        return Err("MV Accelerator envelope is truncated".to_string());
     }
     if &bytes[..4] != MAGIC {
-        return Err("MV envelope has invalid magic".to_string());
+        return Err("MV Accelerator envelope has invalid magic".to_string());
     }
     if bytes[4] != ENVELOPE_VERSION {
-        return Err(format!("unsupported MV envelope version {}", bytes[4]));
+        return Err(format!(
+            "unsupported MV Accelerator envelope version {}",
+            bytes[4]
+        ));
     }
     let kind = MvRecordKind::from_byte(bytes[5])?;
     let key_kind = expected_record_kind(key)?;
     if !kind.matches_key(key_kind) {
         return Err(format!(
-            "MV envelope record kind {:?} does not match key kind {:?}",
+            "MV Accelerator envelope record kind {:?} does not match key kind {:?}",
             kind, key_kind
         ));
     }
@@ -326,23 +305,23 @@ where
     ) as usize;
     let fingerprint_end = HEADER_BYTES_BEFORE_FINGERPRINT
         .checked_add(fingerprint_len)
-        .ok_or_else(|| "MV envelope fingerprint length overflows".to_string())?;
+        .ok_or_else(|| "MV Accelerator fingerprint length overflows".to_string())?;
     let operation_end = fingerprint_end
         .checked_add(OPERATION_ID_BYTES)
-        .ok_or_else(|| "MV envelope operation id length overflows".to_string())?;
+        .ok_or_else(|| "MV Accelerator operation ID length overflows".to_string())?;
     let payload_length_end = operation_end
         .checked_add(PAYLOAD_LENGTH_BYTES)
-        .ok_or_else(|| "MV envelope payload length overflows".to_string())?;
+        .ok_or_else(|| "MV Accelerator payload length overflows".to_string())?;
     if payload_length_end > bytes.len() {
-        return Err("MV envelope is truncated before payload".to_string());
+        return Err("MV Accelerator envelope is truncated before payload".to_string());
     }
     let fingerprint = std::str::from_utf8(&bytes[HEADER_BYTES_BEFORE_FINGERPRINT..fingerprint_end])
-        .map_err(|_| "MV envelope fingerprint is not ASCII".to_string())?;
+        .map_err(|_| "MV Accelerator fingerprint is not ASCII".to_string())?;
     if !fingerprint.is_ascii() {
-        return Err("MV envelope fingerprint is not ASCII".to_string());
+        return Err("MV Accelerator fingerprint is not ASCII".to_string());
     }
     let operation_id = Uuid::from_slice(&bytes[fingerprint_end..operation_end])
-        .map_err(|error| format!("MV envelope operation ID is invalid: {error}"))?;
+        .map_err(|error| format!("MV Accelerator operation ID is invalid: {error}"))?;
     let payload_len = u32::from_be_bytes(
         bytes[operation_end..payload_length_end]
             .try_into()
@@ -350,15 +329,15 @@ where
     ) as usize;
     let payload_end = payload_length_end
         .checked_add(payload_len)
-        .ok_or_else(|| "MV envelope payload length overflows".to_string())?;
+        .ok_or_else(|| "MV Accelerator payload length overflows".to_string())?;
     if payload_end != bytes.len() {
-        return Err("MV envelope payload length does not match exact record size".to_string());
+        return Err("MV Accelerator payload length does not match exact record size".to_string());
     }
     let catalog = schema_catalog()?;
     let writer = catalog.entry(kind.subject(), schema_id)?;
     if writer.fingerprint() != fingerprint {
         return Err(format!(
-            "MV Avro schema fingerprint mismatch for {} schema {}",
+            "MV Accelerator Avro schema fingerprint mismatch for {} schema {}",
             kind.subject(),
             schema_id
         ));
@@ -369,17 +348,17 @@ where
     let datum =
         from_avro_datum(writer.schema(), &mut cursor, Some(reader.schema())).map_err(|error| {
             format!(
-                "decode MV Avro payload for {} writer {} reader {} failed: {error}",
+                "decode MV Accelerator Avro payload for {} writer {} reader {} failed: {error}",
                 kind.subject(),
                 writer.id(),
                 reader.id()
             )
         })?;
     if cursor.position() != payload.len() as u64 {
-        return Err("MV Avro payload has trailing bytes".to_string());
+        return Err("MV Accelerator Avro payload has trailing bytes".to_string());
     }
     let value = from_value(&datum)
-        .map_err(|error| format!("materialize MV Avro payload failed: {error}"))?;
+        .map_err(|error| format!("materialize MV Accelerator Avro payload failed: {error}"))?;
     Ok(DecodedMvRecord {
         operation_id,
         value,

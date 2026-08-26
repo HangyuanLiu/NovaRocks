@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::DataType;
 use serde::Serialize;
@@ -36,8 +37,9 @@ use crate::mv::domain::analysis::{
     resolve_mv_name, validate_mv_partition_columns,
 };
 use crate::mv::domain::analysis_adapter::{
-    BaseColumnDescriptor, BaseTableDescriptor, now_ms, validate_ivm_primary_key,
+    BaseColumnDescriptor, BaseTableDescriptor, validate_ivm_primary_key,
 };
+use crate::mv::domain::application::MvCreateProjectionSeed;
 use crate::mv::domain::application::{
     CreatedMvTarget, MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvEngine,
     MvEngineError, MvEngineErrorKind, MvRefreshRequest, PrepareMvCreateRequest, PreparedMvCreate,
@@ -51,7 +53,7 @@ use crate::mv::domain::lifecycle::{
 };
 use crate::mv::domain::model::{MvStorageEngine, MvTarget, RefreshMode};
 use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
-use crate::mv::domain::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
+use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::descriptor::{DescriptorDependency, MvDescriptorV3};
 use crate::mv::domain::persistence::schema as mv_schema;
@@ -60,6 +62,7 @@ use crate::mv::domain::persistence::schema::{
     HIDDEN_COLUMNS_PROPERTY,
 };
 use crate::mv::domain::persistence::semantic::{MvDesiredSemantics, MvRefreshDesiredConfiguration};
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::apply_key::ApplyKeyContract;
 use crate::mv::domain::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::domain::refresh::contract::ImvRefreshContract;
@@ -97,7 +100,6 @@ use crate::mv::domain::refresh::target_apply::{
     join_apply_key_table_column,
 };
 use crate::mv::domain::refresh_io::acquire_mv_refresh_lock;
-use crate::mv::domain::repository::CreateMvRepositoryRequest;
 use crate::mv::domain::repository::MvRepository;
 use crate::mv::domain::schema_validation::{
     BranchFieldValidationError, ContractDecision, JoinContractDecision, validate_branch_id_field,
@@ -164,6 +166,7 @@ pub struct IcebergMvCorePorts {
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     repository: Arc<dyn MvRepository>,
+    readiness: Arc<MvReadinessPort>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
 }
 
@@ -171,11 +174,12 @@ impl IcebergMvCorePorts {
     /// Construct the exact provider and durable-MV ports required by the
     /// Iceberg MV backend. Frontend composition must provide every leaf; this
     /// value deliberately has no application-facade constructor.
-    pub fn new(
+    pub(crate) fn new(
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         repository: Arc<dyn MvRepository>,
+        readiness: Arc<MvReadinessPort>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
         Self {
@@ -183,23 +187,28 @@ impl IcebergMvCorePorts {
             catalog_application,
             connector_control,
             repository,
+            readiness,
             storage_observation,
         }
     }
 
-    pub fn repository(&self) -> &Arc<dyn MvRepository> {
+    pub(crate) fn repository(&self) -> &Arc<dyn MvRepository> {
         &self.repository
     }
 
-    pub fn connector_control(&self) -> &dyn ConnectorControlRegistry {
+    pub(crate) fn readiness(&self) -> &Arc<MvReadinessPort> {
+        &self.readiness
+    }
+
+    pub(crate) fn connector_control(&self) -> &dyn ConnectorControlRegistry {
         self.connector_control.as_ref()
     }
 
-    pub fn storage_observation(&self) -> &dyn MvStorageObservationPort {
+    pub(crate) fn storage_observation(&self) -> &dyn MvStorageObservationPort {
         self.storage_observation.as_ref()
     }
 
-    pub fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
+    pub(crate) fn catalog_application(&self) -> Option<&dyn CatalogApplicationPort> {
         self.catalog_application.as_deref()
     }
 }
@@ -328,7 +337,7 @@ impl MvEngine for StandaloneMvEngine {
             database: prepared.target.namespace.clone(),
             name: prepared.target.table.clone(),
         };
-        let repository_request = CreateMvRepositoryRequest {
+        let projection_seed = MvCreateProjectionSeed {
             definition: CreateMvDefinitionRequest {
                 query_definition:
                     crate::common::persisted_query_definition::PersistedQueryDefinition::new(
@@ -360,7 +369,7 @@ impl MvEngine for StandaloneMvEngine {
                 )
             })?
             .insert(Self::preparation_key(&target), Arc::new(prepared));
-        Ok(PreparedMvCreate::new(target, repository_request))
+        Ok(PreparedMvCreate::new(target, projection_seed))
     }
 
     fn create_target(
@@ -386,7 +395,7 @@ impl MvEngine for StandaloneMvEngine {
             table: Arc::from(prepared.target.table.as_str()),
         };
         let created = require_known_committed_target_mutation(
-            crate::connector::mutation::resolve_catalog_mutation_with_lease(
+            crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
                 &mutation_lease,
                 novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
                     *operation_id.as_bytes(),
@@ -421,7 +430,7 @@ impl MvEngine for StandaloneMvEngine {
                 "materialized view target create unexpectedly returned NoOp".to_string(),
             ));
         }
-        let bootstrap = crate::connector::mutation::resolve_catalog_mutation_with_lease(
+        let bootstrap = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
             &mutation_lease,
             novarocks_spi::connector::ConnectorMutationOperationId::new(),
             novarocks_spi::connector::ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot {
@@ -437,7 +446,7 @@ impl MvEngine for StandaloneMvEngine {
         match bootstrap {
             crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
                 let cleanup = require_known_committed_target_mutation(
-                    crate::connector::mutation::resolve_catalog_mutation_with_lease(
+                    crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
                         &mutation_lease,
                         novarocks_spi::connector::ConnectorMutationOperationId::new(),
                         novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
@@ -475,7 +484,7 @@ impl MvEngine for StandaloneMvEngine {
                 Ok(loaded_target) => loaded_target,
                 Err(error) => {
                     let cleanup = require_known_committed_target_mutation(
-                    crate::connector::mutation::resolve_catalog_mutation_with_lease(
+                    crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
                         &mutation_lease,
                         novarocks_spi::connector::ConnectorMutationOperationId::new(),
                         novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
@@ -503,7 +512,7 @@ impl MvEngine for StandaloneMvEngine {
             Ok(observation) => observation,
             Err(error) => {
                 let cleanup = require_known_committed_target_mutation(
-                    crate::connector::mutation::resolve_catalog_mutation_with_lease(
+                    crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
                         &mutation_lease,
                         novarocks_spi::connector::ConnectorMutationOperationId::new(),
                         novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
@@ -581,13 +590,13 @@ impl MvEngine for StandaloneMvEngine {
             actual_apply_key_field_id,
         )
         .map_err(engine_target_error)?;
-        let mut repository_request = plan.repository_request.clone();
-        repository_request.definition.schema_contract = Some(schema_contract.clone());
-        repository_request.definition.partition_spec = schema_contract.target.partition.clone();
+        let mut projection_seed = plan.projection_seed.clone();
+        projection_seed.definition.schema_contract = Some(schema_contract.clone());
+        projection_seed.definition.partition_spec = schema_contract.target.partition.clone();
         let descriptor = MvDescriptorV3::from_desired_semantics(
             MvDesiredSemantics::new(
                 format!("{}.{}", prepared.target.namespace, prepared.target.table),
-                repository_request.definition.query_definition.clone(),
+                projection_seed.definition.query_definition.clone(),
                 prepared
                     .analysis
                     .output_columns
@@ -606,23 +615,20 @@ impl MvEngine for StandaloneMvEngine {
                     .iter()
                     .map(descriptor_dependency_from_request)
                     .collect(),
-                repository_request.definition.primary_key_columns.clone(),
+                projection_seed.definition.primary_key_columns.clone(),
                 schema_contract,
                 MvRefreshDesiredConfiguration::new(
-                    repository_request.refresh.policy.clone(),
-                    repository_request.refresh.paused,
-                    repository_request.refresh.interval_ms,
-                    repository_request.refresh.max_staleness_ms,
+                    projection_seed.refresh.policy.clone(),
+                    projection_seed.refresh.paused,
+                    projection_seed.refresh.interval_ms,
+                    projection_seed.refresh.max_staleness_ms,
                 )
                 .map_err(engine_target_error)?,
                 prepared.created_at_ms,
             )
             .map_err(engine_target_error)?,
         );
-        Ok(PreparedMvDefinition {
-            repository_request,
-            descriptor,
-        })
+        Ok(PreparedMvDefinition { descriptor })
     }
 
     fn sync_target_descriptor(
@@ -645,6 +651,56 @@ impl MvEngine for StandaloneMvEngine {
             &connector_context,
         )
         .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error))
+    }
+
+    fn project_created_target(
+        &self,
+        target: &CreatedMvTarget,
+        operation_id: uuid::Uuid,
+    ) -> Result<(), MvEngineError> {
+        let catalog = target.target.catalog.as_deref().ok_or_else(|| {
+            MvEngineError::new(
+                MvEngineErrorKind::DescriptorSync,
+                "MV target has no catalog",
+            )
+        })?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
+            .map_err(|error| engine_target_error(error.to_string()))?;
+        let lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+            self.ports.connector_control.as_ref(),
+            &instance_id,
+        )
+        .map_err(|error| engine_target_error(error.to_string()))?;
+        let table = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id,
+            namespace: Arc::from(target.target.database.as_str()),
+            table: Arc::from(target.target.name.as_str()),
+        };
+        let loaded = lease
+            .binding()
+            .metadata()
+            .load_table(novarocks_spi::connector::ConnectorTableRequest {
+                table,
+                resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                context: self.connector_context.clone(),
+            })
+            .map_err(|error| engine_target_error(error.to_string()))?;
+        let package = crate::mv::domain::storage_observation::observe_lake_package(
+            self.ports.storage_observation.as_ref(),
+            &lease,
+            &loaded,
+            self.connector_context.clone(),
+        )
+        .map_err(|error| engine_target_error(error.to_string()))?
+        .ok_or_else(|| {
+            engine_target_error("created target is missing its MV lake descriptor".to_string())
+        })?;
+        crate::mv::domain::projector::project_observed_repository(
+            self.ports.repository.as_ref(),
+            operation_id,
+            &package,
+        )
+        .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error.to_string()))
     }
 
     fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError> {
@@ -774,13 +830,13 @@ fn initial_refresh_configuration_for_create(
 ) -> crate::mv::domain::repository::InitialMvRefreshConfiguration {
     let (policy, interval_ms) = match policy {
         crate::mv::domain::application::MvCreateRefreshPolicy::Manual => {
-            (StoredMvRefreshPolicy::Manual, None)
+            (MvDesiredRefreshPolicy::Manual, None)
         }
         crate::mv::domain::application::MvCreateRefreshPolicy::AsyncOnChange => {
-            (StoredMvRefreshPolicy::AsyncOnChange, None)
+            (MvDesiredRefreshPolicy::AsyncOnChange, None)
         }
         crate::mv::domain::application::MvCreateRefreshPolicy::AsyncInterval { interval_ms } => {
-            (StoredMvRefreshPolicy::AsyncInterval, Some(*interval_ms))
+            (MvDesiredRefreshPolicy::AsyncInterval, Some(*interval_ms))
         }
     };
     crate::mv::domain::repository::InitialMvRefreshConfiguration {
@@ -788,8 +844,15 @@ fn initial_refresh_configuration_for_create(
         paused: false,
         interval_ms,
         max_staleness_ms: None,
-        next_refresh_after_ms: None,
     }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn partition_fields_for_create(
@@ -1103,24 +1166,11 @@ pub(crate) fn create_iceberg_mv_with_ports(
         // descriptor must remain discoverable rather than being erased.
         return Err(error.to_string());
     }
-    match ports
-        .repository
-        .create(operation_id, definition.repository_request)
-    {
-        Ok(_) => {}
-        Err(error)
-            if error.kind()
-                == crate::mv::domain::repository::MvRepositoryErrorKind::CommitUnknown =>
-        {
-            return Err(error.to_string());
-        }
-        Err(error) => {
-            return Err(known_committed_create_finalize_error(
-                "StateStore accelerator projection",
-                error,
-            ));
-        }
-    };
+    engine
+        .project_created_target(&target, operation_id)
+        .map_err(|error| {
+            known_committed_create_finalize_error("StateStore accelerator projection", error)
+        })?;
     if let Err(error) = engine.register_target(&target) {
         return Err(known_committed_create_finalize_error(
             "catalog registration",
@@ -1164,7 +1214,7 @@ fn persist_iceberg_mv_descriptor_with_ports(
         .derive_mutation_lease()
         .map_err(|error| error.to_string())?;
     require_known_committed_target_mutation(
-        crate::connector::mutation::resolve_catalog_mutation_with_lease(
+        crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
             &mutation_lease,
             novarocks_spi::connector::ConnectorMutationOperationId::new(),
             novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
@@ -1762,7 +1812,7 @@ fn refresh_policy_descriptor_json(
 pub fn sync_iceberg_mv_descriptor_with_ports(
     ports: &IcebergMvCorePorts,
     definition: &StoredMvDefinition,
-    refresh_policy: &StoredMvRefreshPolicy,
+    refresh_policy: &MvDesiredRefreshPolicy,
     refresh_paused: bool,
     refresh_interval_ms: Option<i64>,
     expected_committed_partitioning: Option<
@@ -1826,7 +1876,7 @@ pub fn sync_iceberg_mv_descriptor_with_ports(
         .derive_mutation_lease()
         .map_err(|error| error.to_string())?;
     require_known_committed_target_mutation(
-        crate::connector::mutation::resolve_catalog_mutation_with_lease(
+        crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
             &mutation_lease,
             novarocks_spi::connector::ConnectorMutationOperationId::new(),
             novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
@@ -1849,6 +1899,52 @@ pub fn sync_iceberg_mv_descriptor_with_ports(
     )
     .map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// Re-observe one target after a lake mutation and replace its Accelerator
+/// projection from those authoritative facts.  This is intentionally a
+/// post-commit operation: no caller may manufacture desired state from its
+/// statement inputs after the provider has accepted a mutation.
+pub fn reobserve_and_project_iceberg_mv_with_ports(
+    ports: &IcebergMvCorePorts,
+    target: &IcebergMvTarget,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| error.to_string())?;
+    let lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+        ports.connector_control.as_ref(),
+        &instance_id,
+    )
+    .map_err(|error| error.to_string())?;
+    let table = novarocks_spi::connector::ConnectorTableIdentity {
+        instance_id,
+        namespace: Arc::from(target.namespace.as_str()),
+        table: Arc::from(target.table.as_str()),
+    };
+    let metadata = lease
+        .binding()
+        .metadata()
+        .load_table(novarocks_spi::connector::ConnectorTableRequest {
+            table,
+            resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            context: connector_context.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+    let package = crate::mv::domain::storage_observation::observe_lake_package(
+        ports.storage_observation.as_ref(),
+        &lease,
+        &metadata,
+        connector_context,
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "Iceberg MV target is missing its lake descriptor after mutation".to_string())?;
+    crate::mv::domain::projector::project_observed_repository(
+        ports.repository.as_ref(),
+        uuid::Uuid::now_v7(),
+        &package,
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Peel any top-level `BranchScoped` wrapper, returning the per-row inner
@@ -3077,14 +3173,12 @@ pub(crate) fn register_iceberg_mv_target_in_catalog(
 }
 
 pub fn restore_iceberg_mv_targets(ctx: &MvTargetRestoreContext<'_>) -> Result<(), String> {
-    if !ctx.mv_repository.availability().is_available() {
-        return Ok(());
-    }
     for mv in ctx
         .mv_repository
-        .list_definitions()
+        .list_projections()
         .map_err(|e| format!("load MV definitions for iceberg restore failed: {e}"))?
         .into_iter()
+        .map(|projection| projection.definition)
         .filter(|mv| {
             mv.storage_engine
                 .eq_ignore_ascii_case(MvStorageEngine::Iceberg.as_sql_str())
@@ -5831,17 +5925,38 @@ fn drop_iceberg_mv_metadata_with_repository(
     repository: &dyn MvRepository,
     target: &IcebergMvTarget,
 ) -> Result<(), String> {
+    let target = crate::mv::domain::model::MvTarget {
+        catalog: Some(target.catalog.clone()),
+        database: target.namespace.clone(),
+        name: target.table.clone(),
+    };
+    let Some(loaded) = repository
+        .find_by_target(&target)
+        .map_err(|e| format!("load iceberg MV projection for drop failed: {e}"))?
+    else {
+        return Err(format!(
+            "materialized view {}.{}.{} metadata disappeared during drop",
+            target.catalog.as_deref().unwrap_or_default(),
+            target.database,
+            target.name
+        ));
+    };
     let dropped = repository
-        .drop_by_target(&crate::mv::domain::model::MvTarget {
-            catalog: Some(target.catalog.clone()),
-            database: target.namespace.clone(),
-            name: target.table.clone(),
-        })
-        .map_err(|e| format!("drop iceberg mv metadata failed: {e}"))?;
+        .delete_projection(
+            uuid::Uuid::now_v7(),
+            crate::mv::domain::repository::DeleteMvProjectionRequest {
+                mv_id: loaded.definition.mv_id,
+                expected_version: loaded.version,
+                expected_source_revision: loaded.definition.source_revision,
+            },
+        )
+        .map_err(|e| format!("drop iceberg MV accelerator projection failed: {e}"))?;
     if !dropped {
         return Err(format!(
             "materialized view {}.{}.{} metadata disappeared during drop",
-            target.catalog, target.namespace, target.table
+            target.catalog.as_deref().unwrap_or_default(),
+            target.database,
+            target.name
         ));
     }
     Ok(())
@@ -5868,12 +5983,6 @@ fn preflight_iceberg_mv_drop_with_repository(
             target.catalog, target.namespace, target.table
         ));
     };
-    if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
-        return Err(format!(
-            "cannot drop materialized view {}.{}.{}: refresh in progress",
-            target.catalog, target.namespace, target.table
-        ));
-    }
     crate::mv::domain::dependency_resolver::ensure_no_downstream_dependencies_with_repository(
         repository,
         &crate::mv::domain::dependency::model::iceberg_mv_dependency_ref(

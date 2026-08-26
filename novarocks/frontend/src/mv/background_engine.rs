@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use crate::maintenance::MaintenanceTarget;
 use crate::mv::domain::dependency::model::iceberg_mv_dependency_ref;
-use crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_repository;
+use crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_readiness;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::refresh::{
     definition::parse_iceberg_table_refs, observation::observe_current_refresh_base,
@@ -71,7 +71,7 @@ fn background_connector_request_context() -> Result<ConnectorRequestContext, Str
 pub(crate) struct StandaloneMvBackgroundEngine {
     ports: IcebergMvCorePorts,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    repository: Arc<dyn crate::mv::domain::repository::MvRepository>,
+    readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
 }
 
@@ -79,13 +79,13 @@ impl StandaloneMvBackgroundEngine {
     pub(crate) fn new_with_ports(
         ports: IcebergMvCorePorts,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        repository: Arc<dyn crate::mv::domain::repository::MvRepository>,
+        readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
     ) -> Self {
         Self {
             ports,
             connector_control,
-            repository,
+            readiness,
             storage_observation,
         }
     }
@@ -97,9 +97,9 @@ impl StandaloneMvBackgroundEngine {
         crate::mv::domain::persistence::definition::StoredMvDefinition,
         MvBackgroundEngineError,
     > {
-        let definition = self
-            .repository
-            .find_by_target(target)
+        let projection = self
+            .readiness
+            .load_ready(target)
             .map_err(repository_error)?
             .ok_or_else(|| {
                 MvBackgroundEngineError::new(
@@ -107,6 +107,7 @@ impl StandaloneMvBackgroundEngine {
                     format!("MV target {} no longer exists", target.display_name()),
                 )
             })?;
+        let definition = projection.definition;
         if definition.storage_engine != "iceberg" {
             return Err(MvBackgroundEngineError::new(
                 MvBackgroundEngineErrorKind::InvalidDefinition,
@@ -128,7 +129,7 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
             &target.name,
         );
         let steps =
-            build_upstream_refresh_steps_with_repository(self.repository.as_ref(), &requested)
+            build_upstream_refresh_steps_with_readiness(self.readiness.as_ref(), &requested)
                 .map_err(|error| {
                     MvBackgroundEngineError::new(
                         MvBackgroundEngineErrorKind::InvalidDefinition,
@@ -224,9 +225,12 @@ impl MvBackgroundEngine for StandaloneMvBackgroundEngine {
         target: &MaintenanceTarget,
     ) -> Result<MvMaintenanceFacts, MvBackgroundEngineError> {
         let definitions = self
-            .repository
-            .list_definitions()
-            .map_err(repository_error)?;
+            .readiness
+            .list_ready_projections()
+            .map_err(repository_error)?
+            .into_iter()
+            .map(|projection| projection.definition)
+            .collect::<Vec<_>>();
         let stats = crate::mv::domain::maintenance::stats::collect_table_stats_with_ports(
             self.connector_control.as_ref(),
             self.storage_observation.as_ref(),
@@ -270,10 +274,7 @@ fn repository_error(
         MvRepositoryErrorKind::NotFound => MvBackgroundEngineErrorKind::TargetGone,
         MvRepositoryErrorKind::Unavailable => MvBackgroundEngineErrorKind::TransientUnavailable,
         MvRepositoryErrorKind::Corruption => MvBackgroundEngineErrorKind::Corruption,
-        MvRepositoryErrorKind::CommitUnknown
-        | MvRepositoryErrorKind::KnownCommittedFinalizeFailed => {
-            MvBackgroundEngineErrorKind::RecoveryRequired
-        }
+        MvRepositoryErrorKind::CommitUnknown => MvBackgroundEngineErrorKind::RecoveryRequired,
         MvRepositoryErrorKind::InvalidRequest | MvRepositoryErrorKind::Conflict => {
             MvBackgroundEngineErrorKind::InvariantViolation
         }

@@ -18,7 +18,6 @@
 //! Stateful materialized-view analysis and display adapter.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -28,9 +27,8 @@ use crate::mv::domain::analysis::{MvAnalysis, prepare_mv_select_for_catalog_prov
 use crate::mv::domain::application::MvShowStatement;
 use crate::mv::domain::lifecycle::MvListRow;
 use crate::mv::domain::model::MvStorageEngine;
-use crate::mv::domain::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
-use crate::mv::domain::persistence::refresh::MvRefreshState;
-use crate::mv::domain::repository::MvRepository;
+use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 
 /// Lightweight projection of the iceberg base table that
@@ -125,32 +123,27 @@ fn is_hashable_pk_type(sql_type: &str) -> bool {
     )
 }
 
-/// List materialized views from the explicit durable metadata boundary.
-///
-/// The caller supplies only the repository needed to derive stored refresh
-/// state and dependency display text; this projection has no application-state
-/// or connector ownership.
+/// List materialized views from the readiness-filtered Accelerator projection.
 pub(crate) fn list_mv_rows_with_ports(
-    repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     current_catalog: Option<&str>,
     stmt: &MvShowStatement,
     storage_filter: Option<MvStorageEngine>,
 ) -> Result<Vec<MvListRow>, String> {
-    let definitions = repository
-        .list_definitions()
-        .map_err(|e| format!("load materialized view definitions failed: {e}"))?;
-    let now_ms = now_ms();
+    let definitions = readiness
+        .list_ready_projections()
+        .map_err(|e| format!("load materialized view Accelerator projections failed: {e}"))?;
 
     let mut rows = Vec::new();
-    for mv in &definitions {
+    for loaded in &definitions {
+        let mv = &loaded.definition;
         if let Some(filter) = storage_filter
             && !mv.storage_engine.eq_ignore_ascii_case(filter.as_sql_str())
         {
             continue;
         }
         let engine = MvStorageEngine::from_sql_str(&mv.storage_engine)?;
-        let (refresh_state, retry_after_time) =
-            refresh_status_for_mv_with_repository(repository, mv, now_ms)?;
+        let refresh_state = refresh_status_for_mv(mv);
         if engine != MvStorageEngine::Iceberg {
             continue;
         }
@@ -182,81 +175,37 @@ pub(crate) fn list_mv_rows_with_ports(
             last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
             base_tables: mv.base_table_refs.join(", "),
             select_text: mv.query_definition.raw_query_source.clone(),
-            dependencies: dependency_display_for_mv_with_repository(repository, mv.mv_id)?,
+            dependencies: dependency_display_for_mv_with_readiness(readiness, loaded)?,
             refresh_paused: mv.refresh_paused.to_string(),
-            next_refresh_time: mv.next_refresh_after_ms.map(|value| value.to_string()),
-            last_scheduler_error: mv.last_scheduler_error.clone(),
+            next_refresh_time: None,
+            last_scheduler_error: None,
             max_staleness_ms: mv.max_staleness_ms.map(|value| value.to_string()),
             refresh_state,
-            retry_after_time,
+            retry_after_time: None,
         });
     }
     Ok(rows)
 }
 
-fn refresh_status_for_mv_with_repository(
-    repository: &dyn MvRepository,
-    mv: &StoredMvDefinition,
-    now_ms: i64,
-) -> Result<(String, Option<String>), String> {
-    let retry_after_time = mv
-        .last_scheduler_error
-        .as_ref()
-        .and(mv.next_refresh_after_ms)
-        .filter(|next| *next > now_ms)
-        .map(|value| value.to_string());
+fn refresh_status_for_mv(mv: &StoredMvDefinition) -> String {
     if mv.refresh_paused {
-        return Ok(("PAUSED".to_string(), retry_after_time));
+        return "PAUSED".to_string();
     }
-    if let Some(refresh_id) = mv.active_refresh_id {
-        let refresh = repository
-            .load_refresh(refresh_id)
-            .map_err(|e| format!("load active MV refresh failed: {e}"))?;
-        if refresh
-            .as_ref()
-            .map(|refresh| refresh.state == MvRefreshState::CommitUnknown)
-            .unwrap_or(false)
-        {
-            return Ok(("BLOCKED_RECOVERY".to_string(), retry_after_time));
-        }
-        return Ok(("RUNNING".to_string(), retry_after_time));
-    }
-    if mv.refresh_in_progress {
-        return Ok(("RUNNING".to_string(), retry_after_time));
-    }
-    if mv.last_scheduler_error.is_some() && mv.next_refresh_after_ms.is_none() {
-        return Ok(("BLOCKED_SCHEDULER".to_string(), retry_after_time));
-    }
-    if mv.last_scheduler_error.is_some()
-        && mv
-            .next_refresh_after_ms
-            .map(|next| next > now_ms)
-            .unwrap_or(false)
-    {
-        return Ok(("FAILED_BACKOFF".to_string(), retry_after_time));
-    }
-    if matches!(mv.refresh_policy, StoredMvRefreshPolicy::Manual) {
-        return Ok(("MANUAL".to_string(), retry_after_time));
-    }
-    if mv
-        .next_refresh_after_ms
-        .map(|next| next > now_ms)
-        .unwrap_or(false)
-    {
-        Ok(("SUCCEEDED".to_string(), retry_after_time))
+    if matches!(mv.refresh_policy, MvDesiredRefreshPolicy::Manual) {
+        "MANUAL".to_string()
     } else {
-        Ok(("PENDING".to_string(), retry_after_time))
+        "PENDING".to_string()
     }
 }
 
 /// Render the dependency-column text for a single MV row through the typed
 /// repository boundary.
-fn dependency_display_for_mv_with_repository(
-    repository: &dyn MvRepository,
-    mv_id: i64,
+fn dependency_display_for_mv_with_readiness(
+    readiness: &MvReadinessPort,
+    projection: &crate::mv::domain::repository::LoadedMvProjection,
 ) -> Result<String, String> {
-    let dependencies = repository
-        .list_dependencies_by_downstream(mv_id)
+    let dependencies = readiness
+        .list_ready_dependencies_by_downstream(projection)
         .map_err(|e| format!("load MV dependencies for display failed: {e}"))?;
     Ok(dependencies
         .iter()
@@ -490,11 +439,4 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         columns,
         chunks: vec![record_batch_to_chunk(batch)?],
     })
-}
-
-pub(crate) fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }

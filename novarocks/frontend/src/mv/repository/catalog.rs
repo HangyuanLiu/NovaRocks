@@ -38,13 +38,13 @@ impl MvSchemaEntry {
     pub fn subject(&self) -> &str {
         &self.subject
     }
-    pub fn id(&self) -> i32 {
+    pub const fn id(&self) -> i32 {
         self.id
     }
-    pub fn raw_schema(&self) -> &'static str {
+    pub const fn raw_schema(&self) -> &'static str {
         self.raw_schema
     }
-    pub fn schema(&self) -> &Schema {
+    pub const fn schema(&self) -> &Schema {
         &self.schema
     }
     pub fn fingerprint(&self) -> &str {
@@ -63,7 +63,7 @@ impl MvSchemaCatalog {
         for source in sources {
             let schema = Schema::parse_str(source.raw_schema).map_err(|error| {
                 format!(
-                    "failed to parse MV Avro schema {} v{}: {error}",
+                    "failed to parse MV Accelerator Avro schema {} v{}: {error}",
                     source.subject, source.id
                 )
             })?;
@@ -81,7 +81,7 @@ impl MvSchemaCatalog {
                 .is_some()
             {
                 return Err(format!(
-                    "duplicate MV Avro schema {} v{}",
+                    "duplicate MV Accelerator Avro schema {} v{}",
                     source.subject, source.id
                 ));
             }
@@ -96,14 +96,20 @@ impl MvSchemaCatalog {
         self.by_subject
             .get(subject)
             .and_then(|entries| entries.get(&id))
-            .ok_or_else(|| format!("unknown MV Avro schema entry for subject `{subject}` id {id}"))
+            .ok_or_else(|| {
+                format!("unknown MV Accelerator Avro schema entry for subject `{subject}` id {id}")
+            })
     }
 
     pub fn latest(&self, subject: &str) -> Result<&MvSchemaEntry, String> {
         self.by_subject
             .get(subject)
             .and_then(|entries| entries.last_key_value().map(|(_, entry)| entry))
-            .ok_or_else(|| format!("unknown MV Avro schema subject `{subject}`"))
+            .ok_or_else(|| format!("unknown MV Accelerator Avro schema subject `{subject}`"))
+    }
+
+    pub fn subjects(&self) -> impl Iterator<Item = &str> {
+        self.by_subject.keys().map(String::as_str)
     }
 
     pub fn validate_unique_entries(&self) -> Result<(), String> {
@@ -114,10 +120,9 @@ impl MvSchemaCatalog {
                 if !ids.insert((subject.as_str(), *id))
                     || !fingerprints.insert(entry.fingerprint.as_str())
                 {
-                    return Err(format!("duplicate MV Avro schema entry `{subject}`/{id}"));
-                }
-                if entry.schema.fingerprint::<Rabin>().to_string() != entry.fingerprint {
-                    return Err(format!("MV Avro fingerprint mismatch for `{subject}`/{id}"));
+                    return Err(format!(
+                        "duplicate MV Accelerator Avro schema entry `{subject}`/{id}"
+                    ));
                 }
             }
         }
@@ -128,9 +133,15 @@ impl MvSchemaCatalog {
         for (subject, entries) in &self.by_subject {
             for writer in entries.values() {
                 for reader in entries.values() {
-                    SchemaCompatibility::can_read(writer.schema(), reader.schema()).map_err(|error| {
-                        format!("MV Avro FULL_TRANSITIVE compatibility failed for `{subject}` writer {} reader {}: {error}", writer.id(), reader.id())
-                    })?;
+                    SchemaCompatibility::can_read(writer.schema(), reader.schema()).map_err(
+                        |error| {
+                            format!(
+                                "MV Accelerator Avro FULL_TRANSITIVE compatibility failed for `{subject}` writer {} reader {}: {error}",
+                                writer.id(),
+                                reader.id()
+                            )
+                        },
+                    )?;
                 }
             }
         }
@@ -152,56 +163,24 @@ struct SchemaSource {
 fn schema_sources() -> &'static [SchemaSource] {
     &[
         SchemaSource {
-            subject: "mv.definition",
-            id: 4,
-            raw_schema: include_str!("schemas/mv.definition/0004.avsc"),
-        },
-        SchemaSource {
-            subject: "mv.target_lookup",
+            subject: "mv.accelerator_projection",
             id: 1,
-            raw_schema: include_str!("schemas/mv.target_lookup/0001.avsc"),
+            raw_schema: include_str!("schemas/mv.accelerator_projection/0001.avsc"),
         },
         SchemaSource {
-            subject: "mv.refresh",
-            id: 5,
-            raw_schema: include_str!("schemas/mv.refresh/0005.avsc"),
-        },
-        SchemaSource {
-            subject: "mv.partition_state",
+            subject: "mv.accelerator_target_lookup",
             id: 1,
-            raw_schema: include_str!("schemas/mv.partition_state/0001.avsc"),
+            raw_schema: include_str!("schemas/mv.accelerator_target_lookup/0001.avsc"),
         },
         SchemaSource {
-            subject: "mv.dependency",
+            subject: "mv.accelerator_dependency",
             id: 1,
-            raw_schema: include_str!("schemas/mv.dependency/0001.avsc"),
+            raw_schema: include_str!("schemas/mv.accelerator_dependency/0001.avsc"),
         },
         SchemaSource {
-            subject: "mv.sequence",
+            subject: "mv.accelerator_sequence",
             id: 1,
-            raw_schema: include_str!("schemas/mv.sequence/0001.avsc"),
-        },
-        SchemaSource {
-            subject: "mv.sequence",
-            id: 2,
-            raw_schema: include_str!("schemas/mv.sequence/0002.avsc"),
+            raw_schema: include_str!("schemas/mv.accelerator_sequence/0001.avsc"),
         },
     ]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::schema_catalog;
-
-    #[test]
-    fn mv_definition_hard_cut_registers_only_schema_v4() {
-        let catalog = schema_catalog().expect("schema catalog");
-
-        assert_eq!(catalog.latest("mv.definition").unwrap().id(), 4);
-        let error = catalog.entry("mv.definition", 3).unwrap_err();
-        assert!(
-            error.contains("unknown MV Avro schema entry for subject `mv.definition` id 3"),
-            "unexpected error: {error}"
-        );
-    }
 }

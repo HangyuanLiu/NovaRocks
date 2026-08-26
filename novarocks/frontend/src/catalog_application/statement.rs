@@ -989,15 +989,16 @@ fn ensure_no_iceberg_mv_targets_in_scope(
     scope_catalog: &str,
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
-    let definitions = context
+    let projections = context
         .mv_repository()
-        .list_definitions()
+        .list_projections()
         .map_err(|error| {
             format!("load MV definitions for drop target scope check failed: {error}")
         })?;
-    let targets = definitions
+    let targets = projections
         .iter()
-        .filter(|&definition| definition.storage_engine.eq_ignore_ascii_case("iceberg"))
+        .map(|projection| &projection.definition)
+        .filter(|definition| definition.storage_engine.eq_ignore_ascii_case("iceberg"))
         .map(|definition| {
             crate::mv::domain::persistence::dependency::stored_definition_dependency_ref(
                 definition, None,
@@ -1016,12 +1017,13 @@ fn ensure_no_external_iceberg_dependents(
     scope_catalog: &str,
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
-    let definitions = context
+    let projections = context
         .mv_repository()
-        .list_definitions()
+        .list_projections()
         .map_err(|error| format!("load MV definitions for drop scope check failed: {error}"))?;
-    let mut edges = Vec::with_capacity(definitions.len());
-    for definition in definitions {
+    let mut edges = Vec::with_capacity(projections.len());
+    for projection in projections {
+        let definition = projection.definition;
         let target = crate::mv::domain::persistence::dependency::stored_definition_dependency_ref(
             &definition,
             None,

@@ -65,10 +65,9 @@ pub(crate) struct DownstreamFloor {
     pub(crate) unknown: bool,
 }
 
-/// Minimum consumed-snapshot timestamp across all MV definitions that read
-/// `table_fqn` incrementally (committed positions and in-flight pins). A
-/// consumer pointing at a snapshot we cannot resolve marks the floor unknown,
-/// which blocks expire for safety.
+/// Minimum published consumed-snapshot timestamp across all MV definitions
+/// that read `table_fqn` incrementally. A consumer pointing at a snapshot we
+/// cannot resolve marks the floor unknown, which blocks expire for safety.
 pub(crate) fn downstream_floor(
     definitions: &[StoredMvDefinition],
     table_fqn: &str,
@@ -82,9 +81,6 @@ pub(crate) fn downstream_floor(
     };
     for definition in definitions {
         if let Some(id) = definition.last_refresh_snapshots.get(table_fqn) {
-            consider(*id);
-        }
-        if let Some(id) = definition.refresh_target_snapshots.get(table_fqn) {
             consider(*id);
         }
     }
@@ -197,7 +193,9 @@ mod tests {
     use crate::common::persisted_query_definition::{
         PersistedQueryDefinition, PersistedQueryDialect,
     };
-    use crate::mv::domain::persistence::definition::{StoredMvDefinition, StoredMvRefreshPolicy};
+    use crate::mv::domain::persistence::definition::{
+        MvAcceleratorSourceRevision, MvDesiredRefreshPolicy, StoredMvDefinition,
+    };
     use std::collections::BTreeMap;
 
     fn definition_with_consumed(fqn: &str, snapshot_id: i64) -> StoredMvDefinition {
@@ -220,22 +218,24 @@ mod tests {
             target_table: Some("mv_x".to_string()),
             schema_contract: None,
             partition_spec: None,
-            partition_state_complete: false,
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots,
             last_refresh_table_object_ids: BTreeMap::new(),
             last_refreshed_iceberg_snapshot_id: None,
-            refresh_in_progress: false,
-            active_refresh_id: None,
-            refresh_target_snapshots: BTreeMap::new(),
-            refresh_policy: StoredMvRefreshPolicy::Manual,
+            refresh_policy: MvDesiredRefreshPolicy::Manual,
             refresh_paused: false,
             refresh_interval_ms: None,
             max_staleness_ms: None,
-            last_scheduler_error: None,
-            next_refresh_after_ms: None,
             created_at_ms: 0,
+            source_revision: MvAcceleratorSourceRevision {
+                target_object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
+                    bytes::Bytes::from_static(b"maintenance-test-target"),
+                )
+                .expect("test object ID"),
+                descriptor_content_hash: "test-descriptor".to_string(),
+                current_target_snapshot_id: None,
+            },
         }
     }
 
@@ -276,42 +276,5 @@ mod tests {
         let defs = vec![definition_with_consumed("ice.sales.t", 99)];
         let floor = downstream_floor(&defs, "ice.sales.t", &BTreeMap::new());
         assert!(floor.unknown);
-    }
-
-    #[test]
-    fn floor_considers_in_progress_refresh_pins() {
-        let mut ts_by_id = BTreeMap::new();
-        ts_by_id.insert(10, 1_000);
-        let mut def = definition_with_consumed("ice.sales.other", 1);
-        def.refresh_target_snapshots
-            .insert("ice.sales.t".to_string(), 10);
-        let floor = downstream_floor(&[def], "ice.sales.t", &ts_by_id);
-        assert_eq!(
-            floor,
-            DownstreamFloor {
-                floor_ts_ms: Some(1_000),
-                unknown: false
-            }
-        );
-    }
-
-    #[test]
-    fn floor_takes_min_across_both_maps_for_same_table() {
-        let mut ts_by_id = BTreeMap::new();
-        ts_by_id.insert(10, 1_000);
-        ts_by_id.insert(20, 2_000);
-        // One consumer: committed at snapshot 20, with an in-flight refresh
-        // pinned at the older snapshot 10. The floor must reflect the older pin.
-        let mut def = definition_with_consumed("ice.sales.t", 20);
-        def.refresh_target_snapshots
-            .insert("ice.sales.t".to_string(), 10);
-        let floor = downstream_floor(&[def], "ice.sales.t", &ts_by_id);
-        assert_eq!(
-            floor,
-            DownstreamFloor {
-                floor_ts_ms: Some(1_000),
-                unknown: false
-            }
-        );
     }
 }

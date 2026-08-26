@@ -251,8 +251,8 @@ impl MvCommandExecutor {
             &target.name,
         );
         let steps =
-            crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_repository(
-                self.repository.as_ref(),
+            crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_readiness(
+                self.ports.readiness().as_ref(),
                 &requested_object,
             )?;
         let mut last_result = None;

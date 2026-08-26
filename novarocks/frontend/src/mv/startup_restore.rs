@@ -29,6 +29,7 @@
 use std::sync::Arc;
 
 use crate::catalog_application::{CatalogApplicationPort, CatalogRuntimeProjection};
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::repository::MvRepository;
 use crate::mv::domain::startup_restore::MvStartupRestore;
 use novarocks_spi::connector::ConnectorControlRegistry;
@@ -41,10 +42,7 @@ pub(crate) struct FrontendMvStartupRestore {
     catalog_application: Arc<dyn CatalogApplicationPort>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_repository: Arc<dyn MvRepository>,
-    /// Reconciles unfinished refresh attempts. Held as a closure because the MV
-    /// application service is constructed after this value's other inputs, and
-    /// threading a half-built service through would be worse than a callback.
-    recover: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
+    readiness: Arc<MvReadinessPort>,
 }
 
 impl FrontendMvStartupRestore {
@@ -54,7 +52,7 @@ impl FrontendMvStartupRestore {
         catalog_application: Arc<dyn CatalogApplicationPort>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_repository: Arc<dyn MvRepository>,
-        recover: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
+        readiness: Arc<MvReadinessPort>,
     ) -> Self {
         Self {
             connector_control,
@@ -62,7 +60,7 @@ impl FrontendMvStartupRestore {
             catalog_application,
             mv_storage_observation,
             mv_repository,
-            recover,
+            readiness,
         }
     }
 }
@@ -78,7 +76,7 @@ impl MvStartupRestore for FrontendMvStartupRestore {
                 catalog_application: Some(self.catalog_application.as_ref()),
                 connector_control: self.connector_control.as_ref(),
                 mv_storage_observation: self.mv_storage_observation.as_ref(),
-                mv_repository: self.mv_repository.as_ref(),
+                readiness: self.readiness.as_ref(),
             },
         )
     }
@@ -90,56 +88,5 @@ impl MvStartupRestore for FrontendMvStartupRestore {
                 mv_repository: self.mv_repository.as_ref(),
             },
         )
-    }
-
-    fn recover_unfinished_refreshes(&self) -> Result<(), String> {
-        (self.recover)()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// The recovery step must run the caller's closure exactly once per restore,
-    /// and surface its failure rather than swallowing it -- a swallowed recovery
-    /// failure would let startup proceed with unreconciled attempts.
-    #[test]
-    fn recovery_delegates_to_the_installed_closure() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&calls);
-
-        struct OnlyRecovery {
-            recover: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
-        }
-        impl MvStartupRestore for OnlyRecovery {
-            fn rebuild_cache_from_lake(&self) -> Result<(), String> {
-                Ok(())
-            }
-            fn restore_targets(&self) -> Result<(), String> {
-                Ok(())
-            }
-            fn recover_unfinished_refreshes(&self) -> Result<(), String> {
-                (self.recover)()
-            }
-        }
-
-        let restore = OnlyRecovery {
-            recover: Box::new(move || {
-                counted.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }),
-        };
-        crate::mv::domain::startup_restore::run_mv_startup_restore(&restore)
-            .expect("restore succeeds");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let failing = OnlyRecovery {
-            recover: Box::new(|| Err("recovery failed".to_string())),
-        };
-        let error = crate::mv::domain::startup_restore::run_mv_startup_restore(&failing)
-            .expect_err("a failing recovery must not be swallowed");
-        assert!(error.contains("recovery failed"), "{error}");
     }
 }

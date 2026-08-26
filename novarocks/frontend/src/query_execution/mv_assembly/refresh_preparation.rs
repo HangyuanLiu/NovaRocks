@@ -74,8 +74,8 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorTableIdentity,
-    ConnectorTableObjectId,
+    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorManagedDescriptorProperties,
+    ConnectorTableIdentity, ConnectorTableObjectId,
 };
 use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
 use novarocks_sql::planning::mv::{SqlMvAggregateLayoutScope, extract_aggregate_sql_calls};
@@ -190,7 +190,7 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                     self.current_database,
                     fields,
                     &plan.contract,
-                    request.attempt.write_operation_id,
+                    request.attempt.write_operation_id(),
                     retained_repartition_target.as_ref().ok_or_else(|| {
                         "MV repartition preparation lost its retained target binding".to_string()
                     })?,
@@ -255,11 +255,9 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
             ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
             ExecutableRefreshDecision::MetadataOnly => PreparedMvRefreshWork::MetadataOnly {
                 intent: metadata_only_publication_intent(
+                    self.source,
                     &plan.contract,
                     &request.attempt,
-                    plan.contract.mv_id.ok_or_else(|| {
-                        "Iceberg MV refresh plan has no persisted materialized-view ID".to_string()
-                    })?,
                     &base_table_object_ids,
                 )?,
             },
@@ -299,12 +297,9 @@ impl MvRefreshPreparationService for StandaloneMvRefreshPreparationService<'_> {
                 PreparedIncrementalRefreshWork::MetadataOnly => {
                     PreparedMvRefreshWork::MetadataOnly {
                         intent: metadata_only_publication_intent(
+                            self.source,
                             &plan.contract,
                             &request.attempt,
-                            plan.contract.mv_id.ok_or_else(|| {
-                                "Iceberg MV refresh plan has no persisted materialized-view ID"
-                                    .to_string()
-                            })?,
                             &base_table_object_ids,
                         )?,
                     }
@@ -645,7 +640,7 @@ fn prepare_frontend_first_refresh_write(
     let mut publication_intent = frontend_refresh_publication_intent(
         contract,
         attempt,
-        definition.mv_id,
+        &definition,
         &refresh_query_source,
         base_table_object_ids,
     )?;
@@ -808,14 +803,14 @@ fn prepare_frontend_first_refresh_write(
             target.catalog,
             target.namespace,
             target.table,
-            attempt.staging_branch.clone(),
+            attempt.staging_branch(),
             current_catalog.map(str::to_string),
             current_database.to_string(),
             expected_target_snapshot_id,
             table,
             Arc::clone(&target_write_fields),
             observed_binding,
-            attempt.write_operation_id,
+            attempt.write_operation_id(),
         )?;
         let prepared = MvFirstRefreshWritePreparer::prepare_join_logical(
             request,
@@ -910,14 +905,14 @@ fn prepare_frontend_first_refresh_write(
         target.catalog,
         target.namespace,
         target.table,
-        attempt.staging_branch.clone(),
+        attempt.staging_branch(),
         current_catalog.map(str::to_string),
         current_database.to_string(),
         expected_target_snapshot_id,
         table,
         target_write_fields,
         observed_binding,
-        attempt.write_operation_id,
+        attempt.write_operation_id(),
     )?;
     let prepared = MvFirstRefreshWritePreparer::prepare(request, physical_sql, publication_intent)?;
     Ok(if partition_spec_replacement.is_some() {
@@ -960,7 +955,7 @@ pub(crate) fn select_retained_target_handle(
 fn frontend_refresh_publication_intent(
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
-    mv_id: i64,
+    definition: &crate::mv::domain::persistence::definition::StoredMvDefinition,
     select_sql: &str,
     base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
 ) -> Result<MvRefreshPublicationIntent, String> {
@@ -981,9 +976,10 @@ fn frontend_refresh_publication_intent(
         RefreshStateBaseline::Pinless => BTreeMap::new(),
     };
     mv_refresh_publication_intent(
-        attempt.refresh_id,
-        mv_id,
-        attempt.marker_token.clone(),
+        attempt.publication_id,
+        definition.source_revision.target_object_id.clone(),
+        expected_target_snapshot(contract),
+        managed_descriptor_properties(&definition)?,
         MvRefreshPublicationTechnique::Full,
         &snapshots,
         base_table_object_ids,
@@ -996,14 +992,13 @@ fn frontend_refresh_publication_intent(
             .ok_or_else(|| "MV refresh publication target has no connector catalog".to_string())?,
         contract.target.database.clone(),
         contract.target.name.clone(),
-        attempt.staging_branch.clone(),
     )
 }
 
 fn metadata_only_publication_intent(
+    source: &IcebergMvCorePorts,
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
-    mv_id: i64,
     base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
 ) -> Result<MvRefreshPublicationIntent, String> {
     let snapshots = contract
@@ -1027,10 +1022,21 @@ fn metadata_only_publication_intent(
             "MV metadata-only refresh requires a snapshot-backed target baseline".to_string(),
         );
     };
+    let target = IcebergMvTarget {
+        catalog: contract
+            .target
+            .catalog
+            .clone()
+            .ok_or_else(|| "MV metadata-only target has no connector catalog".to_string())?,
+        namespace: contract.target.database.clone(),
+        table: contract.target.name.clone(),
+    };
+    let definition = load_iceberg_mv_definition_by_target(source.repository().as_ref(), &target)?;
     mv_refresh_publication_intent(
-        attempt.refresh_id,
-        mv_id,
-        attempt.marker_token.clone(),
+        attempt.publication_id,
+        definition.source_revision.target_object_id.clone(),
+        expected_target_snapshot(contract),
+        managed_descriptor_properties(&definition)?,
         MvRefreshPublicationTechnique::MetadataOnly,
         &snapshots,
         base_table_object_ids,
@@ -1043,15 +1049,15 @@ fn metadata_only_publication_intent(
             .ok_or_else(|| "MV metadata-only target has no connector catalog".to_string())?,
         contract.target.database.clone(),
         contract.target.name.clone(),
-        attempt.staging_branch.clone(),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn mv_refresh_publication_intent(
-    refresh_id: i64,
-    mv_id: i64,
-    marker_token: String,
+    publication_id: novarocks_spi::connector::LakePublicationId,
+    target_object_id: ConnectorTableObjectId,
+    expected_target_snapshot_id: Option<i64>,
+    descriptor_properties: ConnectorManagedDescriptorProperties,
     technique: MvRefreshPublicationTechnique,
     snapshots: &BTreeMap<String, i64>,
     base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
@@ -1060,7 +1066,6 @@ fn mv_refresh_publication_intent(
     target_catalog: String,
     target_namespace: String,
     target_name: String,
-    staging_branch: String,
 ) -> Result<MvRefreshPublicationIntent, String> {
     let bases = snapshots
         .iter()
@@ -1079,17 +1084,38 @@ fn mv_refresh_publication_intent(
         })
         .collect::<Result<Vec<_>, _>>()?;
     MvRefreshPublicationIntent::try_new(
-        refresh_id,
-        mv_id,
-        marker_token,
+        publication_id,
+        target_object_id,
+        expected_target_snapshot_id,
+        descriptor_properties,
         technique,
         bases,
         definition_fingerprint,
         target_catalog,
         target_namespace,
         target_name,
-        staging_branch,
     )
+}
+
+fn expected_target_snapshot(contract: &RefreshPlanContract) -> Option<i64> {
+    match &contract.state_baseline {
+        RefreshStateBaseline::SnapshotBacked {
+            target_snapshot_id, ..
+        } => *target_snapshot_id,
+        RefreshStateBaseline::Pinless => None,
+    }
+}
+
+fn managed_descriptor_properties(
+    definition: &crate::mv::domain::persistence::definition::StoredMvDefinition,
+) -> Result<ConnectorManagedDescriptorProperties, String> {
+    use crate::mv::domain::persistence::descriptor::MV_DESCRIPTOR_HASH_PROP;
+
+    ConnectorManagedDescriptorProperties::try_new(vec![(
+        Arc::from(MV_DESCRIPTOR_HASH_PROP),
+        Arc::from(definition.source_revision.descriptor_content_hash.as_str()),
+    )])
+    .map_err(|error| format!("build managed MV descriptor properties: {error}"))
 }
 
 /// Prepare the value-only non-join incremental handoff.  This is deliberately
@@ -1323,17 +1349,22 @@ fn prepare_frontend_incremental_write(
             target.catalog.clone(),
             target.namespace.clone(),
             target.table.clone(),
-            attempt.staging_branch.clone(),
+            attempt.staging_branch(),
             current_catalog.map(str::to_string),
             current_database.to_string(),
             *target_snapshot_id,
             observed_binding,
-            attempt.write_operation_id,
+            attempt.write_operation_id(),
         )?;
         let publication_intent = mv_refresh_publication_intent(
-            attempt.refresh_id,
-            rewrite.mv_definition.mv_id,
-            attempt.marker_token.clone(),
+            attempt.publication_id,
+            rewrite
+                .mv_definition
+                .source_revision
+                .target_object_id
+                .clone(),
+            *target_snapshot_id,
+            managed_descriptor_properties(rewrite.mv_definition.as_ref())?,
             MvRefreshPublicationTechnique::Incremental,
             &rewrite.pin.to_snapshot_map(),
             &rewrite.pin.to_table_object_id_map(),
@@ -1342,7 +1373,6 @@ fn prepare_frontend_incremental_write(
             target.catalog.clone(),
             target.namespace.clone(),
             target.table.clone(),
-            attempt.staging_branch.clone(),
         )?;
         let frozen_base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
             source.connector_control(),
@@ -1505,17 +1535,22 @@ fn prepare_frontend_incremental_write(
         target.catalog.clone(),
         target.namespace.clone(),
         target.table.clone(),
-        attempt.staging_branch.clone(),
+        attempt.staging_branch(),
         current_catalog.map(str::to_string),
         current_database.to_string(),
         *target_snapshot_id,
         observed_binding,
-        attempt.write_operation_id,
+        attempt.write_operation_id(),
     )?;
     let publication_intent = mv_refresh_publication_intent(
-        attempt.refresh_id,
-        rewrite.mv_definition.mv_id,
-        attempt.marker_token.clone(),
+        attempt.publication_id,
+        rewrite
+            .mv_definition
+            .source_revision
+            .target_object_id
+            .clone(),
+        *target_snapshot_id,
+        managed_descriptor_properties(rewrite.mv_definition.as_ref())?,
         MvRefreshPublicationTechnique::Incremental,
         &rewrite.pin.to_snapshot_map(),
         &rewrite.pin.to_table_object_id_map(),
@@ -1524,7 +1559,6 @@ fn prepare_frontend_incremental_write(
         target.catalog.clone(),
         target.namespace.clone(),
         target.table.clone(),
-        attempt.staging_branch.clone(),
     )?;
     let frozen_base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
         source.connector_control(),

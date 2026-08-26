@@ -160,10 +160,11 @@ pub(crate) fn reject_drop_column_mv_dependencies_with_repository(
     let target_key = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
     let target_key_lower = target_key.to_ascii_lowercase();
     let target = MvDependencyTarget::from_backend(target)?;
-    for definition in repository
-        .list_definitions()
+    for projection in repository
+        .list_projections()
         .map_err(|error| format!("load materialized view metadata failed: {error}"))?
     {
+        let definition = projection.definition;
         let references_target = definition
             .base_table_refs
             .iter()

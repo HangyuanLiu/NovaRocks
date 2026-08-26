@@ -59,8 +59,12 @@ impl CanonicalMvTarget {
 /// The application path currently holding, or waiting to hold, an MV gate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MvActivityOwner {
+    Create,
+    Alter,
+    Drop,
     ManualRefresh,
     ScheduledRefresh,
+    Repartition,
     AutomaticMaintenance,
 }
 

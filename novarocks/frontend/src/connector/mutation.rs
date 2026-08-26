@@ -155,6 +155,50 @@ pub fn resolve_catalog_mutation_with_lease(
     resolve_outcome(lease, outcome, context)
 }
 
+/// Dispatches one catalog mutation without reconciliation.
+///
+/// A caller that owns a publication identity with a terminal `CommitUnknown`
+/// contract must use this entry point.  It receives the provider's first
+/// outcome unchanged and must not inspect, replay, clean up, or project after
+/// an unknown result.
+pub fn dispatch_catalog_mutation_once_with_lease(
+    lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
+    operation_id: ConnectorMutationOperationId,
+    operation: ConnectorCatalogMutationOperation,
+    context: ConnectorRequestContext,
+) -> ResolvedCatalogMutation {
+    let request = ConnectorCatalogMutationRequest {
+        operation_id,
+        target: ConnectorExecutionBindingKey {
+            instance_id: lease.descriptor().instance_id.clone(),
+            incarnation: lease.incarnation(),
+        },
+        operation,
+        context,
+    };
+    match lease.execute(request) {
+        Ok(ExternalMutationOutcome::KnownCommitted {
+            effect,
+            receipt,
+            finalization,
+        }) => ResolvedCatalogMutation::KnownCommitted(CompletedCatalogMutation {
+            effect,
+            receipt,
+            finalization,
+        }),
+        Ok(ExternalMutationOutcome::KnownUncommitted { failure }) => {
+            ResolvedCatalogMutation::KnownUncommitted { failure }
+        }
+        Ok(ExternalMutationOutcome::CommitUnknown { failure, evidence }) => {
+            ResolvedCatalogMutation::CommitUnknown { failure, evidence }
+        }
+        Err(error) => ResolvedCatalogMutation::ContractFailure {
+            error,
+            dispatch: MutationDispatchState::PossiblyDispatched,
+        },
+    }
+}
+
 fn resolve_outcome(
     lease: &novarocks_spi::connector::ConnectorCatalogMutationLease,
     outcome: ExternalMutationOutcome<ConnectorCatalogMutationReceipt>,

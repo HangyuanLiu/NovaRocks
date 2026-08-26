@@ -33,7 +33,9 @@ use crate::mv::domain::application::{
     MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine, MvRequestContext,
     MvStatementResult,
 };
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::repository::MvRepository;
+use crate::mv::process_runtime::ProcessRuntime;
 use crate::query_execution::maintenance::{TableMaintenanceEngine, TableMaintenanceService};
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
@@ -43,12 +45,11 @@ use crate::query_execution::service::QueryExecutionService;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 
 use super::{
-    FrontendMvRecoverySummary,
     activity::{CanonicalMvTarget, MvActivityGate, MvActivityOwner},
     create,
     maintenance::MaintenanceCoordinatorConfig,
     maintenance_worker::{FrontendMaintenanceWorker, FrontendMaintenanceWorkerDependencies},
-    recovery, refresh,
+    refresh,
     scheduler::{
         FrontendMvScheduler, FrontendMvSchedulerConfig, ScheduledRefreshDisposition,
         ScheduledRefreshRequest,
@@ -64,8 +65,8 @@ const MV_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// deliberately return `None` so their existing core routes remain active.
 pub struct FrontendMvService {
     repository: Arc<dyn MvRepository>,
+    readiness: Arc<MvReadinessPort>,
     refresh: Option<refresh::FrontendMvRefreshDependencies>,
-    recovery: Option<recovery::FrontendMvRecoveryDependencies>,
     activity_gate: MvActivityGate,
     background: Mutex<Option<FrontendMvBackgroundRuntime>>,
     scheduler_config: FrontendMvSchedulerConfig,
@@ -81,10 +82,11 @@ pub struct FrontendMvService {
 
 impl FrontendMvService {
     pub fn new(repository: Arc<dyn MvRepository>) -> Self {
+        let runtime = Arc::new(ProcessRuntime::default());
         Self {
+            readiness: Arc::new(MvReadinessPort::new(Arc::clone(&repository), runtime)),
             repository,
             refresh: None,
-            recovery: None,
             activity_gate: MvActivityGate::new(),
             background: Mutex::new(None),
             scheduler_config: FrontendMvSchedulerConfig::default(),
@@ -113,25 +115,18 @@ impl FrontendMvService {
         table_maintenance_service: Arc<dyn TableMaintenanceService>,
         optimizer_query_mem_limit_bytes: u64,
         attempt_timeout: Duration,
-        ownership: Option<super::coordination::MvRefreshOwnershipContext>,
     ) -> Self {
+        let runtime = Arc::new(ProcessRuntime::default());
+        let readiness = Arc::new(MvReadinessPort::new(Arc::clone(&repository), runtime));
         Self {
             repository,
             refresh: Some(refresh::FrontendMvRefreshDependencies {
                 query_execution,
                 connector_control: Arc::clone(&connector_control),
                 provider_activation: Arc::clone(&provider_activation),
-                // Cloning shares the same `Arc<MvRefreshOwnershipRegistry>` with
-                // recovery, which is what makes ownership sticky across them: a
-                // target recovery took at startup is still owned when the first
-                // refresh runs, so that refresh does not re-compete for it.
-                ownership: ownership.clone(),
+                readiness: Arc::clone(&readiness),
             }),
-            recovery: Some(recovery::FrontendMvRecoveryDependencies {
-                ownership: ownership.clone(),
-                connector_control,
-                provider_activation: Arc::clone(&provider_activation),
-            }),
+            readiness,
             activity_gate: MvActivityGate::new(),
             background: Mutex::new(None),
             scheduler_config,
@@ -144,21 +139,12 @@ impl FrontendMvService {
         }
     }
 
-    /// Run one bounded startup recovery pass. Failures are retained as MV
-    /// fences inside the repository and do not prevent unrelated SQL from
-    /// becoming ready.
-    pub fn recover_frontend_mv_refreshes(&self) -> FrontendMvRecoverySummary {
-        self.recovery.as_ref().map_or_else(
-            || FrontendMvRecoverySummary {
-                unresolved: 1,
-                ..Default::default()
-            },
-            |dependencies| recovery::recover_once(self.repository.as_ref(), dependencies),
-        )
-    }
-
     pub(crate) fn background_engine_sink(service: Arc<Self>) -> Arc<dyn MvBackgroundEngineSink> {
         Arc::new(FrontendMvBackgroundEngineSink { service })
+    }
+
+    pub(crate) fn readiness_port(&self) -> Arc<MvReadinessPort> {
+        Arc::clone(&self.readiness)
     }
 
     pub(crate) fn shutdown_background_workers(&self) -> Result<(), String> {
@@ -172,19 +158,6 @@ impl FrontendMvService {
         };
         runtime.stop_and_join(Instant::now() + MV_WORKER_SHUTDOWN_TIMEOUT)?;
         guard.take();
-        // Ownership is sticky per target, so it outlives any single refresh and
-        // must be given up with the worker that held it. Doing this after the
-        // worker has joined means no refresh can re-acquire behind us, and doing
-        // it here rather than at process exit means the renewal loops stop before
-        // the StateStore is asked to shut down -- a loop still renewing keeps the
-        // provider from draining inside its deadline.
-        if let Some(ownership) = self
-            .refresh
-            .as_ref()
-            .and_then(|refresh| refresh.ownership.as_ref())
-        {
-            ownership.shutdown();
-        }
         Ok(())
     }
 
@@ -225,7 +198,7 @@ impl FrontendMvService {
         }
         *guard = Some(FrontendMvBackgroundRuntime::start(
             RefreshWorkerDependencies {
-                repository: Arc::clone(&self.repository),
+                readiness: Arc::clone(&self.readiness),
                 refresh: dependencies,
                 background_engine: bindings.engine,
                 topology,
@@ -274,13 +247,7 @@ impl FrontendMvService {
                 "frontend MV refresh dependencies are not installed",
             )
         })?;
-        refresh::execute(
-            self.repository.as_ref(),
-            dependencies,
-            refresh_plan,
-            connector_context,
-            execution,
-        )
+        refresh::execute(dependencies, refresh_plan, connector_context, execution)
     }
 
     pub fn prepare_and_execute_refresh(
@@ -321,7 +288,7 @@ impl FrontendMvService {
                 }
             }
         };
-        let attempt = self.reserve_refresh_attempt()?;
+        let attempt = self.reserve_refresh_attempt();
         let prepared = preparation
             .prepare_step(MvRefreshPreparationRequest {
                 statement,
@@ -343,40 +310,10 @@ impl FrontendMvService {
         self.execute_prepared_refresh(prepared, connector_context, execution)
     }
 
-    pub fn recover_startup_mv_refreshes(&self) -> Result<(), MvApplicationError> {
-        let summary = self.recover_frontend_mv_refreshes();
-        tracing::info!(
-            candidates = summary.candidates,
-            resolved = summary.resolved,
-            unresolved = summary.unresolved,
-            cleanup_backlog = summary.cleanup_backlog,
-            "completed bounded frontend MV startup recovery pass"
-        );
-        Ok(())
-    }
-    fn reserve_refresh_attempt(&self) -> Result<MvRefreshAttemptIdentity, MvApplicationError> {
-        let refresh_id = self
-            .repository
-            .reserve_frontend_refresh_id()
-            .map_err(|error| {
-                MvApplicationError::new(
-                    crate::mv::domain::application::MvApplicationErrorKind::Repository,
-                    error.to_string(),
-                )
-            })?;
-        let request_id = *uuid::Uuid::now_v7().as_bytes();
-        Ok(MvRefreshAttemptIdentity {
-            refresh_id,
-            request_id,
-            staging_branch: format!("__novarocks_mv_refresh_{refresh_id}"),
-            marker_token: uuid::Uuid::now_v7().to_string(),
-            staging_create_operation_id: *uuid::Uuid::now_v7().as_bytes(),
-            write_operation_id: novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(
-                *uuid::Uuid::now_v7().as_bytes(),
-            ),
-            publication_operation_id: *uuid::Uuid::now_v7().as_bytes(),
-            staging_drop_operation_id: *uuid::Uuid::now_v7().as_bytes(),
-        })
+    fn reserve_refresh_attempt(&self) -> MvRefreshAttemptIdentity {
+        MvRefreshAttemptIdentity {
+            publication_id: novarocks_spi::connector::LakePublicationId::new_v7(),
+        }
     }
 }
 
@@ -395,7 +332,7 @@ impl MvBackgroundEngineSink for FrontendMvBackgroundEngineSink {
 
 #[derive(Clone)]
 struct RefreshWorkerDependencies {
-    repository: Arc<dyn MvRepository>,
+    readiness: Arc<MvReadinessPort>,
     refresh: refresh::FrontendMvRefreshDependencies,
     background_engine: Arc<dyn MvBackgroundEngine>,
     topology: BackendTopologyService,
@@ -432,7 +369,7 @@ impl FrontendMvBackgroundRuntime {
             Duration::from_millis(dependencies.maintenance_config.tick_interval_ms.max(1));
         let maintenance = Arc::new(FrontendMaintenanceWorker::new(
             FrontendMaintenanceWorkerDependencies {
-                repository: Arc::clone(&dependencies.repository),
+                readiness: Arc::clone(&dependencies.readiness),
                 background_engine: Arc::clone(&dependencies.background_engine),
                 table_maintenance_engine: Arc::clone(&dependencies.table_maintenance_engine),
                 table_maintenance_service: Arc::clone(&dependencies.table_maintenance_service),
@@ -525,7 +462,7 @@ fn run_refresh_worker(
     loop {
         let now_ms = now_unix_millis();
         match scheduler.poll(
-            dependencies.repository.as_ref(),
+            dependencies.readiness.as_ref(),
             dependencies.background_engine.as_ref(),
             now_ms,
         ) {
@@ -588,12 +525,7 @@ fn run_scheduled_refreshes(
         drop(result_tx);
         for (request, disposition) in result_rx {
             let completed = matches!(disposition, ScheduledRefreshDisposition::Completed);
-            if let Err(error) = scheduler.complete(
-                dependencies.repository.as_ref(),
-                &request,
-                disposition,
-                now_unix_millis(),
-            ) {
+            if let Err(error) = scheduler.complete(&request, disposition, now_unix_millis()) {
                 tracing::warn!(mv_id = request.definition.mv_id, error = %error, "persist frontend MV scheduler outcome failed");
             } else if completed && let Some(wakeup_tx) = &dependencies.maintenance_wakeup_tx {
                 let _ = wakeup_tx.try_send(());
@@ -655,10 +587,7 @@ fn execute_scheduled_refresh(
         if cancellation.is_cancelled() {
             return ScheduledRefreshDisposition::ShutdownCancelled;
         }
-        let attempt = match reserve_refresh_attempt(dependencies.repository.as_ref()) {
-            Ok(attempt) => attempt,
-            Err(error) => return repository_disposition(error),
-        };
+        let attempt = reserve_refresh_attempt();
         let prepared = match dependencies.background_engine.prepare_refresh_step(
             &step,
             attempt,
@@ -669,7 +598,6 @@ fn execute_scheduled_refresh(
         };
         let no_op = matches!(prepared.work, PreparedMvRefreshWork::NoOp);
         if let Err(error) = refresh::execute(
-            dependencies.repository.as_ref(),
             &dependencies.refresh,
             prepared,
             connector_context.clone(),
@@ -716,22 +644,10 @@ fn scheduled_refresh_test_barrier(
     false
 }
 
-fn reserve_refresh_attempt(
-    repository: &dyn MvRepository,
-) -> Result<MvRefreshAttemptIdentity, crate::mv::domain::repository::MvRepositoryError> {
-    let refresh_id = repository.reserve_frontend_refresh_id()?;
-    Ok(MvRefreshAttemptIdentity {
-        refresh_id,
-        request_id: *uuid::Uuid::now_v7().as_bytes(),
-        staging_branch: format!("__novarocks_mv_refresh_{refresh_id}"),
-        marker_token: uuid::Uuid::now_v7().to_string(),
-        staging_create_operation_id: *uuid::Uuid::now_v7().as_bytes(),
-        write_operation_id: novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(
-            *uuid::Uuid::now_v7().as_bytes(),
-        ),
-        publication_operation_id: *uuid::Uuid::now_v7().as_bytes(),
-        staging_drop_operation_id: *uuid::Uuid::now_v7().as_bytes(),
-    })
+fn reserve_refresh_attempt() -> MvRefreshAttemptIdentity {
+    MvRefreshAttemptIdentity {
+        publication_id: novarocks_spi::connector::LakePublicationId::new_v7(),
+    }
 }
 
 fn repository_disposition(
@@ -747,8 +663,7 @@ fn repository_disposition(
         MvRepositoryErrorKind::Corruption => {
             ScheduledRefreshDisposition::Corruption(error.to_string())
         }
-        MvRepositoryErrorKind::CommitUnknown
-        | MvRepositoryErrorKind::KnownCommittedFinalizeFailed => {
+        MvRepositoryErrorKind::CommitUnknown => {
             ScheduledRefreshDisposition::RecoveryRequired(error.to_string())
         }
         MvRepositoryErrorKind::InvalidRequest => {

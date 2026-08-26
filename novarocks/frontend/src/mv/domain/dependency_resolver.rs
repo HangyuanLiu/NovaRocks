@@ -24,9 +24,9 @@ use crate::mv::domain::dependency::model::{
 use crate::mv::domain::dependency::scope::{
     validate_no_external_dependents_for_scope, validate_no_iceberg_mv_targets_in_scope,
 };
-use crate::mv::domain::persistence::definition::StoredMvDefinition;
 #[cfg(test)]
-use crate::mv::domain::persistence::definition::StoredMvRefreshPolicy;
+use crate::mv::domain::persistence::definition::MvDesiredRefreshPolicy;
+use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::dependency::stored_definition_dependency_ref;
 use crate::mv::domain::repository::MvRepository;
@@ -130,8 +130,11 @@ pub(crate) fn ensure_no_iceberg_mv_targets_in_scope_with_repository(
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
     let definitions = repository
-        .list_definitions()
-        .map_err(|e| format!("load MV definitions for drop target scope check failed: {e}"))?;
+        .list_projections()
+        .map_err(|e| format!("load MV projections for drop target scope check failed: {e}"))?
+        .into_iter()
+        .map(|projection| projection.definition)
+        .collect::<Vec<_>>();
     let targets = definitions
         .iter()
         .filter_map(iceberg_mv_target_ref_for_scope)
@@ -152,8 +155,11 @@ pub(crate) fn ensure_no_external_iceberg_dependents_with_repository(
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
     let definitions = repository
-        .list_definitions()
-        .map_err(|e| format!("load MV definitions for drop scope check failed: {e}"))?;
+        .list_projections()
+        .map_err(|e| format!("load MV projections for drop scope check failed: {e}"))?
+        .into_iter()
+        .map(|projection| projection.definition)
+        .collect::<Vec<_>>();
 
     let mut edges: Vec<(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)> =
         Vec::with_capacity(definitions.len());
@@ -177,8 +183,11 @@ pub(crate) fn validate_no_create_cycle_with_repository(
     new_dependencies: &[CreateMvDependencyRequest],
 ) -> Result<(), String> {
     let definitions = repository
-        .list_definitions()
-        .map_err(|e| format!("load MV definitions for dependency cycle check failed: {e}"))?;
+        .list_projections()
+        .map_err(|e| format!("load MV projections for dependency cycle check failed: {e}"))?
+        .into_iter()
+        .map(|projection| projection.definition)
+        .collect::<Vec<_>>();
     let mut edges = Vec::new();
     for definition in definitions {
         let target = stored_definition_dependency_ref_for_iceberg(&definition)?;
@@ -243,22 +252,25 @@ mod tests {
             target_table: target_table.map(str::to_string),
             schema_contract: None,
             partition_spec: None,
-            partition_state_complete: false,
             last_refresh_ms: None,
             last_refresh_rows: None,
             last_refresh_snapshots: std::collections::BTreeMap::new(),
             last_refresh_table_object_ids: std::collections::BTreeMap::new(),
             last_refreshed_iceberg_snapshot_id: None,
-            refresh_in_progress: false,
-            active_refresh_id: None,
-            refresh_target_snapshots: std::collections::BTreeMap::new(),
-            refresh_policy: StoredMvRefreshPolicy::Manual,
+            refresh_policy: MvDesiredRefreshPolicy::Manual,
             refresh_paused: false,
             refresh_interval_ms: None,
             max_staleness_ms: None,
-            last_scheduler_error: None,
-            next_refresh_after_ms: None,
             created_at_ms: 0,
+            source_revision:
+                crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision {
+                    target_object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
+                        bytes::Bytes::from_static(b"dependency-test-target"),
+                    )
+                    .expect("test object ID"),
+                    descriptor_content_hash: "test-descriptor".to_string(),
+                    current_target_snapshot_id: None,
+                },
         }
     }
 

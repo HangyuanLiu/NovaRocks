@@ -22,11 +22,7 @@ use crate::mv::domain::dependency::model::{
 };
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) const MV_DEPENDENCY_SUBJECT: &str = "mv.dependency";
+pub(crate) const MV_ACCELERATOR_DEPENDENCY_SUBJECT: &str = "mv.accelerator_dependency";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMvDependency {
