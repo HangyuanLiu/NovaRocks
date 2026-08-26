@@ -192,6 +192,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         namespace: CatalogNamespaceName,
         creation: crate::iceberg::TableCreation,
     ) -> super::StagedCreateStart {
+        let creation = with_explicit_format_version(creation);
         let ident = match super::delegate::namespace_ident(&namespace) {
             Ok(ident) => ident,
             Err(error) => return super::StagedCreateStart::KnownUncommitted(error.to_string()),
@@ -275,6 +276,10 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     ) -> CatalogTransactionStart {
         match request.intent {
             CatalogCreateIntent::EmptyTable => {
+                let request = crate::catalog::transaction::CreateTableTransactionRequest {
+                    creation: with_explicit_format_version(request.creation),
+                    ..request
+                };
                 super::start_create_table_transaction(&self.delegate, request)
             }
             CatalogCreateIntent::CreateTableAsSelect => {
@@ -297,5 +302,28 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             Ok(()) => super::start_create_table_transaction(&self.delegate, request),
             Err(reason) => CatalogTransactionStart::Unsupported(reason),
         }
+    }
+}
+
+/// Spell the format version into the table properties.
+///
+/// A REST catalog needs it stated explicitly; a filesystem catalog reads it off
+/// the creation itself. That difference is this implementation's to know, which
+/// is why it used to be a catalog-kind comparison at the call site and is not
+/// any more.
+fn with_explicit_format_version(
+    creation: crate::iceberg::TableCreation,
+) -> crate::iceberg::TableCreation {
+    if creation.properties.contains_key("format-version") {
+        return creation;
+    }
+    let mut properties = creation.properties.clone();
+    properties.insert(
+        "format-version".to_string(),
+        (creation.format_version as u8).to_string(),
+    );
+    crate::iceberg::TableCreation {
+        properties,
+        ..creation
     }
 }

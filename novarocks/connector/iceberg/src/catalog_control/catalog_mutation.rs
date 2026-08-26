@@ -38,7 +38,6 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::naming::normalize_identifier;
 
-use crate::catalog_config::IcebergCatalogKind;
 use crate::commit::{RefActionOutcome, execute_ref_action, lower_ref_action};
 use crate::iceberg::spec::{
     FormatVersion, NestedField, Operation, PrimitiveType, Schema, Snapshot, SnapshotReference,
@@ -80,17 +79,19 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         if let Err(error) = validate_request(self, &request) {
             return Ok(known_uncommitted(error));
         }
-        if self.runtime().control_state().configuration().kind == IcebergCatalogKind::Hadoop
-            && let ConnectorCatalogMutationOperation::CreateTable {
-                table,
-                columns,
-                key,
-                partitioning,
-                properties,
-                policy,
-            } = &request.operation
+        // Every catalog creates through the create-table transaction. Which
+        // receipt shape comes back is decided by what the publication proof
+        // actually carries, not by asking which kind of catalog this is.
+        if let ConnectorCatalogMutationOperation::CreateTable {
+            table,
+            columns,
+            key,
+            partitioning,
+            properties,
+            policy,
+        } = &request.operation
         {
-            return execute_hadoop_create_table(
+            return execute_create_table(
                 self,
                 &request,
                 table,
@@ -492,7 +493,7 @@ fn create_table(
         return Err(not_found("Iceberg table namespace does not exist"));
     }
     let (namespace, creation) =
-        prepare_table_creation(provider, table, columns, key, partitioning, properties)?;
+        prepare_table_creation(table, columns, key, partitioning, properties)?;
     let catalog = provider.runtime().novarocks_catalog().vendored_client();
     provider
         .runtime()
@@ -508,15 +509,19 @@ fn create_table(
     Ok(ExternalMutationEffect::Applied)
 }
 
+/// Build the neutral request's table definition.
+///
+/// It no longer takes the provider: the one thing it used it for was asking
+/// which catalog kind this is, so it could spell out the format version for
+/// REST. That belongs to the REST implementation, which now adds it itself.
 fn prepare_table_creation(
-    provider: &IcebergMetadata,
     table: &ConnectorTableIdentity,
     columns: &[ConnectorColumnDefinition],
     key: Option<&ConnectorTableKey>,
     partitioning: &[ConnectorPartitionTransform],
     properties: &[(Arc<str>, Arc<str>)],
 ) -> Result<(NamespaceIdent, TableCreation), ConnectorError> {
-    let (format_version, mut properties) = table_properties(columns, key, properties)?;
+    let (format_version, properties) = table_properties(columns, key, properties)?;
     if format_version != FormatVersion::V3
         && columns.iter().any(|column| {
             column.default.as_ref().is_some_and(|value| {
@@ -537,12 +542,6 @@ fn prepare_table_creation(
                 )));
             }
         }
-    }
-    if provider.runtime().control_state().configuration().kind == IcebergCatalogKind::Rest {
-        properties.insert(
-            "format-version".to_string(),
-            (format_version as u8).to_string(),
-        );
     }
     let schema = Schema::builder()
         .with_fields(super::type_mapping::schema_fields(columns).map_err(invalid)?)
@@ -565,7 +564,7 @@ fn prepare_table_creation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_hadoop_create_table(
+fn execute_create_table(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
@@ -585,80 +584,86 @@ fn execute_hadoop_create_table(
             "Iceberg table namespace does not exist",
         )));
     }
-    let (namespace, creation) =
-        match prepare_table_creation(provider, table, columns, key, partitioning, properties) {
+    let (_namespace, creation) =
+        match prepare_table_creation(table, columns, key, partitioning, properties) {
             Ok(prepared) => prepared,
             Err(error) => return Ok(known_uncommitted(error)),
         };
-    // The conditional-create primitive is reached through the catalog owner, so
-    // no concrete client escapes the factory. Preparing is local: it builds
-    // metadata and sends nothing, which is what lets publication evidence be
-    // frozen before the attempt is dispatched.
+    // Admission through the create-table constructor; publication through the
+    // transaction it hands back. Admission is local for this catalog -- it
+    // builds metadata and sends nothing -- which is what lets publication
+    // evidence be frozen before anything is dispatched.
     let operation_id = hex_encode(&request.operation_id.to_bytes());
     let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
-    let prepare_request = crate::catalog::ConditionalCreateRequest {
-        namespace: crate::catalog::CatalogNamespaceName::new(namespace.to_url_string()),
+    let start_request = crate::catalog::transaction::CreateTableTransactionRequest {
+        identity: crate::catalog::transaction::TransactionIdentity::new(
+            "connector-mutation",
+            request.operation_id.to_bytes(),
+        ),
+        target: crate::catalog::CatalogTableName::new(
+            table.namespace.as_ref(),
+            table.table.as_ref(),
+        ),
+        intent: crate::catalog::CatalogCreateIntent::EmptyTable,
         creation,
-        operation_id: std::sync::Arc::from(operation_id.as_str()),
+        warehouse: None,
     };
-    let prepared = provider
+    let start = provider
         .runtime()
         .resources()
         .catalog_runtime()
-        .block_on(async move { owner.prepare_conditional_create(prepare_request).await })
+        .block_on(async move { owner.new_create_table_transaction(start_request).await })
         .map_err(unavailable)?;
-    let (attempt, _effect, _witness) = match prepared {
-        crate::catalog::error::CatalogOutcome::KnownCommitted { .. } => prepared
-            .into_known_committed()
-            .expect("the matched arm is the committed one"),
-        crate::catalog::error::CatalogOutcome::Unsupported(reason) => {
+    let mut transaction = match start {
+        crate::catalog::CatalogTransactionStart::Ready(transaction) => transaction,
+        crate::catalog::CatalogTransactionStart::Unsupported(reason) => {
             return Ok(known_uncommitted(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
                 reason.message().to_string(),
             )));
         }
-        crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
+        crate::catalog::CatalogTransactionStart::KnownUncommitted { failure } => {
             return Ok(known_uncommitted(map_mutation_failure(&failure)));
         }
-        crate::catalog::error::CatalogOutcome::CommitUnknown { failure, .. } => {
+        crate::catalog::CatalogTransactionStart::CommitUnknown { failure, .. } => {
             return Ok(known_uncommitted(ConnectorError::new(
                 ConnectorErrorKind::Unavailable,
                 failure.to_string(),
             )));
         }
     };
-    let facts = attempt.facts.clone();
-    let evidence = hadoop_create_evidence(provider, request, table, &facts)?;
+    // A catalog whose create publishes a metadata file can name it before the
+    // request goes out, which is what makes a later reconciliation exact. One
+    // that publishes through the catalog itself has no such name, and gets the
+    // ordinary mutation evidence instead.
+    let admission = transaction.admission_facts().clone();
+    let exact_admission = match (
+        admission.table_uuid.clone(),
+        admission.metadata_location.clone(),
+        admission.metadata_digest.clone(),
+    ) {
+        (Some(table_uuid), Some(metadata_location), Some(metadata_digest)) => {
+            Some(crate::catalog::ConditionalCreateFacts {
+                operation_id: std::sync::Arc::from(operation_id.as_str()),
+                table_uuid,
+                metadata_location,
+                metadata_digest,
+            })
+        }
+        _ => None,
+    };
+    let evidence = match &exact_admission {
+        Some(facts) => hadoop_create_evidence(provider, request, table, facts)?,
+        None => mutation_evidence(provider, request.operation_id, &request.operation)?,
+    };
     validate_context(&request.context)?;
-    let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
-    let published = provider
+    let committed = provider
         .runtime()
         .resources()
         .catalog_runtime()
-        .block_on(async move { owner.publish_conditional_create(attempt).await });
-    let result = match published {
-        Ok(crate::catalog::error::CatalogOutcome::KnownCommitted { receipt, .. }) => receipt,
-        Ok(crate::catalog::error::CatalogOutcome::Unsupported(reason)) => {
-            return Ok(known_uncommitted(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                reason.message().to_string(),
-            )));
-        }
-        Ok(crate::catalog::error::CatalogOutcome::KnownUncommitted { failure }) => {
-            return Ok(known_uncommitted(map_mutation_failure(&failure)));
-        }
-        Ok(crate::catalog::error::CatalogOutcome::CommitUnknown {
-            failure: unknown_failure,
-            ..
-        }) => {
-            return Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(&ConnectorError::new(
-                    ConnectorErrorKind::Unavailable,
-                    unknown_failure.to_string(),
-                )),
-                evidence,
-            });
-        }
+        .block_on(async move { transaction.commit().await });
+    let outcome = match committed {
+        Ok(outcome) => outcome,
         // The bridge wraps the conditional write, so it cannot prove the write
         // never happened.
         Err(error) => {
@@ -668,43 +673,67 @@ fn execute_hadoop_create_table(
             });
         }
     };
-    if result.facts.operation_id.as_ref() != operation_id {
-        return Err(internal(
-            "Hadoop create result operation identity changed during publication",
-        ));
-    }
+    let proof = match outcome {
+        crate::catalog::error::CatalogOutcome::KnownCommitted { receipt, .. } => receipt,
+        crate::catalog::error::CatalogOutcome::Unsupported(reason) => {
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                reason.message().to_string(),
+            )));
+        }
+        crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
+            return Ok(known_uncommitted(map_mutation_failure(&failure)));
+        }
+        crate::catalog::error::CatalogOutcome::CommitUnknown {
+            failure: unknown_failure,
+            ..
+        } => {
+            return Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: failure(&ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    unknown_failure.to_string(),
+                )),
+                evidence,
+            });
+        }
+    };
+    // The digest is read back after publication, so a proof that carries one
+    // lets the receipt name exactly what landed. A proof without one still
+    // reports the create; it just cannot be reconciled by metadata identity.
+    let exact_publication = proof.table_uuid.clone().zip(proof.metadata_digest.clone());
+    let build_receipt = |provider: &IcebergMetadata| -> Result<_, ConnectorError> {
+        match &exact_publication {
+            Some((table_uuid, metadata_digest)) => hadoop_create_receipt(
+                provider,
+                request.operation_id,
+                request.operation.kind(),
+                proof.metadata_location.as_deref(),
+                table_uuid,
+                metadata_digest,
+            ),
+            None => receipt(provider, request.operation_id, request.operation.kind()),
+        }
+    };
     provider
         .runtime()
         .control_state()
         .invalidate_table_cache(&table.namespace, &table.table);
-    match result.already_existed {
-        false => Ok(ExternalMutationOutcome::KnownCommitted {
+    match proof.effect {
+        ExternalMutationEffect::Applied => Ok(ExternalMutationOutcome::KnownCommitted {
             effect: ExternalMutationEffect::Applied,
-            receipt: hadoop_create_receipt(
-                provider,
-                request.operation_id,
-                request.operation.kind(),
-                result.published_metadata_location.as_deref(),
-                &result.authoritative_table_uuid,
-                &result.authoritative_metadata_digest,
-            )?,
-            finalization: hadoop_finalization(result.finalization_failure.map(|f| f.to_string())),
+            receipt: build_receipt(provider)?,
+            // The transaction reports the commit itself, and a finalization
+            // failure after it never downgrades that.
+            finalization: ExternalMutationFinalization::Complete,
         }),
-        true if policy == CreatePolicy::NoOpIfExists => {
+        ExternalMutationEffect::NoOp if policy == CreatePolicy::NoOpIfExists => {
             Ok(ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::NoOp,
-                receipt: hadoop_create_receipt(
-                    provider,
-                    request.operation_id,
-                    request.operation.kind(),
-                    result.published_metadata_location.as_deref(),
-                    &result.authoritative_table_uuid,
-                    &result.authoritative_metadata_digest,
-                )?,
+                receipt: build_receipt(provider)?,
                 finalization: ExternalMutationFinalization::Complete,
             })
         }
-        true => Ok(ExternalMutationOutcome::KnownUncommitted {
+        ExternalMutationEffect::NoOp => Ok(ExternalMutationOutcome::KnownUncommitted {
             failure: ConnectorMutationFailure::new(
                 ConnectorMutationFailureKind::AlreadyExists,
                 "Iceberg table already exists",
@@ -3493,15 +3522,9 @@ mod tests {
         else {
             panic!("create request");
         };
-        let (namespace, creation) = prepare_table_creation(
-            &provider,
-            table,
-            columns,
-            key.as_ref(),
-            partitioning,
-            properties,
-        )
-        .expect("prepare table creation");
+        let (namespace, creation) =
+            prepare_table_creation(table, columns, key.as_ref(), partitioning, properties)
+                .expect("prepare table creation");
         // Through the catalog owner, like production: no concrete client here.
         let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
         let prepare = crate::catalog::ConditionalCreateRequest {

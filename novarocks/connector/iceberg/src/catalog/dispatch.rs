@@ -84,11 +84,7 @@ impl CatalogCommitDispatch for UpdateTableDispatch {
             .metadata()
             .current_snapshot()
             .map(|snapshot| snapshot.snapshot_id());
-        Ok(CommitProof {
-            snapshot_id,
-            table_uuid: Some(Arc::from(table.metadata().uuid().to_string())),
-            effect: novarocks_spi::connector::ExternalMutationEffect::Applied,
-        })
+        Ok(CommitProof::applied(snapshot_id).with_table_uuid(table.metadata().uuid().to_string()))
     }
 
     async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
@@ -123,10 +119,8 @@ impl CatalogCommitDispatch for UpdateTableDispatch {
                 matched = Some(snapshot.snapshot_id());
             }
         }
-        Ok(matched.map(|snapshot_id| CommitProof {
-            snapshot_id: Some(snapshot_id),
-            table_uuid: Some(table_uuid.clone()),
-            effect: novarocks_spi::connector::ExternalMutationEffect::Applied,
+        Ok(matched.map(|snapshot_id| {
+            CommitProof::applied(Some(snapshot_id)).with_table_uuid(Arc::clone(&table_uuid))
         }))
     }
 }
@@ -185,14 +179,13 @@ impl CatalogCommitDispatch for CreateTableDispatch {
                 )
             })?;
         let table = self.client.create_table(&self.namespace, creation).await?;
-        Ok(CommitProof {
-            snapshot_id: table
+        Ok(CommitProof::applied(
+            table
                 .metadata()
                 .current_snapshot()
                 .map(|snapshot| snapshot.snapshot_id()),
-            table_uuid: Some(Arc::from(table.metadata().uuid().to_string())),
-            effect: novarocks_spi::connector::ExternalMutationEffect::Applied,
-        })
+        )
+        .with_table_uuid(table.metadata().uuid().to_string()))
     }
 
     async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
@@ -201,14 +194,15 @@ impl CatalogCommitDispatch for CreateTableDispatch {
         // is settled by the caller comparing the expected UUID, which is why
         // the UUID travels in the proof.
         match self.client.load_table(&self.ident).await {
-            Ok(table) => Ok(Some(CommitProof {
-                snapshot_id: table
-                    .metadata()
-                    .current_snapshot()
-                    .map(|snapshot| snapshot.snapshot_id()),
-                table_uuid: Some(Arc::from(table.metadata().uuid().to_string())),
-                effect: novarocks_spi::connector::ExternalMutationEffect::Applied,
-            })),
+            Ok(table) => Ok(Some(
+                CommitProof::applied(
+                    table
+                        .metadata()
+                        .current_snapshot()
+                        .map(|snapshot| snapshot.snapshot_id()),
+                )
+                .with_table_uuid(table.metadata().uuid().to_string()),
+            )),
             Err(error)
                 if matches!(
                     error.kind(),
@@ -273,18 +267,26 @@ impl CatalogCommitDispatch for ConditionalCreateDispatch {
                 )
             })?;
         match self.client.publish_create_attempt(attempt).await {
-            Ok(result) => Ok(CommitProof {
-                snapshot_id: None,
-                table_uuid: Some(Arc::from(result.authoritative_table_uuid)),
-                effect: match result.disposition {
-                    crate::hadoop_catalog::HadoopCreateDisposition::Created => {
-                        novarocks_spi::connector::ExternalMutationEffect::Applied
-                    }
-                    crate::hadoop_catalog::HadoopCreateDisposition::Existing => {
-                        novarocks_spi::connector::ExternalMutationEffect::NoOp
-                    }
-                },
-            }),
+            // The digest comes from the publish result, which re-read the
+            // metadata after writing it. That is what makes it authoritative
+            // rather than an echo of what was sent.
+            Ok(result) => Ok(CommitProof::new(match result.disposition {
+                crate::hadoop_catalog::HadoopCreateDisposition::Created => {
+                    novarocks_spi::connector::ExternalMutationEffect::Applied
+                }
+                crate::hadoop_catalog::HadoopCreateDisposition::Existing => {
+                    novarocks_spi::connector::ExternalMutationEffect::NoOp
+                }
+            })
+            .with_table_uuid(result.authoritative_table_uuid)
+            .with_metadata(
+                result
+                    .table
+                    .metadata_location()
+                    .unwrap_or(self.evidence.metadata_location.as_ref())
+                    .to_string(),
+                result.authoritative_metadata_digest,
+            )),
             // Map onto kinds `proves_uncommitted` recognises so the
             // transaction's own classification keeps each verdict: only
             // `Unknown` may leave the outcome unknown.
@@ -335,13 +337,14 @@ impl CatalogCommitDispatch for ConditionalCreateDispatch {
                 )
             })?;
         match verdict {
-            crate::hadoop_catalog::HadoopCreateReconciliation::Committed { .. } => {
-                Ok(Some(CommitProof {
-                    snapshot_id: None,
-                    table_uuid: Some(Arc::clone(&self.evidence.expected_table_uuid)),
-                    effect: novarocks_spi::connector::ExternalMutationEffect::Applied,
-                }))
-            }
+            crate::hadoop_catalog::HadoopCreateReconciliation::Committed { .. } => Ok(Some(
+                CommitProof::new(novarocks_spi::connector::ExternalMutationEffect::Applied)
+                    .with_table_uuid(Arc::clone(&self.evidence.expected_table_uuid))
+                    .with_metadata(
+                        Arc::clone(&self.evidence.metadata_location),
+                        Arc::clone(&self.evidence.metadata_digest),
+                    ),
+            )),
             // Absent proves nothing, and a foreign target proves this attempt is
             // not what is there -- neither upgrades the verdict.
             crate::hadoop_catalog::HadoopCreateReconciliation::Absent

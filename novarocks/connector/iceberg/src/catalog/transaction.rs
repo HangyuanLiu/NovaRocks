@@ -101,31 +101,71 @@ impl TransactionIdentity {
 }
 
 /// Proof that a specific publication is present in the catalog.
+///
+/// One flat shape, with the fields a publication may or may not produce left
+/// optional. Different operations genuinely observe different things -- a
+/// snapshot append lands on a snapshot id, a conditional metadata create lands
+/// on a metadata file whose digest is re-read afterwards -- and this records
+/// whichever of them the publisher saw.
+///
+/// It is deliberately not a variant per operation. A variant would put the
+/// question "which kind of catalog published this?" back in front of every
+/// caller, which is the thing this owner exists to remove; a caller reads the
+/// fields it needs and ignores the rest.
+///
+/// There is deliberately no `Default`: the effect is the one field a proof can
+/// never be vague about, so every proof states it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitProof {
     /// Snapshot the publication landed on, when the operation produces one.
     pub(crate) snapshot_id: Option<i64>,
     /// Table UUID observed at proof time.
     pub(crate) table_uuid: Option<Arc<str>>,
+    /// Metadata file the target now resolves to, when the operation publishes
+    /// one directly.
+    pub(crate) metadata_location: Option<Arc<str>>,
+    /// Digest of that metadata, read back after publication rather than taken
+    /// from what was sent -- which is what makes it authoritative.
+    pub(crate) metadata_digest: Option<Arc<str>>,
     /// Whether the catalog state changed or the request was already satisfied.
     pub(crate) effect: ExternalMutationEffect,
 }
 
 impl CommitProof {
+    pub(crate) fn new(effect: ExternalMutationEffect) -> Self {
+        Self {
+            snapshot_id: None,
+            table_uuid: None,
+            metadata_location: None,
+            metadata_digest: None,
+            effect,
+        }
+    }
+
     pub(crate) fn applied(snapshot_id: Option<i64>) -> Self {
         Self {
             snapshot_id,
-            table_uuid: None,
-            effect: ExternalMutationEffect::Applied,
+            ..Self::new(ExternalMutationEffect::Applied)
         }
     }
 
     pub(crate) fn no_op() -> Self {
-        Self {
-            snapshot_id: None,
-            table_uuid: None,
-            effect: ExternalMutationEffect::NoOp,
-        }
+        Self::new(ExternalMutationEffect::NoOp)
+    }
+
+    pub(crate) fn with_table_uuid(mut self, uuid: impl Into<Arc<str>>) -> Self {
+        self.table_uuid = Some(uuid.into());
+        self
+    }
+
+    pub(crate) fn with_metadata(
+        mut self,
+        location: impl Into<Arc<str>>,
+        digest: impl Into<Arc<str>>,
+    ) -> Self {
+        self.metadata_location = Some(location.into());
+        self.metadata_digest = Some(digest.into());
+        self
     }
 }
 
@@ -215,6 +255,19 @@ pub(crate) struct CreateTableTransactionRequest {
     pub(crate) warehouse: Option<Arc<str>>,
 }
 
+/// What admission observed, for a caller that must freeze publication evidence
+/// before anything is dispatched.
+///
+/// Flat and optional for the same reason [`CommitProof`] is: the facts differ by
+/// operation, and a caller should read what it needs without asking which kind
+/// of catalog admitted it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AdmissionFacts {
+    pub(crate) table_uuid: Option<Arc<str>>,
+    pub(crate) metadata_location: Option<Arc<str>>,
+    pub(crate) metadata_digest: Option<Arc<str>>,
+}
+
 /// One publication frontier, from admission to a terminal outcome.
 #[derive(Debug)]
 pub(crate) struct Transaction {
@@ -224,6 +277,7 @@ pub(crate) struct Transaction {
     evidence: CatalogCommitEvidence,
     dispatch: Arc<dyn CatalogCommitDispatch>,
     staged: StagedCommit,
+    admission: AdmissionFacts,
     state: TransactionState,
 }
 
@@ -242,8 +296,21 @@ impl Transaction {
             evidence,
             dispatch,
             staged: StagedCommit::default(),
+            admission: AdmissionFacts::default(),
             state: TransactionState::Admitted,
         }
+    }
+
+    /// Record what admission observed. Set by the constructor that admitted
+    /// this transaction, before the caller can dispatch anything.
+    pub(crate) fn with_admission_facts(mut self, facts: AdmissionFacts) -> Self {
+        self.admission = facts;
+        self
+    }
+
+    /// What admission observed, for freezing evidence ahead of dispatch.
+    pub(crate) fn admission_facts(&self) -> &AdmissionFacts {
+        &self.admission
     }
 
     pub(crate) fn identity(&self) -> &TransactionIdentity {

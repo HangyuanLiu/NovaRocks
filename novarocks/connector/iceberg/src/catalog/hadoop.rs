@@ -366,19 +366,29 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
                     super::error::CatalogCommitEvidence::for_target(target.canonical())
                         .with_target_uuid(Arc::clone(&attempt.facts.table_uuid))
                         .with_metadata_location(Arc::clone(&attempt.facts.metadata_location));
-                CatalogTransactionStart::Ready(Box::new(super::transaction::Transaction::new(
-                    request.identity,
-                    target,
-                    super::transaction::TransactionShape::Create(request.intent),
-                    commit_evidence,
-                    Arc::new(super::dispatch::ConditionalCreateDispatch::new(
-                        Arc::clone(&self.client),
-                        attempt
-                            .into_hadoop()
-                            .expect("this catalog prepared the attempt"),
-                        evidence,
-                    )),
-                )))
+                // What admission observed, so the caller can freeze publication
+                // evidence before anything is dispatched.
+                let admission = super::transaction::AdmissionFacts {
+                    table_uuid: Some(Arc::clone(&attempt.facts.table_uuid)),
+                    metadata_location: Some(Arc::clone(&attempt.facts.metadata_location)),
+                    metadata_digest: Some(Arc::clone(&attempt.facts.metadata_digest)),
+                };
+                CatalogTransactionStart::Ready(Box::new(
+                    super::transaction::Transaction::new(
+                        request.identity,
+                        target,
+                        super::transaction::TransactionShape::Create(request.intent),
+                        commit_evidence,
+                        Arc::new(super::dispatch::ConditionalCreateDispatch::new(
+                            Arc::clone(&self.client),
+                            attempt
+                                .into_hadoop()
+                                .expect("this catalog prepared the attempt"),
+                            evidence,
+                        )),
+                    )
+                    .with_admission_facts(admission),
+                ))
             }
             CatalogCreateIntent::CreateTableAsSelect => match self.admit_create(request.intent) {
                 Ok(()) => super::start_create_table_transaction(&self.delegate, request),
