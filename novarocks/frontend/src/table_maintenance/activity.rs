@@ -149,10 +149,10 @@ impl Drop for ActivityLease {
         // This runs only after the final parent/child proof releases the
         // shared lease. A poisoned mutex means shutdown is already
         // inconsistent; never panic from Drop.
-        if let Some(owner) = self.owner.upgrade() {
-            if let Ok(mut active) = owner.lock() {
-                active.remove(&self.key);
-            }
+        if let Some(owner) = self.owner.upgrade()
+            && let Ok(mut active) = owner.lock()
+        {
+            active.remove(&self.key);
         }
     }
 }
