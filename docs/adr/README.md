@@ -118,6 +118,7 @@ code-anchors:
 - ADR-0097 — durable MV 与维护基表 identity 为何保持 opaque、只在 provider-local 边界解释（active）
 - ADR-0089 — Predicate-driven Parquet page pruning 为何只在 FS reader-open 按实际 physical leaf 计算（active）
 - ADR-0104 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
+- ADR-0110 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 
 #### 历史
 
@@ -188,6 +189,7 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 
 
 - ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
+- ADR-0110 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 
 #### 历史
 
