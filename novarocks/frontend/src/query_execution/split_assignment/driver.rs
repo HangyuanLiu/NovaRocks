@@ -157,6 +157,11 @@ pub(crate) struct SplitAssignmentDriver {
     catalog: CatalogHandle,
     transport: std::sync::Arc<dyn TaskUpdateTransport>,
     /// Admitted tasks per plan node, frozen before the Init barrier.
+    ///
+    /// Keyed by plan node alone rather than by (fragment, plan node): the
+    /// distributed planner allocates node ids from one counter spanning every
+    /// fragment, so two fragments cannot share one. If that ever changes, this
+    /// map would silently merge two scans' task sets.
     tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
     sequences: BTreeMap<AssignmentTarget, PlanNodeAssignmentState>,
     task_state: BTreeMap<AssignmentTarget, TaskState>,
