@@ -1575,7 +1575,7 @@ fn join_channel_terminal_values(
     left: RuntimeFilterChannelTerminal,
     right: RuntimeFilterChannelTerminal,
 ) -> Option<RuntimeFilterChannelTerminal> {
-    use RuntimeFilterChannelTerminal::{Completed, Unavailable};
+    use RuntimeFilterChannelTerminal::{Cancelled, Completed, Unavailable};
 
     match (left, right) {
         (Completed(left), Completed(right)) => Some(Completed(left.max(right))),
@@ -1583,6 +1583,16 @@ fn join_channel_terminal_values(
         | (Unavailable(UnavailableReason::IncompleteCoverage), Completed(version)) => {
             Some(Completed(version))
         }
+        // A producer may complete after publishing a logical snapshot while a
+        // consumer-specific materialization is unavailable. The unavailable
+        // result is the channel's fail-open terminal, not a protocol conflict.
+        (Completed(_), Unavailable(reason)) | (Unavailable(reason), Completed(_)) => {
+            Some(Unavailable(reason))
+        }
+        // Cancellation may race with a terminal report on another driver. It
+        // only describes that this observer stopped waiting; a specific
+        // completed or unavailable result remains the authoritative terminal.
+        (Cancelled, terminal) | (terminal, Cancelled) => Some(terminal),
         (left, right) if left == right => Some(left),
         _ => None,
     }
@@ -1925,6 +1935,82 @@ mod tests {
                 channel.terminal(),
                 Some(RuntimeFilterChannelTerminal::Completed(
                     LogicalVersion::FIRST
+                ))
+            );
+            assert_eq!(channel.completed(), 1);
+            assert_eq!(channel.unavailable(), 1);
+        }
+    }
+
+    #[test]
+    fn cancellation_race_preserves_a_specific_channel_terminal() {
+        for completed_first in [false, true] {
+            let fixture = fixture();
+            let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+            let completed = BackendRuntimeFilterEvent::ChannelCompleted {
+                channel: fixture.producer_channel,
+                version: LogicalVersion::FIRST,
+            };
+            let cancelled = BackendRuntimeFilterEvent::ChannelCancelled {
+                channel: fixture.producer_channel,
+            };
+            if completed_first {
+                emitter.record(completed);
+                emitter.record(cancelled);
+            } else {
+                emitter.record(cancelled);
+                emitter.record(completed);
+            }
+
+            let captured = emitter.capture();
+            let channel = captured
+                .channels()
+                .iter()
+                .find(|channel| channel.identity() == fixture.producer_channel)
+                .expect("producer channel observation")
+                .clone();
+            assert_eq!(
+                channel.terminal(),
+                Some(RuntimeFilterChannelTerminal::Completed(
+                    LogicalVersion::FIRST
+                ))
+            );
+            assert_eq!(channel.completed(), 1);
+            assert_eq!(channel.cancelled(), 1);
+        }
+    }
+
+    #[test]
+    fn materialization_unavailable_race_is_fail_open_and_order_independent() {
+        for completed_first in [false, true] {
+            let fixture = fixture();
+            let emitter = RuntimeFilterObservationEmitter::from_install(&fixture.install, None);
+            let completed = BackendRuntimeFilterEvent::ChannelCompleted {
+                channel: fixture.producer_channel,
+                version: LogicalVersion::FIRST,
+            };
+            let unavailable = BackendRuntimeFilterEvent::ChannelUnavailable {
+                channel: fixture.producer_channel,
+                reason: UnavailableReason::MaterializationFailed,
+            };
+            if completed_first {
+                emitter.record(completed);
+                emitter.record(unavailable);
+            } else {
+                emitter.record(unavailable);
+                emitter.record(completed);
+            }
+
+            let captured = emitter.capture();
+            let channel = captured
+                .channels()
+                .iter()
+                .find(|channel| channel.identity() == fixture.producer_channel)
+                .expect("producer channel observation");
+            assert_eq!(
+                channel.terminal(),
+                Some(RuntimeFilterChannelTerminal::Unavailable(
+                    UnavailableReason::MaterializationFailed
                 ))
             );
             assert_eq!(channel.completed(), 1);
