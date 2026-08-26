@@ -129,9 +129,6 @@ pub struct NativeFragmentService {
     /// and fragment instance, so a replaced attempt gets a fresh queue set and
     /// can never inherit a sequence space.
     split_queues: Arc<novarocks_execution::connector::SplitQueueRegistry>,
-    /// Typed connector providers installed for this backend, keyed by the exact
-    /// binding generation. The server composition root owns installation.
-    typed_providers: Arc<crate::connector::TypedConnectorProviderRegistry>,
     lifecycle_observer: Option<LifecycleObserver>,
     #[cfg(test)]
     after_lifecycle_admission: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -197,7 +194,6 @@ impl NativeFragmentService {
             commit_port: Arc::new(BackendSinkCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
             split_queues: Arc::new(novarocks_execution::connector::SplitQueueRegistry::new()),
-            typed_providers: Arc::new(crate::connector::TypedConnectorProviderRegistry::new()),
             lifecycle_observer: None,
             #[cfg(test)]
             after_lifecycle_admission: None,
@@ -311,7 +307,7 @@ impl NativeFragmentService {
         )
         .expect("a query execution id is never an empty session query id");
         crate::fragment::decode::plan::context::TypedScanRuntime::new(
-            Arc::clone(&self.typed_providers),
+            self.execution_host.typed_providers(),
             queues,
             session,
         )

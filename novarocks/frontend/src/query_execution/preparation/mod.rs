@@ -24,6 +24,18 @@ pub(crate) mod runtime_filter_view;
 pub(crate) mod scan;
 pub(crate) mod scan_preparation;
 mod topology;
+// MIGRATION: the round driver that consumes the typed scan lowering lands in a
+// later task of the same arc; until then nothing calls into these modules.
+#[allow(
+    dead_code,
+    reason = "Consumed by the typed connector round driver later in this arc."
+)]
+pub(crate) mod typed_predicate;
+#[allow(
+    dead_code,
+    reason = "Consumed by the typed connector round driver later in this arc."
+)]
+pub(crate) mod typed_scan;
 
 use std::collections::{BTreeMap, BTreeSet};
 

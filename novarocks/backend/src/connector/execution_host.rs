@@ -50,6 +50,14 @@ pub struct ConnectorExecutionHost {
 
 struct ExecutionHostState {
     installers: BTreeMap<ConnectorExecutionProviderKind, Arc<dyn ConnectorExecutionInstaller>>,
+    /// Per-provider worker factories, sealed at startup like the installers.
+    /// A generation gets its typed entry the moment its binding is ensured, so
+    /// "installed" has exactly one meaning on this backend.
+    typed_factories: BTreeMap<
+        ConnectorExecutionProviderKind,
+        Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+    >,
+    typed_registry: Arc<super::TypedConnectorProviderRegistry>,
     bindings: BTreeMap<ConnectorExecutionBindingKey, Arc<BindingCell>>,
     retiring: BTreeSet<ConnectorExecutionBindingKey>,
     query_leases: BTreeMap<QueryExecutionId, BTreeSet<ConnectorExecutionBindingKey>>,
@@ -218,6 +226,13 @@ impl ConnectorExecutionHost {
     /// ready. There is intentionally no runtime registration operation.
     pub fn try_new(
         installers: impl IntoIterator<Item = Arc<dyn ConnectorExecutionInstaller>>,
+        typed_factories: impl IntoIterator<
+            Item = (
+                ConnectorExecutionProviderKind,
+                Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+            ),
+        >,
+        typed_registry: Arc<super::TypedConnectorProviderRegistry>,
     ) -> Result<Self, ConnectorError> {
         let mut sealed_installers = BTreeMap::new();
         for installer in installers {
@@ -237,9 +252,20 @@ impl ConnectorExecutionHost {
                 ));
             }
         }
+        let mut sealed_typed_factories = BTreeMap::new();
+        for (kind, factory) in typed_factories {
+            if sealed_typed_factories.insert(kind, factory).is_some() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!("startup typed factory set contains duplicate {kind:?} factory"),
+                ));
+            }
+        }
         Ok(Self {
             state: Arc::new(Mutex::new(ExecutionHostState {
                 installers: sealed_installers,
+                typed_factories: sealed_typed_factories,
+                typed_registry,
                 bindings: BTreeMap::new(),
                 retiring: BTreeSet::new(),
                 query_leases: BTreeMap::new(),
@@ -253,6 +279,8 @@ impl ConnectorExecutionHost {
         Self {
             state: Arc::new(Mutex::new(ExecutionHostState {
                 installers: BTreeMap::new(),
+                typed_factories: BTreeMap::new(),
+                typed_registry: Arc::new(super::TypedConnectorProviderRegistry::new()),
                 bindings: BTreeMap::new(),
                 retiring: BTreeSet::new(),
                 query_leases: BTreeMap::new(),
@@ -342,6 +370,26 @@ impl ConnectorExecutionHost {
         }
         match completion {
             Completion::Ready(_) => {
+                // The typed entry appears exactly when the binding does, so the
+                // worker decode path and the host never disagree about which
+                // generation is installed. Ensure is retried on an ambiguous
+                // response, so an existing identical entry is success.
+                if let Some(factory) = state
+                    .typed_factories
+                    .get(&declaration.provider_kind())
+                    .cloned()
+                {
+                    let providers = super::TypedConnectorProviders::new(factory);
+                    if let Err(error) = state.typed_registry.install(&key, providers)
+                        && state.typed_registry.resolve(&key).is_err()
+                    {
+                        drop(state);
+                        return rejected(internal_failure(&ConnectorError::new(
+                            ConnectorErrorKind::Internal,
+                            error.to_string(),
+                        )));
+                    }
+                }
                 state.query_leases.entry(query).or_default().insert(key);
                 drop(state);
                 self.publish_resource_snapshot();
@@ -406,7 +454,24 @@ impl ConnectorExecutionHost {
             );
         }
         state.retiring.insert(key.clone());
+        // Retiring the typed entry alongside the binding is what makes a stale
+        // generation unresolvable: a fragment decoded after this point can no
+        // longer reach a provider whose credentials and clients are going away.
+        state.typed_registry.retire(key);
         RetireConnectorExecutionBindingResult::new(RetireConnectorExecutionBindingOutcome::Accepted)
+    }
+
+    /// The typed provider registry this host writes on ensure and clears on
+    /// retire. The fragment runtime reads it at decode, so both roles agree on
+    /// which generation is installed instead of keeping two answers.
+    pub fn typed_providers(&self) -> Arc<super::TypedConnectorProviderRegistry> {
+        match self.state.lock() {
+            Ok(state) => Arc::clone(&state.typed_registry),
+            // A poisoned host cannot resolve any generation; an empty registry
+            // makes every typed scan fail closed rather than silently reach a
+            // provider whose host state is unknown.
+            Err(_) => Arc::new(super::TypedConnectorProviderRegistry::new()),
+        }
     }
 
     pub fn resolver_for(&self, query: QueryExecutionId) -> ConnectorExecutionQueryResolver {
@@ -803,8 +868,20 @@ mod tests {
         })
     }
 
+    /// Build a host with no typed factories: these tests exercise the SPI
+    /// installer lifecycle, and a typed factory would add nothing to it.
+    fn try_host(
+        installers: impl IntoIterator<Item = Arc<dyn ConnectorExecutionInstaller>>,
+    ) -> Result<ConnectorExecutionHost, ConnectorError> {
+        ConnectorExecutionHost::try_new(
+            installers,
+            std::iter::empty(),
+            Arc::new(super::super::TypedConnectorProviderRegistry::new()),
+        )
+    }
+
     fn host(installs: Arc<AtomicUsize>, error: Option<ConnectorError>) -> ConnectorExecutionHost {
-        ConnectorExecutionHost::try_new([
+        try_host([
             installer(ConnectorExecutionProviderKind::Iceberg, installs, error),
             installer(
                 ConnectorExecutionProviderKind::StarRocks,
@@ -842,7 +919,7 @@ mod tests {
     fn sealed_set_rejects_missing_and_duplicate_installers() {
         let installs = Arc::new(AtomicUsize::new(0));
         assert!(
-            ConnectorExecutionHost::try_new([installer(
+            try_host([installer(
                 ConnectorExecutionProviderKind::Iceberg,
                 Arc::clone(&installs),
                 None,
@@ -850,7 +927,7 @@ mod tests {
             .is_err()
         );
         assert!(
-            ConnectorExecutionHost::try_new([
+            try_host([
                 installer(
                     ConnectorExecutionProviderKind::Iceberg,
                     Arc::clone(&installs),
