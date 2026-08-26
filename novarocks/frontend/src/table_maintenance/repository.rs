@@ -51,7 +51,7 @@ use super::model::{
     DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
     DistributedRewriteOpaquePayload, DistributedRewriteOperation,
     DistributedRewriteOperationCreate, DistributedRewriteOperationState,
-    DistributedRewritePlanPayload, GcOwnedRefObservation, METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES,
+    DistributedRewritePlanPayload, METADATA_MAINTENANCE_MAX_PAYLOAD_BYTES,
     METADATA_MAINTENANCE_OPERATION_SCHEMA_VERSION, MaintenanceAuthorityV1,
     MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload, MetadataMaintenanceOperation,
     MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationState,
@@ -61,7 +61,7 @@ use super::model::{
     StoredDistributedRewriteAttemptV3, StoredDistributedRewriteOperationV3,
     StoredDistributedRewritePayloadKindV3, StoredDistributedRewritePayloadV3,
     StoredDistributedRewriteTransactionActionV3, StoredDistributedRewriteTransactionV3,
-    StoredGcOwnedRefObservationV7, StoredMaintenanceTargetV1, StoredMetadataMaintenanceOperationV2,
+    StoredMaintenanceTargetV1, StoredMetadataMaintenanceOperationV2,
     StoredMetadataMaintenancePayloadKindV2, StoredMetadataMaintenancePayloadV2,
     StoredMetadataMaintenanceTransactionActionV2, StoredMetadataMaintenanceTransactionV2,
     StoredOptimizeCounterV1, StoredOptimizeJobStateV1, StoredOptimizeJobV1,
@@ -100,8 +100,6 @@ const CLEANUP_BATCH_PREFIX: &str = "novarocks/frontend/table-maintenance/v4/clea
 const CLEANUP_STATE_PREFIX: &str = "novarocks/frontend/table-maintenance/v4/cleanup/state/";
 const CLEANUP_TRANSACTION_PREFIX: &str =
     "novarocks/frontend/table-maintenance/v4/cleanup/transactions/";
-const GC_OWNED_REF_OBSERVATION_PREFIX: &str =
-    "novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/";
 
 fn is_optimize_schema_version(version: u8) -> bool {
     version == OPTIMIZE_JOB_SCHEMA_VERSION
@@ -6892,137 +6890,6 @@ pub struct CleanupOperationRepository {
     metrics: Arc<StateStoreMetrics>,
 }
 
-/// Result of recording one provider-validated owned-ref observation.
-///
-/// `NotMature` is the only result for a first observation or a changed tuple.
-/// Callers must treat every repository error as not mature and must not issue
-/// a catalog deletion from that cycle.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GcOwnedRefObservationDecision {
-    NotMature { first_observed_at_ms: i64 },
-    Mature { first_observed_at_ms: i64 },
-}
-
-/// Durable, frontend-owned clock for catalog refs that are eligible for GC.
-///
-/// The repository never lists, adopts, resumes, publishes, or deletes any
-/// catalog object. It only maintains a bounded first-observation record keyed
-/// by `(table UUID, ref name)` for the cleanup runtime's two-observation
-/// safety check.
-#[derive(Clone)]
-pub struct GcOwnedRefObservationRepository {
-    store: Arc<dyn StateStore>,
-    durable: DurableRecordStore,
-    metrics: Arc<StateStoreMetrics>,
-}
-
-impl fmt::Debug for GcOwnedRefObservationRepository {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GcOwnedRefObservationRepository")
-            .field("provider", &self.metrics.provider())
-            .finish_non_exhaustive()
-    }
-}
-
-impl GcOwnedRefObservationRepository {
-    pub async fn open(store: Arc<dyn StateStore>) -> RepositoryResult<Self> {
-        Ok(Self {
-            metrics: Arc::new(StateStoreMetrics::new(store.metrics_snapshot().provider)),
-            durable: DurableRecordStore::new(Arc::clone(&store)),
-            store,
-        })
-    }
-
-    /// Atomically record or compare one exact owned-ref fact tuple.
-    ///
-    /// The initial or changed tuple is written with `now_ms` and always
-    /// returns `NotMature`. Only a later exact tuple can return `Mature`, and
-    /// only after `safe_gc_age_ms` has elapsed from that durable first
-    /// observation. A store, decode, or commit-unknown error is returned to
-    /// the caller rather than being interpreted as maturity.
-    pub async fn observe(
-        &self,
-        observation: GcOwnedRefObservation,
-        now_ms: i64,
-        safe_gc_age_ms: i64,
-    ) -> RepositoryResult<GcOwnedRefObservationDecision> {
-        validate_gc_owned_ref_observation(&observation)?;
-        if now_ms <= 0 {
-            return Err(RepositoryError::corruption(
-                "GC owned-ref observation time must be positive",
-            ));
-        }
-        if safe_gc_age_ms <= 0 {
-            return Err(RepositoryError::corruption(
-                "GC owned-ref safe age must be positive",
-            ));
-        }
-
-        let operation_id = OperationId::new_v7();
-        let durable = self.durable.clone();
-        let result = run_side_effect_free(
-            self.store.as_ref(),
-            self.metrics.as_ref(),
-            operation_id,
-            "record frontend GC owned-ref observation",
-            move |transaction| {
-                let observation = observation.clone();
-                let durable = durable.clone();
-                Box::pin(async move {
-                    apply_gc_owned_ref_observation(
-                        transaction,
-                        &durable,
-                        observation,
-                        now_ms,
-                        safe_gc_age_ms,
-                    )
-                    .await
-                })
-            },
-        )
-        .await;
-        match result {
-            Ok(success) => success.value,
-            Err(failure) => Err(format_run_failure(
-                "record frontend GC owned-ref observation",
-                failure,
-            )),
-        }
-    }
-
-    /// Forget a record only after the cleanup runtime has observed the ref as
-    /// absent or has retired it with its own exact catalog CAS. If the ref is
-    /// later recreated, its next observation therefore starts a fresh age
-    /// window instead of inheriting stale eligibility.
-    pub async fn remove(&self, table_uuid: Uuid, ref_name: String) -> RepositoryResult<bool> {
-        GcOwnedRefObservation::validate_key(table_uuid, &ref_name).map_err(|error| {
-            RepositoryError::corruption(format!("invalid GC owned-ref key: {error}"))
-        })?;
-        let operation_id = OperationId::new_v7();
-        let result = run_side_effect_free(
-            self.store.as_ref(),
-            self.metrics.as_ref(),
-            operation_id,
-            "remove frontend GC owned-ref observation",
-            move |transaction| {
-                let ref_name = ref_name.clone();
-                Box::pin(async move {
-                    apply_remove_gc_owned_ref_observation(transaction, table_uuid, ref_name).await
-                })
-            },
-        )
-        .await;
-        match result {
-            Ok(success) => success.value,
-            Err(failure) => Err(format_run_failure(
-                "remove frontend GC owned-ref observation",
-                failure,
-            )),
-        }
-    }
-}
-
 impl fmt::Debug for CleanupOperationRepository {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -7965,117 +7832,6 @@ impl CleanupOperationRepository {
         result.sort_by_key(|value| value.operation_id);
         Ok(result)
     }
-}
-
-async fn apply_gc_owned_ref_observation(
-    transaction: &mut dyn WriteTransaction,
-    durable: &DurableRecordStore,
-    observation: GcOwnedRefObservation,
-    now_ms: i64,
-    safe_gc_age_ms: i64,
-) -> TransactionResult<GcOwnedRefObservationDecision> {
-    let key = match gc_owned_ref_observation_key(&observation.table_uuid, &observation.ref_name) {
-        Ok(key) => key,
-        Err(error) => return Ok(Err(error)),
-    };
-    let current = transaction.get(&key).await?;
-    let Some(current) = current else {
-        let first = GcOwnedRefObservation {
-            first_observed_at_ms: now_ms,
-            ..observation
-        };
-        let stored = StoredGcOwnedRefObservationV7::from(&first);
-        let value = match encode_durable_record(durable, &stored) {
-            Ok(value) => value,
-            Err(error) => return Ok(Err(error)),
-        };
-        durable
-            .put_record(transaction, key, value, Precondition::Absent)
-            .await?;
-        return Ok(Ok(GcOwnedRefObservationDecision::NotMature {
-            first_observed_at_ms: first.first_observed_at_ms,
-        }));
-    };
-
-    let prior = match decode_gc_owned_ref_observation(current.clone()) {
-        Ok(value) => value,
-        Err(error) => return Ok(Err(error)),
-    };
-    if prior.table_uuid != observation.table_uuid || prior.ref_name != observation.ref_name {
-        return Ok(Err(RepositoryError::corruption(
-            "GC owned-ref observation record identity does not match its key",
-        )));
-    }
-    if prior.matches_facts(&observation) {
-        let mature_at_ms = prior
-            .first_observed_at_ms
-            .checked_add(safe_gc_age_ms)
-            .ok_or_else(|| {
-                StateStoreError::new(
-                    StateStoreErrorKind::Internal,
-                    "GC owned-ref maturity time overflow",
-                )
-            })?;
-        return Ok(Ok(if now_ms > mature_at_ms {
-            GcOwnedRefObservationDecision::Mature {
-                first_observed_at_ms: prior.first_observed_at_ms,
-            }
-        } else {
-            GcOwnedRefObservationDecision::NotMature {
-                first_observed_at_ms: prior.first_observed_at_ms,
-            }
-        }));
-    }
-
-    let replacement = GcOwnedRefObservation {
-        first_observed_at_ms: now_ms,
-        ..observation
-    };
-    let stored = StoredGcOwnedRefObservationV7::from(&replacement);
-    let value = match encode_durable_record(durable, &stored) {
-        Ok(value) => value,
-        Err(error) => return Ok(Err(error)),
-    };
-    durable
-        .put_record(
-            transaction,
-            key,
-            value,
-            Precondition::Version(current.version),
-        )
-        .await?;
-    Ok(Ok(GcOwnedRefObservationDecision::NotMature {
-        first_observed_at_ms: replacement.first_observed_at_ms,
-    }))
-}
-
-async fn apply_remove_gc_owned_ref_observation(
-    transaction: &mut dyn WriteTransaction,
-    table_uuid: Uuid,
-    ref_name: String,
-) -> TransactionResult<bool> {
-    let key = match gc_owned_ref_observation_key(&table_uuid, &ref_name) {
-        Ok(key) => key,
-        Err(error) => return Ok(Err(error)),
-    };
-    let Some(current) = transaction.get(&key).await? else {
-        return Ok(Ok(false));
-    };
-    // Decode before deleting: corrupted state must fail closed rather than
-    // permitting a later observation to silently inherit an unknown clock.
-    let prior = match decode_gc_owned_ref_observation(current.clone()) {
-        Ok(value) => value,
-        Err(error) => return Ok(Err(error)),
-    };
-    if prior.table_uuid != table_uuid || prior.ref_name != ref_name {
-        return Ok(Err(RepositoryError::corruption(
-            "GC owned-ref observation record identity does not match its key",
-        )));
-    }
-    transaction
-        .delete(key, Precondition::Version(current.version))
-        .await?;
-    Ok(Ok(true))
 }
 
 struct VersionedStoredCleanupOperation {
@@ -9053,37 +8809,6 @@ fn cleanup_checkpoint_from_stored(value: StoredCleanupBatchV4) -> CleanupBatchCh
         failed_count: value.failed_count,
         unknown_count: value.unknown_count,
     }
-}
-
-fn validate_gc_owned_ref_observation(observation: &GcOwnedRefObservation) -> RepositoryResult<()> {
-    observation.validate().map_err(|error| {
-        RepositoryError::corruption(format!("invalid GC owned-ref observation: {error}"))
-    })
-}
-
-fn decode_gc_owned_ref_observation(record: StateRecord) -> RepositoryResult<GcOwnedRefObservation> {
-    let stored: StoredGcOwnedRefObservationV7 =
-        decode_cleanup_json(record.value.as_bytes(), "GC owned-ref observation")?;
-    GcOwnedRefObservation::try_from(stored).map_err(|error| {
-        RepositoryError::corruption(format!("invalid GC owned-ref observation: {error}"))
-    })
-}
-
-fn gc_owned_ref_observation_key(table_uuid: &Uuid, ref_name: &str) -> RepositoryResult<Key> {
-    // The name is hex-encoded rather than appended directly, so a catalog ref
-    // cannot change the StateStore namespace structure or collide with an
-    // unrelated key through path separators.
-    GcOwnedRefObservation::validate_key(*table_uuid, ref_name).map_err(|error| {
-        RepositoryError::corruption(format!("invalid GC owned-ref key: {error}"))
-    })?;
-    make_key(
-        format!(
-            "{GC_OWNED_REF_OBSERVATION_PREFIX}{}/{}",
-            table_uuid,
-            hex::encode(ref_name.as_bytes())
-        ),
-        "build GC owned-ref observation key",
-    )
 }
 
 fn decode_cleanup_json<T>(bytes: &[u8], context: &str) -> RepositoryResult<T>

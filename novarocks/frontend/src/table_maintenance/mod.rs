@@ -59,18 +59,20 @@ use self::coordination::{
     MaintenanceAcquireOutcome, MaintenanceCoordination, MaintenanceFenceValidator,
     MaintenanceLeaseAttempt,
 };
+use self::gc_observation::{
+    GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
+};
 use self::model::{
     CleanupBatchCheckpoint, CleanupOperationCreate, CleanupOperationState, CleanupPlanPayload,
     DistributedRewriteAttemptCheckpoint, DistributedRewriteAttemptDisposition,
     DistributedRewriteOpaquePayload, DistributedRewriteOperationCreate,
-    DistributedRewriteOperationKind, DistributedRewritePlanPayload, GcOwnedRefObservation,
-    MaintenanceAuthorityV1, MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload,
+    DistributedRewriteOperationKind, DistributedRewritePlanPayload, MaintenanceAuthorityV1,
+    MetadataMaintenanceExactOwner, MetadataMaintenanceOpaquePayload,
     MetadataMaintenanceOperationCreate, MetadataMaintenanceOperationKind,
     MetadataMaintenancePlanPayload, OptimizeJobCreate,
 };
 use self::repository::{
     CleanupOperationRepository, DistributedRewriteOperationRepository,
-    GcOwnedRefObservationDecision, GcOwnedRefObservationRepository,
     MetadataMaintenanceOperationRepository, OptimizeJobRepository, RepositoryErrorKind,
     cleanup_payload_digest, distributed_rewrite_payload_digest,
     metadata_maintenance_payload_digest,
@@ -80,6 +82,7 @@ use self::worker::OptimizeWorker;
 
 pub mod admission;
 pub mod coordination;
+pub mod gc_observation;
 pub mod model;
 pub mod repository;
 pub mod result;
@@ -129,7 +132,7 @@ pub struct FrontendTableMaintenanceService {
     metadata_repository: Option<Arc<MetadataMaintenanceOperationRepository>>,
     distributed_rewrite_repository: Option<Arc<DistributedRewriteOperationRepository>>,
     cleanup_repository: Option<Arc<CleanupOperationRepository>>,
-    gc_owned_ref_observation_repository: Option<Arc<GcOwnedRefObservationRepository>>,
+    gc_owned_ref_observation_repository: Option<Arc<GcOwnedRefObservationAccelerator>>,
     coordination: Option<MaintenanceCoordination>,
     worker: Mutex<WorkerLifecycle>,
     runtime: Handle,
@@ -197,7 +200,7 @@ impl FrontendTableMaintenanceService {
                         })?,
                 )),
                 Some(Arc::new(
-                    GcOwnedRefObservationRepository::open(Arc::clone(&store))
+                    GcOwnedRefObservationAccelerator::open(Arc::clone(&store))
                         .await
                         .map_err(|error| {
                             format!(
@@ -262,7 +265,7 @@ impl FrontendTableMaintenanceService {
     /// adds only the restart-safe temporal proof and never deletes a ref.
     fn observe_mature_owned_refs(
         &self,
-        repository: &GcOwnedRefObservationRepository,
+        repository: &GcOwnedRefObservationAccelerator,
         candidates: &[ConnectorCleanupCandidate],
         now_ms: i64,
         safe_gc_age_ms: i64,
