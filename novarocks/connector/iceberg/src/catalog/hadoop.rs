@@ -29,7 +29,9 @@ use super::error::{CatalogOutcome, CatalogUnsupported};
 use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use super::{
     CatalogCreateIntent, CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName,
-    CatalogTransactionStart, NovaRocksCatalog,
+    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
+    ConditionalCreateFacts, ConditionalCreateReceipt, ConditionalCreateRequest,
+    ConditionalCreateVerdict, NovaRocksCatalog,
 };
 
 /// A Hadoop filesystem Iceberg catalog.
@@ -201,6 +203,126 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         self.delegate.register_table(table, metadata_location).await
     }
 
+    /// Prepare the conditional metadata write that makes this table exist.
+    ///
+    /// Local only: it builds metadata and sends nothing, which is what lets the
+    /// caller freeze publication evidence before the attempt is dispatched.
+    async fn stage_create_table(
+        &self,
+        _namespace: CatalogNamespaceName,
+        _creation: crate::iceberg::TableCreation,
+    ) -> super::StagedCreateStart {
+        super::StagedCreateStart::Unsupported(CatalogUnsupported::new(
+            "Hadoop Iceberg catalog has no staged-create protocol",
+        ))
+    }
+
+    async fn commit_staged_table(
+        &self,
+        _commit: crate::iceberg::TableCommit,
+    ) -> super::StagedCommitResult {
+        super::StagedCommitResult::Unsupported(CatalogUnsupported::new(
+            "Hadoop Iceberg catalog has no staged-create protocol",
+        ))
+    }
+
+    async fn prepare_conditional_create(
+        &self,
+        request: ConditionalCreateRequest,
+    ) -> CatalogOutcome<ConditionalCreateAttempt> {
+        let namespace = match super::delegate::namespace_ident(&request.namespace) {
+            Ok(ident) => ident,
+            Err(error) => {
+                return CatalogOutcome::uncommitted(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
+                    error.to_string(),
+                );
+            }
+        };
+        match self.client.prepare_create_attempt(
+            &namespace,
+            request.creation,
+            request.operation_id.to_string(),
+        ) {
+            Ok(attempt) => {
+                let facts = facts_from_hadoop(attempt.facts());
+                CatalogOutcome::committed(
+                    ConditionalCreateAttempt::hadoop(attempt, facts),
+                    novarocks_spi::connector::ExternalMutationEffect::NoOp,
+                )
+            }
+            // Preparing never dispatches, so every failure here is proven
+            // uncommitted -- including an unsupported storage binding, which is
+            // checked before any directory is created.
+            Err(failure) => map_prepare_failure(&failure),
+        }
+    }
+
+    async fn publish_conditional_create(
+        &self,
+        attempt: ConditionalCreateAttempt,
+    ) -> CatalogOutcome<ConditionalCreateReceipt> {
+        let facts = attempt.facts.clone();
+        let Some(attempt) = attempt.into_hadoop() else {
+            return CatalogOutcome::uncommitted(
+                novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
+                "conditional create attempt was not prepared by this catalog",
+            );
+        };
+        match self.client.publish_create_attempt(attempt).await {
+            Ok(result) => CatalogOutcome::committed(
+                ConditionalCreateReceipt {
+                    facts,
+                    already_existed: matches!(
+                        result.disposition,
+                        crate::hadoop_catalog::HadoopCreateDisposition::Existing
+                    ),
+                    authoritative_table_uuid: Arc::from(result.authoritative_table_uuid),
+                    authoritative_metadata_digest: Arc::from(result.authoritative_metadata_digest),
+                    published_metadata_location: result.table.metadata_location().map(Arc::from),
+                    finalization_failure: result.finalization_failure.map(Arc::from),
+                },
+                novarocks_spi::connector::ExternalMutationEffect::Applied,
+            ),
+            Err(failure) => map_publish_failure(&failure, &facts),
+        }
+    }
+
+    async fn adjudicate_conditional_create(
+        &self,
+        evidence: ConditionalCreateEvidence,
+    ) -> Result<ConditionalCreateVerdict, ConnectorError> {
+        let outcome = self
+            .client
+            .reconcile_create_attempt(
+                &evidence.namespace,
+                &evidence.table,
+                &evidence.expected_table_uuid,
+                &evidence.metadata_location,
+                &evidence.metadata_digest,
+            )
+            .await
+            .map_err(|error| {
+                ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                    error,
+                )
+            })?;
+        Ok(match outcome {
+            crate::hadoop_catalog::HadoopCreateReconciliation::Committed {
+                finalization_failure,
+            } => ConditionalCreateVerdict::Committed {
+                finalization_failure: finalization_failure.map(Arc::from),
+            },
+            crate::hadoop_catalog::HadoopCreateReconciliation::Absent => {
+                ConditionalCreateVerdict::Absent
+            }
+            crate::hadoop_catalog::HadoopCreateReconciliation::Foreign => {
+                ConditionalCreateVerdict::Foreign
+            }
+        })
+    }
+
     async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
         super::start_update_table_transaction(&self.delegate, request)
     }
@@ -227,5 +349,63 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         CatalogTransactionStart::Unsupported(CatalogUnsupported::new(
             "Hadoop Iceberg catalog cannot replace a table atomically",
         ))
+    }
+}
+
+fn facts_from_hadoop(
+    facts: &crate::hadoop_catalog::HadoopCreateAttemptFacts,
+) -> ConditionalCreateFacts {
+    ConditionalCreateFacts {
+        operation_id: Arc::from(facts.operation_id.as_str()),
+        table_uuid: Arc::from(facts.table_uuid.as_str()),
+        metadata_location: Arc::from(facts.metadata_location.as_str()),
+        metadata_digest: Arc::from(facts.metadata_digest.as_str()),
+    }
+}
+
+/// Preparing sends nothing, so its failures are all proven uncommitted.
+fn map_prepare_failure<T>(
+    failure: &crate::hadoop_catalog::HadoopCreateFailure,
+) -> CatalogOutcome<T> {
+    use crate::hadoop_catalog::HadoopCreateFailureKind as Kind;
+    use novarocks_spi::connector::ConnectorMutationFailureKind as Neutral;
+    match failure.kind {
+        Kind::Unsupported => CatalogOutcome::unsupported(failure.message.clone()),
+        Kind::Invalid => CatalogOutcome::uncommitted(Neutral::InvalidRequest, message(failure)),
+        // Preparation cannot reach these, but classifying them as unknown keeps
+        // the conservative answer if it ever does.
+        Kind::Uncommitted => CatalogOutcome::uncommitted(Neutral::Unavailable, message(failure)),
+        Kind::Unknown => CatalogOutcome::unknown(
+            message(failure),
+            super::error::CatalogCommitEvidence::default(),
+        ),
+    }
+}
+
+fn map_publish_failure<T>(
+    failure: &crate::hadoop_catalog::HadoopCreateFailure,
+    facts: &ConditionalCreateFacts,
+) -> CatalogOutcome<T> {
+    use crate::hadoop_catalog::HadoopCreateFailureKind as Kind;
+    use novarocks_spi::connector::ConnectorMutationFailureKind as Neutral;
+    match failure.kind {
+        Kind::Unsupported => CatalogOutcome::unsupported(failure.message.clone()),
+        Kind::Invalid => CatalogOutcome::uncommitted(Neutral::InvalidRequest, message(failure)),
+        Kind::Uncommitted => CatalogOutcome::uncommitted(Neutral::Unavailable, message(failure)),
+        // The conditional write may have landed. Carry the exact identity a
+        // read-only adjudication needs; nothing here may retry or delete.
+        Kind::Unknown => CatalogOutcome::unknown(
+            message(failure),
+            super::error::CatalogCommitEvidence::default()
+                .with_target_uuid(Arc::clone(&facts.table_uuid))
+                .with_metadata_location(Arc::clone(&facts.metadata_location)),
+        ),
+    }
+}
+
+fn message(failure: &crate::hadoop_catalog::HadoopCreateFailure) -> String {
+    match failure.facts.as_ref() {
+        Some(facts) => format!("{} [operation_id={}]", failure.message, facts.operation_id),
+        None => failure.message.clone(),
     }
 }

@@ -29,7 +29,8 @@ use super::error::CatalogOutcome;
 use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use super::{
     CatalogCreateIntent, CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName,
-    CatalogTransactionStart, NovaRocksCatalog,
+    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
+    ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
 };
 
 /// A REST Iceberg catalog.
@@ -43,6 +44,9 @@ use super::{
 #[derive(Debug)]
 pub(super) struct NovaRocksRestCatalog {
     delegate: CatalogDelegate,
+    /// The REST client, for the staged-create protocol that has no equivalent
+    /// on the generic catalog trait. It never leaves this module.
+    client: Arc<crate::iceberg_catalog_rest::RestCatalog>,
     warehouse: Option<Arc<str>>,
 }
 
@@ -52,7 +56,8 @@ impl NovaRocksRestCatalog {
         warehouse: Option<Arc<str>>,
     ) -> Self {
         Self {
-            delegate: CatalogDelegate::new(client),
+            delegate: CatalogDelegate::new(client.clone()),
+            client,
             warehouse,
         }
     }
@@ -180,6 +185,84 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             table,
             novarocks_spi::connector::ExternalMutationEffect::NoOp,
         )
+    }
+
+    async fn stage_create_table(
+        &self,
+        namespace: CatalogNamespaceName,
+        creation: crate::iceberg::TableCreation,
+    ) -> super::StagedCreateStart {
+        let ident = match super::delegate::namespace_ident(&namespace) {
+            Ok(ident) => ident,
+            Err(error) => return super::StagedCreateStart::KnownUncommitted(error.to_string()),
+        };
+        match self.client.stage_create_table_typed(&ident, creation).await {
+            Ok(staged) => {
+                let (table, initialization_updates) = staged.into_parts();
+                super::StagedCreateStart::Staged {
+                    table,
+                    initialization_updates,
+                }
+            }
+            Err(crate::iceberg_catalog_rest::StagedCreateError::Conflict(error)) => {
+                super::StagedCreateStart::Conflict(error.to_string())
+            }
+            Err(crate::iceberg_catalog_rest::StagedCreateError::KnownNotDispatched(error)) => {
+                super::StagedCreateStart::KnownUncommitted(error.to_string())
+            }
+            Err(crate::iceberg_catalog_rest::StagedCreateError::PossiblyDispatched(error)) => {
+                super::StagedCreateStart::CommitUnknown(error.to_string())
+            }
+        }
+    }
+
+    async fn commit_staged_table(
+        &self,
+        commit: crate::iceberg::TableCommit,
+    ) -> super::StagedCommitResult {
+        match self.client.commit_staged_table_typed(commit).await {
+            Ok(table) => super::StagedCommitResult::Committed(table),
+            Err(crate::iceberg_catalog_rest::StagedCommitError::Conflict(error)) => {
+                super::StagedCommitResult::Conflict(error.to_string())
+            }
+            Err(crate::iceberg_catalog_rest::StagedCommitError::KnownNotDispatched(error)) => {
+                super::StagedCommitResult::KnownUncommitted(error.to_string())
+            }
+            Err(crate::iceberg_catalog_rest::StagedCommitError::PossiblyDispatched(error)) => {
+                super::StagedCommitResult::CommitUnknown(error.to_string())
+            }
+            Err(crate::iceberg_catalog_rest::StagedCommitError::CommittedResponseInvalid(
+                error,
+            )) => super::StagedCommitResult::CommittedResponseInvalid(error.to_string()),
+        }
+    }
+
+    async fn prepare_conditional_create(
+        &self,
+        _request: ConditionalCreateRequest,
+    ) -> CatalogOutcome<ConditionalCreateAttempt> {
+        CatalogOutcome::unsupported(
+            "REST Iceberg catalog publishes a create through the catalog, not through a conditional metadata write",
+        )
+    }
+
+    async fn publish_conditional_create(
+        &self,
+        _attempt: ConditionalCreateAttempt,
+    ) -> CatalogOutcome<ConditionalCreateReceipt> {
+        CatalogOutcome::unsupported(
+            "REST Iceberg catalog publishes a create through the catalog, not through a conditional metadata write",
+        )
+    }
+
+    async fn adjudicate_conditional_create(
+        &self,
+        _evidence: ConditionalCreateEvidence,
+    ) -> Result<ConditionalCreateVerdict, ConnectorError> {
+        Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "REST Iceberg catalog publishes a create through the catalog, not through a conditional metadata write",
+        ))
     }
 
     async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {

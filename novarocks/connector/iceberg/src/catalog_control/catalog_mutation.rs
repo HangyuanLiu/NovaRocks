@@ -590,35 +590,77 @@ fn execute_hadoop_create_table(
             Ok(prepared) => prepared,
             Err(error) => return Ok(known_uncommitted(error)),
         };
-    let hadoop = provider
-        .runtime()
-        .hadoop_catalog()
-        .cloned()
-        .ok_or_else(|| internal("Hadoop catalog runtime is missing its typed client"))?;
+    // The conditional-create primitive is reached through the catalog owner, so
+    // no concrete client escapes the factory. Preparing is local: it builds
+    // metadata and sends nothing, which is what lets publication evidence be
+    // frozen before the attempt is dispatched.
     let operation_id = hex_encode(&request.operation_id.to_bytes());
-    let attempt = match hadoop.prepare_create_attempt(&namespace, creation, operation_id.clone()) {
-        Ok(attempt) => attempt,
-        Err(error) => return Ok(known_uncommitted(map_hadoop_create_failure(&error))),
+    let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
+    let prepare_request = crate::catalog::ConditionalCreateRequest {
+        namespace: crate::catalog::CatalogNamespaceName::new(namespace.to_url_string()),
+        creation,
+        operation_id: std::sync::Arc::from(operation_id.as_str()),
     };
-    let facts = attempt.facts().clone();
-    let evidence = hadoop_create_evidence(provider, request, table, &facts)?;
-    validate_context(&request.context)?;
-    let result = provider
+    let prepared = provider
         .runtime()
         .resources()
         .catalog_runtime()
-        .block_on(async move { hadoop.publish_create_attempt(attempt).await });
-    let result = match result {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => {
-            if error.kind == crate::hadoop_catalog::HadoopCreateFailureKind::Unknown {
-                return Ok(ExternalMutationOutcome::CommitUnknown {
-                    failure: failure(&map_hadoop_create_failure(&error)),
-                    evidence,
-                });
-            }
-            return Ok(known_uncommitted(map_hadoop_create_failure(&error)));
+        .block_on(async move { owner.prepare_conditional_create(prepare_request).await })
+        .map_err(unavailable)?;
+    let (attempt, _effect, _witness) = match prepared {
+        crate::catalog::error::CatalogOutcome::KnownCommitted { .. } => prepared
+            .into_known_committed()
+            .expect("the matched arm is the committed one"),
+        crate::catalog::error::CatalogOutcome::Unsupported(reason) => {
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                reason.message().to_string(),
+            )));
         }
+        crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
+            return Ok(known_uncommitted(map_mutation_failure(&failure)));
+        }
+        crate::catalog::error::CatalogOutcome::CommitUnknown { failure, .. } => {
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                failure.to_string(),
+            )));
+        }
+    };
+    let facts = attempt.facts.clone();
+    let evidence = hadoop_create_evidence(provider, request, table, &facts)?;
+    validate_context(&request.context)?;
+    let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
+    let published = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move { owner.publish_conditional_create(attempt).await });
+    let result = match published {
+        Ok(crate::catalog::error::CatalogOutcome::KnownCommitted { receipt, .. }) => receipt,
+        Ok(crate::catalog::error::CatalogOutcome::Unsupported(reason)) => {
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                reason.message().to_string(),
+            )));
+        }
+        Ok(crate::catalog::error::CatalogOutcome::KnownUncommitted { failure }) => {
+            return Ok(known_uncommitted(map_mutation_failure(&failure)));
+        }
+        Ok(crate::catalog::error::CatalogOutcome::CommitUnknown {
+            failure: unknown_failure,
+            ..
+        }) => {
+            return Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: failure(&ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    unknown_failure.to_string(),
+                )),
+                evidence,
+            });
+        }
+        // The bridge wraps the conditional write, so it cannot prove the write
+        // never happened.
         Err(error) => {
             return Ok(ExternalMutationOutcome::CommitUnknown {
                 failure: failure(&unavailable(error)),
@@ -626,7 +668,7 @@ fn execute_hadoop_create_table(
             });
         }
     };
-    if result.facts.operation_id != operation_id {
+    if result.facts.operation_id.as_ref() != operation_id {
         return Err(internal(
             "Hadoop create result operation identity changed during publication",
         ));
@@ -635,45 +677,39 @@ fn execute_hadoop_create_table(
         .runtime()
         .control_state()
         .invalidate_table_cache(&table.namespace, &table.table);
-    match result.disposition {
-        crate::hadoop_catalog::HadoopCreateDisposition::Created => {
-            Ok(ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
-                receipt: hadoop_create_receipt(
-                    provider,
-                    request.operation_id,
-                    request.operation.kind(),
-                    result.table.metadata_location(),
-                    &result.authoritative_table_uuid,
-                    &result.authoritative_metadata_digest,
-                )?,
-                finalization: hadoop_finalization(result.finalization_failure),
-            })
-        }
-        crate::hadoop_catalog::HadoopCreateDisposition::Existing
-            if policy == CreatePolicy::NoOpIfExists =>
-        {
+    match result.already_existed {
+        false => Ok(ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            receipt: hadoop_create_receipt(
+                provider,
+                request.operation_id,
+                request.operation.kind(),
+                result.published_metadata_location.as_deref(),
+                &result.authoritative_table_uuid,
+                &result.authoritative_metadata_digest,
+            )?,
+            finalization: hadoop_finalization(result.finalization_failure.map(|f| f.to_string())),
+        }),
+        true if policy == CreatePolicy::NoOpIfExists => {
             Ok(ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::NoOp,
                 receipt: hadoop_create_receipt(
                     provider,
                     request.operation_id,
                     request.operation.kind(),
-                    result.table.metadata_location(),
+                    result.published_metadata_location.as_deref(),
                     &result.authoritative_table_uuid,
                     &result.authoritative_metadata_digest,
                 )?,
                 finalization: ExternalMutationFinalization::Complete,
             })
         }
-        crate::hadoop_catalog::HadoopCreateDisposition::Existing => {
-            Ok(ExternalMutationOutcome::KnownUncommitted {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::AlreadyExists,
-                    "Iceberg table already exists",
-                ),
-            })
-        }
+        true => Ok(ExternalMutationOutcome::KnownUncommitted {
+            failure: ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::AlreadyExists,
+                "Iceberg table already exists",
+            ),
+        }),
     }
 }
 
@@ -2448,7 +2484,7 @@ fn hadoop_create_evidence(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
-    facts: &crate::hadoop_catalog::HadoopCreateAttemptFacts,
+    facts: &crate::catalog::ConditionalCreateFacts,
 ) -> Result<ExternalMutationEvidence, ConnectorError> {
     let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
     let table_name = normalize_identifier(&table.table).map_err(invalid)?;
@@ -2459,10 +2495,10 @@ fn hadoop_create_evidence(
         IcebergMutationEvidenceTarget::HadoopCreate {
             namespace,
             table: table_name,
-            expected_uuid: facts.table_uuid.clone(),
-            metadata_location: facts.metadata_location.clone(),
-            metadata_digest: facts.metadata_digest.clone(),
-            operation_id: facts.operation_id.clone(),
+            expected_uuid: facts.table_uuid.to_string(),
+            metadata_location: facts.metadata_location.to_string(),
+            metadata_digest: facts.metadata_digest.to_string(),
+            operation_id: facts.operation_id.to_string(),
         },
     )
 }
@@ -2554,33 +2590,23 @@ fn reconcile_evidence(
                     "Hadoop create evidence operation identity does not match its envelope",
                 ));
             }
-            let hadoop = provider
-                .runtime()
-                .hadoop_catalog()
-                .cloned()
-                .ok_or_else(|| invalid("Hadoop create evidence requires a Hadoop catalog"))?;
-            let reconcile_namespace = namespace.clone();
-            let reconcile_table = table.clone();
-            let reconcile_uuid = expected_uuid.clone();
-            let reconcile_location = metadata_location.clone();
-            let reconcile_digest = metadata_digest.clone();
+            // Read-only adjudication through the catalog owner. Absence stays
+            // ambiguous rather than becoming proof, and nothing here writes.
+            let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
+            let adjudication = crate::catalog::ConditionalCreateEvidence {
+                namespace: std::sync::Arc::from(namespace.as_str()),
+                table: std::sync::Arc::from(table.as_str()),
+                expected_table_uuid: std::sync::Arc::from(expected_uuid.as_str()),
+                metadata_location: std::sync::Arc::from(metadata_location.as_str()),
+                metadata_digest: std::sync::Arc::from(metadata_digest.as_str()),
+            };
             let result = provider
                 .runtime()
                 .resources()
                 .catalog_runtime()
-                .block_on(async move {
-                    hadoop
-                        .reconcile_create_attempt(
-                            &reconcile_namespace,
-                            &reconcile_table,
-                            &reconcile_uuid,
-                            &reconcile_location,
-                            &reconcile_digest,
-                        )
-                        .await
-                });
+                .block_on(async move { owner.adjudicate_conditional_create(adjudication).await });
             match result {
-                Ok(Ok(crate::hadoop_catalog::HadoopCreateReconciliation::Committed {
+                Ok(Ok(crate::catalog::ConditionalCreateVerdict::Committed {
                     finalization_failure,
                 })) => Ok(ExternalMutationOutcome::KnownCommitted {
                     effect: ExternalMutationEffect::Applied,
@@ -2592,15 +2618,18 @@ fn reconcile_evidence(
                         &expected_uuid,
                         &metadata_digest,
                     )?,
-                    finalization: hadoop_finalization(finalization_failure),
+                    finalization: hadoop_finalization(finalization_failure.map(|f| f.to_string())),
                 }),
-                Ok(Ok(crate::hadoop_catalog::HadoopCreateReconciliation::Absent)) => {
+                Ok(Ok(crate::catalog::ConditionalCreateVerdict::Absent)) => {
                     uncommitted("Hadoop create fence is absent")
                 }
-                Ok(Ok(crate::hadoop_catalog::HadoopCreateReconciliation::Foreign)) => {
+                Ok(Ok(crate::catalog::ConditionalCreateVerdict::Foreign)) => {
                     ambiguous("Hadoop create fence belongs to another table incarnation")
                 }
-                Ok(Err(message)) | Err(message) => ambiguous(&format!(
+                Ok(Err(error)) => {
+                    ambiguous(&format!("read authoritative Hadoop create fence: {error}"))
+                }
+                Err(message) => ambiguous(&format!(
                     "read authoritative Hadoop create fence: {message}"
                 )),
             }
@@ -3086,28 +3115,6 @@ fn hadoop_finalization(failure: Option<String>) -> ExternalMutationFinalization 
     }
 }
 
-fn map_hadoop_create_failure(
-    failure: &crate::hadoop_catalog::HadoopCreateFailure,
-) -> ConnectorError {
-    let kind = match failure.kind {
-        crate::hadoop_catalog::HadoopCreateFailureKind::Invalid => {
-            ConnectorErrorKind::InvalidRequest
-        }
-        crate::hadoop_catalog::HadoopCreateFailureKind::Unsupported => {
-            ConnectorErrorKind::Unsupported
-        }
-        crate::hadoop_catalog::HadoopCreateFailureKind::Uncommitted => {
-            ConnectorErrorKind::Unavailable
-        }
-        crate::hadoop_catalog::HadoopCreateFailureKind::Unknown => ConnectorErrorKind::Unavailable,
-    };
-    let message = match failure.facts.as_ref() {
-        Some(facts) => format!("{} [operation_id={}]", failure.message, facts.operation_id),
-        None => failure.message.clone(),
-    };
-    ConnectorError::new(kind, message)
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -3495,23 +3502,35 @@ mod tests {
             properties,
         )
         .expect("prepare table creation");
-        let hadoop = provider
-            .runtime()
-            .hadoop_catalog()
-            .cloned()
-            .expect("Hadoop catalog");
-        let attempt = hadoop
-            .prepare_create_attempt(&namespace, creation, hex_encode(&operation_id.to_bytes()))
-            .expect("prepare attempt");
-        let evidence = hadoop_create_evidence(&provider, &request, table, attempt.facts())
-            .expect("create evidence");
-        provider
+        // Through the catalog owner, like production: no concrete client here.
+        let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
+        let prepare = crate::catalog::ConditionalCreateRequest {
+            namespace: crate::catalog::CatalogNamespaceName::new(namespace.to_url_string()),
+            creation,
+            operation_id: std::sync::Arc::from(hex_encode(&operation_id.to_bytes()).as_str()),
+        };
+        let prepared = provider
             .runtime()
             .resources()
             .catalog_runtime()
-            .block_on(async move { hadoop.publish_create_attempt(attempt).await })
-            .expect("catalog runtime")
-            .expect("publish v1");
+            .block_on(async move { owner.prepare_conditional_create(prepare).await })
+            .expect("catalog runtime");
+        let (attempt, _effect, _witness) = prepared
+            .into_known_committed()
+            .expect("prepare is local and cannot fail here");
+        let evidence = hadoop_create_evidence(&provider, &request, table, &attempt.facts)
+            .expect("create evidence");
+        let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
+        let published = provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { owner.publish_conditional_create(attempt).await })
+            .expect("catalog runtime");
+        assert!(matches!(
+            published,
+            crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+        ));
 
         let reconciled = provider
             .reconcile(ConnectorCatalogMutationReconcileRequest {

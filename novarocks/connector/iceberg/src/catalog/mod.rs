@@ -193,6 +193,129 @@ pub(crate) struct CatalogDropTableReceipt {
     pub(crate) last_updated_ms: i64,
 }
 
+/// Inputs for a conditional create.
+#[derive(Debug)]
+pub(crate) struct ConditionalCreateRequest {
+    pub(crate) namespace: CatalogNamespaceName,
+    pub(crate) creation: crate::iceberg::TableCreation,
+    /// Caller-owned operation identity, stamped into the attempt so a later
+    /// adjudication can recognise this exact attempt rather than any create.
+    pub(crate) operation_id: Arc<str>,
+}
+
+/// A prepared-but-unpublished conditional create.
+///
+/// Opaque above this module: the concrete attempt state belongs to whichever
+/// implementation prepared it.
+#[derive(Debug)]
+pub(crate) struct ConditionalCreateAttempt {
+    pub(crate) facts: ConditionalCreateFacts,
+    inner: ConditionalCreateAttemptState,
+}
+
+#[derive(Debug)]
+enum ConditionalCreateAttemptState {
+    Hadoop(Box<crate::hadoop_catalog::HadoopCreateAttempt>),
+}
+
+impl ConditionalCreateAttempt {
+    pub(crate) fn hadoop(
+        attempt: crate::hadoop_catalog::HadoopCreateAttempt,
+        facts: ConditionalCreateFacts,
+    ) -> Self {
+        Self {
+            facts,
+            inner: ConditionalCreateAttemptState::Hadoop(Box::new(attempt)),
+        }
+    }
+
+    pub(crate) fn into_hadoop(self) -> Option<crate::hadoop_catalog::HadoopCreateAttempt> {
+        match self.inner {
+            ConditionalCreateAttemptState::Hadoop(attempt) => Some(*attempt),
+        }
+    }
+}
+
+/// Facts a prepared attempt exposes so its caller can build publication
+/// evidence before the attempt is dispatched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConditionalCreateFacts {
+    pub(crate) operation_id: Arc<str>,
+    pub(crate) table_uuid: Arc<str>,
+    pub(crate) metadata_location: Arc<str>,
+    pub(crate) metadata_digest: Arc<str>,
+}
+
+/// What a published conditional create produced.
+#[derive(Clone, Debug)]
+pub(crate) struct ConditionalCreateReceipt {
+    pub(crate) facts: ConditionalCreateFacts,
+    pub(crate) already_existed: bool,
+    pub(crate) authoritative_table_uuid: Arc<str>,
+    pub(crate) authoritative_metadata_digest: Arc<str>,
+    /// Metadata location the published table now resolves to.
+    pub(crate) published_metadata_location: Option<Arc<str>>,
+    /// A failure that happened after the create committed. It never downgrades
+    /// the commit; it is finalization state.
+    pub(crate) finalization_failure: Option<Arc<str>>,
+}
+
+/// Identity a later adjudication compares against.
+#[derive(Clone, Debug)]
+pub(crate) struct ConditionalCreateEvidence {
+    pub(crate) namespace: Arc<str>,
+    pub(crate) table: Arc<str>,
+    pub(crate) expected_table_uuid: Arc<str>,
+    pub(crate) metadata_location: Arc<str>,
+    pub(crate) metadata_digest: Arc<str>,
+}
+
+/// Read-only verdict on a conditional create.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ConditionalCreateVerdict {
+    /// Exact positive: this attempt's metadata is present.
+    Committed {
+        finalization_failure: Option<Arc<str>>,
+    },
+    /// Nothing is there. Not proof the request never landed elsewhere.
+    Absent,
+    /// Something is there, but it is not this attempt's.
+    Foreign,
+}
+
+/// What a staged create produced, keeping every dispatch distinction the
+/// underlying protocol makes.
+///
+/// The arms mirror the REST client's typed staged-create result rather than
+/// collapsing it: `Conflict` is a definite server rejection, `KnownUncommitted`
+/// proves the request never went out, and `CommitUnknown` means it may have.
+/// Flattening these is how a lost response becomes a duplicate publication.
+#[derive(Debug)]
+pub(crate) enum StagedCreateStart {
+    Staged {
+        table: crate::iceberg::table::Table,
+        initialization_updates: Vec<crate::iceberg::TableUpdate>,
+    },
+    Conflict(String),
+    KnownUncommitted(String),
+    CommitUnknown(String),
+    /// This catalog has no staged-create protocol. Proven zero side effect.
+    Unsupported(CatalogUnsupported),
+}
+
+/// What committing a staged create produced.
+#[derive(Debug)]
+pub(crate) enum StagedCommitResult {
+    Committed(crate::iceberg::table::Table),
+    Conflict(String),
+    KnownUncommitted(String),
+    CommitUnknown(String),
+    /// The server answered, but the answer does not prove the publication. The
+    /// create may well have landed, so this is not an uncommitted result.
+    CommittedResponseInvalid(String),
+    Unsupported(CatalogUnsupported),
+}
+
 /// The single semantic owner of Iceberg catalog behavior.
 ///
 /// Implementations are chosen once per control generation by
@@ -320,6 +443,50 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         &self,
         request: transaction::TransactionRequest,
     ) -> CatalogTransactionStart;
+
+    /// Create an invisible target for a staged publication.
+    ///
+    /// The staged table is not reachable through the catalog until it is
+    /// committed, which is what makes a CTAS absent-or-complete. A catalog with
+    /// no such protocol answers `Unsupported`, and never by creating a visible
+    /// empty table to fill in afterwards.
+    async fn stage_create_table(
+        &self,
+        namespace: CatalogNamespaceName,
+        creation: crate::iceberg::TableCreation,
+    ) -> StagedCreateStart;
+
+    /// Publish a staged create with exactly one assert-create request.
+    async fn commit_staged_table(&self, commit: crate::iceberg::TableCommit) -> StagedCommitResult;
+
+    /// Stage a conditional create against storage, without publishing it.
+    ///
+    /// A filesystem catalog's create is not a catalog call: its linearization
+    /// point is a conditional write of the canonical metadata (ADR-0077). That
+    /// primitive has no equivalent on the generic catalog trait, so it lives
+    /// here rather than being reached for through a concrete client -- which is
+    /// how a catalog kind used to escape the factory.
+    ///
+    /// Preparing is local: it builds metadata and sends nothing.
+    async fn prepare_conditional_create(
+        &self,
+        request: ConditionalCreateRequest,
+    ) -> CatalogOutcome<ConditionalCreateAttempt>;
+
+    /// Publish a prepared conditional create with exactly one storage request.
+    async fn publish_conditional_create(
+        &self,
+        attempt: ConditionalCreateAttempt,
+    ) -> CatalogOutcome<ConditionalCreateReceipt>;
+
+    /// Read-only adjudication of a conditional create whose outcome is unknown.
+    ///
+    /// Exact-positive only: an absent target proves nothing, and this must never
+    /// write or delete.
+    async fn adjudicate_conditional_create(
+        &self,
+        evidence: ConditionalCreateEvidence,
+    ) -> Result<ConditionalCreateVerdict, ConnectorError>;
 
     /// Decide whether a create with this intent can be admitted.
     ///

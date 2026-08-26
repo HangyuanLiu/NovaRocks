@@ -67,6 +67,9 @@ pub(crate) enum HadoopCreateDisposition {
 #[derive(Debug)]
 pub(crate) struct HadoopCreateResult {
     pub(crate) disposition: HadoopCreateDisposition,
+    /// Kept for the fault tests, which assert the published attempt's identity
+    /// straight off the client result rather than through the catalog owner.
+    #[allow(dead_code)]
     pub(crate) facts: HadoopCreateAttemptFacts,
     pub(crate) authoritative_table_uuid: String,
     pub(crate) authoritative_metadata_digest: String,

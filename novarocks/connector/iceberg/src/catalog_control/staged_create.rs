@@ -48,7 +48,7 @@ use crate::commit::{
     build_staged_fast_append_action,
 };
 use crate::iceberg::{
-    Catalog, ErrorKind, NamespaceIdent, TableCommit, TableCreation, TableRequirement, TableUpdate,
+    Catalog, ErrorKind, TableCommit, TableCreation, TableRequirement, TableUpdate,
 };
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
@@ -79,7 +79,6 @@ pub(crate) struct UnanchoredCtasProvenanceFileV1 {
 
 #[derive(Clone)]
 pub(crate) struct RestStagedTableCreate {
-    pub(crate) catalog: Arc<crate::iceberg_catalog_rest::RestCatalog>,
     pub(crate) table: crate::iceberg::table::Table,
     pub(crate) initialization_updates: Vec<TableUpdate>,
 }
@@ -134,28 +133,30 @@ pub(crate) fn prepare_rest_staged_table(
     // The generation-level twin of `admit_create(CreateTableAsSelect)`. Both
     // gates decide the same thing from the same generation, and both must
     // decide it before anything is attempted.
-    let catalog = runtime.rest_catalog().cloned().ok_or_else(|| {
-        RestStagedPrepareFailure::Unsupported(
-            "atomic staged table publication is unsupported by this Iceberg catalog".to_string(),
-        )
-    })?;
+    let owner = Arc::clone(runtime.novarocks_catalog());
+    // Admission first. Everything below costs something -- a staging location,
+    // a namespace round trip -- and a catalog that cannot stage a create should
+    // not pay for any of it, nor have its real reason masked by whichever of
+    // those steps happens to fail first.
+    if let Err(reason) =
+        owner.admit_create(crate::catalog::CatalogCreateIntent::CreateTableAsSelect)
+    {
+        return Err(RestStagedPrepareFailure::Unsupported(
+            reason.message().to_string(),
+        ));
+    }
     let namespace_name = normalize_identifier(namespace_name)?;
     let table_name = normalize_identifier(table_name)?;
-    let namespace = NamespaceIdent::new(namespace_name.clone());
     let location = ctas_staging_location(
         &runtime.control_state().configuration().warehouse_uri,
         publication_id,
     )?;
-    let namespace_catalog = Arc::clone(&catalog);
-    let namespace_for_check = namespace.clone();
+    let namespace_owner = Arc::clone(&owner);
+    let namespace_probe = crate::catalog::CatalogNamespaceName::new(namespace_name.clone());
     let exists = runtime
         .resources()
         .catalog_runtime()
-        .block_on(async move {
-            namespace_catalog
-                .namespace_exists(&namespace_for_check)
-                .await
-        })
+        .block_on(async move { namespace_owner.namespace_exists(namespace_probe).await })
         .map_err(|error| {
             RestStagedPrepareFailure::KnownUncommitted(format!(
                 "check REST namespace runtime: {error}"
@@ -223,13 +224,14 @@ pub(crate) fn prepare_rest_staged_table(
     } else {
         creation.build()
     };
-    let staging_catalog = Arc::clone(&catalog);
+    let staging_owner = Arc::clone(&owner);
+    let staging_namespace = crate::catalog::CatalogNamespaceName::new(namespace_name.clone());
     let staged = runtime
         .resources()
         .catalog_runtime()
         .block_on(async move {
-            staging_catalog
-                .stage_create_table_typed(&namespace, creation)
+            staging_owner
+                .stage_create_table(staging_namespace, creation)
                 .await
         })
         .map_err(|error| {
@@ -242,23 +244,33 @@ pub(crate) fn prepare_rest_staged_table(
             RestStagedPrepareFailure::CommitUnknown(format!(
                 "prepare staged REST table runtime: {error}"
             ))
-        })?
-        .map_err(|error| match error {
-            crate::iceberg_catalog_rest::StagedCreateError::Conflict(error) => {
-                RestStagedPrepareFailure::Conflict(format!("prepare staged REST table: {error}"))
-            }
-            crate::iceberg_catalog_rest::StagedCreateError::KnownNotDispatched(error) => {
-                RestStagedPrepareFailure::KnownUncommitted(format!(
-                    "prepare staged REST table: {error}"
-                ))
-            }
-            crate::iceberg_catalog_rest::StagedCreateError::PossiblyDispatched(error) => {
-                RestStagedPrepareFailure::CommitUnknown(format!(
-                    "prepare staged REST table: {error}"
-                ))
-            }
         })?;
-    let (table, mut initialization_updates) = staged.into_parts();
+    let (table, mut initialization_updates) = match staged {
+        crate::catalog::StagedCreateStart::Staged {
+            table,
+            initialization_updates,
+        } => (table, initialization_updates),
+        crate::catalog::StagedCreateStart::Conflict(error) => {
+            return Err(RestStagedPrepareFailure::Conflict(format!(
+                "prepare staged REST table: {error}"
+            )));
+        }
+        crate::catalog::StagedCreateStart::KnownUncommitted(error) => {
+            return Err(RestStagedPrepareFailure::KnownUncommitted(format!(
+                "prepare staged REST table: {error}"
+            )));
+        }
+        crate::catalog::StagedCreateStart::CommitUnknown(error) => {
+            return Err(RestStagedPrepareFailure::CommitUnknown(format!(
+                "prepare staged REST table: {error}"
+            )));
+        }
+        crate::catalog::StagedCreateStart::Unsupported(reason) => {
+            return Err(RestStagedPrepareFailure::Unsupported(
+                reason.message().to_string(),
+            ));
+        }
+    };
     if table.metadata().location() != location {
         return Err(RestStagedPrepareFailure::CommitUnknown(
             "REST stage-create returned a table at a location other than the requested CTAS staging location"
@@ -279,7 +291,6 @@ pub(crate) fn prepare_rest_staged_table(
         });
     }
     Ok(RestStagedTableCreate {
-        catalog,
         table,
         initialization_updates,
     })
@@ -654,7 +665,7 @@ impl IcebergStagedCreateAdapter {
             .map(|write| Arc::clone(&write.abort_handle))
             .ok_or_else(|| invalid("staged-create action requires a bound writer aggregate"))?;
         let table = prepared.staged.table.clone();
-        let catalog: Arc<dyn Catalog> = prepared.staged.catalog.clone();
+        let catalog: Arc<dyn Catalog> = self.runtime.novarocks_catalog().vendored_client();
         let file_io = table.file_io().clone();
         let action_abort = Arc::clone(&abort_handle);
         let action_collector = Arc::clone(&collector);
@@ -1180,12 +1191,13 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             .requirements(vec![TableRequirement::NotExist])
             .updates(updates)
             .build();
-        let catalog = Arc::clone(&prepared.staged.catalog);
+        let owner = Arc::clone(self.runtime.novarocks_catalog());
         let result = self
             .runtime
             .resources()
             .catalog_runtime()
-            .block_on(async move { catalog.commit_staged_table_typed(commit).await });
+            .block_on(async move { owner.commit_staged_table(commit).await })
+            .map(staged_commit_to_legacy);
         match result {
             Ok(Ok(table))
                 if publication_matches(&table, operation_id, &prepared, expected_snapshot_id) =>
@@ -1406,7 +1418,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 "Iceberg staged-create publish evidence does not match the exact operation",
             ));
         }
-        let catalog: Arc<dyn Catalog> = prepared.staged.catalog.clone();
+        let catalog: Arc<dyn Catalog> = self.runtime.novarocks_catalog().vendored_client();
         let ident = ident.clone();
         let load = self
             .runtime
@@ -1641,6 +1653,39 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unavailable, message.into())
 }
 
+/// Project the owner's staged-commit result onto the shape this module's match
+/// arms already handle.
+///
+/// Each arm keeps its dispatch verdict: a conflict is a definite rejection,
+/// `KnownNotDispatched` proves the request never went out, `PossiblyDispatched`
+/// means it may have, and an invalid committed response is not an uncommitted
+/// result -- the create may well have landed.
+fn staged_commit_to_legacy(
+    result: crate::catalog::StagedCommitResult,
+) -> Result<crate::iceberg::table::Table, crate::iceberg_catalog_rest::StagedCommitError> {
+    use crate::catalog::StagedCommitResult as Owned;
+    use crate::iceberg_catalog_rest::StagedCommitError as Legacy;
+    match result {
+        Owned::Committed(table) => Ok(table),
+        Owned::Conflict(error) => Err(Legacy::Conflict(rest_error(error))),
+        Owned::KnownUncommitted(error) => Err(Legacy::KnownNotDispatched(rest_error(error))),
+        Owned::CommitUnknown(error) => Err(Legacy::PossiblyDispatched(rest_error(error))),
+        Owned::CommittedResponseInvalid(error) => {
+            Err(Legacy::CommittedResponseInvalid(rest_error(error)))
+        }
+        // A catalog with no staged-create protocol never reaches publication:
+        // admission refused it. Treat it as proven-not-dispatched rather than
+        // inventing an outcome.
+        Owned::Unsupported(reason) => Err(Legacy::KnownNotDispatched(rest_error(
+            reason.message().to_string(),
+        ))),
+    }
+}
+
+fn rest_error(message: String) -> crate::iceberg::Error {
+    crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1747,7 +1792,7 @@ mod tests {
     }
 
     /// A prepared aggregate with no writer bound, for state-machine tests.
-    fn prepared_operation(runtime: &IcebergMetadataContext) -> PreparedOperation {
+    fn prepared_operation(_runtime: &IcebergMetadataContext) -> PreparedOperation {
         let location = "file:///tmp/novarocks-staged-create/table";
         let schema = crate::iceberg::spec::Schema::builder()
             .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
@@ -1779,7 +1824,6 @@ mod tests {
             publication_id: novarocks_spi::connector::LakePublicationId::new_v7(),
             handle_digest: [7u8; 32],
             staged: RestStagedTableCreate {
-                catalog: Arc::clone(runtime.rest_catalog().expect("REST generation")),
                 table,
                 initialization_updates: Vec::new(),
             },
@@ -1817,7 +1861,9 @@ mod tests {
     #[test]
     fn hadoop_generation_fails_closed_without_constructing_a_rest_client() {
         let runtime = hadoop_runtime();
-        assert!(runtime.rest_catalog().is_none());
+        // The catalog owner answers this now; there is no concrete-client slot
+        // left to inspect.
+        assert_eq!(runtime.novarocks_catalog().implementation_name(), "hadoop");
         let failure = match prepare_rest_staged_table(
             &runtime,
             ConnectorMutationOperationId::new(),
@@ -1834,10 +1880,12 @@ mod tests {
         // `Unsupported`, not `KnownUncommitted`: the two arms differ in what
         // they promise. Both say nothing was published, but only this one says
         // nothing was attempted, and a caller may act on that.
+        // The catalog owner explains itself now, so the refusal names the
+        // missing protocol rather than only repeating the word "unsupported".
         assert!(matches!(
             failure,
             RestStagedPrepareFailure::Unsupported(message)
-                if message.contains("unsupported")
+                if message.contains("staged-create protocol")
         ));
     }
 
@@ -1850,9 +1898,10 @@ mod tests {
     #[test]
     fn rest_generation_without_a_warehouse_refuses_staged_create_as_unsupported() {
         let runtime = rest_runtime();
-        assert!(
-            runtime.rest_catalog().is_some(),
-            "a REST generation retains its concrete client even without a warehouse"
+        assert_eq!(
+            runtime.novarocks_catalog().implementation_name(),
+            "rest",
+            "a REST generation attaches even without a warehouse; CTAS is what it cannot do"
         );
         runtime
             .novarocks_catalog()
@@ -1871,10 +1920,13 @@ mod tests {
             Ok(_) => panic!("a warehouse-less REST generation cannot stage a CTAS target"),
             Err(failure) => failure,
         };
+        // Admission now answers before the staging location is derived, so the
+        // message is the catalog's own explanation of the consequence rather
+        // than the location helper's complaint about its input.
         assert!(matches!(
             failure,
             RestStagedPrepareFailure::Unsupported(message)
-                if message.contains("explicit warehouse URI")
+                if message.contains("no explicit warehouse")
         ));
     }
 

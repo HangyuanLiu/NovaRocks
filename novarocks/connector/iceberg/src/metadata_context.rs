@@ -49,8 +49,6 @@ pub struct IcebergMetadataContext {
     /// bounded; retired with the generation.
     drop_cleanup: Arc<crate::catalog_control::drop_cleanup::DropCleanupQueue>,
     catalog: Arc<dyn crate::iceberg::Catalog>,
-    hadoop_catalog: Option<Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>>,
-    rest_catalog: Option<Arc<crate::iceberg_catalog_rest::RestCatalog>>,
     write_activations: Arc<crate::write_activation::IcebergWriteActivationReservations>,
 }
 
@@ -71,7 +69,6 @@ impl IcebergMetadataContext {
                 async move { crate::catalog_runtime::build_catalog_client(&configuration).await },
             )?
             .map_err(|error| format!("build Iceberg control-generation catalog: {error}"))?;
-        let rest_catalog = catalog.rest().cloned();
         // Every handle below is derived from this one client. Building a second
         // one for the owner would give the generation two clients with separate
         // in-memory state, and they would disagree about the same lake -- a
@@ -87,8 +84,6 @@ impl IcebergMetadataContext {
             novarocks_catalog,
             drop_cleanup: Arc::new(crate::catalog_control::drop_cleanup::DropCleanupQueue::new()),
             catalog: legacy_client,
-            hadoop_catalog: catalog.hadoop().cloned(),
-            rest_catalog,
             write_activations: Arc::new(
                 crate::write_activation::IcebergWriteActivationReservations::default(),
             ),
@@ -113,16 +108,6 @@ impl IcebergMetadataContext {
 
     pub(crate) fn catalog(&self) -> &Arc<dyn crate::iceberg::Catalog> {
         &self.catalog
-    }
-
-    pub(crate) fn rest_catalog(&self) -> Option<&Arc<crate::iceberg_catalog_rest::RestCatalog>> {
-        self.rest_catalog.as_ref()
-    }
-
-    pub(crate) fn hadoop_catalog(
-        &self,
-    ) -> Option<&Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>> {
-        self.hadoop_catalog.as_ref()
     }
 
     pub(crate) fn resources(&self) -> &IcebergMetadataResources {
@@ -292,8 +277,6 @@ impl std::fmt::Debug for IcebergMetadataContext {
             .field("control_state", &"<provider catalog state>")
             .field("resources", &self.resources)
             .field("catalog", &"<provider catalog client>")
-            .field("hadoop_catalog", &self.hadoop_catalog.is_some())
-            .field("rest_catalog", &self.rest_catalog.is_some())
             .finish()
     }
 }

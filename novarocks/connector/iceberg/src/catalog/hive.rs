@@ -29,7 +29,8 @@ use super::error::{CatalogOutcome, CatalogUnsupported};
 use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use super::{
     CatalogCreateIntent, CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName,
-    CatalogTransactionStart, NovaRocksCatalog,
+    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
+    ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
 };
 
 /// A Hive Metastore Iceberg catalog.
@@ -166,6 +167,53 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
             table,
             novarocks_spi::connector::ExternalMutationEffect::NoOp,
         )
+    }
+
+    async fn stage_create_table(
+        &self,
+        _namespace: CatalogNamespaceName,
+        _creation: crate::iceberg::TableCreation,
+    ) -> super::StagedCreateStart {
+        super::StagedCreateStart::Unsupported(CatalogUnsupported::new(
+            "Hive Metastore Iceberg catalog has no staged-create protocol",
+        ))
+    }
+
+    async fn commit_staged_table(
+        &self,
+        _commit: crate::iceberg::TableCommit,
+    ) -> super::StagedCommitResult {
+        super::StagedCommitResult::Unsupported(CatalogUnsupported::new(
+            "Hive Metastore Iceberg catalog has no staged-create protocol",
+        ))
+    }
+
+    async fn prepare_conditional_create(
+        &self,
+        _request: ConditionalCreateRequest,
+    ) -> CatalogOutcome<ConditionalCreateAttempt> {
+        CatalogOutcome::unsupported(
+            "Hive Metastore Iceberg catalog publishes a create through the metastore, not through a conditional metadata write",
+        )
+    }
+
+    async fn publish_conditional_create(
+        &self,
+        _attempt: ConditionalCreateAttempt,
+    ) -> CatalogOutcome<ConditionalCreateReceipt> {
+        CatalogOutcome::unsupported(
+            "Hive Metastore Iceberg catalog publishes a create through the metastore, not through a conditional metadata write",
+        )
+    }
+
+    async fn adjudicate_conditional_create(
+        &self,
+        _evidence: ConditionalCreateEvidence,
+    ) -> Result<ConditionalCreateVerdict, ConnectorError> {
+        Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "Hive Metastore Iceberg catalog publishes a create through the metastore, not through a conditional metadata write",
+        ))
     }
 
     async fn new_transaction(&self, request: TransactionRequest) -> CatalogTransactionStart {
