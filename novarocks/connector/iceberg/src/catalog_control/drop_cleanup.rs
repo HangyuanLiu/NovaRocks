@@ -44,6 +44,11 @@
 //! catalog reported but never owned — and a prefix delete cannot tell the
 //! difference.
 
+// Migration scaffolding: the drop path that fills this queue and the pass that
+// drains it land later in the same change. The single-authority cut removes
+// this attribute; it must not survive the PR.
+#![allow(dead_code)]
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 

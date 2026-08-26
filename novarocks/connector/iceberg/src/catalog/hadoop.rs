@@ -77,6 +77,16 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         "hadoop"
     }
 
+    fn admit_create(&self, intent: CatalogCreateIntent) -> Result<(), CatalogUnsupported> {
+        match intent {
+            CatalogCreateIntent::EmptyTable => Ok(()),
+            CatalogCreateIntent::CreateTableAsSelect => Err(CatalogUnsupported::new(
+                "Hadoop Iceberg catalog has no staged-create protocol, so CREATE TABLE AS \
+                     SELECT cannot publish its target atomically",
+            )),
+        }
+    }
+
     async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError> {
         self.delegate.list_namespaces().await
     }
@@ -162,12 +172,10 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
             CatalogCreateIntent::EmptyTable => {
                 super::start_create_table_transaction(&self.delegate, request)
             }
-            CatalogCreateIntent::CreateTableAsSelect => {
-                CatalogTransactionStart::Unsupported(CatalogUnsupported::new(
-                    "Hadoop Iceberg catalog has no staged-create protocol, so CREATE TABLE AS \
-                     SELECT cannot publish its target atomically",
-                ))
-            }
+            CatalogCreateIntent::CreateTableAsSelect => match self.admit_create(request.intent) {
+                Ok(()) => super::start_create_table_transaction(&self.delegate, request),
+                Err(reason) => CatalogTransactionStart::Unsupported(reason),
+            },
         }
     }
 

@@ -38,7 +38,7 @@ use novarocks_spi::connector::{
 use super::staged_create::{
     ctas_staging_location, decode_unanchored_ctas_provenance, unanchored_ctas_provenance_location,
 };
-use crate::control_runtime::IcebergControlRuntime;
+use crate::metadata_context::IcebergMetadataContext;
 
 const CTAS_STAGING_NAMESPACE: &str = "_novarocks/ctas-staging/v1";
 const CTAS_UNANCHORED_PROVENANCE_FILE: &str = "_novarocks.ctas.provenance.v1.json";
@@ -47,15 +47,28 @@ const CTAS_UNANCHORED_PROVENANCE_FILE: &str = "_novarocks.ctas.provenance.v1.jso
 pub(crate) struct IcebergUnanchoredCtasCleanupAdapter {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
-    runtime: Arc<IcebergControlRuntime>,
+    runtime: Arc<IcebergMetadataContext>,
 }
 
 impl IcebergUnanchoredCtasCleanupAdapter {
     pub(crate) fn try_new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ConnectorInstanceIncarnation,
-        runtime: Arc<IcebergControlRuntime>,
+        runtime: Arc<IcebergMetadataContext>,
     ) -> Result<Self, ConnectorError> {
+        // A catalog that cannot publish a CTAS target atomically never stages
+        // anything unanchored, so there is nothing here to collect. Refusing at
+        // construction matters for ordering, not just tidiness: the frontend
+        // derives this lease and sweeps during preflight, ahead of the
+        // staged-create prepare that would report the refusal. Attaching a
+        // sweeper to a catalog that cannot CTAS would delete objects before the
+        // statement was told it could not run.
+        if let Err(reason) = runtime
+            .novarocks_catalog()
+            .admit_create(crate::catalog::CatalogCreateIntent::CreateTableAsSelect)
+        {
+            return Err(unsupported(reason.message().to_string()));
+        }
         let warehouse = runtime.control_state().configuration().warehouse_uri.trim();
         if warehouse.is_empty() {
             return Err(unsupported(

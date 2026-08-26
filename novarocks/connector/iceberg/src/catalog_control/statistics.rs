@@ -36,8 +36,8 @@ use novarocks_spi::connector::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::control_provider::{IcebergControlProvider, IcebergTablePayload};
 use crate::manifest::{DataFileWithStats, extract_data_files_with_stats_at};
+use crate::metadata::{IcebergMetadata, IcebergTablePayload};
 use crate::reconcile_payload::{
     ICEBERG_STATISTICS_EVIDENCE_VERSION, IcebergStatisticsEvidenceV1, encode_statistics_evidence,
 };
@@ -59,7 +59,7 @@ const THETA_PARTIAL_WIRE_VERSION: u8 = 1;
 const THETA_PARTIAL_WIRE_HEADER_BYTES: usize = 14;
 const MAX_THETA_RETAINED_HASHES: usize = 1 << 12;
 
-impl StatisticsReader for IcebergControlProvider {
+impl StatisticsReader for IcebergMetadata {
     fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
         self.descriptor()
     }
@@ -321,7 +321,7 @@ fn evidence_revision(
     )))
 }
 
-impl StatisticsCollection for IcebergControlProvider {
+impl StatisticsCollection for IcebergMetadata {
     fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
         self.descriptor()
     }
@@ -588,7 +588,7 @@ impl StatisticsCollection for IcebergControlProvider {
     }
 }
 
-impl ConnectorStatistics for IcebergControlProvider {
+impl ConnectorStatistics for IcebergMetadata {
     fn collection(&self) -> Option<&dyn StatisticsCollection> {
         Some(self)
     }
@@ -886,7 +886,7 @@ fn take<'a>(bytes: &'a [u8], cursor: &mut usize, count: usize) -> Result<&'a [u8
 }
 
 fn statistics_evidence(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
     table: &IcebergTablePayload,
     data_version: &StatisticsDataVersion,
@@ -911,7 +911,7 @@ fn statistics_evidence(
 }
 
 fn statistics_receipt(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: novarocks_spi::connector::ConnectorMutationOperationId,
     data_version: StatisticsDataVersion,
     revision: StatisticsEvidenceRevision,
@@ -1013,14 +1013,10 @@ mod tests {
 
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
-    use crate::control_runtime::IcebergControlRuntime;
-    use crate::resources::IcebergControlResources;
+    use crate::metadata_context::IcebergMetadataContext;
+    use crate::resources::IcebergMetadataResources;
 
-    fn provider() -> (
-        tokio::runtime::Runtime,
-        tempfile::TempDir,
-        IcebergControlProvider,
-    ) {
+    fn provider() -> (tokio::runtime::Runtime, tempfile::TempDir, IcebergMetadata) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let configuration = crate::catalog_config::parse_catalog_configuration(
@@ -1042,9 +1038,9 @@ mod tests {
             )),
         );
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
-                IcebergControlResources::new(binding, executor.handle().clone()),
+                IcebergMetadataResources::new(binding, executor.handle().clone()),
             )
             .expect("control runtime"),
         );
@@ -1052,7 +1048,7 @@ mod tests {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
             instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
         };
-        let provider = IcebergControlProvider::new(
+        let provider = IcebergMetadata::new(
             descriptor,
             ConnectorInstanceIncarnation::from_bytes([4; 16]),
             runtime,

@@ -47,11 +47,11 @@ use crate::commit::{
     AbortLog, CommitCtx, CommitOpKind, IcebergCommitCollector, IcebergWriteControl,
     build_staged_fast_append_action,
 };
-use crate::control_provider::IcebergControlProvider;
-use crate::control_runtime::IcebergControlRuntime;
 use crate::iceberg::{
     Catalog, ErrorKind, NamespaceIdent, TableCommit, TableCreation, TableRequirement, TableUpdate,
 };
+use crate::metadata::IcebergMetadata;
+use crate::metadata_context::IcebergMetadataContext;
 
 const EVIDENCE_VERSION: u16 = 1;
 const CTAS_OPERATION_MARKER: &str = "novarocks.ctas.operation-id";
@@ -108,7 +108,7 @@ impl From<ConnectorError> for RestStagedPrepareFailure {
     reason = "The REST stage-create boundary keeps every SQL-visible creation input explicit."
 )]
 pub(crate) fn prepare_rest_staged_table(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     _operation_id: ConnectorStagedCreateOperationId,
     publication_id: novarocks_spi::connector::LakePublicationId,
     namespace_name: &str,
@@ -313,7 +313,7 @@ pub(crate) fn decode_unanchored_ctas_provenance(
 }
 
 fn write_unanchored_ctas_provenance(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table_location: &str,
     provenance: &ConnectorCtasUnanchoredProvenance,
 ) -> Result<(), ConnectorError> {
@@ -363,9 +363,9 @@ fn write_unanchored_ctas_provenance(
 pub struct IcebergStagedCreateAdapter {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
-    provider: Arc<IcebergControlProvider>,
+    provider: Arc<IcebergMetadata>,
     write_control: Arc<IcebergWriteControl>,
-    runtime: Arc<IcebergControlRuntime>,
+    runtime: Arc<IcebergMetadataContext>,
     operations: Arc<Mutex<HashMap<ConnectorStagedCreateOperationId, OperationState>>>,
 }
 
@@ -419,15 +419,9 @@ struct PublishEvidenceV1 {
 
 impl IcebergStagedCreateAdapter {
     pub fn try_new(
-        provider: Arc<IcebergControlProvider>,
+        provider: Arc<IcebergMetadata>,
         write_control: Arc<IcebergWriteControl>,
     ) -> Result<Self, ConnectorError> {
-        if provider.runtime().rest_catalog().is_none() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "Iceberg catalog has no atomic staged-create publication capability",
-            ));
-        }
         let owner = ConnectorExecutionBindingKey {
             instance_id: provider.descriptor().instance_id.clone(),
             incarnation: provider.incarnation(),
@@ -802,6 +796,23 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         if let Err(error) = Self::validate_context(&request.context) {
             return Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted {
                 failure: failure_from_connector(error),
+            });
+        }
+        // Admission first, before an operation slot is reserved, a property map
+        // is built, or a staging location is derived. A catalog that cannot
+        // publish a CTAS target atomically has to say so here: past this point
+        // the caller starts its source, and a refusal would arrive after work
+        // that can no longer be taken back.
+        if let Err(unsupported) = self
+            .runtime
+            .novarocks_catalog()
+            .admit_create(crate::catalog::CatalogCreateIntent::CreateTableAsSelect)
+        {
+            return Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted {
+                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unsupported,
+                    unsupported.message().to_string(),
+                ),
             });
         }
         {
@@ -1457,7 +1468,7 @@ fn publication_receipt(
     )
 }
 
-fn invalidate_prepared(runtime: &IcebergControlRuntime, prepared: &PreparedOperation) {
+fn invalidate_prepared(runtime: &IcebergMetadataContext, prepared: &PreparedOperation) {
     let ident = prepared.staged.table.identifier();
     runtime
         .control_state()
@@ -1548,12 +1559,12 @@ mod tests {
     use super::*;
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
-    use crate::resources::IcebergControlResources;
+    use crate::resources::IcebergMetadataResources;
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorMutationOperationId, ConnectorProviderId,
     };
 
-    fn hadoop_runtime() -> IcebergControlRuntime {
+    fn hadoop_runtime() -> IcebergMetadataContext {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let handle = executor.handle().clone();
         let warehouse = tempfile::tempdir().expect("warehouse");
@@ -1571,9 +1582,9 @@ mod tests {
             Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
             Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
         );
-        IcebergControlRuntime::try_new(
+        IcebergMetadataContext::try_new(
             IcebergCatalogControlState::new(configuration),
-            IcebergControlResources::new(binding, handle),
+            IcebergMetadataResources::new(binding, handle),
         )
         .expect("control runtime")
     }
@@ -1602,14 +1613,20 @@ mod tests {
         ));
     }
 
+    /// The adapter attaches everywhere; the refusal moved to admission.
+    ///
+    /// This used to assert the opposite — that constructing the adapter on a
+    /// Hadoop generation failed — which made an absent slot stand in for an
+    /// unsupported request. Those are different facts, and conflating them is
+    /// what let a CTAS discover it was impossible only after work had started.
     #[test]
-    fn staged_capability_is_rest_only_for_the_exact_generation() {
+    fn staged_adapter_attaches_on_every_generation() {
         let runtime = Arc::new(hadoop_runtime());
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
             instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
         };
-        let provider = Arc::new(IcebergControlProvider::new(
+        let provider = Arc::new(IcebergMetadata::new(
             descriptor.clone(),
             ConnectorInstanceIncarnation::new(),
             Arc::clone(&runtime),
@@ -1619,11 +1636,23 @@ mod tests {
             provider.incarnation(),
             runtime,
         ));
-        let error = match IcebergStagedCreateAdapter::try_new(provider, write) {
-            Ok(_) => panic!("Hadoop must not expose staged create"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        IcebergStagedCreateAdapter::try_new(provider, write)
+            .expect("the staged-create adapter attaches on a Hadoop generation");
+    }
+
+    /// A Hadoop catalog refuses CTAS before the statement can do anything.
+    #[test]
+    fn hadoop_refuses_ctas_at_admission_with_a_typed_unsupported() {
+        let runtime = Arc::new(hadoop_runtime());
+        let unsupported = runtime
+            .novarocks_catalog()
+            .admit_create(crate::catalog::CatalogCreateIntent::CreateTableAsSelect)
+            .expect_err("Hadoop cannot publish a CTAS target atomically");
+        assert!(unsupported.message().contains("staged-create"));
+        runtime
+            .novarocks_catalog()
+            .admit_create(crate::catalog::CatalogCreateIntent::EmptyTable)
+            .expect("an empty-table create is atomic on this catalog");
     }
 
     #[test]

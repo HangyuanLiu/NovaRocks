@@ -42,9 +42,9 @@ use crate::commit::write_shared::{
     exact_requested_write_fields, invalid_write_activation, snapshot_token,
     write_target_snapshot_id,
 };
-use crate::control_provider::IcebergTablePayload;
 use crate::file_reader::execution_payload::decode_payload;
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
+use crate::metadata::IcebergTablePayload;
 use crate::storage_inspector::MV_DESCRIPTOR_PACKAGE_ID_PROP;
 
 /// Sign the SQL-proposed Arrow input while the Iceberg provider still owns the

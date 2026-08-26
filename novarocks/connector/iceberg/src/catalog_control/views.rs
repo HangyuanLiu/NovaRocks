@@ -23,7 +23,6 @@ use novarocks_spi::connector::{
 use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_config::IcebergCatalogKind;
-use crate::control_runtime::IcebergControlRuntime;
 use crate::iceberg::spec::{
     Schema, SqlViewRepresentation, ViewMetadata, ViewRepresentation, ViewRepresentations,
     ViewVersion,
@@ -31,6 +30,7 @@ use crate::iceberg::spec::{
 use crate::iceberg::{
     Catalog, NamespaceIdent, TableIdent, ViewCommit, ViewCreation, ViewRequirement,
 };
+use crate::metadata_context::IcebergMetadataContext;
 
 pub(crate) const VIEW_DIALECT_STARROCKS: &str = "starrocks";
 const NOVAROCKS_ENGINE_NAME: &str = "novarocks";
@@ -49,7 +49,7 @@ pub(crate) struct LoadedIcebergView {
     pub properties: HashMap<String, String>,
 }
 
-fn ensure_rest(runtime: &IcebergControlRuntime) -> Result<(), String> {
+fn ensure_rest(runtime: &IcebergMetadataContext) -> Result<(), String> {
     let kind = runtime.control_state().configuration().kind;
     if kind != IcebergCatalogKind::Rest {
         return Err(format!(
@@ -132,7 +132,7 @@ fn source_format_from_summary(
     reason = "The control-plane view operation preserves its established explicit input contract."
 )]
 pub(crate) fn create_view(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     namespace: &str,
     view: &str,
     columns: &[ConnectorColumnDefinition],
@@ -211,7 +211,7 @@ pub(crate) fn create_view(
 
 #[allow(clippy::too_many_arguments)]
 fn replace_view(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     catalog: std::sync::Arc<dyn Catalog>,
     ident: &TableIdent,
     current: ViewMetadata,
@@ -261,7 +261,7 @@ fn replace_view(
 }
 
 pub(crate) fn load_view(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     namespace: &str,
     view: &str,
 ) -> Result<LoadedIcebergView, String> {
@@ -280,7 +280,7 @@ pub(crate) fn load_view(
 }
 
 pub(crate) fn drop_view(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     namespace: &str,
     view: &str,
 ) -> Result<(), String> {
@@ -298,7 +298,7 @@ pub(crate) fn drop_view(
 }
 
 pub(crate) fn view_exists(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     namespace: &str,
     view: &str,
 ) -> Result<bool, String> {
@@ -318,7 +318,7 @@ pub(crate) fn view_exists(
 }
 
 pub(crate) fn list_views(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     namespace: &str,
 ) -> Result<Vec<String>, String> {
     // A catalog that cannot create views cannot contain any, so enumerating
@@ -395,14 +395,14 @@ fn loaded_view_from_metadata(
     })
 }
 
-use crate::control_provider::IcebergControlProvider;
+use crate::metadata::IcebergMetadata;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
     ConnectorListViewsRequest, ConnectorViewDialect, ConnectorViewIdentity, ConnectorViewMetadata,
     ConnectorViewMetadataValue, ConnectorViewRequest,
 };
 
-impl ConnectorViewMetadata for IcebergControlProvider {
+impl ConnectorViewMetadata for IcebergMetadata {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         self.descriptor()
     }
@@ -473,7 +473,7 @@ impl ConnectorViewMetadata for IcebergControlProvider {
 }
 
 fn ensure_request(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     owner: &novarocks_spi::connector::ConnectorInstanceId,
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
@@ -521,7 +521,7 @@ mod tests {
 
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
-    use crate::resources::IcebergControlResources;
+    use crate::resources::IcebergMetadataResources;
 
     fn novarocks_definition(raw_sql: &str) -> ConnectorViewDefinition {
         ConnectorViewDefinition {
@@ -536,7 +536,7 @@ mod tests {
     fn hadoop_runtime() -> (
         tokio::runtime::Runtime,
         tempfile::TempDir,
-        IcebergControlRuntime,
+        IcebergMetadataContext,
     ) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
@@ -558,9 +558,9 @@ mod tests {
                 executor.handle().clone(),
             )),
         );
-        let runtime = IcebergControlRuntime::try_new(
+        let runtime = IcebergMetadataContext::try_new(
             IcebergCatalogControlState::new(configuration),
-            IcebergControlResources::new(binding, executor.handle().clone()),
+            IcebergMetadataResources::new(binding, executor.handle().clone()),
         )
         .expect("control runtime");
         (executor, warehouse, runtime)

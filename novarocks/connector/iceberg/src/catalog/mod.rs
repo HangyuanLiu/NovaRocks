@@ -295,6 +295,17 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         request: transaction::TransactionRequest,
     ) -> CatalogTransactionStart;
 
+    /// Decide whether a create with this intent can be admitted.
+    ///
+    /// This is not a capability table. It is the same decision
+    /// [`NovaRocksCatalog::new_create_table_transaction`] makes, reachable by
+    /// callers that must refuse before they build a table definition — a CTAS
+    /// has to be turned away before its source runs, and building the
+    /// definition first would already be work done on a request that cannot
+    /// succeed. Implementations answer it from the same inputs, and the
+    /// constructor calls it, so the two cannot drift apart.
+    fn admit_create(&self, intent: CatalogCreateIntent) -> Result<(), CatalogUnsupported>;
+
     /// Begin a transaction that creates a table.
     ///
     /// The request carries [`CatalogCreateIntent`], and implementations may

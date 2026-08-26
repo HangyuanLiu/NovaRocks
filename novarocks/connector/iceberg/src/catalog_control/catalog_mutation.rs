@@ -40,8 +40,6 @@ use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog_config::IcebergCatalogKind;
 use crate::commit::{RefActionOutcome, execute_ref_action, lower_ref_action};
-use crate::control_provider::IcebergControlProvider;
-use crate::control_runtime::IcebergControlRuntime;
 use crate::iceberg::spec::{
     FormatVersion, NestedField, Operation, PrimitiveType, Schema, Snapshot, SnapshotReference,
     SnapshotRetention, StructType, Summary, Transform, Type, UnboundPartitionField,
@@ -51,6 +49,8 @@ use crate::iceberg::transaction::{ApplyTransactionAction, Transaction};
 use crate::iceberg::{
     NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
 };
+use crate::metadata::IcebergMetadata;
+use crate::metadata_context::IcebergMetadataContext;
 use crate::reconcile_payload::{
     ICEBERG_MUTATION_EVIDENCE_VERSION, IcebergMutationEvidenceTarget, IcebergMutationEvidenceV1,
     decode_mutation_evidence, encode_mutation_evidence,
@@ -64,7 +64,7 @@ const COLUMN_AGGREGATION_PROPERTY_PREFIX: &str = "novarocks.column_agg.";
 const BOOTSTRAP_OPERATION_MARKER: &str = "novarocks.bootstrap.empty.operation-id";
 const INITIAL_PARTITION_FIELD_ID: i32 = 1000;
 
-impl ConnectorCatalogMutation for IcebergControlProvider {
+impl ConnectorCatalogMutation for IcebergMetadata {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         self.descriptor()
     }
@@ -219,7 +219,7 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
 }
 
 fn validate_request(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
 ) -> Result<(), ConnectorError> {
     validate_context(&request.context)?;
@@ -252,7 +252,7 @@ fn validate_context(
 }
 
 fn execute_operation(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation: &ConnectorCatalogMutationOperation,
 ) -> Result<ExternalMutationEffect, ConnectorError> {
     match operation {
@@ -464,7 +464,7 @@ fn view_properties(
 }
 
 fn create_table(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     table: &ConnectorTableIdentity,
     columns: &[ConnectorColumnDefinition],
     key: Option<&ConnectorTableKey>,
@@ -509,7 +509,7 @@ fn create_table(
 }
 
 fn prepare_table_creation(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     table: &ConnectorTableIdentity,
     columns: &[ConnectorColumnDefinition],
     key: Option<&ConnectorTableKey>,
@@ -566,7 +566,7 @@ fn prepare_table_creation(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_hadoop_create_table(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     columns: &[ConnectorColumnDefinition],
@@ -678,7 +678,7 @@ fn execute_hadoop_create_table(
 }
 
 fn drop_table(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     table: &ConnectorTableIdentity,
     policy: DropPolicy,
     _data_disposition: ConnectorDropTableDataDisposition,
@@ -820,7 +820,7 @@ pub(crate) fn initial_partition_spec(
 }
 
 fn alter_partition_spec(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table: &ConnectorTableIdentity,
     add: &[ConnectorPartitionTransform],
     drop: &[ConnectorPartitionTransform],
@@ -1012,7 +1012,7 @@ fn validate_partition_transform(
 }
 
 fn alter_properties(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table: &ConnectorTableIdentity,
     changes: &[ConnectorPropertyChange],
     authority: ConnectorPropertyAuthority,
@@ -1138,7 +1138,7 @@ fn is_engine_namespace(key: &str) -> bool {
 
 // Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
 fn alter_schema(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table: &ConnectorTableIdentity,
     changes: &[ConnectorSchemaChange],
 ) -> Result<(), ConnectorError> {
@@ -1568,7 +1568,7 @@ fn widen_type(current: &Type, target: Type) -> Result<Type, ConnectorError> {
 }
 
 fn ensure_owner(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     owner: &novarocks_spi::connector::ConnectorInstanceId,
 ) -> Result<(), ConnectorError> {
     if owner == &provider.descriptor().instance_id {
@@ -1589,7 +1589,7 @@ fn table_ident(table: &ConnectorTableIdentity) -> Result<TableIdent, String> {
 }
 
 fn update_table(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     commit: TableCommit,
     action: &str,
 ) -> Result<crate::iceberg::table::Table, ConnectorError> {
@@ -1603,7 +1603,7 @@ fn update_table(
 }
 
 fn execute_bootstrap(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     expected_current_snapshot: Option<i64>,
@@ -1743,7 +1743,7 @@ fn execute_bootstrap(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_metadata_only_mv_stage(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     expected_table_uuid: &str,
@@ -1985,7 +1985,7 @@ fn execute_metadata_only_mv_stage(
 }
 
 fn execute_guarded_properties(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     changes: &[ConnectorPropertyChange],
@@ -2101,7 +2101,7 @@ fn guarded_property_commit_conflict(kind: crate::iceberg::ErrorKind) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn execute_guarded_publication(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     source_branch: &str,
@@ -2241,7 +2241,7 @@ fn execute_guarded_publication(
 }
 
 fn mutation_evidence(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation: &ConnectorCatalogMutationOperation,
 ) -> Result<ExternalMutationEvidence, ConnectorError> {
@@ -2338,7 +2338,7 @@ fn mutation_evidence(
 }
 
 fn evidence(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation_kind: &str,
     target: IcebergMutationEvidenceTarget,
@@ -2359,7 +2359,7 @@ fn evidence(
 }
 
 fn hadoop_create_evidence(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     facts: &crate::hadoop_catalog::HadoopCreateAttemptFacts,
@@ -2382,7 +2382,7 @@ fn hadoop_create_evidence(
 }
 
 fn reconcile_evidence(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     target: IcebergMutationEvidenceTarget,
     evidence: ExternalMutationEvidence,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
@@ -2663,7 +2663,7 @@ fn metadata_only_base_uuid(
 
 #[allow(clippy::too_many_arguments)]
 fn reconcile_metadata_only_mv_stage(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     evidence: &ExternalMutationEvidence,
     namespace: &str,
     table: &str,
@@ -2758,7 +2758,7 @@ fn reconcile_metadata_only_mv_stage(
 
 #[allow(clippy::too_many_arguments)]
 fn reconcile_guarded_ref(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     evidence: &ExternalMutationEvidence,
     namespace: &str,
     table: &str,
@@ -2842,7 +2842,7 @@ fn reconcile_guarded_ref(
 }
 
 fn reconcile_ref(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     evidence: &ExternalMutationEvidence,
     namespace: &str,
     table: &str,
@@ -2894,7 +2894,7 @@ fn reconcile_ref(
 }
 
 fn load_optional_table(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table: &ConnectorTableIdentity,
 ) -> Result<Option<crate::loaded_table::IcebergPhysicalTable>, ConnectorError> {
     if !runtime
@@ -2910,7 +2910,7 @@ fn load_optional_table(
 }
 
 fn receipt(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation_kind: &str,
 ) -> Result<ConnectorCatalogMutationReceipt, ConnectorError> {
@@ -2924,7 +2924,7 @@ fn receipt(
 }
 
 fn receipt_with_version(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation_kind: &str,
     metadata_location: Option<&str>,
@@ -2939,7 +2939,7 @@ fn receipt_with_version(
 }
 
 fn guarded_publication_receipt(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation_kind: &str,
     metadata_location: Option<&str>,
@@ -2967,7 +2967,7 @@ struct HadoopCreateProviderVersion<'a> {
 }
 
 fn hadoop_create_receipt(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation_kind: &str,
     metadata_location: Option<&str>,
@@ -3151,7 +3151,7 @@ mod tests {
 
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
-    use crate::resources::IcebergControlResources;
+    use crate::resources::IcebergMetadataResources;
 
     struct NeverCancelled;
 
@@ -3171,11 +3171,7 @@ mod tests {
         .expect("context")
     }
 
-    fn provider() -> (
-        tokio::runtime::Runtime,
-        tempfile::TempDir,
-        IcebergControlProvider,
-    ) {
+    fn provider() -> (tokio::runtime::Runtime, tempfile::TempDir, IcebergMetadata) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let configuration = crate::catalog_config::parse_catalog_configuration(
@@ -3197,13 +3193,13 @@ mod tests {
             )),
         );
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
-                IcebergControlResources::new(binding, executor.handle().clone()),
+                IcebergMetadataResources::new(binding, executor.handle().clone()),
             )
             .expect("control runtime"),
         );
-        let provider = IcebergControlProvider::new(
+        let provider = IcebergMetadata::new(
             ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
                 instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
@@ -3232,7 +3228,7 @@ mod tests {
             .expect("schema")
     }
 
-    fn guarded_table(provider: &IcebergControlProvider) -> ConnectorTableIdentity {
+    fn guarded_table(provider: &IcebergMetadata) -> ConnectorTableIdentity {
         let namespace = NamespaceIdent::new("guarded".to_string());
         let catalog = provider.runtime().catalog().clone();
         provider
@@ -3292,7 +3288,7 @@ mod tests {
         }
     }
 
-    fn create_namespace(provider: &IcebergControlProvider, name: &str) {
+    fn create_namespace(provider: &IcebergMetadata, name: &str) {
         let namespace = NamespaceIdent::new(name.to_string());
         let catalog = provider.runtime().catalog().clone();
         provider
@@ -3305,7 +3301,7 @@ mod tests {
     }
 
     fn create_request(
-        provider: &IcebergControlProvider,
+        provider: &IcebergMetadata,
         operation_id: ConnectorMutationOperationId,
         policy: CreatePolicy,
     ) -> ConnectorCatalogMutationRequest {

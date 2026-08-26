@@ -746,7 +746,7 @@ impl FrontendApplicationHost {
             as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>
     }
 
-    pub fn connector_control_factory_resolver(
+    pub fn connector_connector_factory_resolver(
         &self,
     ) -> Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver> {
         Arc::clone(&self.connector_control)

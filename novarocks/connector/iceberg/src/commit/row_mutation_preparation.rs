@@ -40,9 +40,9 @@ use crate::commit::write_shared::{
     exact_requested_write_fields_at_schema, snapshot_token, write_target_schema,
     write_target_snapshot_id,
 };
-use crate::control_provider::{IcebergTablePayload, metadata_arrow_fields, projected_schema};
 use crate::file_reader::execution_payload::{decode_payload, encode_payload};
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
+use crate::metadata::{IcebergTablePayload, metadata_arrow_fields, projected_schema};
 
 /// Provider-side row-mutation admission. This is intentionally independent of
 /// `prepare_write`: it chooses the table-format strategy and signs identity

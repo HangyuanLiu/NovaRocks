@@ -79,6 +79,19 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         "rest"
     }
 
+    fn admit_create(
+        &self,
+        intent: CatalogCreateIntent,
+    ) -> Result<(), super::error::CatalogUnsupported> {
+        match intent {
+            CatalogCreateIntent::EmptyTable => Ok(()),
+            CatalogCreateIntent::CreateTableAsSelect => self
+                .admit_staged_create(intent)
+                .map(|_| ())
+                .map_err(super::error::CatalogUnsupported::new),
+        }
+    }
+
     async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError> {
         self.delegate.list_namespaces().await
     }
@@ -165,17 +178,12 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 super::start_create_table_transaction(&self.delegate, request)
             }
             CatalogCreateIntent::CreateTableAsSelect => {
-                // Admission runs before anything is staged or executed. The
-                // staged-create dispatch itself is wired by the CTAS family,
-                // which owns the staged-write aggregate; what belongs here is
-                // the catalog's own answer to "can this request work at all".
-                match self.admit_staged_create(request.intent) {
-                    Ok(_warehouse) => {
-                        super::start_create_table_transaction(&self.delegate, request)
-                    }
-                    Err(reason) => CatalogTransactionStart::Unsupported(
-                        super::error::CatalogUnsupported::new(reason),
-                    ),
+                // Same decision as `admit_create`, so a caller that asked first
+                // and a caller that went straight to the constructor get the
+                // same answer.
+                match self.admit_create(request.intent) {
+                    Ok(()) => super::start_create_table_transaction(&self.delegate, request),
+                    Err(reason) => CatalogTransactionStart::Unsupported(reason),
                 }
             }
         }
@@ -185,11 +193,9 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         &self,
         request: CreateTableTransactionRequest,
     ) -> CatalogTransactionStart {
-        match self.admit_staged_create(request.intent) {
-            Ok(_warehouse) => super::start_create_table_transaction(&self.delegate, request),
-            Err(reason) => {
-                CatalogTransactionStart::Unsupported(super::error::CatalogUnsupported::new(reason))
-            }
+        match self.admit_create(CatalogCreateIntent::CreateTableAsSelect) {
+            Ok(()) => super::start_create_table_transaction(&self.delegate, request),
+            Err(reason) => CatalogTransactionStart::Unsupported(reason),
         }
     }
 }

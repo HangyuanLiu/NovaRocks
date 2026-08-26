@@ -48,9 +48,9 @@ use crate::commit::{
     RecoveryEvidence, RunInput, run_iceberg_commit,
 };
 use crate::commit::{CommitOpKind, CommitOutcome, WrittenFile};
-use crate::control_provider::IcebergControlProvider;
-use crate::control_runtime::IcebergControlRuntime;
 use crate::fs_io;
+use crate::metadata::IcebergMetadata;
+use crate::metadata_context::IcebergMetadataContext;
 
 const PLAN_PAYLOAD_VERSION: u16 = 1;
 const RECEIPT_PAYLOAD_VERSION: u16 = 1;
@@ -197,12 +197,12 @@ enum MarkerLookup {
 }
 
 struct RegisteredIcebergDataMutationBackend {
-    provider: Arc<IcebergControlProvider>,
-    runtime: Arc<IcebergControlRuntime>,
+    provider: Arc<IcebergMetadata>,
+    runtime: Arc<IcebergMetadataContext>,
 }
 
 impl RegisteredIcebergDataMutationBackend {
-    fn new(provider: Arc<IcebergControlProvider>) -> Self {
+    fn new(provider: Arc<IcebergMetadata>) -> Self {
         Self {
             runtime: Arc::clone(provider.runtime()),
             provider,
@@ -570,7 +570,7 @@ pub struct IcebergDataMutationAdapter {
 }
 
 impl IcebergDataMutationAdapter {
-    pub(crate) fn try_new(provider: Arc<IcebergControlProvider>) -> Result<Self, ConnectorError> {
+    pub(crate) fn try_new(provider: Arc<IcebergMetadata>) -> Result<Self, ConnectorError> {
         let key = ConnectorExecutionBindingKey {
             instance_id: provider.descriptor().instance_id.clone(),
             incarnation: provider.incarnation(),
@@ -1074,7 +1074,7 @@ fn data_file_to_written_file(
 }
 
 fn validate_no_duplicate_data_files(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
     manifest: &AddFilesManifest,
 ) -> Result<(), ConnectorError> {
@@ -1102,7 +1102,7 @@ fn validate_no_duplicate_data_files(
 }
 
 fn build_abort_cleanup(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
 ) -> Result<(crate::opendal::Operator, Option<CleanupPathMapper>), ConnectorError> {
     let state = runtime.control_state();
     let warehouse_uri = &state.configuration().warehouse_uri;
@@ -1137,7 +1137,7 @@ fn build_abort_cleanup(
 }
 
 fn ensure_hadoop_registration(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
 ) -> Result<(), ConnectorError> {
     if runtime.control_state().uses_remote_catalog() {
@@ -1333,7 +1333,7 @@ mod tests {
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
     use crate::iceberg::{NamespaceIdent, TableCreation};
-    use crate::resources::IcebergControlResources;
+    use crate::resources::IcebergMetadataResources;
 
     struct NeverCancelled;
 
@@ -1446,7 +1446,7 @@ mod tests {
     fn exact_provider_with_empty_table() -> (
         tokio::runtime::Runtime,
         tempfile::TempDir,
-        Arc<IcebergControlProvider>,
+        Arc<IcebergMetadata>,
     ) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
@@ -1468,9 +1468,9 @@ mod tests {
                 executor.handle().clone(),
             )),
         );
-        let resources = IcebergControlResources::new(binding, executor.handle().clone());
+        let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
                 resources,
             )
@@ -1505,7 +1505,7 @@ mod tests {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
             instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
         };
-        let provider = Arc::new(IcebergControlProvider::new(
+        let provider = Arc::new(IcebergMetadata::new(
             descriptor,
             ConnectorInstanceIncarnation::from_bytes([8; 16]),
             runtime,

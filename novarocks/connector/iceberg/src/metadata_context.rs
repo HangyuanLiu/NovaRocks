@@ -30,13 +30,24 @@ use novarocks_types::naming::normalize_identifier;
 use crate::catalog_control::IcebergCatalogControlState;
 use crate::iceberg::{NamespaceIdent, TableIdent};
 use crate::loaded_table::IcebergPhysicalTable;
-use crate::resources::IcebergControlResources;
+use crate::resources::IcebergMetadataResources;
 
-#[allow(dead_code)] // Assembled into the concrete provider factory during R3C.
+/// Everything one Iceberg control generation owns.
+///
+/// The generation freezes a single catalog, and every operation family reaches
+/// it through [`IcebergMetadataContext::novarocks_catalog`]. The generic and
+/// optional-concrete handles beside it are migration residue: the families move
+/// onto the single owner one at a time, and the single-authority cut removes
+/// the rest. Nothing new should reach for them.
 #[derive(Clone)]
-pub struct IcebergControlRuntime {
+pub struct IcebergMetadataContext {
     control_state: IcebergCatalogControlState,
-    resources: IcebergControlResources,
+    resources: IcebergMetadataResources,
+    /// The one semantic owner of catalog behavior for this generation.
+    novarocks_catalog: Arc<dyn crate::catalog::NovaRocksCatalog>,
+    /// Proven-committed drops awaiting collection. Generation-local and
+    /// bounded; retired with the generation.
+    drop_cleanup: Arc<crate::catalog_control::drop_cleanup::DropCleanupQueue>,
     catalog: Arc<dyn crate::iceberg::Catalog>,
     hadoop_catalog: Option<Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>>,
     rest_catalog: Option<Arc<crate::iceberg_catalog_rest::RestCatalog>>,
@@ -44,14 +55,14 @@ pub struct IcebergControlRuntime {
 }
 
 #[allow(dead_code)]
-impl IcebergControlRuntime {
+impl IcebergMetadataContext {
     /// Construct one fully local provider generation.  REST and HMS client
     /// initialization is polled only through the runtime injected by server
     /// composition, so factory construction remains deterministic in every
     /// frontend role.
     pub fn try_new(
         control_state: IcebergCatalogControlState,
-        resources: IcebergControlResources,
+        resources: IcebergMetadataResources,
     ) -> Result<Self, String> {
         let configuration = control_state.configuration().clone();
         let catalog = resources
@@ -61,9 +72,18 @@ impl IcebergControlRuntime {
             )?
             .map_err(|error| format!("build Iceberg control-generation catalog: {error}"))?;
         let rest_catalog = catalog.rest().cloned();
+        let configuration = control_state.configuration().clone();
+        let novarocks_catalog = resources
+            .catalog_runtime()
+            .block_on(async move {
+                crate::catalog::factory::NovaRocksCatalogFactory::build(&configuration).await
+            })?
+            .map_err(|error| format!("build Iceberg control-generation catalog owner: {error}"))?;
         Ok(Self {
             control_state,
             resources,
+            novarocks_catalog,
+            drop_cleanup: Arc::new(crate::catalog_control::drop_cleanup::DropCleanupQueue::new()),
             catalog: Arc::clone(catalog.generic()),
             hadoop_catalog: catalog.hadoop().cloned(),
             rest_catalog,
@@ -75,6 +95,18 @@ impl IcebergControlRuntime {
 
     pub(crate) fn control_state(&self) -> &IcebergCatalogControlState {
         &self.control_state
+    }
+
+    /// The generation's single catalog owner.
+    pub(crate) fn novarocks_catalog(&self) -> &Arc<dyn crate::catalog::NovaRocksCatalog> {
+        &self.novarocks_catalog
+    }
+
+    /// Proven-committed drops awaiting their collection pass.
+    pub(crate) fn drop_cleanup(
+        &self,
+    ) -> &Arc<crate::catalog_control::drop_cleanup::DropCleanupQueue> {
+        &self.drop_cleanup
     }
 
     pub(crate) fn catalog(&self) -> &Arc<dyn crate::iceberg::Catalog> {
@@ -91,7 +123,7 @@ impl IcebergControlRuntime {
         self.hadoop_catalog.as_ref()
     }
 
-    pub(crate) fn resources(&self) -> &IcebergControlResources {
+    pub(crate) fn resources(&self) -> &IcebergMetadataResources {
         &self.resources
     }
 
@@ -251,10 +283,10 @@ fn catalog_error_kind(error: &crate::iceberg::Error) -> ConnectorErrorKind {
     ConnectorErrorKind::Unavailable
 }
 
-impl std::fmt::Debug for IcebergControlRuntime {
+impl std::fmt::Debug for IcebergMetadataContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("IcebergControlRuntime")
+            .debug_struct("IcebergMetadataContext")
             .field("control_state", &"<provider catalog state>")
             .field("resources", &self.resources)
             .field("catalog", &"<provider catalog client>")
@@ -290,10 +322,12 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let control = IcebergControlResources::new(binding, runtime.handle().clone());
-        let generation =
-            IcebergControlRuntime::try_new(IcebergCatalogControlState::new(configuration), control)
-                .expect("generation runtime");
+        let control = IcebergMetadataResources::new(binding, runtime.handle().clone());
+        let generation = IcebergMetadataContext::try_new(
+            IcebergCatalogControlState::new(configuration),
+            control,
+        )
+        .expect("generation runtime");
 
         assert_eq!(generation.control_state().properties().len(), 2);
         assert!(Arc::strong_count(generation.catalog()) >= 1);

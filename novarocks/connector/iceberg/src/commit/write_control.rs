@@ -56,9 +56,9 @@ use novarocks_spi::connector::{
     LakePublicationId, LakePublicationMarkerHeader,
 };
 
-use crate::control_provider::IcebergControlProvider;
-use crate::control_runtime::IcebergControlRuntime;
 use crate::delete_file::IcebergFileFormat;
+use crate::metadata::IcebergMetadata;
+use crate::metadata_context::IcebergMetadataContext;
 use crate::row_lineage_synth::{
     ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
     ICEBERG_RESERVED_FIELD_ID_ROW_ID, ICEBERG_ROW_ID_COL,
@@ -96,8 +96,8 @@ const MAX_ICEBERG_WRITE_TERMINAL_TOMBSTONES: usize = 16_384;
 pub struct IcebergWriteControl {
     key: ConnectorExecutionBindingKey,
     descriptor: ConnectorInstanceDescriptor,
-    provider: IcebergControlProvider,
-    runtime: Arc<IcebergControlRuntime>,
+    provider: IcebergMetadata,
+    runtime: Arc<IcebergMetadataContext>,
     activations: Arc<IcebergWriteActivationReservations>,
     operations: Arc<Mutex<OperationTable>>,
 }
@@ -345,15 +345,14 @@ impl IcebergWriteControl {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ConnectorInstanceIncarnation,
-        runtime: Arc<IcebergControlRuntime>,
+        runtime: Arc<IcebergMetadataContext>,
     ) -> Self {
         let key = ConnectorExecutionBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation,
         };
         let activations = Arc::clone(runtime.write_activation_reservations());
-        let provider =
-            IcebergControlProvider::new(descriptor.clone(), incarnation, Arc::clone(&runtime));
+        let provider = IcebergMetadata::new(descriptor.clone(), incarnation, Arc::clone(&runtime));
         Self {
             key,
             descriptor,
@@ -3240,7 +3239,7 @@ fn snapshot_total_records(
     reason = "Commit-service errors are propagated unchanged across the existing public error boundary."
 )]
 fn table_snapshot_row_count(
-    runtime: &Arc<IcebergControlRuntime>,
+    runtime: &Arc<IcebergMetadataContext>,
     target: &ActiveTarget,
     snapshot_id: i64,
 ) -> Result<Option<u64>, CommitServiceError> {
@@ -3699,13 +3698,13 @@ mod tests {
 
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
-    use crate::control_provider::IcebergTablePayload;
     use crate::iceberg::spec::{
         FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
         SortOrder, Summary, TableMetadataBuilder, Type,
     };
     use crate::iceberg::{NamespaceIdent, TableCreation};
-    use crate::resources::IcebergControlResources;
+    use crate::metadata::IcebergTablePayload;
+    use crate::resources::IcebergMetadataResources;
     use crate::scan_model::IcebergTableInfo;
 
     use super::*;
@@ -3746,9 +3745,9 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
         );
-        let resources = IcebergControlResources::new(binding, executor.handle().clone());
+        let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
                 resources,
             )
@@ -3788,9 +3787,9 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
         );
-        let resources = IcebergControlResources::new(binding, executor.handle().clone());
+        let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
                 resources,
             )

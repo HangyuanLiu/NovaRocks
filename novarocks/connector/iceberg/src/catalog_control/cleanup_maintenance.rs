@@ -45,9 +45,9 @@ use super::cleanup_candidates::{
 use super::owned_ref_cleanup::{
     OwnedRefCandidate, collect_owned_ref_candidates, matches_owned_ref_candidate,
 };
-use crate::control_provider::IcebergTablePayload;
-use crate::control_runtime::IcebergControlRuntime;
 use crate::iceberg::io::FileIO;
+use crate::metadata::IcebergTablePayload;
+use crate::metadata_context::IcebergMetadataContext;
 
 const ARTIFACT_VERSION: u16 = 2;
 const MAX_RECORDS: usize = 262_144;
@@ -215,14 +215,14 @@ struct CachedPlan {
 pub struct IcebergCleanupMaintenanceAdapter {
     key: ConnectorExecutionBindingKey,
     descriptor: ConnectorInstanceDescriptor,
-    runtime: Arc<IcebergControlRuntime>,
+    runtime: Arc<IcebergMetadataContext>,
     plans: Mutex<HashMap<ConnectorCleanupOperationId, CachedPlan>>,
 }
 
 impl IcebergCleanupMaintenanceAdapter {
     pub fn new(
         key: ConnectorExecutionBindingKey,
-        runtime: Arc<IcebergControlRuntime>,
+        runtime: Arc<IcebergMetadataContext>,
     ) -> Result<Self, ConnectorError> {
         Ok(Self {
             descriptor: ConnectorInstanceDescriptor {
@@ -801,7 +801,7 @@ fn table_uuid_from_payload(payload: &PlanPayload) -> Result<uuid::Uuid, Connecto
 }
 
 fn execute_frozen_batch(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     payload: &PlanPayload,
     batch: &[ManifestRecord],
     config: Option<&novarocks_fs::ObjectStoreConfig>,
@@ -883,7 +883,7 @@ fn execute_frozen_batch(
     reason = "Exact ref retirement keeps every provenance field explicit at the destructive boundary."
 )]
 fn execute_owned_ref(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     payload: &PlanPayload,
     ordinal: u32,
     name: &str,
@@ -994,7 +994,7 @@ async fn delete_exact(
 }
 
 fn write_manifest(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     file_io: &FileIO,
     root: &str,
     digest: [u8; 32],
@@ -1037,7 +1037,7 @@ fn write_manifest(
 }
 
 fn read_manifest(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     file_io: &FileIO,
     root: &str,
     expected_digest: [u8; 32],
@@ -1136,7 +1136,7 @@ fn split_manifest_parts(records: &[ManifestRecord]) -> Result<Vec<ManifestPart>,
 }
 
 fn write_immutable(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     file_io: &FileIO,
     location: &str,
     bytes: Bytes,
@@ -1161,7 +1161,7 @@ fn write_immutable(
 }
 
 fn read_optional(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     file_io: &FileIO,
     location: &str,
     max: usize,
@@ -1182,7 +1182,7 @@ fn read_optional(
 }
 
 fn read(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     file_io: &FileIO,
     location: &str,
     max: usize,
@@ -1486,7 +1486,7 @@ mod tests {
     use super::*;
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
-    use crate::resources::IcebergControlResources;
+    use crate::resources::IcebergMetadataResources;
 
     struct NeverCancelled;
 
@@ -1557,7 +1557,7 @@ mod tests {
     fn local_runtime() -> (
         tokio::runtime::Runtime,
         tempfile::TempDir,
-        Arc<IcebergControlRuntime>,
+        Arc<IcebergMetadataContext>,
     ) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
@@ -1579,9 +1579,9 @@ mod tests {
                 executor.handle().clone(),
             )),
         );
-        let resources = IcebergControlResources::new(binding, executor.handle().clone());
+        let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
                 resources,
             )

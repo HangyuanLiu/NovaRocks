@@ -61,6 +61,16 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         "hive"
     }
 
+    fn admit_create(&self, intent: CatalogCreateIntent) -> Result<(), CatalogUnsupported> {
+        match intent {
+            CatalogCreateIntent::EmptyTable => Ok(()),
+            CatalogCreateIntent::CreateTableAsSelect => Err(CatalogUnsupported::new(
+                "Hive Metastore Iceberg catalog has no standard staged-create protocol, so \
+                     CREATE TABLE AS SELECT cannot publish its target atomically",
+            )),
+        }
+    }
+
     async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError> {
         self.delegate.list_namespaces().await
     }
@@ -146,12 +156,10 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
             CatalogCreateIntent::EmptyTable => {
                 super::start_create_table_transaction(&self.delegate, request)
             }
-            CatalogCreateIntent::CreateTableAsSelect => {
-                CatalogTransactionStart::Unsupported(CatalogUnsupported::new(
-                    "Hive Metastore Iceberg catalog has no standard staged-create protocol, so \
-                     CREATE TABLE AS SELECT cannot publish its target atomically",
-                ))
-            }
+            CatalogCreateIntent::CreateTableAsSelect => match self.admit_create(request.intent) {
+                Ok(()) => super::start_create_table_transaction(&self.delegate, request),
+                Err(reason) => CatalogTransactionStart::Unsupported(reason),
+            },
         }
     }
 
