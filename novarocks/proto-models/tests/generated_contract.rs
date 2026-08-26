@@ -137,3 +137,38 @@ fn retired_terminal_self_attestation_fields_remain_reserved() {
         );
     }
 }
+
+#[test]
+fn retired_request_self_attestation_fields_remain_reserved() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    // Each entry named a digest whose derivation inputs were entirely present in
+    // the same message. The receiver derives the identity instead; other
+    // messages keep carrying it as a cross-message reference.
+    for (message_name, field_number, field_name) in
+        [("novarocks.InitQueryRequest", 2, "init_digest")]
+    {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        assert!(
+            message
+                .reserved_ranges()
+                .any(|range| range.contains(&field_number)),
+            "{message_name} field {field_number} must remain reserved"
+        );
+        assert!(
+            message.reserved_names().any(|name| name == field_name),
+            "{message_name} {field_name} name must remain reserved"
+        );
+        assert!(
+            message.fields().all(|field| field.number() != field_number),
+            "{message_name} must not reuse retired tag {field_number}"
+        );
+        assert!(
+            message.fields().all(|field| field.name() != field_name),
+            "{message_name} must not reuse retired name {field_name}"
+        );
+    }
+}

@@ -153,7 +153,8 @@ enum QueryTerminationReason {
 
 message InitQueryRequest {
   ParticipantManifest manifest = 1;
-  bytes init_digest = 2;
+  reserved 2;
+  reserved "init_digest";
 }
 
 message InitQueryResponse {

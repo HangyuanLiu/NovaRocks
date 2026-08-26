@@ -907,6 +907,8 @@ mod tests {
                 ProtoQueryControlAttach {
                     execution_id: manifest.as_proto().execution_id,
                     init_digest: init
+                        .manifest()
+                        .expect("validated init manifest")
                         .digest()
                         .expect("validated InitQuery has digest")
                         .as_bytes()
@@ -1154,6 +1156,8 @@ mod tests {
             .abort_query(protocol_abort_request(
                 &protocol_init,
                 protocol_init
+                    .manifest()
+                    .expect("validated init manifest")
                     .digest()
                     .expect("validated InitQuery has digest")
                     .as_bytes(),
@@ -1255,6 +1259,8 @@ mod tests {
                     .expect("validated manifest execution id"),
                 ParticipantManifestDigest::new(
                     *protocol_init
+                        .manifest()
+                        .expect("validated init manifest")
                         .digest()
                         .expect("validated InitQuery has digest")
                         .as_bytes(),
@@ -1425,6 +1431,8 @@ mod tests {
             .abort_query(protocol_abort_request(
                 &protocol_init,
                 protocol_different
+                    .manifest()
+                    .expect("validated init manifest")
                     .digest()
                     .expect("validated InitQuery has digest")
                     .as_bytes(),

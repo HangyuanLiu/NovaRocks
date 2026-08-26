@@ -1009,8 +1009,15 @@ mod tests {
         let mut attachment = service
             .lifecycle
             .attach_control(
-                QueryControlAttach::new(execution_id, init.digest().expect("valid init digest"), 1)
-                    .expect("control attachment"),
+                QueryControlAttach::new(
+                    execution_id,
+                    init.manifest()
+                        .expect("validated init manifest")
+                        .digest()
+                        .expect("valid init digest"),
+                    1,
+                )
+                .expect("control attachment"),
             )
             .expect("control attaches");
         assert!(matches!(

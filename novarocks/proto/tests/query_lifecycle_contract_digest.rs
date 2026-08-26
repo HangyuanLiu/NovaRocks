@@ -17,7 +17,6 @@
 
 use std::time::Duration;
 
-use novarocks_proto::ProtocolErrorKind;
 use novarocks_proto::lifecycle::{
     AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantRole,
     QueryControlEndpoint, QueryExecutionId, QueryInitRequest, QueryOptions,
@@ -60,40 +59,59 @@ fn request_with_runtime_filter() -> QueryInitRequest {
 }
 
 #[test]
-fn runtime_filter_contribution_digest_round_trips_canonical_payload() {
+fn sender_and_receiver_derive_the_same_manifest_identity() {
     let request = request_with_runtime_filter();
-    let wire = request.as_proto().clone();
+    let expected = request
+        .manifest()
+        .expect("request manifest")
+        .digest()
+        .expect("request digest");
 
-    let decoded = QueryInitRequest::parse(wire).expect("canonical request decodes");
+    let decoded =
+        QueryInitRequest::parse(request.as_proto().clone()).expect("canonical request decodes");
 
     assert_eq!(
         decoded.manifest().expect("decoded manifest"),
         request.manifest().expect("request manifest")
     );
     assert_eq!(
-        decoded.digest().expect("decoded digest"),
-        request.digest().expect("request digest")
+        decoded
+            .manifest()
+            .expect("decoded manifest")
+            .digest()
+            .expect("decoded digest"),
+        expected,
+        "the identity is derived from content, not carried by the request"
     );
 }
 
 #[test]
-fn participant_manifest_digest_rejects_mutated_runtime_filter_digest() {
-    let mut wire = request_with_runtime_filter().as_proto().clone();
-    let contribution = wire
-        .manifest
+fn participant_manifest_digest_covers_the_nested_runtime_filter_contribution() {
+    let request = request_with_runtime_filter();
+    let baseline = request
+        .manifest()
+        .expect("manifest")
+        .digest()
+        .expect("baseline digest");
+
+    let mut wire = request.as_proto().clone();
+    wire.manifest
         .as_mut()
         .expect("manifest")
         .runtime_filter
         .as_mut()
-        .expect("runtime filter contribution");
-    contribution.contribution_digest[0] ^= 1;
+        .expect("runtime filter contribution")
+        .participant_id += 1;
 
-    let error = QueryInitRequest::parse(wire)
-        .expect_err("mutated runtime filter carrier must not retain the manifest digest");
+    let mutated = QueryInitRequest::parse(wire)
+        .expect("a structurally valid request still decodes")
+        .manifest()
+        .expect("mutated manifest")
+        .digest()
+        .expect("mutated digest");
 
-    assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
-    assert_eq!(
-        error.detail(),
-        "participant manifest digest does not match canonical projection"
+    assert_ne!(
+        baseline, mutated,
+        "descriptor traversal must reach the nested contribution"
     );
 }

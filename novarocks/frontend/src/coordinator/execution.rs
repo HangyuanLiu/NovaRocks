@@ -487,11 +487,9 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         request: QueryInitRequest,
         _timeout: Duration,
     ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
-        let execution_id = request
-            .manifest()
-            .and_then(|manifest| manifest.execution_id())
-            .map_err(protocol_contract_error)?;
-        let digest = request.digest().map_err(protocol_contract_error)?;
+        let manifest = request.manifest().map_err(protocol_contract_error)?;
+        let execution_id = manifest.execution_id().map_err(protocol_contract_error)?;
+        let digest = manifest.digest().map_err(protocol_contract_error)?;
         QueryInitAck::parse(protocol::InitQueryResponse {
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
                 execution_id,

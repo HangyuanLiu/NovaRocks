@@ -1755,7 +1755,10 @@ fn frontend_query_lifecycle_unknown_init_ack_retries_same_request_once() {
             .expect("Protocol manifest")
             .execution_id()
     );
-    assert_eq!(backend_one[0].1.digest(), backend_one[1].1.digest());
+    assert_eq!(
+        backend_one[0].1.manifest().expect("manifest").digest(),
+        backend_one[1].1.manifest().expect("manifest").digest()
+    );
     assert_eq!(
         calls
             .iter()
@@ -2543,7 +2546,11 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
         .expect("live manifest")
         .execution_id()
         .expect("id");
-    let digest = request.digest().expect("digest");
+    let digest = request
+        .manifest()
+        .expect("validated init manifest")
+        .digest()
+        .expect("digest");
     let live_manifest = request.manifest().expect("live manifest");
     let plan = QueryInitPlan::from_manifests_for_contract_test(execution_id, [(7, live_manifest)])
         .expect("live plan");
@@ -2610,7 +2617,11 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
         .expect("manifest")
         .execution_id()
         .expect("id");
-    let digest = request.digest().expect("digest");
+    let digest = request
+        .manifest()
+        .expect("validated init manifest")
+        .digest()
+        .expect("digest");
     let transport =
         new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
             .expect("production lifecycle transport");
@@ -2667,7 +2678,11 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
         .expect("manifest")
         .execution_id()
         .expect("id");
-    let digest = request.digest().expect("digest");
+    let digest = request
+        .manifest()
+        .expect("validated init manifest")
+        .digest()
+        .expect("digest");
     let transport =
         new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
             .expect("production lifecycle transport");
@@ -2739,7 +2754,11 @@ async fn frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_c
         .expect("manifest")
         .execution_id()
         .expect("id");
-    let digest = request.digest().expect("digest");
+    let digest = request
+        .manifest()
+        .expect("validated init manifest")
+        .digest()
+        .expect("digest");
     let transport =
         new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
             .expect("production lifecycle transport");
@@ -2827,7 +2846,11 @@ async fn frontend_query_lifecycle_live_transport_rejects_mismatched_terminal_ack
         .expect("manifest")
         .execution_id()
         .expect("id");
-    let digest = request.digest().expect("digest");
+    let digest = request
+        .manifest()
+        .expect("validated init manifest")
+        .digest()
+        .expect("digest");
     let transport =
         new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
             .expect("production lifecycle transport");
@@ -2880,7 +2903,11 @@ async fn frontend_query_lifecycle_live_transport_accepts_finalized_abort_replay_
         .expect("manifest")
         .execution_id()
         .expect("id");
-    let digest = request.digest().expect("digest");
+    let digest = request
+        .manifest()
+        .expect("validated init manifest")
+        .digest()
+        .expect("digest");
     let transport =
         new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
             .expect("production lifecycle transport");
@@ -3298,7 +3325,11 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
             })
             .expect("validated Protocol InitQuery carries manifest");
         let execution_id = manifest.execution_id().expect("validated execution id");
-        let digest = request.digest().expect("validated digest");
+        let digest = request
+            .manifest()
+            .expect("validated init manifest")
+            .digest()
+            .expect("validated digest");
         *self
             .initialized_backend
             .lock()
