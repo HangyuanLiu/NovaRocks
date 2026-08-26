@@ -1584,7 +1584,9 @@ fn execute_target_query_with_fault(
             format!("FAIL (runner fault injection): {error:#}"),
         )
     });
-    if meta.kill_fe_after_control_ready_count.is_some() || meta.kill_fe_at_lifecycle_phase.is_some()
+    if meta.kill_fe_after_control_ready_count.is_some()
+        || meta.kill_fe_after_mv_known_committed_before_projector_cas
+        || meta.kill_fe_at_lifecycle_phase.is_some()
     {
         if fault_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return (
@@ -3658,6 +3660,7 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
         "drop_next_init_ack_be_index",
         "stop_query_control_heartbeat_be_index",
         "kill_fe_after_control_ready_count",
+        "kill_fe_after_mv_known_committed_before_projector_cas",
         "restart_be_after_init_ack_index",
         "kill_query_after_control_ready_count",
         "kill_query_after_be_log_contains",

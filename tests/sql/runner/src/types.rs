@@ -309,6 +309,9 @@ pub struct QueryMeta {
     pub drop_next_init_ack_be_index: Option<usize>,
     pub stop_query_control_heartbeat_be_index: Option<usize>,
     pub kill_fe_after_control_ready_count: Option<usize>,
+    /// Kill and restart FE after an MV lake publication is known committed but
+    /// before the Accelerator projector can CAS its local projection.
+    pub kill_fe_after_mv_known_committed_before_projector_cas: bool,
     pub restart_be_after_init_ack_index: Option<usize>,
     /// Execute KILL QUERY from a separate client after this query's Nth ControlReady.
     pub kill_query_after_control_ready_count: Option<usize>,

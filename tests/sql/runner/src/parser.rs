@@ -481,6 +481,10 @@ fn parse_meta_with_sql_error_descriptors(
                 })?;
                 meta.kill_fe_after_control_ready_count = Some(value);
             }
+            "kill_fe_after_mv_known_committed_before_projector_cas" => {
+                meta.kill_fe_after_mv_known_committed_before_projector_cas =
+                    parse_bool(&raw_value)?;
+            }
             "restart_be_after_init_ack_index" => {
                 let value = raw_value.parse::<usize>().with_context(|| {
                     format!("invalid restart_be_after_init_ack_index: {raw_value}")
@@ -884,6 +888,9 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         kill_fe_after_control_ready_count: override_meta
             .kill_fe_after_control_ready_count
             .or(base.kill_fe_after_control_ready_count),
+        kill_fe_after_mv_known_committed_before_projector_cas: override_meta
+            .kill_fe_after_mv_known_committed_before_projector_cas
+            || base.kill_fe_after_mv_known_committed_before_projector_cas,
         restart_be_after_init_ack_index: override_meta
             .restart_be_after_init_ack_index
             .or(base.restart_be_after_init_ack_index),
@@ -1503,6 +1510,7 @@ mod opt5_directive_tests {
             "-- @drop_next_init_ack_be_index=1".to_string(),
             "-- @stop_query_control_heartbeat_be_index=2".to_string(),
             "-- @kill_fe_after_control_ready_count=3".to_string(),
+            "-- @kill_fe_after_mv_known_committed_before_projector_cas=true".to_string(),
             "-- @restart_be_after_init_ack_index=0".to_string(),
             "-- @kill_query_after_control_ready_count=2".to_string(),
             "-- @kill_query_after_be_log_contains=split_id=iceberg-metadata-0".to_string(),
@@ -1524,6 +1532,7 @@ mod opt5_directive_tests {
         assert_eq!(meta.drop_next_init_ack_be_index, Some(1));
         assert_eq!(meta.stop_query_control_heartbeat_be_index, Some(2));
         assert_eq!(meta.kill_fe_after_control_ready_count, Some(3));
+        assert!(meta.kill_fe_after_mv_known_committed_before_projector_cas);
         assert_eq!(meta.restart_be_after_init_ack_index, Some(0));
         assert_eq!(meta.kill_query_after_control_ready_count, Some(2));
         assert_eq!(
@@ -1949,6 +1958,7 @@ mod opt5_directive_tests {
             drop_next_init_ack_be_index: Some(0),
             stop_query_control_heartbeat_be_index: Some(1),
             kill_fe_after_control_ready_count: Some(2),
+            kill_fe_after_mv_known_committed_before_projector_cas: true,
             restart_be_after_init_ack_index: Some(0),
             kill_query_after_control_ready_count: Some(1),
             kill_query_after_be_log_contains: Some("reader-open".to_string()),
@@ -1968,6 +1978,7 @@ mod opt5_directive_tests {
         assert_eq!(inherited.drop_next_init_ack_be_index, Some(0));
         assert_eq!(inherited.stop_query_control_heartbeat_be_index, Some(1));
         assert_eq!(inherited.kill_fe_after_control_ready_count, Some(2));
+        assert!(inherited.kill_fe_after_mv_known_committed_before_projector_cas);
         assert_eq!(inherited.restart_be_after_init_ack_index, Some(0));
         assert_eq!(inherited.kill_query_after_control_ready_count, Some(1));
         assert_eq!(
@@ -2015,6 +2026,7 @@ mod opt5_directive_tests {
         assert_eq!(overridden.drop_next_init_ack_be_index, Some(2));
         assert_eq!(overridden.stop_query_control_heartbeat_be_index, Some(0));
         assert_eq!(overridden.kill_fe_after_control_ready_count, Some(3));
+        assert!(overridden.kill_fe_after_mv_known_committed_before_projector_cas);
         assert_eq!(overridden.restart_be_after_init_ack_index, Some(2));
         assert_eq!(overridden.kill_query_after_control_ready_count, Some(3));
         assert_eq!(

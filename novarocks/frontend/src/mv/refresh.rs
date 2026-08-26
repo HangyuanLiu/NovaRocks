@@ -17,6 +17,8 @@
 //! Frontend execution of a lake-authoritative MV publication.
 
 use std::sync::{Arc, RwLock};
+#[cfg(debug_assertions)]
+use std::time::{Duration, Instant};
 
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::mv::domain::application::{
@@ -295,6 +297,7 @@ fn execute_data(
     let package = dependencies
         .provider_activation
         .observe_published_package(planning, &table, snapshot, &context)?;
+    wait_for_known_committed_before_projector_cas(&attempt.publication_id)?;
     dependencies
         .readiness
         .project_observed(*attempt.publication_id.as_uuid(), &package)
@@ -503,11 +506,60 @@ fn execute_metadata_only(
     let package = dependencies
         .provider_activation
         .observe_published_package(planning, &table, snapshot, &context)?;
+    wait_for_known_committed_before_projector_cas(&attempt.publication_id)?;
     dependencies
         .readiness
         .project_observed(*attempt.publication_id.as_uuid(), &package)
         .map_err(repository_error)?;
     Ok(MvStatementResult::Ok)
+}
+
+/// Debug-only runner seam: the lake publication is known committed and its
+/// immutable package has been read, but the Accelerator projector has not yet
+/// entered its CAS. This is deliberately not a query-lifecycle phase.
+#[cfg(debug_assertions)]
+fn wait_for_known_committed_before_projector_cas(
+    publication_id: &novarocks_spi::connector::LakePublicationId,
+) -> Result<(), MvApplicationError> {
+    let Some(root) = novarocks_failpoint::configured_root() else {
+        return Ok(());
+    };
+    let trigger = novarocks_failpoint::mv_known_committed_before_projector_cas_trigger_path(&root);
+    if !trigger.exists() {
+        return Ok(());
+    }
+    let marker = novarocks_failpoint::mv_known_committed_before_projector_cas_marker_path(&root);
+    let contents = format!(
+        "publication_id={}\nphase=known-committed-before-projector-cas\n",
+        publication_id.as_uuid()
+    );
+    std::fs::write(&marker, contents).map_err(|error| {
+        unavailable(format!(
+            "write runner-owned MV projector barrier marker {}: {error}",
+            marker.display()
+        ))
+    })?;
+    eprintln!(
+        "NOVAROCKS_MV_PROJECTOR_PHASE publication_id={} phase=known-committed-before-projector-cas action=kill_fe",
+        publication_id.as_uuid()
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while trigger.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if trigger.exists() {
+        return Err(unavailable(
+            "timed out waiting for runner-owned MV projector barrier release",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn wait_for_known_committed_before_projector_cas(
+    _publication_id: &novarocks_spi::connector::LakePublicationId,
+) -> Result<(), MvApplicationError> {
+    Ok(())
 }
 
 fn require_catalog_commit(
