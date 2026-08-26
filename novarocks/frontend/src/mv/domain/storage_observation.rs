@@ -425,7 +425,7 @@ pub(crate) struct MvLakeSourceRevision {
 /// Complete accelerator watermark projection derived from one validated lake
 /// package. Never-published packages deliberately do not invent a waterline.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MvLakePublishedProjection {
+pub enum MvLakePublishedProjection {
     NeverPublished,
     Published {
         last_refresh_ms: i64,

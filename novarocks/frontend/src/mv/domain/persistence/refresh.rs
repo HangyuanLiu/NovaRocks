@@ -502,6 +502,9 @@ pub struct RecordPublishCommitRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvRefreshFinalizeRequest {
     pub refresh_id: i64,
+    /// Timestamp of the exact target snapshot that proved the published MV
+    /// waterline. It is never a frontend wall-clock observation.
+    pub last_refresh_ms: i64,
     pub rows: i64,
     pub base_snapshots: BTreeMap<String, i64>,
     pub base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,

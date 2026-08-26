@@ -296,6 +296,7 @@ fn frontend_recovery_upgrades_v3_and_finalizes_published_truth_atomically() {
         .finalize_recovered_published_refresh(FinalizeRecoveredMvRefreshRequest {
             finalize: MvRefreshFinalizeRequest {
                 refresh_id: refresh.refresh_id,
+                last_refresh_ms: 1,
                 rows: 2,
                 base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
                 base_table_object_ids: BTreeMap::from([(
@@ -582,6 +583,7 @@ fn frontend_noop_refresh_persists_no_synthetic_external_actions() {
     repository
         .finalize_frontend_refresh_without_external_actions(MvRefreshFinalizeRequest {
             refresh_id: refresh.refresh_id,
+            last_refresh_ms: 1,
             rows: 0,
             base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
             base_table_object_ids: BTreeMap::from([(
@@ -641,6 +643,7 @@ fn refresh_lifecycle_persists_transitions_and_finalizes_definition() {
     repository
         .finalize_refresh(MvRefreshFinalizeRequest {
             refresh_id: refresh.refresh_id,
+            last_refresh_ms: 1,
             rows: 7,
             base_snapshots: base_snapshots.clone(),
             base_table_object_ids: BTreeMap::from([(
@@ -733,6 +736,7 @@ fn list_refreshes_pages_and_includes_finalized_and_aborted_records() {
     repository
         .finalize_refresh(MvRefreshFinalizeRequest {
             refresh_id: finalized.refresh_id,
+            last_refresh_ms: 1,
             rows: 1,
             base_snapshots: BTreeMap::new(),
             base_table_object_ids: BTreeMap::new(),
@@ -822,6 +826,7 @@ fn dropping_a_finalized_mv_removes_refresh_and_partition_records_before_reopen()
     repository
         .finalize_refresh(MvRefreshFinalizeRequest {
             refresh_id: refresh.refresh_id,
+            last_refresh_ms: 1,
             rows: 1,
             base_snapshots: BTreeMap::new(),
             base_table_object_ids: BTreeMap::new(),
@@ -911,6 +916,7 @@ fn dropping_paged_mv_records_removes_all_dependencies_and_refresh_history() {
         repository
             .finalize_refresh(MvRefreshFinalizeRequest {
                 refresh_id: refresh.refresh_id,
+                last_refresh_ms: snapshot_id,
                 rows: snapshot_id,
                 base_snapshots: BTreeMap::new(),
                 base_table_object_ids: BTreeMap::new(),
@@ -994,6 +1000,7 @@ fn finalize_with_partitions_returns_not_found_for_missing_partition_mv() {
         .finalize_refresh_with_partitions(FinalizeMvRefreshWithPartitionsRequest {
             refresh: MvRefreshFinalizeRequest {
                 refresh_id: refresh.refresh_id,
+                last_refresh_ms: 1,
                 rows: 1,
                 base_snapshots: BTreeMap::new(),
                 base_table_object_ids: BTreeMap::new(),

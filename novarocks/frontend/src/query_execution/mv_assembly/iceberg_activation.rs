@@ -22,14 +22,16 @@
 //! writer registration, provenance encoding and commit/reconcile machinery.
 
 use novarocks_spi::connector::{
-    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationIntent,
-    ConnectorManagedPublicationTechnique, ConnectorRequestContext,
-    ConnectorStagedPublicationBaseFact, ConnectorWriteActivationIntent, ConnectorWriteInputRequest,
+    ConnectorControlPlanningLease, ConnectorManagedPublicationEmptyInputDisposition,
+    ConnectorManagedPublicationIntent, ConnectorManagedPublicationTechnique,
+    ConnectorRequestContext, ConnectorStagedPublicationBaseFact, ConnectorTableIdentity,
+    ConnectorTableResolution, ConnectorWriteActivationIntent, ConnectorWriteInputRequest,
     ConnectorWriteLease, ConnectorWriteOperationId,
 };
 
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
+use crate::mv::domain::storage_observation::{MvLakePublishedProjection, observe_lake_package};
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvRefreshCommittedFacts, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
@@ -101,6 +103,53 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
         MvRefreshCommittedFacts::from_write_receipt(intent, receipt)
     }
 
+    fn observe_published_projection(
+        &self,
+        planning_lease: &ConnectorControlPlanningLease,
+        table: &ConnectorTableIdentity,
+        expected_snapshot_id: i64,
+        connector_context: &ConnectorRequestContext,
+    ) -> Result<MvLakePublishedProjection, String> {
+        if planning_lease.binding().descriptor().instance_id != table.instance_id {
+            return Err(
+                "MV publication observation table belongs to a different connector generation"
+                    .to_string(),
+            );
+        }
+        let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+            planning_lease,
+            connector_context.clone(),
+            table.namespace.as_ref(),
+            table.table.as_ref(),
+            ConnectorTableResolution::StrictBaseTable,
+        )
+        .map_err(|error| format!("reload MV publication target metadata: {error}"))?;
+        if metadata.identity != *table {
+            return Err(
+                "MV publication observation loaded metadata for a different target table"
+                    .to_string(),
+            );
+        }
+        let package = observe_lake_package(
+            self.ports.storage_observation(),
+            planning_lease,
+            &metadata,
+            connector_context.clone(),
+        )
+        .map_err(|error| format!("observe MV publication lake package: {error}"))?
+        .ok_or_else(|| "MV publication target has no lake package observation".to_string())?;
+        if package.table != *table {
+            return Err(
+                "MV publication observer returned a package for a different target table"
+                    .to_string(),
+            );
+        }
+        let projection = package
+            .published_projection()
+            .map_err(|error| format!("project MV publication lake package: {error}"))?;
+        require_exact_published_projection(projection, expected_snapshot_id)
+    }
+
     fn sync_repartition_descriptor(
         &self,
         mv_id: i64,
@@ -130,6 +179,27 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
             Some(committed_partitioning),
             connector_context,
         )
+    }
+}
+
+fn require_exact_published_projection(
+    projection: MvLakePublishedProjection,
+    expected_snapshot_id: i64,
+) -> Result<MvLakePublishedProjection, String> {
+    match &projection {
+        MvLakePublishedProjection::Published {
+            last_refreshed_iceberg_snapshot_id,
+            ..
+        } if *last_refreshed_iceberg_snapshot_id == expected_snapshot_id => Ok(projection),
+        MvLakePublishedProjection::Published {
+            last_refreshed_iceberg_snapshot_id,
+            ..
+        } => Err(format!(
+            "MV publication lake snapshot {last_refreshed_iceberg_snapshot_id} does not match committed snapshot {expected_snapshot_id}"
+        )),
+        MvLakePublishedProjection::NeverPublished => {
+            Err("MV publication committed but its lake package is never-published".to_string())
+        }
     }
 }
 
@@ -276,4 +346,38 @@ pub(crate) fn managed_publication_activation_intent(
         ),
     }
     .map_err(|error| format!("build managed MV publication activation intent: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::{MvLakePublishedProjection, require_exact_published_projection};
+
+    fn published(snapshot_id: i64) -> MvLakePublishedProjection {
+        MvLakePublishedProjection::Published {
+            last_refresh_ms: 1_700_000_010_000,
+            last_refresh_rows: 7,
+            last_refreshed_iceberg_snapshot_id: snapshot_id,
+            base_snapshots: BTreeMap::new(),
+            base_table_object_ids: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn exact_published_projection_retains_the_lake_timestamp() {
+        assert_eq!(
+            require_exact_published_projection(published(99), 99)
+                .expect("exact snapshot is accepted"),
+            published(99)
+        );
+    }
+
+    #[test]
+    fn advanced_published_projection_fails_closed() {
+        let error = require_exact_published_projection(published(100), 99)
+            .expect_err("advanced lake head must not finalize an older publication");
+
+        assert!(error.contains("does not match committed snapshot 99"));
+    }
 }

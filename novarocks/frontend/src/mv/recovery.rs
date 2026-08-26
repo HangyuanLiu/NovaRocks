@@ -267,6 +267,7 @@ fn recover_one(
             finalize_published(
                 repository,
                 dependencies,
+                &lease,
                 &recovered,
                 frontend_observation.clone(),
                 committed_partitioning.as_ref(),
@@ -308,7 +309,14 @@ fn recover_legacy_one(
     match observation.disposition {
         ConnectorStagedPublicationDisposition::Ambiguous => Err(()),
         ConnectorStagedPublicationDisposition::Published => {
-            finalize_legacy_published(repository, &refresh, &observation)?;
+            finalize_legacy_published(
+                repository,
+                dependencies,
+                &lease,
+                &refresh,
+                &observation,
+                &context,
+            )?;
             Ok(RecoveryResult::Resolved)
         }
         ConnectorStagedPublicationDisposition::Superseded
@@ -354,19 +362,21 @@ fn legacy_cleanup(
 
 fn finalize_legacy_published(
     repository: &dyn MvRepository,
+    dependencies: &FrontendMvRecoveryDependencies,
+    lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     refresh: &StoredMvRefresh,
     observation: &ConnectorStagedPublicationObservation,
+    connector_context: &ConnectorRequestContext,
 ) -> Result<(), ()> {
-    let rows = i64::try_from(observation.resulting_row_count.ok_or(())?).map_err(|_| ())?;
     let snapshot = observation.target_snapshot_id.ok_or(())?;
-    let finalize = MvRefreshFinalizeRequest {
-        refresh_id: refresh.refresh_id,
-        rows,
-        base_snapshots: refresh.target_snapshots.clone(),
-        base_table_object_ids: refresh.base_table_object_ids.clone(),
-        target_snapshot_id: Some(snapshot),
-        partition_spec: None,
-    };
+    let finalize = finalize_published_projection(
+        dependencies,
+        lease,
+        refresh,
+        snapshot,
+        None,
+        connector_context,
+    )?;
     use crate::mv::domain::persistence::refresh::MvRefreshState;
     match refresh.state {
         MvRefreshState::IntentCreated => repository
@@ -499,6 +509,7 @@ fn record_cleanup_outcome(
 fn finalize_published(
     repository: &dyn MvRepository,
     dependencies: &FrontendMvRecoveryDependencies,
+    lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     refresh: &StoredMvRefresh,
     observation: FrontendMvRefreshRecoveryObservation,
     committed_partitioning: Option<&novarocks_spi::connector::ConnectorCommittedPartitioning>,
@@ -511,7 +522,6 @@ fn finalize_published(
     // from finalizing; the owned branch is now retired by age-gated GC.
     recovery.cleanup_state = None;
     recovery.cleanup_evidence = None;
-    let rows = observation.resulting_row_count.ok_or(())?;
     // The current target head may have advanced beyond this publication after
     // the marker commit. Durable MV refresh facts must retain the exact marker
     // snapshot proven by the committed version, not the later observed head.
@@ -538,17 +548,49 @@ fn finalize_published(
     }
     repository
         .finalize_recovered_published_refresh(FinalizeRecoveredMvRefreshRequest {
-            finalize: MvRefreshFinalizeRequest {
-                refresh_id: refresh.refresh_id,
-                rows,
-                base_snapshots: refresh.target_snapshots.clone(),
-                base_table_object_ids: refresh.base_table_object_ids.clone(),
-                target_snapshot_id: Some(committed_snapshot_id),
+            finalize: finalize_published_projection(
+                dependencies,
+                lease,
+                refresh,
+                committed_snapshot_id,
                 partition_spec,
-            },
+                connector_context,
+            )?,
             recovery,
         })
         .map_err(|_| ())
+}
+
+fn finalize_published_projection(
+    dependencies: &FrontendMvRecoveryDependencies,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    refresh: &StoredMvRefresh,
+    expected_snapshot_id: i64,
+    partition_spec: Option<crate::mv::domain::persistence::schema::MvPartitionContract>,
+    connector_context: &ConnectorRequestContext,
+) -> Result<MvRefreshFinalizeRequest, ()> {
+    let instance_id =
+        ConnectorInstanceId::parse(refresh.target_catalog.as_deref().ok_or(())?).map_err(|_| ())?;
+    let table = ConnectorTableIdentity {
+        instance_id,
+        namespace: Arc::from(refresh.target_namespace.as_deref().ok_or(())?),
+        table: Arc::from(refresh.target_table.as_deref().ok_or(())?),
+    };
+    let projection = dependencies
+        .provider_activation
+        .observe_published_projection(
+            planning_lease,
+            &table,
+            expected_snapshot_id,
+            connector_context,
+        )
+        .map_err(|_| ())?;
+    super::refresh::finalize_request_from_published_projection(
+        refresh.refresh_id,
+        projection,
+        partition_spec,
+    )
+    .map_err(|_| ())
 }
 
 fn unresolved(
@@ -922,17 +964,19 @@ mod tests {
         BeginFrontendMvRefreshIntentRequest, CreateMvRepositoryRequest,
         InitialMvRefreshConfiguration, MvRepository,
     };
+    use crate::mv::domain::storage_observation::MvLakePublishedProjection;
     use crate::state_store::testing::{
         StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
         StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
     };
     use novarocks_spi::connector::{
         ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
-        ConnectorCommittedVersion, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-        ConnectorManagedPartitionTransform, ConnectorMutationFailure, ConnectorMutationFailureKind,
-        ConnectorProviderId, ConnectorStagedPublicationCleanupReceipt,
-        ConnectorStagedPublicationProof, ConnectorStagedPublicationRecovery,
-        ConnectorTableObjectId, ExternalMutationEffect, ExternalMutationEvidence,
+        ConnectorCommittedVersion, ConnectorControlPlanningLease, ConnectorExecutionBindingKey,
+        ConnectorInstanceDescriptor, ConnectorManagedPartitionTransform, ConnectorMutationFailure,
+        ConnectorMutationFailureKind, ConnectorProviderId,
+        ConnectorStagedPublicationCleanupReceipt, ConnectorStagedPublicationProof,
+        ConnectorStagedPublicationRecovery, ConnectorTableObjectId, ExternalMutationEffect,
+        ExternalMutationEvidence,
     };
     use novarocks_spi::state_store::FeDeploymentView;
     use novarocks_sql::planning::mv::ApplyKeySource;
@@ -1069,6 +1113,22 @@ mod tests {
             String,
         > {
             unreachable!("recovery never interprets a live write receipt")
+        }
+
+        fn observe_published_projection(
+            &self,
+            _planning_lease: &ConnectorControlPlanningLease,
+            _table: &ConnectorTableIdentity,
+            expected_snapshot_id: i64,
+            _connector_context: &ConnectorRequestContext,
+        ) -> Result<MvLakePublishedProjection, String> {
+            Ok(MvLakePublishedProjection::Published {
+                last_refresh_ms: 1,
+                last_refresh_rows: 0,
+                last_refreshed_iceberg_snapshot_id: expected_snapshot_id,
+                base_snapshots: BTreeMap::new(),
+                base_table_object_ids: BTreeMap::new(),
+            })
         }
 
         fn sync_repartition_descriptor(

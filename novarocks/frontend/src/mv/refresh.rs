@@ -34,6 +34,7 @@ use crate::mv::domain::persistence::refresh::{
 use crate::mv::domain::repository::{
     BeginFrontendMvRefreshIntentRequest, MvRepository, MvRepositoryError,
 };
+use crate::mv::domain::storage_observation::MvLakePublishedProjection;
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::contract::ConnectorWriteExecutionRegistration;
@@ -129,6 +130,31 @@ impl FrontendMvRefreshProviderActivationPort {
         activation
             .interpret_write_commit(intent, receipt)
             .map_err(invalid)
+    }
+
+    pub(super) fn observe_published_projection(
+        &self,
+        planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        table: &ConnectorTableIdentity,
+        expected_snapshot_id: i64,
+        connector_context: &ConnectorRequestContext,
+    ) -> Result<MvLakePublishedProjection, MvApplicationError> {
+        let activation = self
+            .activation
+            .read()
+            .map_err(|_| unavailable("MV refresh provider activation lock is poisoned"))?
+            .clone()
+            .ok_or_else(|| unavailable("MV refresh provider activation is unavailable"))?;
+        activation
+            .observe_published_projection(
+                planning_lease,
+                table,
+                expected_snapshot_id,
+                connector_context,
+            )
+            .map_err(|error| {
+                MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
+            })
     }
 
     pub(super) fn sync_repartition_descriptor(
@@ -280,27 +306,17 @@ pub(super) fn execute(
         ..
     } = refresh;
     match work {
-        PreparedMvRefreshWork::NoOp => {
-            repository
-                .finalize_frontend_refresh_without_external_actions(MvRefreshFinalizeRequest {
-                    refresh_id: attempt.refresh_id,
-                    rows: 0,
-                    base_snapshots,
-                    base_table_object_ids,
-                    target_snapshot_id: finalize.expected_target_snapshot_id,
-                    partition_spec: None,
-                })
-                .map_err(repository_error)?;
-            Ok(MvStatementResult::Ok)
-        }
+        PreparedMvRefreshWork::NoOp => Err(invalid(
+            "MV refresh no-op reached durable finalization after early-return admission",
+        )),
         PreparedMvRefreshWork::MetadataOnly { intent } => execute_metadata_only_refresh(
             repository,
+            dependencies,
             &planning_lease,
             attempt,
             finalize,
             intent,
-            base_snapshots,
-            connector_context,
+            connector_context.clone(),
         ),
         PreparedMvRefreshWork::DataProducing { write } => execute_data_refresh(
             repository,
@@ -309,7 +325,6 @@ pub(super) fn execute(
             attempt,
             finalize,
             write,
-            base_snapshots,
             connector_context,
             execution,
         ),
@@ -319,11 +334,11 @@ pub(super) fn execute(
 #[allow(clippy::too_many_arguments)]
 fn execute_metadata_only_refresh(
     repository: &dyn MvRepository,
+    dependencies: &FrontendMvRefreshDependencies,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     attempt: MvRefreshAttemptIdentity,
     finalize: MvRefreshFinalizeFacts,
     intent: crate::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
-    base_snapshots: BTreeMap<String, i64>,
     connector_context: ConnectorRequestContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
     if finalize.expected_target_snapshot_id.is_none() {
@@ -401,14 +416,6 @@ fn execute_metadata_only_refresh(
         .committed_version()
         .cloned()
         .ok_or_else(|| invalid("metadata-only MV staging committed without a snapshot version"))?;
-    let rows = staged_snapshot
-        .receipt
-        .resulting_row_count()
-        .ok_or_else(|| {
-            invalid("metadata-only MV staging committed without its inherited row count")
-        })?;
-    let rows =
-        i64::try_from(rows).map_err(|_| invalid("metadata-only MV row count exceeds i64"))?;
     let staged_frontend_version = frontend_version(&committed_version)?;
     recovery_phase_barrier("write-committed")?;
 
@@ -437,7 +444,7 @@ fn execute_metadata_only_refresh(
                     guard,
                 },
             },
-            connector_context,
+            connector_context.clone(),
         ),
         Some(staged_frontend_version),
     )?;
@@ -449,6 +456,12 @@ fn execute_metadata_only_refresh(
             invalid("metadata-only MV publication committed without a snapshot version")
         })?;
     let published_version = frontend_version(&published_version)?;
+    let published_snapshot_id = published_version.snapshot_id.ok_or_else(|| {
+        MvApplicationError::new(
+            MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+            "metadata-only MV publication committed without a snapshot ID",
+        )
+    })?;
     recovery_phase_barrier("publication-committed")?;
     record_proof_only_phase(
         repository,
@@ -459,14 +472,15 @@ fn execute_metadata_only_refresh(
         None,
     )?;
     repository
-        .finalize_refresh(MvRefreshFinalizeRequest {
-            refresh_id: attempt.refresh_id,
-            rows,
-            base_snapshots,
-            base_table_object_ids: finalize.base_table_object_ids,
-            target_snapshot_id: published_version.snapshot_id,
-            partition_spec: None,
-        })
+        .finalize_refresh(finalize_published_projection(
+            dependencies,
+            planning_lease,
+            attempt.refresh_id,
+            &finalize,
+            published_snapshot_id,
+            None,
+            &connector_context,
+        )?)
         .map_err(|error| {
             MvApplicationError::new(
                 MvApplicationErrorKind::KnownCommittedFinalizeFailed,
@@ -484,7 +498,6 @@ fn execute_data_refresh(
     attempt: MvRefreshAttemptIdentity,
     finalize: MvRefreshFinalizeFacts,
     prepared: PreparedMvRefreshWrite,
-    base_snapshots: BTreeMap<String, i64>,
     connector_context: ConnectorRequestContext,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<MvStatementResult, MvApplicationError> {
@@ -695,6 +708,12 @@ fn execute_data_refresh(
     let published =
         MvRefreshPublishedFacts::try_new(committed, publication_version).map_err(invalid)?;
     let published_frontend_version = frontend_version(published.publication_version())?;
+    let published_snapshot_id = published_frontend_version.snapshot_id.ok_or_else(|| {
+        MvApplicationError::new(
+            MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+            "MV publication committed without a snapshot ID",
+        )
+    })?;
 
     recovery_phase_barrier("publication-committed")?;
 
@@ -728,14 +747,15 @@ fn execute_data_refresh(
             )?;
     }
     repository
-        .finalize_refresh(MvRefreshFinalizeRequest {
-            refresh_id: attempt.refresh_id,
-            rows: published.committed().resulting_row_count(),
-            base_snapshots,
-            base_table_object_ids: finalize.base_table_object_ids,
-            target_snapshot_id: published_frontend_version.snapshot_id,
+        .finalize_refresh(finalize_published_projection(
+            dependencies,
+            planning_lease,
+            attempt.refresh_id,
+            &finalize,
+            published_snapshot_id,
             partition_spec,
-        })
+            &connector_context,
+        )?)
         .map_err(|error| {
             MvApplicationError::new(
                 MvApplicationErrorKind::KnownCommittedFinalizeFailed,
@@ -809,6 +829,58 @@ fn table_identity(
         instance_id,
         namespace: facts.target.database.clone().into(),
         table: facts.target.name.clone().into(),
+    }
+}
+
+fn finalize_published_projection(
+    dependencies: &FrontendMvRefreshDependencies,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    refresh_id: i64,
+    facts: &MvRefreshFinalizeFacts,
+    expected_snapshot_id: i64,
+    partition_spec: Option<crate::mv::domain::persistence::schema::MvPartitionContract>,
+    connector_context: &ConnectorRequestContext,
+) -> Result<MvRefreshFinalizeRequest, MvApplicationError> {
+    let table = table_identity(
+        facts,
+        planning_lease.binding().descriptor().instance_id.clone(),
+    );
+    let projection = dependencies
+        .provider_activation
+        .observe_published_projection(
+            planning_lease,
+            &table,
+            expected_snapshot_id,
+            connector_context,
+        )?;
+    finalize_request_from_published_projection(refresh_id, projection, partition_spec)
+}
+
+pub(super) fn finalize_request_from_published_projection(
+    refresh_id: i64,
+    projection: MvLakePublishedProjection,
+    partition_spec: Option<crate::mv::domain::persistence::schema::MvPartitionContract>,
+) -> Result<MvRefreshFinalizeRequest, MvApplicationError> {
+    match projection {
+        MvLakePublishedProjection::Published {
+            last_refresh_ms,
+            last_refresh_rows,
+            last_refreshed_iceberg_snapshot_id,
+            base_snapshots,
+            base_table_object_ids,
+        } => Ok(MvRefreshFinalizeRequest {
+            refresh_id,
+            last_refresh_ms,
+            rows: last_refresh_rows,
+            base_snapshots,
+            base_table_object_ids,
+            target_snapshot_id: Some(last_refreshed_iceberg_snapshot_id),
+            partition_spec,
+        }),
+        MvLakePublishedProjection::NeverPublished => Err(MvApplicationError::new(
+            MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+            "MV publication committed but its lake package is never-published",
+        )),
     }
 }
 
@@ -1259,6 +1331,7 @@ fn repository_error(error: MvRepositoryError) -> MvApplicationError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -1267,6 +1340,7 @@ mod tests {
         FrontendMvRefreshActionPhase, FrontendMvRefreshActionState,
         FrontendMvRefreshCommittedVersion,
     };
+    use crate::mv::domain::storage_observation::MvLakePublishedProjection;
     use crate::query_execution::mv_assembly::refresh_artifact::{
         MvRefreshCommittedFacts, MvRefreshPublicationIntent,
     };
@@ -1277,8 +1351,8 @@ mod tests {
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorCommittedPartitionField, ConnectorCommittedPartitioning,
         ConnectorControlPlanningLease, ConnectorManagedPartitionTransform, ConnectorRequestContext,
-        ConnectorWriteLease, ConnectorWriteReceipt, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        ConnectorTableIdentity, ConnectorWriteLease, ConnectorWriteReceipt,
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
     use super::{FrontendMvRefreshProviderActivationPort, proof_only_action, receipt_evidence};
@@ -1312,6 +1386,22 @@ mod tests {
             _receipt: &ConnectorWriteReceipt,
         ) -> Result<MvRefreshCommittedFacts, String> {
             unreachable!("the composition test never interprets a receipt")
+        }
+
+        fn observe_published_projection(
+            &self,
+            _planning_lease: &ConnectorControlPlanningLease,
+            _table: &ConnectorTableIdentity,
+            expected_snapshot_id: i64,
+            _connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<MvLakePublishedProjection, String> {
+            Ok(MvLakePublishedProjection::Published {
+                last_refresh_ms: 1,
+                last_refresh_rows: 0,
+                last_refreshed_iceberg_snapshot_id: expected_snapshot_id,
+                base_snapshots: BTreeMap::new(),
+                base_table_object_ids: BTreeMap::new(),
+            })
         }
 
         fn sync_repartition_descriptor(
@@ -1367,6 +1457,46 @@ mod tests {
             ],
         )
         .expect("committed partitioning")
+    }
+
+    #[test]
+    fn complete_lake_projection_populates_every_finalize_waterline_field() {
+        let request = super::finalize_request_from_published_projection(
+            42,
+            MvLakePublishedProjection::Published {
+                last_refresh_ms: 1_700_000_010_000,
+                last_refresh_rows: 7,
+                last_refreshed_iceberg_snapshot_id: 99,
+                base_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 88)]),
+                base_table_object_ids: BTreeMap::new(),
+            },
+            None,
+        )
+        .expect("complete lake projection finalizes");
+
+        assert_eq!(request.refresh_id, 42);
+        assert_eq!(request.last_refresh_ms, 1_700_000_010_000);
+        assert_eq!(request.rows, 7);
+        assert_eq!(request.target_snapshot_id, Some(99));
+        assert_eq!(
+            request.base_snapshots,
+            BTreeMap::from([("ice.sales.orders".to_string(), 88)])
+        );
+    }
+
+    #[test]
+    fn never_published_lake_projection_cannot_finalize_a_known_commit() {
+        let error = super::finalize_request_from_published_projection(
+            42,
+            MvLakePublishedProjection::NeverPublished,
+            None,
+        )
+        .expect_err("never-published lake state must fail closed");
+
+        assert_eq!(
+            error.kind(),
+            crate::mv::domain::application::MvApplicationErrorKind::KnownCommittedFinalizeFailed
+        );
     }
 
     #[test]
