@@ -10,7 +10,7 @@ use tonic::Request;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-use crate::common::backend_topology::{BeId, HeartbeatOutcome, LiveBackendTarget};
+use crate::common::backend_topology::{HeartbeatOutcome, LiveBackendTarget};
 use crate::metrics::observe_backend_heartbeat_rtt;
 use crate::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, decode_fetched_query_batch,
@@ -33,6 +33,9 @@ use novarocks_proto::lifecycle::{
     QueryInitRequest, QueryStageAck, QueryStageRequest, QueryStartAck, QueryStartRequest,
     QueryTerminationAck, QueryTerminationReason,
 };
+use novarocks_proto::membership::{
+    BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId, parse_reported_state,
+};
 use novarocks_proto::provider::{
     EnsureConnectorExecutionBindingOutcome, EnsureConnectorExecutionBindingResult,
     RetireConnectorExecutionBindingOutcome, RetireConnectorExecutionBindingResult,
@@ -43,7 +46,7 @@ use novarocks_proto_models::novarocks::{
     QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
     fetch_result_response::Status as FetchStatus,
 };
-use novarocks_types::{NativeEndpoint, UniqueId};
+use novarocks_types::{BackendProcessId, NativeEndpoint, UniqueId};
 
 use super::data_runtime::FrontendDataRuntime;
 use super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
@@ -399,7 +402,7 @@ impl ConnectorBindingDispatcher for ConnectorBindingControl {
 
 pub(crate) fn heartbeat(
     data_runtime: &FrontendDataRuntime,
-    be_id: BeId,
+    process_id: BackendProcessId,
     endpoint: RuntimeEndpoint,
 ) -> HeartbeatOutcome {
     let started = Instant::now();
@@ -409,8 +412,11 @@ pub(crate) fn heartbeat(
             let mut grpc = client.grpc().await?;
             grpc.heartbeat(Request::new(
                 novarocks_proto_models::novarocks::HeartbeatRequest {
-                    assigned_be_id: be_id,
-                    fe_epoch: 0,
+                    expected_process_id: Some(
+                        ProtocolBackendProcessId::from_domain(process_id)
+                            .as_proto()
+                            .clone(),
+                    ),
                 },
             ))
             .await
@@ -420,17 +426,24 @@ pub(crate) fn heartbeat(
     })();
     observe_backend_heartbeat_rtt(started.elapsed());
     match outcome {
-        Ok(response) if response.status_code == 0 => HeartbeatOutcome::Ok {
-            start_epoch: response.start_epoch,
-            version: response.version,
-            num_cores: response.num_cores,
-            now_ms: now_millis(),
-        },
-        Ok(response) => HeartbeatOutcome::Failed {
-            err: format!(
-                "heartbeat returned nonzero status_code {}",
-                response.status_code
-            ),
+        Ok(response) => match response
+            .descriptor
+            .ok_or_else(|| "heartbeat response missing descriptor".to_string())
+            .and_then(|descriptor| {
+                BackendProcessDescriptor::parse(descriptor).map_err(|error| error.to_string())
+            })
+            .and_then(|descriptor| {
+                parse_reported_state(response.reported_state)
+                    .map(|reported_state| (descriptor, reported_state))
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok((descriptor, reported_state)) => HeartbeatOutcome::Ok {
+                descriptor,
+                reported_state,
+                num_cores: response.num_cores,
+                now_ms: now_millis(),
+            },
+            Err(err) => HeartbeatOutcome::Failed { err },
         },
         Err(err) => HeartbeatOutcome::Failed { err },
     }
@@ -457,11 +470,15 @@ pub(crate) fn new_query_lifecycle_transport(
                 (
                     QueryLifecycleTarget::new(
                         backend.backend_idx(),
-                        backend.endpoint().clone(),
-                        backend.start_epoch(),
+                        backend.endpoint().map_err(|error| error.to_string())?,
+                        backend.process_id().map_err(|error| error.to_string())?,
                     ),
                     Client::new(
-                        backend.endpoint().native_endpoint().clone(),
+                        backend
+                            .endpoint()
+                            .map_err(|error| error.to_string())?
+                            .native_endpoint()
+                            .clone(),
                         data_runtime.clone(),
                     ),
                 ),
@@ -494,9 +511,9 @@ impl LifecycleTransport {
                 "backend {} target changed from {}@{} to {}@{}",
                 target.backend_idx(),
                 actual.endpoint(),
-                actual.start_epoch(),
+                actual.process_id(),
                 target.endpoint(),
-                target.start_epoch()
+                target.process_id()
             )));
         }
         Ok(client)
@@ -947,13 +964,11 @@ fn validate_init_target(
         .manifest()
         .and_then(|manifest| manifest.backend())
         .map_err(invalid)?;
-    let id = usize::try_from(identity.backend_id())
-        .map_err(|_| invalid("InitQuery backend id exceeds usize"))?;
     let endpoint = identity.endpoint().map_err(invalid)?;
-    if id != target.backend_idx()
-        || endpoint.host() != target.endpoint().host()
+    let process_id = identity.process_id().map_err(invalid)?;
+    if endpoint.host() != target.endpoint().host()
         || i32::from(endpoint.port()) != target.endpoint().port()
-        || identity.start_epoch() != target.start_epoch()
+        || process_id != target.process_id()
     {
         return Err(invalid(
             "InitQuery manifest backend identity does not match frozen target",

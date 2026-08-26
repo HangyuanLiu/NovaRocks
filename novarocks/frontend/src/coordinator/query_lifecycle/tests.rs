@@ -793,7 +793,7 @@ impl QueryLifecycleTransport for RecordingTransport {
         _timeout: Duration,
     ) -> Result<protocol_lifecycle::QueryInitAck, QueryLifecycleTransportError> {
         let mut state = self.state.lock().expect("recording transport lock");
-        state.init_calls.push((target, request));
+        state.init_calls.push((target.clone(), request));
         let result = state
             .init_results
             .get_mut(&target.backend_idx())
@@ -819,7 +819,7 @@ impl QueryLifecycleTransport for RecordingTransport {
         _timeout: Duration,
     ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
         let mut state = self.state.lock().expect("recording transport lock");
-        state.attach_calls.push((target, attach));
+        state.attach_calls.push((target.clone(), attach));
         state
             .attach_results
             .get_mut(&target.backend_idx())
@@ -839,7 +839,7 @@ impl QueryLifecycleTransport for RecordingTransport {
         _timeout: Duration,
     ) -> Result<protocol_lifecycle::QueryTerminationAck, QueryLifecycleTransportError> {
         let mut state = self.state.lock().expect("recording transport lock");
-        state.abort_calls.push((target, request.clone()));
+        state.abort_calls.push((target.clone(), request.clone()));
         state
             .abort_results
             .get_mut(&target.backend_idx())
@@ -910,8 +910,11 @@ fn protocol_backend_from_live(backend: LiveBackendTarget) -> ParticipantBackendI
         backend
             .process_id()
             .expect("validated live backend process id"),
-        QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port())
-            .expect("live backend endpoint"),
+        QueryControlEndpoint::new(
+            endpoint.host().to_string(),
+            endpoint.port().try_into().expect("valid endpoint port"),
+        )
+        .expect("live backend endpoint"),
     )
     .expect("live backend identity")
 }
@@ -1039,7 +1042,7 @@ fn observation_control(
         .freeze_admitted()
         .expect("fixture admits every ControlReady participant");
     let session = ActiveSession::new(
-        participant.target,
+        participant.target.clone(),
         participant.digest,
         Arc::new(RecordingSession::with_events([])),
     );
@@ -2741,11 +2744,11 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
         new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
             .expect("production lifecycle transport");
     transport
-        .init_query(target, request, Duration::from_secs(2))
+        .init_query(target.clone(), request, Duration::from_secs(2))
         .expect("InitQuery");
     let session = transport
         .attach_control(
-            target,
+            target.clone(),
             protocol_attach_for(execution_id, digest, 9),
             Duration::from_secs(2),
         )
@@ -2801,7 +2804,7 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
         new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
             .expect("production lifecycle transport");
     transport
-        .init_query(target, request, Duration::from_secs(2))
+        .init_query(target.clone(), request, Duration::from_secs(2))
         .expect("InitQuery");
     let session = transport
         .attach_control(
@@ -2876,7 +2879,7 @@ async fn frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_c
         new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
             .expect("production lifecycle transport");
     transport
-        .init_query(target, request, Duration::from_secs(2))
+        .init_query(target.clone(), request, Duration::from_secs(2))
         .expect("InitQuery");
     let session = transport
         .attach_control(
@@ -2967,7 +2970,7 @@ async fn frontend_query_lifecycle_live_transport_rejects_mismatched_terminal_ack
         new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
             .expect("production lifecycle transport");
     transport
-        .init_query(target, request, Duration::from_secs(2))
+        .init_query(target.clone(), request, Duration::from_secs(2))
         .expect("InitQuery");
     let session = transport
         .attach_control(
@@ -3023,11 +3026,11 @@ async fn frontend_query_lifecycle_live_transport_accepts_finalized_abort_replay_
         new_query_lifecycle_transport(&[backend.clone()], frontend_data_runtime_for_test())
             .expect("production lifecycle transport");
     transport
-        .init_query(target, request, Duration::from_secs(2))
+        .init_query(target.clone(), request, Duration::from_secs(2))
         .expect("InitQuery");
     let session = transport
         .attach_control(
-            target,
+            target.clone(),
             protocol_attach_for(execution_id, digest, 14),
             Duration::from_secs(2),
         )
@@ -3104,7 +3107,7 @@ async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unkn
 
     transport
         .init_query(
-            target,
+            target.clone(),
             live_init_request(&backend, 807),
             Duration::from_secs(2),
         )

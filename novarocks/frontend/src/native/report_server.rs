@@ -10,9 +10,13 @@ use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 
 use crate::coordinator::QueryTerminalIngress;
+use crate::topology::ClusterBackendService;
 use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_proto::lifecycle::{
     ParticipantTerminalOutcome, QueryTerminalReportAck, QueryTerminalReportOutcome,
+};
+use novarocks_proto::membership::{
+    BackendAnnounceRejectionReason, BackendAnnounceRequest, BackendAnnounceResult,
 };
 use novarocks_proto::{ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{filter, novarocks as proto};
@@ -710,6 +714,8 @@ fn lifecycle_metric_map(
 #[derive(Clone)]
 struct FrontendReportService {
     ingress: Arc<dyn QueryTerminalIngress>,
+    membership: Arc<ClusterBackendService>,
+    deployment_id: String,
 }
 
 impl FrontendReportService {
@@ -739,9 +745,34 @@ impl NovaRocksGrpc for FrontendReportService {
 
     async fn announce_backend(
         &self,
-        _request: tonic::Request<proto::AnnounceBackendRequest>,
+        request: tonic::Request<proto::AnnounceBackendRequest>,
     ) -> Result<tonic::Response<proto::AnnounceBackendResponse>, tonic::Status> {
-        Err(Self::rejected("AnnounceBackend"))
+        let announce = BackendAnnounceRequest::parse(request.into_inner())
+            .map_err(status_from_contract_error)?;
+        let descriptor = announce.descriptor().map_err(status_from_contract_error)?;
+        let result = if descriptor.deployment_id() != self.deployment_id {
+            BackendAnnounceResult::rejected(
+                BackendAnnounceRejectionReason::DeploymentMismatch,
+                "backend deployment does not match frontend deployment",
+            )
+        } else {
+            self.membership
+                .record_announce(
+                    descriptor,
+                    announce
+                        .reported_state()
+                        .map_err(status_from_contract_error)?,
+                )
+                .map(|()| BackendAnnounceResult::accepted(self.membership.announce_lease_ttl_ms()))
+                .unwrap_or_else(|error| {
+                    BackendAnnounceResult::rejected(
+                        BackendAnnounceRejectionReason::DescriptorConflict,
+                        error,
+                    )
+                })
+        }
+        .map_err(status_from_contract_error)?;
+        Ok(tonic::Response::new(result.to_proto()))
     }
 
     async fn exchange(
@@ -908,6 +939,7 @@ mod tests {
         RuntimeFilterTerminalRollup, RuntimeFilterTerminalTotals,
         RuntimeFilterTerminalTotalsTelemetry, RuntimeFilterTerminalTotalsUnavailable,
     };
+    use crate::topology::ClusterBackendService;
     use novarocks_native_trust::{
         DeploymentId, NativeCallerSubject, NativeClientAuthInterceptor, NativeTransportMode,
         NativeTrust, ValidatedSharedSecret,
@@ -1208,6 +1240,7 @@ mod tests {
             let mut server = FrontendReportServerHandle::start(
                 SocketAddr::from(([127, 0, 0, 1], 0)),
                 ingress,
+                Arc::new(ClusterBackendService::new_transient_for_test(1)),
                 convergence_reader,
                 Arc::clone(&trust),
                 FrontendNativeTransport::plaintext(),
@@ -1253,6 +1286,7 @@ mod tests {
         let mut server = FrontendReportServerHandle::start(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             ingress,
+            Arc::new(ClusterBackendService::new_transient_for_test(1)),
             Arc::new(EmptyConvergenceReader),
             Arc::clone(&trust),
             FrontendNativeTransport::plaintext(),
@@ -1307,6 +1341,7 @@ mod tests {
         let mut server = FrontendReportServerHandle::start(
             SocketAddr::from(([127, 0, 0, 1], 0)),
             ingress,
+            Arc::new(ClusterBackendService::new_transient_for_test(1)),
             convergence_reader,
             trust,
             FrontendNativeTransport::plaintext(),
@@ -1376,6 +1411,7 @@ impl FrontendReportServerHandle {
     pub(crate) fn start(
         address: SocketAddr,
         ingress: Arc<dyn QueryTerminalIngress>,
+        membership: Arc<ClusterBackendService>,
         _convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
@@ -1442,9 +1478,13 @@ impl FrontendReportServerHandle {
                                 }
                             }
                         });
-                        let service = NovaRocksGrpcServer::new(FrontendReportService { ingress })
-                            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+                        let service = NovaRocksGrpcServer::new(FrontendReportService {
+                            ingress,
+                            membership,
+                            deployment_id: native_trust.deployment_id().as_str().to_string(),
+                        })
+                        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
+                        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
                         let serve = tonic::transport::Server::builder()
                             .layer(
                                 NativeServerAdmission::new(native_trust.as_ref().clone())
@@ -1502,6 +1542,7 @@ impl FrontendReportServerHandle {
         host: &str,
         port: u16,
         ingress: Arc<dyn QueryTerminalIngress>,
+        membership: Arc<ClusterBackendService>,
         convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
@@ -1509,6 +1550,7 @@ impl FrontendReportServerHandle {
         Self::start(
             parse_bind_addr(host, port)?,
             ingress,
+            membership,
             convergence_reader,
             native_trust,
             native_transport,

@@ -2175,16 +2175,16 @@ pub fn render_cross_process_config(
             cluster.insert("role".to_string(), Value::String("fe".to_string()));
             cluster.insert("heartbeat_interval_ms".to_string(), Value::Integer(500));
             cluster.insert("heartbeat_timeout_retries".to_string(), Value::Integer(2));
-            let backends: Vec<Value> = runtime
-                .be
-                .iter()
-                .map(|be| Value::String(format!("127.0.0.1:{}", be.grpc)))
-                .collect();
-            cluster.insert("backends".to_string(), Value::Array(backends));
+            cluster.remove("backends");
+            cluster.remove("frontend_endpoint");
         }
         ClusterProcessRole::Be => {
             cluster.insert("role".to_string(), Value::String("be".to_string()));
             cluster.remove("backends");
+            cluster.insert(
+                "frontend_endpoint".to_string(),
+                Value::String(format!("127.0.0.1:{}", runtime.fe_grpc_port)),
+            );
         }
     }
 
@@ -2205,6 +2205,10 @@ struct CrossProcessLaunchConfig<'a> {
     cleanup_faults_enabled: bool,
     overlay: Option<&'a str>,
     native_trust_fixture: &'a PreparedNativeTrustFixture,
+    #[allow(
+        dead_code,
+        reason = "Kept while callers migrate from deprecated seed controls."
+    )]
     initial_backend_seeds: &'a [usize],
 }
 
@@ -2219,7 +2223,7 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
         cleanup_faults_enabled,
         overlay,
         native_trust_fixture,
-        initial_backend_seeds,
+        initial_backend_seeds: _,
     } = config;
     let rendered = render_cross_process_config(base_config, role, be_index, runtime)?;
     let mut value = rendered
@@ -2232,27 +2236,6 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
         merge_safe_config_overlay(root, overlay)?;
     }
     native_trust_fixture.apply_config(root);
-    if role == ClusterProcessRole::Fe {
-        let cluster = root
-            .get_mut("cluster")
-            .and_then(Value::as_table_mut)
-            .context("rendered cross-process FE config requires [cluster]")?;
-        cluster.insert(
-            "backends".to_string(),
-            Value::Array(
-                initial_backend_seeds
-                    .iter()
-                    .map(|index| {
-                        Value::String(format!(
-                            "{}:{}",
-                            native_trust_fixture.fixture.advertise_host(),
-                            runtime.be[*index].grpc
-                        ))
-                    })
-                    .collect(),
-            ),
-        );
-    }
     let cluster = table_mut(root, "cluster");
     cluster.insert(
         "advertise_host".to_string(),
@@ -2717,8 +2700,7 @@ impl CrossProcessServerHandle {
             &child_environment.be_by_index,
             cluster_size,
         )?;
-        let initial_backend_seeds =
-            resolve_initial_backend_seeds(initial_backend_seeds.as_deref(), cluster_size)?;
+        let _ = initial_backend_seeds;
         let runtime_dir = RuntimeDirGuard::new(create_runtime_dir(&runtime_root)?);
         let native_trust_fixture =
             PreparedNativeTrustFixture::prepare(native_trust_fixture, runtime_dir.path())?;
@@ -2755,10 +2737,6 @@ impl CrossProcessServerHandle {
             fe_grpc_port: reserved.fe_grpc_port.port(),
             fe_mysql_port: reserved.fe_mysql_port.port(),
         };
-        let initial_backend_seed_ports = initial_backend_seeds
-            .iter()
-            .map(|index| runtime.be[*index].grpc)
-            .collect::<Vec<_>>();
 
         let base_config = fs::read_to_string(&base_config_path).with_context(|| {
             format!(
@@ -2792,7 +2770,7 @@ impl CrossProcessServerHandle {
                     ClusterProcessRole::Be => config_overlay.be.as_deref(),
                 },
                 native_trust_fixture: &native_trust_fixture,
-                initial_backend_seeds: &initial_backend_seeds,
+                initial_backend_seeds: &[],
             })
         };
 
@@ -2816,6 +2794,31 @@ impl CrossProcessServerHandle {
         let fe_config_path = runtime_dir.path().join("fe.toml");
         fs::write(&fe_config_path, render(ClusterProcessRole::Fe, 0)?)
             .with_context(|| format!("write {}", fe_config_path.display()))?;
+
+        // Start FE before BEs so every backend uses the same authenticated
+        // self-registration ingress from its first announce attempt.
+        let _ = reserved.fe_http_port.release();
+        let _ = reserved.fe_grpc_port.release();
+        let _ = reserved.fe_mysql_port.release();
+        let mut fe_process = spawn_novarocks_process(ProcessLaunch {
+            binary: &novarocks_bin,
+            role: "fe",
+            config_path: &fe_config_path,
+            marker: "NOVAROCKS_READY mysql_port=",
+            startup_timeout,
+            log_path: runtime_dir.path().join("fe.log"),
+            fragment_failure_trigger: None,
+            query_lifecycle_fault_scope: query_lifecycle_faults_enabled
+                .then_some((query_lifecycle_fault_files.root(), None)),
+            cleanup_fault_dir: cleanup_fault_files.as_ref().map(CleanupFaultFiles::root),
+            child_environment: &fe_environment,
+        })?;
+        println!(
+            "started cross-process FE pid={} mysql_port={} config={}",
+            fe_process.pid(),
+            runtime.fe_mysql_port,
+            fe_config_path.display()
+        );
 
         // Spawn all BEs: release each BE's ports immediately before spawning it.
         let mut be_processes: Vec<ManagedProcess> = Vec::with_capacity(cluster_size);
@@ -2850,34 +2853,11 @@ impl CrossProcessServerHandle {
             be_processes.push(be_process);
         }
 
-        // Spawn FE.
-        let _ = reserved.fe_http_port.release();
-        let _ = reserved.fe_grpc_port.release();
-        let _ = reserved.fe_mysql_port.release();
-        let mut fe_process = spawn_novarocks_process(ProcessLaunch {
-            binary: &novarocks_bin,
-            role: "fe",
-            config_path: &fe_config_path,
-            marker: "NOVAROCKS_READY mysql_port=",
-            startup_timeout,
-            log_path: runtime_dir.path().join("fe.log"),
-            fragment_failure_trigger: None,
-            query_lifecycle_fault_scope: query_lifecycle_faults_enabled
-                .then_some((query_lifecycle_fault_files.root(), None)),
-            cleanup_fault_dir: cleanup_fault_files.as_ref().map(CleanupFaultFiles::root),
-            child_environment: &fe_environment,
-        })?;
-        println!(
-            "started cross-process FE pid={} mysql_port={} config={}",
-            fe_process.pid(),
-            runtime.fe_mysql_port,
-            fe_config_path.display()
-        );
         wait_for_live_backend_topology(
             LiveBackendTopologyWait {
                 mysql_user: &mysql_user,
                 runtime: &runtime,
-                expected_ports: &initial_backend_seed_ports,
+                expected_ports: &runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>(),
                 fe_config_path: &fe_config_path,
                 be_config_paths: &be_config_paths,
                 timeout: startup_timeout,
@@ -5171,12 +5151,7 @@ enable_path_style_access = true
             fe_value["cluster"]["heartbeat_timeout_retries"].as_integer(),
             Some(2)
         );
-        // 1-BE: FE backends list has exactly one entry pointing at the single BE's grpc port.
-        let fe_backends = fe_value["cluster"]["backends"]
-            .as_array()
-            .expect("fe backends array");
-        assert_eq!(fe_backends.len(), 1);
-        assert_eq!(fe_backends[0].as_str(), Some("127.0.0.1:19070"));
+        assert!(fe_value["cluster"].get("backends").is_none());
 
         assert!(
             be_value.get("state_store").is_none(),
@@ -5201,6 +5176,10 @@ enable_path_style_access = true
                 .is_none()
         );
         assert_eq!(be_value["cluster"]["role"].as_str(), Some("be"));
+        assert_eq!(
+            be_value["cluster"]["frontend_endpoint"].as_str(),
+            Some("127.0.0.1:29070")
+        );
         assert!(
             be_value
                 .get("cluster")
@@ -5397,11 +5376,7 @@ enable_path_style_access = true
             fe_value["cluster"]["heartbeat_timeout_retries"].as_integer(),
             Some(2)
         );
-        let fe_backends = fe_value["cluster"]["backends"]
-            .as_array()
-            .expect("fe backends array");
-        assert_eq!(fe_backends.len(), 1);
-        assert_eq!(fe_backends[0].as_str(), Some("127.0.0.1:19070"));
+        assert!(fe_value["cluster"].get("backends").is_none());
 
         assert_eq!(be_value["cluster"]["role"].as_str(), Some("be"));
         assert!(
@@ -5419,7 +5394,7 @@ enable_path_style_access = true
     }
 
     #[test]
-    fn render_cross_process_config_2be_fe_has_both_backends() {
+    fn render_cross_process_config_2be_fe_has_no_backend_seeds() {
         let runtime = make_runtime_2be();
 
         let fe = render_cross_process_config(BASE_CONFIG, ClusterProcessRole::Fe, 0, &runtime)
@@ -5435,12 +5410,7 @@ enable_path_style_access = true
             fe_value["cluster"]["heartbeat_timeout_retries"].as_integer(),
             Some(2)
         );
-        let backends = fe_value["cluster"]["backends"]
-            .as_array()
-            .expect("fe backends array");
-        assert_eq!(backends.len(), 2, "FE backends must list all 2 BEs");
-        assert_eq!(backends[0].as_str(), Some("127.0.0.1:19070"));
-        assert_eq!(backends[1].as_str(), Some("127.0.0.1:19071"));
+        assert!(fe_value["cluster"].get("backends").is_none());
     }
 
     #[test]
@@ -5457,6 +5427,10 @@ enable_path_style_access = true
 
         // BE[0]
         assert_eq!(be0_value["cluster"]["role"].as_str(), Some("be"));
+        assert_eq!(
+            be0_value["cluster"]["frontend_endpoint"].as_str(),
+            Some("127.0.0.1:29070")
+        );
         assert!(
             be0_value
                 .get("cluster")
@@ -5468,6 +5442,10 @@ enable_path_style_access = true
 
         // BE[1]
         assert_eq!(be1_value["cluster"]["role"].as_str(), Some("be"));
+        assert_eq!(
+            be1_value["cluster"]["frontend_endpoint"].as_str(),
+            Some("127.0.0.1:29070")
+        );
         assert!(
             be1_value
                 .get("cluster")

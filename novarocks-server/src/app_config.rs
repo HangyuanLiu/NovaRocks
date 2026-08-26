@@ -233,18 +233,20 @@ fn deserialize_foundationdb_client<'de, D: Deserializer<'de>>(
 
 /// Configuration for the `[cluster]` TOML section.
 #[derive(Clone, Debug, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClusterConfig {
     pub role: ClusterRole,
-    pub backends: Vec<String>,
+    /// Exact logical FE native endpoint used by a BE to announce itself.
+    /// FE membership is self-registration only; no role accepts a BE seed list.
+    pub frontend_endpoint: Option<String>,
     pub advertise_host: String,
     pub advertise_port: u16,
     #[serde(default = "default_heartbeat_interval_ms")]
     pub heartbeat_interval_ms: u64,
     #[serde(default = "default_heartbeat_timeout_retries")]
     pub heartbeat_timeout_retries: u32,
-    #[serde(default = "default_decommission_timeout_secs")]
-    pub decommission_timeout_secs: u64,
+    #[serde(default = "default_backend_announce_lease_ttl_ms")]
+    pub backend_announce_lease_ttl_ms: u64,
 }
 
 fn default_heartbeat_interval_ms() -> u64 {
@@ -255,20 +257,20 @@ fn default_heartbeat_timeout_retries() -> u32 {
     3
 }
 
-fn default_decommission_timeout_secs() -> u64 {
-    300
+fn default_backend_announce_lease_ttl_ms() -> u64 {
+    5000
 }
 
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             role: ClusterRole::Fe,
-            backends: Vec::new(),
+            frontend_endpoint: None,
             advertise_host: String::new(),
             advertise_port: 0,
             heartbeat_interval_ms: default_heartbeat_interval_ms(),
             heartbeat_timeout_retries: default_heartbeat_timeout_retries(),
-            decommission_timeout_secs: default_decommission_timeout_secs(),
+            backend_announce_lease_ttl_ms: default_backend_announce_lease_ttl_ms(),
         }
     }
 }
@@ -277,25 +279,21 @@ impl ClusterConfig {
     /// Validate cluster config consistency. Called at startup after parsing.
     pub fn validate(&self) -> Result<(), String> {
         match self.role {
-            ClusterRole::Fe => {
-                let mut seen = std::collections::HashSet::new();
-                for b in &self.backends {
-                    let canonical = b
-                        .parse::<NativeEndpoint>()
-                        .map_err(|e| format!("invalid backend addr '{b}': {e}"))?
-                        .to_string();
-                    if !seen.insert(canonical) {
-                        return Err(format!("duplicate backend in [cluster].backends: {}", b));
-                    }
-                }
+            ClusterRole::Fe if self.frontend_endpoint.is_some() => {
+                return Err("role=fe must not configure [cluster].frontend_endpoint".to_string());
             }
+            ClusterRole::Fe => {}
             ClusterRole::Be => {
-                if !self.backends.is_empty() {
-                    return Err(format!(
-                        "role=be must not configure [cluster].backends (got {} entries)",
-                        self.backends.len()
-                    ));
-                }
+                self.frontend_endpoint
+                    .as_deref()
+                    .ok_or_else(|| {
+                        "role=be requires [cluster].frontend_endpoint for authenticated self-registration"
+                            .to_string()
+                    })?
+                    .parse::<NativeEndpoint>()
+                    .map_err(|error| {
+                        format!("invalid [cluster].frontend_endpoint: {error}")
+                    })?;
             }
         }
         Ok(())
@@ -311,21 +309,20 @@ mod cluster_hb_tests {
         let c = ClusterConfig::default();
         assert_eq!(c.heartbeat_interval_ms, 5000);
         assert_eq!(c.heartbeat_timeout_retries, 3);
-        assert_eq!(c.decommission_timeout_secs, 300);
+        assert_eq!(c.backend_announce_lease_ttl_ms, 5000);
     }
 
     #[test]
     fn cluster_config_parses_heartbeat_overrides() {
         let toml = r#"
             role = "fe"
-            backends = ["127.0.0.1:9070"]
             heartbeat_interval_ms = 2000
             heartbeat_timeout_retries = 5
         "#;
         let c: ClusterConfig = toml::from_str(toml).unwrap();
         assert_eq!(c.heartbeat_interval_ms, 2000);
         assert_eq!(c.heartbeat_timeout_retries, 5);
-        assert_eq!(c.decommission_timeout_secs, 300);
+        assert_eq!(c.backend_announce_lease_ttl_ms, 5000);
     }
 }
 
@@ -2498,103 +2495,51 @@ host = "127.0.0.1"
 "#;
         let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse default");
         assert_eq!(cfg.cluster.role, super::ClusterRole::Fe);
-        assert!(cfg.cluster.backends.is_empty());
+        assert!(cfg.cluster.frontend_endpoint.is_none());
     }
 
     #[test]
-    fn test_cluster_role_fe_with_single_backend() {
+    fn test_cluster_role_fe_rejects_legacy_backend_seeds() {
         let toml = r#"
 [cluster]
 role = "fe"
 backends = ["127.0.0.1:9070"]
 "#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse fe");
-        assert_eq!(cfg.cluster.role, super::ClusterRole::Fe);
-        assert_eq!(cfg.cluster.backends, vec!["127.0.0.1:9070".to_string()]);
+        assert!(toml::from_str::<NovaRocksConfig>(toml).is_err());
     }
 
     #[test]
-    fn test_cluster_role_be_rejects_backends() {
+    fn test_cluster_role_be_requires_frontend_endpoint() {
         let toml = r#"
 [cluster]
 role = "be"
-backends = ["127.0.0.1:9070"]
 "#;
-        let parsed: NovaRocksConfig = toml::from_str(toml).expect("parse be with backends");
-        let err = parsed
-            .cluster
-            .validate()
-            .expect_err("be with backends should fail");
-        assert!(err.contains("backends"));
+        let parsed: NovaRocksConfig = toml::from_str(toml).expect("parse be");
+        assert!(parsed.cluster.validate().is_err());
     }
 
     #[test]
-    fn test_cluster_role_fe_with_three_backends_passes() {
+    fn test_cluster_role_be_accepts_dns_frontend_endpoint() {
         let toml = r#"
 [cluster]
-role = "fe"
-backends = ["10.0.0.1:9070", "10.0.0.2:9070", "10.0.0.3:9070"]
+role = "be"
+frontend_endpoint = "fe.native.example:9070"
 "#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse fe with 3 backends");
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse be");
         cfg.cluster
             .validate()
-            .expect("3 backends should pass D2 validate");
+            .expect("dns frontend endpoint should pass validation");
     }
 
     #[test]
-    fn test_cluster_role_fe_accepts_canonical_dns_backend() {
+    fn test_cluster_role_fe_rejects_frontend_endpoint() {
         let toml = r#"
 [cluster]
 role = "fe"
-backends = ["localhost:9070"]
-"#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse DNS backend");
-        cfg.cluster
-            .validate()
-            .expect("canonical DNS backend should pass validation");
-    }
-
-    #[test]
-    fn test_cluster_role_fe_rejects_duplicate_backends() {
-        let toml = r#"
-[cluster]
-role = "fe"
-backends = ["10.0.0.1:9070", "10.0.0.1:9070"]
+frontend_endpoint = "fe.native.example:9070"
 "#;
         let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
-        let err = cfg
-            .cluster
-            .validate()
-            .expect_err("duplicate backends should fail");
-        assert!(err.contains("duplicate") || err.contains("10.0.0.1:9070"));
-    }
-
-    #[test]
-    fn test_cluster_role_fe_rejects_malformed_backend() {
-        let toml = r#"
-[cluster]
-role = "fe"
-backends = ["not-a-socket-addr"]
-"#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
-        let err = cfg
-            .cluster
-            .validate()
-            .expect_err("malformed addr should fail");
-        assert!(err.contains("not-a-socket-addr") || err.contains("invalid"));
-    }
-
-    #[test]
-    fn test_cluster_role_fe_empty_backends_allowed() {
-        let toml = r#"
-[cluster]
-role = "fe"
-backends = []
-"#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
-        cfg.cluster
-            .validate()
-            .expect("role=fe may start with no configured backends");
+        assert!(cfg.cluster.validate().is_err());
     }
 
     #[test]

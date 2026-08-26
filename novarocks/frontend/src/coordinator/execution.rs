@@ -18,6 +18,7 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -44,6 +45,7 @@ use crate::query_execution::lifecycle_plan::{QueryInitOptions, QueryLifecycleLea
 use crate::query_execution::write::WriteTerminalBuilder;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::runtime::statement_result::StatementResult;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::lifecycle::QueryOptions as ProtocolQueryOptions;
 use novarocks_spi::connector::ConnectorWriteLease;
 use novarocks_types::{
@@ -177,7 +179,7 @@ impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
         &self,
         _execution_id: QueryExecutionId,
         _backend_idx: usize,
-        _endpoint: SocketAddr,
+        _endpoint: RuntimeEndpoint,
         _declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
     ) -> Result<(), crate::query_execution::connector_binding::ConnectorBindingDispatchError> {
         Ok(())
@@ -185,7 +187,7 @@ impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
 
     fn retire(
         &self,
-        _endpoint: SocketAddr,
+        _endpoint: RuntimeEndpoint,
         _key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
     ) -> Result<(), crate::query_execution::connector_binding::ConnectorBindingRetirementError>
     {
@@ -207,7 +209,7 @@ impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
             .installed_backends
             .iter()
             .enumerate()
-            .filter_map(|(index, endpoint)| match endpoint.parse::<SocketAddr>() {
+            .filter_map(|(index, endpoint)| match RuntimeEndpoint::parse(endpoint) {
                 Ok(endpoint) => Some((index, endpoint)),
                 Err(error) => {
                     tracing::warn!(
@@ -235,7 +237,7 @@ impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
                 }
             };
         for (_, endpoint) in endpoints {
-            if let Err(error) = dispatcher.retire(endpoint, &retirement.key) {
+            if let Err(error) = dispatcher.retire(endpoint.clone(), &retirement.key) {
                 tracing::warn!(
                     instance_id = %retirement.key.instance_id.as_str(),
                     incarnation = ?retirement.key.incarnation,
@@ -251,13 +253,13 @@ impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
 impl ConnectorBindingInstallObserver for FrontendConnectorBindingInstallObserver {
     fn installed(
         &self,
-        endpoint: std::net::SocketAddr,
+        endpoint: RuntimeEndpoint,
         declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
     ) -> Result<(), String> {
         self.control
             .record_installed_backend(
                 &novarocks_spi::connector::ConnectorExecutionBindingKey::from(declaration),
-                endpoint.to_string(),
+                endpoint.as_host_port(),
             )
             .map_err(|error| error.to_string())
     }
@@ -912,7 +914,7 @@ impl FrontendDistributedQueryCoordinator {
         };
         for retirement in ready {
             for endpoint in retirement.installed_backends {
-                let endpoint = match endpoint.parse::<SocketAddr>() {
+                let endpoint = match RuntimeEndpoint::parse(&endpoint) {
                     Ok(endpoint) => endpoint,
                     Err(error) => {
                         tracing::warn!(
@@ -925,7 +927,7 @@ impl FrontendDistributedQueryCoordinator {
                         continue;
                     }
                 };
-                if let Err(error) = dispatcher.retire(endpoint, &retirement.key) {
+                if let Err(error) = dispatcher.retire(endpoint.clone(), &retirement.key) {
                     tracing::warn!(
                         instance_id = %retirement.key.instance_id.as_str(),
                         incarnation = ?retirement.key.incarnation,

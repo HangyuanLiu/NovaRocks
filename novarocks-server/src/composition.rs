@@ -416,6 +416,13 @@ pub fn compose_backend_server_config(
         host: native_trust.advertised_endpoint().host().to_string(),
         port: native_trust.advertised_endpoint().port(),
     };
+    let frontend_endpoint = config
+        .cluster
+        .frontend_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("role=be requires [cluster].frontend_endpoint"))?
+        .parse::<novarocks_types::NativeEndpoint>()
+        .map_err(|error| anyhow::anyhow!("parse [cluster].frontend_endpoint: {error}"))?;
     Ok(BackendServerConfig {
         bind_host: config.server.host.clone(),
         grpc_port: config.server.grpc_port,
@@ -423,6 +430,8 @@ pub fn compose_backend_server_config(
         advertise_endpoint,
         native_trust: std::sync::Arc::clone(native_trust.trust()),
         native_transport: backend_native_transport(native_trust.transport()),
+        frontend_endpoint,
+        announce_interval: Duration::from_millis(config.cluster.heartbeat_interval_ms),
         query_lifecycle_sweep_interval: Duration::from_millis(
             runtime_config.query_control_heartbeat_interval_ms,
         ),

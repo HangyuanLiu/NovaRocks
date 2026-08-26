@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
@@ -41,17 +40,17 @@ use crate::query_execution::terminal_set::QueryTerminalSet;
 /// Frozen target selected from one live backend snapshot.
 ///
 /// This is coordinator orchestration state, not a native lifecycle message.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct QueryLifecycleTarget {
     backend_idx: usize,
-    endpoint: SocketAddr,
+    endpoint: RuntimeEndpoint,
     process_id: BackendProcessId,
 }
 
 impl QueryLifecycleTarget {
-    pub const fn new(
+    pub fn new(
         backend_idx: usize,
-        endpoint: SocketAddr,
+        endpoint: RuntimeEndpoint,
         process_id: BackendProcessId,
     ) -> Self {
         Self {
@@ -61,15 +60,15 @@ impl QueryLifecycleTarget {
         }
     }
 
-    pub const fn backend_idx(self) -> usize {
+    pub const fn backend_idx(&self) -> usize {
         self.backend_idx
     }
 
-    pub const fn endpoint(self) -> SocketAddr {
-        self.endpoint
+    pub const fn endpoint(&self) -> &RuntimeEndpoint {
+        &self.endpoint
     }
 
-    pub const fn process_id(self) -> BackendProcessId {
+    pub const fn process_id(&self) -> BackendProcessId {
         self.process_id
     }
 }
@@ -102,8 +101,9 @@ fn protocol_backend_identity(
     let process_id = target.process_id().map_err(protocol_contract_error)?;
     ParticipantBackendIdentity::parse(novarocks::ParticipantBackendIdentity {
         endpoint: Some(novarocks::QueryControlEndpoint {
-            host: endpoint.ip().to_string(),
-            port: u32::from(endpoint.port()),
+            host: endpoint.host().to_string(),
+            port: u32::try_from(endpoint.port())
+                .map_err(|_| contract_error("backend endpoint port is outside u32 range"))?,
         }),
         process_id: Some(novarocks::BackendProcessId {
             value: process_id.to_bytes().to_vec(),
@@ -199,7 +199,7 @@ impl QueryInitOptions {
                 )));
             }
             let endpoint = target.endpoint().map_err(protocol_contract_error)?;
-            if !endpoints.insert(endpoint) {
+            if !endpoints.insert(endpoint.clone()) {
                 return Err(contract_error(format!(
                     "query initialization live snapshot repeats endpoint {}",
                     endpoint
@@ -301,16 +301,11 @@ impl QueryInitPlan {
                     .backend()
                     .endpoint()
                     .map_err(protocol_contract_error)?;
-                let endpoint_ip = endpoint.host().parse::<IpAddr>().map_err(|error| {
-                    contract_error(format!(
-                        "query stage backend {} endpoint is not an IP address: {error}",
-                        participant.backend_idx()
-                    ))
-                })?;
                 StageParticipantBinding::new(
                     QueryLifecycleTarget::new(
                         participant.backend_idx(),
-                        SocketAddr::new(endpoint_ip, endpoint.port()),
+                        RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port()))
+                            .map_err(|error| contract_error(error.to_string()))?,
                         participant
                             .backend()
                             .process_id()
@@ -528,7 +523,7 @@ pub(crate) fn compile_query_init_plan(
             ))
         })?;
         let target_endpoint = target.endpoint().map_err(protocol_contract_error)?;
-        if RuntimeEndpoint::from_socket_addr(target_endpoint) != *endpoint {
+        if target_endpoint != *endpoint {
             return Err(contract_error(format!(
                 "scheduled backend {backend_idx} endpoint {} differs from query initialization snapshot endpoint {}",
                 endpoint.as_host_port(),
@@ -701,18 +696,8 @@ mod tests {
                 (1, BTreeSet::from([fragment_one])),
             ]),
             BTreeMap::from([
-                (
-                    0,
-                    novarocks_execution::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
-                        backend(0).endpoint().expect("valid endpoint"),
-                    ),
-                ),
-                (
-                    1,
-                    novarocks_execution::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
-                        backend(1).endpoint().expect("valid endpoint"),
-                    ),
-                ),
+                (0, backend(0).endpoint().expect("valid endpoint")),
+                (1, backend(1).endpoint().expect("valid endpoint")),
             ]),
             Vec::new(),
         )
@@ -795,12 +780,7 @@ mod tests {
     fn query_init_plan_rejects_backend_restart_at_the_same_endpoint() {
         let fragments = FragmentLifecycleProjection::new(
             BTreeMap::from([(0, BTreeSet::from([UniqueId::new(10, 1)]))]),
-            BTreeMap::from([(
-                0,
-                novarocks_execution::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
-                    backend(0).endpoint().expect("valid endpoint"),
-                ),
-            )]),
+            BTreeMap::from([(0, backend(0).endpoint().expect("valid endpoint"))]),
             Vec::new(),
         )
         .with_frozen_live_backends(vec![backend(0)])

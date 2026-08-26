@@ -23,7 +23,6 @@
 //! reconciliation path.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -31,6 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::membership::{BackendProcessDescriptor, BackendReportedState};
 use novarocks_types::{BackendProcessId, ClusterRole};
 use novarocks_version::native_build_identity;
@@ -92,7 +92,7 @@ impl ClusterBackendOpenConfig {
 }
 
 type HeartbeatProbe =
-    dyn Fn(SocketAddr, BackendProcessId) -> HeartbeatOutcome + Send + Sync + 'static;
+    dyn Fn(RuntimeEndpoint, BackendProcessId) -> HeartbeatOutcome + Send + Sync + 'static;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Compatibility {
@@ -150,9 +150,9 @@ struct TopologyState {
     // Primary index: a process is never inferred from an address.
     processes: BTreeMap<BackendProcessId, BackendFacts>,
     // Verified endpoint owner only. This is part of the eligibility predicate.
-    endpoint_owners: BTreeMap<SocketAddr, BackendProcessId>,
+    endpoint_owners: BTreeMap<RuntimeEndpoint, BackendProcessId>,
     // Announce creates a pending replacement; exact pull transfers ownership.
-    pending_endpoint_owners: BTreeMap<SocketAddr, BackendProcessId>,
+    pending_endpoint_owners: BTreeMap<RuntimeEndpoint, BackendProcessId>,
 }
 
 #[derive(Clone, Copy)]
@@ -176,6 +176,13 @@ pub(crate) struct ClusterBackendService {
 }
 
 impl ClusterBackendService {
+    pub(crate) fn announce_lease_ttl_ms(&self) -> u64 {
+        self.announce_lease_ttl
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+
     pub(crate) async fn open(
         config: ClusterBackendOpenConfig,
         runtime: Handle,
@@ -185,7 +192,7 @@ impl ClusterBackendService {
             return Err("role=be must not open ClusterBackendService".to_string());
         }
         let service = Arc::new(Self::new(&config, move |endpoint, process_id| {
-            native_heartbeat(&data_runtime, endpoint, process_id)
+            native_heartbeat(&data_runtime, process_id, endpoint)
         }));
         let _ = runtime;
         // Only a BE can create its immutable ProcessId descriptor through
@@ -196,7 +203,7 @@ impl ClusterBackendService {
 
     fn new<F>(config: &ClusterBackendOpenConfig, probe: F) -> Self
     where
-        F: Fn(SocketAddr, BackendProcessId) -> HeartbeatOutcome + Send + Sync + 'static,
+        F: Fn(RuntimeEndpoint, BackendProcessId) -> HeartbeatOutcome + Send + Sync + 'static,
     {
         Self {
             state: Mutex::new(TopologyState {
@@ -241,7 +248,7 @@ impl ClusterBackendService {
         let handle = runtime.handle().clone();
         let data_runtime = FrontendDataRuntime::new(handle);
         let mut service = Self::new(&config, move |endpoint, process_id| {
-            native_heartbeat(&data_runtime, endpoint, process_id)
+            native_heartbeat(&data_runtime, process_id, endpoint)
         });
         service._test_runtime_owner = Some(runtime);
         service
@@ -254,7 +261,7 @@ impl ClusterBackendService {
         for target in targets {
             let process_id = target.process_id().expect("captured process id");
             let endpoint = target.endpoint().expect("captured endpoint");
-            state.endpoint_owners.insert(endpoint, process_id);
+            state.endpoint_owners.insert(endpoint.clone(), process_id);
             state.processes.insert(
                 process_id,
                 BackendFacts {
@@ -303,7 +310,7 @@ impl ClusterBackendService {
         if reported_state == BackendReportedState::Unspecified {
             return Err("announced backend state must be running or draining".to_string());
         }
-        let endpoint = descriptor_socket_addr(&descriptor)?;
+        let endpoint = descriptor_runtime_endpoint(&descriptor)?;
         let process_id = descriptor
             .process_id()
             .map_err(|error| format!("invalid announced backend process id: {error}"))?;
@@ -475,7 +482,7 @@ impl ClusterBackendService {
         }
     }
 
-    fn heartbeat_rows(&self) -> Vec<(BackendProcessId, SocketAddr)> {
+    fn heartbeat_rows(&self) -> Vec<(BackendProcessId, RuntimeEndpoint)> {
         let state = self.state.lock().unwrap();
         state
             .processes
@@ -484,7 +491,7 @@ impl ClusterBackendService {
                 facts
                     .announce_lease_valid
                     .then(|| {
-                        descriptor_socket_addr(&facts.descriptor)
+                        descriptor_runtime_endpoint(&facts.descriptor)
                             .ok()
                             .map(|endpoint| (*id, endpoint))
                     })
@@ -535,7 +542,7 @@ impl ClusterBackendService {
         } else {
             Compatibility::Compatible
         };
-        let Ok(endpoint) = descriptor_socket_addr(&announced.descriptor) else {
+        let Ok(endpoint) = descriptor_runtime_endpoint(&announced.descriptor) else {
             return;
         };
         let transfer = exact
@@ -547,7 +554,7 @@ impl ClusterBackendService {
             .flatten();
         if transfer {
             state.pending_endpoint_owners.remove(&endpoint);
-            state.endpoint_owners.insert(endpoint, process_id);
+            state.endpoint_owners.insert(endpoint.clone(), process_id);
             if let Some(old) = old_owner
                 .filter(|old| *old != process_id)
                 .and_then(|old| state.processes.get_mut(&old))
@@ -846,16 +853,16 @@ fn diagnostic_status(facts: &BackendFacts) -> String {
     }
 }
 
-fn descriptor_socket_addr(descriptor: &BackendProcessDescriptor) -> Result<SocketAddr, String> {
+fn descriptor_runtime_endpoint(
+    descriptor: &BackendProcessDescriptor,
+) -> Result<RuntimeEndpoint, String> {
     let endpoint = descriptor
         .endpoint()
         .map_err(|error| format!("announced backend endpoint is invalid: {error}"))?;
-    // Current transport is SocketAddr. Reject DNS explicitly rather than
-    // resolving/rebinding it here; NWT-2 owns the host+port carrier cut.
-    let host = endpoint.host().parse::<IpAddr>().map_err(|error| format!("announced backend endpoint host {} must be an IP address for current native transport: {error}", endpoint.host()))?;
-    Ok(SocketAddr::new(host, endpoint.port()))
+    RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port()))
+        .map_err(|error| format!("announced backend endpoint is invalid: {error}"))
 }
-fn eligible_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, SocketAddr)> {
+fn eligible_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, RuntimeEndpoint)> {
     state
         .processes
         .iter()
@@ -863,7 +870,7 @@ fn eligible_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, Socket
             facts
                 .eligible()
                 .then(|| {
-                    descriptor_socket_addr(&facts.descriptor)
+                    descriptor_runtime_endpoint(&facts.descriptor)
                         .ok()
                         .map(|endpoint| (*id, endpoint))
                 })
@@ -911,7 +918,7 @@ fn metrics_snapshot(state: &TopologyState) -> BackendTopologyMetricsSnapshot {
 }
 fn advance_if_eligible_changed(
     state: &mut TopologyState,
-    before: BTreeSet<(BackendProcessId, SocketAddr)>,
+    before: BTreeSet<(BackendProcessId, RuntimeEndpoint)>,
 ) -> Result<bool, String> {
     if before == eligible_members(state) {
         return Ok(false);

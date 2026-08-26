@@ -25,7 +25,6 @@ pub use native_submission::{
 };
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -590,23 +589,23 @@ impl<'a> RuntimeFilterScheduledView<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeFilterBackendTopologyEntry {
     backend_idx: usize,
-    endpoint: SocketAddr,
+    endpoint: RuntimeEndpoint,
     process_id: BackendProcessId,
 }
 
 impl RuntimeFilterBackendTopologyEntry {
-    pub const fn backend_idx(self) -> usize {
+    pub const fn backend_idx(&self) -> usize {
         self.backend_idx
     }
 
-    pub const fn endpoint(self) -> SocketAddr {
-        self.endpoint
+    pub const fn endpoint(&self) -> &RuntimeEndpoint {
+        &self.endpoint
     }
 
-    pub const fn process_id(self) -> BackendProcessId {
+    pub const fn process_id(&self) -> BackendProcessId {
         self.process_id
     }
 }
@@ -991,11 +990,11 @@ impl SchedulingEdgeView<'_> {
 /// remains core-private.
 pub struct BackendPlacement {
     backend_idx: usize,
-    endpoint: SocketAddr,
+    endpoint: RuntimeEndpoint,
 }
 
 impl BackendPlacement {
-    pub const fn new(backend_idx: usize, endpoint: SocketAddr) -> Self {
+    pub fn new(backend_idx: usize, endpoint: RuntimeEndpoint) -> Self {
         Self {
             backend_idx,
             endpoint,
@@ -1052,7 +1051,7 @@ impl FragmentScheduleDraft {
                     "frontend schedule live topology repeats backend process identity {process_id}"
                 )));
             }
-            if !endpoints.insert(endpoint) {
+            if !endpoints.insert(endpoint.clone()) {
                 return Err(contract_error(format!(
                     "frontend schedule live topology repeats endpoint {}",
                     endpoint
@@ -1172,7 +1171,7 @@ impl ValidatedFragmentSchedule {
                             instance_index,
                         )?,
                         backend_idx: placement.backend_idx,
-                        endpoint: RuntimeEndpoint::from_socket_addr(placement.endpoint),
+                        endpoint: placement.endpoint.clone(),
                         scan_ranges: BTreeMap::new(),
                         connector_splits: BTreeMap::new(),
                         destinations: Vec::new(),

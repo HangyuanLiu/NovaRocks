@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::net::{IpAddr, SocketAddr};
-
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::QueryInitPlan;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::lifecycle::QueryExecutionId;
 use novarocks_proto::lifecycle::{ParticipantManifestDigest, ParticipantRole, QueryInitRequest};
 use novarocks_proto_models::novarocks as protocol_wire;
@@ -45,33 +44,15 @@ pub(super) fn materialize(
     let mut participants = Vec::with_capacity(plan.participant_count());
     for participant in plan.into_participants() {
         let (backend_idx, backend, manifest, digest) = participant.into_parts();
-        let endpoint_ip = backend
-            .endpoint()
-            .map_err(|error| {
-                contract_error(format!(
-                    "query lifecycle backend {backend_idx} endpoint is invalid: {error}"
-                ))
-            })?
-            .host()
-            .parse::<IpAddr>()
-            .map_err(|error| {
-                contract_error(format!(
-                    "query lifecycle backend {backend_idx} endpoint is not an IP address: {error}"
-                ))
-            })?;
+        let endpoint = backend.endpoint().map_err(|error| {
+            contract_error(format!(
+                "query lifecycle backend {backend_idx} endpoint is invalid: {error}"
+            ))
+        })?;
         let target = QueryLifecycleTarget::new(
             backend_idx,
-            SocketAddr::new(
-                endpoint_ip,
-                backend
-                    .endpoint()
-                    .map_err(|error| {
-                        contract_error(format!(
-                            "query lifecycle backend {backend_idx} endpoint is invalid: {error}"
-                        ))
-                    })?
-                    .port(),
-            ),
+            RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port()))
+                .map_err(|error| contract_error(error.to_string()))?,
             backend.process_id().map_err(|error| {
                 contract_error(format!(
                     "query lifecycle backend {backend_idx} process id is invalid: {error}"

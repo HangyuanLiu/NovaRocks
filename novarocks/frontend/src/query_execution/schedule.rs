@@ -171,7 +171,7 @@ impl FragmentLifecycleProjection {
                     format!("lifecycle projection repeats backend process identity {process_id}"),
                 ));
             }
-            if !endpoints.insert(endpoint) {
+            if !endpoints.insert(endpoint.clone()) {
                 return Err(DistributedQueryError::new(
                     DistributedQueryErrorKind::ContractViolation,
                     format!("lifecycle projection repeats endpoint {}", endpoint),
@@ -202,7 +202,7 @@ impl FragmentLifecycleProjection {
                     format!("scheduled backend {backend_idx} has invalid frozen endpoint: {error}"),
                 )
             })?;
-            if RuntimeEndpoint::from_socket_addr(target_endpoint) != *endpoint {
+            if target_endpoint != *endpoint {
                 return Err(DistributedQueryError::new(
                     DistributedQueryErrorKind::ContractViolation,
                     format!(

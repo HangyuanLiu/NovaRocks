@@ -7,12 +7,17 @@ use std::time::{Duration, Instant};
 
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_native_trust::NativeTrust;
+use novarocks_proto::lifecycle::QueryControlEndpoint;
 use novarocks_proto::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryStageAck,
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
 };
+use novarocks_proto::membership::BackendProcessDescriptor;
+use novarocks_proto::membership::{
+    BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
+};
 use novarocks_spi::connector::ConnectorExecutionInstaller;
-use novarocks_types::{AdvertiseEndpoint, NativeEndpoint};
+use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
 
 use crate::BackendDataRuntime;
 use crate::connector::ConnectorRegistry;
@@ -27,6 +32,7 @@ use crate::query_lifecycle::{
     NativeQueryLifecycleLocalRuntime, QueryControlAttachment, QueryLifecycleError,
     QueryLifecycleIngress, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
 };
+use crate::rpc::client::BackendRpcClient;
 use crate::rpc::runtime::BackendNativeTransport;
 use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
 use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
@@ -35,6 +41,7 @@ use novarocks_spi::connector::WriteCommitEvidenceLimits;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const ANNOUNCE_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct BackendServerConfig {
     pub bind_host: String,
@@ -46,6 +53,9 @@ pub struct BackendServerConfig {
     /// configuration or credentials itself.
     pub native_trust: Arc<NativeTrust>,
     pub native_transport: BackendNativeTransport,
+    /// Exact FE native ingress used exclusively for authenticated membership announce.
+    pub frontend_endpoint: NativeEndpoint,
+    pub announce_interval: Duration,
     pub query_lifecycle_sweep_interval: Duration,
     pub query_lifecycle_config: QueryLifecycleRegistryConfig,
     /// Server-resolved per-fragment terminal write evidence budget.
@@ -110,6 +120,126 @@ pub struct BackendApplicationHost {
     _execution_runtime: Arc<ExecutionRuntime>,
     query_lifecycle_sweep: QueryLifecycleSweepTask,
     metrics_http_server: MetricsHttpServer,
+    process_descriptor: BackendProcessDescriptor,
+    announce_task: BackendAnnounceTask,
+}
+
+struct BackendAnnounceTask {
+    stop: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
+    wake: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    join: Option<std::thread::JoinHandle<()>>,
+    data_runtime: BackendDataRuntime,
+    frontend_endpoint: NativeEndpoint,
+    descriptor: BackendProcessDescriptor,
+}
+
+impl BackendAnnounceTask {
+    fn start(
+        data_runtime: BackendDataRuntime,
+        frontend_endpoint: NativeEndpoint,
+        descriptor: BackendProcessDescriptor,
+        interval: Duration,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let draining = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let thread_stop = Arc::clone(&stop);
+        let thread_draining = Arc::clone(&draining);
+        let thread_wake = Arc::clone(&wake);
+        let thread_runtime = data_runtime.clone();
+        let thread_frontend_endpoint = frontend_endpoint.clone();
+        let thread_descriptor = descriptor.clone();
+        let join = std::thread::Builder::new()
+            .name("backend-announce".to_string())
+            .spawn(move || {
+                let client = BackendRpcClient::new_native_endpoint(
+                    thread_runtime,
+                    thread_frontend_endpoint,
+                );
+                while !thread_stop.load(Ordering::Acquire) {
+                    let reported_state = if thread_draining.load(Ordering::Acquire) {
+                        BackendReportedState::Draining
+                    } else {
+                        BackendReportedState::Running
+                    };
+                    let request = BackendAnnounceRequest::new(
+                        thread_descriptor.clone(),
+                        reported_state,
+                    )
+                        .expect("backend process descriptor remains validated");
+                    match client.blocking_announce_backend_with_timeout(
+                        request.as_proto().clone(),
+                        ANNOUNCE_RPC_TIMEOUT,
+                    ) {
+                        Ok(BackendAnnounceResult::Accepted { .. }) => {}
+                        Ok(BackendAnnounceResult::Rejected { reason, safe_detail }) => {
+                            tracing::error!(?reason, %safe_detail, "backend announce rejected by frontend");
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "backend announce attempt failed");
+                        }
+                    }
+                    let (pending, signal) = &*thread_wake;
+                    let mut pending = pending.lock().expect("backend announce wake lock");
+                    if !*pending && !thread_stop.load(Ordering::Acquire) {
+                        let (next, _) = signal
+                            .wait_timeout(pending, interval)
+                            .expect("backend announce wake wait");
+                        pending = next;
+                    }
+                    *pending = false;
+                }
+            })
+            .expect("spawn backend announce task");
+        Self {
+            stop,
+            draining,
+            wake,
+            join: Some(join),
+            data_runtime,
+            frontend_endpoint,
+            descriptor,
+        }
+    }
+
+    fn begin_drain(&self) {
+        self.draining.store(true, Ordering::Release);
+        let client = BackendRpcClient::new_native_endpoint(
+            self.data_runtime.clone(),
+            self.frontend_endpoint.clone(),
+        );
+        let request =
+            BackendAnnounceRequest::new(self.descriptor.clone(), BackendReportedState::Draining)
+                .expect("backend process descriptor remains validated");
+        match client.blocking_announce_backend_with_timeout(
+            request.as_proto().clone(),
+            ANNOUNCE_RPC_TIMEOUT,
+        ) {
+            Ok(BackendAnnounceResult::Accepted { .. }) => {}
+            Ok(BackendAnnounceResult::Rejected {
+                reason,
+                safe_detail,
+            }) => {
+                tracing::error!(?reason, %safe_detail, "backend drain announce rejected by frontend");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "backend drain announce attempt failed");
+            }
+        }
+        let (pending, signal) = &*self.wake;
+        *pending.lock().expect("backend announce wake lock") = true;
+        signal.notify_one();
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let (_, signal) = &*self.wake;
+        signal.notify_one();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 impl fmt::Debug for BackendApplicationHost {
@@ -139,8 +269,12 @@ struct BackendStageLifecycleIngress {
 }
 
 impl QueryLifecycleIngress for BackendStageLifecycleIngress {
-    fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError> {
-        self.registry.bind_backend_identity(backend_id)
+    fn backend_process_id(&self) -> BackendProcessId {
+        self.registry.local_process_id()
+    }
+
+    fn is_draining(&self) -> bool {
+        self.registry.is_draining()
     }
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
@@ -286,9 +420,8 @@ fn compose_backend_application_services(
         Arc::clone(&controls),
         Arc::clone(&execution_host),
     ));
-    let query_lifecycle_registry = QueryLifecycleRegistry::new_unbound_with_runtime(
+    let query_lifecycle_registry = QueryLifecycleRegistry::new_with_runtime(
         data_runtime.clone(),
-        crate::runtime::start_epoch::start_epoch(),
         local_runtime,
         query_lifecycle_config,
     );
@@ -373,6 +506,21 @@ impl BackendApplicationHost {
         SocketAddr::new(ip, bound.port())
     }
 
+    pub fn process_descriptor(&self) -> &BackendProcessDescriptor {
+        &self.process_descriptor
+    }
+
+    /// SIGTERM makes this BE ineligible for new Init while existing admitted
+    /// lifecycle entries remain reachable until their normal terminal state.
+    pub fn begin_drain(&self) {
+        self._query_lifecycle_registry.begin_drain();
+        self.announce_task.begin_drain();
+    }
+
+    pub fn is_drained(&self) -> bool {
+        self._query_lifecycle_registry.is_drained()
+    }
+
     pub fn poll_failure(
         &mut self,
     ) -> Result<Option<BackendApplicationError>, BackendApplicationError> {
@@ -401,6 +549,7 @@ impl BackendApplicationHost {
     }
 
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
+        self.announce_task.stop();
         let listener_shutdown = self.grpc_server.stop();
         let execution_shutdown = self
             .execution_host
@@ -428,6 +577,8 @@ impl BackendApplicationHost {
             advertise_endpoint,
             native_trust,
             native_transport,
+            frontend_endpoint,
+            announce_interval,
             query_lifecycle_sweep_interval,
             query_lifecycle_config,
             write_commit_evidence_limits,
@@ -450,6 +601,24 @@ impl BackendApplicationHost {
             write_commit_evidence_limits,
             &execution_installers,
         )?;
+        let process_descriptor = BackendProcessDescriptor::new(
+            services.query_lifecycle_ingress.backend_process_id(),
+            QueryControlEndpoint::new(advertise_endpoint.host.clone(), advertise_endpoint.port)
+                .map_err(|error| {
+                    BackendApplicationError::new(
+                        BackendApplicationErrorKind::Configuration,
+                        format!("resolve backend process endpoint: {error}"),
+                    )
+                })?,
+            native_trust.deployment_id().as_str(),
+            novarocks_version::native_build_identity(),
+        )
+        .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("construct backend process descriptor: {error}"),
+            )
+        })?;
         let metrics_registry = Arc::new(BackendMetricsRegistry::new().map_err(|error| {
             BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
         })?);
@@ -484,6 +653,7 @@ impl BackendApplicationHost {
                 services.query_lifecycle_ingress.clone(),
                 runtime_filter_ingress,
                 Arc::clone(&services.exchange_receiver_port),
+                process_descriptor.clone(),
             ),
             native_trust,
             native_transport,
@@ -519,6 +689,13 @@ impl BackendApplicationHost {
             ));
         }
 
+        let announce_task = BackendAnnounceTask::start(
+            readiness_runtime,
+            frontend_endpoint,
+            process_descriptor.clone(),
+            announce_interval.max(Duration::from_millis(100)),
+        );
+
         Ok(Self {
             ready_marker: format!(
                 "NOVAROCKS_READY role=be grpc_port={grpc_port} advertise_host={} pid={}",
@@ -532,6 +709,8 @@ impl BackendApplicationHost {
             _execution_runtime: services.execution_runtime,
             query_lifecycle_sweep,
             metrics_http_server,
+            process_descriptor,
+            announce_task,
         })
     }
 }
@@ -635,6 +814,7 @@ where
         },
         Err(error) => Err(error),
     };
+    host.begin_drain();
     combine_primary_and_shutdown(primary, host.shutdown())
 }
 
@@ -726,9 +906,8 @@ mod tests {
         QueryControlRequest as ProtoQueryControlRequest,
     };
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
-    use novarocks_types::AdvertiseEndpoint;
     use novarocks_types::QueryId;
-    use novarocks_version::native_build_identity;
+    use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
     use tokio_stream::wrappers::ReceiverStream;
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -826,6 +1005,9 @@ mod tests {
             },
             native_trust: crate::rpc::runtime::test_backend_native_trust(),
             native_transport: crate::rpc::runtime::BackendNativeTransport::Plaintext,
+            frontend_endpoint: NativeEndpoint::from_host_port("127.0.0.1", unused_port())
+                .expect("valid frontend endpoint"),
+            announce_interval: Duration::from_secs(60),
             query_lifecycle_sweep_interval: Duration::from_millis(1_000),
             query_lifecycle_config: query_lifecycle_registry_config(Duration::from_millis(5_000)),
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
@@ -834,7 +1016,7 @@ mod tests {
         }
     }
 
-    fn live_query_init_request(start_epoch: u64, query_low: i64) -> QueryInitRequest {
+    fn live_query_init_request(process_id: BackendProcessId, query_low: i64) -> QueryInitRequest {
         let execution_id = QueryExecutionId::new(
             QueryId::new(0x514c_4302, query_low),
             AttemptId::new(1).expect("nonzero attempt"),
@@ -844,9 +1026,8 @@ mod tests {
             ParticipantManifest::new(
                 execution_id,
                 ParticipantBackendIdentity::new(
-                    7,
+                    process_id,
                     QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid backend endpoint"),
-                    start_epoch,
                 )
                 .expect("valid backend identity"),
                 [ParticipantRole::FragmentExecutor],
@@ -1011,16 +1192,11 @@ mod tests {
             BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
                 .expect("native backend host starts");
         let mut client = connect_live_client(grpc_port).await;
-        let heartbeat = client
-            .heartbeat(HeartbeatRequest {
-                assigned_be_id: 7,
-                fe_epoch: 1,
-            })
-            .await
-            .expect("bind backend identity")
-            .into_inner();
-        assert_eq!(heartbeat.version, native_build_identity());
-        let init = live_query_init_request(heartbeat.start_epoch, 901);
+        let process_id = host
+            .process_descriptor()
+            .process_id()
+            .expect("host process identity");
+        let init = live_query_init_request(process_id, 901);
         let protocol_init = protocol_init_request(&init);
         client
             .init_query(protocol_init.as_proto().clone())
@@ -1107,15 +1283,11 @@ mod tests {
         let host = BackendApplicationHost::open(config, test_data_runtime())
             .expect("native backend host starts");
         let mut client = connect_live_client(grpc_port).await;
-        let heartbeat = client
-            .heartbeat(HeartbeatRequest {
-                assigned_be_id: 7,
-                fe_epoch: 1,
-            })
-            .await
-            .expect("bind backend identity")
-            .into_inner();
-        let init = live_query_init_request(heartbeat.start_epoch, 902);
+        let process_id = host
+            .process_descriptor()
+            .process_id()
+            .expect("host process identity");
+        let init = live_query_init_request(process_id, 902);
         let protocol_init = protocol_init_request(&init);
         client
             .init_query(protocol_init.as_proto().clone())
@@ -1191,15 +1363,11 @@ mod tests {
                 .expect("native backend host starts");
         let registry = Arc::clone(&host._query_lifecycle_registry);
         let mut client = connect_live_client(grpc_port).await;
-        let heartbeat = client
-            .heartbeat(HeartbeatRequest {
-                assigned_be_id: 7,
-                fe_epoch: 1,
-            })
-            .await
-            .expect("bind backend identity")
-            .into_inner();
-        let init = live_query_init_request(heartbeat.start_epoch, 903);
+        let process_id = host
+            .process_descriptor()
+            .process_id()
+            .expect("host process identity");
+        let init = live_query_init_request(process_id, 903);
         let protocol_init = protocol_init_request(&init);
         client
             .init_query(protocol_init.as_proto().clone())
@@ -1316,8 +1484,7 @@ mod tests {
         let mut missing_auth = NovaRocksGrpcClient::new(connect_live_channel(grpc_port).await);
         let error = missing_auth
             .heartbeat(HeartbeatRequest {
-                assigned_be_id: 7,
-                fe_epoch: 1,
+                expected_process_id: host.process_descriptor().as_proto().process_id.clone(),
             })
             .await
             .expect_err("Native RPC without JWT must fail before domain validation");
@@ -1340,8 +1507,7 @@ mod tests {
         let result: Result<tonic::Response<HeartbeatResponse>, tonic::Status> = grpc
             .unary(
                 tonic::Request::new(HeartbeatRequest {
-                    assigned_be_id: 7,
-                    fe_epoch: 1,
+                    expected_process_id: host.process_descriptor().as_proto().process_id.clone(),
                 }),
                 "/novarocks.NovaRocksGrpc/Unknown"
                     .parse()
@@ -1411,16 +1577,12 @@ mod tests {
             BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
                 .expect("native backend host starts");
         let mut client = connect_live_client(grpc_port).await;
-        let heartbeat = client
-            .heartbeat(HeartbeatRequest {
-                assigned_be_id: 7,
-                fe_epoch: 1,
-            })
-            .await
-            .expect("bind backend identity")
-            .into_inner();
-        let init = live_query_init_request(heartbeat.start_epoch, 904);
-        let different = live_query_init_request(heartbeat.start_epoch, 905);
+        let process_id = host
+            .process_descriptor()
+            .process_id()
+            .expect("host process identity");
+        let init = live_query_init_request(process_id, 904);
+        let different = live_query_init_request(process_id, 905);
         let protocol_init = protocol_init_request(&init);
         let protocol_different = protocol_init_request(&different);
         client

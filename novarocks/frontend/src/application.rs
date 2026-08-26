@@ -766,6 +766,10 @@ impl FrontendApplicationHost {
         )
     }
 
+    pub(crate) fn backend_membership_ingress(&self) -> Arc<ClusterBackendService> {
+        Arc::clone(self.topology())
+    }
+
     pub fn start_report_server(
         &self,
         bind_addr: std::net::SocketAddr,
@@ -776,6 +780,7 @@ impl FrontendApplicationHost {
         crate::native::report_server::FrontendReportServerHandle::start(
             bind_addr,
             self.terminal_ingress(),
+            self.backend_membership_ingress(),
             self.lifecycle_convergence_reader(),
             native_trust,
             native_transport,
@@ -795,6 +800,7 @@ impl FrontendApplicationHost {
             host,
             port,
             self.terminal_ingress(),
+            self.backend_membership_ingress(),
             self.lifecycle_convergence_reader(),
             native_trust,
             native_transport,

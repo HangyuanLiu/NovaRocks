@@ -286,18 +286,17 @@ impl LiveBackendTarget {
         self.descriptor.process_id()
     }
 
-    pub fn endpoint(&self) -> Result<SocketAddr, novarocks_proto::ProtocolError> {
+    pub fn endpoint(&self) -> Result<RuntimeEndpoint, novarocks_proto::ProtocolError> {
         let endpoint = self.descriptor.endpoint()?;
-        let address = endpoint.host().parse().map_err(|error| {
+        RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port())).map_err(|error| {
             novarocks_proto::ProtocolError::new(
                 novarocks_proto::FieldPath::root("backend_process_descriptor")
                     .field("endpoint")
                     .field("host"),
                 novarocks_proto::ProtocolErrorKind::InvalidValue,
-                format!("backend endpoint must be an IP address for native transport: {error}"),
+                format!("backend endpoint is invalid for native transport: {error}"),
             )
-        })?;
-        Ok(SocketAddr::new(address, endpoint.port()))
+        })
     }
 }
 
