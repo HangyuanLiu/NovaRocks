@@ -16,8 +16,6 @@
 // under the License.
 
 use bytes::Bytes;
-use novarocks_frontend::OperationId;
-use novarocks_frontend::state_store::coordination::{ControlPlaneMode, IncarnationGate};
 use novarocks_frontend::view::repository::database_key;
 use novarocks_frontend::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
@@ -220,30 +218,6 @@ async fn sqlite_host_reopens_without_a_dml_recovery_surface() {
 
     let reopened = open_host(Some(config)).await.expect("reopened host");
     assert!(!Arc::ptr_eq(&first, &reopened.dml_service()));
-    reopened.shutdown().await.expect("reopened shutdown");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sqlite_host_bootstraps_once_and_preserves_reconciling_mode() {
-    let config = state_store_input();
-    let host = open_host(Some(config.clone())).await.expect("first host");
-    let store = host.state_store().expect("configured StateStore");
-    let gate = IncarnationGate::new(store);
-    let initial = gate.load().await.expect("bootstrapped control plane");
-    assert_eq!(initial.mode(), ControlPlaneMode::WriteOpen);
-    let reconciling = gate
-        .begin_restore(&initial, OperationId::new_v7())
-        .await
-        .expect("close writes for restore");
-    drop(gate);
-    host.shutdown().await.expect("first shutdown");
-
-    let reopened = open_host(Some(config)).await.expect("reopened host");
-    let gate = IncarnationGate::new(reopened.state_store().expect("reopened StateStore"));
-    let preserved = gate.load().await.expect("preserved control plane");
-    assert_eq!(preserved.mode(), ControlPlaneMode::Reconciling);
-    assert_eq!(preserved.incarnation(), reconciling.incarnation());
-    drop(gate);
     reopened.shutdown().await.expect("reopened shutdown");
 }
 

@@ -32,7 +32,6 @@ use crate::catalog_attachment::CatalogAttachmentRepository;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::common::admitted_query_context::LakePublicationRuntimePolicy;
 use crate::connector::ConnectorControlHost;
-use crate::coordination::FrontendCoordinationRuntime;
 use crate::coordinator::{FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader};
 use crate::dml::DmlService;
 use crate::mv::maintenance::MaintenanceCoordinatorConfig;
@@ -76,7 +75,6 @@ fn test_native_trust() -> Arc<NativeTrust> {
 pub enum FrontendApplicationErrorKind {
     DeploymentSource,
     StateStoreHost,
-    CoordinationOpen,
     ViewServiceOpen,
     TableMaintenanceServiceOpen,
     MvServiceOpen,
@@ -144,7 +142,6 @@ pub struct FrontendApplicationHost {
     mv_refresh_provider_activation: Option<Arc<FrontendMvRefreshProviderActivationPort>>,
     mv_background_engine_sink: Option<Arc<dyn crate::mv::background::MvBackgroundEngineSink>>,
     state_store_host: Option<StateStoreHost>,
-    coordination: Option<Arc<FrontendCoordinationRuntime>>,
     query_execution: Option<QueryExecutionService>,
     query_control: crate::query_execution::control::QueryControlService,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
@@ -375,7 +372,6 @@ impl FrontendApplicationHost {
             mv_refresh_provider_activation: None,
             mv_background_engine_sink: None,
             state_store_host: None,
-            coordination: None,
             query_execution: None,
             query_control: FrontendQueryControl::service(),
             coordinator: None,
@@ -392,19 +388,6 @@ impl FrontendApplicationHost {
                 .await
         {
             return Err(host.cleanup_open_error(error).await);
-        }
-        if let Some(store) = host.state_store() {
-            match FrontendCoordinationRuntime::open(store).await {
-                Ok(coordination) => host.coordination = Some(Arc::new(coordination)),
-                Err(error) => {
-                    return Err(host
-                        .cleanup_open_error(FrontendApplicationError::new(
-                            FrontendApplicationErrorKind::CoordinationOpen,
-                            error,
-                        ))
-                        .await);
-                }
-            }
         }
         host.catalog_application_port = match host.state_store() {
             Some(store) => match CatalogAttachmentRepository::open(store).await {
@@ -709,10 +692,6 @@ impl FrontendApplicationHost {
             .and_then(StateStoreHost::state_store)
     }
 
-    pub(crate) fn coordination(&self) -> Option<Arc<FrontendCoordinationRuntime>> {
-        self.coordination.as_ref().map(Arc::clone)
-    }
-
     pub fn execution_role(&self) -> novarocks_types::ClusterRole {
         self.execution_role
     }
@@ -972,7 +951,6 @@ impl FrontendApplicationHost {
         self.mv_refresh_provider_activation.take();
         self.mv_background_engine_sink.take();
         self.mv_repository.take();
-        self.coordination.take();
         if let Some(catalog_controller_error) = catalog_controller_error {
             let error = format!("shutdown catalog controller failed: {catalog_controller_error}");
             if let Some(primary) = primary_error.as_mut() {

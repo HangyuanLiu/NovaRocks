@@ -17,7 +17,6 @@
 
 //! Frontend-owned StateStore consumer runtime.
 
-pub mod coordination;
 mod host;
 pub mod host_error;
 pub mod metrics;

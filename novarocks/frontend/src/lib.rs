@@ -24,8 +24,6 @@ mod catalog_projection_metrics;
 pub mod client_connection;
 pub mod common;
 pub mod connector;
-#[doc(hidden)]
-pub mod coordination;
 pub mod coordinator;
 pub mod deployment;
 pub mod dml;
