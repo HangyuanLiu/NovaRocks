@@ -122,8 +122,11 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
     let fault = match fault.trim() {
         "before-dispatch" => PublicationCatalogFault::BeforeDispatch,
         "after-commit-before-response" => PublicationCatalogFault::AfterCommitBeforeResponse,
+        "after-commit-hold-for-frontend-kill" => {
+            PublicationCatalogFault::AfterCommitHoldForFrontendKill
+        }
         other => anyhow::bail!(
-            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, after-commit-before-response"
+            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, after-commit-before-response, after-commit-hold-for-frontend-kill"
         ),
     };
     Ok(PublicationCatalogFaultDirective { action, fault })
@@ -1362,6 +1365,26 @@ mod opt5_directive_tests {
             Some(PublicationCatalogFaultDirective {
                 action: PublicationCatalogAction::TableCommit,
                 fault: PublicationCatalogFault::AfterCommitBeforeResponse,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_meta_parses_inflight_publication_frontend_kill_fault() {
+        let re = meta_re();
+        let meta = parse_meta(
+            &[
+                "-- @publication_catalog_fault=table-commit,after-commit-hold-for-frontend-kill"
+                    .to_string(),
+            ],
+            &re,
+        )
+        .expect("parse in-flight frontend kill fault");
+        assert_eq!(
+            meta.publication_catalog_fault,
+            Some(PublicationCatalogFaultDirective {
+                action: PublicationCatalogAction::TableCommit,
+                fault: PublicationCatalogFault::AfterCommitHoldForFrontendKill,
             })
         );
     }

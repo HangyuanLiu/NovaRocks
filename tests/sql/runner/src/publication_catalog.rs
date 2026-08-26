@@ -29,7 +29,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, delete, post};
+use axum::routing::{any, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROXY_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -51,6 +51,7 @@ pub(crate) struct FixtureConfig {
 
 pub(crate) struct FixtureHandle {
     uri: String,
+    next_fault: Arc<Mutex<NextFaultState>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -59,6 +60,7 @@ pub(crate) struct FixtureHandle {
 pub(crate) struct FixtureControl {
     uri: String,
     client: reqwest::blocking::Client,
+    next_fault: Arc<Mutex<NextFaultState>>,
 }
 
 pub(crate) struct FixtureFaultGuard {
@@ -78,7 +80,7 @@ struct AppState {
 #[derive(Default)]
 struct NextFaultState {
     armed: Option<ArmedNextFault>,
-    status: Option<(String, bool)>,
+    status: Option<ConsumedNextFault>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -102,6 +104,7 @@ impl PublicationAction {
 pub(crate) enum PublicationFault {
     BeforeDispatch,
     AfterCommitBeforeResponse,
+    AfterCommitHoldForFrontendKill,
 }
 
 impl PublicationFault {
@@ -109,6 +112,7 @@ impl PublicationFault {
         match self {
             Self::BeforeDispatch => "before-dispatch",
             Self::AfterCommitBeforeResponse => "after-commit-before-response",
+            Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
         }
     }
 }
@@ -118,6 +122,14 @@ struct ArmedNextFault {
     arm_id: String,
     action: PublicationAction,
     fault: PublicationFault,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Debug, Clone)]
+struct ConsumedNextFault {
+    arm_id: String,
+    entered: bool,
+    release: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -142,10 +154,11 @@ impl FixtureHandle {
             .context("reserve publication catalog fixture listener")?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
+        let next_fault = Arc::new(Mutex::new(NextFaultState::default()));
         let state = AppState {
             downstream: downstream.trim_end_matches('/').to_string(),
             client: reqwest::Client::builder().no_proxy().build()?,
-            next_fault: Arc::new(Mutex::new(NextFaultState::default())),
+            next_fault: Arc::clone(&next_fault),
             next_fault_sequence: Arc::new(AtomicU64::new(1)),
         };
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -176,6 +189,7 @@ impl FixtureHandle {
             .context("wait for publication catalog fixture readiness")?;
         Ok(Self {
             uri: format!("http://{address}"),
+            next_fault,
             shutdown: Some(shutdown),
             thread: Some(thread),
         })
@@ -189,6 +203,7 @@ impl FixtureHandle {
         Ok(FixtureControl {
             uri: self.uri.clone(),
             client: reqwest::blocking::Client::builder().no_proxy().build()?,
+            next_fault: Arc::clone(&self.next_fault),
         })
     }
 }
@@ -229,6 +244,28 @@ impl FixtureControl {
             .context("decode publication catalog next-action fault cleanup")?;
         Ok(response.entered)
     }
+
+    fn wait_until_entered(&self, arm_id: &str, deadline: Instant) -> Result<()> {
+        loop {
+            let entered = self
+                .next_fault
+                .lock()
+                .expect("publication fault mutex")
+                .status
+                .as_ref()
+                .filter(|status| status.arm_id == arm_id)
+                .is_some_and(|status| status.entered);
+            if entered {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for publication catalog fault {arm_id} to reach the downstream-successful hold"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
 }
 
 fn parse_action(value: &str) -> Result<PublicationAction> {
@@ -243,14 +280,29 @@ fn parse_fault(value: &str) -> Result<PublicationFault> {
     match value {
         "before-dispatch" => Ok(PublicationFault::BeforeDispatch),
         "after-commit-before-response" => Ok(PublicationFault::AfterCommitBeforeResponse),
+        "after-commit-hold-for-frontend-kill" => {
+            Ok(PublicationFault::AfterCommitHoldForFrontendKill)
+        }
         other => anyhow::bail!("unknown publication catalog fault `{other}`"),
     }
 }
 
 impl FixtureFaultGuard {
-    pub(crate) fn finish(mut self) -> Result<()> {
+    pub(crate) fn wait_until_entered(&self, deadline: Instant) -> Result<()> {
+        self.control.wait_until_entered(&self.arm_id, deadline)
+    }
+
+    pub(crate) fn release(&mut self) -> Result<bool> {
+        if self.cleared {
+            return Ok(true);
+        }
         let entered = self.control.clear_arm(&self.arm_id)?;
         self.cleared = true;
+        Ok(entered)
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        let entered = self.release()?;
         if !entered {
             anyhow::bail!(
                 "publication catalog next-action fault {} was not consumed by its matching REST request",
@@ -264,8 +316,7 @@ impl FixtureFaultGuard {
 impl Drop for FixtureFaultGuard {
     fn drop(&mut self) {
         if !self.cleared {
-            let _ = self.control.clear_arm(&self.arm_id);
-            self.cleared = true;
+            let _ = self.release();
         }
     }
 }
@@ -301,7 +352,7 @@ fn router(state: AppState) -> Router {
         .route("/_fixture/publication-faults/next", post(arm_next_fault))
         .route(
             "/_fixture/publication-faults/next/{arm_id}",
-            delete(clear_next_fault),
+            axum::routing::delete(clear_next_fault),
         )
         .fallback(any(dispatch))
         .with_state(state)
@@ -327,6 +378,7 @@ async fn arm_next_fault(
         arm_id: arm_id.clone(),
         action: request.action,
         fault: request.fault,
+        release: Arc::new(tokio::sync::Notify::new()),
     });
     json_response(StatusCode::OK, json!({"arm_id": arm_id}))
 }
@@ -337,7 +389,7 @@ async fn clear_next_fault(
 ) -> Response {
     let mut next = state.next_fault.lock().expect("publication fault mutex");
     let entered = match next.status.as_ref() {
-        Some((known_arm_id, entered)) if known_arm_id == &arm_id => *entered,
+        Some(status) if status.arm_id == arm_id => status.entered,
         None => {
             return wire_error(
                 StatusCode::NOT_FOUND,
@@ -353,6 +405,12 @@ async fn clear_next_fault(
             );
         }
     };
+    let release = next
+        .status
+        .as_ref()
+        .expect("checked publication fault status")
+        .release
+        .clone();
     next.status = None;
     if next
         .armed
@@ -361,6 +419,8 @@ async fn clear_next_fault(
     {
         next.armed = None;
     }
+    drop(next);
+    release.notify_waiters();
     json_response(StatusCode::OK, json!({"entered": entered}))
 }
 
@@ -372,7 +432,9 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     };
     let action = standard_publication_action(&parts.method, parts.uri.path(), &bytes);
     let fault = action.and_then(|action| take_matching_fault(&state, action));
-    if let Some((_, PublicationFault::BeforeDispatch)) = fault {
+    if let Some(armed) = fault.as_ref()
+        && armed.fault == PublicationFault::BeforeDispatch
+    {
         // The fixture proves it did not forward this request. Use a typed
         // non-5xx REST response so the standard client can truthfully classify
         // the operation as known-not-dispatched rather than a transport
@@ -380,10 +442,21 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
         return known_not_dispatched("publication REST request rejected before dispatch");
     }
     let response = proxy_request(&state, parts.method, parts.uri, parts.headers, bytes).await;
-    if let Some((_, PublicationFault::AfterCommitBeforeResponse)) = fault
+    if let Some(armed) = fault
         && response.status().is_success()
     {
-        return temporary_failure("publication REST response was lost after downstream success");
+        match armed.fault {
+            PublicationFault::AfterCommitBeforeResponse => {
+                return temporary_failure("publication REST response was lost after downstream success");
+            }
+            PublicationFault::AfterCommitHoldForFrontendKill => {
+                armed.release.notified().await;
+                return temporary_failure(
+                    "publication REST response released after frontend kill",
+                );
+            }
+            PublicationFault::BeforeDispatch => unreachable!("returned before dispatch"),
+        }
     }
     response
 }
@@ -413,16 +486,19 @@ fn standard_publication_action(
 fn take_matching_fault(
     state: &AppState,
     action: PublicationAction,
-) -> Option<(String, PublicationFault)> {
+) -> Option<ArmedNextFault> {
     let mut next = state.next_fault.lock().expect("publication fault mutex");
     let armed = next.armed.as_ref()?;
     if armed.action != action {
         return None;
     }
-    let arm_id = armed.arm_id.clone();
-    let fault = armed.fault;
-    next.status = Some((arm_id.clone(), true));
-    Some((arm_id, fault))
+    let armed = armed.clone();
+    next.status = Some(ConsumedNextFault {
+        arm_id: armed.arm_id.clone(),
+        entered: true,
+        release: Arc::clone(&armed.release),
+    });
+    Some(armed)
 }
 
 async fn proxy_request(
@@ -543,18 +619,16 @@ mod tests {
                     arm_id: "one".to_string(),
                     action: PublicationAction::TableCommit,
                     fault: PublicationFault::AfterCommitBeforeResponse,
+                    release: Arc::new(tokio::sync::Notify::new()),
                 }),
                 status: None,
             })),
             next_fault_sequence: Arc::new(AtomicU64::new(1)),
         };
         assert!(take_matching_fault(&state, PublicationAction::StageCreate).is_none());
-        assert_eq!(
-            take_matching_fault(&state, PublicationAction::TableCommit),
-            Some((
-                "one".to_string(),
-                PublicationFault::AfterCommitBeforeResponse
-            ))
-        );
+        let consumed = take_matching_fault(&state, PublicationAction::TableCommit)
+            .expect("matching fault is consumed");
+        assert_eq!(consumed.arm_id, "one");
+        assert_eq!(consumed.fault, PublicationFault::AfterCommitBeforeResponse);
     }
 }

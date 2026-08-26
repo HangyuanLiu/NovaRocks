@@ -439,6 +439,9 @@ impl PublicationCatalogAction {
 pub enum PublicationCatalogFault {
     BeforeDispatch,
     AfterCommitBeforeResponse,
+    /// Hold the downstream-successful response until the runner has killed
+    /// the frontend while the issuing statement is still in flight.
+    AfterCommitHoldForFrontendKill,
 }
 
 impl PublicationCatalogFault {
@@ -446,7 +449,12 @@ impl PublicationCatalogFault {
         match self {
             Self::BeforeDispatch => "before-dispatch",
             Self::AfterCommitBeforeResponse => "after-commit-before-response",
+            Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
         }
+    }
+
+    pub const fn requires_inflight_frontend_kill(self) -> bool {
+        matches!(self, Self::AfterCommitHoldForFrontendKill)
     }
 }
 
