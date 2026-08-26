@@ -153,6 +153,7 @@ grpc_port = {be_grpc_port}
 
 [cluster]
 role = "be"
+frontend_endpoint = "127.0.0.1:{fe_grpc_port}"
 "#,
                 log_dir.display(),
             ),
@@ -539,9 +540,11 @@ grpc_port = {conflict_port}
 
 [cluster]
 role = "be"
+frontend_endpoint = "127.0.0.1:{}"
 "#,
             log_dir.display(),
             pair.be_http_port,
+            pair.fe_grpc_port,
         ),
     );
     let conflicting_fe = write_config(
