@@ -314,10 +314,6 @@ impl QueryInitPlan {
                     participant.digest(),
                     participant
                         .manifest()
-                        .roles()
-                        .map_err(protocol_contract_error)?,
-                    participant
-                        .manifest()
                         .expected_fragment_instance_ids()
                         .into_iter()
                         .map(|id| novarocks_types::UniqueId::new(id.hi, id.lo)),

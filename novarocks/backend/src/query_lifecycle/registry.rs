@@ -1615,7 +1615,7 @@ impl QueryLifecycleRegistry {
             state.local_drained_event_permit = Some(local_drained_event_permit);
             state.terminal_snapshot_event_permit = Some(terminal_snapshot_event_permit);
             state.terminal_event_permit = Some(terminal_event_permit);
-            if !validated(entry.manifest.roles()).contains(&ParticipantRole::FragmentExecutor) {
+            if entry.expected_fragment_instance_ids.is_empty() {
                 state.pre_start_deadline = None;
             }
         }
@@ -2153,7 +2153,7 @@ impl QueryLifecycleRegistry {
                 "query control is not ready",
             ));
         }
-        if !validated(entry.manifest.roles()).contains(&ParticipantRole::FragmentExecutor) {
+        if entry.expected_fragment_instance_ids.is_empty() {
             drop(state);
             return Err(self.admission_error(
                 execution_id,
