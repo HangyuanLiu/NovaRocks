@@ -149,7 +149,7 @@ exception、backend-specific stage-create fallback 与未闭合的 rollback clea
 
 ## 实现期修订（合入前）
 
-本 ADR 在实现期收到两处修订，均在合入前完成，因此直接写入正文而非另立 ADR：
+本 ADR 在实现期收到四处修订，均在合入前完成，因此直接写入正文而非另立 ADR：
 
 1. **文件系统 Catalog 的边界细节**（见「裁决」）：删除 Hadoop 的递归前缀删除后表重建失败，暴露出
    filesystem catalog 的 catalog 条目本身就是存储对象。这不是立场变化，是把裁决说准。
@@ -158,6 +158,27 @@ exception、backend-specific stage-create fallback 与未闭合的 rollback clea
    是删非空库的唯一途径——「改用显式删表」对不预先知道表名的人不可达，SQL 测试 runner 的通用用例隔离
    机制就是活证人。裁决保持不变（仍然一律 `Unsupported`），但同时补上 `information_schema.tables`
    把能力洞堵上。这条正是下面「何时重新评估」第六项在实现期就触发的结果。
+3. **publication receipt 的形状不是设计问题**：实现期一度把「`Transaction::commit` 只返回一个
+   `CommitProof`，而各 operation family 需要形状不同的 receipt」当成阻塞裁决的设计问题。它不是。
+   `CommitProof` 采用**扁平的可选字段**（`table_uuid` / `metadata_location` / `metadata_digest` /
+   `snapshot_id`），receipt 的形状由 proof 实际携带了什么决定，而不是由「这是哪种 catalog」决定——
+   后者恰好是本 ADR 要消除的那个提问方式。带 metadata identity 的 proof 得到可按 metadata 身份对账的
+   receipt，不带的仍然报告 create、只是无法这样对账。`AdmissionFacts` 对准入所观察到的事实做同样处理，
+   使调用方能在 dispatch 之前冻结 publication evidence。CREATE TABLE 因此对**所有** catalog 都走
+   create-table transaction，工厂之外再无 `IcebergCatalogKind` 分派。
+4. **「唯一语义 owner」在读路径上一度是空话**：owner trait 建好后，生产的 catalog 读取仍然经
+   `vendored_client()` 直接调用通用 client，owner 自己的 `load_table` / `list_tables` /
+   `table_exists` / `namespace_exists` / `list_views` / `load_view` 以及两个 namespace mutation
+   全都没有生产调用者。这个事实**被模块级 `#![allow(dead_code)]` 掩盖了**——去掉它才暴露出来。已全部
+   改经 owner；读路径的包装代码反而更短（owner 已经做了各调用点各自重复的排序、去重与 bookkeeping
+   namespace 过滤）。教训写在这里：owner 的边界不是由 trait 是否存在证明的，而是由「绕过它的路径是否
+   为零」证明的，而 blanket dead-code 允许会让这个证据消失。
+
+   同期删除的两条「第二路径」都已经真的分叉了：`NovaRocksCatalogFactory::build` 与 `adopt` 各自做一遍
+   kind 分派，且 `build` 包的是与 `adopt` 不同的 Hive client，还会**再建一个 client**——正是 `adopt`
+   的注释所说、本分支已经修过一次的 two-clients-one-lake 故障；`create_table` 与
+   `execute_create_table` 并存，导致 `CREATE TABLE IF NOT EXISTS` 的 no-op 语义在统一到 transaction
+   时被静默丢掉（由套件用例抓到）。**没有调用者的并行路径不是「预留」，它是会分叉的负债。**
 
 ## 何时重新评估
 
