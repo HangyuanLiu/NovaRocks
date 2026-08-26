@@ -201,6 +201,7 @@ impl MvCommandExecutor {
             self.ports.connector_control(),
             self.storage_observation.as_ref(),
             self.ports.repository().as_ref(),
+            self.ports.readiness().as_ref(),
             statement,
             current_database,
             connector_context.clone(),

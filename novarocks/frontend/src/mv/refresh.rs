@@ -215,6 +215,9 @@ fn execute_data(
         ));
     }
     let intent = prepared.publication_intent().clone();
+    if intent.partition_spec_replacement().is_none() {
+        create_data_staging_branch(planning, &attempt, &finalize, &intent, context.clone())?;
+    }
     let write_lease = planning
         .derive_write_lease()
         .map_err(|error| unavailable(error.to_string()))?;
@@ -273,10 +276,15 @@ fn execute_data(
     let committed = dependencies
         .provider_activation
         .validate_write_commit(intent, &receipt)?;
-    let snapshot = committed.committed_version().snapshot_id().ok_or_else(|| {
+    let publication_version = if committed.intent().partition_spec_replacement().is_some() {
+        committed.committed_version().clone()
+    } else {
+        publish_data_staging_branch(planning, &attempt, &finalize, &committed, context.clone())?
+    };
+    let snapshot = publication_version.snapshot_id().ok_or_else(|| {
         MvApplicationError::new(
             MvApplicationErrorKind::KnownCommittedFinalizeFailed,
-            "MV publication committed without a snapshot ID",
+            "MV publication completed without a snapshot ID",
         )
     })?;
     let table = ConnectorTableIdentity {
@@ -292,6 +300,97 @@ fn execute_data(
         .project_observed(*attempt.publication_id.as_uuid(), &package)
         .map_err(repository_error)?;
     Ok(MvStatementResult::Ok)
+}
+
+fn create_data_staging_branch(
+    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    attempt: &MvRefreshAttemptIdentity,
+    finalize: &novarocks_sql::planning::mv::MvRefreshFinalizeFacts,
+    intent: &crate::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
+    context: ConnectorRequestContext,
+) -> Result<(), MvApplicationError> {
+    if finalize.target_table_uuid.is_empty() {
+        return Err(invalid(
+            "data-producing MV refresh requires a frozen target table UUID",
+        ));
+    }
+    let table = ConnectorTableIdentity {
+        instance_id: planning.binding().descriptor().instance_id.clone(),
+        namespace: finalize.target.database.clone().into(),
+        table: finalize.target.name.clone().into(),
+    };
+    let mutation = planning
+        .derive_mutation_lease()
+        .map_err(|error| unavailable(error.to_string()))?;
+    let operation_id =
+        ConnectorMutationOperationId::from_bytes(*attempt.publication_id.as_uuid().as_bytes());
+    require_catalog_commit(
+        crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
+            &mutation,
+            operation_id,
+            ConnectorCatalogMutationOperation::AlterRef {
+                table,
+                action: ConnectorRefAction::Create {
+                    kind: ConnectorRefKind::Branch,
+                    name: attempt.staging_branch().into(),
+                    snapshot_id: intent.expected_target_snapshot_id(),
+                    policy: CreateOrReplacePolicy::FailIfExists,
+                    expected_table_uuid: Some(finalize.target_table_uuid.clone().into()),
+                },
+            },
+            context,
+        ),
+        "create data-producing MV staging branch",
+    )?;
+    Ok(())
+}
+
+fn publish_data_staging_branch(
+    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    attempt: &MvRefreshAttemptIdentity,
+    finalize: &novarocks_sql::planning::mv::MvRefreshFinalizeFacts,
+    committed: &MvRefreshCommittedFacts,
+    context: ConnectorRequestContext,
+) -> Result<novarocks_spi::connector::ConnectorCommittedVersion, MvApplicationError> {
+    if finalize.target_table_uuid.is_empty() {
+        return Err(invalid(
+            "data-producing MV publication requires a frozen target table UUID",
+        ));
+    }
+    let table = ConnectorTableIdentity {
+        instance_id: planning.binding().descriptor().instance_id.clone(),
+        namespace: finalize.target.database.clone().into(),
+        table: finalize.target.name.clone().into(),
+    };
+    let mutation = planning
+        .derive_mutation_lease()
+        .map_err(|error| unavailable(error.to_string()))?;
+    let operation_id =
+        ConnectorMutationOperationId::from_bytes(*attempt.publication_id.as_uuid().as_bytes());
+    let published = require_catalog_commit(
+        crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
+            &mutation,
+            operation_id,
+            ConnectorCatalogMutationOperation::AlterRef {
+                table,
+                action: ConnectorRefAction::FastForwardBranch {
+                    source_branch: attempt.staging_branch().into(),
+                    target_branch: Arc::from("main"),
+                    committed_version: committed.committed_version().clone(),
+                    expected_target_snapshot_id: committed.intent().expected_target_snapshot_id(),
+                    expected_table_uuid: finalize.target_table_uuid.clone().into(),
+                    guard: ConnectorRefreshPublicationGuard::new(attempt.publication_id),
+                },
+            },
+            context,
+        ),
+        "publish data-producing MV staging branch",
+    )?;
+    published
+        .receipt
+        .committed_version()
+        .cloned()
+        .ok_or_else(|| invalid("data-producing MV publication committed without a version"))
 }
 
 fn execute_metadata_only(

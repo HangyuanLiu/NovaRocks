@@ -3599,23 +3599,57 @@ fn restart_frontend_after_step(
     session: &mut MysqlSession,
     log: &mut String,
 ) -> Result<()> {
-    if !step.meta.restart_fe_after_step {
+    let Some(wipe) = step.meta.imv_accelerator_wipe_restart.as_ref() else {
+        if !step.meta.restart_fe_after_step {
+            return Ok(());
+        }
+        let mut server = server_handle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
+        if server.be_count() == 0 {
+            bail!("@restart_fe_after_step requires a runner-owned cross-process frontend");
+        }
+        server
+            .restart_fe()
+            .context("restart frontend after successful SQL step")?;
+        drop(server);
+        session
+            .reconnect()
+            .context("reconnect target SQL session after frontend restart")?;
+        let _ = writeln!(log, "    @restart_fe_after_step PASS");
         return Ok(());
+    };
+
+    let catalog = wipe.catalog.as_deref().unwrap_or("ice");
+    let fqn = wipe.mv.as_str();
+    let call = format!(
+        "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => '{fqn}', level => 'wipe')"
+    );
+    let _ = writeln!(log, "    @imv_accelerator_wipe_restart: {call}");
+    let result = execute_required_query(session, 60, &call)
+        .map_err(|reason| anyhow::anyhow!("@imv_accelerator_wipe_restart failed: {reason}"))?;
+    let level = result
+        .rows
+        .first()
+        .and_then(|row| row.first())
+        .map(String::as_str);
+    if !level.is_some_and(|value| value.eq_ignore_ascii_case("wipe")) {
+        bail!("@imv_accelerator_wipe_restart did not confirm Accelerator wipe");
     }
     let mut server = server_handle
         .lock()
         .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
     if server.be_count() == 0 {
-        bail!("@restart_fe_after_step requires a runner-owned cross-process frontend");
+        bail!("@imv_accelerator_wipe_restart requires a runner-owned cross-process frontend");
     }
     server
         .restart_fe()
-        .context("restart frontend after successful SQL step")?;
+        .context("restart frontend after Accelerator wipe")?;
     drop(server);
     session
         .reconnect()
         .context("reconnect target SQL session after frontend restart")?;
-    let _ = writeln!(log, "    @restart_fe_after_step PASS");
+    let _ = writeln!(log, "    @imv_accelerator_wipe_restart PASS");
     Ok(())
 }
 
@@ -3728,6 +3762,27 @@ fn validate_lnp_3c_runtime_cut_preflight(
     }
     if jobs != 1 {
         bail!("lnp-3c-runtime-cut requires -j 1 because it restarts the shared frontend");
+    }
+    Ok(())
+}
+
+fn validate_lnp_3d_mv_accelerator_preflight(
+    suite_names: &[String],
+    mode: ClusterMode,
+    cluster_size: usize,
+    jobs: usize,
+) -> Result<()> {
+    if !suite_names
+        .iter()
+        .any(|suite| suite == "lnp-3d-mv-accelerator")
+    {
+        return Ok(());
+    }
+    if mode != ClusterMode::CrossProcess || cluster_size != 3 {
+        bail!("lnp-3d-mv-accelerator requires --cluster-mode cross-process --cluster-size 3");
+    }
+    if jobs != 1 {
+        bail!("lnp-3d-mv-accelerator requires -j 1 because it wipes and restarts the shared frontend");
     }
     Ok(())
 }
@@ -3977,6 +4032,15 @@ fn run() -> Result<i32> {
         return Ok(1);
     }
     if let Err(error) = validate_lnp_3c_runtime_cut_preflight(
+        &suite_names,
+        selected_cluster_mode,
+        selected_cluster_size,
+        cli.jobs,
+    ) {
+        println!("❌ ERROR: {error}");
+        return Ok(1);
+    }
+    if let Err(error) = validate_lnp_3d_mv_accelerator_preflight(
         &suite_names,
         selected_cluster_mode,
         selected_cluster_size,
@@ -4701,7 +4765,8 @@ mod tests {
         expected_engine_error_code_diff_result, expected_engine_error_code_result,
         finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
         statement_starts_dml_operation, validate_dml_cluster_jobs, validate_fault_injection_jobs,
-        validate_lake_publication_preflight, validate_selected_suite_cluster,
+        validate_lake_publication_preflight, validate_lnp_3d_mv_accelerator_preflight,
+        validate_selected_suite_cluster,
         verify_runtime_filter_structured_assertion,
     };
     use clap::Parser;
@@ -5030,6 +5095,23 @@ mod tests {
                     "noncanonical {suite} selection must fail"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn lnp_3d_mv_accelerator_requires_native_serial_selection() {
+        let suites = vec!["lnp-3d-mv-accelerator".to_string()];
+        validate_lnp_3d_mv_accelerator_preflight(&suites, ClusterMode::CrossProcess, 3, 1)
+            .expect("canonical native selection");
+        for (mode, size, jobs) in [
+            (ClusterMode::AllInOne, 1, 1),
+            (ClusterMode::CrossProcess, 2, 1),
+            (ClusterMode::CrossProcess, 3, 2),
+        ] {
+            assert!(
+                validate_lnp_3d_mv_accelerator_preflight(&suites, mode, size, jobs).is_err(),
+                "noncanonical selection must fail"
+            );
         }
     }
 

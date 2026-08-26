@@ -372,6 +372,10 @@ pub struct QueryMeta {
     /// `Package`) — i.e. its lake-native metadata is sufficient to reproduce
     /// current contents without relying on in-process incremental state.
     pub imv_stateless_rebuild: Option<ImvStatelessDirective>,
+    /// Test-only destructive Accelerator wipe followed immediately by a
+    /// runner-owned cold FE restart. This is intentionally distinct from the
+    /// in-process `full` stateless rebuild check.
+    pub imv_accelerator_wipe_restart: Option<ImvStatelessDirective>,
     /// Require a substring to occur in at least one runner-owned BE log.
     pub be_log_contains: Vec<String>,
     /// Reject a substring if it occurs in any runner-owned BE log after this step began.

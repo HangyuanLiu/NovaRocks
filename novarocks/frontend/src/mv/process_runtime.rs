@@ -99,4 +99,33 @@ impl ProcessRuntime {
             entry.active = None;
         }
     }
+
+    /// A test-only Accelerator wipe must never race a publication that this
+    /// frontend still owns. The runtime is deliberately process-local, so a
+    /// subsequent FE restart starts with no active entries.
+    pub(crate) fn has_active_publications(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("MV runtime lock poisoned")
+            .values()
+            .any(|entry| entry.active.is_some())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_publication_state_is_observable_and_released() {
+        let runtime = ProcessRuntime::default();
+        let target = CanonicalMvTarget::from_parts(Some("ice"), "analytics", "orders_mv");
+        let publication_id = LakePublicationId::new_v7();
+
+        assert!(!runtime.has_active_publications());
+        assert!(runtime.begin(target.clone(), publication_id));
+        assert!(runtime.has_active_publications());
+        runtime.finish(&target, publication_id);
+        assert!(!runtime.has_active_publications());
+    }
 }

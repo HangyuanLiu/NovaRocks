@@ -267,9 +267,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                     .collect();
                 MvLakePublicationObservation::Published(MvPublishedRefreshObservation::try_new(
                     facts.target_snapshot_id,
-                    facts.refresh_id,
-                    facts.mv_id,
-                    facts.token,
+                    facts.publication_id,
                     technique,
                     bases,
                     facts.definition_fingerprint,
@@ -282,6 +280,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
         };
         MvLakePackageObservation::try_new(
             metadata.identity.clone(),
+            observed.target_object_id,
             descriptor,
             current_target_snapshot,
             publication,
@@ -332,9 +331,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                     (
                         snapshot_id,
                         MvObservedRefreshMarker {
-                            refresh_id: marker.refresh_id,
-                            mv_id: marker.mv_id,
-                            token: marker.token,
+                            publication_id: marker.publication_id,
                         },
                     )
                 })

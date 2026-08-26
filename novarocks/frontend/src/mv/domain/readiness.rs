@@ -265,6 +265,19 @@ impl MvReadinessPort {
             publication_id,
         })
     }
+
+    /// Reject the test/harness-only whole-family Accelerator wipe while this
+    /// FE owns any publication. A wipe has no distributed coordination role;
+    /// the runner immediately restarts this FE after the wipe succeeds.
+    pub(crate) fn ensure_no_active_publications(&self) -> Result<(), MvRepositoryError> {
+        if self.runtime.has_active_publications() {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                "cannot wipe MV Accelerator while an MV publication is active",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn canonical_target(package: &MvLakePackageObservation) -> CanonicalMvTarget {

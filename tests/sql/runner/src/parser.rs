@@ -667,6 +667,11 @@ fn parse_meta_with_sql_error_descriptors(
             "imv_stateless_rebuild" => {
                 meta.imv_stateless_rebuild = Some(parse_imv_stateless_rebuild(&raw_value)?);
             }
+            "imv_accelerator_wipe_restart" => {
+                let mut directive = parse_imv_stateless_rebuild(&raw_value)?;
+                directive.level = ImvStatelessLevel::Full;
+                meta.imv_accelerator_wipe_restart = Some(directive);
+            }
             "be_log_contains" => {
                 meta.be_log_contains.push(raw_value);
             }
@@ -979,6 +984,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .imv_stateless_rebuild
             .clone()
             .or_else(|| base.imv_stateless_rebuild.clone()),
+        imv_accelerator_wipe_restart: override_meta
+            .imv_accelerator_wipe_restart
+            .clone()
+            .or_else(|| base.imv_accelerator_wipe_restart.clone()),
         be_log_contains: if override_meta.be_log_contains.is_empty() {
             base.be_log_contains.clone()
         } else {
@@ -1864,6 +1873,19 @@ mod opt5_directive_tests {
         let d = meta.imv_stateless_rebuild.as_ref().expect("directive");
         assert_eq!(d.mv, "orders_mv");
         assert_eq!(d.level, ImvStatelessLevel::Package);
+        assert_eq!(d.catalog.as_deref(), Some("mv_ice_x"));
+    }
+
+    #[test]
+    fn parse_meta_collects_imv_accelerator_wipe_restart() {
+        let re = meta_re();
+        let lines = vec!["-- @imv_accelerator_wipe_restart=orders_mv,catalog=mv_ice_x".to_string()];
+        let meta = parse_meta(&lines, &re).expect("parse");
+        let d = meta
+            .imv_accelerator_wipe_restart
+            .as_ref()
+            .expect("directive");
+        assert_eq!(d.mv, "orders_mv");
         assert_eq!(d.catalog.as_deref(), Some("mv_ice_x"));
     }
 
