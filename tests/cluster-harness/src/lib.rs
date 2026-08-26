@@ -692,9 +692,6 @@ pub struct CrossProcessClusterOptions {
     /// Harness-owned Native trust profile. `Default` is authenticated h2c on
     /// the loopback IP reference, never an unauthenticated transport.
     pub native_trust_fixture: NativeTrustFixture,
-    /// `None` preserves the normal all-BE seed list; `Some` selects the FE
-    /// startup seed subset for dynamic-membership scenarios.
-    pub initial_backend_seeds: Option<Vec<usize>>,
 }
 
 /// Lifecycle boundaries accepted by the distributed fault controls.
@@ -1288,50 +1285,57 @@ impl QueryLifecyclePhase {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BackendTopologyRow {
+    process_id: String,
     grpc_port: u16,
     state: String,
     alive: bool,
     scheduled_fragments: u64,
-    start_epoch: u64,
     build_identity: String,
     status_detail: String,
 }
 
 fn parse_frontend_show_backends_values(values: &[String]) -> Result<BackendTopologyRow> {
-    let grpc_port = values
-        .get(2)
-        .context("SHOW BACKENDS row missing GrpcPort")?
-        .parse::<u16>()
-        .context("parse SHOW BACKENDS GrpcPort")?;
-    let state = values
-        .get(3)
-        .context("SHOW BACKENDS row missing State")?
+    let process_id = values
+        .first()
+        .context("SHOW BACKENDS row missing ProcessId")?
         .clone();
-    let alive = state.eq_ignore_ascii_case("Live");
+    let endpoint = values
+        .get(1)
+        .context("SHOW BACKENDS row missing Endpoint")?;
+    let (_, port) = endpoint
+        .rsplit_once(':')
+        .context("SHOW BACKENDS Endpoint must contain a port")?;
+    let grpc_port = port
+        .parse::<u16>()
+        .context("parse SHOW BACKENDS endpoint port")?;
+    let alive = values
+        .get(7)
+        .context("SHOW BACKENDS row missing Eligible")?
+        .parse::<bool>()
+        .context("parse SHOW BACKENDS Eligible")?;
+    let state = values
+        .get(12)
+        .context("SHOW BACKENDS row missing DiagnosticStatus")?
+        .clone();
     let scheduled_fragments = values
-        .get(4)
+        .get(8)
         .context("SHOW BACKENDS row missing ScheduledFragments")?
         .parse::<u64>()
         .context("parse SHOW BACKENDS ScheduledFragments")?;
-    let start_epoch = values
-        .get(5)
-        .context("SHOW BACKENDS row missing StartEpoch")?
-        .parse::<u64>()
-        .context("parse SHOW BACKENDS StartEpoch")?;
     let build_identity = values
-        .get(6)
+        .get(11)
         .context("SHOW BACKENDS row missing BuildIdentity")?
         .clone();
     let status_detail = values
-        .get(7)
+        .get(13)
         .context("SHOW BACKENDS row missing StatusDetail")?
         .clone();
     Ok(BackendTopologyRow {
+        process_id,
         grpc_port,
         state,
         alive,
         scheduled_fragments,
-        start_epoch,
         build_identity,
         status_detail,
     })
@@ -1923,8 +1927,8 @@ pub trait ServerHandle: Send {
     fn kill_query_until(&mut self, connection_id: u32, _deadline: Instant) -> Result<()> {
         self.kill_query(connection_id)
     }
-    fn backend_start_epoch(&self, index: usize) -> Result<u64> {
-        bail!("backend start epoch is unsupported by this server mode (index={index})")
+    fn backend_process_id(&self, index: usize) -> Result<String> {
+        bail!("backend process identity is unsupported by this server mode (index={index})")
     }
     fn fe_log_count(&self, needle: &str) -> Result<usize> {
         bail!("FE log counting is unsupported by this server mode (pattern={needle:?})")
@@ -2205,11 +2209,6 @@ struct CrossProcessLaunchConfig<'a> {
     cleanup_faults_enabled: bool,
     overlay: Option<&'a str>,
     native_trust_fixture: &'a PreparedNativeTrustFixture,
-    #[allow(
-        dead_code,
-        reason = "Kept while callers migrate from deprecated seed controls."
-    )]
-    initial_backend_seeds: &'a [usize],
 }
 
 fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> Result<String> {
@@ -2223,7 +2222,6 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
         cleanup_faults_enabled,
         overlay,
         native_trust_fixture,
-        initial_backend_seeds: _,
     } = config;
     let rendered = render_cross_process_config(base_config, role, be_index, runtime)?;
     let mut value = rendered
@@ -2692,7 +2690,6 @@ impl CrossProcessServerHandle {
             child_environment,
             config_overlay,
             native_trust_fixture,
-            initial_backend_seeds,
         } = options;
         let mut fe_environment = child_environment.fe;
         let mut be_environments = resolve_be_environments(
@@ -2700,7 +2697,6 @@ impl CrossProcessServerHandle {
             &child_environment.be_by_index,
             cluster_size,
         )?;
-        let _ = initial_backend_seeds;
         let runtime_dir = RuntimeDirGuard::new(create_runtime_dir(&runtime_root)?);
         let native_trust_fixture =
             PreparedNativeTrustFixture::prepare(native_trust_fixture, runtime_dir.path())?;
@@ -2770,7 +2766,6 @@ impl CrossProcessServerHandle {
                     ClusterProcessRole::Be => config_overlay.be.as_deref(),
                 },
                 native_trust_fixture: &native_trust_fixture,
-                initial_backend_seeds: &[],
             })
         };
 
@@ -3560,7 +3555,7 @@ impl ServerHandle for CrossProcessServerHandle {
             })
     }
 
-    fn backend_start_epoch(&self, index: usize) -> Result<u64> {
+    fn backend_process_id(&self, index: usize) -> Result<String> {
         self.ensure_be_index(index)?;
         let grpc_port = self.be_grpc_ports[index];
         query_frontend_backend_topology(
@@ -3571,7 +3566,7 @@ impl ServerHandle for CrossProcessServerHandle {
         )?
         .into_iter()
         .find(|row| row.grpc_port == grpc_port)
-        .map(|row| row.start_epoch)
+        .map(|row| row.process_id)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "SHOW BACKENDS has no row for cross-process BE[{index}] grpc_port={grpc_port}"
@@ -3727,7 +3722,7 @@ impl ServerHandle for CrossProcessServerHandle {
 
     fn restart_be_until(&mut self, index: usize, deadline: Instant) -> Result<()> {
         self.ensure_be_index(index)?;
-        let old_start_epoch = self.backend_start_epoch(index)?;
+        let old_process_id = self.backend_process_id(index)?;
         let prior_log = self.be_processes[index]
             .log_contents()
             .with_context(|| format!("preserve cross-process BE[{index}] log before restart"))?;
@@ -3801,7 +3796,7 @@ impl ServerHandle for CrossProcessServerHandle {
         )
         .context("cross-process backend topology barrier after BE restart")?;
         loop {
-            let remaining = remaining_until(deadline, "BE start-epoch barrier")?;
+            let remaining = remaining_until(deadline, "BE process-identity barrier")?;
             let observed = query_frontend_backend_topology(
                 &self.mysql_user,
                 &self.target_host,
@@ -3813,12 +3808,13 @@ impl ServerHandle for CrossProcessServerHandle {
                 rows.into_iter()
                     .find(|row| row.grpc_port == self.be_grpc_ports[index])
             });
-            if observed.as_ref().is_some_and(|row| {
-                row.alive && row.start_epoch != 0 && row.start_epoch != old_start_epoch
-            }) {
+            if observed
+                .as_ref()
+                .is_some_and(|row| row.alive && row.process_id != old_process_id)
+            {
                 println!(
-                    "cross-process BE[{index}] start-epoch barrier PASS: old_epoch={old_start_epoch} new_epoch={}",
-                    observed.expect("observed row checked").start_epoch
+                    "cross-process BE[{index}] process-identity barrier PASS: old_process_id={old_process_id} new_process_id={}",
+                    observed.expect("observed row checked").process_id
                 );
                 break;
             }
@@ -3831,7 +3827,7 @@ impl ServerHandle for CrossProcessServerHandle {
                     &self.runtime,
                 )?;
                 bail!(
-                    "timed out waiting for BE[{index}] start epoch to change from {old_start_epoch}; observed={observed:?}; {diagnostics}"
+                    "timed out waiting for BE[{index}] process identity to change from {old_process_id}; observed={observed:?}; {diagnostics}"
                 );
             }
             thread::sleep(
@@ -4149,27 +4145,6 @@ fn resolve_be_environments(
             environment
         })
         .collect())
-}
-
-fn resolve_initial_backend_seeds(
-    configured: Option<&[usize]>,
-    cluster_size: usize,
-) -> Result<Vec<usize>> {
-    let seeds = configured
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| (0..cluster_size).collect());
-    let mut seen = std::collections::BTreeSet::new();
-    for index in &seeds {
-        if *index >= cluster_size {
-            bail!(
-                "initial backend seed index {index} is out of bounds for cross-process cluster with {cluster_size} BE(s)"
-            );
-        }
-        if !seen.insert(*index) {
-            bail!("initial backend seed index {index} is duplicated");
-        }
-    }
-    Ok(seeds)
 }
 
 fn next_fragment_failure_token(index: usize) -> String {
@@ -4650,35 +4625,41 @@ mod tests {
 
     fn backend_row(grpc_port: u16, state: &str, alive: bool) -> BackendTopologyRow {
         BackendTopologyRow {
+            process_id: format!("01900000-0000-7000-8000-{grpc_port:012x}"),
             grpc_port,
             state: state.to_string(),
             alive,
             scheduled_fragments: 0,
-            start_epoch: 17,
             build_identity: "test-build-identity".to_string(),
             status_detail: String::new(),
         }
     }
 
     #[test]
-    fn frontend_eight_column_show_backends_includes_build_admission_diagnostics() {
+    fn frontend_show_backends_parses_membership_diagnostics() {
         let row = parse_frontend_show_backends_values(&[
-            "0".to_string(),
-            "127.0.0.1".to_string(),
-            "19070".to_string(),
-            "Live".to_string(),
+            "01900000-0000-7000-8000-000000000001".to_string(),
+            "127.0.0.1:19070".to_string(),
+            "true".to_string(),
+            "true".to_string(),
+            "Running".to_string(),
+            "true".to_string(),
+            "true".to_string(),
+            "true".to_string(),
             "41".to_string(),
-            "17".to_string(),
+            "1000".to_string(),
+            "1001".to_string(),
             "test-build-identity".to_string(),
+            "Live".to_string(),
             "".to_string(),
         ])
         .expect("parse frontend SHOW BACKENDS row");
 
+        assert_eq!(row.process_id, "01900000-0000-7000-8000-000000000001");
         assert_eq!(row.grpc_port, 19070);
         assert_eq!(row.state, "Live");
         assert!(row.alive);
         assert_eq!(row.scheduled_fragments, 41);
-        assert_eq!(row.start_epoch, 17);
         assert_eq!(row.build_identity, "test-build-identity");
         assert!(row.status_detail.is_empty());
     }
@@ -4768,13 +4749,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_seed_backend_topology_is_ready_only_when_show_backends_is_empty() {
+    fn empty_backend_topology_is_ready_only_when_show_backends_is_empty() {
         validate_live_backend_topology(&[], &[])
-            .expect("an empty dynamic-membership registry should be ready before ADD BACKEND");
+            .expect("an empty self-registration registry should be ready before any BE announces");
 
         let unexpected = vec![backend_row(19070, "Live", true)];
         let error = validate_live_backend_topology(&[], &unexpected)
-            .expect_err("an empty seed set must reject an unexpected backend row");
+            .expect_err("an empty topology expectation must reject an announced backend row");
         assert!(
             error.to_string().contains("registered=1 expected=0"),
             "{error}"
@@ -5311,7 +5292,6 @@ enable_path_style_access = true
             cleanup_faults_enabled: false,
             overlay: None,
             native_trust_fixture: &native_trust_fixture,
-            initial_backend_seeds: &[0],
         })
         .unwrap()
         .parse::<Value>()
@@ -5326,7 +5306,6 @@ enable_path_style_access = true
             cleanup_faults_enabled: false,
             overlay: None,
             native_trust_fixture: &native_trust_fixture,
-            initial_backend_seeds: &[0],
         })
         .unwrap()
         .parse::<Value>()
@@ -5658,25 +5637,6 @@ enable_path_style_access = true
         let error = resolve_be_environments(&BTreeMap::new(), &overrides, 2)
             .expect_err("out of range override must fail");
         assert!(format!("{error:#}").contains("out of bounds"));
-    }
-
-    #[test]
-    fn initial_backend_seeds_default_to_every_backend_and_allow_empty() {
-        assert_eq!(
-            resolve_initial_backend_seeds(None, 3).expect("default seeds"),
-            vec![0, 1, 2]
-        );
-        assert!(
-            resolve_initial_backend_seeds(Some(&[]), 3)
-                .expect("empty dynamic membership seeds")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn initial_backend_seeds_reject_invalid_or_duplicate_indices() {
-        assert!(resolve_initial_backend_seeds(Some(&[3]), 3).is_err());
-        assert!(resolve_initial_backend_seeds(Some(&[1, 1]), 3).is_err());
     }
 
     #[test]

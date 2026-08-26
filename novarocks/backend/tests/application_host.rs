@@ -47,6 +47,14 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         },
         native_trust: test_native_trust(),
         native_transport: BackendNativeTransport::Plaintext,
+        frontend_endpoint: novarocks_types::NativeEndpoint::from_host_port(
+            "127.0.0.1",
+            unused_port(),
+        )
+        .expect("valid frontend endpoint"),
+        announce_interval: Duration::from_secs(60),
+        announce_initial_backoff: Duration::from_millis(100),
+        announce_max_backoff: Duration::from_secs(2),
         query_lifecycle_sweep_interval: Duration::from_millis(1_000),
         query_lifecycle_config: QueryLifecycleRegistryConfig::new(
             4_096,

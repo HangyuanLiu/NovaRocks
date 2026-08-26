@@ -137,8 +137,8 @@ Deployable role configuration is explicit. Use the two templates as a pair:
   connector execution binding.
 
 Both files must contain `[cluster].role`; the command line asserts that role
-and never changes it. A frontend role uses `[state_store]` for durable backend
-membership. A minimal FE outline is:
+and never changes it. A frontend role uses `[state_store]` for durable control-plane
+state, never backend membership. A minimal FE outline is:
 
 ```toml
 [state_store]
@@ -157,7 +157,6 @@ http_port = 8040
 
 [cluster]
 role = "fe"
-backends = ["127.0.0.1:9081"]
 
 [standalone_server]
 mysql_port = 9030
@@ -170,7 +169,10 @@ access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
 enable_path_style_access = true
 ```
 
-`[state_store]` is the frontend-owned durable control-plane store. Persistent
+`[state_store]` is the frontend-owned durable control-plane store, not a backend
+membership registry. Every BE self-registers to the FE native endpoint and is
+eligible only after its authenticated announce and FE-pull heartbeat agree on its
+process identity. Persistent
 user tables belong to explicitly created external Iceberg catalogs;
 `[connector.object_store]` supplies process-local object-store credentials for
 connector execution and does not create a native internal table store.

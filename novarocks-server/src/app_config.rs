@@ -241,16 +241,16 @@ pub struct ClusterConfig {
     pub frontend_endpoint: Option<String>,
     pub advertise_host: String,
     pub advertise_port: u16,
-    #[serde(default = "default_heartbeat_interval_ms")]
-    pub heartbeat_interval_ms: u64,
-    #[serde(default = "default_heartbeat_timeout_retries")]
-    pub heartbeat_timeout_retries: u32,
-    #[serde(default = "default_backend_announce_lease_ttl_ms")]
-    pub backend_announce_lease_ttl_ms: u64,
+    pub heartbeat_interval_ms: Option<u64>,
+    pub heartbeat_timeout_retries: Option<u32>,
+    pub backend_announce_lease_ttl_ms: Option<u64>,
+    pub backend_announce_interval_ms: Option<u64>,
+    pub backend_announce_initial_backoff_ms: Option<u64>,
+    pub backend_announce_max_backoff_ms: Option<u64>,
 }
 
 fn default_heartbeat_interval_ms() -> u64 {
-    5000
+    1000
 }
 
 fn default_heartbeat_timeout_retries() -> u32 {
@@ -261,6 +261,18 @@ fn default_backend_announce_lease_ttl_ms() -> u64 {
     5000
 }
 
+fn default_backend_announce_interval_ms() -> u64 {
+    1000
+}
+
+fn default_backend_announce_initial_backoff_ms() -> u64 {
+    100
+}
+
+fn default_backend_announce_max_backoff_ms() -> u64 {
+    2000
+}
+
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
@@ -268,9 +280,12 @@ impl Default for ClusterConfig {
             frontend_endpoint: None,
             advertise_host: String::new(),
             advertise_port: 0,
-            heartbeat_interval_ms: default_heartbeat_interval_ms(),
-            heartbeat_timeout_retries: default_heartbeat_timeout_retries(),
-            backend_announce_lease_ttl_ms: default_backend_announce_lease_ttl_ms(),
+            heartbeat_interval_ms: None,
+            heartbeat_timeout_retries: None,
+            backend_announce_lease_ttl_ms: None,
+            backend_announce_interval_ms: None,
+            backend_announce_initial_backoff_ms: None,
+            backend_announce_max_backoff_ms: None,
         }
     }
 }
@@ -282,7 +297,24 @@ impl ClusterConfig {
             ClusterRole::Fe if self.frontend_endpoint.is_some() => {
                 return Err("role=fe must not configure [cluster].frontend_endpoint".to_string());
             }
-            ClusterRole::Fe => {}
+            ClusterRole::Fe => {
+                if self.backend_announce_interval_ms.is_some()
+                    || self.backend_announce_initial_backoff_ms.is_some()
+                    || self.backend_announce_max_backoff_ms.is_some()
+                {
+                    return Err(
+                        "role=fe must not configure BE announce cadence or backoff".to_string()
+                    );
+                }
+                if self.heartbeat_interval_ms() == 0
+                    || self.heartbeat_timeout_retries() == 0
+                    || self.backend_announce_lease_ttl_ms() == 0
+                {
+                    return Err(
+                        "FE heartbeat and announce lease settings must be nonzero".to_string()
+                    );
+                }
+            }
             ClusterRole::Be => {
                 self.frontend_endpoint
                     .as_deref()
@@ -294,9 +326,64 @@ impl ClusterConfig {
                     .map_err(|error| {
                         format!("invalid [cluster].frontend_endpoint: {error}")
                     })?;
+                if self.heartbeat_interval_ms.is_some()
+                    || self.heartbeat_timeout_retries.is_some()
+                    || self.backend_announce_lease_ttl_ms.is_some()
+                {
+                    return Err(
+                        "role=be must not configure FE heartbeat or announce lease settings"
+                            .to_string(),
+                    );
+                }
+                if self.backend_announce_initial_backoff_ms()
+                    > self.backend_announce_max_backoff_ms()
+                {
+                    return Err(
+                        "[cluster].backend_announce_max_backoff_ms must be at least backend_announce_initial_backoff_ms"
+                            .to_string(),
+                    );
+                }
+                if self.backend_announce_interval_ms() == 0
+                    || self.backend_announce_initial_backoff_ms() == 0
+                    || self.backend_announce_max_backoff_ms() == 0
+                {
+                    return Err(
+                        "BE announce cadence and backoff settings must be nonzero".to_string()
+                    );
+                }
             }
         }
         Ok(())
+    }
+
+    pub fn heartbeat_interval_ms(&self) -> u64 {
+        self.heartbeat_interval_ms
+            .unwrap_or_else(default_heartbeat_interval_ms)
+    }
+
+    pub fn heartbeat_timeout_retries(&self) -> u32 {
+        self.heartbeat_timeout_retries
+            .unwrap_or_else(default_heartbeat_timeout_retries)
+    }
+
+    pub fn backend_announce_lease_ttl_ms(&self) -> u64 {
+        self.backend_announce_lease_ttl_ms
+            .unwrap_or_else(default_backend_announce_lease_ttl_ms)
+    }
+
+    pub fn backend_announce_interval_ms(&self) -> u64 {
+        self.backend_announce_interval_ms
+            .unwrap_or_else(default_backend_announce_interval_ms)
+    }
+
+    pub fn backend_announce_initial_backoff_ms(&self) -> u64 {
+        self.backend_announce_initial_backoff_ms
+            .unwrap_or_else(default_backend_announce_initial_backoff_ms)
+    }
+
+    pub fn backend_announce_max_backoff_ms(&self) -> u64 {
+        self.backend_announce_max_backoff_ms
+            .unwrap_or_else(default_backend_announce_max_backoff_ms)
     }
 }
 
@@ -307,9 +394,12 @@ mod cluster_hb_tests {
     #[test]
     fn cluster_config_heartbeat_defaults() {
         let c = ClusterConfig::default();
-        assert_eq!(c.heartbeat_interval_ms, 5000);
-        assert_eq!(c.heartbeat_timeout_retries, 3);
-        assert_eq!(c.backend_announce_lease_ttl_ms, 5000);
+        assert_eq!(c.heartbeat_interval_ms(), 1000);
+        assert_eq!(c.heartbeat_timeout_retries(), 3);
+        assert_eq!(c.backend_announce_lease_ttl_ms(), 5000);
+        assert_eq!(c.backend_announce_interval_ms(), 1000);
+        assert_eq!(c.backend_announce_initial_backoff_ms(), 100);
+        assert_eq!(c.backend_announce_max_backoff_ms(), 2000);
     }
 
     #[test]
@@ -320,9 +410,9 @@ mod cluster_hb_tests {
             heartbeat_timeout_retries = 5
         "#;
         let c: ClusterConfig = toml::from_str(toml).unwrap();
-        assert_eq!(c.heartbeat_interval_ms, 2000);
-        assert_eq!(c.heartbeat_timeout_retries, 5);
-        assert_eq!(c.backend_announce_lease_ttl_ms, 5000);
+        assert_eq!(c.heartbeat_interval_ms(), 2000);
+        assert_eq!(c.heartbeat_timeout_retries(), 5);
+        assert_eq!(c.backend_announce_lease_ttl_ms(), 5000);
     }
 }
 
@@ -2539,6 +2629,39 @@ role = "fe"
 frontend_endpoint = "fe.native.example:9070"
 "#;
         let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
+        assert!(cfg.cluster.validate().is_err());
+    }
+
+    #[test]
+    fn test_cluster_role_fe_rejects_be_announce_settings() {
+        let toml = r#"
+[cluster]
+role = "fe"
+backend_announce_interval_ms = 1000
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
+        assert!(cfg.cluster.validate().is_err());
+    }
+
+    #[test]
+    fn test_cluster_role_be_rejects_frontend_lease_settings_and_invalid_backoff() {
+        let lease_toml = r#"
+[cluster]
+role = "be"
+frontend_endpoint = "fe.native.example:9070"
+backend_announce_lease_ttl_ms = 5000
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(lease_toml).expect("parse");
+        assert!(cfg.cluster.validate().is_err());
+
+        let backoff_toml = r#"
+[cluster]
+role = "be"
+frontend_endpoint = "fe.native.example:9070"
+backend_announce_initial_backoff_ms = 2000
+backend_announce_max_backoff_ms = 100
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(backoff_toml).expect("parse");
         assert!(cfg.cluster.validate().is_err());
     }
 

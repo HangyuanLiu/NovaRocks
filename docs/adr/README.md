@@ -191,11 +191,12 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 永久只支持 shared-data。
 
 
-- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
+- ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 
 #### 历史
 
 - ADR-0026 — 为何退役 StarRocks-compatible backend runtime role，并把 StarRocks 限定为外部 Connector（superseded → ADR-0108）
+- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one（superseded → ADR-0112）
 
 ### native-transport-security
 
@@ -216,17 +217,18 @@ system default 或 role-local source 偷偷扩张。
 
 ### cluster-membership
 
-领域哲学：backend membership 的 durable desired state 与 heartbeat/live/generation 等运行期 observation 必须分离。
-frontend 的 `ClusterBackendService` 通过 StateStore 成为唯一 membership authority；core 只消费稳定的
-`BackendTopologyPort`，不保留 metadata bridge、global registry 或内存 durable fallback。配置的 backend 是 additive
-seeds，动态 ADD/DROP 的结果跨 FE 重启恢复；单 FE writer 与未来多 FE fencing/takeover 分阶段裁决。
+领域哲学：外部 orchestrator 是 backend desired lifecycle 的唯一权威；Frontend 只保存可丢失的
+announce/heartbeat/compatibility observation，并从中派生可调度 topology。core 只消费稳定的
+`BackendTopologyPort`，不保留 metadata bridge、global registry、seed 或 durable membership fallback；多 FE
+fencing/takeover 仍须单独裁决。
 
-- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
-- ADR-0107 — Backend 为何以自注册、精确 heartbeat 与 pre-ready 完整重规划取代 durable membership（active）
+- ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（active）
+- ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
+- ADR-0111 — Backend 为何以自注册、精确 heartbeat 与 pre-ready 完整重规划取代 durable membership（active）
 
 #### 历史
 
- - ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（superseded → ADR-0107）
+ - ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（superseded → ADR-0111）
 - ADR-0103 — 中央 Provider wire authority 与同构 Native build admission 为何统一由 Protocol 和 Frontend topology 拥有（superseded → ADR-0105）
 - ADR-0105 — Provider wire authority 为何与 SPI domain carrier 分离、但仍保持单一 Protocol digest（superseded → ADR-0106）
 
@@ -325,7 +327,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（active）
 - ADR-0093 — StateStore provider 为何作为 leaf crate、Frontend 直接拥有 consumer runtime（active）
 - ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
-- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
+- ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 
 #### 历史
 
@@ -341,7 +343,7 @@ debug/test 开关归启动进程环境。跨域 wire section 不因名字相似�
 
 - ADR-0087 — 进程 data runtime 为何由 Server 创建并经 role-local adapter 注入 FE/BE（active）
 - ADR-0107 — 静态 startup secret 为何由 Server exact resolve，并向 provider 投影 direct credential（active）
-- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
+- ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 
 #### 历史
 

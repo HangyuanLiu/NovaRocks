@@ -431,7 +431,13 @@ pub fn compose_backend_server_config(
         native_trust: std::sync::Arc::clone(native_trust.trust()),
         native_transport: backend_native_transport(native_trust.transport()),
         frontend_endpoint,
-        announce_interval: Duration::from_millis(config.cluster.heartbeat_interval_ms),
+        announce_interval: Duration::from_millis(config.cluster.backend_announce_interval_ms()),
+        announce_initial_backoff: Duration::from_millis(
+            config.cluster.backend_announce_initial_backoff_ms(),
+        ),
+        announce_max_backoff: Duration::from_millis(
+            config.cluster.backend_announce_max_backoff_ms(),
+        ),
         query_lifecycle_sweep_interval: Duration::from_millis(
             runtime_config.query_control_heartbeat_interval_ms,
         ),
@@ -542,9 +548,9 @@ pub fn compose_frontend_server_config(
     }
     let backend_open = ClusterBackendOpenConfig::new(
         config.cluster.role,
-        Duration::from_millis(config.cluster.heartbeat_interval_ms),
-        config.cluster.heartbeat_timeout_retries,
-        Duration::from_millis(config.cluster.backend_announce_lease_ttl_ms),
+        Duration::from_millis(config.cluster.heartbeat_interval_ms()),
+        config.cluster.heartbeat_timeout_retries(),
+        Duration::from_millis(config.cluster.backend_announce_lease_ttl_ms()),
     )
     .map_err(|error| anyhow::anyhow!("open frontend backend cluster configuration: {error}"))?;
     let mysql_listener = novarocks_frontend::resolve_mysql_listener_settings(

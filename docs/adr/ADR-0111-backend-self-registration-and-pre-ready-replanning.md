@@ -1,5 +1,5 @@
 ---
-id: ADR-0107
+id: ADR-0111
 title: "Backend self-registration and pre-ready distributed replanning"
 domain: [cluster-membership, distributed-query-lifecycle]
 status: active

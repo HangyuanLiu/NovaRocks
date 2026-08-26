@@ -56,6 +56,8 @@ pub struct BackendServerConfig {
     /// Exact FE native ingress used exclusively for authenticated membership announce.
     pub frontend_endpoint: NativeEndpoint,
     pub announce_interval: Duration,
+    pub announce_initial_backoff: Duration,
+    pub announce_max_backoff: Duration,
     pub query_lifecycle_sweep_interval: Duration,
     pub query_lifecycle_config: QueryLifecycleRegistryConfig,
     /// Server-resolved per-fragment terminal write evidence budget.
@@ -140,6 +142,8 @@ impl BackendAnnounceTask {
         frontend_endpoint: NativeEndpoint,
         descriptor: BackendProcessDescriptor,
         interval: Duration,
+        initial_backoff: Duration,
+        max_backoff: Duration,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let draining = Arc::new(AtomicBool::new(false));
@@ -157,6 +161,9 @@ impl BackendAnnounceTask {
                     thread_runtime,
                     thread_frontend_endpoint,
                 );
+                let initial_backoff = initial_backoff.max(Duration::from_millis(1));
+                let max_backoff = max_backoff.max(initial_backoff);
+                let mut retry_delay = initial_backoff;
                 while !thread_stop.load(Ordering::Acquire) {
                     let reported_state = if thread_draining.load(Ordering::Acquire) {
                         BackendReportedState::Draining
@@ -168,23 +175,32 @@ impl BackendAnnounceTask {
                         reported_state,
                     )
                         .expect("backend process descriptor remains validated");
-                    match client.blocking_announce_backend_with_timeout(
+                    let next_delay = match client.blocking_announce_backend_with_timeout(
                         request.as_proto().clone(),
                         ANNOUNCE_RPC_TIMEOUT,
                     ) {
-                        Ok(BackendAnnounceResult::Accepted { .. }) => {}
+                        Ok(BackendAnnounceResult::Accepted { lease_ttl_ms }) => {
+                            retry_delay = initial_backoff;
+                            interval.min(Duration::from_millis(lease_ttl_ms.saturating_div(3).max(1)))
+                        }
                         Ok(BackendAnnounceResult::Rejected { reason, safe_detail }) => {
                             tracing::error!(?reason, %safe_detail, "backend announce rejected by frontend");
+                            let delay = retry_delay;
+                            retry_delay = retry_delay.saturating_mul(2).min(max_backoff);
+                            delay
                         }
                         Err(error) => {
                             tracing::warn!(%error, "backend announce attempt failed");
+                            let delay = retry_delay;
+                            retry_delay = retry_delay.saturating_mul(2).min(max_backoff);
+                            delay
                         }
-                    }
+                    };
                     let (pending, signal) = &*thread_wake;
                     let mut pending = pending.lock().expect("backend announce wake lock");
                     if !*pending && !thread_stop.load(Ordering::Acquire) {
                         let (next, _) = signal
-                            .wait_timeout(pending, interval)
+                            .wait_timeout(pending, next_delay)
                             .expect("backend announce wake wait");
                         pending = next;
                     }
@@ -579,6 +595,8 @@ impl BackendApplicationHost {
             native_transport,
             frontend_endpoint,
             announce_interval,
+            announce_initial_backoff,
+            announce_max_backoff,
             query_lifecycle_sweep_interval,
             query_lifecycle_config,
             write_commit_evidence_limits,
@@ -694,6 +712,8 @@ impl BackendApplicationHost {
             frontend_endpoint,
             process_descriptor.clone(),
             announce_interval.max(Duration::from_millis(100)),
+            announce_initial_backoff,
+            announce_max_backoff,
         );
 
         Ok(Self {
@@ -1008,6 +1028,8 @@ mod tests {
             frontend_endpoint: NativeEndpoint::from_host_port("127.0.0.1", unused_port())
                 .expect("valid frontend endpoint"),
             announce_interval: Duration::from_secs(60),
+            announce_initial_backoff: Duration::from_millis(100),
+            announce_max_backoff: Duration::from_secs(2),
             query_lifecycle_sweep_interval: Duration::from_millis(1_000),
             query_lifecycle_config: query_lifecycle_registry_config(Duration::from_millis(5_000)),
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
