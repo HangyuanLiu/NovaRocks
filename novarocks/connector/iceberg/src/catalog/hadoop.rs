@@ -66,6 +66,8 @@ impl NovaRocksHadoopCatalog {
 
     /// The concrete client, for the conditional-create path that has no
     /// equivalent on the generic catalog trait.
+    // Reached only by tests; production reaches the client through the dispatch.
+    #[allow(dead_code)]
     pub(super) fn conditional_client(
         &self,
     ) -> &Arc<crate::hadoop_catalog::HadoopFileSystemCatalog> {
@@ -156,14 +158,6 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
 
     async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt> {
         self.delegate.drop_table(table).await
-    }
-
-    async fn register_table(
-        &self,
-        table: CatalogTableName,
-        metadata_location: Arc<str>,
-    ) -> CatalogOutcome<CatalogTableName> {
-        self.delegate.register_table(table, metadata_location).await
     }
 
     async fn anchor_written_metadata(
@@ -437,6 +431,8 @@ fn map_prepare_failure<T>(
     }
 }
 
+// Used by `publish_conditional_create`, which only tests reach.
+#[allow(dead_code)]
 fn map_publish_failure<T>(
     failure: &crate::hadoop_catalog::HadoopCreateFailure,
     facts: &ConditionalCreateFacts,

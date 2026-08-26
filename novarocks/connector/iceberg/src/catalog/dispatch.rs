@@ -40,6 +40,9 @@ use super::transaction::{CatalogCommitDispatch, CommitProof, StagedCommit};
 /// id says only "something committed" while the marker says "*this* attempt
 /// committed". Absence is never treated as proof.
 #[derive(Debug)]
+// No production caller yet: this is the update-commit half of the lifecycle,
+// wired when `commit/**` migrates off `vendored_client`.
+#[allow(dead_code)]
 pub(super) struct UpdateTableDispatch {
     client: Arc<dyn Catalog>,
     ident: TableIdent,
@@ -49,6 +52,7 @@ pub(super) struct UpdateTableDispatch {
     marker: Option<(Arc<str>, Arc<str>)>,
 }
 
+#[allow(dead_code)]
 impl UpdateTableDispatch {
     pub(super) fn new(
         client: Arc<dyn Catalog>,

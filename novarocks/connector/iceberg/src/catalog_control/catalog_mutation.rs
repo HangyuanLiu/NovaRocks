@@ -260,6 +260,31 @@ fn validate_context(
 /// return type cannot express; `execute_create_table` handles it before this is
 /// ever reached. Keeping a create path here is what let `IF NOT EXISTS` quietly
 /// diverge once, and one create path is the point of the owner.
+/// Translate a namespace mutation's three-state outcome into an effect.
+///
+/// Nothing is lost by returning two states here: the caller reads dispatch
+/// certainty off the error's kind and turns an unknown into `CommitUnknown`,
+/// so `Unavailable` is the unknown rather than a flat failure.
+fn namespace_effect(
+    outcome: crate::catalog::error::CatalogOutcome<crate::catalog::CatalogNamespaceName>,
+) -> Result<ExternalMutationEffect, ConnectorError> {
+    match outcome {
+        crate::catalog::error::CatalogOutcome::KnownCommitted { .. } => {
+            Ok(ExternalMutationEffect::Applied)
+        }
+        crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
+            Err(map_mutation_failure(&failure))
+        }
+        crate::catalog::error::CatalogOutcome::CommitUnknown { failure, .. } => {
+            Err(unavailable(failure.to_string()))
+        }
+        crate::catalog::error::CatalogOutcome::Unsupported(reason) => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            reason.message().to_string(),
+        )),
+    }
+}
+
 fn execute_operation(
     provider: &IcebergMetadata,
     operation: &ConnectorCatalogMutationOperation,
@@ -283,17 +308,17 @@ fn execute_operation(
                     Err(already_exists("Iceberg namespace already exists"))
                 };
             }
-            let namespace =
-                NamespaceIdent::new(normalize_identifier(&namespace.namespace).map_err(invalid)?);
-            let catalog = provider.runtime().novarocks_catalog().vendored_client();
-            provider
+            let namespace = crate::catalog::CatalogNamespaceName::new(
+                normalize_identifier(&namespace.namespace).map_err(invalid)?,
+            );
+            let owner = Arc::clone(provider.runtime().novarocks_catalog());
+            let outcome = provider
                 .runtime()
                 .resources()
                 .catalog_runtime()
-                .block_on(async move { catalog.create_namespace(&namespace, HashMap::new()).await })
-                .map_err(unavailable)?
-                .map_err(map_iceberg)?;
-            Ok(ExternalMutationEffect::Applied)
+                .block_on(async move { owner.create_namespace(namespace).await })
+                .map_err(unavailable)?;
+            namespace_effect(outcome)
         }
         ConnectorCatalogMutationOperation::DropNamespace { namespace, policy } => {
             ensure_owner(provider, &namespace.instance_id)?;
@@ -308,17 +333,17 @@ fn execute_operation(
                     Err(not_found("Iceberg namespace does not exist"))
                 };
             }
-            let namespace =
-                NamespaceIdent::new(normalize_identifier(&namespace.namespace).map_err(invalid)?);
-            let catalog = provider.runtime().novarocks_catalog().vendored_client();
-            provider
+            let namespace = crate::catalog::CatalogNamespaceName::new(
+                normalize_identifier(&namespace.namespace).map_err(invalid)?,
+            );
+            let owner = Arc::clone(provider.runtime().novarocks_catalog());
+            let outcome = provider
                 .runtime()
                 .resources()
                 .catalog_runtime()
-                .block_on(async move { catalog.drop_namespace(&namespace).await })
-                .map_err(unavailable)?
-                .map_err(map_iceberg)?;
-            Ok(ExternalMutationEffect::Applied)
+                .block_on(async move { owner.drop_namespace(namespace).await })
+                .map_err(unavailable)?;
+            namespace_effect(outcome)
         }
         ConnectorCatalogMutationOperation::DropTable {
             table,

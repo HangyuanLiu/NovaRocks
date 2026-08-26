@@ -68,38 +68,6 @@ impl NovaRocksCatalogFactory {
             ))),
         }
     }
-
-    /// Construct exactly one catalog for this configuration.
-    ///
-    /// A generation gets one call and keeps the result: rebuilding would give
-    /// two clients that can disagree about the same lake.
-    pub(crate) async fn build(
-        configuration: &IcebergCatalogConfiguration,
-    ) -> Result<Arc<dyn NovaRocksCatalog>, String> {
-        let warehouse: Option<Arc<str>> = if configuration.warehouse_uri.is_empty() {
-            None
-        } else {
-            Some(Arc::from(configuration.warehouse_uri.as_str()))
-        };
-        match configuration.kind {
-            IcebergCatalogKind::Hadoop => {
-                let client = Arc::new(crate::catalog_runtime::build_hadoop_catalog(configuration)?);
-                Ok(Arc::new(super::hadoop::NovaRocksHadoopCatalog::new(client)))
-            }
-            IcebergCatalogKind::Rest => {
-                let client =
-                    Arc::new(crate::catalog_runtime::build_rest_catalog(configuration).await?);
-                Ok(Arc::new(super::rest::NovaRocksRestCatalog::new(
-                    client, warehouse,
-                )))
-            }
-            IcebergCatalogKind::Hive => {
-                let client =
-                    Arc::new(crate::catalog_runtime::build_hms_catalog(configuration).await?);
-                Ok(Arc::new(super::hive::NovaRocksHiveCatalog::new(client)))
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -115,6 +83,20 @@ mod tests {
     use crate::iceberg::TableCreation;
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use novarocks_spi::connector::ConnectorErrorKind;
+
+    /// Build a catalog for a test the way production does.
+    ///
+    /// Production never constructs a client here: the generation already has
+    /// one and this adopts it. A second construction path used to exist, and it
+    /// had already drifted -- it wrapped a different Hive client than adoption
+    /// did, and it built a second client of its own, which is exactly the
+    /// two-clients-one-lake failure `adopt` documents.
+    async fn adopted(
+        configuration: &IcebergCatalogConfiguration,
+    ) -> Result<Arc<dyn NovaRocksCatalog>, String> {
+        let client = crate::catalog_runtime::build_catalog_client(configuration).await?;
+        NovaRocksCatalogFactory::adopt(configuration, &client)
+    }
 
     fn hadoop_configuration(warehouse: &std::path::Path) -> IcebergCatalogConfiguration {
         crate::catalog_config::parse_catalog_configuration(
@@ -158,9 +140,7 @@ mod tests {
     async fn factory_builds_one_catalog_and_hides_the_concrete_kind() {
         let warehouse = tempfile::tempdir().expect("warehouse");
         let configuration = hadoop_configuration(warehouse.path());
-        let catalog = NovaRocksCatalogFactory::build(&configuration)
-            .await
-            .expect("catalog");
+        let catalog = adopted(&configuration).await.expect("catalog");
         assert_eq!(catalog.implementation_name(), "hadoop");
     }
 
@@ -173,7 +153,7 @@ mod tests {
     #[tokio::test]
     async fn view_enumeration_reports_unsupported_instead_of_faking_absence() {
         let warehouse = tempfile::tempdir().expect("warehouse");
-        let catalog = NovaRocksCatalogFactory::build(&hadoop_configuration(warehouse.path()))
+        let catalog = adopted(&hadoop_configuration(warehouse.path()))
             .await
             .expect("catalog");
 
@@ -201,7 +181,7 @@ mod tests {
     #[tokio::test]
     async fn hadoop_admits_empty_create_and_refuses_ctas_before_any_side_effect() {
         let warehouse = tempfile::tempdir().expect("warehouse");
-        let catalog = NovaRocksCatalogFactory::build(&hadoop_configuration(warehouse.path()))
+        let catalog = adopted(&hadoop_configuration(warehouse.path()))
             .await
             .expect("catalog");
         assert!(matches!(
@@ -250,7 +230,7 @@ mod tests {
     #[tokio::test]
     async fn create_or_replace_is_refused_where_it_cannot_be_atomic() {
         let warehouse = tempfile::tempdir().expect("warehouse");
-        let catalog = NovaRocksCatalogFactory::build(&hadoop_configuration(warehouse.path()))
+        let catalog = adopted(&hadoop_configuration(warehouse.path()))
             .await
             .expect("catalog");
         let outcome = catalog
@@ -266,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn existing_table_transactions_are_admitted_on_every_catalog() {
         let warehouse = tempfile::tempdir().expect("warehouse");
-        let catalog = NovaRocksCatalogFactory::build(&hadoop_configuration(warehouse.path()))
+        let catalog = adopted(&hadoop_configuration(warehouse.path()))
             .await
             .expect("catalog");
         let start = catalog

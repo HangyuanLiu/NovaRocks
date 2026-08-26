@@ -49,12 +49,6 @@ pub(super) struct NovaRocksHiveCatalog {
 }
 
 impl NovaRocksHiveCatalog {
-    pub(super) fn new(client: Arc<crate::iceberg_catalog_hms::HmsCatalog>) -> Self {
-        Self {
-            delegate: CatalogDelegate::new(client),
-        }
-    }
-
     /// Wrap a client the generation already built.
     pub(super) fn adopt(client: Arc<dyn crate::iceberg::Catalog>) -> Self {
         Self {
@@ -146,14 +140,6 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
 
     async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt> {
         self.delegate.drop_table(table).await
-    }
-
-    async fn register_table(
-        &self,
-        table: CatalogTableName,
-        metadata_location: Arc<str>,
-    ) -> CatalogOutcome<CatalogTableName> {
-        self.delegate.register_table(table, metadata_location).await
     }
 
     async fn anchor_written_metadata(

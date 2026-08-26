@@ -166,14 +166,6 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         self.delegate.drop_table(table).await
     }
 
-    async fn register_table(
-        &self,
-        table: CatalogTableName,
-        metadata_location: Arc<str>,
-    ) -> CatalogOutcome<CatalogTableName> {
-        self.delegate.register_table(table, metadata_location).await
-    }
-
     async fn anchor_written_metadata(
         &self,
         table: CatalogTableName,

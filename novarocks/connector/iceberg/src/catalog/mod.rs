@@ -47,20 +47,12 @@
 //! would be surface no caller reaches and no test can exercise. The trait
 //! covers the operations the provider actually performs, and grows only when a
 //! real caller appears.
-
-// The transaction lifecycle and its dispatch objects are built, tested, and
-// implemented by every catalog, but no operation family calls the three
-// constructors yet, so parts of this surface have no production caller.
-//
-// This is not scaffolding waiting to be deleted -- it is the half of the design
-// that is not wired. Wiring it is blocked on a real design question rather than
-// on effort: `Transaction::commit` returns one `CommitProof`, and the families
-// need publication receipts that differ by what was published (a conditional
-// create yields an authoritative re-read digest; a staged create yields a
-// committed table). Either the unified result grows a variant-typed payload, or
-// each family keeps its own receipt path. That belongs in the design, not in a
-// mechanical rewrite here.
-#![allow(dead_code)]
+//!
+//! There is no `register_table` either. Every catalog could forward one, but
+//! nothing called it: production anchors an already-written metadata file
+//! through `anchor_written_metadata`, which is the operation the provider
+//! actually performs. A trait method whose only content is a forward to a
+//! primitive no caller wants is a second way to do one thing.
 
 pub(crate) mod delegate;
 pub(crate) mod dispatch;
@@ -168,6 +160,8 @@ pub(crate) enum CatalogTransactionStart {
     },
     /// Admission itself may have dispatched a request — a REST staged create
     /// is a real catalog mutation. Callers must not retry or clean up.
+    // Not constructed yet: no wired constructor dispatches during admission.
+    #[allow(dead_code)]
     CommitUnknown {
         failure: novarocks_spi::connector::ConnectorMutationFailure,
         evidence: error::CatalogCommitEvidence,
@@ -182,6 +176,9 @@ impl CatalogTransactionStart {
     /// transaction has not failed at all, and releasing its state is
     /// [`transaction::Transaction::abort`]'s business, which refuses once the
     /// outcome is unknown.
+    // No production caller yet: this is the update-commit half of the
+    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
+    #[allow(dead_code)]
     pub(crate) fn permits_cleanup(&self) -> bool {
         matches!(self, Self::Unsupported(_) | Self::KnownUncommitted { .. })
     }
@@ -256,6 +253,8 @@ pub(crate) struct ConditionalCreateFacts {
 }
 
 /// What a published conditional create produced.
+// Produced only by `publish_conditional_create`; see the note there.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct ConditionalCreateReceipt {
     pub(crate) facts: ConditionalCreateFacts,
@@ -351,6 +350,8 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     ///
     /// This must never be consulted to decide whether an operation is
     /// supported. Ask the operation.
+    // Identity for assertions; nothing in production needs to ask.
+    #[allow(dead_code)]
     fn implementation_name(&self) -> &'static str;
 
     /// The vendored client this owner wraps.
@@ -422,13 +423,6 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// owner's job and may only proceed on `KnownCommitted`; see ADR-0110.
     async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt>;
 
-    /// Anchor an already-written metadata file into the catalog.
-    async fn register_table(
-        &self,
-        table: CatalogTableName,
-        metadata_location: Arc<str>,
-    ) -> CatalogOutcome<CatalogTableName>;
-
     /// Make a write's freshly published metadata reachable through this
     /// catalog.
     ///
@@ -448,6 +442,9 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     // ---- C. Transaction constructors ------------------------------------
 
     /// Begin a transaction against an existing table.
+    // No production caller yet: this is the update-commit half of the
+    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
+    #[allow(dead_code)]
     async fn new_transaction(
         &self,
         request: transaction::TransactionRequest,
@@ -483,6 +480,9 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     ) -> CatalogOutcome<ConditionalCreateAttempt>;
 
     /// Publish a prepared conditional create with exactly one storage request.
+    // Reached only by tests, which is the only way the lost-response path can
+    // be exercised at all: production publishes through `ConditionalCreateDispatch`.
+    #[allow(dead_code)]
     async fn publish_conditional_create(
         &self,
         attempt: ConditionalCreateAttempt,
@@ -518,6 +518,9 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     ) -> CatalogTransactionStart;
 
     /// Begin a transaction that creates a table or replaces it in place.
+    // No production caller yet: this is the update-commit half of the
+    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
+    #[allow(dead_code)]
     async fn new_create_or_replace_table_transaction(
         &self,
         request: transaction::CreateTableTransactionRequest,
@@ -532,6 +535,8 @@ pub(crate) mod transaction;
 /// updates arrive after the writer runs. Admission here is the identity and
 /// name check, which is exactly the work that must happen before a source
 /// executes.
+// No production caller yet: see the note on `new_transaction`.
+#[allow(dead_code)]
 fn start_update_table_transaction(
     delegate: &delegate::CatalogDelegate,
     request: transaction::TransactionRequest,

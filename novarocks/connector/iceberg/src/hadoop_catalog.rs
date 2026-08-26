@@ -74,6 +74,9 @@ pub(crate) struct HadoopCreateResult {
     pub(crate) authoritative_table_uuid: String,
     pub(crate) authoritative_metadata_digest: String,
     pub(crate) table: Table,
+    /// Read by the fault tests only. A finalization failure never downgrades a
+    /// commit the client already proved, so no production caller consults it.
+    #[allow(dead_code)]
     pub(crate) finalization_failure: Option<String>,
 }
 

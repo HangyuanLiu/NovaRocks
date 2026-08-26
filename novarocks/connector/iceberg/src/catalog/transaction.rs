@@ -1,3 +1,14 @@
+// Part of this file has no production caller: the staging payload, the
+// update-commit dispatch, `adjudicate`, `abort_before_dispatch`, and the
+// existing-table / create-or-replace request shapes. Only the create path is
+// wired today, and it uses admission plus `commit`.
+//
+// This is not a design question -- the receipt shape it was once blocked on is
+// settled, and `CommitProof` carries it. What wires the rest is migrating the
+// `commit/**` layer off `vendored_client()` onto this transaction, which is a
+// bounded follow-up rather than a decision. Every item here is exercised by
+// tests, so this allowance hides unexercised code from nobody.
+#![allow(dead_code)]
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information

@@ -101,6 +101,9 @@ impl CatalogCommitEvidence {
         }
     }
 
+    // No production caller yet: this is the update-commit half of the
+    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
+    #[allow(dead_code)]
     pub(crate) fn with_commit_uuid(mut self, commit_uuid: impl Into<Arc<str>>) -> Self {
         self.commit_uuid = Some(commit_uuid.into());
         self
@@ -111,11 +114,17 @@ impl CatalogCommitEvidence {
         self
     }
 
+    // No production caller yet: this is the update-commit half of the
+    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
+    #[allow(dead_code)]
     pub(crate) fn with_target_ref(mut self, target_ref: impl Into<Arc<str>>) -> Self {
         self.target_ref = Some(target_ref.into());
         self
     }
 
+    // No production caller yet: this is the update-commit half of the
+    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
+    #[allow(dead_code)]
     pub(crate) fn with_base_snapshot_id(mut self, base: Option<i64>) -> Self {
         self.base_snapshot_id = base;
         self
@@ -213,11 +222,17 @@ impl<T> CatalogOutcome<T> {
 
     /// True when the caller still owns every resource the request touched, so
     /// cleanup of caller-owned temporary state is safe.
+    // No production caller yet: this is the update-commit half of the
+    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
+    #[allow(dead_code)]
     pub(crate) fn permits_cleanup(&self) -> bool {
         matches!(self, Self::Unsupported(_) | Self::KnownUncommitted { .. })
     }
 
     /// True when no further mutation may be issued for this frontier.
+    // No production caller yet: this is the update-commit half of the
+    // lifecycle, which is wired when `commit/**` migrates off `vendored_client`.
+    #[allow(dead_code)]
     pub(crate) fn closes_mutation_authority(&self) -> bool {
         matches!(self, Self::CommitUnknown { .. })
     }
@@ -228,6 +243,8 @@ impl<T> CatalogOutcome<T> {
 /// Callers must only use this where the surrounding code proves nothing was
 /// dispatched — argument validation, local metadata construction, or an
 /// admission check that runs ahead of any network or storage write.
+// No production caller yet: the wired paths build their own failures.
+#[allow(dead_code)]
 pub(crate) fn predispatch_failure(
     kind: ConnectorMutationFailureKind,
     message: impl Into<Arc<str>>,
@@ -335,6 +352,8 @@ pub(crate) fn classify_dispatched_error<T>(
 ///
 /// The bridge fails around the future, so it cannot say whether the wrapped
 /// request was dispatched. Treat it exactly like a lost response.
+// No production caller yet: the wired bridge sites classify inline.
+#[allow(dead_code)]
 pub(crate) fn classify_bridge_failure<T>(
     message: &str,
     evidence: CatalogCommitEvidence,

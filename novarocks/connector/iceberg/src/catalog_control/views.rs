@@ -277,15 +277,19 @@ pub(crate) fn load_view(
     view: &str,
 ) -> Result<LoadedIcebergView, String> {
     let (_, ident) = view_ident(namespace, view)?;
-    let catalog = runtime.novarocks_catalog().vendored_client();
+    let owner = std::sync::Arc::clone(runtime.novarocks_catalog());
+    let target =
+        crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
     let metadata = runtime
         .resources()
         .catalog_runtime()
-        .block_on({
-            let ident = ident.clone();
-            async move { catalog.load_view(&ident).await }
-        })?
-        .map_err(|error| map_view_error(&ident, "load", error))?;
+        .block_on(async move { owner.load_view(target).await })?
+        // Absence is read from the error's kind. The owner classifies it, so
+        // there is nothing here to recognize by substring.
+        .map_err(|error| match error.kind() {
+            ConnectorErrorKind::NotFound => format!("unknown view: {ident}"),
+            _ => format!("load Iceberg view {ident}: {error}"),
+        })?;
     loaded_view_from_metadata(&ident, &metadata)
 }
 

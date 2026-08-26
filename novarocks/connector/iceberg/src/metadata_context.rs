@@ -143,15 +143,17 @@ impl IcebergMetadataContext {
         }
         let ident = TableIdent::from_strs([namespace.as_str(), table.as_str()])
             .map_err(|error| invalid_request(format!("build Iceberg table identity: {error}")))?;
-        let catalog = self.novarocks_catalog().vendored_client();
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target =
+            crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
         let loaded = self
             .resources
             .catalog_runtime()
-            .block_on(async move { catalog.load_table(&ident).await })
+            .block_on(async move { owner.load_table(target).await })
             .map_err(unavailable)?
             .map_err(|error| {
                 (
-                    catalog_error_kind(&error),
+                    error.kind(),
                     format!("load Iceberg table {namespace}.{table}: {error}"),
                 )
             })?;
@@ -165,51 +167,33 @@ impl IcebergMetadataContext {
     }
 
     pub(crate) fn list_namespaces(&self) -> Result<Vec<String>, String> {
-        let catalog = self.novarocks_catalog().vendored_client();
-        let mut namespaces = self
-            .resources
+        let owner = Arc::clone(self.novarocks_catalog());
+        self.resources
             .catalog_runtime()
-            .block_on(async move { catalog.list_namespaces(None).await })?
-            .map_err(|error| format!("list Iceberg namespaces: {error}"))?
-            .into_iter()
-            .flat_map(|namespace| {
-                namespace
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|namespace| !namespace.starts_with('.'))
-            .collect::<Vec<_>>();
-        namespaces.sort();
-        namespaces.dedup();
-        Ok(namespaces)
+            .block_on(async move { owner.list_namespaces().await })?
+            .map_err(|error| format!("list Iceberg namespaces: {error}"))
     }
 
     pub(crate) fn namespace_exists(&self, namespace: &str) -> Result<bool, String> {
         let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
         let namespace_label = namespace.to_string();
-        let catalog = self.novarocks_catalog().vendored_client();
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
         self.resources
             .catalog_runtime()
-            .block_on(async move { catalog.namespace_exists(&namespace).await })?
+            .block_on(async move { owner.namespace_exists(target).await })?
             .map_err(|error| format!("check Iceberg namespace {namespace_label}: {error}"))
     }
 
     pub(crate) fn list_tables(&self, namespace: &str) -> Result<Vec<String>, String> {
         let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
         let namespace_label = namespace.to_string();
-        let catalog = self.novarocks_catalog().vendored_client();
-        let mut tables = self
-            .resources
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
+        self.resources
             .catalog_runtime()
-            .block_on(async move { catalog.list_tables(&namespace).await })?
-            .map_err(|error| format!("list Iceberg tables in {namespace_label}: {error}"))?
-            .into_iter()
-            .map(|table| table.name)
-            .collect::<Vec<_>>();
-        tables.sort();
-        tables.dedup();
-        Ok(tables)
+            .block_on(async move { owner.list_tables(target).await })?
+            .map_err(|error| format!("list Iceberg tables in {namespace_label}: {error}"))
     }
 
     pub(crate) fn table_exists(&self, namespace: &str, table: &str) -> Result<bool, String> {
@@ -218,10 +202,12 @@ impl IcebergMetadataContext {
             normalize_identifier(table)?,
         );
         let ident_label = ident.to_string();
-        let catalog = self.novarocks_catalog().vendored_client();
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target =
+            crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
         self.resources
             .catalog_runtime()
-            .block_on(async move { catalog.table_exists(&ident).await })?
+            .block_on(async move { owner.table_exists(target).await })?
             .map_err(|error| format!("check Iceberg table {ident_label}: {error}"))
     }
 
@@ -240,30 +226,6 @@ fn invalid_request(message: String) -> (ConnectorErrorKind, String) {
 
 fn unavailable(message: String) -> (ConnectorErrorKind, String) {
     (ConnectorErrorKind::Unavailable, message)
-}
-
-/// Project a catalog client error onto the neutral connector classification.
-/// Only absence is special: everything else stays a retryable control-plane
-/// failure, exactly as the string-returning path reports it.
-fn catalog_error_kind(error: &crate::iceberg::Error) -> ConnectorErrorKind {
-    if matches!(
-        error.kind(),
-        crate::iceberg::ErrorKind::TableNotFound | crate::iceberg::ErrorKind::NamespaceNotFound
-    ) {
-        return ConnectorErrorKind::NotFound;
-    }
-    // Catalog backends disagree about how to tag a missing table — the REST
-    // client reports `Unexpected` — so absence is also recognized from the
-    // wording each backend normalizes to.
-    let message = error.to_string().to_ascii_lowercase();
-    if message.contains("not found")
-        || message.contains("does not exist")
-        || message.contains("unknown table")
-        || message.contains("no metadata files")
-    {
-        return ConnectorErrorKind::NotFound;
-    }
-    ConnectorErrorKind::Unavailable
 }
 
 impl std::fmt::Debug for IcebergMetadataContext {
