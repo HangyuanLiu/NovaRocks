@@ -320,6 +320,11 @@ impl SplitAssignmentDriver {
                     },
                 ));
             }
+            // Sequences are allocated before the send and are not rolled back
+            // if it fails. That is deliberate: a failed send ends the round, so
+            // the sequence space dies with it. Reusing a sequence after a
+            // failure would be indistinguishable, on the receiving task, from a
+            // conflicting retransmission of the one that failed.
             let assignment = self
                 .sequences
                 .entry(target.clone())
