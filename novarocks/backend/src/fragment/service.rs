@@ -976,8 +976,8 @@ mod tests {
     };
     use novarocks_proto::lifecycle::{AttemptId as ProtocolAttemptId, QueryExecutionId};
     use novarocks_proto::lifecycle::{
-        ParticipantBackendIdentity, ParticipantManifest, ParticipantRole, QueryControlAttach,
-        QueryControlEndpoint, QueryInitOutcome, QueryInitRequest, QueryOptions, StageFragment,
+        ParticipantBackendIdentity, ParticipantManifest, QueryControlAttach, QueryControlEndpoint,
+        QueryInitOutcome, QueryInitRequest, QueryOptions, StageFragment,
     };
     use novarocks_proto_models as proto;
     use novarocks_types::QueryId as ExecutionQueryId;
@@ -1149,7 +1149,6 @@ mod tests {
                 QueryControlEndpoint::new("127.0.0.1", 19030).expect("control endpoint"),
             )
             .expect("backend identity"),
-            [ParticipantRole::FragmentExecutor],
             expected_fragments
                 .into_iter()
                 .map(|id| proto::common::UniqueId {

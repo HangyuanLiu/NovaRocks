@@ -26,7 +26,7 @@ use crate::query_execution::schedule::FragmentLifecycleProjection;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto::lifecycle::{
-    ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest, ParticipantRole,
+    ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
     QueryControlEndpoint, QueryExecutionId, QueryOptions as ProtocolQueryOptions,
     RuntimeFilterContribution,
 };
@@ -562,25 +562,17 @@ pub(crate) fn compile_query_init_plan(
             })?
             .clone();
         let backend = protocol_backend_identity(target)?;
-        let mut roles = BTreeSet::new();
         let expected_instances = fragments
             .instances_by_backend
             .get(&backend_idx)
             .cloned()
             .unwrap_or_default();
-        if !expected_instances.is_empty() {
-            roles.insert(ParticipantRole::FragmentExecutor);
-        }
         let runtime_filter = runtime_filter_by_backend.remove(&backend_idx);
-        if runtime_filter.is_some() {
-            roles.insert(ParticipantRole::RuntimeFilterService);
-        }
         let manifest = ParticipantManifest::parse(novarocks::ParticipantManifest {
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
                 options.execution_id,
             )),
             backend: Some(backend.as_proto().clone()),
-            participant_roles: roles.into_iter().map(i32::from).collect(),
             expected_fragment_instance_ids: expected_instances
                 .into_iter()
                 .map(protocol_unique_id)
@@ -629,7 +621,7 @@ mod tests {
     use crate::query_execution::contract::{QueryId, ResolvedQueryOptions};
     use crate::query_execution::schedule::FragmentLifecycleProjection;
     use novarocks_proto::lifecycle::{
-        AttemptId, ParticipantRole, QueryExecutionId, QueryOptions, RuntimeFilterContribution,
+        AttemptId, QueryExecutionId, QueryOptions, RuntimeFilterContribution,
     };
     use novarocks_proto::membership::BackendProcessDescriptor;
     use novarocks_proto_models::novarocks;
@@ -728,13 +720,13 @@ mod tests {
                 .expected_fragment_instance_ids(),
             Vec::new()
         );
-        assert_eq!(
+        assert!(
             plan.participant(2)
                 .expect("service-only participant")
                 .manifest()
-                .roles()
-                .expect("validated roles"),
-            vec![ParticipantRole::RuntimeFilterService]
+                .runtime_filter()
+                .expect("validated contribution")
+                .is_some()
         );
     }
 

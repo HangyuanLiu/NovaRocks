@@ -23,7 +23,7 @@ use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
 use novarocks_proto::lifecycle::{
-    AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantRole,
+    AttemptId, ParticipantBackendIdentity, ParticipantManifest,
     ParticipantTerminalOutcome as ProtocolParticipantTerminalOutcome, QueryAbortRequest,
     QueryControlAttach, QueryControlEndpoint, QueryExecutionId, QueryInitOutcome, QueryInitRequest,
     QueryOptions, QueryStageOutcome, QueryStageRequest, QueryStartOutcome, QueryStartRequest,
@@ -826,7 +826,6 @@ fn init_request_fixture_for_process(
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
         )
         .expect("valid backend identity"),
-        [ParticipantRole::RuntimeFilterService],
         [],
         default_query_options(),
         query_deadline_unix_ms,
@@ -848,7 +847,6 @@ fn fragment_init_request_fixture(query_low: i64, expected: &[UniqueId]) -> Query
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
         )
         .expect("valid backend identity"),
-        [ParticipantRole::FragmentExecutor],
         expected.iter().copied().map(protocol_unique_id),
         default_query_options(),
         10_000,
@@ -873,10 +871,6 @@ fn fragment_runtime_filter_init_request_fixture(
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
         )
         .expect("valid backend identity"),
-        [
-            ParticipantRole::FragmentExecutor,
-            ParticipantRole::RuntimeFilterService,
-        ],
         expected.iter().copied().map(protocol_unique_id),
         default_query_options(),
         10_000,
@@ -2567,20 +2561,10 @@ fn coordinator_abort_immediately_retains_incomplete_drain_proof_for_admitted_par
     assert_eq!(registry.metrics_snapshot().terminal_records_frozen, 1);
 }
 
-#[test]
-fn query_lifecycle_registry_rejects_fragment_executor_without_exact_set() {
-    let runtime = RecordingLocalRuntime::default();
-    let registry = registry_with(runtime.clone(), 8);
-
-    assert_eq!(
-        registry
-            .init_query(fragment_init_request_fixture(76, &[]))
-            .outcome()
-            .expect("validated lifecycle acknowledgement"),
-        QueryInitOutcome::QueryInitRejectedInvalidManifest
-    );
-    assert_eq!(runtime.runtime_filter_install_calls(), 0);
-}
+// A participant that declares no fragment instance and no runtime filter
+// contribution is no longer representable: the Protocol rejects it while the
+// manifest is being built, so admission never sees it. That negative now lives
+// beside the rule, in the participant manifest contract tests.
 
 #[test]
 fn query_lifecycle_attach_distinguishes_duplicate_active_from_terminated() {

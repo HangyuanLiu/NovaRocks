@@ -21,7 +21,7 @@ pub use identity::{
 };
 pub use manifest::{
     ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,
-    ParticipantManifestDigest, ParticipantRole, QueryControlEndpoint, RuntimeFilterContribution,
+    ParticipantManifestDigest, QueryControlEndpoint, RuntimeFilterContribution,
 };
 pub use query_options::QueryOptions;
 pub use scan_range::{FileScanRange, ScanRange, ScanRangeParams};

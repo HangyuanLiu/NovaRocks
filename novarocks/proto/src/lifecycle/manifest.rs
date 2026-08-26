@@ -18,12 +18,6 @@ use novarocks_types::BackendProcessId as DomainBackendProcessId;
 const PARTICIPANT_MANIFEST_V1_DOMAIN: &[u8] =
     b"novarocks.query-lifecycle.participant-manifest.v1\0";
 
-/// The generated role enum is the sole role representation.
-///
-/// It has no cross-field state of its own; `ParticipantManifest::parse`
-/// validates its permitted values and set membership.
-pub use novarocks::QueryParticipantRole as ParticipantRole;
-
 /// Validated generated query-control endpoint.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryControlEndpoint {
@@ -301,7 +295,6 @@ impl ParticipantManifest {
     pub fn new(
         execution_id: QueryExecutionId,
         backend: ParticipantBackendIdentity,
-        roles: impl IntoIterator<Item = ParticipantRole>,
         expected_fragment_instance_ids: impl IntoIterator<Item = common::UniqueId>,
         query_options: QueryOptions,
         query_deadline_unix_ms: u64,
@@ -319,7 +312,6 @@ impl ParticipantManifest {
         Self::parse(novarocks::ParticipantManifest {
             execution_id: Some(encode_query_execution_id(execution_id)),
             backend: Some(backend.as_proto().clone()),
-            participant_roles: roles.into_iter().map(|role| role as i32).collect(),
             expected_fragment_instance_ids: expected_fragment_instance_ids.into_iter().collect(),
             query_options: Some(*query_options.as_proto()),
             query_deadline_unix_ms,
@@ -349,33 +341,6 @@ impl ParticipantManifest {
             )
         })?;
 
-        let mut roles = BTreeSet::new();
-        for (index, role) in raw.participant_roles.iter().copied().enumerate() {
-            let role = parse_role(role).map_err(|error| {
-                prefix_path(
-                    FieldPath::root("participant_manifest")
-                        .field("participant_roles")
-                        .index(index),
-                    error,
-                )
-            })?;
-            if !roles.insert(role) {
-                return Err(ProtocolError::new(
-                    FieldPath::root("participant_manifest")
-                        .field("participant_roles")
-                        .index(index),
-                    ProtocolErrorKind::InvalidValue,
-                    "duplicate participant role",
-                ));
-            }
-        }
-        if roles.is_empty() {
-            return Err(invalid(
-                FieldPath::root("participant_manifest").field("participant_roles"),
-                "participant roles must not be empty",
-            ));
-        }
-
         let mut fragment_ids = BTreeSet::new();
         for (index, fragment_id) in raw
             .expected_fragment_instance_ids
@@ -401,14 +366,6 @@ impl ParticipantManifest {
                 ));
             }
         }
-        if !roles.contains(&ParticipantRole::FragmentExecutor) && !fragment_ids.is_empty() {
-            return Err(ProtocolError::new(
-                FieldPath::root("participant_manifest").field("expected_fragment_instance_ids"),
-                ProtocolErrorKind::InvalidValue,
-                "service-only participant must not declare fragment instances",
-            ));
-        }
-
         let options = raw.query_options.ok_or_else(|| {
             missing(
                 FieldPath::root("participant_manifest").field("query_options"),
@@ -459,11 +416,14 @@ impl ParticipantManifest {
             .clone()
             .map(RuntimeFilterContribution::parse)
             .transpose()?;
-        if runtime_filter.is_some() != roles.contains(&ParticipantRole::RuntimeFilterService) {
+        // A participant must carry work. Fragment execution and the runtime
+        // filter service are the only two forms, and each is read directly
+        // from the payload that carries it.
+        if fragment_ids.is_empty() && runtime_filter.is_none() {
             return Err(ProtocolError::new(
-                FieldPath::root("participant_manifest").field("runtime_filter"),
+                FieldPath::root("participant_manifest"),
                 ProtocolErrorKind::InvalidValue,
-                "runtime filter contribution and participant role must be present together",
+                "participant manifest must declare fragment instances or a runtime filter contribution",
             ));
         }
         if raw.query_deadline_unix_ms == 0 {
@@ -500,15 +460,6 @@ impl ParticipantManifest {
 
     pub fn backend(&self) -> Result<ParticipantBackendIdentity, ProtocolError> {
         required_backend(&self.raw.backend)
-    }
-
-    pub fn roles(&self) -> Result<Vec<ParticipantRole>, ProtocolError> {
-        self.raw
-            .participant_roles
-            .iter()
-            .copied()
-            .map(parse_role)
-            .collect()
     }
 
     pub fn expected_fragment_instance_ids(&self) -> Vec<common::UniqueId> {
@@ -647,19 +598,6 @@ fn required_unique_id(
     })
 }
 
-fn parse_role(raw: i32) -> Result<ParticipantRole, ProtocolError> {
-    match ParticipantRole::try_from(raw) {
-        Ok(role @ (ParticipantRole::FragmentExecutor | ParticipantRole::RuntimeFilterService)) => {
-            Ok(role)
-        }
-        Ok(ParticipantRole::Unspecified) | Err(_) => Err(ProtocolError::new(
-            FieldPath::root("participant_role"),
-            ProtocolErrorKind::InvalidValue,
-            format!("unknown participant role {raw}"),
-        )),
-    }
-}
-
 const fn is_missing_unique_id(id: common::UniqueId) -> bool {
     id.hi == 0 && id.lo == 0
 }
@@ -667,7 +605,7 @@ const fn is_missing_unique_id(id: common::UniqueId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExchangeRouteManifest, ParticipantManifest, ParticipantManifestDigest, ParticipantRole,
+        ExchangeRouteManifest, ParticipantManifest, ParticipantManifestDigest,
         QueryControlEndpoint, RuntimeFilterContribution,
     };
     use crate::ProtocolErrorKind;
@@ -725,7 +663,6 @@ mod tests {
         novarocks::ParticipantManifest {
             execution_id: Some(execution_id()),
             backend: Some(backend()),
-            participant_roles: vec![ParticipantRole::FragmentExecutor as i32],
             expected_fragment_instance_ids: vec![id(11, 12)],
             query_options: Some(novarocks::QueryOptions::default()),
             query_deadline_unix_ms: 1_000,
@@ -742,6 +679,19 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_service_only_participant_carrying_no_fragment_instances() {
+        // A participant that runs no fragment is admissible as long as it
+        // carries a runtime filter contribution. The empty instance list is
+        // the authoritative representation of that shape; nothing declares it.
+        let mut raw = manifest();
+        raw.expected_fragment_instance_ids.clear();
+        raw.runtime_filter = Some(contribution());
+        let parsed = ParticipantManifest::parse(raw).expect("service-only manifest is valid");
+        assert!(parsed.expected_fragment_instance_ids().is_empty());
+        assert!(parsed.runtime_filter().expect("contribution").is_some());
+    }
+
+    #[test]
     fn retains_the_exact_generated_manifest_and_parses_leaves_on_access() {
         let raw = manifest();
         let parsed = ParticipantManifest::parse(raw.clone()).expect("valid manifest");
@@ -752,10 +702,6 @@ mod tests {
             QueryId::new(5, 6)
         );
         assert!(parsed.backend().expect("backend").process_id().is_ok());
-        assert_eq!(
-            parsed.roles().expect("roles"),
-            vec![ParticipantRole::FragmentExecutor]
-        );
         assert_eq!(parsed.expected_fragment_instance_ids(), vec![id(11, 12)]);
         assert_eq!(
             parsed.query_options().expect("options").as_proto(),
@@ -829,18 +775,6 @@ mod tests {
     #[test]
     fn rejects_each_manifest_set_and_cross_field_violation() {
         let mut raw = manifest();
-        raw.participant_roles.clear();
-        assert_invalid(raw, "participant roles must not be empty");
-
-        let mut raw = manifest();
-        raw.participant_roles = vec![99];
-        assert_invalid(raw, "unknown participant role 99");
-
-        let mut raw = manifest();
-        raw.participant_roles = vec![ParticipantRole::FragmentExecutor as i32; 2];
-        assert_invalid(raw, "duplicate participant role");
-
-        let mut raw = manifest();
         raw.expected_fragment_instance_ids = vec![id(11, 12), id(11, 12)];
         assert_invalid(raw, "duplicate fragment instance id");
 
@@ -848,26 +782,14 @@ mod tests {
         raw.expected_fragment_instance_ids = vec![id(0, 0)];
         assert_invalid(raw, "expected fragment instance ids must be nonzero");
 
-        let mut raw = manifest();
-        raw.participant_roles = vec![ParticipantRole::RuntimeFilterService as i32];
-        assert_invalid(
-            raw,
-            "service-only participant must not declare fragment instances",
-        );
-
+        // A participant that carries neither fragment instances nor a runtime
+        // filter contribution has no work, and no longer has a role set that
+        // could have declared any.
         let mut raw = manifest();
         raw.expected_fragment_instance_ids.clear();
-        raw.participant_roles = vec![ParticipantRole::RuntimeFilterService as i32];
         assert_invalid(
             raw,
-            "runtime filter contribution and participant role must be present together",
-        );
-
-        let mut raw = manifest();
-        raw.runtime_filter = Some(contribution());
-        assert_invalid(
-            raw,
-            "runtime filter contribution and participant role must be present together",
+            "participant manifest must declare fragment instances or a runtime filter contribution",
         );
 
         let mut raw = manifest();
@@ -886,15 +808,6 @@ mod tests {
     #[test]
     fn reports_nested_manifest_rejection_paths_with_repeated_indexes() {
         let mut raw = manifest();
-        raw.participant_roles = vec![ParticipantRole::FragmentExecutor as i32, 99];
-        let role_error = ParticipantManifest::parse(raw).expect_err("unknown role");
-        assert_eq!(role_error.kind(), ProtocolErrorKind::InvalidValue);
-        assert_eq!(
-            role_error.path().to_string(),
-            "participant_manifest.participant_roles[1]"
-        );
-
-        let mut raw = manifest();
         raw.exchange_routes[0].sender_count = 0;
         let route_error = ParticipantManifest::parse(raw).expect_err("invalid route");
         assert_eq!(route_error.kind(), ProtocolErrorKind::InvalidValue);
@@ -908,9 +821,6 @@ mod tests {
     fn descriptor_digest_includes_generated_fields_without_a_hand_written_projection() {
         let first = ParticipantManifest::parse(manifest()).expect("valid manifest");
         let mut changed_raw = manifest();
-        changed_raw
-            .participant_roles
-            .push(ParticipantRole::RuntimeFilterService as i32);
         changed_raw.runtime_filter = Some(novarocks::RuntimeFilterContribution {
             lifecycle: Some(
                 novarocks_proto_models::filter::RuntimeFilterQueryLifecycleOptions {
