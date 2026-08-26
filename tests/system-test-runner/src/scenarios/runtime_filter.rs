@@ -16,11 +16,11 @@
 // under the License.
 
 use crate::actors::mysql as mysql_actor;
-use crate::scenario::{Scenario, ScenarioContext};
+use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{
-    QueryExecutionResourceSnapshot, QueryLifecycleStructuredSnapshot,
+    NativeTrustFixture, QueryExecutionResourceSnapshot, QueryLifecycleStructuredSnapshot,
     RuntimeFilterParticipantTerminalDetails, RuntimeFilterParticipantTerminalTelemetry,
     RuntimeFilterParticipantTerminalTelemetryValue, RuntimeFilterTerminalRollup,
     RuntimeFilterTerminalTotals, RuntimeFilterTerminalTotalsTelemetry, ServerHandle,
@@ -44,6 +44,27 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     ]
 }
 
+/// Trust acceptance needs directional evidence from the same native 1FE+3BE
+/// launcher: FE-to-BE lifecycle admission, BE-to-BE Runtime Filter transport,
+/// and the BE-to-FE unary terminal fallback.  Keep this as one scenario per
+/// transport profile so no alternate orchestration owns those assertions.
+pub fn native_trust_directional_scenarios() -> Vec<Box<dyn Scenario>> {
+    vec![
+        Box::new(NativeTrustDirectional {
+            name: "native-trust/directional-plaintext-ip",
+            fixture: NativeTrustFixture::plaintext_ip(),
+        }),
+        Box::new(NativeTrustDirectional {
+            name: "native-trust/directional-automatic-dns",
+            fixture: NativeTrustFixture::automatic_dns(),
+        }),
+        Box::new(NativeTrustDirectional {
+            name: "native-trust/directional-pem-ip",
+            fixture: NativeTrustFixture::pem_ip(),
+        }),
+    ]
+}
+
 struct AcceptedAfterAckDrop;
 
 impl Scenario for AcceptedAfterAckDrop {
@@ -52,51 +73,7 @@ impl Scenario for AcceptedAfterAckDrop {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        require_three_backends(context)?;
-        let mut control = connect_control(context, "connect retry scenario control session")?;
-        let tables = create_runtime_filter_tables(context, &mut control, "retry")?;
-        configure_partitioned_runtime_filter(&mut control)?;
-        let before_candidate_execution_id = latest_execution_id(context)?;
-
-        let candidate_rows: Vec<i64> = control
-            .query(runtime_filter_count_query(&tables))
-            .context("execute native partitioned Runtime Filter candidate query")?;
-        ensure!(
-            candidate_rows == [30],
-            "Runtime Filter candidate query returned unexpected rows: {candidate_rows:?}"
-        );
-        let candidate_snapshot =
-            await_terminal_snapshot(context, before_candidate_execution_id.as_deref())?;
-        assert_remote_contribution_candidate(&candidate_snapshot)?;
-        context.action(
-            "typed terminal oracle verified a multi-backend Runtime Filter contribution candidate",
-        );
-        let before_execution_id = candidate_snapshot.execution_id.clone();
-
-        arm_target_backend(context, "runtime-filter-contribution-ack-drop")?;
-        context.action(
-            "armed an Accepted-after-ACK-drop Runtime Filter fault for the targeted native backend",
-        );
-
-        let rows: Vec<i64> = control
-            .query(runtime_filter_count_query(&tables))
-            .context("execute native partitioned Runtime Filter query with ACK-drop fault")?;
-        ensure!(
-            rows == [30],
-            "Runtime Filter retry query returned unexpected rows: {rows:?}"
-        );
-        context.action("completed the partitioned Runtime Filter query with expected row count");
-
-        let snapshot = await_terminal_snapshot(context, before_execution_id.as_deref())?;
-        assert_retry_duplicate_conformance(&snapshot)?;
-        context.action(
-            "typed terminal oracle proved a retried sender route and receiver-side duplicate",
-        );
-        context
-            .handle()
-            .clear_query_lifecycle_faults()
-            .context("clear Runtime Filter ACK-drop fault tokens")?;
-        Ok(())
+        run_accepted_after_ack_drop(context)
     }
 }
 
@@ -108,65 +85,146 @@ impl Scenario for CancelWithTerminalAckReplay {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        require_three_backends(context)?;
-        let mut control =
-            connect_control(context, "connect cancellation scenario control session")?;
-        let tables = create_runtime_filter_tables(context, &mut control, "cancel")?;
-        configure_broadcast_runtime_filter(&mut control)?;
-        let baseline = resource_snapshot(context)?;
-        let before_execution_id = latest_execution_id(context)?;
+        run_cancel_with_terminal_ack_replay(context)
+    }
+}
 
-        context
-            .handle()
-            .arm_terminal_ack_drop(0)
-            .context("arm terminal ACK drop for the targeted backend")?;
-        context.action("armed a terminal ACK-drop replay fault for the targeted native backend");
+struct NativeTrustDirectional {
+    name: &'static str,
+    fixture: NativeTrustFixture,
+}
 
-        let target = start_blocking_runtime_filter_query(
-            context.mysql_user(),
-            context.mysql_port(),
-            context.remaining("connect blocking Runtime Filter query actor")?,
-            runtime_filter_blocking_query(&tables),
-        )?;
-        let connection_id = target
-            .ready
-            .recv_timeout(context.remaining("receive Runtime Filter query connection id")?)
-            .context("Runtime Filter query terminated before publishing its connection id")?;
-        context.action("started an in-flight native Runtime Filter query through public MySQL");
-        await_runtime_filter_activity(context, &baseline)?;
-        context.action(
-            "observed active Runtime Filter services, all participant ControlReady events, and an admitted native fragment through the typed resource oracle",
-        );
+impl Scenario for NativeTrustDirectional {
+    fn name(&self) -> &'static str {
+        self.name
+    }
 
-        control
-            .query_drop(format!("KILL QUERY {connection_id}"))
-            .context("cancel Runtime Filter query through public MySQL KILL QUERY")?;
-        assert_cancelled_query(
-            &target.done,
-            context.remaining("await Runtime Filter query cancellation")?,
-        )?;
-        target
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("Runtime Filter query actor panicked"))??;
-        context.action("cancelled the active Runtime Filter query through public MySQL");
+    fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        Ok(ScenarioLaunchConfig {
+            native_trust_fixture: self.fixture.clone(),
+            ..Default::default()
+        })
+    }
 
-        let snapshot = await_terminal_snapshot(context, before_execution_id.as_deref())?;
-        assert_cancelled_replay_conformance(&snapshot)?;
-        context.action(
-            "typed terminal oracle proved replay retained one complete, non-duplicated Runtime Filter view",
-        );
-        context
-            .handle()
-            .clear_query_lifecycle_faults()
-            .context("clear terminal ACK-drop replay fault tokens")?;
-        let deadline = context.deadline();
-        context
-            .handle()
-            .await_query_execution_resource_convergence(&baseline, true, deadline)
-            .context("await resource convergence after Runtime Filter cancellation")?;
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_accepted_after_ack_drop(context)?;
+        run_cancel_with_terminal_ack_replay(context)?;
+        context.action("proved FE-to-BE lifecycle admission, BE-to-BE Runtime Filter transport, and BE-to-FE terminal fallback using the same 1FE+3BE Native trust profile");
         Ok(())
     }
+}
+
+fn run_accepted_after_ack_drop(context: &mut ScenarioContext) -> Result<()> {
+    require_three_backends(context)?;
+    let mut control = connect_control(context, "connect retry scenario control session")?;
+    let tables = create_runtime_filter_tables(context, &mut control, "retry")?;
+    configure_partitioned_runtime_filter(&mut control)?;
+    let before_candidate_execution_id = latest_execution_id(context)?;
+
+    let candidate_rows: Vec<i64> = control
+        .query(runtime_filter_count_query(&tables))
+        .context("execute native partitioned Runtime Filter candidate query")?;
+    ensure!(
+        candidate_rows == [30],
+        "Runtime Filter candidate query returned unexpected rows: {candidate_rows:?}"
+    );
+    let candidate_snapshot =
+        await_terminal_snapshot(context, before_candidate_execution_id.as_deref())?;
+    assert_remote_contribution_candidate(&candidate_snapshot)?;
+    context.action(
+        "typed terminal oracle verified a multi-backend Runtime Filter contribution candidate",
+    );
+    let before_execution_id = candidate_snapshot.execution_id.clone();
+
+    arm_target_backend(context, "runtime-filter-contribution-ack-drop")?;
+    context.action(
+        "armed an Accepted-after-ACK-drop Runtime Filter fault for the targeted native backend",
+    );
+
+    let rows: Vec<i64> = control
+        .query(runtime_filter_count_query(&tables))
+        .context("execute native partitioned Runtime Filter query with ACK-drop fault")?;
+    ensure!(
+        rows == [30],
+        "Runtime Filter retry query returned unexpected rows: {rows:?}"
+    );
+    context.action("completed the partitioned Runtime Filter query with expected row count");
+
+    let snapshot = await_terminal_snapshot(context, before_execution_id.as_deref())?;
+    assert_retry_duplicate_conformance(&snapshot)?;
+    context
+        .action("typed terminal oracle proved a retried sender route and receiver-side duplicate");
+    context
+        .handle()
+        .clear_query_lifecycle_faults()
+        .context("clear Runtime Filter ACK-drop fault tokens")?;
+    Ok(())
+}
+
+fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<()> {
+    require_three_backends(context)?;
+    let mut control = connect_control(context, "connect cancellation scenario control session")?;
+    let tables = create_runtime_filter_tables(context, &mut control, "cancel")?;
+    configure_broadcast_runtime_filter(&mut control)?;
+    let baseline = resource_snapshot(context)?;
+    let before_execution_id = latest_execution_id(context)?;
+    let fallback_before = context
+        .handle()
+        .backend_terminal_fallback_accepted(0)
+        .context("read terminal fallback baseline for BE[0]")?;
+
+    context
+        .handle()
+        .arm_terminal_ack_drop(0)
+        .context("arm terminal ACK drop for the targeted backend")?;
+    context.action("armed a terminal ACK-drop replay fault for the targeted native backend");
+
+    let target = start_blocking_runtime_filter_query(
+        context.mysql_user(),
+        context.mysql_port(),
+        context.remaining("connect blocking Runtime Filter query actor")?,
+        runtime_filter_blocking_query(&tables),
+    )?;
+    let connection_id = target
+        .ready
+        .recv_timeout(context.remaining("receive Runtime Filter query connection id")?)
+        .context("Runtime Filter query terminated before publishing its connection id")?;
+    context.action("started an in-flight native Runtime Filter query through public MySQL");
+    await_runtime_filter_activity(context, &baseline)?;
+    context.action(
+        "observed active Runtime Filter services, all participant ControlReady events, and an admitted native fragment through the typed resource oracle",
+    );
+
+    control
+        .query_drop(format!("KILL QUERY {connection_id}"))
+        .context("cancel Runtime Filter query through public MySQL KILL QUERY")?;
+    assert_cancelled_query(
+        &target.done,
+        context.remaining("await Runtime Filter query cancellation")?,
+    )?;
+    target
+        .thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("Runtime Filter query actor panicked"))??;
+    context.action("cancelled the active Runtime Filter query through public MySQL");
+
+    let snapshot = await_terminal_snapshot(context, before_execution_id.as_deref())?;
+    assert_cancelled_replay_conformance(&snapshot)?;
+    context.action(
+        "typed terminal oracle proved replay retained one complete, non-duplicated Runtime Filter view",
+    );
+    await_terminal_fallback_accepted(context, 0, fallback_before)?;
+    context.action("observed BE[0] terminal fallback acceptance counter advance after the dropped terminal ACK");
+    context
+        .handle()
+        .clear_query_lifecycle_faults()
+        .context("clear terminal ACK-drop replay fault tokens")?;
+    let deadline = context.deadline();
+    context
+        .handle()
+        .await_query_execution_resource_convergence(&baseline, true, deadline)
+        .context("await resource convergence after Runtime Filter cancellation")?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -353,6 +411,24 @@ fn resource_snapshot(context: &mut ScenarioContext) -> Result<QueryExecutionReso
         .handle()
         .query_execution_resource_snapshot()?
         .context("cross-process Runtime Filter scenario requires resource oracle")
+}
+
+fn await_terminal_fallback_accepted(
+    context: &mut ScenarioContext,
+    backend: usize,
+    before: f64,
+) -> Result<()> {
+    loop {
+        let current = context
+            .handle()
+            .backend_terminal_fallback_accepted(backend)
+            .with_context(|| format!("read terminal fallback count from BE[{backend}]"))?;
+        if current >= before + 1.0 {
+            return Ok(());
+        }
+        let remaining = context.remaining("await BE-to-FE terminal fallback acceptance")?;
+        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
+    }
 }
 
 fn await_runtime_filter_activity(

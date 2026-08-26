@@ -26,7 +26,11 @@ anyhow = "1"
 mysql = "25.0.1"
 novarocks-test-support = { path = "../test-support" }
 novarocks-failpoint = { path = "../../novarocks/failpoint", default-features = false }
+novarocks-native-trust = { path = "../../novarocks/native-trust" }
+novarocks-secret = { path = "../../novarocks/secret" }
+novarocks-types = { path = "../../novarocks/types" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "http2", "json", "rustls-tls"] }
+rcgen = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

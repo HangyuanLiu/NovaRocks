@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use novarocks_cluster_harness::{
-    CrossProcessChildEnvironment, CrossProcessConfigOverlay, CrossProcessServerHandle, ServerHandle,
+    CrossProcessChildEnvironment, CrossProcessConfigOverlay, CrossProcessServerHandle,
+    NativeTrustFixture, ServerHandle,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -26,6 +27,7 @@ pub trait Scenario: Send + Sync {
 pub struct ScenarioLaunchConfig {
     pub child_environment: CrossProcessChildEnvironment,
     pub config_overlay: CrossProcessConfigOverlay,
+    pub native_trust_fixture: NativeTrustFixture,
     pub initial_backend_seeds: Option<Vec<usize>>,
 }
 

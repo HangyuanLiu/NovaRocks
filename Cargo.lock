@@ -3190,7 +3190,11 @@ dependencies = [
  "anyhow",
  "mysql",
  "novarocks-failpoint",
+ "novarocks-native-trust",
+ "novarocks-secret",
  "novarocks-test-support",
+ "novarocks-types",
+ "rcgen",
  "reqwest",
  "serde",
  "serde_json",
@@ -3569,10 +3573,17 @@ name = "novarocks-system-test-runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
+ "h2",
+ "http",
  "mysql",
  "novarocks-cluster-harness",
  "novarocks-connector-iceberg",
+ "novarocks-native-trust",
+ "novarocks-secret",
+ "novarocks-types",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
