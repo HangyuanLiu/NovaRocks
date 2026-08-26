@@ -4571,7 +4571,7 @@ mod tests {
     fn operation_marker_accepts_materialized_view_refresh_family() {
         let (_executor, control) = control();
         let owner = control.binding_key().clone();
-        let operation_id = ConnectorWriteOperationId::from_bytes([32; 16]);
+        let operation_id = ConnectorWriteOperationId::new();
         let mut request = activation_request(&owner, operation_id, 1);
         request.intent = ConnectorWriteActivationIntent::Publication(
             LakePublicationFamily::MaterializedViewRefresh,
