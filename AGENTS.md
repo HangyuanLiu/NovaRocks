@@ -373,6 +373,15 @@ SQL client
   `host`, `priority_networks`, `http_port`, `grpc_port`, and native advertise
   identity.
 
+- `[native_trust]`
+  Required in each deployable FE/BE config: a common `deployment_id` and
+  Server-resolved `shared_secret`. Every Native RPC requires its deployment
+  JWT. An absent `[native_trust.transport]` deliberately means authenticated
+  plaintext h2c; `automatic` and `pem` add optional TLS 1.3/h2 without
+  removing JWT. This does not protect MySQL or management HTTP. Read
+  `docs/guides/deployment/native-trust.md` and ADR-0110 before changing this
+  boundary; NWT-4 protocol slimming remains separate follow-up work.
+
 - `[runtime]`
   `exchange_wait_ms`, `exchange_io_threads`, `exchange_io_max_inflight_bytes`,
   `pipeline_scan_thread_pool_thread_num`, `pipeline_exec_thread_pool_thread_num`, `cache.*`

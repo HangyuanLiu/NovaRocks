@@ -215,6 +215,10 @@ spark_image="${SPARK_ICEBERG_IMAGE:-$default_spark_image}"
 spark_build_context="$SCRIPT_DIR/spark"
 spark_version="$configured_spark_version"
 iceberg_version="$configured_iceberg_version"
+# This ignored, generated test-only secret is stable for one worktree so the
+# fixture remains restartable. It is never a production credential and both
+# role configs still use the Server-owned exact ENV reference.
+native_trust_secret="local-native-trust-fixture-${hash}-${hash}"
 
 spark_image_dockerfile_sha() {
   # Content hash of the inputs that determine the built Spark image (Dockerfile
@@ -367,6 +371,10 @@ NOVA_ENV_ICEBERG_VERSION=$iceberg_version
 EOF
 
 cat > "$runtime_dir/fe.toml" <<EOF
+[native_trust]
+deployment_id = "$env_id"
+shared_secret = "\${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
+
 [server]
 host = "127.0.0.1"
 http_port = $fe_http_port
@@ -407,6 +415,10 @@ enable_path_style_access = true
 EOF
 
 cat > "$runtime_dir/be.toml" <<EOF
+[native_trust]
+deployment_id = "$env_id"
+shared_secret = "\${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
+
 [server]
 host = "127.0.0.1"
 http_port = $be_http_port
@@ -548,6 +560,7 @@ export NOVA_ENV_FE_GRPC_PORT="$fe_grpc_port"
 export NOVA_ENV_FE_HTTP_PORT="$fe_http_port"
 export NOVA_ENV_BE_GRPC_PORT="$be_grpc_port"
 export NOVA_ENV_BE_HTTP_PORT="$be_http_port"
+export NOVAROCKS_NATIVE_SHARED_SECRET="$native_trust_secret"
 export AWS_S3_ENDPOINT="$minio_endpoint"
 export AWS_S3_ACCESS_KEY_ID="$minio_user"
 export AWS_S3_SECRET_ACCESS_KEY="$minio_password"
@@ -616,6 +629,7 @@ cat > "$manifest_file" <<EOF
     "fe_http_port": $fe_http_port,
     "be_grpc_port": $be_grpc_port,
     "be_http_port": $be_http_port,
+    "native_trust_deployment_id": "$env_id",
     "fe_config": "$runtime_dir/fe.toml",
     "be_config": "$runtime_dir/be.toml",
     "state_store_path": "$runtime_dir/frontend-state.sqlite",
