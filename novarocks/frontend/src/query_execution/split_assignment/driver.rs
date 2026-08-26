@@ -28,7 +28,11 @@ use std::fmt;
 use novarocks_proto::lifecycle::QueryExecutionId;
 use novarocks_types::UniqueId;
 
-use super::super::connector_domain::{PlanNodeAssignmentState, Split, SplitAssignmentError};
+use novarocks_proto::connector_read::{TypedConnectorSplitSource, WireDynamicFilterSnapshot};
+
+use super::super::connector_domain::{
+    CatalogHandle, PlanNodeAssignmentState, Split, SplitAssignmentError,
+};
 use super::transport::{TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError};
 
 /// Largest number of splits one update may carry, matching the wire bound.
@@ -61,6 +65,14 @@ pub(crate) enum SplitAssignmentDriverError {
         reason: String,
         detail: String,
     },
+    /// The connector's own enumeration failed. It is never retried blindly:
+    /// re-enumerating could produce a different split set for the same pinned
+    /// snapshot only if something is wrong, and silently continuing would drop
+    /// work.
+    SplitSource {
+        plan_node_id: i32,
+        detail: String,
+    },
 }
 
 impl fmt::Display for SplitAssignmentDriverError {
@@ -85,6 +97,13 @@ impl fmt::Display for SplitAssignmentDriverError {
                 formatter,
                 "backend {} rejected a task update ({reason}): {detail}",
                 target.backend_idx
+            ),
+            Self::SplitSource {
+                plan_node_id,
+                detail,
+            } => write!(
+                formatter,
+                "split enumeration for plan node {plan_node_id} failed: {detail}"
             ),
         }
     }
@@ -134,6 +153,8 @@ struct TaskState {
 /// The coordinator-side driver for one execution round.
 pub(crate) struct SplitAssignmentDriver {
     execution_id: QueryExecutionId,
+    /// The catalog generation every split of this round belongs to.
+    catalog: CatalogHandle,
     transport: std::sync::Arc<dyn TaskUpdateTransport>,
     /// Admitted tasks per plan node, frozen before the Init barrier.
     tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
@@ -149,6 +170,7 @@ pub(crate) struct SplitAssignmentDriver {
 impl SplitAssignmentDriver {
     pub(crate) fn new(
         execution_id: QueryExecutionId,
+        catalog: CatalogHandle,
         transport: std::sync::Arc<dyn TaskUpdateTransport>,
         tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
         max_queued_splits_per_task: u64,
@@ -173,6 +195,7 @@ impl SplitAssignmentDriver {
             .collect();
         Self {
             execution_id,
+            catalog,
             transport,
             tasks,
             sequences,
@@ -335,6 +358,64 @@ impl SplitAssignmentDriver {
         Ok(())
     }
 
+    /// Drive one split source to exhaustion for one plan node.
+    ///
+    /// At most one batch request is outstanding at a time, and the driver stops
+    /// pulling while every admitted task is at its queue ceiling. An empty
+    /// batch means "nothing right now" and is retried, never treated as the end
+    /// of enumeration.
+    pub(crate) fn pump(
+        &mut self,
+        plan_node_id: i32,
+        source: &mut dyn TypedConnectorSplitSource,
+        batch_size: usize,
+    ) -> Result<(), SplitAssignmentDriverError> {
+        let batch_size = batch_size.clamp(1, MAX_SPLITS_PER_UPDATE);
+        // The frontend produces no runtime feedback today, so the snapshot it
+        // offers is honestly unconstrained and final rather than a fabricated
+        // pending filter.
+        let snapshot = WireDynamicFilterSnapshot::all_complete();
+        loop {
+            if self.closed {
+                return Err(SplitAssignmentDriverError::Closed);
+            }
+            if self.is_backpressured(plan_node_id) {
+                // Every task is saturated. Returning lets the caller retry
+                // after an acknowledgement rather than spinning here.
+                return Ok(());
+            }
+            let batch = source.next_batch(batch_size, &snapshot).map_err(|error| {
+                SplitAssignmentDriverError::SplitSource {
+                    plan_node_id,
+                    detail: error.to_string(),
+                }
+            })?;
+            let no_more_splits = batch.no_more_splits();
+            let splits = batch
+                .into_splits()
+                .into_iter()
+                .map(|split| Split::new(self.catalog_for(plan_node_id), split))
+                .collect::<Vec<_>>();
+            let has_work = !splits.is_empty();
+            if has_work || no_more_splits {
+                let placement = self.distribute(plan_node_id, splits)?;
+                self.send(plan_node_id, placement, no_more_splits)?;
+            }
+            if no_more_splits {
+                return Ok(());
+            }
+            if !has_work {
+                // Nothing right now and the source has not finished: hand
+                // control back so the caller can decide whether to wait.
+                return Ok(());
+            }
+        }
+    }
+
+    fn catalog_for(&self, _plan_node_id: i32) -> CatalogHandle {
+        self.catalog.clone()
+    }
+
     /// Close the round.
     ///
     /// Idempotent, and after it no assignment may be produced or sent. A
@@ -355,6 +436,8 @@ mod tests {
     use novarocks_proto::FieldPath;
     use novarocks_proto::connector_read::ValidatedConnectorSplit;
     use novarocks_proto_models::connector_read as dto;
+    use novarocks_spi::connector::read_stack::ConnectorSplitBatch;
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
     use novarocks_types::{AttemptId, QueryId};
 
     use super::super::super::connector_domain::CatalogHandle;
@@ -411,7 +494,7 @@ mod tests {
             .expect("execution id")
     }
 
-    fn split(weight_raw: u64) -> Split {
+    fn validated_split(weight_raw: u64) -> ValidatedConnectorSplit {
         let raw = dto::ConnectorSplit {
             split_weight_raw: weight_raw,
             remotely_accessible: true,
@@ -439,11 +522,50 @@ mod tests {
                 })),
             })),
         };
+        ValidatedConnectorSplit::parse(raw, FieldPath::root("connector_split"))
+            .expect("valid split")
+    }
+
+    fn split(weight_raw: u64) -> Split {
         Split::new(
             CatalogHandle::new("ice", [1; 16]),
-            ValidatedConnectorSplit::parse(raw, FieldPath::root("connector_split"))
-                .expect("valid split"),
+            validated_split(weight_raw),
         )
+    }
+
+    /// A source that hands out pre-programmed batches in order.
+    struct ScriptedSource {
+        batches: std::collections::VecDeque<ConnectorSplitBatch<ValidatedConnectorSplit>>,
+        fail: bool,
+        closed: usize,
+    }
+
+    impl TypedConnectorSplitSource for ScriptedSource {
+        fn next_batch(
+            &mut self,
+            _max_size: usize,
+            _dynamic_filter: &WireDynamicFilterSnapshot,
+        ) -> Result<ConnectorSplitBatch<ValidatedConnectorSplit>, ConnectorError> {
+            if self.fail {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    "manifest read failed",
+                ));
+            }
+            Ok(self
+                .batches
+                .pop_front()
+                .unwrap_or_else(ConnectorSplitBatch::finished))
+        }
+
+        fn is_finished(&self) -> bool {
+            self.batches.is_empty()
+        }
+
+        fn close(&mut self) -> Result<(), ConnectorError> {
+            self.closed += 1;
+            Ok(())
+        }
     }
 
     fn target(backend_idx: usize) -> AssignmentTarget {
@@ -456,7 +578,13 @@ mod tests {
     fn new_driver(transport: Arc<RecordingTransport>, backends: usize) -> SplitAssignmentDriver {
         let mut tasks = BTreeMap::new();
         tasks.insert(7_i32, (0..backends).map(target).collect::<Vec<_>>());
-        SplitAssignmentDriver::new(execution_id(), transport, tasks, 1024)
+        SplitAssignmentDriver::new(
+            execution_id(),
+            CatalogHandle::new("ice", [1; 16]),
+            transport,
+            tasks,
+            1024,
+        )
     }
 
     #[test]
@@ -587,5 +715,83 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(sequences, vec![0, 1]);
+    }
+
+    #[test]
+    fn pump_drains_a_source_and_delivers_the_terminal_marker() {
+        let transport = Arc::new(RecordingTransport::default());
+        let mut driver = new_driver(Arc::clone(&transport), 2);
+        let mut source = ScriptedSource {
+            batches: [
+                ConnectorSplitBatch::new(vec![validated_split(100), validated_split(100)], false),
+                ConnectorSplitBatch::new(vec![validated_split(100)], true),
+            ]
+            .into_iter()
+            .collect(),
+            fail: false,
+            closed: 0,
+        };
+        driver.pump(7, &mut source, 16).expect("pump");
+        let sent = transport.sent.lock().expect("transport lock");
+        let total_splits: usize = sent
+            .iter()
+            .map(|(_, assignments)| assignments[0].splits.len())
+            .sum();
+        assert_eq!(total_splits, 3);
+        assert!(
+            sent.iter()
+                .filter(|(_, assignments)| assignments[0].no_more_splits)
+                .count()
+                >= 1
+        );
+    }
+
+    #[test]
+    fn an_empty_batch_yields_without_ending_enumeration() {
+        let transport = Arc::new(RecordingTransport::default());
+        let mut driver = new_driver(Arc::clone(&transport), 1);
+        let mut source = ScriptedSource {
+            batches: [ConnectorSplitBatch::empty()].into_iter().collect(),
+            fail: false,
+            closed: 0,
+        };
+        driver.pump(7, &mut source, 16).expect("pump");
+        assert!(transport.sent.lock().expect("transport lock").is_empty());
+        assert!(!driver.is_closed());
+    }
+
+    #[test]
+    fn a_source_failure_surfaces_typed_and_sends_nothing() {
+        let transport = Arc::new(RecordingTransport::default());
+        let mut driver = new_driver(Arc::clone(&transport), 1);
+        let mut source = ScriptedSource {
+            batches: std::collections::VecDeque::new(),
+            fail: true,
+            closed: 0,
+        };
+        assert!(matches!(
+            driver.pump(7, &mut source, 16).expect_err("source failure"),
+            SplitAssignmentDriverError::SplitSource {
+                plan_node_id: 7,
+                ..
+            }
+        ));
+        assert!(transport.sent.lock().expect("transport lock").is_empty());
+    }
+
+    #[test]
+    fn a_closed_driver_refuses_to_pump() {
+        let transport = Arc::new(RecordingTransport::default());
+        let mut driver = new_driver(transport, 1);
+        driver.close();
+        let mut source = ScriptedSource {
+            batches: std::collections::VecDeque::new(),
+            fail: false,
+            closed: 0,
+        };
+        assert_eq!(
+            driver.pump(7, &mut source, 16).expect_err("closed"),
+            SplitAssignmentDriverError::Closed
+        );
     }
 }
