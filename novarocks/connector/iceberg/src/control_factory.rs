@@ -219,6 +219,25 @@ impl IcebergUnpublishedControl {
         &self.runtime
     }
 
+    /// Mint the coordinator-side typed boundary for this control generation.
+    ///
+    /// The runtime handle stays crate-private: the composition root gets a
+    /// ready boundary rather than the runtime it is built from, so nothing
+    /// outside this crate can assemble a second control path over it.
+    pub fn typed_boundary(
+        &self,
+        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+        incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation,
+        transaction: crate::typed_read::table_handle::HiveTransactionHandle,
+    ) -> crate::typed_boundary::IcebergTypedBoundary {
+        crate::typed_boundary::IcebergTypedBoundary::new(
+            descriptor,
+            incarnation,
+            transaction,
+            Arc::clone(self.runtime()),
+        )
+    }
+
     pub fn durable_properties(&self) -> &[(String, String)] {
         &self.durable_properties
     }
