@@ -1,10 +1,11 @@
 # ADR-0038：Frontend 为何拥有 MV background worker lifecycle 与 per-target activity gate
 
-- Status: accepted
+- Status: superseded
 - Date: 2026-08-03
 - Decision Makers: NovaRocks maintainers
 - Tags: frontend, materialized-view, lifecycle, table-maintenance
 - Related: ADR-0009, ADR-0036, ADR-0037
+- Superseded-by: ADR-0112
 - Provenance: discussion: 2026-08-03 frontend MV background lifecycle
 
 ## 背景与问题

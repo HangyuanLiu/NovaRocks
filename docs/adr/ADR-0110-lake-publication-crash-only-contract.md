@@ -1,5 +1,5 @@
 ---
-id: ADR-0104
+id: ADR-0110
 title: "Lake publication uses crash-only outcomes, target OCC, and age-gated garbage collection"
 domain: [provider-spi, frontend-dml, frontend-mv, table-maintenance]
 status: active

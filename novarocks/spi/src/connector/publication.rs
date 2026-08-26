@@ -16,7 +16,7 @@
 // under the License.
 
 //! Provider-neutral identity and diagnostic vocabulary for one lake publication.
-// Design: ADR-0104 (docs/adr/ADR-0104-lake-publication-crash-only-contract.md)
+// Design: ADR-0110 (docs/adr/ADR-0110-lake-publication-crash-only-contract.md)
 
 use std::fmt;
 use std::str::FromStr;

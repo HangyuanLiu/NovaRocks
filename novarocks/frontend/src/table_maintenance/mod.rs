@@ -67,7 +67,7 @@ enum WorkerLifecycle {
     Stopped(Result<(), String>),
 }
 
-// Design: ADR-0109 (docs/adr/ADR-0109-frontend-process-runtime-jobs-and-gc-observation-accelerator.md)
+// Design: ADR-0111 (docs/adr/ADR-0111-frontend-process-runtime-jobs-and-gc-observation-accelerator.md)
 pub struct FrontendTableMaintenanceService {
     optimize_runtime: Arc<OptimizeProcessRuntime>,
     activity: TableMaintenanceActivity,

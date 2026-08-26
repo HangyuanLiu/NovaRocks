@@ -4,7 +4,7 @@ title: "External MV publication fencing at the lake commit point"
 domain: [frontend-mv, provider-spi]
 status: superseded
 supersedes: []
-superseded-by: ADR-0104
+superseded-by: ADR-0110
 date: 2026-08-13
 provenance:
   - "discussion: 2026-08-10 MV refresh active-active recalibration"
