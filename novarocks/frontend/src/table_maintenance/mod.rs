@@ -21,17 +21,18 @@
 //! survives a frontend restart. The sole durable exception is the separately
 //! named GC first-observation accelerator; it never owns a catalog mutation.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use novarocks_spi::connector::{
     ConnectorCleanupCandidate, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
+    ConnectorWriteOperationId, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use novarocks_spi::state_store::StateStore;
 use tokio::runtime::Handle;
 
+use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
@@ -379,14 +380,105 @@ impl OptimizeJobExecutor for DirectOptimizeExecutor {
         engine: &dyn TableMaintenanceEngine,
         job: &model::OptimizeJob,
     ) -> Result<MaintenanceActionOutcome, String> {
-        engine.execute_action(MaintenanceActionRequest::RewriteDataFiles {
-            target: job.target.clone(),
-            base_snapshot_id: job.base_snapshot_id,
-            job_id: Some(job.job_id),
-            options: BTreeMap::new(),
-            branch: None,
-            where_clause: None,
-        })
+        execute_distributed_optimize(engine, &job.target)
+    }
+}
+
+/// Execute one current-process OPTIMIZE job through the frontend-owned native
+/// distributed rewrite path. The process runtime deliberately retains no
+/// recovery record, but a single attempt must still finish or abort its exact
+/// frozen connector session before the worker reports a terminal job state.
+fn execute_distributed_optimize(
+    engine: &dyn TableMaintenanceEngine,
+    target: &MaintenanceTarget,
+) -> Result<MaintenanceActionOutcome, String> {
+    let session = engine.plan_distributed_rewrite(
+        target,
+        ConnectorWriteOperationId::new(),
+        DistributedRewriteIntent::DataFiles { rewrite_all: true },
+    )?;
+    let plan = session.plan();
+    if session.is_noop() {
+        return Ok(MaintenanceActionOutcome::RewriteDataFiles {
+            target_snapshot_id: None,
+            rewritten_data_files_count: 0,
+            added_data_files_count: 0,
+            rewritten_bytes_count: 0,
+            failed_data_files_count: 0,
+            removed_delete_files_count: 0,
+            output_record_count: 0,
+        });
+    }
+
+    for cohort in plan.cohorts() {
+        let completion = engine
+            .prepare_distributed_rewrite_cohort(&session, cohort.cohort_id())
+            .and_then(|prepared| {
+                crate::native::fragment_encoder::encode_native_fragment_bundle(
+                    prepared.encoding().encoding_view(),
+                )
+                .map_err(|error| format!("encode distributed rewrite fragments: {error}"))
+                .and_then(|bundle| prepared.finish(bundle))
+            });
+        let completion = match completion {
+            Ok(completion) => completion,
+            Err(error) => return abort_distributed_optimize(engine, &session, error),
+        };
+        if let Err(error) = engine.checkpoint_distributed_rewrite_attempt(&session, &completion) {
+            return abort_distributed_optimize(engine, &session, error);
+        }
+    }
+
+    match engine.commit_distributed_rewrite(&session)? {
+        ExternalMutationOutcome::KnownCommitted {
+            receipt,
+            finalization,
+            ..
+        } => {
+            let receipt = engine.finalize_distributed_rewrite(&session, &receipt)?;
+            if let ExternalMutationFinalization::Failed(error) = finalization {
+                return Err(format!(
+                    "distributed optimize committed but finalization failed: {error}"
+                ));
+            }
+            let summary = receipt.summary();
+            let plan_summary = plan.summary();
+            Ok(MaintenanceActionOutcome::RewriteDataFiles {
+                target_snapshot_id: summary.target_version,
+                rewritten_data_files_count: i32::try_from(summary.input_data_files)
+                    .map_err(|_| "distributed optimize input data file count exceeds i32")?,
+                added_data_files_count: i32::try_from(summary.output_data_files)
+                    .map_err(|_| "distributed optimize output data file count exceeds i32")?,
+                rewritten_bytes_count: i64::try_from(plan_summary.input_bytes)
+                    .map_err(|_| "distributed optimize input byte count exceeds i64")?,
+                failed_data_files_count: 0,
+                removed_delete_files_count: i32::try_from(summary.input_delete_files)
+                    .map_err(|_| "distributed optimize input delete file count exceeds i32")?,
+                output_record_count: i64::try_from(summary.output_rows)
+                    .map_err(|_| "distributed optimize output row count exceeds i64")?,
+            })
+        }
+        ExternalMutationOutcome::KnownUncommitted { failure } => abort_distributed_optimize(
+            engine,
+            &session,
+            format!("distributed optimize commit was not applied: {failure}"),
+        ),
+        ExternalMutationOutcome::CommitUnknown { failure, .. } => Err(format!(
+            "distributed optimize commit outcome is unknown: {failure}; do not retry automatically"
+        )),
+    }
+}
+
+fn abort_distributed_optimize(
+    engine: &dyn TableMaintenanceEngine,
+    session: &crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession,
+    error: String,
+) -> Result<MaintenanceActionOutcome, String> {
+    match engine.abort_distributed_rewrite(session) {
+        Ok(_) => Err(error),
+        Err(abort) => Err(format!(
+            "{error}; distributed optimize abort failed: {abort}"
+        )),
     }
 }
 
