@@ -60,7 +60,7 @@ pub trait CatalogDropContext:
     + crate::catalog_application::query_catalog::CatalogServiceSource
 {
     fn connector_control(&self) -> &dyn ConnectorControlRegistry;
-    fn mv_repository(&self) -> &dyn crate::mv::domain::repository::MvRepository;
+    fn mv_readiness(&self) -> &crate::mv::domain::readiness::MvReadinessPort;
     fn mv_storage_observation(&self) -> &dyn novarocks_spi::connector::MvStorageObservationPort;
 }
 
@@ -882,8 +882,8 @@ pub(crate) fn execute_drop_table_statement(
         Err(err) => return Err(err),
     }
     context
-        .mv_repository()
-        .ensure_no_downstream_dependencies(&dependency_ref)
+        .mv_readiness()
+        .ensure_no_ready_downstream_dependencies(&dependency_ref)
         .map_err(|error| error.to_string())?;
     let instance_id = mutation_instance_id(&target.catalog)?;
     match crate::connector::mutation::execute_catalog_mutation(
@@ -990,8 +990,8 @@ fn ensure_no_iceberg_mv_targets_in_scope(
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
     let projections = context
-        .mv_repository()
-        .list_projections()
+        .mv_readiness()
+        .list_ready_projections()
         .map_err(|error| {
             format!("load MV definitions for drop target scope check failed: {error}")
         })?;
@@ -1018,19 +1018,19 @@ fn ensure_no_external_iceberg_dependents(
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
     let projections = context
-        .mv_repository()
-        .list_projections()
+        .mv_readiness()
+        .list_ready_projections()
         .map_err(|error| format!("load MV definitions for drop scope check failed: {error}"))?;
     let mut edges = Vec::with_capacity(projections.len());
     for projection in projections {
-        let definition = projection.definition;
+        let definition = projection.definition.clone();
         let target = crate::mv::domain::persistence::dependency::stored_definition_dependency_ref(
             &definition,
             None,
         )?;
         let upstreams = context
-            .mv_repository()
-            .list_dependencies_by_downstream(definition.mv_id)
+            .mv_readiness()
+            .list_ready_dependencies_by_downstream(&projection)
             .map_err(|error| format!("load MV dependencies for drop scope check failed: {error}"))?
             .into_iter()
             .map(|dependency| dependency.upstream)

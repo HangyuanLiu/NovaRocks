@@ -37,7 +37,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     explain_refresh_full_guard(stmt.full)?;
 
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)?;
-    let mv_definition = load_iceberg_mv_definition_by_target(ports.repository().as_ref(), &target)?;
+    let mv_definition = load_iceberg_mv_definition_by_target(ports.readiness().as_ref(), &target)?;
     let target_binding = load_iceberg_mv_target_binding(
         ports.connector_control(),
         ports.storage_observation(),

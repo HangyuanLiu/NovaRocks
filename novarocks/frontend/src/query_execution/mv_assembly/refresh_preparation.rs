@@ -423,7 +423,7 @@ fn prepare_managed_repartition_transition(
         table: contract.target.name.clone(),
     };
     validate_retained_target_identity(&target, retained_target.binding.identity())?;
-    let definition = load_iceberg_mv_definition_by_target(source.repository().as_ref(), &target)?;
+    let definition = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
     let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
         format!(
             "iceberg MV target {}.{}.{} is missing its schema contract; recreate the MV before repartitioning",
@@ -627,7 +627,7 @@ fn prepare_frontend_first_refresh_write(
             "MV first-refresh target connector generation changed during admission".to_string(),
         );
     }
-    let definition = load_iceberg_mv_definition_by_target(source.repository().as_ref(), &target)?;
+    let definition = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
     let (definition, refresh_query_source) = rebind_mv_definition_before_refresh_derivation(
         source.connector_control(),
         source.storage_observation(),
@@ -1031,7 +1031,7 @@ fn metadata_only_publication_intent(
         namespace: contract.target.database.clone(),
         table: contract.target.name.clone(),
     };
-    let definition = load_iceberg_mv_definition_by_target(source.repository().as_ref(), &target)?;
+    let definition = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
     mv_refresh_publication_intent(
         attempt.publication_id,
         definition.source_revision.target_object_id.clone(),
@@ -1146,7 +1146,7 @@ fn prepare_frontend_incremental_write(
         namespace: contract.target.database.clone(),
         table: contract.target.name.clone(),
     };
-    let definition = load_iceberg_mv_definition_by_target(source.repository().as_ref(), &target)?;
+    let definition = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
     let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
         "Iceberg MV incremental refresh requires a persisted schema contract".to_string()
     })?;

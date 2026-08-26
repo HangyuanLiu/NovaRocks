@@ -220,7 +220,7 @@ pub struct CatalogCommandPorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    mv_repository: Arc<dyn MvRepository>,
+    mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     #[allow(
         dead_code,
@@ -235,7 +235,7 @@ impl CatalogCommandPorts {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        mv_repository: Arc<dyn MvRepository>,
+        mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         view_service: Arc<dyn ViewService>,
     ) -> Self {
@@ -243,7 +243,7 @@ impl CatalogCommandPorts {
             catalog_service,
             catalog_application,
             connector_control,
-            mv_repository,
+            mv_readiness,
             mv_storage_observation,
             view_service,
         }
@@ -257,7 +257,7 @@ pub fn catalog_command_executor(
         ports.catalog_service,
         ports.catalog_application,
         ports.connector_control,
-        ports.mv_repository,
+        ports.mv_readiness,
         ports.mv_storage_observation,
     )
 }
@@ -443,7 +443,6 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
         iceberg_ports,
         ports.create_application,
         ports.refresh_service,
-        Arc::clone(&ports.repository),
         Arc::clone(&ports.storage_observation),
         backend,
     )

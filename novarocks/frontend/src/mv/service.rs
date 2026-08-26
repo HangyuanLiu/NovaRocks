@@ -64,7 +64,6 @@ const MV_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// MVX-1 owns only Iceberg CREATE sequencing. Other MV statement classes
 /// deliberately return `None` so their existing core routes remain active.
 pub struct FrontendMvService {
-    repository: Arc<dyn MvRepository>,
     readiness: Arc<MvReadinessPort>,
     refresh: Option<refresh::FrontendMvRefreshDependencies>,
     activity_gate: MvActivityGate,
@@ -85,7 +84,6 @@ impl FrontendMvService {
         let runtime = Arc::new(ProcessRuntime::default());
         Self {
             readiness: Arc::new(MvReadinessPort::new(Arc::clone(&repository), runtime)),
-            repository,
             refresh: None,
             activity_gate: MvActivityGate::new(),
             background: Mutex::new(None),
@@ -119,7 +117,6 @@ impl FrontendMvService {
         let runtime = Arc::new(ProcessRuntime::default());
         let readiness = Arc::new(MvReadinessPort::new(Arc::clone(&repository), runtime));
         Self {
-            repository,
             refresh: Some(refresh::FrontendMvRefreshDependencies {
                 query_execution,
                 connector_control: Arc::clone(&connector_control),
@@ -226,8 +223,7 @@ impl MvApplicationService for FrontendMvService {
     ) -> Result<Option<MvStatementResult>, MvApplicationError> {
         match statement {
             MvApplicationStatement::Create(statement) => {
-                create::handle_create(self.repository.as_ref(), engine, statement, context)
-                    .map(Some)
+                create::handle_create(engine, statement, context).map(Some)
             }
             MvApplicationStatement::Unhandled => Ok(None),
         }
@@ -250,44 +246,16 @@ impl FrontendMvService {
         refresh::execute(dependencies, refresh_plan, connector_context, execution)
     }
 
-    pub fn prepare_and_execute_refresh(
+    pub(crate) fn prepare_and_execute_refresh(
         &self,
         preparation: &dyn MvRefreshPreparationService,
         statement: novarocks_sql::planning::mv::MvRefreshStatement,
         target: crate::mv::domain::repository::MvTarget,
+        owner: MvActivityOwner,
         connector_context: ConnectorRequestContext,
         execution: &crate::common::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvStatementResult, MvApplicationError> {
-        let mut gate_ticket = self
-            .activity_gate
-            .request(
-                CanonicalMvTarget::from_mv_target(&target),
-                MvActivityOwner::ManualRefresh,
-            )
-            .map_err(|_| {
-                MvApplicationError::new(
-                    crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
-                    "frontend MV activity admission is closed",
-                )
-            })?;
-        let _gate_lease = loop {
-            if execution.cancellation().is_cancelled() {
-                return Err(MvApplicationError::new(
-                    crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
-                    "manual MV refresh was cancelled while waiting for activity gate",
-                ));
-            }
-            match gate_ticket.try_acquire() {
-                Ok(Some(lease)) => break lease,
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                Err(_) => {
-                    return Err(MvApplicationError::new(
-                        crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
-                        "frontend MV activity admission is closed",
-                    ));
-                }
-            }
-        };
+        let _gate_lease = self.acquire_activity_lease(&target, owner, execution)?;
         let attempt = self.reserve_refresh_attempt();
         let prepared = preparation
             .prepare_step(MvRefreshPreparationRequest {
@@ -308,6 +276,57 @@ impl FrontendMvService {
             ));
         }
         self.execute_prepared_refresh(prepared, connector_context, execution)
+    }
+
+    /// Run one foreground DDL path under the same per-target FIFO gate as
+    /// refresh and background maintenance. The SQL session cancellation scope
+    /// remains the authority while the statement waits for its turn.
+    pub(crate) fn execute_serialized<T>(
+        &self,
+        target: &crate::mv::domain::repository::MvTarget,
+        owner: MvActivityOwner,
+        execution: &crate::common::admitted_query_context::QueryExecutionContext,
+        action: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let _gate_lease = self
+            .acquire_activity_lease(target, owner, execution)
+            .map_err(|error| error.to_string())?;
+        action()
+    }
+
+    fn acquire_activity_lease(
+        &self,
+        target: &crate::mv::domain::repository::MvTarget,
+        owner: MvActivityOwner,
+        execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    ) -> Result<crate::mv::activity::MvActivityLease, MvApplicationError> {
+        let mut gate_ticket = self
+            .activity_gate
+            .request(CanonicalMvTarget::from_mv_target(target), owner)
+            .map_err(|_| {
+                MvApplicationError::new(
+                    crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
+                    "frontend MV activity admission is closed",
+                )
+            })?;
+        loop {
+            if execution.cancellation().is_cancelled() {
+                return Err(MvApplicationError::new(
+                    crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
+                    "MV statement was cancelled while waiting for activity gate",
+                ));
+            }
+            match gate_ticket.try_acquire() {
+                Ok(Some(lease)) => return Ok(lease),
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => {
+                    return Err(MvApplicationError::new(
+                        crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
+                        "frontend MV activity admission is closed",
+                    ));
+                }
+            }
+        }
     }
 
     fn reserve_refresh_attempt(&self) -> MvRefreshAttemptIdentity {

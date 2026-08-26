@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::descriptor::MvDescriptorV3;
-use crate::mv::domain::repository::{InitialMvRefreshConfiguration, MvRepository, MvTarget};
+use crate::mv::domain::repository::{InitialMvRefreshConfiguration, MvTarget};
 use crate::runtime::query_result::QueryResult;
 use novarocks_parser::ast::{
     LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
@@ -444,7 +444,6 @@ pub trait MvEngine: Send + Sync {
     fn prepare_create(
         &self,
         request: PrepareMvCreateRequest<'_>,
-        repository: &dyn MvRepository,
     ) -> Result<PreparedMvCreate, MvEngineError>;
 
     fn create_target(

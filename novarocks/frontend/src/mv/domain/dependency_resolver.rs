@@ -29,7 +29,7 @@ use crate::mv::domain::persistence::definition::MvDesiredRefreshPolicy;
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::dependency::stored_definition_dependency_ref;
-use crate::mv::domain::repository::MvRepository;
+use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_types::naming::TableIdentity;
 
 #[derive(Debug)]
@@ -38,12 +38,12 @@ pub(crate) struct ResolvedCreateMvDependencies {
     pub(crate) dependencies: Vec<CreateMvDependencyRequest>,
 }
 
-pub(crate) fn ensure_no_downstream_dependencies_with_repository(
-    repository: &dyn MvRepository,
+pub(crate) fn ensure_no_downstream_dependencies_with_readiness(
+    readiness: &MvReadinessPort,
     upstream: &MvDependencyObjectRef,
 ) -> Result<(), String> {
-    repository
-        .ensure_no_downstream_dependencies(upstream)
+    readiness
+        .ensure_no_ready_downstream_dependencies(upstream)
         .map_err(|e| e.to_string())
 }
 
@@ -64,8 +64,8 @@ fn iceberg_mv_target_ref_for_scope(
     ))
 }
 
-pub(crate) fn resolve_create_mv_dependencies_with_repository(
-    repository: &dyn MvRepository,
+pub(crate) fn resolve_create_mv_dependencies_with_readiness(
+    readiness: &MvReadinessPort,
     resolved_refs: &[ResolvedTableRef],
     created_at_ms: i64,
 ) -> Result<ResolvedCreateMvDependencies, String> {
@@ -78,8 +78,8 @@ pub(crate) fn resolve_create_mv_dependencies_with_repository(
                 namespace,
                 table,
             } => {
-                let is_mv_dependency = repository
-                    .find_by_target(&crate::mv::domain::model::MvTarget {
+                let is_mv_dependency = readiness
+                    .load_ready(&crate::mv::domain::model::MvTarget {
                         catalog: Some(catalog.clone()),
                         database: namespace.clone(),
                         name: table.clone(),
@@ -124,13 +124,13 @@ pub(crate) fn resolve_create_mv_dependencies_with_repository(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-pub(crate) fn ensure_no_iceberg_mv_targets_in_scope_with_repository(
-    repository: &dyn MvRepository,
+pub(crate) fn ensure_no_iceberg_mv_targets_in_scope_with_readiness(
+    readiness: &MvReadinessPort,
     scope_catalog: &str,
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
-    let definitions = repository
-        .list_projections()
+    let definitions = readiness
+        .list_ready_projections()
         .map_err(|e| format!("load MV projections for drop target scope check failed: {e}"))?
         .into_iter()
         .map(|projection| projection.definition)
@@ -149,24 +149,20 @@ pub(crate) fn ensure_no_iceberg_mv_targets_in_scope_with_repository(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-pub(crate) fn ensure_no_external_iceberg_dependents_with_repository(
-    repository: &dyn MvRepository,
+pub(crate) fn ensure_no_external_iceberg_dependents_with_readiness(
+    readiness: &MvReadinessPort,
     scope_catalog: &str,
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
-    let definitions = repository
-        .list_projections()
-        .map_err(|e| format!("load MV projections for drop scope check failed: {e}"))?
-        .into_iter()
-        .map(|projection| projection.definition)
-        .collect::<Vec<_>>();
-
+    let projections = readiness
+        .list_ready_projections()
+        .map_err(|e| format!("load MV projections for drop scope check failed: {e}"))?;
     let mut edges: Vec<(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)> =
-        Vec::with_capacity(definitions.len());
-    for def in &definitions {
-        let mv_target = stored_definition_dependency_ref_for_iceberg(def)?;
-        let upstreams = repository
-            .list_dependencies_by_downstream(def.mv_id)
+        Vec::with_capacity(projections.len());
+    for projection in projections {
+        let mv_target = stored_definition_dependency_ref_for_iceberg(&projection.definition)?;
+        let upstreams = readiness
+            .list_ready_dependencies_by_downstream(&projection)
             .map_err(|e| format!("load MV dependencies for drop scope check failed: {e}"))?
             .into_iter()
             .map(|dep| dep.upstream)
@@ -177,22 +173,19 @@ pub(crate) fn ensure_no_external_iceberg_dependents_with_repository(
     validate_no_external_dependents_for_scope(scope_catalog, scope_namespace, &edges)
 }
 
-pub(crate) fn validate_no_create_cycle_with_repository(
-    repository: &dyn MvRepository,
+pub(crate) fn validate_no_create_cycle_with_readiness(
+    readiness: &MvReadinessPort,
     new_target: &MvDependencyObjectRef,
     new_dependencies: &[CreateMvDependencyRequest],
 ) -> Result<(), String> {
-    let definitions = repository
-        .list_projections()
-        .map_err(|e| format!("load MV projections for dependency cycle check failed: {e}"))?
-        .into_iter()
-        .map(|projection| projection.definition)
-        .collect::<Vec<_>>();
+    let projections = readiness
+        .list_ready_projections()
+        .map_err(|e| format!("load MV projections for dependency cycle check failed: {e}"))?;
     let mut edges = Vec::new();
-    for definition in definitions {
-        let target = stored_definition_dependency_ref_for_iceberg(&definition)?;
-        let dependencies = repository
-            .list_dependencies_by_downstream(definition.mv_id)
+    for projection in projections {
+        let target = stored_definition_dependency_ref_for_iceberg(&projection.definition)?;
+        let dependencies = readiness
+            .list_ready_dependencies_by_downstream(&projection)
             .map_err(|e| format!("load MV dependencies for cycle check failed: {e}"))?
             .into_iter()
             .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
@@ -311,8 +304,12 @@ mod tests {
     #[test]
     fn native_internal_mv_base_table_is_rejected() {
         let repository = crate::mv::domain::test_repository::InMemoryMvRepository::default();
-        let error = resolve_create_mv_dependencies_with_repository(
-            &repository,
+        let readiness = MvReadinessPort::new(
+            std::sync::Arc::new(repository),
+            std::sync::Arc::new(crate::mv::process_runtime::ProcessRuntime::default()),
+        );
+        let error = resolve_create_mv_dependencies_with_readiness(
+            &readiness,
             &[ResolvedTableRef::UnsupportedNative {
                 display_name: "sales.orders".to_string(),
             }],

@@ -14,10 +14,12 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::mv::activity::CanonicalMvTarget;
+use crate::mv::domain::dependency::model::MvDependencyObjectRef;
 use crate::mv::domain::persistence::dependency::StoredMvDependency;
 use crate::mv::domain::projector::MvAcceleratorProjector;
 use crate::mv::domain::repository::{
-    LoadedMvProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTarget,
+    DeleteMvProjectionRequest, LoadedMvProjection, MvRepository, MvRepositoryError,
+    MvRepositoryErrorKind, MvTarget,
 };
 use crate::mv::domain::storage_observation::MvLakePackageObservation;
 use crate::mv::process_runtime::{MvTargetReadiness, ProcessRuntime};
@@ -188,6 +190,61 @@ impl MvReadinessPort {
         let _ = self.load_ready(&target)?;
         self.repository
             .list_dependencies_by_downstream(projection.definition.mv_id)
+    }
+
+    /// Reject a mutation only when a currently consumable downstream MV
+    /// depends on the upstream object. Quarantined projections are retained
+    /// accelerator data, not active semantic dependencies.
+    pub(crate) fn ensure_no_ready_downstream_dependencies(
+        &self,
+        upstream: &MvDependencyObjectRef,
+    ) -> Result<(), MvRepositoryError> {
+        let mut downstream_ids = Vec::new();
+        for projection in self.list_ready_projections()? {
+            let dependencies = self.list_ready_dependencies_by_downstream(&projection)?;
+            if dependencies
+                .iter()
+                .any(|dependency| dependency.upstream == *upstream)
+            {
+                downstream_ids.push(projection.definition.mv_id);
+            }
+        }
+        if downstream_ids.is_empty() {
+            return Ok(());
+        }
+        Err(MvRepositoryError::new(
+            MvRepositoryErrorKind::Conflict,
+            format!(
+                "{} has downstream materialized views: {}",
+                upstream.display_name(),
+                downstream_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        ))
+    }
+
+    /// Delete the current ready projection using its opaque loaded version.
+    /// DDL never fabricates a repository version or reads the Accelerator
+    /// behind the readiness boundary.
+    pub(crate) fn delete_ready_projection(
+        &self,
+        operation_id: Uuid,
+        target: &MvTarget,
+    ) -> Result<bool, MvRepositoryError> {
+        let Some(loaded) = self.load_ready(target)? else {
+            return Ok(false);
+        };
+        self.repository.delete_projection(
+            operation_id,
+            DeleteMvProjectionRequest {
+                mv_id: loaded.definition.mv_id,
+                expected_version: loaded.version,
+                expected_source_revision: loaded.definition.source_revision,
+            },
+        )
     }
 
     pub(crate) fn begin_publication(

@@ -18,6 +18,7 @@
 //! Closed typed executor for Iceberg MV statements.
 
 use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::mv::activity::MvActivityOwner;
 use crate::mv::domain::application::{
     MvAlterAction, MvAlterStatement, MvApplicationService, MvCreateDistribution,
     MvCreatePartitionField, MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement,
@@ -25,7 +26,6 @@ use crate::mv::domain::application::{
 };
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use crate::mv::domain::repository::MvRepository;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::{
     CallStatement, Literal, LiteralKind, MaterializedViewAlterAction as TypedAlterAction,
@@ -52,7 +52,6 @@ pub struct MvCommandExecutor {
     ports: IcebergMvCorePorts,
     create_application: Arc<dyn MvApplicationService>,
     refresh_service: Arc<FrontendMvService>,
-    repository: Arc<dyn MvRepository>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_backend: Arc<IcebergMvBackend>,
 }
@@ -62,7 +61,6 @@ impl MvCommandExecutor {
         ports: IcebergMvCorePorts,
         create_application: Arc<dyn MvApplicationService>,
         refresh_service: Arc<FrontendMvService>,
-        repository: Arc<dyn MvRepository>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_backend: Arc<IcebergMvBackend>,
     ) -> Self {
@@ -70,7 +68,6 @@ impl MvCommandExecutor {
             ports,
             create_application,
             refresh_service,
-            repository,
             storage_observation,
             mv_backend,
         }
@@ -89,36 +86,78 @@ impl MvCommandExecutor {
         execution: &QueryExecutionContext,
     ) -> Result<StatementResult, String> {
         match statement {
-            MaterializedViewStatement::Create(statement) => create_mv_with_ports(
-                &self.ports,
-                self.create_application.as_ref(),
-                self.mv_backend.as_ref(),
-                current_catalog,
-                current_database,
-                &lower_typed_create(statement)?,
-                connector_context,
-            ),
-            MaterializedViewStatement::Drop(statement) => drop_mv_with_ports(
-                self.repository.as_ref(),
-                self.mv_backend.as_ref(),
-                current_catalog,
-                current_database,
-                &MvDropStatement {
+            MaterializedViewStatement::Create(statement) => {
+                let statement = lower_typed_create(statement)?;
+                let target = resolve_refresh_mv_target(
+                    current_catalog,
+                    current_database,
+                    &statement.name_parts,
+                )?;
+                self.refresh_service.execute_serialized(
+                    &target,
+                    MvActivityOwner::Create,
+                    execution,
+                    || {
+                        create_mv_with_ports(
+                            &self.ports,
+                            self.create_application.as_ref(),
+                            self.mv_backend.as_ref(),
+                            current_catalog,
+                            current_database,
+                            &statement,
+                            connector_context,
+                        )
+                    },
+                )
+            }
+            MaterializedViewStatement::Drop(statement) => {
+                let statement = MvDropStatement {
                     name_parts: lower_typed_name_parts(&statement.name)?,
                     if_exists: statement.if_exists,
-                },
-                connector_context,
-            ),
+                };
+                let target = resolve_refresh_mv_target(
+                    current_catalog,
+                    current_database,
+                    &statement.name_parts,
+                )?;
+                self.refresh_service.execute_serialized(
+                    &target,
+                    MvActivityOwner::Drop,
+                    execution,
+                    || {
+                        drop_mv_with_ports(
+                            self.ports.readiness().as_ref(),
+                            self.mv_backend.as_ref(),
+                            current_catalog,
+                            current_database,
+                            &statement,
+                            connector_context,
+                        )
+                    },
+                )
+            }
             MaterializedViewStatement::Alter(statement)
                 if !matches!(&statement.action, TypedAlterAction::Repartition(_)) =>
             {
                 let statement = lower_typed_alter(statement)?;
-                alter_mv_with_ports(
-                    &self.ports,
+                let target = resolve_refresh_mv_target(
                     current_catalog,
                     current_database,
-                    &statement,
-                    connector_context,
+                    &statement.name_parts,
+                )?;
+                self.refresh_service.execute_serialized(
+                    &target,
+                    MvActivityOwner::Alter,
+                    execution,
+                    || {
+                        alter_mv_with_ports(
+                            &self.ports,
+                            current_catalog,
+                            current_database,
+                            &statement,
+                            connector_context,
+                        )
+                    },
                 )
             }
             MaterializedViewStatement::Alter(statement) => self.execute_repartition(
@@ -161,7 +200,7 @@ impl MvCommandExecutor {
         execute_typed_novarocks_imv_stateless_rebuild(
             self.ports.connector_control(),
             self.storage_observation.as_ref(),
-            self.repository.as_ref(),
+            self.ports.repository().as_ref(),
             statement,
             current_database,
             connector_context.clone(),
@@ -222,6 +261,7 @@ impl MvCommandExecutor {
                 &preparation,
                 refresh_statement.sql_refresh_statement(),
                 target,
+                MvActivityOwner::Repartition,
                 connector_context.clone(),
                 execution,
             )
@@ -285,6 +325,7 @@ impl MvCommandExecutor {
                         &preparation,
                         step_statement.sql_refresh_statement(),
                         target,
+                        MvActivityOwner::ManualRefresh,
                         connector_context.clone(),
                         execution,
                     )

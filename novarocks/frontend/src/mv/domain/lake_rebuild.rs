@@ -167,18 +167,33 @@ pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), S
         .map(|observation| observation.instance_id)
         .collect::<Vec<_>>();
     for instance_id in instance_ids {
-        let discovery = discover_mv_lake_packages(
+        let discovery = match discover_mv_lake_packages(
             ctx.connector_control,
             [instance_id.clone()],
             ctx.mv_storage_observation,
             context.clone(),
-        )
-        .map_err(|error| {
-            format!(
-                "discover lake MV packages for catalog {} failed: {error}",
-                instance_id.as_str()
-            )
-        })?;
+        ) {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                let reason = format!("lake MV catalog discovery failed: {error}");
+                if let Err(quarantine_error) = ctx
+                    .readiness
+                    .quarantine_catalog(instance_id.as_str(), reason.clone())
+                {
+                    tracing::warn!(
+                        catalog = instance_id.as_str(),
+                        error = %quarantine_error,
+                        "failed to quarantine MV projections after catalog discovery failure"
+                    );
+                }
+                tracing::warn!(
+                    catalog = instance_id.as_str(),
+                    error = %error,
+                    "skipping MV startup rebuild for failed catalog discovery"
+                );
+                continue;
+            }
+        };
         let outcomes = match discovery {
             MvLakeCatalogDiscovery::Complete(outcomes) => outcomes,
             MvLakeCatalogDiscovery::Incomplete(reason) => {
@@ -218,10 +233,46 @@ pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), S
             // assertion correctly refuses. Skipping keeps a foreign or
             // already-dropped package from failing frontend startup, while the
             // targeted rebuild procedure still fails closed on the same condition.
-            if !package_catalogs_are_admitted(ctx.catalog_application, &package)? {
+            let target = crate::mv::activity::CanonicalMvTarget::from_parts(
+                Some(package.table.instance_id.as_str()),
+                &package.table.namespace,
+                &package.table.table,
+            );
+            let admitted = match package_catalogs_are_admitted(ctx.catalog_application, &package) {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    ctx.readiness.quarantine(
+                        target,
+                        format!("verify lake MV package catalog admission failed: {error}"),
+                    );
+                    tracing::warn!(
+                        catalog = instance_id.as_str(),
+                        mv_target = %package.table.table,
+                        error = %error,
+                        "skipping MV startup rebuild after package admission failure"
+                    );
+                    continue;
+                }
+            };
+            if !admitted {
+                ctx.readiness.quarantine(
+                    target,
+                    "a referenced catalog attachment is not admitted here".to_string(),
+                );
                 continue;
             }
-            rebuild_one_lake_package_if_missing(ctx, &package)?;
+            if let Err(error) = rebuild_one_lake_package_if_missing(ctx, &package) {
+                ctx.readiness.quarantine(
+                    target,
+                    format!("project lake MV package into Accelerator failed: {error}"),
+                );
+                tracing::warn!(
+                    catalog = instance_id.as_str(),
+                    mv_target = %package.table.table,
+                    error = %error,
+                    "skipping failed MV startup rebuild package"
+                );
+            }
         }
     }
     Ok(())

@@ -163,7 +163,6 @@ pub fn build_frontend_query_session_factory(
         Arc::clone(&catalog_projection),
         Arc::clone(&catalog_application),
         Arc::clone(&mv_storage_observation),
-        Arc::clone(&mv_repository),
         mv_service.readiness_port(),
     );
     crate::mv::domain::startup_restore::run_mv_startup_restore(&startup_restore)
@@ -269,7 +268,7 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
-            Arc::clone(&mv_repository),
+            Arc::clone(&mv_readiness),
             Arc::clone(&mv_storage_observation),
             view_service,
         ));

@@ -29,8 +29,8 @@ use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::lifecycle::{CreateMvRequest, DropMvRequest, ListMvsRequest};
 use crate::mv::domain::model::{MvStorageEngine, MvTarget};
 use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
-use crate::mv::domain::repository::MvRepository;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::Visit;
 use novarocks_types::naming::normalize_identifier;
@@ -62,11 +62,11 @@ fn storage_engine_for_create(stmt: &MvCreateStatement) -> Result<MvStorageEngine
 }
 
 fn existing_mv_storage_engine_by_target(
-    repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     target: &IcebergMvTarget,
 ) -> Result<Option<MvStorageEngine>, String> {
-    let Some(definition) = repository
-        .find_by_target(&MvTarget {
+    let Some(definition) = readiness
+        .load_ready(&MvTarget {
             catalog: Some(target.catalog.clone()),
             database: target.namespace.clone(),
             name: target.table.clone(),
@@ -105,14 +105,14 @@ pub(crate) fn initial_refresh_configuration_for_create(
 }
 
 fn load_definition_for_alter(
-    repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     current_catalog: Option<&str>,
     db: &str,
     name_parts: &[String],
 ) -> Result<StoredMvDefinition, String> {
     let target = resolve_refresh_target(current_catalog, db, name_parts)?;
-    let Some(definition) = repository
-        .find_by_target(&MvTarget {
+    let Some(definition) = readiness
+        .load_ready(&MvTarget {
             catalog: Some(target.catalog.clone()),
             database: target.namespace.clone(),
             name: target.table.clone(),
@@ -183,9 +183,10 @@ pub fn create_mv_with_ports(
     Ok(StatementResult::Ok)
 }
 
-/// Drop an MV from the durable MV repository and the injected MV backend.
+/// Drop an MV through the readiness-aware Accelerator view and the injected
+/// MV backend.
 pub fn drop_mv_with_ports(
-    repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     mv_backend: &IcebergMvBackend,
     current_catalog: Option<&str>,
     db: &str,
@@ -194,7 +195,7 @@ pub fn drop_mv_with_ports(
 ) -> Result<StatementResult, String> {
     crate::connector::validate_request_context(connector_context)?;
     let target = resolve_refresh_target(current_catalog, db, &stmt.name_parts)?;
-    if let Some(engine) = existing_mv_storage_engine_by_target(repository, &target)?
+    if let Some(engine) = existing_mv_storage_engine_by_target(readiness, &target)?
         && engine != MvStorageEngine::Iceberg
     {
         return Err(
@@ -234,7 +235,7 @@ pub fn alter_mv_with_ports(
             "ALTER MATERIALIZED VIEW requires current Iceberg catalog".to_string()
         })?;
         let target = resolve_refresh_target(Some(current_catalog), db, &stmt.name_parts)?;
-        let engine = existing_mv_storage_engine_by_target(ports.repository().as_ref(), &target)?
+        let engine = existing_mv_storage_engine_by_target(ports.readiness().as_ref(), &target)?
             .ok_or_else(|| {
                 format!(
                     "materialized view {}.{}.{} not found",
@@ -284,7 +285,7 @@ pub fn alter_mv_with_ports(
         return Ok(StatementResult::Ok);
     }
     let definition = load_definition_for_alter(
-        ports.repository().as_ref(),
+        ports.readiness().as_ref(),
         current_catalog,
         db,
         &stmt.name_parts,

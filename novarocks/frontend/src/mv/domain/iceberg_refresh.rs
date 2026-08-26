@@ -321,14 +321,12 @@ impl MvEngine for StandaloneMvEngine {
     fn prepare_create(
         &self,
         request: PrepareMvCreateRequest<'_>,
-        repository: &dyn crate::mv::domain::repository::MvRepository,
     ) -> Result<PreparedMvCreate, MvEngineError> {
         let prepared = prepare_iceberg_mv_create_with_ports(
             &self.ports,
             request.context.current_catalog,
             request.context.current_database,
             request.statement,
-            repository,
             &self.connector_context,
         )
         .map_err(engine_prepare_error)?;
@@ -695,12 +693,12 @@ impl MvEngine for StandaloneMvEngine {
         .ok_or_else(|| {
             engine_target_error("created target is missing its MV lake descriptor".to_string())
         })?;
-        crate::mv::domain::projector::project_observed_repository(
-            self.ports.repository.as_ref(),
-            operation_id,
-            &package,
-        )
-        .map_err(|error| MvEngineError::new(MvEngineErrorKind::DescriptorSync, error.to_string()))
+        self.ports
+            .readiness
+            .project_observed(operation_id, &package)
+            .map_err(|error| {
+                MvEngineError::new(MvEngineErrorKind::DescriptorSync, error.to_string())
+            })
     }
 
     fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvEngineError> {
@@ -722,14 +720,8 @@ impl MvEngine for StandaloneMvEngine {
                 error,
             ));
         }
-        register_iceberg_mv_target_in_catalog(
-            &MvTargetRestoreContext {
-                connector_control: self.ports.connector_control.as_ref(),
-                mv_repository: self.ports.repository.as_ref(),
-            },
-            &target,
-        )
-        .map_err(|error| MvEngineError::new(MvEngineErrorKind::CatalogRegistration, error))?;
+        register_iceberg_mv_target_in_catalog(self.ports.connector_control.as_ref(), &target)
+            .map_err(|error| MvEngineError::new(MvEngineErrorKind::CatalogRegistration, error))?;
         self.preparations
             .lock()
             .map_err(|error| {
@@ -914,7 +906,6 @@ fn prepare_iceberg_mv_create_with_ports(
     current_catalog: Option<&str>,
     current_database: &str,
     stmt: &MvCreateStatement,
-    repository: &dyn crate::mv::domain::repository::MvRepository,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<IcebergMvCreatePreparation, String> {
     crate::connector::validate_request_context(connector_context)?;
@@ -987,8 +978,8 @@ fn prepare_iceberg_mv_create_with_ports(
     validate_mv_partition_columns(Some(&partition_fields), &analysis.output_columns)?;
     let created_at_ms = now_ms();
     let resolved_dependencies =
-        crate::mv::domain::dependency_resolver::resolve_create_mv_dependencies_with_repository(
-            repository,
+        crate::mv::domain::dependency_resolver::resolve_create_mv_dependencies_with_readiness(
+            ports.readiness.as_ref(),
             &analysis.resolved_refs,
             created_at_ms,
         )?;
@@ -997,8 +988,8 @@ fn prepare_iceberg_mv_create_with_ports(
         &target.namespace,
         &target.table,
     );
-    crate::mv::domain::dependency_resolver::validate_no_create_cycle_with_repository(
-        repository,
+    crate::mv::domain::dependency_resolver::validate_no_create_cycle_with_readiness(
+        ports.readiness.as_ref(),
         &dependency_target,
         &resolved_dependencies.dependencies,
     )
@@ -1135,16 +1126,13 @@ pub(crate) fn create_iceberg_mv_with_ports(
     let statement = stmt.clone();
     let engine = StandaloneMvEngine::new_with_ports(ports.clone(), connector_context.clone());
     let plan = engine
-        .prepare_create(
-            PrepareMvCreateRequest {
-                statement: &statement,
-                context: crate::mv::domain::application::MvRequestContext {
-                    current_catalog,
-                    current_database,
-                },
+        .prepare_create(PrepareMvCreateRequest {
+            statement: &statement,
+            context: crate::mv::domain::application::MvRequestContext {
+                current_catalog,
+                current_database,
             },
-            ports.repository.as_ref(),
-        )
+        })
         .map_err(|error| error.to_string())?;
     let operation_id = uuid::Uuid::now_v7();
     let target = engine
@@ -3150,11 +3138,11 @@ fn aggregate_state_role_contract(
 /// the engine.
 pub struct MvTargetRestoreContext<'a> {
     pub connector_control: &'a dyn novarocks_spi::connector::ConnectorControlRegistry,
-    pub mv_repository: &'a dyn crate::mv::domain::repository::MvRepository,
+    pub readiness: &'a MvReadinessPort,
 }
 
 pub(crate) fn register_iceberg_mv_target_in_catalog(
-    ctx: &MvTargetRestoreContext<'_>,
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
     target: &IcebergMvTarget,
 ) -> Result<(), String> {
     // SQLX-2 keeps provider tables out of the process-wide planner catalog.
@@ -3165,7 +3153,7 @@ pub(crate) fn register_iceberg_mv_target_in_catalog(
     let instance_id = ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| format!("parse MV target connector identity: {error}"))?;
     novarocks_spi::connector::ConnectorControlResolver::acquire_current(
-        ctx.connector_control,
+        connector_control,
         &instance_id,
     )
     .map_err(|error| format!("acquire MV target connector generation: {error}"))?;
@@ -3173,10 +3161,17 @@ pub(crate) fn register_iceberg_mv_target_in_catalog(
 }
 
 pub fn restore_iceberg_mv_targets(ctx: &MvTargetRestoreContext<'_>) -> Result<(), String> {
-    for mv in ctx
-        .mv_repository
-        .list_projections()
-        .map_err(|e| format!("load MV definitions for iceberg restore failed: {e}"))?
+    let projections = match ctx.readiness.list_ready_projections() {
+        Ok(projections) => projections,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "skipping Iceberg MV target restore because the Accelerator is unavailable"
+            );
+            return Ok(());
+        }
+    };
+    for mv in projections
         .into_iter()
         .map(|projection| projection.definition)
         .filter(|mv| {
@@ -3184,18 +3179,28 @@ pub fn restore_iceberg_mv_targets(ctx: &MvTargetRestoreContext<'_>) -> Result<()
                 .eq_ignore_ascii_case(MvStorageEngine::Iceberg.as_sql_str())
         })
     {
-        let target = IcebergMvTarget {
-            catalog: mv
-                .target_catalog
-                .ok_or_else(|| format!("iceberg MV {} missing target_catalog", mv.mv_id))?,
-            namespace: mv
-                .target_namespace
-                .ok_or_else(|| format!("iceberg MV {} missing target_namespace", mv.mv_id))?,
-            table: mv
-                .target_table
-                .ok_or_else(|| format!("iceberg MV {} missing target_table", mv.mv_id))?,
+        let target = match (mv.target_catalog, mv.target_namespace, mv.target_table) {
+            (Some(catalog), Some(namespace), Some(table)) => IcebergMvTarget {
+                catalog,
+                namespace,
+                table,
+            },
+            _ => {
+                tracing::warn!(
+                    mv_id = mv.mv_id,
+                    "skipping Iceberg MV target restore without a canonical target"
+                );
+                continue;
+            }
         };
-        register_iceberg_mv_target_in_catalog(ctx, &target)?;
+        if let Err(error) = register_iceberg_mv_target_in_catalog(ctx.connector_control, &target) {
+            tracing::warn!(
+                mv_id = mv.mv_id,
+                target = %format!("{}.{}.{}", target.catalog, target.namespace, target.table),
+                error = %error,
+                "skipping failed Iceberg MV target registration during startup restore"
+            );
+        }
     }
     Ok(())
 }
@@ -3965,7 +3970,7 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     // current frontend-owned attempt must never perform recovery before its
     // durable v3 intent exists.
     let mv_definition =
-        load_iceberg_mv_definition_by_target(source.repository().as_ref(), &iceberg_target)
+        load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &iceberg_target)
             .map_err(RefreshError::user)?;
     let target_ref = TableIdentity {
         catalog: iceberg_target.catalog.clone(),
@@ -5881,11 +5886,8 @@ pub(crate) fn drop_iceberg_mv_with_ports(
             parts: stmt.name_parts.clone(),
         },
     )?;
-    if !preflight_iceberg_mv_drop_with_repository(
-        ports.repository.as_ref(),
-        &target,
-        stmt.if_exists,
-    )? {
+    if !preflight_iceberg_mv_drop_with_readiness(ports.readiness.as_ref(), &target, stmt.if_exists)?
+    {
         return Ok(StatementResult::Ok);
     }
 
@@ -5905,7 +5907,7 @@ pub(crate) fn drop_iceberg_mv_with_ports(
         },
         connector_context.clone(),
     )?;
-    drop_iceberg_mv_metadata_with_repository(ports.repository.as_ref(), &target)?;
+    drop_iceberg_mv_metadata_with_readiness(ports.readiness.as_ref(), &target)?;
     crate::catalog_application::query_catalog::drop_local_table_registration_if_exists(
         ports,
         &target.namespace,
@@ -5921,8 +5923,8 @@ pub(crate) fn drop_iceberg_mv_with_ports(
     Ok(StatementResult::Ok)
 }
 
-fn drop_iceberg_mv_metadata_with_repository(
-    repository: &dyn MvRepository,
+fn drop_iceberg_mv_metadata_with_readiness(
+    readiness: &MvReadinessPort,
     target: &IcebergMvTarget,
 ) -> Result<(), String> {
     let target = crate::mv::domain::model::MvTarget {
@@ -5930,26 +5932,8 @@ fn drop_iceberg_mv_metadata_with_repository(
         database: target.namespace.clone(),
         name: target.table.clone(),
     };
-    let Some(loaded) = repository
-        .find_by_target(&target)
-        .map_err(|e| format!("load iceberg MV projection for drop failed: {e}"))?
-    else {
-        return Err(format!(
-            "materialized view {}.{}.{} metadata disappeared during drop",
-            target.catalog.as_deref().unwrap_or_default(),
-            target.database,
-            target.name
-        ));
-    };
-    let dropped = repository
-        .delete_projection(
-            uuid::Uuid::now_v7(),
-            crate::mv::domain::repository::DeleteMvProjectionRequest {
-                mv_id: loaded.definition.mv_id,
-                expected_version: loaded.version,
-                expected_source_revision: loaded.definition.source_revision,
-            },
-        )
+    let dropped = readiness
+        .delete_ready_projection(uuid::Uuid::now_v7(), &target)
         .map_err(|e| format!("drop iceberg MV accelerator projection failed: {e}"))?;
     if !dropped {
         return Err(format!(
@@ -5958,17 +5942,17 @@ fn drop_iceberg_mv_metadata_with_repository(
             target.database,
             target.name
         ));
-    }
+    };
     Ok(())
 }
 
-fn preflight_iceberg_mv_drop_with_repository(
-    repository: &dyn MvRepository,
+fn preflight_iceberg_mv_drop_with_readiness(
+    readiness: &MvReadinessPort,
     target: &IcebergMvTarget,
     if_exists: bool,
 ) -> Result<bool, String> {
-    let Some(definition) = repository
-        .find_by_target(&crate::mv::domain::model::MvTarget {
+    let Some(_) = readiness
+        .load_ready(&crate::mv::domain::model::MvTarget {
             catalog: Some(target.catalog.clone()),
             database: target.namespace.clone(),
             name: target.table.clone(),
@@ -5983,8 +5967,8 @@ fn preflight_iceberg_mv_drop_with_repository(
             target.catalog, target.namespace, target.table
         ));
     };
-    crate::mv::domain::dependency_resolver::ensure_no_downstream_dependencies_with_repository(
-        repository,
+    crate::mv::domain::dependency_resolver::ensure_no_downstream_dependencies_with_readiness(
+        readiness,
         &crate::mv::domain::dependency::model::iceberg_mv_dependency_ref(
             &target.catalog,
             &target.namespace,

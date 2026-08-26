@@ -62,8 +62,8 @@ impl CatalogDropContext for CatalogCommandKernel {
         self.connector_control().as_ref()
     }
 
-    fn mv_repository(&self) -> &dyn crate::mv::domain::repository::MvRepository {
-        self.mv_repository().as_ref()
+    fn mv_readiness(&self) -> &crate::mv::domain::readiness::MvReadinessPort {
+        self.mv_readiness().as_ref()
     }
 
     fn mv_storage_observation(&self) -> &dyn novarocks_spi::connector::MvStorageObservationPort {

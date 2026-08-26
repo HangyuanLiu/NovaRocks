@@ -30,7 +30,6 @@ use std::sync::Arc;
 
 use crate::catalog_application::{CatalogApplicationPort, CatalogRuntimeProjection};
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::mv::domain::repository::MvRepository;
 use crate::mv::domain::startup_restore::MvStartupRestore;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::MvStorageObservationPort;
@@ -41,7 +40,6 @@ pub(crate) struct FrontendMvStartupRestore {
     catalog_runtime_projection: Arc<CatalogRuntimeProjection>,
     catalog_application: Arc<dyn CatalogApplicationPort>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-    mv_repository: Arc<dyn MvRepository>,
     readiness: Arc<MvReadinessPort>,
 }
 
@@ -51,7 +49,6 @@ impl FrontendMvStartupRestore {
         catalog_runtime_projection: Arc<CatalogRuntimeProjection>,
         catalog_application: Arc<dyn CatalogApplicationPort>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-        mv_repository: Arc<dyn MvRepository>,
         readiness: Arc<MvReadinessPort>,
     ) -> Self {
         Self {
@@ -59,7 +56,6 @@ impl FrontendMvStartupRestore {
             catalog_runtime_projection,
             catalog_application,
             mv_storage_observation,
-            mv_repository,
             readiness,
         }
     }
@@ -85,7 +81,7 @@ impl MvStartupRestore for FrontendMvStartupRestore {
         crate::mv::domain::iceberg_refresh::restore_iceberg_mv_targets(
             &crate::mv::domain::iceberg_refresh::MvTargetRestoreContext {
                 connector_control: self.connector_control.as_ref(),
-                mv_repository: self.mv_repository.as_ref(),
+                readiness: self.readiness.as_ref(),
             },
         )
     }

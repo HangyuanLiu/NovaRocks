@@ -22,18 +22,18 @@ use sha2::{Digest, Sha256};
 
 use crate::mv::domain::model::MvTarget;
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::target::IcebergMvTarget;
-use crate::mv::domain::repository::MvRepository;
 
 /// Loads the persisted definition for one normalized Iceberg MV target.
 pub fn load_iceberg_mv_definition_by_target(
-    repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     target: &IcebergMvTarget,
 ) -> Result<StoredMvDefinition, String> {
     #[cfg(test)]
     record_definition_load();
-    repository
-        .find_by_target(&MvTarget {
+    readiness
+        .load_ready(&MvTarget {
             catalog: Some(target.catalog.clone()),
             database: target.namespace.clone(),
             name: target.table.clone(),

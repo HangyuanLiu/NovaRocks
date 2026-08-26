@@ -19,17 +19,15 @@ use crate::mv::domain::application::{
     MvApplicationError, MvApplicationErrorKind, MvCreateStatement, MvEngine, MvEngineError,
     MvRequestContext, MvStatementResult, PrepareMvCreateRequest,
 };
-use crate::mv::domain::repository::MvRepository;
 use uuid::Uuid;
 
 pub(super) fn handle_create(
-    repository: &dyn MvRepository,
     engine: &dyn MvEngine,
     statement: &MvCreateStatement,
     context: MvRequestContext<'_>,
 ) -> Result<MvStatementResult, MvApplicationError> {
     let plan = engine
-        .prepare_create(PrepareMvCreateRequest { statement, context }, repository)
+        .prepare_create(PrepareMvCreateRequest { statement, context })
         .map_err(engine_error)?;
     let operation_id = Uuid::now_v7();
     let target = engine
