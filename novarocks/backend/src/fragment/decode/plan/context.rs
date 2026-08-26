@@ -52,6 +52,10 @@ pub(crate) struct TypedScanRuntime {
     providers: Arc<crate::connector::TypedConnectorProviderRegistry>,
     queues: Arc<novarocks_execution::connector::TaskAttemptSplitQueues>,
     session: novarocks_spi::connector::read_stack::ConnectorSession,
+    /// Absent when this attempt installed no runtime filter. A typed scan then
+    /// uses the truthful unconstrained filter rather than pretending to have
+    /// feedback it never received.
+    runtime_filter: Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>,
 }
 
 impl TypedScanRuntime {
@@ -59,11 +63,13 @@ impl TypedScanRuntime {
         providers: Arc<crate::connector::TypedConnectorProviderRegistry>,
         queues: Arc<novarocks_execution::connector::TaskAttemptSplitQueues>,
         session: novarocks_spi::connector::read_stack::ConnectorSession,
+        runtime_filter: Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>,
     ) -> Self {
         Self {
             providers,
             queues,
             session,
+            runtime_filter,
         }
     }
 
@@ -77,6 +83,12 @@ impl TypedScanRuntime {
 
     pub(crate) fn session(&self) -> novarocks_spi::connector::read_stack::ConnectorSession {
         self.session.clone()
+    }
+
+    pub(crate) fn runtime_filter(
+        &self,
+    ) -> Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef> {
+        self.runtime_filter.clone()
     }
 }
 

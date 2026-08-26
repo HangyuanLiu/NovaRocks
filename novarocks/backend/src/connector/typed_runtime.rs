@@ -840,7 +840,9 @@ pub(crate) mod test_support {
             std::time::SystemTime::UNIX_EPOCH,
         )
         .expect("session");
-        crate::fragment::decode::plan::context::TypedScanRuntime::new(providers, queues, session)
+        crate::fragment::decode::plan::context::TypedScanRuntime::new(
+            providers, queues, session, None,
+        )
     }
 
     pub(crate) fn scan_source_proto() -> dto::ConnectorTableScanSource {

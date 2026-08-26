@@ -306,10 +306,19 @@ impl NativeFragmentService {
             std::time::SystemTime::now(),
         )
         .expect("a query execution id is never an empty session query id");
+        // A fragment with no installed runtime filter gets `None`, which the
+        // typed scan turns into the truthful unconstrained filter rather than
+        // a live one that never narrows.
+        let runtime_filter = self
+            .lifecycle
+            .runtime_filter_session_for_fragment(execution_id, fragment_instance_id, false)
+            .ok()
+            .flatten();
         crate::fragment::decode::plan::context::TypedScanRuntime::new(
             self.execution_host.typed_providers(),
             queues,
             session,
+            runtime_filter,
         )
     }
 
