@@ -331,9 +331,7 @@ pub enum MvLakePublicationObservation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvPublishedRefreshObservation {
     pub target_snapshot_id: i64,
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    pub token: String,
+    pub publication_id: super::LakePublicationId,
     pub technique: MvPublishedRefreshTechnique,
     pub bases: Vec<MvPublishedBaseObservation>,
     pub definition_fingerprint: String,
@@ -361,9 +359,7 @@ impl MvPublishedRefreshObservation {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         target_snapshot_id: i64,
-        refresh_id: i64,
-        mv_id: i64,
-        token: String,
+        publication_id: super::LakePublicationId,
         technique: MvPublishedRefreshTechnique,
         bases: Vec<MvPublishedBaseObservation>,
         definition_fingerprint: String,
@@ -373,10 +369,9 @@ impl MvPublishedRefreshObservation {
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_context(context)?;
-        if target_snapshot_id < 0 || refresh_id < 0 || mv_id < 0 || rows < 0 {
+        if target_snapshot_id < 0 || rows < 0 {
             return corrupt("published MV lake facts contain a negative value");
         }
-        require_non_empty(&token, "published MV refresh token")?;
         require_non_empty(
             &definition_fingerprint,
             "published MV definition fingerprint",
@@ -388,10 +383,7 @@ impl MvPublishedRefreshObservation {
         }
         let mut names = HashSet::with_capacity(bases.len());
         let mut object_ids = HashSet::with_capacity(bases.len());
-        let mut used = token.len()
-            + definition_fingerprint.len()
-            + provenance_hash.len()
-            + waterline_hash.len();
+        let mut used = definition_fingerprint.len() + provenance_hash.len() + waterline_hash.len();
         for base in &bases {
             require_non_empty(&base.table_fqn, "published MV base table FQN")?;
             if base.to_snapshot < 0 || base.from_snapshot.is_some_and(|id| id < 0) {
@@ -413,9 +405,7 @@ impl MvPublishedRefreshObservation {
         }
         Ok(Self {
             target_snapshot_id,
-            refresh_id,
-            mv_id,
-            token,
+            publication_id,
             technique,
             bases,
             definition_fingerprint,
@@ -601,9 +591,7 @@ impl MvRefreshBaseObservation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvObservedRefreshMarker {
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    pub token: String,
+    pub publication_id: super::LakePublicationId,
 }
 
 /// Exact target facts required by refresh application.
@@ -676,14 +664,13 @@ impl MvRefreshTargetObservation {
             }
             reserve(&mut used, 8, context, "MV refresh target lineage")?;
         }
-        for (snapshot_id, marker) in &snapshot_markers {
-            if *snapshot_id < 0 || marker.refresh_id < 0 || marker.mv_id < 0 {
-                return corrupt("MV refresh target marker has a negative ID");
+        for snapshot_id in snapshot_markers.keys() {
+            if *snapshot_id < 0 {
+                return corrupt("MV refresh target marker has a negative snapshot ID");
             }
-            require_non_empty(&marker.token, "MV refresh target marker token")?;
             reserve(
                 &mut used,
-                MARKER_FIXED_BYTES + marker.token.len(),
+                MARKER_FIXED_BYTES,
                 context,
                 "MV refresh target markers",
             )?;
