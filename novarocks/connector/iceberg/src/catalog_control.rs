@@ -154,19 +154,6 @@ impl IcebergCatalogControlState {
         self.configuration.object_store_config.is_some()
     }
 
-    /// Whether this configuration names a remote catalog.
-    ///
-    /// Diagnostics only. This is a catalog-kind branch, and no operation may
-    /// decide behavior from it: ask the catalog owner instead, which is the
-    /// one place that knows what a specific request can do.
-    pub fn uses_remote_catalog(&self) -> bool {
-        matches!(
-            self.configuration.kind,
-            crate::catalog_config::IcebergCatalogKind::Rest
-                | crate::catalog_config::IcebergCatalogKind::Hive
-        )
-    }
-
     pub fn object_store_config(&self) -> Option<&novarocks_fs::ObjectStoreConfig> {
         self.configuration.object_store_config.as_ref()
     }
@@ -250,7 +237,6 @@ mod tests {
         });
 
         assert!(!state.is_s3());
-        assert!(!state.uses_remote_catalog());
         assert_eq!(state.properties().len(), 3);
         assert_eq!(
             state.cloud_properties_map().get("aws.s3.endpoint"),

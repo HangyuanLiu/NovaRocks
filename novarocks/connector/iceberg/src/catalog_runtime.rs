@@ -162,17 +162,6 @@ pub async fn build_hms_catalog(
         .map_err(|error| format!("build HMS iceberg catalog: {error}"))
 }
 
-/// Construct the concrete catalog client for one provider control generation.
-///
-/// The returned client remains provider-private.  In particular, the caller
-/// supplies both the configuration and the runtime that polls this future;
-/// this helper never discovers either from process-global state.
-pub async fn build_catalog(
-    configuration: &IcebergCatalogConfiguration,
-) -> Result<Arc<dyn crate::iceberg::Catalog>, String> {
-    Ok(build_catalog_client(configuration).await?.generic)
-}
-
 /// Construct the single concrete client retained by one control generation.
 pub async fn build_catalog_client(
     configuration: &IcebergCatalogConfiguration,

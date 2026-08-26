@@ -1138,9 +1138,9 @@ fn build_abort_cleanup(
 /// Make a committed write reachable through this generation's catalog.
 ///
 /// This used to be `ensure_hadoop_registration`, and it decided what to do by
-/// asking `uses_remote_catalog()` — a catalog-kind branch living outside the
-/// factory, in the DML publication path. The catalog answers now: one that owns
-/// its metadata pointer no-ops, and a filesystem catalog anchors.
+/// comparing catalog kinds in the DML publication path -- a branch living
+/// outside the factory. The catalog answers now: one that owns its metadata
+/// pointer no-ops, and a filesystem catalog anchors.
 ///
 /// It also created the namespace with `let _ =`, so a namespace that failed to
 /// appear surfaced later as a confusing registration failure rather than as the
