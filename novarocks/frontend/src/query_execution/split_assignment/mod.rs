@@ -23,10 +23,14 @@
 //! state survives a round.
 
 mod driver;
+mod round;
 mod transport;
 
 pub(crate) use driver::{
     AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError, SplitSourceHandle,
+};
+pub(crate) use round::{
+    DEFAULT_PUMP_BATCH_SIZE, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitSource,
 };
 pub(crate) use transport::{
     AcceptedPlanNode, TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError,

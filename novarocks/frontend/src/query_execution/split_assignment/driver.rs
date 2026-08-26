@@ -218,6 +218,15 @@ impl SplitAssignmentDriver {
         &self.sources
     }
 
+    /// Whether this plan node has already sent its terminal marker to every
+    /// admitted task, so there is nothing left to pump.
+    pub(crate) fn is_terminal_for(&self, plan_node_id: i32) -> bool {
+        self.sources
+            .iter()
+            .find(|source| source.plan_node_id() == plan_node_id)
+            .is_some_and(SplitSourceHandle::is_finished)
+    }
+
     /// Whether every task is currently at or above its queue ceiling, so the
     /// driver should not pull another batch from a split source yet.
     pub(crate) fn is_backpressured(&self, plan_node_id: i32) -> bool {
@@ -358,58 +367,52 @@ impl SplitAssignmentDriver {
         Ok(())
     }
 
-    /// Drive one split source to exhaustion for one plan node.
+    /// Pull one batch from a split source and deliver it.
     ///
-    /// At most one batch request is outstanding at a time, and the driver stops
-    /// pulling while every admitted task is at its queue ceiling. An empty
-    /// batch means "nothing right now" and is retried, never treated as the end
-    /// of enumeration.
+    /// Exactly one batch per call, so a caller driving several sources can give
+    /// each a turn: draining one source to exhaustion here would let a slow
+    /// enumeration starve every other scan in the round.
+    ///
+    /// Returns `Ok(false)` when nothing was delivered — the tasks are
+    /// saturated, or the source had nothing right now. An empty batch means
+    /// "nothing right now", never the end of enumeration.
     pub(crate) fn pump(
         &mut self,
         plan_node_id: i32,
         source: &mut dyn TypedConnectorSplitSource,
         batch_size: usize,
-    ) -> Result<(), SplitAssignmentDriverError> {
-        let batch_size = batch_size.clamp(1, MAX_SPLITS_PER_UPDATE);
+    ) -> Result<bool, SplitAssignmentDriverError> {
+        if self.closed {
+            return Err(SplitAssignmentDriverError::Closed);
+        }
+        if self.is_backpressured(plan_node_id) {
+            return Ok(false);
+        }
         // The frontend produces no runtime feedback today, so the snapshot it
         // offers is honestly unconstrained and final rather than a fabricated
         // pending filter.
-        let snapshot = WireDynamicFilterSnapshot::all_complete();
-        loop {
-            if self.closed {
-                return Err(SplitAssignmentDriverError::Closed);
-            }
-            if self.is_backpressured(plan_node_id) {
-                // Every task is saturated. Returning lets the caller retry
-                // after an acknowledgement rather than spinning here.
-                return Ok(());
-            }
-            let batch = source.next_batch(batch_size, &snapshot).map_err(|error| {
-                SplitAssignmentDriverError::SplitSource {
-                    plan_node_id,
-                    detail: error.to_string(),
-                }
+        let batch = source
+            .next_batch(
+                batch_size.clamp(1, MAX_SPLITS_PER_UPDATE),
+                &WireDynamicFilterSnapshot::all_complete(),
+            )
+            .map_err(|error| SplitAssignmentDriverError::SplitSource {
+                plan_node_id,
+                detail: error.to_string(),
             })?;
-            let no_more_splits = batch.no_more_splits();
-            let splits = batch
-                .into_splits()
-                .into_iter()
-                .map(|split| Split::new(self.catalog_for(plan_node_id), split))
-                .collect::<Vec<_>>();
-            let has_work = !splits.is_empty();
-            if has_work || no_more_splits {
-                let placement = self.distribute(plan_node_id, splits)?;
-                self.send(plan_node_id, placement, no_more_splits)?;
-            }
-            if no_more_splits {
-                return Ok(());
-            }
-            if !has_work {
-                // Nothing right now and the source has not finished: hand
-                // control back so the caller can decide whether to wait.
-                return Ok(());
-            }
+        let no_more_splits = batch.no_more_splits();
+        let splits = batch
+            .into_splits()
+            .into_iter()
+            .map(|split| Split::new(self.catalog_for(plan_node_id), split))
+            .collect::<Vec<_>>();
+        let has_work = !splits.is_empty();
+        if !has_work && !no_more_splits {
+            return Ok(false);
         }
+        let placement = self.distribute(plan_node_id, splits)?;
+        self.send(plan_node_id, placement, no_more_splits)?;
+        Ok(true)
     }
 
     fn catalog_for(&self, _plan_node_id: i32) -> CatalogHandle {
@@ -731,7 +734,9 @@ mod tests {
             fail: false,
             closed: 0,
         };
-        driver.pump(7, &mut source, 16).expect("pump");
+        while !driver.is_terminal_for(7) {
+            driver.pump(7, &mut source, 16).expect("pump");
+        }
         let sent = transport.sent.lock().expect("transport lock");
         let total_splits: usize = sent
             .iter()
@@ -755,7 +760,7 @@ mod tests {
             fail: false,
             closed: 0,
         };
-        driver.pump(7, &mut source, 16).expect("pump");
+        assert!(!driver.pump(7, &mut source, 16).expect("pump"));
         assert!(transport.sent.lock().expect("transport lock").is_empty());
         assert!(!driver.is_closed());
     }
