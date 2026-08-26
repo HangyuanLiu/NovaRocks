@@ -389,6 +389,7 @@ fn query_lifecycle_fault_preferred_live_index(
         return Ok(None);
     };
     let fault_kinds = [
+        QueryLifecycleFaultKind::RestartAfterInitAck,
         QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
         QueryLifecycleFaultKind::ObservationP2BudgetPressure,
         QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
