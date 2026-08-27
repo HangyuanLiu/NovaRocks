@@ -16,6 +16,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(StaticFileDisposableCarrier),
         Box::new(GracefulDrain),
+        Box::new(ForcedDrain),
     ]
 }
 
@@ -94,6 +95,70 @@ impl Scenario for StaticFileDisposableCarrier {
 }
 
 struct GracefulDrain;
+
+struct ForcedDrain;
+
+impl Scenario for ForcedDrain {
+    fn name(&self) -> &'static str {
+        "frontend-lifecycle/forced-drain"
+    }
+
+    fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        Ok(ScenarioLaunchConfig {
+            config_overlay: CrossProcessConfigOverlay {
+                fe: Some(
+                    "[server]\nfrontend_drain_timeout_ms = 500\nfrontend_cleanup_timeout_ms = 2000\n"
+                        .to_string(),
+                ),
+                be: None,
+            },
+            ..Default::default()
+        })
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let user = context.mysql_user().to_string();
+        let port = context.mysql_port();
+        let (query_tx, query_rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let result = (|| -> Result<Vec<i64>> {
+                let mut connection = mysql_actor::connect(&user, port, Duration::from_secs(30))?;
+                connection
+                    .query("SELECT sleep(10)")
+                    .context("run forced-drain query")
+            })();
+            let _ = query_tx.send(result);
+        });
+        wait_for_active_statement(context)?;
+        context.action("observed an admitted statement before the short drain deadline");
+
+        context
+            .handle()
+            .begin_fe_drain()
+            .context("begin forced FE drain through SIGTERM")?;
+        let result = query_rx
+            .recv_timeout(context.remaining("wait for forced-drain cancellation")?)
+            .map_err(|error| anyhow::anyhow!("forced-drain query did not finish: {error}"))?;
+        let error = format!(
+            "{:#}",
+            result.expect_err("forced drain must cancel the statement")
+        );
+        ensure!(
+            error.contains("FRONTEND_DRAIN_DEADLINE_EXCEEDED"),
+            "forced drain did not preserve the typed deadline cancellation: {error}"
+        );
+        context.action("observed the typed frontend drain deadline cancellation");
+
+        let deadline = context.deadline();
+        context
+            .handle()
+            .wait_fe_exit_until(deadline)
+            .context("wait for FE exit after forced drain")?;
+        context.action("FE exited successfully within the configured forced-drain budget");
+        Ok(())
+    }
+}
 
 impl Scenario for GracefulDrain {
     fn name(&self) -> &'static str {

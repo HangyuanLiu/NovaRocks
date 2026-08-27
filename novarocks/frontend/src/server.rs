@@ -668,6 +668,12 @@ where
             let graceful = tokio::time::timeout(drain_timeout, lifecycle.wait_for_no_active_work()).await;
             if graceful.is_err() {
                 lifecycle.cancel_active_at_drain_deadline(drain_timeout.as_millis().min(u64::MAX as u128) as u64);
+                // Keep the admitted protocol tasks alive long enough to
+                // observe the first-wins deadline cancellation and return
+                // its typed error. Final connection termination remains the
+                // fallback when a cancelled attempt does not converge inside
+                // the configured bounded cleanup window.
+                let _ = tokio::time::timeout(cleanup_timeout, lifecycle.wait_for_no_active_work()).await;
             }
             session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
             client_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);

@@ -4340,9 +4340,21 @@ fn merge_safe_config_overlay(
     let overlay = overlay
         .as_table()
         .context("cross-process config overlay root must be a TOML table")?;
-    for key in ["server", "cluster", "state_store"] {
+    for key in ["cluster", "state_store"] {
         if overlay.contains_key(key) {
             bail!("cross-process config overlay cannot modify [{key}]");
+        }
+    }
+    if let Some(server) = overlay.get("server").and_then(Value::as_table) {
+        for key in server.keys() {
+            if !matches!(
+                key.as_str(),
+                "frontend_drain_timeout_ms" | "frontend_cleanup_timeout_ms"
+            ) {
+                bail!(
+                    "cross-process config overlay cannot modify server.{key}; only frontend drain budgets are scenario-safe"
+                );
+            }
         }
     }
     if overlay
@@ -6120,6 +6132,16 @@ static_file_path = "catalogs.toml"
         );
         assert_eq!(root["runtime"]["exchange_wait_ms"].as_integer(), Some(42));
         assert!(merge_safe_config_overlay(root, "[cluster]\nrole = 'be'\n").is_err());
+        assert!(merge_safe_config_overlay(root, "[server]\ngrpc_port = 1\n").is_err());
+        merge_safe_config_overlay(
+            root,
+            "[server]\nfrontend_drain_timeout_ms = 500\nfrontend_cleanup_timeout_ms = 2000\n",
+        )
+        .expect("merge scenario-safe frontend drain budgets");
+        assert_eq!(
+            root["server"]["frontend_drain_timeout_ms"].as_integer(),
+            Some(500)
+        );
         assert!(merge_safe_config_overlay(root, "[standalone_server]\nmysql_port = 1\n").is_err());
     }
 

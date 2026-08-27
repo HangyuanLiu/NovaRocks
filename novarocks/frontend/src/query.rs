@@ -1229,9 +1229,23 @@ impl FrontendQuerySession {
                 }
             }
         } else {
-            worker
-                .await
-                .map_err(|error| internal_error(error.to_string()))?
+            // A drain cancellation is injected through the same statement
+            // source as ordinary query control. Some blocking execution paths
+            // only observe it at their next cooperative boundary, so the
+            // protocol owner must not wait indefinitely before returning the
+            // first-wins typed cancellation to its already-admitted client.
+            loop {
+                tokio::select! {
+                    result = &mut worker => break result.map_err(|error| internal_error(error.to_string()))?,
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if cancellation.is_cancelled() {
+                            return Err(cancellation_error(
+                                cancellation.reason().expect("cancelled statement has a reason"),
+                            ));
+                        }
+                    }
+                }
+            }
         };
         let (result, completion) = result;
         match completion {
