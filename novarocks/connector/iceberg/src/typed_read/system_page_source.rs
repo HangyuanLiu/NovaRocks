@@ -68,12 +68,12 @@ use novarocks_types::logical::{LogicalType, field_with_logical_type};
 
 use crate::access_binding::IcebergReadBinding;
 use crate::iceberg::spec::{
-    DataContentType, DataFile, DataFileFormat, Datum, FieldSummary, Literal, Manifest,
-    ManifestFile, ManifestList, ManifestStatus, PartitionSpec, PrimitiveLiteral, PrimitiveType,
-    Schema, SnapshotRetention, TableMetadata, Type,
+    DataContentType, DataFile, DataFileFormat, Datum, FieldSummary, ListType, Literal, Manifest,
+    ManifestFile, ManifestList, ManifestStatus, MapType, NestedField, PartitionSpec,
+    PrimitiveLiteral, PrimitiveType, Schema, SnapshotRetention, StructType, TableMetadata, Type,
 };
 
-use super::column_handle::{IcebergColumnHandle, corrupt, invalid, unsupported};
+use super::column_handle::{IcebergColumnHandle, corrupt, invalid, type_to_json, unsupported};
 use super::system_table::{
     FilesTableSplit, IcebergPartitionsView, IcebergSystemTableExecution,
     IcebergSystemTableReference, IcebergSystemTableType, TrinoManifestFile,
@@ -175,6 +175,171 @@ fn iceberg_primitive_to_arrow(primitive: &PrimitiveType) -> Result<DataType, Con
             ));
         }
     })
+}
+
+/// Hands out the field IDs a metadata relation's column identities carry.
+///
+/// A metadata relation is not an Iceberg table: its columns have no
+/// format-assigned IDs, because no manifest ever describes them. The IDs below
+/// exist only to make each published identity distinct and internally
+/// consistent -- a scan of a system relation is resolved by column *name*
+/// against the frozen schema (see [`project_system_relation_columns`]), never
+/// by ID. They are minted fresh for every derivation and are never compared
+/// against a table field.
+struct MetadataRelationFieldIds {
+    next: i32,
+}
+
+impl MetadataRelationFieldIds {
+    /// Iceberg field IDs are positive, so the first one is 1.
+    const fn new() -> Self {
+        Self { next: 1 }
+    }
+
+    fn take(&mut self) -> Result<i32, ConnectorError> {
+        let field_id = self.next;
+        self.next = self.next.checked_add(1).ok_or_else(|| {
+            internal("iceberg metadata relation exhausted its column identity field ids")
+        })?;
+        Ok(field_id)
+    }
+}
+
+/// The Iceberg mirror of one frozen metadata-relation Arrow field.
+fn metadata_relation_field(
+    field: &Field,
+    ids: &mut MetadataRelationFieldIds,
+) -> Result<NestedField, ConnectorError> {
+    let field_type = metadata_relation_type(field.data_type(), ids)?;
+    let field_id = ids.take()?;
+    Ok(if field.is_nullable() {
+        NestedField::optional(field_id, field.name(), field_type)
+    } else {
+        NestedField::required(field_id, field.name(), field_type)
+    })
+}
+
+/// The Iceberg mirror of one frozen metadata-relation Arrow type.
+///
+/// This is the inverse of [`iceberg_primitive_to_arrow`] over exactly the
+/// carriers the frozen schemas above produce, plus the three constructors they
+/// nest. It is total on that set and refuses everything else rather than
+/// widening: a carrier this function has not been told about would otherwise be
+/// published under a type the relation never produces.
+///
+/// `Utf8` becomes `string`, which is the metadata relation's own frozen column
+/// type and not a downgrade of some base-table `uuid`: the frozen schema
+/// already renders a UUID partition value or bound as text, so `string` is what
+/// the column *is* here.
+fn metadata_relation_type(
+    data_type: &DataType,
+    ids: &mut MetadataRelationFieldIds,
+) -> Result<Type, ConnectorError> {
+    let primitive = match data_type {
+        DataType::Boolean => Some(PrimitiveType::Boolean),
+        DataType::Int32 => Some(PrimitiveType::Int),
+        DataType::Int64 => Some(PrimitiveType::Long),
+        DataType::Float32 => Some(PrimitiveType::Float),
+        DataType::Float64 => Some(PrimitiveType::Double),
+        DataType::Decimal128(precision, scale) => Some(PrimitiveType::Decimal {
+            precision: u32::from(*precision),
+            scale: u32::try_from(*scale)
+                .map_err(|_| invalid(format!("iceberg decimal scale {scale} is out of range")))?,
+        }),
+        DataType::Date32 => Some(PrimitiveType::Date),
+        DataType::Time64(TimeUnit::Microsecond) => Some(PrimitiveType::Time),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => Some(PrimitiveType::Timestamp),
+        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => Some(PrimitiveType::Timestamptz),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => Some(PrimitiveType::TimestampNs),
+        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => Some(PrimitiveType::TimestamptzNs),
+        DataType::Utf8 => Some(PrimitiveType::String),
+        DataType::Binary => Some(PrimitiveType::Binary),
+        DataType::FixedSizeBinary(width) => Some(PrimitiveType::Fixed(
+            u64::try_from(*width)
+                .map_err(|_| invalid(format!("iceberg fixed width {width} is out of range")))?,
+        )),
+        _ => None,
+    };
+    if let Some(primitive) = primitive {
+        return Ok(Type::Primitive(primitive));
+    }
+    match data_type {
+        DataType::Struct(fields) => {
+            let mut mirrored = Vec::with_capacity(fields.len());
+            for field in fields {
+                mirrored.push(Arc::new(metadata_relation_field(field.as_ref(), ids)?));
+            }
+            Ok(Type::Struct(StructType::new(mirrored)))
+        }
+        DataType::List(element) => Ok(Type::List(ListType::new(Arc::new(
+            metadata_relation_field(element.as_ref(), ids)?,
+        )))),
+        DataType::Map(entries, _) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(internal(
+                    "an iceberg metadata relation map carries entries that are not a struct",
+                ));
+            };
+            let [key, value] = fields.as_ref() else {
+                return Err(internal(
+                    "an iceberg metadata relation map must carry exactly a key and a value",
+                ));
+            };
+            Ok(Type::Map(MapType::new(
+                Arc::new(metadata_relation_field(key.as_ref(), ids)?),
+                Arc::new(metadata_relation_field(value.as_ref(), ids)?),
+            )))
+        }
+        other => Err(unsupported(format!(
+            "an iceberg metadata relation column carrier {other:?} has no iceberg type"
+        ))),
+    }
+}
+
+/// The Iceberg mirror of one frozen metadata-relation schema, as a ROW.
+fn metadata_relation_row(schema: &SchemaRef) -> Result<Type, ConnectorError> {
+    let mut ids = MetadataRelationFieldIds::new();
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        fields.push(Arc::new(metadata_relation_field(field.as_ref(), &mut ids)?));
+    }
+    Ok(Type::Struct(StructType::new(fields)))
+}
+
+/// The column handles one worker system relation publishes, in frozen order.
+///
+/// The boundary hands these to the engine as the relation's columns, and the
+/// reader resolves a scan's assignments back against the same frozen schema, so
+/// both ends are derived from one function rather than from two lists that
+/// could disagree about a column's name, order, or type.
+pub fn system_relation_columns(
+    relation: IcebergSystemTableType,
+    schema: &Schema,
+    specs: &[PartitionSpec],
+) -> Result<Vec<IcebergColumnHandle>, ConnectorError> {
+    let frozen = system_relation_schema(relation, schema, specs)?;
+    let mut ids = MetadataRelationFieldIds::new();
+    let mut columns = Vec::with_capacity(frozen.fields().len());
+    for field in frozen.fields() {
+        let mirrored = metadata_relation_field(field.as_ref(), &mut ids)?;
+        columns.push(IcebergColumnHandle::base_column(&mirrored)?);
+    }
+    Ok(columns)
+}
+
+/// The frozen `$files` output schema, rendered as the JSON a split carries.
+pub fn files_relation_schema_json(
+    schema: &Schema,
+    specs: &[PartitionSpec],
+) -> Result<String, ConnectorError> {
+    let frozen = system_relation_schema(IcebergSystemTableType::Files, schema, specs)?;
+    type_to_json(&metadata_relation_row(&frozen)?)
+}
+
+/// One schema-derived ROW type, rendered as the JSON a `$files` split carries.
+pub fn derived_row_type_json(row: &DataType) -> Result<String, ConnectorError> {
+    let mut ids = MetadataRelationFieldIds::new();
+    type_to_json(&metadata_relation_type(row, &mut ids)?)
 }
 
 // ---------------------------------------------------------------------------

@@ -67,6 +67,11 @@ message ScalarType {
   // for nanoseconds, mirroring src/types/arrow_thrift.rs. Conversion boundaries
   // must reject any other value.
   optional int32 time_unit = 5;
+  // DATETIME time zone. Present exactly when the engine's timestamp carries
+  // one, and then it is the zone verbatim. A timestamp with a zone and one
+  // without are different types, so dropping this would silently rewrite a
+  // column's type across the process boundary.
+  optional string time_zone = 6;
 }
 
 // List SQL type descriptor.

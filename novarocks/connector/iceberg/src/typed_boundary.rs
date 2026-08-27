@@ -67,32 +67,33 @@ use novarocks_spi::connector::{
 use crate::control_runtime::IcebergControlRuntime;
 use crate::file_pruning::file_may_satisfy_physical_predicates;
 use crate::iceberg::spec::{
-    DataContentType, DataFileFormat, Datum, FormatVersion, Literal, ManifestStatus, NestedField,
-    PrimitiveLiteral, PrimitiveType, Schema, SchemaRef, StructType, TableMetadata, Type,
+    DataContentType, DataFileFormat, Datum, FormatVersion, Literal, ManifestFile, ManifestStatus,
+    NestedField, PartitionSpec, PrimitiveLiteral, Schema, SchemaRef, StructType, TableMetadata,
+    Type,
 };
 use crate::iceberg::table::Table;
 use crate::loaded_table::IcebergPhysicalTable;
 use crate::read_model::{IcebergReadFile, IcebergReadSnapshot};
 use crate::ref_snapshot::resolve_branch_head_snapshot_id;
-use crate::row_lineage_synth::{
-    ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL,
-    ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-    ICEBERG_ROW_ID_COL,
-};
 use crate::scan_model::{
     IcebergDataFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue,
     IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
     IcebergPhysicalPredicateValue,
 };
+use crate::schema_facts::row_lineage_enabled;
 use crate::typed_read::column_handle::{corrupt, from_protocol, invalid, unsupported};
 use crate::typed_read::{
-    HiveTransactionHandle, ICEBERG_CHANGE_OP_COLUMN, IcebergChangeSplit,
-    IcebergChangeWindowEndpoints, IcebergChangeWindowHandle, IcebergChangeWindowHandleParams,
-    IcebergChangeWindowSplitSource, IcebergColumnHandle, IcebergDeleteFileFacts, IcebergFileFormat,
-    IcebergPlannedDataFile, IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions,
-    IcebergTableHandle, IcebergTableHandleParams, change_op_column_handle,
-    decode_tuple_domain as decode_iceberg_tuple_domain,
-    encode_tuple_domain as encode_iceberg_tuple_domain, plan_change_window_splits,
+    ALWAYS_BOUND_METADATA_COLUMNS, FilesTableSplit, FilesTableSplitSource,
+    FilesTableSplitSourceParams, HiveTransactionHandle, ICEBERG_CHANGE_OP_COLUMN,
+    IcebergChangeSplit, IcebergChangeWindowEndpoints, IcebergChangeWindowHandle,
+    IcebergChangeWindowHandleParams, IcebergChangeWindowSplitSource, IcebergColumnHandle,
+    IcebergDeleteFileFacts, IcebergFileFormat, IcebergMetadataColumn, IcebergPlannedDataFile,
+    IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions, IcebergSystemTableExecution,
+    IcebergSystemTableReference, IcebergTableHandle, IcebergTableHandleParams,
+    ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile, bounds_row_type, change_op_column_handle,
+    decode_tuple_domain as decode_iceberg_tuple_domain, derived_row_type_json,
+    encode_tuple_domain as encode_iceberg_tuple_domain, files_relation_schema_json,
+    partition_row_type, plan_change_window_splits, system_relation_columns,
 };
 
 /// The Iceberg table property carrying the default name mapping.
@@ -140,31 +141,46 @@ pub enum IcebergSystemRelation {
 }
 
 impl IcebergSystemRelation {
-    /// The immutable reference kind a worker is given.
-    const fn system_table_type(self) -> dto::IcebergSystemTableType {
-        match self {
-            // `$partitions` binds to the same pinned FILES plan it aggregates.
-            Self::Files | Self::Partitions => dto::IcebergSystemTableType::Files,
-            Self::Entries => dto::IcebergSystemTableType::Entries,
-            Self::Snapshots => dto::IcebergSystemTableType::Snapshots,
-            Self::History => dto::IcebergSystemTableType::History,
-            Self::Refs => dto::IcebergSystemTableType::Refs,
-            Self::Manifests => dto::IcebergSystemTableType::Manifests,
-        }
-    }
-
-    /// Where the relation runs.
+    /// How a worker is told to read this relation, when a worker can.
     ///
-    /// FILES walks every manifest of the snapshot, which is real distributable
-    /// I/O. The other five read only the single pinned metadata file, so
-    /// spreading them over the cluster would multiply one small read rather
-    /// than divide any work.
-    const fn distribution(self) -> SystemTableDistribution {
+    /// `None` is `$partitions` and only `$partitions`: it is an aggregation
+    /// over `$files`, and the wire has no reference kind that says so. A FILES
+    /// reference would reach a backend as the un-aggregated `$files` relation,
+    /// which answers a different question with a plausible shape -- one row per
+    /// data file instead of one row per partition -- so it is refused at
+    /// planning instead.
+    ///
+    /// FILES is distributed because it walks every manifest of the snapshot,
+    /// which is real divisible I/O. The other five read only the single pinned
+    /// metadata file, so spreading them over the cluster would multiply one
+    /// small read rather than divide any work.
+    const fn worker_plan(self) -> Option<(dto::IcebergSystemTableType, SystemTableDistribution)> {
         match self {
-            Self::Files | Self::Partitions => SystemTableDistribution::AllNodes,
-            Self::Entries | Self::Snapshots | Self::History | Self::Refs | Self::Manifests => {
-                SystemTableDistribution::SingleCoordinator
-            }
+            Self::Files => Some((
+                dto::IcebergSystemTableType::Files,
+                SystemTableDistribution::AllNodes,
+            )),
+            Self::Entries => Some((
+                dto::IcebergSystemTableType::Entries,
+                SystemTableDistribution::SingleCoordinator,
+            )),
+            Self::Snapshots => Some((
+                dto::IcebergSystemTableType::Snapshots,
+                SystemTableDistribution::SingleCoordinator,
+            )),
+            Self::History => Some((
+                dto::IcebergSystemTableType::History,
+                SystemTableDistribution::SingleCoordinator,
+            )),
+            Self::Refs => Some((
+                dto::IcebergSystemTableType::Refs,
+                SystemTableDistribution::SingleCoordinator,
+            )),
+            Self::Manifests => Some((
+                dto::IcebergSystemTableType::Manifests,
+                SystemTableDistribution::SingleCoordinator,
+            )),
+            Self::Partitions => None,
         }
     }
 }
@@ -446,6 +462,143 @@ impl IcebergTypedBoundary {
         }
     }
 
+    /// Whether this relation's rows carry Iceberg v3 row lineage.
+    ///
+    /// The answer is a table property, which the handle deliberately does not
+    /// carry: only the four split-planning knobs travel on it. It is read back
+    /// from the pinned metadata the handle was frozen against, so the column
+    /// set a scan is offered describes the very snapshot it will read.
+    fn relation_has_row_lineage(
+        &self,
+        handle: &IcebergTableHandle,
+    ) -> Result<bool, ConnectorError> {
+        let physical = self.load_pinned_relation(handle.schema_table_name())?;
+        Ok(row_lineage_enabled(physical.table.metadata()))
+    }
+
+    /// The pinned metadata one system relation reference describes.
+    ///
+    /// The reference names the base relation and the exact metadata file it was
+    /// frozen from, so the load is verified against both before its schema is
+    /// used: a location that has been reused by another table would otherwise
+    /// answer with some other relation's columns.
+    fn system_relation_metadata(
+        &self,
+        reference: &IcebergSystemTableReference,
+    ) -> Result<TableMetadata, ConnectorError> {
+        let physical = self.load_pinned_relation(reference.schema_table_name())?;
+        let metadata = physical.table.metadata();
+        reference.verify_loaded_metadata(metadata)?;
+        Ok(metadata.clone())
+    }
+
+    /// The columns one system relation exposes, in the frozen order.
+    ///
+    /// A system relation is not a table, so it has no table fields to publish
+    /// and no metadata pseudo-columns either: every column it has is one of its
+    /// own, and each is visible.
+    fn system_relation_column_bindings(
+        &self,
+        reference: &dto::ConnectorSystemTableReference,
+    ) -> Result<Vec<TypedColumnBinding>, ConnectorError> {
+        let reference = IcebergSystemTableReference::from_system_table_reference_proto(reference)?;
+        let metadata = self.system_relation_metadata(&reference)?;
+        let columns = system_relation_columns(
+            reference.system_table_type(),
+            metadata.current_schema(),
+            &partition_specs_of(&metadata),
+        )?;
+        let mut bindings = Vec::with_capacity(columns.len());
+        for column in columns {
+            let name = column.base_column_identity().name().to_string();
+            bindings.push(TypedColumnBinding::new(
+                name,
+                iceberg_column_to_wire(&column)?,
+                false,
+            ));
+        }
+        Ok(bindings)
+    }
+
+    /// Enumerate the work of one pinned system relation.
+    ///
+    /// `$files` is the only distributed system relation: one split per manifest
+    /// of the pinned snapshot. The other five were planned as
+    /// [`SystemTableDistribution::SingleCoordinator`], which froze their scan as
+    /// a whole-relation read -- one backend opens the pinned metadata file
+    /// itself and needs no split queue. Their work is therefore genuinely
+    /// unsplit, and an empty enumeration is the true answer rather than a
+    /// refusal: the rows come from the whole-relation lane either way.
+    fn system_relation_split_source(
+        &self,
+        reference: &dto::ConnectorSystemTableReference,
+    ) -> Result<Box<dyn TypedConnectorSplitSource>, ConnectorError> {
+        let reference = IcebergSystemTableReference::from_system_table_reference_proto(reference)?;
+        if reference.system_table_type().execution()
+            != IcebergSystemTableExecution::DistributedSplits
+        {
+            return Ok(Box::new(UnsplitRelationSource));
+        }
+        let metadata = self.system_relation_metadata(&reference)?;
+        let specs = partition_specs_of(&metadata);
+        let table_schema = metadata.current_schema().as_ref().clone();
+        let mut partition_spec_jsons = BTreeMap::new();
+        for spec in &specs {
+            partition_spec_jsons.insert(
+                spec.spec_id(),
+                serde_json::to_string(spec).map_err(|error| {
+                    corrupt(format!(
+                        "iceberg partition spec is not serializable: {error}"
+                    ))
+                })?,
+            );
+        }
+        FilesTableSplitSource::try_new(FilesTableSplitSourceParams {
+            manifests: self.pinned_snapshot_manifests(&reference)?,
+            table_schema_json: serde_json::to_string(&table_schema).map_err(|error| {
+                corrupt(format!("iceberg table schema is not serializable: {error}"))
+            })?,
+            metadata_table_schema_json: files_relation_schema_json(&table_schema, &specs)?,
+            partition_spec_jsons,
+            partition_column_type_json: partition_row_type(&table_schema, &specs)?
+                .as_ref()
+                .map(derived_row_type_json)
+                .transpose()?,
+            bounds_column_type_json: bounds_row_type(&table_schema)?
+                .as_ref()
+                .map(derived_row_type_json)
+                .transpose()?,
+            encryption_key_id: None,
+            reference,
+        })
+        .map(|source| {
+            Box::new(IcebergTypedSplitSource::new(source)) as Box<dyn TypedConnectorSplitSource>
+        })
+    }
+
+    /// The manifest-list entries of the snapshot a `$files` reference pins.
+    fn pinned_snapshot_manifests(
+        &self,
+        reference: &IcebergSystemTableReference,
+    ) -> Result<Vec<TrinoManifestFile>, ConnectorError> {
+        let snapshot_id = reference.snapshot_id().ok_or_else(|| {
+            corrupt("iceberg $files reference carries no pinned snapshot to walk")
+        })?;
+        let physical = self.load_pinned_relation(reference.schema_table_name())?;
+        let table = physical.table.clone();
+        let entries = self
+            .runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { pinned_snapshot_manifest_list(&table, snapshot_id).await })
+            .map_err(unavailable)?
+            .map_err(unavailable)?;
+        entries
+            .iter()
+            .map(TrinoManifestFile::from_manifest_file)
+            .collect()
+    }
+
     /// Enumerate one frozen change window as the difference of its endpoints.
     fn change_window_split_source(
         &self,
@@ -579,7 +732,8 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
                         false,
                     ));
                 }
-                for (name, column) in metadata_pseudo_columns(self.relation_has_row_lineage(&handle)?)?
+                for (name, column) in
+                    metadata_pseudo_columns(self.relation_has_row_lineage(&handle)?)?
                 {
                     bindings.push(TypedColumnBinding::new(
                         name,
@@ -675,6 +829,17 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
             // scan of some other relation.
             return Ok(None);
         };
+        // A relation with no worker plan is one this stack can name but cannot
+        // read. It is refused here, where the `$suffix` is still visible, so
+        // the message can say which relation and why -- rather than resolved
+        // into some other relation's plan and answered with its rows.
+        let Some((system_table_type, distribution)) = relation.worker_plan() else {
+            return Err(unsupported(format!(
+                "iceberg {}.{} is an aggregation over $files that the connector read contract cannot carry: IcebergSystemTableReference has no reference kind for it",
+                name.schema_name(),
+                name.table_name()
+            )));
+        };
         let base_name = SchemaTableName::try_new(name.schema_name(), &base_table)?;
         let Some(physical) = self.load_relation(&base_name)? else {
             return Ok(None);
@@ -697,7 +862,7 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
                 // frozen, not the `$suffix` spelling that selected it.
                 table_name: base_table,
             }),
-            system_table_type: relation.system_table_type() as i32,
+            system_table_type: system_table_type as i32,
             metadata_file_location,
             table_uuid: metadata.uuid().to_string(),
             snapshot_id: metadata.current_snapshot_id(),
@@ -709,10 +874,7 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
                 )),
             },
         ))?;
-        Ok(Some(TypedSystemTablePlan::new(
-            wrapped,
-            relation.distribution(),
-        )))
+        Ok(Some(TypedSystemTablePlan::new(wrapped, distribution)))
     }
 
     fn get_change_window_plan(
@@ -767,6 +929,14 @@ impl TypedConnectorSplitManager for IcebergTypedBoundary {
             return Ok(Box::new(IcebergTypedSplitSource::new(
                 self.change_window_split_source(&handle)?,
             )));
+        }
+
+        // A system relation reads metadata files, not data files: `$files` cuts
+        // a snapshot's manifest list with no predicate and no delete state, and
+        // the rest are unsplit. Nothing about the data enumerator below applies
+        // to either.
+        if let ConnectorRelation::SystemTable(reference) = table.relation() {
+            return self.system_relation_split_source(reference);
         }
 
         let handle = self.data_table_handle(table)?;
@@ -834,6 +1004,39 @@ impl IcebergWireSplit for IcebergSplit {
 impl IcebergWireSplit for IcebergChangeSplit {
     fn to_wire_split_proto(&self) -> dto::ConnectorSplit {
         self.to_connector_split_proto()
+    }
+}
+
+impl IcebergWireSplit for FilesTableSplit {
+    fn to_wire_split_proto(&self) -> dto::ConnectorSplit {
+        self.to_connector_split_proto()
+    }
+}
+
+/// The enumeration of a relation whose work is not divided into splits.
+///
+/// It is finished before it is asked: the scan that owns it was frozen as a
+/// whole-relation read, so one backend opens the relation itself. Yielding a
+/// split here would hand the same relation to a second reader and double every
+/// row it produces.
+#[derive(Debug)]
+struct UnsplitRelationSource;
+
+impl TypedConnectorSplitSource for UnsplitRelationSource {
+    fn next_batch(
+        &mut self,
+        _max_size: usize,
+        _dynamic_filter: &WireDynamicFilterSnapshot,
+    ) -> Result<ConnectorSplitBatch<ValidatedConnectorSplit>, ConnectorError> {
+        Ok(ConnectorSplitBatch::finished())
+    }
+
+    fn is_finished(&self) -> bool {
+        true
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
     }
 }
 
@@ -1395,6 +1598,38 @@ async fn plan_pinned_snapshot(
     Ok((read_snapshot, facts))
 }
 
+/// Every partition spec a table has ever had, in the order the metadata holds
+/// them.
+///
+/// A metadata relation's `partition` column is the union across specs, so the
+/// whole set is handed over rather than the default spec alone.
+fn partition_specs_of(metadata: &TableMetadata) -> Vec<PartitionSpec> {
+    metadata
+        .partition_specs_iter()
+        .map(|spec| spec.as_ref().clone())
+        .collect()
+}
+
+/// The manifest-list entries of one pinned snapshot.
+///
+/// Only the list is read: the manifests themselves are what the `$files` splits
+/// distribute, so opening them here would do on the coordinator the very work
+/// the splits exist to spread.
+async fn pinned_snapshot_manifest_list(
+    table: &Table,
+    snapshot_id: i64,
+) -> Result<Vec<ManifestFile>, String> {
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("iceberg snapshot {snapshot_id} is absent from table metadata"))?;
+    let manifest_list = snapshot
+        .load_manifest_list(table.file_io(), metadata)
+        .await
+        .map_err(|error| format!("load manifest list: {error}"))?;
+    Ok(manifest_list.entries().to_vec())
+}
+
 async fn collect_manifest_facts(table: &Table, snapshot_id: i64) -> Result<ManifestFacts, String> {
     let metadata = table.metadata();
     let snapshot = metadata
@@ -1710,8 +1945,8 @@ mod tests {
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::iceberg::spec::{
-        FormatVersion, Operation, PartitionSpec, Snapshot, SnapshotReference, SnapshotRetention,
-        SortOrder, Summary, TableMetadataBuilder, Transform,
+        FormatVersion, Operation, PartitionSpec, PrimitiveType, Snapshot, SnapshotReference,
+        SnapshotRetention, SortOrder, Summary, TableMetadataBuilder, Transform,
     };
     use crate::iceberg::{NamespaceIdent, TableCreation};
     use crate::resources::IcebergControlResources;
@@ -1798,6 +2033,16 @@ mod tests {
             table: &str,
             properties: StdHashMap<String, String>,
         ) {
+            self.create_table_at(namespace, table, FormatVersion::V2, properties);
+        }
+
+        fn create_table_at(
+            &self,
+            namespace: &str,
+            table: &str,
+            format_version: FormatVersion,
+            properties: StdHashMap<String, String>,
+        ) {
             let catalog = Arc::clone(self.runtime.catalog());
             let namespace_name = namespace.to_string();
             let table_name = table.to_string();
@@ -1819,13 +2064,34 @@ mod tests {
                         TableCreation::builder()
                             .name(table_name)
                             .schema(table_schema())
-                            .format_version(FormatVersion::V2)
+                            .format_version(format_version)
                             .properties(properties)
                             .build(),
                     )
                     .await
                     .expect("create table");
             });
+        }
+
+        /// The hidden binding names a relation publishes, in publication order.
+        fn hidden_binding_names(&self, schema: &str, table: &str) -> Vec<String> {
+            let wrapped = self
+                .boundary
+                .get_table_handle(
+                    &session(),
+                    &name(schema, table),
+                    TypedRelationVersion::Current,
+                    None,
+                )
+                .expect("get table handle")
+                .expect("relation exists");
+            self.boundary
+                .get_column_bindings(&session(), &wrapped)
+                .expect("column bindings")
+                .iter()
+                .filter(|binding| binding.is_hidden())
+                .map(|binding| binding.name().to_string())
+                .collect()
         }
     }
 
@@ -2126,29 +2392,71 @@ mod tests {
             .filter(|binding| binding.is_hidden())
             .map(TypedColumnBinding::name)
             .collect::<Vec<_>>();
-        assert_eq!(
-            hidden,
-            vec![
-                PSEUDO_COLUMN_PATH,
-                PSEUDO_COLUMN_PARTITION,
-                PSEUDO_COLUMN_FILE_MODIFIED_TIME,
-                PSEUDO_COLUMN_ROW_ID,
-                PSEUDO_COLUMN_LAST_UPDATED_SEQUENCE_NUMBER,
-            ]
+        // A v2 relation has no row lineage, so it publishes only the two
+        // metadata columns every Iceberg table has.
+        assert_eq!(hidden, vec!["_file", "_pos"]);
+
+        // Every binding is a usable predicate key, and each metadata column
+        // keeps the reserved field ID its reader binds against rather than
+        // borrowing a table field.
+        for metadata in ALWAYS_BOUND_METADATA_COLUMNS {
+            let column = wire_column_to_iceberg(
+                bindings
+                    .iter()
+                    .find(|binding| binding.name() == metadata.column_name())
+                    .unwrap_or_else(|| panic!("{} binding", metadata.column_name()))
+                    .column(),
+            )
+            .expect("concrete column");
+            assert_eq!(column.base_field_id(), metadata.field_id());
+            assert_eq!(column.base_column_identity().name(), metadata.column_name());
+            assert_eq!(
+                column.type_json(),
+                format!("\"{}\"", metadata.declared_type())
+            );
+        }
+    }
+
+    /// The engine writes `_file`, `_pos`, `_row_id` and
+    /// `_last_updated_sequence_number`; a relation that published any other
+    /// spelling would be unaddressable from SQL.
+    #[test]
+    fn each_metadata_column_binds_under_the_name_the_engine_asks_for() {
+        let fixture = fixture();
+        fixture.create_table_at(
+            "db",
+            "lineage",
+            FormatVersion::V3,
+            StdHashMap::from([("write.row-lineage".to_string(), "true".to_string())]),
         );
 
-        // Every binding is a usable predicate key, and the pseudo-columns keep
-        // their Iceberg reserved field IDs rather than borrowing a table field.
-        let path = wire_column_to_iceberg(
-            bindings
-                .iter()
-                .find(|binding| binding.name() == PSEUDO_COLUMN_PATH)
-                .expect("path binding")
-                .column(),
-        )
-        .expect("concrete column");
-        assert_eq!(path.base_field_id(), RESERVED_FIELD_ID_FILE_PATH);
-        assert_eq!(path.base_column_identity().name(), ICEBERG_FILE_PATH_COL);
+        assert_eq!(
+            fixture.hidden_binding_names("db", "lineage"),
+            vec!["_file", "_pos", "_row_id", "_last_updated_sequence_number"]
+        );
+    }
+
+    /// A row-lineage column is absent from a relation that stores no row
+    /// lineage, rather than bound and forever empty: `_row_id` is
+    /// `first_row_id + position`, and there is no `first_row_id` to add.
+    #[test]
+    fn a_relation_without_row_lineage_publishes_no_row_lineage_column() {
+        let fixture = fixture();
+        fixture.create_table_at("db", "v2", FormatVersion::V2, StdHashMap::new());
+        fixture.create_table_at(
+            "db",
+            "v3_opted_out",
+            FormatVersion::V3,
+            StdHashMap::from([("write.row-lineage".to_string(), "false".to_string())]),
+        );
+
+        for table in ["v2", "v3_opted_out"] {
+            assert_eq!(
+                fixture.hidden_binding_names("db", table),
+                vec!["_file", "_pos"],
+                "{table}"
+            );
+        }
     }
 
     #[test]
@@ -2340,8 +2648,115 @@ mod tests {
         }
     }
 
+    /// `$partitions` is a relation this connector can name and cannot carry:
+    /// the wire's reference kinds do not include the aggregation, and a FILES
+    /// reference would reach a backend as un-aggregated `$files` -- one row per
+    /// data file where the query asked for one row per partition. Refusing is
+    /// the only answer that is not silently wrong.
     #[test]
-    fn partitions_binds_to_the_same_pinned_files_plan() {
+    fn partitions_is_refused_rather_than_answered_with_files_rows() {
+        let fixture = fixture();
+        fixture.create_table("db", "t", StdHashMap::new());
+
+        let error = fixture
+            .boundary
+            .get_system_table_plan(&session(), &name("db", "t$partitions"))
+            .expect_err("partitions has no worker plan");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert!(
+            error.to_string().contains("aggregation over $files"),
+            "{error}"
+        );
+    }
+
+    /// A scan of a system relation asks it to bind the very column names the
+    /// frozen metadata-relation contract declares, in the frozen order.
+    #[test]
+    fn a_system_relation_resolves_its_own_columns_in_the_frozen_order() {
+        let fixture = fixture();
+        fixture.create_table("db", "t", StdHashMap::new());
+
+        let expected = [
+            (
+                "t$snapshots",
+                vec![
+                    "committed_at",
+                    "snapshot_id",
+                    "parent_id",
+                    "operation",
+                    "manifest_list",
+                    "summary",
+                ],
+            ),
+            (
+                "t$history",
+                vec![
+                    "made_current_at",
+                    "snapshot_id",
+                    "parent_id",
+                    "is_current_ancestor",
+                ],
+            ),
+            (
+                "t$refs",
+                vec![
+                    "name",
+                    "type",
+                    "snapshot_id",
+                    "max_reference_age_in_ms",
+                    "min_snapshots_to_keep",
+                    "max_snapshot_age_in_ms",
+                ],
+            ),
+            (
+                "t$entries",
+                vec![
+                    "status",
+                    "snapshot_id",
+                    "sequence_number",
+                    "file_sequence_number",
+                    "data_file",
+                    "readable_metrics",
+                ],
+            ),
+        ];
+        for (table, columns) in expected {
+            let plan = fixture
+                .boundary
+                .get_system_table_plan(&session(), &name("db", table))
+                .expect("system table plan")
+                .unwrap_or_else(|| panic!("{table} has a plan"));
+            let bindings = fixture
+                .boundary
+                .get_column_bindings(&session(), plan.handle())
+                .unwrap_or_else(|error| panic!("{table} column bindings: {error}"));
+            assert_eq!(
+                bindings
+                    .iter()
+                    .map(TypedColumnBinding::name)
+                    .collect::<Vec<_>>(),
+                columns,
+                "{table}"
+            );
+            // A system relation is all columns of its own: none of them is a
+            // metadata pseudo-column, so none is hidden from `SELECT *`.
+            assert!(
+                bindings.iter().all(|binding| !binding.is_hidden()),
+                "{table}"
+            );
+        }
+    }
+
+    /// No system relation reaches the data-file enumerator.
+    ///
+    /// `$files` is the one distributed system relation, so it goes to the
+    /// manifest-list enumerator -- which here refuses a relation with no pinned
+    /// snapshot, the refusal that enumerator owns, rather than the data
+    /// enumerator's "no data table handle". The other five are frozen as
+    /// whole-relation reads: one backend opens the pinned metadata file itself,
+    /// so their enumeration is empty and finished from the start.
+    #[test]
+    fn no_system_relation_falls_through_to_the_data_enumerator() {
         let fixture = fixture();
         fixture.create_table("db", "t", StdHashMap::new());
 
@@ -2350,17 +2765,53 @@ mod tests {
             .get_system_table_plan(&session(), &name("db", "t$files"))
             .expect("files plan")
             .expect("files plan exists");
-        let partitions = fixture
+        let error = fixture
             .boundary
-            .get_system_table_plan(&session(), &name("db", "t$partitions"))
-            .expect("partitions plan")
-            .expect("partitions plan exists");
+            .get_splits(
+                &session(),
+                files.handle(),
+                &[],
+                &BTreeSet::new(),
+                &WireConstraint::of_summary(TupleDomain::all()),
+            )
+            .err()
+            .expect("files needs a pinned snapshot to walk");
+        assert!(
+            error
+                .to_string()
+                .contains("requires a selected snapshot id"),
+            "{error}"
+        );
 
-        // `$partitions` is an aggregation over `$files` of the same pinned
-        // snapshot, so it must be the very same reference rather than a second
-        // resolution of the same relation.
-        assert_eq!(partitions.distribution(), SystemTableDistribution::AllNodes);
-        assert_eq!(partitions.handle(), files.handle());
+        for table in [
+            "t$entries",
+            "t$snapshots",
+            "t$history",
+            "t$refs",
+            "t$manifests",
+        ] {
+            let plan = fixture
+                .boundary
+                .get_system_table_plan(&session(), &name("db", table))
+                .expect("system table plan")
+                .unwrap_or_else(|| panic!("{table} has a plan"));
+            let mut source = fixture
+                .boundary
+                .get_splits(
+                    &session(),
+                    plan.handle(),
+                    &[],
+                    &BTreeSet::new(),
+                    &WireConstraint::of_summary(TupleDomain::all()),
+                )
+                .unwrap_or_else(|error| panic!("{table} enumerates: {error}"));
+            assert!(source.is_finished(), "{table}");
+            let batch = source
+                .next_batch(4, &WireDynamicFilterSnapshot::all_complete())
+                .unwrap_or_else(|error| panic!("{table} batch: {error}"));
+            assert!(batch.no_more_splits(), "{table}");
+            assert!(batch.into_splits().is_empty(), "{table}");
+        }
     }
 
     /// Not accepting a pushdown is always a legal answer; refusing one is not.

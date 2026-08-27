@@ -337,7 +337,7 @@ pub(crate) fn prepare_typed_scan(
     }
 
     // 4. Lower the scan's own conjuncts into the offered summary.
-    let lowered = lower_scan_predicates(scan, &columns_by_name, &value_types_by_name);
+    let mut lowered = lower_scan_predicates(scan, &columns_by_name, &value_types_by_name);
     let constraint = WireConstraint::of_summary(lowered.summary.clone());
 
     // 5. Offer the filter. Whatever the connector hands back stays the
@@ -348,8 +348,19 @@ pub(crate) fn prepare_typed_scan(
         .map_err(|error| {
             format!("typed scan filter pushdown on relation {relation_name} failed: {error}")
         })? {
-        // Nothing was accepted, so the engine keeps the whole predicate.
-        None => (TupleDomain::all(), lowered.summary.clone(), None),
+        // Nothing was accepted, so the engine keeps the whole predicate — and
+        // keeping it means evaluating it, not handing it to the reader.
+        //
+        // An unenforced predicate is the reader's own work by contract. A
+        // relation the connector declines outright may have no reader that
+        // applies one: a system relation read whole by a single backend opens
+        // its page source with no constraint at all, so a predicate parked
+        // there is applied by nobody and the query silently returns rows it
+        // must not see.
+        None => {
+            lowered.residual_ordinals = (0..scan.predicates.len()).collect();
+            (TupleDomain::all(), TupleDomain::all(), None)
+        }
         Some(application) => {
             let unenforced = application.remaining_constraint().summary().clone();
             let remaining_expression = application
@@ -1064,17 +1075,16 @@ mod tests {
         let prepared =
             prepare(Arc::new(stub), outputs(), id_predicate(), None, &[]).expect("prepared scan");
         let source = prepared.table_scan.source();
-        // Nothing is claimed as connector-enforced, and the reader keeps the
-        // whole offered summary.
+        // Nothing is claimed as connector-enforced, and nothing is parked for
+        // a reader either: an unenforced predicate is the reader's own work by
+        // contract, and a relation the connector declined may have no reader
+        // that applies one.
         assert!(source.enforced_predicate().is_all());
-        assert_eq!(
-            source
-                .unenforced_predicate()
-                .domain_for(&column_handle(1, "id")),
-            Some(&Domain::single_value(ConnectorValue::Integer(7)).expect("single value"))
-        );
-        // The conjunct was representable, so it is not a SQL-level residual.
-        assert!(prepared.residual_ordinals.is_empty());
+        assert!(source.unenforced_predicate().is_all());
+        // So the engine keeps it, which means evaluating it. Being
+        // representable is what let it be offered; it does not make it
+        // somebody else's work once the offer was declined.
+        assert_eq!(prepared.residual_ordinals, vec![0]);
     }
 
     #[test]

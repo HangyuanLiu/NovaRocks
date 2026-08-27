@@ -1220,7 +1220,7 @@ mod tests {
                 novarocks_proto_models::common::ScalarType {
                     r#type: novarocks_proto_models::common::PrimitiveType::Bigint as i32,
                     ..Default::default()
-                },
+        },
             )),
         }
     }

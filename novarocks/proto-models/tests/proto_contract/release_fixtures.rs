@@ -75,6 +75,7 @@ fn scalar_type(prim: common::PrimitiveType) -> common::TypeDesc {
             precision: None,
             scale: None,
             time_unit: None,
+            time_zone: None,
         })),
     }
 }

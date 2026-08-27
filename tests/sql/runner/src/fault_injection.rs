@@ -664,9 +664,9 @@ where
                     token: server
                         .armed_query_lifecycle_fault_token(index, "restart-after-init-ack")?
                         .context("restart-after-InitAck fault has no armed token")?,
-                    process_id: parse_backend_process_id(
-                        &server.backend_process_id(index)?,
-                    )?,
+                    // The harness already parses it: a process identity crosses
+                    // this boundary as a type, not as text to re-parse.
+                    process_id: server.backend_process_id(index)?,
                 }
             }
             PostQueryFault::KillQueryAtLifecyclePhase { phase, .. }
@@ -858,8 +858,7 @@ where
                                 );
                             }
                             server.restart_be_until(index, deadline)?;
-                            let new_process_id =
-                                parse_backend_process_id(&server.backend_process_id(index)?)?;
+                            let new_process_id = server.backend_process_id(index)?;
                             if new_process_id == *process_id {
                                 bail!(
                                     "BE[{index}] restart did not replace process identity: old={process_id} new={new_process_id}"

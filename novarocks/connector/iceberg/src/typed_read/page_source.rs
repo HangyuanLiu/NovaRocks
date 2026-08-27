@@ -2496,13 +2496,13 @@ mod tests {
                 ..SplitOptions::whole_file(harness.file_size, records)
             },
         );
-        // `$row_id` is `first_row_id + absolute position`, so it proves the
+        // `_row_id` is `first_row_id + absolute position`, so it proves the
         // positions were not renumbered from the start of the split.
         let row_id = IcebergColumnHandle::try_new(
             crate::typed_read::column_handle::IcebergColumnHandleParams {
                 base_column_identity: crate::typed_read::column_handle::ColumnIdentity::try_new(
                     crate::row_lineage_synth::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                    "$row_id",
+                    crate::row_lineage_synth::ICEBERG_ROW_ID_COL,
                     crate::typed_read::column_handle::ColumnIdentityCategory::Primitive,
                     Vec::new(),
                 )

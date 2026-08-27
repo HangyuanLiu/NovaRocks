@@ -139,7 +139,7 @@ mod tests {
                 kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
                     r#type: common::PrimitiveType::Int as i32,
                     ..Default::default()
-                })),
+        })),
             }),
             is_internal: false,
         }
