@@ -471,11 +471,11 @@ async fn dynamic_state_store_mode_survives_a_frontend_restart_through_one_snapsh
 }
 
 // ---------------------------------------------------------------------------
-// 2. A non-dynamic mode rejects SQL mutation, and never falls back
+// 2. An unimplemented mode rejects SQL mutation, and never falls back
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_non_dynamic_source_mode_rejects_sql_catalog_mutation_without_falling_back() {
+async fn an_unimplemented_source_mode_rejects_sql_catalog_mutation_without_falling_back() {
     let host = state_store_fixture::open(format!(
         "catalog-desired-state-mode-reject-{}",
         Uuid::now_v7()
@@ -486,10 +486,7 @@ async fn a_non_dynamic_source_mode_rejects_sql_catalog_mutation_without_falling_
         .await
         .expect("open attachment repository");
 
-    for mode in [
-        CatalogDesiredStateSourceMode::StaticFile,
-        CatalogDesiredStateSourceMode::ManagedController,
-    ] {
+    for mode in [CatalogDesiredStateSourceMode::ManagedController] {
         // Handing the StateStore authority to a non-dynamic mode is the exact
         // shape a silent fallback would take, so the source is built *with* a
         // usable repository and must still refuse.
@@ -547,10 +544,7 @@ async fn a_non_dynamic_source_mode_rejects_sql_catalog_mutation_without_falling_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_effect() {
     let registry = state_store_fixture::registry();
-    for mode in [
-        CatalogDesiredStateSourceMode::StaticFile,
-        CatalogDesiredStateSourceMode::ManagedController,
-    ] {
+    for mode in [CatalogDesiredStateSourceMode::ManagedController] {
         // No StateStore input at all: if the rejection depended on anything the
         // frontend opens, this could not fail here.
         let error = FrontendApplicationHost::open_with_factories_and_state_store_registry(

@@ -15,17 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
 use once_cell::sync::Lazy;
 use prometheus::{
     Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
     Registry, TextEncoder,
+};
+
+use crate::workload_lifecycle::{
+    FrontendCatalogSourceMode, FrontendServingSnapshot, FrontendServingState,
 };
 
 pub(crate) mod dml_publication;
@@ -237,6 +237,120 @@ static NATIVE_TRUST_TRANSPORT_REJECTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("register novarocks_native_trust_transport_rejections_total")
 });
 
+static FRONTEND_SERVING_STATE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_frontend_serving_state",
+            "Frontend serving lifecycle state as a one-hot gauge.",
+        ),
+        &["state"],
+    )
+    .expect("register novarocks_frontend_serving_state")
+});
+
+static FRONTEND_BASE_READY: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(Opts::new(
+        "novarocks_frontend_base_ready",
+        "Whether this Frontend currently admits base workloads.",
+    ))
+    .expect("register novarocks_frontend_base_ready")
+});
+
+static FRONTEND_CATALOG_SOURCE_MODE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_frontend_catalog_source_mode",
+            "Selected catalog desired-state source mode as a one-hot gauge.",
+        ),
+        &["mode"],
+    )
+    .expect("register novarocks_frontend_catalog_source_mode")
+});
+
+static FRONTEND_CATALOGS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_frontend_catalogs",
+            "Catalog bootstrap aggregate counts by sanitized state.",
+        ),
+        &["state"],
+    )
+    .expect("register novarocks_frontend_catalogs")
+});
+
+static FRONTEND_WORKLOAD_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_frontend_workload_active",
+            "Active admitted Frontend workloads by kind.",
+        ),
+        &["kind"],
+    )
+    .expect("register novarocks_frontend_workload_active")
+});
+
+static FRONTEND_WORKLOAD_ADMISSION_REJECTED: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "novarocks_frontend_workload_admission_rejected_total",
+            "Total rejected Frontend workload admissions by kind.",
+        ),
+        &["kind"],
+    )
+    .expect("register novarocks_frontend_workload_admission_rejected_total")
+});
+
+static FRONTEND_WORKLOAD_COMPLETED_DURING_DRAIN: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "novarocks_frontend_workload_completed_during_drain_total",
+            "Total admitted Frontend workloads that completed while draining.",
+        ),
+        &["kind"],
+    )
+    .expect("register novarocks_frontend_workload_completed_during_drain_total")
+});
+
+static FRONTEND_WORKLOAD_DRAIN_DEADLINE_CANCELLED: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "novarocks_frontend_workload_drain_deadline_cancelled_total",
+            "Total admitted Frontend workloads cancelled at the drain deadline.",
+        ),
+        &["kind"],
+    )
+    .expect("register novarocks_frontend_workload_drain_deadline_cancelled_total")
+});
+
+static FRONTEND_DRAIN_STARTED_TIME_SECONDS: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(Opts::new(
+        "novarocks_frontend_drain_started_time_seconds",
+        "Unix timestamp at which Frontend drain began, or zero before drain.",
+    ))
+    .expect("register novarocks_frontend_drain_started_time_seconds")
+});
+
+static FRONTEND_DRAIN_DEADLINE_TIME_SECONDS: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(Opts::new(
+        "novarocks_frontend_drain_deadline_time_seconds",
+        "Unix timestamp at which Frontend drain reaches its deadline, or zero before drain.",
+    ))
+    .expect("register novarocks_frontend_drain_deadline_time_seconds")
+});
+
+static FRONTEND_DRAIN_ELAPSED_SECONDS: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(Opts::new(
+        "novarocks_frontend_drain_elapsed_seconds",
+        "Elapsed time spent draining this Frontend, or zero before drain.",
+    ))
+    .expect("register novarocks_frontend_drain_elapsed_seconds")
+});
+
+/// Publishing uses reset-plus-current-total for process-local lifecycle
+/// counters. Serialize that sequence so a concurrent observation cannot turn
+/// a cumulative total into an accidental double-count.
+static FRONTEND_SERVING_METRICS_PUBLISH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
 /// Explicit collector registry owned by one Frontend management host.
 ///
 /// This keeps FE's metrics surface role-local even when a process supervises
@@ -271,6 +385,17 @@ impl FrontendMetricsRegistry {
             Box::new(FRONTEND_QUERY_LIFECYCLE_CONTROL.clone()),
             Box::new(FRONTEND_QUERY_LIFECYCLE_LATENCY.clone()),
             Box::new(NATIVE_TRUST_TRANSPORT_REJECTIONS.clone()),
+            Box::new(FRONTEND_SERVING_STATE.clone()),
+            Box::new(FRONTEND_BASE_READY.clone()),
+            Box::new(FRONTEND_CATALOG_SOURCE_MODE.clone()),
+            Box::new(FRONTEND_CATALOGS.clone()),
+            Box::new(FRONTEND_WORKLOAD_ACTIVE.clone()),
+            Box::new(FRONTEND_WORKLOAD_ADMISSION_REJECTED.clone()),
+            Box::new(FRONTEND_WORKLOAD_COMPLETED_DURING_DRAIN.clone()),
+            Box::new(FRONTEND_WORKLOAD_DRAIN_DEADLINE_CANCELLED.clone()),
+            Box::new(FRONTEND_DRAIN_STARTED_TIME_SECONDS.clone()),
+            Box::new(FRONTEND_DRAIN_DEADLINE_TIME_SECONDS.clone()),
+            Box::new(FRONTEND_DRAIN_ELAPSED_SECONDS.clone()),
         ] {
             registry
                 .register(collector)
@@ -300,6 +425,94 @@ pub(crate) fn observe_native_trust_transport_rejection(listener: &'static str) {
     NATIVE_TRUST_TRANSPORT_REJECTIONS
         .with_label_values(&[listener])
         .inc();
+}
+
+/// Publishes the low-cardinality management snapshot into the explicitly
+/// registered Frontend metric family. No catalog name, property, credential,
+/// connection, or attempt identity is a metric label.
+pub(crate) fn publish_frontend_serving_metrics(snapshot: FrontendServingSnapshot) {
+    let _publish_guard = FRONTEND_SERVING_METRICS_PUBLISH_LOCK
+        .lock()
+        .expect("frontend serving metrics publish lock poisoned");
+    for state in [
+        FrontendServingState::Starting,
+        FrontendServingState::Ready,
+        FrontendServingState::Draining,
+        FrontendServingState::Stopping,
+    ] {
+        FRONTEND_SERVING_STATE
+            .with_label_values(&[state.as_metric_label()])
+            .set((snapshot.serving_state == state) as i64);
+    }
+    FRONTEND_BASE_READY.set(snapshot.base_ready() as i64);
+    for mode in [
+        FrontendCatalogSourceMode::StaticFile,
+        FrontendCatalogSourceMode::DynamicStateStore,
+        FrontendCatalogSourceMode::ManagedController,
+    ] {
+        FRONTEND_CATALOG_SOURCE_MODE
+            .with_label_values(&[mode.as_metric_label()])
+            .set((snapshot.catalog.source_mode == Some(mode)) as i64);
+    }
+    for (state, value) in [
+        ("desired", snapshot.catalog.counts.desired),
+        ("ready", snapshot.catalog.counts.ready),
+        ("unavailable", snapshot.catalog.counts.unavailable),
+    ] {
+        FRONTEND_CATALOGS
+            .with_label_values(&[state])
+            .set(value as i64);
+    }
+    for (kind, active, completed, cancelled) in [
+        (
+            "statement",
+            snapshot.workload.active.statement,
+            snapshot.workload.completed_during_drain.statement,
+            snapshot.workload.deadline_cancelled.statement,
+        ),
+        (
+            "background",
+            snapshot.workload.active.background,
+            snapshot.workload.completed_during_drain.background,
+            snapshot.workload.deadline_cancelled.background,
+        ),
+    ] {
+        FRONTEND_WORKLOAD_ACTIVE
+            .with_label_values(&[kind])
+            .set(active as i64);
+        let completed_metric = FRONTEND_WORKLOAD_COMPLETED_DURING_DRAIN.with_label_values(&[kind]);
+        completed_metric.reset();
+        completed_metric.inc_by(completed);
+        let cancelled_metric =
+            FRONTEND_WORKLOAD_DRAIN_DEADLINE_CANCELLED.with_label_values(&[kind]);
+        cancelled_metric.reset();
+        cancelled_metric.inc_by(cancelled);
+    }
+    for (kind, rejected) in [
+        ("session", snapshot.workload.rejected_admissions.session),
+        ("statement", snapshot.workload.rejected_admissions.statement),
+        (
+            "background",
+            snapshot.workload.rejected_admissions.background,
+        ),
+    ] {
+        let rejected_metric = FRONTEND_WORKLOAD_ADMISSION_REJECTED.with_label_values(&[kind]);
+        rejected_metric.reset();
+        rejected_metric.inc_by(rejected);
+    }
+    FRONTEND_DRAIN_STARTED_TIME_SECONDS.set(
+        snapshot
+            .drain
+            .started_at_unix_ms
+            .map_or(0, |millis| (millis / 1_000) as i64),
+    );
+    FRONTEND_DRAIN_DEADLINE_TIME_SECONDS.set(
+        snapshot
+            .drain
+            .deadline_unix_ms
+            .map_or(0, |millis| (millis / 1_000) as i64),
+    );
+    FRONTEND_DRAIN_ELAPSED_SECONDS.set((snapshot.drain.elapsed_ms / 1_000) as i64);
 }
 
 pub(crate) fn record_backend_announce(outcome: &'static str) {
@@ -446,27 +659,6 @@ pub fn publish_frontend_query_lifecycle_metrics(snapshot: FrontendQueryLifecycle
         FRONTEND_QUERY_LIFECYCLE_LATENCY
             .with_label_values(&[phase, "samples"])
             .set(samples as i64);
-    }
-}
-
-/// Management HTTP handler for the role-owned Frontend registry.
-pub(crate) async fn handle_metrics(
-    State(registry): State<Arc<FrontendMetricsRegistry>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    if params
-        .get("type")
-        .is_some_and(|value| value.eq_ignore_ascii_case("json"))
-    {
-        return match render_metrics_json(registry.as_ref()) {
-            Ok(body) => ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
-            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
-        };
-    }
-
-    match render_metrics(registry.as_ref()) {
-        Ok(body) => ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response(),
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
     }
 }
 

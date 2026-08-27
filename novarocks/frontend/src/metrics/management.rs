@@ -15,15 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::http::StatusCode;
+use axum::extract::{Query, State};
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::{Json, Router, routing::get};
 
 use crate::coordinator::QueryLifecycleConvergenceReader;
+use crate::workload_lifecycle::{
+    FrontendServingLifecycle, FrontendServingSnapshot, FrontendServingSnapshotReader,
+    FrontendServingState,
+};
 
-use super::{FrontendMetricsRegistry, handle_metrics};
+use super::{FrontendMetricsRegistry, render_metrics, render_metrics_json};
+
+#[derive(Clone)]
+struct FrontendManagementState {
+    registry: Arc<FrontendMetricsRegistry>,
+    serving_reader: Arc<dyn FrontendServingSnapshotReader>,
+}
 
 /// Builds the complete Frontend management HTTP surface. Native report gRPC
 /// must not compose any management routes.
@@ -31,20 +43,33 @@ pub(crate) fn frontend_management_router(
     registry: Arc<FrontendMetricsRegistry>,
     convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
 ) -> Router {
-    frontend_management_router_with_debug(
+    frontend_management_router_with_readers(
         registry,
-        convergence_reader,
+        Arc::new(FrontendServingLifecycle::new()),
+        Some(convergence_reader),
         crate::native::report_server::lifecycle_convergence_debug_enabled(),
     )
 }
 
-fn frontend_management_router_with_debug(
+/// Builds the management surface from late-bindable, read-only capabilities.
+/// No route in this router can mutate the serving lifecycle.
+pub(crate) fn frontend_management_router_with_readers(
     registry: Arc<FrontendMetricsRegistry>,
-    convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
+    serving_reader: Arc<dyn FrontendServingSnapshotReader>,
+    convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
     debug_enabled: bool,
 ) -> Router {
-    let router = Router::new().route("/metrics", get(handle_metrics));
-    let router = if debug_enabled {
+    let state = FrontendManagementState {
+        registry,
+        serving_reader,
+    };
+    let router = Router::new()
+        .route("/metrics", get(handle_management_metrics))
+        .route("/livez", get(livez))
+        .route("/readyz", get(readyz))
+        .route("/v1/frontend/state", get(frontend_state));
+    let router = if debug_enabled && convergence_reader.is_some() {
+        let convergence_reader = convergence_reader.expect("checked above");
         router.route(
             crate::native::report_server::LIFECYCLE_CONVERGENCE_DEBUG_PATH,
             get(move || latest_lifecycle_convergence_snapshot(Arc::clone(&convergence_reader))),
@@ -52,7 +77,57 @@ fn frontend_management_router_with_debug(
     } else {
         router
     };
-    router.with_state(registry)
+    router.with_state(state)
+}
+
+async fn handle_management_metrics(
+    State(state): State<FrontendManagementState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    if params
+        .get("type")
+        .is_some_and(|value| value.eq_ignore_ascii_case("json"))
+    {
+        return match render_metrics_json(state.registry.as_ref()) {
+            Ok(body) => ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
+            Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+        };
+    }
+    match render_metrics(state.registry.as_ref()) {
+        Ok(body) => ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+async fn livez(State(state): State<FrontendManagementState>) -> axum::response::Response {
+    if state
+        .serving_reader
+        .frontend_serving_snapshot()
+        .serving_state
+        == FrontendServingState::Stopping
+    {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    } else {
+        StatusCode::OK.into_response()
+    }
+}
+
+async fn readyz(State(state): State<FrontendManagementState>) -> axum::response::Response {
+    if state
+        .serving_reader
+        .frontend_serving_snapshot()
+        .base_ready()
+    {
+        StatusCode::OK.into_response()
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    }
+}
+
+async fn frontend_state(
+    State(state): State<FrontendManagementState>,
+) -> Json<FrontendServingSnapshot> {
+    Json(state.serving_reader.frontend_serving_snapshot())
 }
 
 async fn latest_lifecycle_convergence_snapshot(
@@ -72,8 +147,12 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
 
-    use super::{FrontendMetricsRegistry, frontend_management_router_with_debug};
+    use super::{FrontendMetricsRegistry, frontend_management_router_with_readers};
     use crate::coordinator::{QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot};
+    use crate::workload_lifecycle::{
+        FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,
+        FrontendServingLifecycle,
+    };
 
     struct EmptyConvergenceReader;
 
@@ -83,17 +162,19 @@ mod tests {
         }
     }
 
-    fn router(debug_enabled: bool) -> axum::Router {
-        frontend_management_router_with_debug(
+    fn router(debug_enabled: bool, lifecycle: Arc<FrontendServingLifecycle>) -> axum::Router {
+        frontend_management_router_with_readers(
             FrontendMetricsRegistry::new().expect("create frontend metrics registry"),
-            Arc::new(EmptyConvergenceReader),
+            lifecycle,
+            Some(Arc::new(EmptyConvergenceReader)),
             debug_enabled,
         )
     }
 
     #[tokio::test]
     async fn management_router_serves_metrics_and_gates_lifecycle_debug_route() {
-        let metrics = router(false)
+        let lifecycle = Arc::new(FrontendServingLifecycle::new());
+        let metrics = router(false, Arc::clone(&lifecycle))
             .oneshot(
                 Request::builder()
                     .uri("/metrics")
@@ -104,7 +185,7 @@ mod tests {
             .expect("metrics response");
         assert_eq!(metrics.status(), StatusCode::OK);
 
-        let debug_off = router(false)
+        let debug_off = router(false, Arc::clone(&lifecycle))
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -116,7 +197,7 @@ mod tests {
             .expect("debug-off response");
         assert_eq!(debug_off.status(), StatusCode::NOT_FOUND);
 
-        let debug_on = router(true)
+        let debug_on = router(true, lifecycle)
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -127,5 +208,74 @@ mod tests {
             .await
             .expect("debug-on response");
         assert_eq!(debug_on.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn management_routes_report_liveness_readiness_and_sanitized_state() {
+        let lifecycle = Arc::new(FrontendServingLifecycle::new());
+        lifecycle.publish_catalog_bootstrap(
+            FrontendCatalogSourceMode::StaticFile,
+            true,
+            Some(
+                FrontendCatalogSnapshotIdentity::try_new(2, "0123456789abcdef")
+                    .expect("snapshot identity"),
+            ),
+            FrontendCatalogCounts {
+                desired: 2,
+                ready: 1,
+                unavailable: 1,
+            },
+        );
+        let live = router(false, Arc::clone(&lifecycle))
+            .oneshot(
+                Request::builder()
+                    .uri("/livez")
+                    .body(Body::empty())
+                    .expect("live request"),
+            )
+            .await
+            .expect("live response");
+        assert_eq!(live.status(), StatusCode::OK);
+        let not_ready = router(false, Arc::clone(&lifecycle))
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .expect("ready request"),
+            )
+            .await
+            .expect("ready response");
+        assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        lifecycle.mark_ready().expect("mark ready");
+        let state = router(false, Arc::clone(&lifecycle))
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/frontend/state")
+                    .body(Body::empty())
+                    .expect("state request"),
+            )
+            .await
+            .expect("state response");
+        assert_eq!(state.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(state.into_body(), usize::MAX)
+            .await
+            .expect("state body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("state json");
+        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["catalog"]["counts"]["desired"], 2);
+        assert!(json.get("properties").is_none());
+        assert!(json.to_string().contains("0123456789abcdef"));
+
+        let ready = router(false, lifecycle)
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .expect("ready request"),
+            )
+            .await
+            .expect("ready response");
+        assert_eq!(ready.status(), StatusCode::OK);
     }
 }

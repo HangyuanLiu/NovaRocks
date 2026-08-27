@@ -22,10 +22,21 @@ use std::sync::{Arc, OnceLock};
 /// The actor that first requested cancellation for a statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryCancellationReason {
-    ExplicitKill { requester_connection_id: u32 },
-    ExplicitKillConnection { requester_connection_id: u32 },
+    ExplicitKill {
+        requester_connection_id: u32,
+    },
+    ExplicitKillConnection {
+        requester_connection_id: u32,
+    },
     ClientDisconnected,
-    DeadlineExceeded { timeout_ms: u64 },
+    DeadlineExceeded {
+        timeout_ms: u64,
+    },
+    /// The bounded FE-local drain deadline expired before the attempt
+    /// completed. This remains distinct from an ordinary statement deadline.
+    FrontendDrainDeadlineExceeded {
+        timeout_ms: u64,
+    },
     ServerShutdown,
 }
 

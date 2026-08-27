@@ -1951,6 +1951,12 @@ fn cancellation_error(reason: QueryCancellationReason) -> QueryServiceError {
             QueryServiceErrorKind::Timeout,
             format!("query timed out after {timeout_ms} ms"),
         ),
+        QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms } => (
+            QueryServiceErrorKind::Interrupted,
+            format!(
+                "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded after {timeout_ms} ms"
+            ),
+        ),
         QueryCancellationReason::ExplicitKill { .. } => (
             QueryServiceErrorKind::Interrupted,
             "Query execution was interrupted".to_string(),
