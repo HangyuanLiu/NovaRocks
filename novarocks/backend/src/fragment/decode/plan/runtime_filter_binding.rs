@@ -81,9 +81,14 @@ pub(crate) enum DecodedConsumerBindingTarget {
 
 /// A scan-domain target is deliberately decoded before the execution node is
 /// built.  The backend never infers it from a connector schema or catalog.
+///
+/// It names no column.  Which column a runtime filter constrains is stated by
+/// the scan's own `ConnectorTableScanSource`, whose `DynamicFilterBinding` maps
+/// this binding id to a `ScanAssignment` variable and so to a typed
+/// `ColumnHandle`.  This target carries only the exact type contract the
+/// consumer expression was frozen against.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DecodedRuntimeFilterScanDomainTarget {
-    pub(crate) field_ordinal: u32,
     pub(crate) data_type: DataType,
     pub(crate) nullable: bool,
 }
@@ -968,7 +973,6 @@ fn decode_wire_role(
                             )
                         })?;
                         Ok::<_, NativeFragmentDecodeError>(DecodedRuntimeFilterScanDomainTarget {
-                            field_ordinal: target.field_ordinal,
                             data_type,
                             nullable: target.nullable,
                         })

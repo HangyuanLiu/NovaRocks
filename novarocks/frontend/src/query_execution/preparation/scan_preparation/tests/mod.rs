@@ -45,6 +45,26 @@ fn prepare_scan_bindings(
     prepare_scan_bindings_with_controls(plan, &controls, resolver)
 }
 
+/// Prepare a plan whose scans must offer the connector these runtime filters.
+fn prepare_scan_bindings_with_runtime_filters(
+    plan: &DistributedPlan,
+    connectors: &FixtureConnectorRegistry,
+    runtime_filter_scans: &[novarocks_sql::planning::query_execution::SqlRuntimeFilterSourceScanRequest],
+) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
+    let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
+    let query_bindings = fixture_query_table_bindings(plan, &controls);
+    let typed = fixture_typed_control_registry(plan, &controls);
+    super::prepare_scan_bindings(
+        plan,
+        &controls,
+        &crate::connector::test_request_context(),
+        Some(&query_bindings),
+        None,
+        &fixture_scan_preparation_options(typed),
+        runtime_filter_scans,
+    )
+}
+
 /// Prepare a plan whose change-window lane resolves through the production
 /// query-local resolver, exactly as a refresh does.
 fn prepare_scan_bindings_with_delta_resolver(
@@ -64,6 +84,7 @@ fn prepare_scan_bindings_with_delta_resolver(
         Some(&query_bindings),
         Some(&resolver),
         &fixture_scan_preparation_options(typed),
+        &[],
     )
 }
 
@@ -83,6 +104,7 @@ fn prepare_scan_bindings_with_controls(
         Some(&query_bindings),
         resolver,
         &fixture_scan_preparation_options(typed),
+        &[],
     )
 }
 

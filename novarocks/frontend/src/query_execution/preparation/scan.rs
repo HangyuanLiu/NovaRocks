@@ -60,6 +60,13 @@ pub(crate) enum ResolvedScanExecution {
     /// A query-local opaque read admission.  Core may inspect only its SPI
     /// schema and selector while preparation asks the exact lease to plan it.
     AdmittedConnectorRead(QueryScanMaterialization),
+    /// A query-local admission read as one system relation of its table.
+    ///
+    /// It carries the same admitted materialization as an ordinary read: the
+    /// exact planning lease and table handle the statement froze. Which system
+    /// relation it is comes from the SQL scan's own metadata table kind, and
+    /// the connector resolves that name to a pinned metadata file.
+    AdmittedSystemTable(QueryScanMaterialization),
     /// A query-local admission read as a change window over its relation.
     ///
     /// It carries the same admitted materialization as an ordinary read: the

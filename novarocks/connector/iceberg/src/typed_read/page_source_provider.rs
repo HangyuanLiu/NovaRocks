@@ -40,10 +40,13 @@ use novarocks_spi::connector::read_stack::{ConnectorPageSource, ConnectorSession
 use crate::access_binding::IcebergReadBinding;
 
 use super::change_window::{IcebergChangeSplit, IcebergChangeWindowHandle};
-use super::column_handle::{IcebergColumnHandle, invalid, unsupported};
-use super::delete_manager::DeleteManager;
+use super::change_window_page_source::{
+    IcebergChangeWindowPageSourceRequest, create_iceberg_change_window_page_source,
+};
+use super::column_handle::{IcebergColumnHandle, invalid};
+use super::delete_manager::{DeleteEvaluationMode, DeleteManager};
 use super::page_source::{
-    IcebergPageSourceRequest, ParquetFooterCache, create_iceberg_page_source,
+    IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache, create_iceberg_page_source,
 };
 use super::split::IcebergSplit;
 use super::table_handle::IcebergTableHandle;
@@ -143,22 +146,37 @@ impl TypedConnectorPageSourceProvider for IcebergPageSourceProvider {
         // relation's semantics: its sign comes from the split variant and its
         // reverse side selects the rows a delete removed instead of hiding
         // them. Both carriers are decoded here so a mismatched pairing fails
-        // as a mismatch, then the lane reports exactly what it still lacks.
+        // as a mismatch rather than as a wrong read.
         if split.category() == SplitCategory::ChangeWindow {
-            return Err(change_window_read_not_implemented(
-                &iceberg_change_window_handle(table)?,
-                &iceberg_change_window_split(split)?,
-            ));
+            let handle = iceberg_change_window_handle(table)?;
+            let change_split = iceberg_change_window_split(split)?;
+            return create_iceberg_change_window_page_source(
+                IcebergChangeWindowPageSourceRequest {
+                    handle: &handle,
+                    split: &change_split,
+                    columns: &columns,
+                    delete_manager: Arc::clone(&self.delete_manager),
+                    footers: Arc::clone(&self.footers),
+                    access_binding: self.access_binding.clone(),
+                    context: self.context.clone(),
+                    budget: self.options.budget,
+                    reader_options: self.options.reader_options,
+                    scheduled_split_sequence_id,
+                    dynamic_filter: Arc::clone(dynamic_filter),
+                },
+            );
         }
 
         let table_handle = iceberg_table_handle(table)?;
         let split = iceberg_data_split(split)?;
+        let relation = IcebergReadRelation::of_table(&table_handle, split.partition_spec_id())?;
 
         create_iceberg_page_source(IcebergPageSourceRequest {
-            table_handle: &table_handle,
+            relation: &relation,
             split: &split,
             columns: &columns,
             delete_manager: Arc::clone(&self.delete_manager),
+            delete_mode: DeleteEvaluationMode::ExcludeDeleted,
             footers: Arc::clone(&self.footers),
             access_binding: self.access_binding.clone(),
             context: self.context.clone(),
@@ -264,43 +282,6 @@ pub fn iceberg_change_window_split(
             "the iceberg change-window reader reads a change-window split, not a rewrite-position-delete split",
         )),
     }
-}
-
-/// The stable rejection every change-window split currently receives.
-///
-/// The coordinator side of this lane is complete -- a window is admitted, its
-/// columns are named, and its splits are the proven difference of the two
-/// endpoints -- but no worker can execute one yet, and two facts are missing
-/// for reasons that live outside this connector:
-///
-/// * `ConnectorChangeWindowHandle` carries a schema, columns, a name mapping,
-///   and the two endpoints, and no partition specs. Reading a data file needs
-///   the spec named by `IcebergSplit::partition_spec_id` to decode
-///   `partition_data_json`, and inventing one would be a guess about the
-///   relation's own partitioning;
-/// * the reverse side needs delete verdicts this stack does not express:
-///   `IcebergPositionDeletedRows` selects the rows its newly applied artifacts
-///   name, which is the inverse of every mode `DeleteEvaluationMode` offers,
-///   and `IcebergEqualityDeletedRows` needs `EqualityMatchOnly`, which
-///   `create_iceberg_page_source` never asks for.
-///
-/// Returning a stable `Unsupported` here keeps a wrong answer impossible: a
-/// reader that ignored either fact would silently emit the wrong rows with the
-/// right shape.
-fn change_window_read_not_implemented(
-    handle: &IcebergChangeWindowHandle,
-    split: &IcebergChangeSplit,
-) -> ConnectorError {
-    unsupported(format!(
-        "iceberg change window {}.{} over snapshots ({}, {}] is not readable by this page source: \
-         its handle carries no partition spec for data file {}, and the change-window delete \
-         verdicts are not implemented",
-        handle.schema_table_name().schema_name(),
-        handle.schema_table_name().table_name(),
-        handle.from_snapshot_id_exclusive(),
-        handle.to_snapshot_id_inclusive(),
-        split.data().path(),
-    ))
 }
 
 /// Turn a protocol-validated split into the `$files` manifest split.
@@ -555,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn a_change_window_split_is_routed_to_the_change_window_lane_and_reports_what_it_lacks() {
+    fn a_change_window_split_whose_partition_spec_the_handle_lacks_is_rejected_not_guessed() {
         let (_runtime, provider) = provider();
         let outcome = provider.create_page_source(
             &session(),
@@ -566,15 +547,16 @@ mod tests {
             &unconstrained_filter(),
         );
         let Err(error) = outcome else {
-            panic!("the change-window lane is not readable yet");
+            panic!("a split whose partition spec the window does not carry cannot be read");
         };
 
-        // A stable Unsupported, not a wrong answer with the right shape: the
-        // handle carries no partition spec for the split's data file, and the
-        // reverse side's delete verdicts are not implemented.
-        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-        assert!(error.to_string().contains("sales"));
-        assert!(error.to_string().contains("added.parquet"));
+        // A window spans two snapshots, so files written under different specs
+        // appear on both sides of the difference and every spec travels on the
+        // handle. Inventing the missing one would be a guess about how the
+        // relation is partitioned.
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.to_string().contains("partition spec id 7"));
+        assert!(error.to_string().contains("change window"));
         // It reached the change-window branch rather than the data reader's
         // generic split rejection.
         assert!(!error.to_string().contains("not a change-window split"));

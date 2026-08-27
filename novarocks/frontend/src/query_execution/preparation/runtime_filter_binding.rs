@@ -17,19 +17,14 @@
 
 //! Core-side resolution of SQL-projected scan-domain requests.
 //!
-//! SQL owns runtime-filter semantics. Core only matches each request against
-//! the exact connector read already pinned during scan preparation.
+//! SQL owns runtime-filter semantics. Core only confirms that the typed scan
+//! preparation just froze really carries the filter, bound to the one scan
+//! output column the request names.
 //!
-//! A scan-domain target is a *provider schema field index*: the backend matches
-//! it against the per-scan-unit domain facts a split carries
-//! (`novarocks/execution/src/runtime_filter/scan_domain.rs`, which compares
-//! `ConnectorScanUnitColumn::field_ordinal`). The opaque read froze that index
-//! in `PlannedConnectorRead::provider_field_ordinals`; the typed carrier names
-//! a column by `ValidatedColumnHandle` instead and exposes no such index, and
-//! reading one out of the handle would mean interpreting a provider variant
-//! inside the frontend. So this resolution has no typed authority yet and
-//! refuses rather than inventing an ordinal that would silently target another
-//! column.
+//! The binding travels on the scan carrier itself as `filter id -> variable ->
+//! ColumnHandle`, which is column identity — for Iceberg, the field ID. Nothing
+//! here, and nothing downstream, needs a provider schema field index: the
+//! opaque read that used to freeze one has no producer left.
 
 use crate::query_execution::preparation::scan::ScanExecutionBindings;
 use novarocks_sql::planning::query_execution::{
@@ -54,12 +49,6 @@ fn resolve_target(
         "runtime filter binding id={} scan-domain target has no pinned scan binding for node_id={}",
         request.binding_id, request.node_id
     ))?;
-    let read = scan_bindings
-        .connector_read(request.fragment_id, request.node_id)
-        .ok_or_else(|| format!(
-            "runtime filter binding id={} scan-domain target for fragment_id={} node_id={} has no frozen provider field ordinal: the typed connector scan names its columns by column handle, and this stack has no scan-domain identity to freeze in its place",
-            request.binding_id, request.fragment_id, request.node_id
-        ))?;
     let physical = binding
         .physical_columns
         .iter()
@@ -81,33 +70,55 @@ fn resolve_target(
             request.binding_id, physical.source.name
         ));
     }
-    let output_matches = read
-        .scan
-        .output_schema()
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, field)| field.name().eq_ignore_ascii_case(&physical.source.name))
-        .collect::<Vec<_>>();
-    let [(output_ordinal, output)] = output_matches.as_slice() else {
+    let typed = scan_bindings
+        .typed_scan(request.fragment_id, request.node_id)
+        .ok_or_else(|| format!(
+            "runtime filter binding id={} scan-domain target requires a typed connector scan for fragment_id={} node_id={}",
+            request.binding_id, request.fragment_id, request.node_id
+        ))?;
+    // Preparation bound this filter before the relation was frozen. Confirming
+    // it here is what proves the reader really receives the filter, instead of
+    // a producer publishing into a scan that never consults it.
+    let bound_output = typed
+        .prepared
+        .dynamic_filter_output(request.binding_id)
+        .ok_or_else(|| format!(
+            "runtime filter binding id={} scan-domain target was never offered to the typed scan of fragment_id={} node_id={}",
+            request.binding_id, request.fragment_id, request.node_id
+        ))?;
+    if bound_output != physical.planner.name {
         return Err(format!(
-            "runtime filter binding id={} scan-domain target source column '{}' does not resolve to exactly one pinned connector output",
-            request.binding_id, physical.source.name
-        ));
-    };
-    if output.data_type() != &request.data_type || output.is_nullable() != request.nullable {
-        return Err(format!(
-            "runtime filter binding id={} scan-domain target source column '{}' type/nullability drifted from pinned connector output",
-            request.binding_id, physical.source.name
+            "runtime filter binding id={} scan-domain target names column '{}' but the typed scan bound it to '{bound_output}'",
+            request.binding_id, physical.planner.name
         ));
     }
-    let field_ordinal = *read.provider_field_ordinals.get(*output_ordinal).ok_or_else(|| format!(
-        "runtime filter binding id={} scan-domain target connector output ordinal {} has no pinned provider ordinal",
-        request.binding_id, output_ordinal
-    ))?;
+    // The carrier is the only thing the backend reads, so the binding must be
+    // on it exactly once and must name an assignment this scan really makes.
+    let source = typed.prepared.table_scan.source();
+    let carried = source
+        .dynamic_filters()
+        .iter()
+        .filter(|filter| filter.filter_id() == request.binding_id)
+        .collect::<Vec<_>>();
+    let [carried] = carried.as_slice() else {
+        return Err(format!(
+            "runtime filter binding id={} scan-domain target does not appear exactly once on the typed scan carrier of fragment_id={} node_id={}",
+            request.binding_id, request.fragment_id, request.node_id
+        ));
+    };
+    if !source
+        .assignments()
+        .iter()
+        .any(|assignment| assignment.variable() == carried.variable())
+    {
+        return Err(format!(
+            "runtime filter binding id={} scan-domain target names scan variable '{}', which the typed scan does not assign",
+            request.binding_id,
+            carried.variable()
+        ));
+    }
     Ok(SqlRuntimeFilterSourceResolution {
         binding_id: request.binding_id,
-        field_ordinal,
         data_type: request.data_type,
         nullable: request.nullable,
     })

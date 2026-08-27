@@ -63,15 +63,56 @@ use crate::position_delete::load_position_deletes_with_context;
 use super::column_handle::{IcebergColumnHandle, corrupt, unsupported};
 use super::split::{IcebergDeleteFile, IcebergDeleteFileContent, IcebergFileFormat, IcebergSplit};
 
-/// How the equality verdict is spent.
+/// How the delete verdict is spent.
 ///
 /// Ordinary reads exclude deleted rows. IVM reverse projection needs the rows
 /// a delete removes instead, so the equality verdict is inverted -- and only
 /// the equality verdict: a position-deleted row is gone from both answers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// A change window's reverse side asks a third question neither of those can
+/// express: *which rows did this window remove*. That is the inverse of
+/// position exclusion -- the newly applied artifacts name exactly the rows to
+/// emit, not the rows to hide -- minus whatever the artifacts that already
+/// applied at the lower endpoint had removed, because those rows were not
+/// visible there either and the window's difference does not own them.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DeleteEvaluationMode {
     ExcludeDeleted,
     EqualityMatchOnly,
+    /// Keep exactly the rows one change window removed.
+    ///
+    /// The data split itself carries no exclusion closure in this mode: both
+    /// sets are named here, so one split never carries two contradictory
+    /// delete meanings.
+    SelectRemovedRows {
+        selected: RemovedRowSelection,
+        /// Artifacts already applied at the window's lower endpoint. The rows
+        /// they name were invisible there, so they are subtracted rather than
+        /// emitted.
+        previously_applied: Vec<IcebergDeleteFile>,
+    },
+}
+
+/// Which rows of one data file a change window removed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RemovedRowSelection {
+    /// The data file is gone at the upper endpoint, so every row it still had
+    /// at the lower one was removed.
+    WholeFile,
+    /// Exactly the rows these newly applied artifacts name.
+    NamedBy(Vec<IcebergDeleteFile>),
+}
+
+/// The verdict shape one mode resolves to, decided before any I/O.
+///
+/// It is separate from the mode because the mode owns the artifact lists the
+/// loading borrows, while this outlives them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VerdictShape {
+    ExcludeDeleted,
+    EqualityMatchOnly,
+    SelectNamedRows,
+    SelectWholeFile,
 }
 
 /// One grouping scope of the manager's delete state.
@@ -195,50 +236,46 @@ impl DeleteManager {
         table_schema: &Schema,
         mode: DeleteEvaluationMode,
     ) -> Result<SplitDeleteFilter, ConnectorError> {
+        let shape = verdict_shape(&mode);
+        let (applied, previously_applied) = evaluation_inputs(split, &mode)?;
+
         // Classification and the cost bound both run before any I/O, so an
-        // illegal or oversized closure never opens a file.
-        let closure = DeleteClosure::classify(split)?;
-        validate_split_delete_cost(split)?;
+        // illegal or oversized closure never opens a file. One data file has
+        // one physical delete state however a change window divides it, so
+        // the structural rules are proved over both sides together: a
+        // deletion vector that already applied and one that newly applies
+        // would be two answers for the same rows.
+        DeleteClosure::classify(
+            split.path(),
+            applied.iter().chain(previously_applied.iter()),
+        )?;
+        validate_split_delete_cost(split, applied, previously_applied)?;
 
         let data_sequence_number = split.data_sequence_number();
-        if !closure.equality_files.is_empty() && data_sequence_number.is_none() {
-            return Err(corrupt(format!(
-                "iceberg data file {} carries equality deletes but no data sequence number",
-                split.path()
-            )));
-        }
-
-        let position_files = closure.applicable_position_deletes(split, data_sequence_number);
-        let equality_groups = equality_groups_in_schema_order(
-            &closure.applicable_equality_deletes(data_sequence_number),
+        let applied = GatedClosure::of(split, applied, data_sequence_number, table_schema)?;
+        let previously = GatedClosure::of(
+            split,
+            previously_applied,
+            data_sequence_number,
             table_schema,
         )?;
 
         let scope = DeleteScope::of(split);
         let mut state = self.lock_state()?;
 
-        let position_work = position_files
-            .iter()
-            .map(|delete| (position_cache_key(split, delete), *delete))
-            .collect::<Vec<_>>();
+        let applied_position_work = position_work(split, &applied.position_files);
+        let previously_position_work = position_work(split, &previously.position_files);
 
         // Resolve access exactly once, over exactly the artifacts still
         // missing. A split whose closure is fully cached opens no handle at
         // all, which is what makes a second split of the same data file free.
         let mut pending_paths = Vec::new();
-        for (key, delete) in &position_work {
-            if !state.position.contains_key(key) {
-                pending_paths.push(delete.path());
-            }
+        for side in [&applied, &previously] {
+            collect_pending_paths(&state, &scope, side, &mut pending_paths);
         }
-        for (equality_field_ids, deletes) in &equality_groups {
-            let cache_key = EqualityCacheKey {
-                scope: scope.clone(),
-                equality_field_ids: equality_field_ids.clone(),
-            };
-            let index = state.equality.get(&cache_key);
-            for delete in deletes {
-                if index.is_none_or(|index| !index.artifacts.contains_key(delete.path())) {
+        for work in [&applied_position_work, &previously_position_work] {
+            for (key, delete) in work {
+                if !state.position.contains_key(key) {
                     pending_paths.push(delete.path());
                 }
             }
@@ -252,22 +289,78 @@ impl DeleteManager {
             )
         };
 
-        let deleted_positions =
-            self.load_position_deletes(&mut state, split, &position_work, access.as_ref())?;
-        let (equality, hidden_columns) = self.load_equality_deletes(
+        let mut hidden_columns: BTreeMap<usize, IcebergColumnHandle> = BTreeMap::new();
+        let applied = self.resolve_side(
             &mut state,
-            &scope,
-            &equality_groups,
-            table_schema,
-            access.as_ref(),
+            SideLoad {
+                split,
+                scope: &scope,
+                closure: &applied,
+                position_work: &applied_position_work,
+                table_schema,
+                access: access.as_ref(),
+            },
+            &mut hidden_columns,
+        )?;
+        let previously = self.resolve_side(
+            &mut state,
+            SideLoad {
+                split,
+                scope: &scope,
+                closure: &previously,
+                position_work: &previously_position_work,
+                table_schema,
+                access: access.as_ref(),
+            },
+            &mut hidden_columns,
         )?;
 
+        let verdict = match shape {
+            VerdictShape::ExcludeDeleted => FilterVerdict::ExcludeDeleted(applied),
+            VerdictShape::EqualityMatchOnly => FilterVerdict::EqualityMatchOnly(applied),
+            VerdictShape::SelectNamedRows => FilterVerdict::SelectRemovedRows {
+                selected: SelectedRows::NamedBy(applied),
+                previously_applied: previously,
+            },
+            VerdictShape::SelectWholeFile => FilterVerdict::SelectRemovedRows {
+                selected: SelectedRows::WholeFile,
+                previously_applied: previously,
+            },
+        };
+
         Ok(SplitDeleteFilter {
-            mode,
+            verdict,
             data_file_path: Arc::from(split.path()),
+            hidden_columns: hidden_columns.into_values().collect(),
+        })
+    }
+
+    /// Load one side's artifacts and fold its equality key columns into the
+    /// shared hidden suffix.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_side(
+        &self,
+        state: &mut DeleteManagerState,
+        split: &IcebergSplit,
+        scope: &DeleteScope,
+        closure: &GatedClosure<'_>,
+        position_work: &[(PositionCacheKey, &IcebergDeleteFile)],
+        table_schema: &Schema,
+        access: Option<&FsAccessHandle>,
+        hidden_columns: &mut BTreeMap<usize, IcebergColumnHandle>,
+    ) -> Result<ResolvedDeletes, ConnectorError> {
+        let deleted_positions = self.load_position_deletes(state, split, position_work, access)?;
+        let (equality, side_hidden) = self.load_equality_deletes(
+            state,
+            scope,
+            &closure.equality_groups,
+            table_schema,
+            access,
+        )?;
+        hidden_columns.extend(side_hidden);
+        Ok(ResolvedDeletes {
             deleted_positions,
             equality,
-            hidden_columns,
         })
     }
 
@@ -327,7 +420,13 @@ impl DeleteManager {
         groups: &EqualityGroups<'_>,
         table_schema: &Schema,
         access: Option<&FsAccessHandle>,
-    ) -> Result<(Vec<Arc<LoadedEqualityDelete>>, Vec<IcebergColumnHandle>), ConnectorError> {
+    ) -> Result<
+        (
+            Vec<Arc<LoadedEqualityDelete>>,
+            BTreeMap<usize, IcebergColumnHandle>,
+        ),
+        ConnectorError,
+    > {
         let mut applications = Vec::new();
         // Keyed by top-level schema position so the hidden suffix is ordered
         // by the table schema and carries each column exactly once, however
@@ -401,7 +500,7 @@ impl DeleteManager {
             }
         }
 
-        Ok((applications, hidden_columns.into_values().collect()))
+        Ok((applications, hidden_columns))
     }
 
     fn load_equality_delete(
@@ -441,12 +540,42 @@ impl DeleteManager {
     }
 }
 
-/// The row verdict for one split.
-pub struct SplitDeleteFilter {
-    mode: DeleteEvaluationMode,
-    data_file_path: Arc<str>,
+/// One side's loaded delete state.
+struct ResolvedDeletes {
     deleted_positions: Arc<RoaringTreemap>,
     equality: Vec<Arc<LoadedEqualityDelete>>,
+}
+
+impl ResolvedDeletes {
+    fn is_empty(&self) -> bool {
+        self.deleted_positions.is_empty() && self.equality.is_empty()
+    }
+
+    fn names_position(&self, position: u64) -> bool {
+        self.deleted_positions.contains(position)
+    }
+}
+
+/// The rows one change window removed from a data file.
+enum SelectedRows {
+    WholeFile,
+    NamedBy(ResolvedDeletes),
+}
+
+/// What the loaded state means for a row, resolved once at open time.
+enum FilterVerdict {
+    ExcludeDeleted(ResolvedDeletes),
+    EqualityMatchOnly(ResolvedDeletes),
+    SelectRemovedRows {
+        selected: SelectedRows,
+        previously_applied: ResolvedDeletes,
+    },
+}
+
+/// The row verdict for one split.
+pub struct SplitDeleteFilter {
+    verdict: FilterVerdict,
+    data_file_path: Arc<str>,
     hidden_columns: Vec<IcebergColumnHandle>,
 }
 
@@ -465,14 +594,25 @@ impl SplitDeleteFilter {
     /// Whether this split has nothing to filter, so the page source can skip
     /// reading positions and hidden columns entirely.
     pub fn is_empty(&self) -> bool {
-        match self.mode {
-            DeleteEvaluationMode::ExcludeDeleted => {
-                self.deleted_positions.is_empty() && self.equality.is_empty()
-            }
+        match &self.verdict {
+            FilterVerdict::ExcludeDeleted(applied) => applied.is_empty(),
             // Reverse projection keeps only the rows an equality delete
             // removes, so an absent equality filter means "keep nothing" --
             // never "keep everything".
-            DeleteEvaluationMode::EqualityMatchOnly => false,
+            FilterVerdict::EqualityMatchOnly(_) => false,
+            // A file that is gone at the upper endpoint had every one of its
+            // rows removed, so with nothing already applied at the lower
+            // endpoint there is genuinely nothing to subtract.
+            FilterVerdict::SelectRemovedRows {
+                selected: SelectedRows::WholeFile,
+                previously_applied,
+            } => previously_applied.is_empty(),
+            // A named selection keeps only what its artifacts name, so an
+            // absent filter would mean "keep nothing", never "keep all".
+            FilterVerdict::SelectRemovedRows {
+                selected: SelectedRows::NamedBy(_),
+                ..
+            } => false,
         }
     }
 
@@ -498,29 +638,69 @@ impl SplitDeleteFilter {
         if rows == 0 {
             return Ok(BooleanArray::from(Vec::<bool>::new()));
         }
-
-        let mut keep = Vec::with_capacity(rows);
-        for (row, equality_deleted) in self.equality_verdict(batch, rows)?.into_iter().enumerate() {
+        for row in 0..rows {
             if absolute_positions.is_null(row) {
                 return Err(corrupt(format!(
                     "iceberg row {row} of {} has no absolute row position",
                     self.data_file_path
                 )));
             }
-            let position_keep = !self
-                .deleted_positions
-                .contains(absolute_positions.value(row));
-            let equality_keep = !equality_deleted;
-            let equality_verdict = match self.mode {
-                DeleteEvaluationMode::ExcludeDeleted => equality_keep,
-                DeleteEvaluationMode::EqualityMatchOnly => !equality_keep,
-            };
-            keep.push(position_keep && equality_verdict);
         }
+
+        let keep = match &self.verdict {
+            FilterVerdict::ExcludeDeleted(applied) => {
+                let equality_deleted = self.equality_verdict(batch, rows, &applied.equality)?;
+                (0..rows)
+                    .map(|row| {
+                        !applied.names_position(absolute_positions.value(row))
+                            && !equality_deleted[row]
+                    })
+                    .collect::<Vec<_>>()
+            }
+            FilterVerdict::EqualityMatchOnly(applied) => {
+                let equality_deleted = self.equality_verdict(batch, rows, &applied.equality)?;
+                (0..rows)
+                    .map(|row| {
+                        !applied.names_position(absolute_positions.value(row))
+                            && equality_deleted[row]
+                    })
+                    .collect::<Vec<_>>()
+            }
+            FilterVerdict::SelectRemovedRows {
+                selected,
+                previously_applied,
+            } => {
+                // Rows the lower endpoint had already lost were never visible
+                // there, so the window's difference does not own them -- this
+                // is what keeps an equality-deleted split from re-emitting a
+                // row a position delete of the same window already named.
+                let already_gone =
+                    self.equality_verdict(batch, rows, &previously_applied.equality)?;
+                let named = match selected {
+                    SelectedRows::WholeFile => vec![true; rows],
+                    SelectedRows::NamedBy(newly) => {
+                        let newly_equality = self.equality_verdict(batch, rows, &newly.equality)?;
+                        (0..rows)
+                            .map(|row| {
+                                newly.names_position(absolute_positions.value(row))
+                                    || newly_equality[row]
+                            })
+                            .collect::<Vec<_>>()
+                    }
+                };
+                (0..rows)
+                    .map(|row| {
+                        named[row]
+                            && !previously_applied.names_position(absolute_positions.value(row))
+                            && !already_gone[row]
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
         Ok(BooleanArray::from(keep))
     }
 
-    /// Which rows at least one applicable equality delete matches.
+    /// Which rows at least one of the given equality deletes matches.
     ///
     /// Each artifact is evaluated on its own so the shared decode, field-ID
     /// lookup, and scalar-key comparison in `equality_delete` stay the single
@@ -529,9 +709,10 @@ impl SplitDeleteFilter {
         &self,
         batch: &RecordBatch,
         rows: usize,
+        equality: &[Arc<LoadedEqualityDelete>],
     ) -> Result<Vec<bool>, ConnectorError> {
         let mut deleted = vec![false; rows];
-        for application in &self.equality {
+        for application in equality {
             let keep = equality_delete_keep_mask(batch, std::slice::from_ref(&application.keys))
                 .map_err(|error| {
                     corrupt(format!(
@@ -558,12 +739,10 @@ impl SplitDeleteFilter {
     }
 }
 
-impl std::fmt::Debug for SplitDeleteFilter {
+impl std::fmt::Debug for ResolvedDeletes {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("SplitDeleteFilter")
-            .field("mode", &self.mode)
-            .field("data_file_path", &self.data_file_path)
+            .debug_struct("ResolvedDeletes")
             .field("deleted_positions", &self.deleted_positions.len())
             .field(
                 "equality",
@@ -575,8 +754,161 @@ impl std::fmt::Debug for SplitDeleteFilter {
                     })
                     .collect::<Vec<_>>(),
             )
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for SelectedRows {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WholeFile => formatter.write_str("WholeFile"),
+            Self::NamedBy(newly) => formatter.debug_tuple("NamedBy").field(newly).finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for FilterVerdict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExcludeDeleted(applied) => formatter
+                .debug_tuple("ExcludeDeleted")
+                .field(applied)
+                .finish(),
+            Self::EqualityMatchOnly(applied) => formatter
+                .debug_tuple("EqualityMatchOnly")
+                .field(applied)
+                .finish(),
+            Self::SelectRemovedRows {
+                selected,
+                previously_applied,
+            } => formatter
+                .debug_struct("SelectRemovedRows")
+                .field("selected", selected)
+                .field("previously_applied", previously_applied)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SplitDeleteFilter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SplitDeleteFilter")
+            .field("verdict", &self.verdict)
+            .field("data_file_path", &self.data_file_path)
             .field("hidden_columns", &self.hidden_columns.len())
             .finish()
+    }
+}
+
+/// The verdict shape one mode resolves to.
+const fn verdict_shape(mode: &DeleteEvaluationMode) -> VerdictShape {
+    match mode {
+        DeleteEvaluationMode::ExcludeDeleted => VerdictShape::ExcludeDeleted,
+        DeleteEvaluationMode::EqualityMatchOnly => VerdictShape::EqualityMatchOnly,
+        DeleteEvaluationMode::SelectRemovedRows { selected, .. } => match selected {
+            RemovedRowSelection::WholeFile => VerdictShape::SelectWholeFile,
+            RemovedRowSelection::NamedBy(_) => VerdictShape::SelectNamedRows,
+        },
+    }
+}
+
+/// The two artifact sets one mode asks the manager to load.
+///
+/// An ordinary read has exactly one: the split's own closure. A change
+/// window's reverse side has two, and both are named by the mode -- the data
+/// split must carry none, because a split that also carried an exclusion
+/// closure would state two contradictory delete meanings for the same rows.
+fn evaluation_inputs<'a>(
+    split: &'a IcebergSplit,
+    mode: &'a DeleteEvaluationMode,
+) -> Result<(&'a [IcebergDeleteFile], &'a [IcebergDeleteFile]), ConnectorError> {
+    match mode {
+        DeleteEvaluationMode::ExcludeDeleted | DeleteEvaluationMode::EqualityMatchOnly => {
+            Ok((split.deletes(), &[]))
+        }
+        DeleteEvaluationMode::SelectRemovedRows {
+            selected,
+            previously_applied,
+        } => {
+            if !split.deletes().is_empty() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!(
+                        "iceberg data file {} names the rows a change window removed, so it must carry no exclusion closure of its own",
+                        split.path()
+                    ),
+                ));
+            }
+            let selected = match selected {
+                RemovedRowSelection::WholeFile => &[][..],
+                RemovedRowSelection::NamedBy(newly) => newly.as_slice(),
+            };
+            Ok((selected, previously_applied.as_slice()))
+        }
+    }
+}
+
+/// One side's classified, sequence-gated closure -- everything decided before
+/// any I/O.
+struct GatedClosure<'a> {
+    position_files: Vec<&'a IcebergDeleteFile>,
+    equality_groups: EqualityGroups<'a>,
+}
+
+impl<'a> GatedClosure<'a> {
+    fn of(
+        split: &IcebergSplit,
+        deletes: &'a [IcebergDeleteFile],
+        data_sequence_number: Option<i64>,
+        table_schema: &Schema,
+    ) -> Result<Self, ConnectorError> {
+        let closure = DeleteClosure::classify(split.path(), deletes.iter())?;
+        if !closure.equality_files.is_empty() && data_sequence_number.is_none() {
+            return Err(corrupt(format!(
+                "iceberg data file {} carries equality deletes but no data sequence number",
+                split.path()
+            )));
+        }
+        Ok(Self {
+            position_files: closure.applicable_position_deletes(split, data_sequence_number),
+            equality_groups: equality_groups_in_schema_order(
+                &closure.applicable_equality_deletes(data_sequence_number),
+                table_schema,
+            )?,
+        })
+    }
+}
+
+/// Pair each applicable position delete with its cache identity.
+fn position_work<'a>(
+    split: &IcebergSplit,
+    position_files: &[&'a IcebergDeleteFile],
+) -> Vec<(PositionCacheKey, &'a IcebergDeleteFile)> {
+    position_files
+        .iter()
+        .map(|delete| (position_cache_key(split, delete), *delete))
+        .collect()
+}
+
+/// The equality-delete paths of one side that this manager has not read yet.
+fn collect_pending_paths<'a>(
+    state: &DeleteManagerState,
+    scope: &DeleteScope,
+    closure: &GatedClosure<'a>,
+    pending: &mut Vec<&'a str>,
+) {
+    for (equality_field_ids, deletes) in &closure.equality_groups {
+        let cache_key = EqualityCacheKey {
+            scope: scope.clone(),
+            equality_field_ids: equality_field_ids.clone(),
+        };
+        let index = state.equality.get(&cache_key);
+        for delete in deletes {
+            if index.is_none_or(|index| !index.artifacts.contains_key(delete.path())) {
+                pending.push(delete.path());
+            }
+        }
     }
 }
 
@@ -590,13 +922,16 @@ struct DeleteClosure<'a> {
 }
 
 impl<'a> DeleteClosure<'a> {
-    fn classify(split: &'a IcebergSplit) -> Result<Self, ConnectorError> {
+    fn classify<I>(data_file_path: &str, deletes: I) -> Result<Self, ConnectorError>
+    where
+        I: IntoIterator<Item = &'a IcebergDeleteFile>,
+    {
         let mut closure = Self {
             position_files: Vec::new(),
             deletion_vector: None,
             equality_files: Vec::new(),
         };
-        for delete in split.deletes() {
+        for delete in deletes {
             match delete.content() {
                 IcebergDeleteFileContent::PositionDeletes => match delete.format() {
                     IcebergFileFormat::Puffin => {
@@ -607,7 +942,7 @@ impl<'a> DeleteClosure<'a> {
                         if let Some(existing) = closure.deletion_vector {
                             return Err(corrupt(format!(
                                 "iceberg data file {} carries more than one deletion vector: {} and {}",
-                                split.path(),
+                                data_file_path,
                                 existing.path(),
                                 delete.path()
                             )));
@@ -647,7 +982,7 @@ impl<'a> DeleteClosure<'a> {
         {
             return Err(corrupt(format!(
                 "iceberg data file {} carries deletion vector {} alongside {} position-delete file(s)",
-                split.path(),
+                data_file_path,
                 deletion_vector.path(),
                 closure.position_files.len()
             )));
@@ -840,9 +1175,17 @@ fn physical_delete_spec(
 /// against. The projection below carries only what the bound reads -- the data
 /// file's identity and each attached delete's size -- and is handed to nothing
 /// else.
-fn validate_split_delete_cost(split: &IcebergSplit) -> Result<(), ConnectorError> {
-    let mut delete_files = Vec::with_capacity(split.deletes().len());
-    for delete in split.deletes() {
+///
+/// Both sides are bounded together: a change window's reverse side opens its
+/// newly applied and previously applied artifacts in one read, so charging it
+/// for only one of them would admit twice the work the bound allows.
+fn validate_split_delete_cost(
+    split: &IcebergSplit,
+    applied: &[IcebergDeleteFile],
+    previously_applied: &[IcebergDeleteFile],
+) -> Result<(), ConnectorError> {
+    let mut delete_files = Vec::with_capacity(applied.len() + previously_applied.len());
+    for delete in applied.iter().chain(previously_applied.iter()) {
         let file_format = match delete.format() {
             IcebergFileFormat::Parquet => crate::scan_model::IcebergDeleteFileFormat::Parquet,
             IcebergFileFormat::Puffin => crate::scan_model::IcebergDeleteFileFormat::Puffin,
@@ -1765,5 +2108,154 @@ mod tests {
             )
             .expect_err("short position array must fail");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    // --------------------------------------------------- change-window reverse
+
+    #[test]
+    fn a_named_selection_keeps_the_newly_deleted_rows_minus_what_was_already_gone() {
+        let fixture = Fixture::new();
+        let previously = fixture.path("previously.parquet");
+        let newly = fixture.path("newly.parquet");
+        write_position_delete_parquet(&previously, &[(DATA_FILE, 0)]);
+        write_position_delete_parquet(&newly, &[(DATA_FILE, 0), (DATA_FILE, 2)]);
+
+        let filter = fixture
+            .manager
+            .open_split(
+                &split_of(DATA_FILE, Some(5), Vec::new()),
+                &table_schema(),
+                DeleteEvaluationMode::SelectRemovedRows {
+                    selected: RemovedRowSelection::NamedBy(vec![
+                        DeleteBuilder::position(&newly, 7).build(),
+                    ]),
+                    previously_applied: vec![DeleteBuilder::position(&previously, 6).build()],
+                },
+            )
+            .expect("open split");
+
+        // Row 0 was already invisible at the lower endpoint, row 1 survives at
+        // the upper one, and row 2 is the only row this window removed.
+        let mask = filter
+            .evaluate(
+                &data_batch(&[1, 2, 3], &["a", "a", "a"]),
+                &positions(&[0, 1, 2]),
+            )
+            .expect("evaluate");
+        assert_eq!(keeps(&mask), vec![false, false, true]);
+        assert!(!filter.is_empty());
+    }
+
+    #[test]
+    fn a_whole_file_selection_subtracts_a_previously_applied_equality_delete() {
+        let fixture = Fixture::new();
+        let previously = fixture.path("previously.parquet");
+        write_equality_delete_parquet(&previously, 1, "id", &[2]);
+
+        let filter = fixture
+            .manager
+            .open_split(
+                &split_of(DATA_FILE, Some(5), Vec::new()),
+                &table_schema(),
+                DeleteEvaluationMode::SelectRemovedRows {
+                    selected: RemovedRowSelection::WholeFile,
+                    previously_applied: vec![
+                        DeleteBuilder::equality(&previously, 6, vec![1]).build(),
+                    ],
+                },
+            )
+            .expect("open split");
+
+        // The previously applied side needs its key column read too, so it
+        // contributes to the same hidden suffix the applied side does.
+        assert_eq!(filter.required_hidden_columns().len(), 1);
+        let mask = filter
+            .evaluate(
+                &data_batch(&[1, 2, 3], &["a", "a", "a"]),
+                &positions(&[0, 1, 2]),
+            )
+            .expect("evaluate");
+        assert_eq!(keeps(&mask), vec![true, false, true]);
+    }
+
+    #[test]
+    fn a_whole_file_selection_with_nothing_already_applied_filters_nothing() {
+        let fixture = Fixture::new();
+        let filter = fixture
+            .manager
+            .open_split(
+                &split_of(DATA_FILE, Some(5), Vec::new()),
+                &table_schema(),
+                DeleteEvaluationMode::SelectRemovedRows {
+                    selected: RemovedRowSelection::WholeFile,
+                    previously_applied: Vec::new(),
+                },
+            )
+            .expect("open split");
+
+        // Every row the file still had at the lower endpoint left the relation,
+        // so the page source can skip reading positions entirely.
+        assert!(filter.is_empty());
+        assert_eq!(fixture.loaded_artifacts(), 0);
+    }
+
+    #[test]
+    fn a_reverse_side_split_that_also_carries_an_exclusion_closure_is_rejected() {
+        let fixture = Fixture::new();
+        let deletes = fixture.path("deletes.parquet");
+        write_position_delete_parquet(&deletes, &[(DATA_FILE, 1)]);
+
+        // One split cannot say both "hide these rows" and "these are exactly
+        // the rows to emit" about the same data file.
+        let error = fixture
+            .manager
+            .open_split(
+                &split_of(
+                    DATA_FILE,
+                    Some(5),
+                    vec![DeleteBuilder::position(&deletes, 6).build()],
+                ),
+                &table_schema(),
+                DeleteEvaluationMode::SelectRemovedRows {
+                    selected: RemovedRowSelection::WholeFile,
+                    previously_applied: Vec::new(),
+                },
+            )
+            .expect_err("a reverse-side split names its deletes as variant facts");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(fixture.loaded_artifacts(), 0);
+    }
+
+    #[test]
+    fn one_data_file_never_has_two_deletion_vectors_across_the_two_change_window_sides() {
+        let fixture = Fixture::new();
+        let previously = fixture.path("previously.puffin");
+        let newly = fixture.path("newly.puffin");
+        let previously_range = write_deletion_vector(&previously, &[0], 4);
+        let newly_range = write_deletion_vector(&newly, &[0, 2], 4);
+
+        // A rewritten deletion vector would put one on each side. Nothing here
+        // can prove the replacement covers what it replaced, so the structural
+        // rule is proved over both sides together rather than per side.
+        let error = fixture
+            .manager
+            .open_split(
+                &split_of(DATA_FILE, Some(5), Vec::new()),
+                &table_schema(),
+                DeleteEvaluationMode::SelectRemovedRows {
+                    selected: RemovedRowSelection::NamedBy(vec![
+                        DeleteBuilder::deletion_vector(&newly, 7, newly_range).build(),
+                    ]),
+                    previously_applied: vec![
+                        DeleteBuilder::deletion_vector(&previously, 6, previously_range).build(),
+                    ],
+                },
+            )
+            .expect_err("two deletion vectors are two answers for the same rows");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.to_string().contains("more than one deletion vector"));
+        assert_eq!(fixture.loaded_artifacts(), 0);
     }
 }

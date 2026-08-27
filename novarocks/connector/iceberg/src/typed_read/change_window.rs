@@ -56,7 +56,7 @@ use novarocks_spi::connector::{
     ConnectorChangeWindowFullRebuildReason, ConnectorError, ConnectorErrorKind,
 };
 
-use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use crate::iceberg::spec::{NestedField, PartitionSpec, PrimitiveType, Schema, Type};
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, unsupported};
 use super::split::{
@@ -683,6 +683,35 @@ impl IcebergChangeWindowHandle {
     pub fn parse_table_schema(&self) -> Result<Schema, ConnectorError> {
         serde_json::from_str::<Schema>(&self.table_schema_json)
             .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))
+    }
+
+    /// The partition spec one of this window's splits names.
+    ///
+    /// A window spans two snapshots, so files written under different specs
+    /// appear on both sides of the difference. Every spec travels on the
+    /// handle for that reason, and a split naming one the handle does not
+    /// carry is a typed rejection rather than a guess about how the relation
+    /// is partitioned.
+    pub fn parse_partition_spec(&self, spec_id: i32) -> Result<PartitionSpec, ConnectorError> {
+        let spec_json = self.partition_spec_jsons.get(&spec_id).ok_or_else(|| {
+            invalid(format!(
+                "iceberg partition spec id {spec_id} is not carried by this change window"
+            ))
+        })?;
+        if spec_json.is_empty() || spec_json.len() > MAX_JSON_BYTES {
+            return Err(invalid(
+                "iceberg partition spec json must be non-empty and bounded",
+            ));
+        }
+        let spec: PartitionSpec = serde_json::from_str(spec_json)
+            .map_err(|error| invalid(format!("iceberg partition spec json is invalid: {error}")))?;
+        if spec.spec_id() != spec_id {
+            return Err(invalid(format!(
+                "iceberg partition spec json declares spec id {} under key {spec_id}",
+                spec.spec_id()
+            )));
+        }
+        Ok(spec)
     }
 
     pub fn to_proto(&self) -> dto::IcebergChangeWindowHandle {

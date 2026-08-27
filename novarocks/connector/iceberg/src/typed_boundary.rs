@@ -336,6 +336,31 @@ impl IcebergTypedBoundary {
     }
 
     /// The concrete DATA-relation handle behind a validated carrier.
+    /// The data table handle a pushdown would apply to, if this relation has
+    /// one.
+    ///
+    /// Absent means this relation accepts no pushdown at all, which is what
+    /// `None` means to every `apply_*` caller: the engine keeps the whole
+    /// predicate, projection or limit. Refusing instead would fail the scan,
+    /// even though not accepting a pushdown is always a legal answer. An
+    /// ownership or decoding failure is still an error.
+    fn pushdown_table_handle(
+        &self,
+        table: &CatalogTableHandle,
+    ) -> Result<Option<IcebergTableHandle>, ConnectorError> {
+        self.ensure_owned(table)?;
+        match table.relation() {
+            ConnectorRelation::Table(handle) => {
+                IcebergTableHandle::from_table_handle_proto(handle).map(Some)
+            }
+            ConnectorRelation::TableFunction(_)
+            | ConnectorRelation::ChangeWindow(_)
+            | ConnectorRelation::SystemTable(_)
+            | ConnectorRelation::TableExecute(_)
+            | ConnectorRelation::MergeTable(_) => Ok(None),
+        }
+    }
+
     fn data_table_handle(
         &self,
         table: &CatalogTableHandle,
@@ -601,7 +626,9 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
         table: &CatalogTableHandle,
         constraint: &WireConstraint,
     ) -> Result<Option<TypedFilterApplication>, ConnectorError> {
-        let handle = self.data_table_handle(table)?;
+        let Some(handle) = self.pushdown_table_handle(table)? else {
+            return Ok(None);
+        };
         let applied = handle.apply_filter(&wire_constraint_to_iceberg(constraint)?)?;
         if applied.handle() == &handle {
             // The connector accepted nothing, so the engine keeps the whole
@@ -634,7 +661,9 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
         table: &CatalogTableHandle,
         assignments: &[ScanAssignment],
     ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
-        let handle = self.data_table_handle(table)?;
+        let Some(handle) = self.pushdown_table_handle(table)? else {
+            return Ok(None);
+        };
         let applied = handle.apply_projection(&ordered_assignments(assignments)?)?;
         if applied.handle() == &handle {
             return Ok(None);
@@ -648,7 +677,9 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
         table: &CatalogTableHandle,
         limit: u64,
     ) -> Result<Option<TypedLimitApplication>, ConnectorError> {
-        let handle = self.data_table_handle(table)?;
+        let Some(handle) = self.pushdown_table_handle(table)? else {
+            return Ok(None);
+        };
         let applied = handle.apply_limit(limit)?;
         if applied.handle() == &handle {
             return Ok(None);
@@ -2393,6 +2424,49 @@ mod tests {
         // resolution of the same relation.
         assert_eq!(partitions.distribution(), SystemTableDistribution::AllNodes);
         assert_eq!(partitions.handle(), files.handle());
+    }
+
+    /// Not accepting a pushdown is always a legal answer; refusing one is not.
+    /// A relation that has no data table handle to push into must report that
+    /// it accepted nothing, or every scan of it fails before it can read.
+    #[test]
+    fn a_relation_with_no_pushdown_accepts_nothing_instead_of_refusing() {
+        let fixture = fixture();
+        fixture.create_table("db", "t", StdHashMap::new());
+        let system_table = fixture
+            .boundary
+            .get_system_table_plan(&session(), &name("db", "t$snapshots"))
+            .expect("snapshots plan")
+            .expect("snapshots plan exists")
+            .into_handle();
+
+        assert!(
+            fixture
+                .boundary
+                .apply_filter(
+                    &session(),
+                    &system_table,
+                    &Constraint::of_summary(
+                        novarocks_spi::connector::read_stack::TupleDomain::all()
+                    )
+                )
+                .expect("a system relation accepts no filter rather than refusing")
+                .is_none()
+        );
+        assert!(
+            fixture
+                .boundary
+                .apply_projection(&session(), &system_table, &[])
+                .expect("a system relation accepts no projection rather than refusing")
+                .is_none()
+        );
+        assert!(
+            fixture
+                .boundary
+                .apply_limit(&session(), &system_table, 10)
+                .expect("a system relation accepts no limit rather than refusing")
+                .is_none()
+        );
     }
 
     #[test]

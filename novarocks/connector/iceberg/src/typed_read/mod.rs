@@ -32,6 +32,7 @@
 //!   format, no inferred default, and no partially supported read.
 
 pub mod change_window;
+pub mod change_window_page_source;
 pub mod column_handle;
 pub mod delete_manager;
 pub mod merge;
@@ -54,11 +55,17 @@ pub use change_window::{
     TableChangesFileChange, TableChangesFunctionHandle, TableChangesFunctionHandleParams,
     TableChangesSplit, TableChangesSplitParams, change_op_column_handle,
 };
+pub use change_window_page_source::{
+    IcebergChangeWindowPageSource, IcebergChangeWindowPageSourceRequest,
+    create_iceberg_change_window_page_source,
+};
 pub use column_handle::{
     ColumnIdentity, ColumnIdentityCategory, IcebergColumnHandle, IcebergColumnHandleParams,
     decode_tuple_domain, encode_tuple_domain,
 };
-pub use delete_manager::{DeleteEvaluationMode, DeleteManager, SplitDeleteFilter};
+pub use delete_manager::{
+    DeleteEvaluationMode, DeleteManager, RemovedRowSelection, SplitDeleteFilter,
+};
 pub use merge::{
     IcebergInsertTableHandle, IcebergInsertTableHandleParams, IcebergMergeSourcePlan,
     IcebergMergeSourcePlanParams, IcebergMergeTableHandle,
@@ -66,7 +73,7 @@ pub use merge::{
 pub use page_source::{
     DynamicFilterCheckpoint, DynamicFilterObservation, DynamicFilterVerdict,
     IcebergPageSourceRequest, IcebergParquetPageSource, IcebergPartitionOnlyPageSource,
-    ParquetFooterCache, create_iceberg_page_source,
+    IcebergReadRelation, ParquetFooterCache, create_iceberg_page_source,
 };
 pub use page_source_provider::{
     IcebergPageSourceProvider, IcebergPageSourceProviderOptions, iceberg_change_window_handle,

@@ -39,7 +39,7 @@ use novarocks_proto::connector_read::{
 };
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
-    ConnectorSession, ConnectorValueType, SchemaTableName, TupleDomain,
+    ConnectorSession, ConnectorValueType, SchemaTableName, SystemTableDistribution, TupleDomain,
 };
 use novarocks_sql::plan_read::PlanScanNode;
 
@@ -82,6 +82,13 @@ pub(crate) enum TypedRelationFreeze<'a> {
     /// therefore not part of the window: this is a difference of two visible
     /// row sets, never a replay of the manifests between them.
     ChangeWindow(TypedChangeWindow),
+    /// One system relation of a table.
+    ///
+    /// It carries no pin of its own: the relation name already spells the
+    /// connector's `<table>$<SUFFIX>` vocabulary, and the connector resolves
+    /// that suffix and pins the immutable metadata file behind it. How the
+    /// relation is executed is the connector's answer too, not the engine's.
+    SystemTable,
 }
 
 impl TypedRelationFreeze<'_> {
@@ -90,6 +97,7 @@ impl TypedRelationFreeze<'_> {
         match self {
             Self::Table { .. } => ConnectorRelationKind::Table,
             Self::ChangeWindow(_) => ConnectorRelationKind::ChangeWindow,
+            Self::SystemTable => ConnectorRelationKind::SystemTable,
         }
     }
 }
@@ -116,6 +124,22 @@ pub(crate) struct PreparedTypedScan {
     /// connector's own answer sets this; an absent or declined limit leaves it
     /// false so the engine keeps its own limit operator.
     pub(crate) limit_guaranteed: bool,
+    /// The scan output column each dynamic filter was bound to, keyed by the
+    /// runtime filter's id.
+    ///
+    /// It records the binding this scan actually made, so a later resolution
+    /// proves the filter reaches the reader through that column's assignment
+    /// instead of assuming it did.
+    pub(crate) dynamic_filter_outputs: BTreeMap<u32, String>,
+}
+
+impl PreparedTypedScan {
+    /// The scan output column one runtime filter constrains on this scan.
+    pub(crate) fn dynamic_filter_output(&self, filter_id: u32) -> Option<&str> {
+        self.dynamic_filter_outputs
+            .get(&filter_id)
+            .map(String::as_str)
+    }
 }
 
 impl std::fmt::Debug for PreparedTypedScan {
@@ -128,6 +152,7 @@ impl std::fmt::Debug for PreparedTypedScan {
             .field("constraint", &self.constraint)
             .field("residual_ordinals", &self.residual_ordinals)
             .field("limit_guaranteed", &self.limit_guaranteed)
+            .field("dynamic_filter_outputs", &self.dynamic_filter_outputs)
             .finish_non_exhaustive()
     }
 }
@@ -165,33 +190,65 @@ pub(crate) fn prepare_typed_scan(
     // 1. Freeze the relation the lane asked for. Admission already resolved
     //    this name, so a connector that now reports nothing means the pin is
     //    gone rather than that the query referenced an unknown table.
-    let mut handle = match freeze {
-        TypedRelationFreeze::Table { version, reference } => metadata
-            .get_table_handle(session, relation, version, reference)
-            .map_err(|error| {
-                format!("typed scan cannot freeze relation {relation_name}: {error}")
-            })?
-            .ok_or_else(|| {
-                format!(
-                    "typed scan relation {relation_name} is no longer resolvable after admission pinned it"
-                )
-            })?,
-        TypedRelationFreeze::ChangeWindow(window) => metadata
-            .get_change_window_plan(session, relation, window)
-            .map_err(|error| {
-                format!(
-                    "typed scan cannot freeze the change window of relation {relation_name} from snapshot {} to snapshot {}: {error}",
-                    window.from_snapshot_id(),
-                    window.to_snapshot_id()
-                )
-            })?
-            .ok_or_else(|| {
-                format!(
-                    "typed scan relation {relation_name} exposes no change window from snapshot {} to snapshot {}",
-                    window.from_snapshot_id(),
-                    window.to_snapshot_id()
-                )
-            })?,
+    //
+    //    How this scan's work reaches a backend is decided here too, because
+    //    only the connector knows it: a system relation it resolves to one
+    //    task has no split at all.
+    let (mut handle, work_source) = match freeze {
+        TypedRelationFreeze::Table { version, reference } => {
+            let handle = metadata
+                .get_table_handle(session, relation, version, reference)
+                .map_err(|error| {
+                    format!("typed scan cannot freeze relation {relation_name}: {error}")
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "typed scan relation {relation_name} is no longer resolvable after admission pinned it"
+                    )
+                })?;
+            (handle, dto::ScanWorkSource::RuntimeSplits)
+        }
+        TypedRelationFreeze::ChangeWindow(window) => {
+            let handle = metadata
+                .get_change_window_plan(session, relation, window)
+                .map_err(|error| {
+                    format!(
+                        "typed scan cannot freeze the change window of relation {relation_name} from snapshot {} to snapshot {}: {error}",
+                        window.from_snapshot_id(),
+                        window.to_snapshot_id()
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "typed scan relation {relation_name} exposes no change window from snapshot {} to snapshot {}",
+                        window.from_snapshot_id(),
+                        window.to_snapshot_id()
+                    )
+                })?;
+            (handle, dto::ScanWorkSource::RuntimeSplits)
+        }
+        TypedRelationFreeze::SystemTable => {
+            let plan = metadata
+                .get_system_table_plan(session, relation)
+                .map_err(|error| {
+                    format!(
+                        "typed scan cannot freeze system relation {relation_name}: {error}"
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "typed scan relation {relation_name} is not a system relation of this connector"
+                    )
+                })?;
+            // `SingleCoordinator` means one backend reads one immutable
+            // metadata file with no split; spreading it would duplicate every
+            // row. `AllNodes` is real distributable I/O and enumerates.
+            let work_source = match plan.distribution() {
+                SystemTableDistribution::AllNodes => dto::ScanWorkSource::RuntimeSplits,
+                SystemTableDistribution::SingleCoordinator => dto::ScanWorkSource::WholeRelation,
+            };
+            (plan.into_handle(), work_source)
+        }
     };
 
     // 2. Resolve the relation's columns.
@@ -337,18 +394,8 @@ pub(crate) fn prepare_typed_scan(
     }
 
     // 8. Bind the dynamic filters and validate the whole source.
-    let dynamic_filter_bindings =
+    let (dynamic_filter_bindings, dynamic_filter_outputs) =
         bind_dynamic_filters(dynamic_filters, &variables_by_name, &relation_name)?;
-    // Both families this preparation freezes are enumerated: a table and a
-    // change window each produce splits the round drives at runtime. Reading a
-    // relation whole belongs to a system relation resolved to one task, which
-    // this preparation cannot freeze, so naming the variants here keeps adding
-    // one a compile error rather than a scan that reads nothing.
-    let work_source = match freeze {
-        TypedRelationFreeze::Table { .. } | TypedRelationFreeze::ChangeWindow(_) => {
-            dto::ScanWorkSource::RuntimeSplits
-        }
-    };
     let source = dto::ConnectorTableScanSource {
         table: Some(handle.as_proto().clone()),
         assignments: assignments
@@ -385,6 +432,7 @@ pub(crate) fn prepare_typed_scan(
         constraint,
         residual_ordinals: lowered.residual_ordinals,
         limit_guaranteed,
+        dynamic_filter_outputs,
     })
 }
 
@@ -414,25 +462,35 @@ fn unique_binding<'a>(
     Ok(binding)
 }
 
+/// The carrier bindings and the output column each filter id was bound to.
+///
+/// One filter id may name only one column of one scan: two bindings would ask
+/// the reader to constrain two columns from a single artifact, and choosing
+/// either of them would apply the filter to a column it was not built for.
 fn bind_dynamic_filters(
     dynamic_filters: &[(u32, String)],
     variables_by_name: &BTreeMap<String, String>,
     relation_name: &str,
-) -> Result<Vec<dto::DynamicFilterBinding>, String> {
-    dynamic_filters
-        .iter()
-        .map(|(filter_id, column_name)| {
-            let variable = variables_by_name.get(column_name).ok_or_else(|| {
-                format!(
-                    "typed scan dynamic filter {filter_id} names column '{column_name}', which the scan of relation {relation_name} does not output"
-                )
-            })?;
-            Ok(dto::DynamicFilterBinding {
-                filter_id: *filter_id,
-                variable: variable.clone(),
-            })
-        })
-        .collect()
+) -> Result<(Vec<dto::DynamicFilterBinding>, BTreeMap<u32, String>), String> {
+    let mut bindings = Vec::with_capacity(dynamic_filters.len());
+    let mut outputs = BTreeMap::new();
+    for (filter_id, column_name) in dynamic_filters {
+        let variable = variables_by_name.get(column_name).ok_or_else(|| {
+            format!(
+                "typed scan dynamic filter {filter_id} names column '{column_name}', which the scan of relation {relation_name} does not output"
+            )
+        })?;
+        if outputs.insert(*filter_id, column_name.clone()).is_some() {
+            return Err(format!(
+                "typed scan of relation {relation_name} binds dynamic filter {filter_id} more than once"
+            ));
+        }
+        bindings.push(dto::DynamicFilterBinding {
+            filter_id: *filter_id,
+            variable: variable.clone(),
+        });
+    }
+    Ok((bindings, outputs))
 }
 
 #[cfg(test)]
@@ -444,8 +502,9 @@ mod tests {
 
     use arrow::datatypes::DataType;
     use novarocks_proto::connector_read::{
-        CatalogTableHandle, ConnectorRelation, TypedConnectorMetadata, TypedConnectorSplitSource,
-        TypedFilterApplication, TypedLimitApplication, TypedSystemTablePlan,
+        CatalogTableHandle, ConnectorRelation, ScanWorkSource, TypedConnectorMetadata,
+        TypedConnectorSplitSource, TypedFilterApplication, TypedLimitApplication,
+        TypedSystemTablePlan,
     };
     use novarocks_spi::connector::read_stack::{ConnectorValue, Domain, ValueSet};
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
@@ -486,6 +545,11 @@ mod tests {
         splits_requested: AtomicUsize,
         /// Every change window the stub was asked to freeze.
         change_windows_requested: Mutex<Vec<TypedChangeWindow>>,
+        /// How the stub says its system relation must be executed. `None`
+        /// stands for "this is not a system relation of mine".
+        system_table: Option<SystemTableDistribution>,
+        /// Every relation name the stub was asked for a system table plan.
+        system_tables_requested: Mutex<Vec<String>>,
     }
 
     impl StubControl {
@@ -501,6 +565,8 @@ mod tests {
                 limit: LimitBehavior::Decline,
                 splits_requested: AtomicUsize::new(0),
                 change_windows_requested: Mutex::new(Vec::new()),
+                system_table: Some(SystemTableDistribution::SingleCoordinator),
+                system_tables_requested: Mutex::new(Vec::new()),
             }
         }
     }
@@ -578,9 +644,15 @@ mod tests {
         fn get_system_table_plan(
             &self,
             _session: &ConnectorSession,
-            _name: &SchemaTableName,
+            name: &SchemaTableName,
         ) -> Result<Option<TypedSystemTablePlan>, ConnectorError> {
-            Ok(None)
+            self.system_tables_requested
+                .lock()
+                .expect("system table log")
+                .push(name.table_name().to_owned());
+            Ok(self.system_table.map(|distribution| {
+                TypedSystemTablePlan::new(catalog_system_table_handle(), distribution)
+            }))
         }
 
         fn get_change_window_plan(
@@ -703,6 +775,45 @@ mod tests {
             FieldPath::root("catalog_table_handle"),
         )
         .expect("valid catalog change window handle")
+    }
+
+    /// The stub's frozen system relation, pinned to one immutable metadata
+    /// file. The reference names the base table, never the `$SUFFIX` spelling
+    /// that selected it.
+    fn catalog_system_table_handle() -> CatalogTableHandle {
+        CatalogTableHandle::parse(
+            dto::CatalogTableHandle {
+                catalog_name: "ice".to_owned(),
+                instance_incarnation: vec![1_u8; 16],
+                transaction: Some(dto::ConnectorTransactionHandle {
+                    handle: Some(dto::connector_transaction_handle::Handle::Iceberg(
+                        dto::HiveTransactionHandle {
+                            auto_commit: true,
+                            uuid: vec![2_u8; 16],
+                        },
+                    )),
+                }),
+                relation: Some(dto::catalog_table_handle::Relation::SystemTable(
+                    dto::ConnectorSystemTableReference {
+                        reference: Some(dto::connector_system_table_reference::Reference::Iceberg(
+                            dto::IcebergSystemTableReference {
+                                schema_table_name: Some(dto::SchemaTableName {
+                                    schema_name: "db".to_owned(),
+                                    table_name: "t".to_owned(),
+                                }),
+                                system_table_type: dto::IcebergSystemTableType::Snapshots as i32,
+                                metadata_file_location: "s3://bucket/table/metadata/v3.json"
+                                    .to_owned(),
+                                table_uuid: "00000000-0000-4000-8000-000000000001".to_owned(),
+                                snapshot_id: Some(7),
+                            },
+                        )),
+                    },
+                )),
+            },
+            FieldPath::root("catalog_table_handle"),
+        )
+        .expect("valid catalog system table handle")
     }
 
     fn iceberg_column(field_id: i32, name: &str) -> dto::IcebergColumnHandle {
@@ -908,13 +1019,41 @@ mod tests {
             &[(4, "category".to_owned())],
         )
         .expect("prepared scan");
-        let bindings = prepared.table_scan.source().dynamic_filters();
+        let source = prepared.table_scan.source();
+        let bindings = source.dynamic_filters();
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].filter_id(), 4);
         assert_eq!(bindings[0].variable(), "v1");
+        // The variable resolves to the assignment holding that column's own
+        // handle, so the filter is bound by column identity rather than by the
+        // filter's position among the scan outputs.
+        let bound = source
+            .assignments()
+            .iter()
+            .find(|assignment| assignment.variable() == bindings[0].variable())
+            .expect("the binding names an assignment of this scan");
+        assert_eq!(bound.column(), &column_handle(2, "category"));
         assert_eq!(
             prepared.table_scan.dynamic_filter_columns(),
             BTreeSet::from([column_handle(2, "category")])
+        );
+        assert_eq!(prepared.dynamic_filter_output(4), Some("category"));
+        assert_eq!(prepared.dynamic_filter_output(5), None);
+    }
+
+    #[test]
+    fn one_filter_id_may_bind_only_one_column_of_a_scan() {
+        let error = prepare(
+            Arc::new(StubControl::new()),
+            outputs(),
+            Vec::new(),
+            None,
+            &[(4, "id".to_owned()), (4, "category".to_owned())],
+        )
+        .expect_err("a filter id cannot constrain two columns of one scan");
+        assert!(
+            error.contains("dynamic filter 4") && error.contains("more than once"),
+            "unexpected error: {error}"
         );
     }
 
@@ -1172,6 +1311,85 @@ mod tests {
         assert!(
             error.contains("db.t")
                 && error.contains("exposes no change window from snapshot 6 to snapshot 7"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A system relation is frozen through its own control entry point, and
+    /// the connector's own distribution decides how the scan's work reaches a
+    /// backend. `SingleCoordinator` means one task reads one immutable
+    /// metadata file, so the carrier declares no split at all.
+    #[test]
+    fn a_system_relation_carries_the_connectors_own_distribution() {
+        for (distribution, expected) in [
+            (
+                SystemTableDistribution::SingleCoordinator,
+                ScanWorkSource::WholeRelation,
+            ),
+            (
+                SystemTableDistribution::AllNodes,
+                ScanWorkSource::RuntimeSplits,
+            ),
+        ] {
+            let mut stub = StubControl::new();
+            stub.system_table = Some(distribution);
+            let stub = Arc::new(stub);
+            let columns = outputs();
+            let physical_columns = physical(&columns);
+            let prepared = prepare_with_physical_columns(
+                Arc::clone(&stub),
+                columns,
+                &physical_columns,
+                Vec::new(),
+                TypedRelationFreeze::SystemTable,
+                None,
+                &[],
+            )
+            .unwrap_or_else(|error| {
+                panic!("system relation lowering for {distribution:?}: {error}")
+            });
+
+            assert_eq!(
+                prepared.table_scan.table().relation_kind(),
+                ConnectorRelationKind::SystemTable
+            );
+            assert_eq!(
+                prepared.table_scan.source().work_source(),
+                expected,
+                "{distribution:?} must decide the scan's work source"
+            );
+            // The relation name preparation asked for is the one the scan
+            // named; the connector alone maps it to a base table.
+            assert_eq!(
+                *stub
+                    .system_tables_requested
+                    .lock()
+                    .expect("system table log"),
+                vec!["t".to_owned()]
+            );
+        }
+    }
+
+    /// A name the connector does not recognize as one of its system relations
+    /// is a refusal, never a fall back to the base table's data handle.
+    #[test]
+    fn a_relation_that_is_no_system_relation_is_an_error() {
+        let mut stub = StubControl::new();
+        stub.system_table = None;
+        let columns = outputs();
+        let physical_columns = physical(&columns);
+        let error = prepare_with_physical_columns(
+            Arc::new(stub),
+            columns,
+            &physical_columns,
+            Vec::new(),
+            TypedRelationFreeze::SystemTable,
+            None,
+            &[],
+        )
+        .expect_err("an unrecognized system relation cannot fall back to the table");
+        assert!(
+            error.contains("db.t") && error.contains("is not a system relation of this connector"),
             "unexpected error: {error}"
         );
     }

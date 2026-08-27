@@ -1040,31 +1040,24 @@ fn consumer_spec(
     binding: &DecodedRuntimeFilterBinding,
     expr_id: novarocks_execution::exec::expr::ExprId,
 ) -> Result<RuntimeFilterConsumerBinding, String> {
-    let DecodedBindingRole::Consumer { contract, target } = &binding.role else {
+    let DecodedBindingRole::Consumer { contract, .. } = &binding.role else {
         return Err(format!(
             "native runtime-filter binding_id={} expected consumer role",
             binding.binding_id
         ));
     };
-    let scan_domain = match target {
-        DecodedConsumerBindingTarget::DirectInput { .. } => None,
-        DecodedConsumerBindingTarget::SourceBoundary { scan_domain } => {
-            scan_domain.as_ref().map(|target| {
-                execution::scan_domain::RuntimeFilterScanDomainBinding::new(
-                    execution::RuntimeFilterBindingId::new(binding.binding_id),
-                    execution::scan_domain::RuntimeFilterScanDomainTarget::new(
-                        target.field_ordinal,
-                        target.data_type.clone(),
-                        target.nullable,
-                    ),
-                )
-            })
-        }
-    };
+    // A scan-domain consumer reaches its connector scan through that scan's own
+    // carrier: `ConnectorTableScanSource::dynamic_filters` maps this binding id
+    // to a `ScanAssignment` variable and so to a typed `ColumnHandle`, and
+    // `ScanSource::with_runtime_filter_contracts` turns the pair into the live
+    // dynamic filter the reader consults. The decoded scan-domain target states
+    // only the type contract -- already checked against the consumer expression
+    // by `validate_scan_domain_target` -- so there is no column identity left
+    // for the sealed-unit evaluator to key on, and none is fabricated here.
     Ok(RuntimeFilterConsumerBinding::new(
         expr_id,
         contract.clone(),
-        scan_domain,
+        None,
     ))
 }
 

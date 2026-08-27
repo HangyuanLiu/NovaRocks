@@ -293,6 +293,7 @@ fn a_scan_whose_binding_generation_does_not_resolve_fails_closed() {
             Some(&query_bindings),
             None,
             &fixture_scan_preparation_options(empty),
+            &[],
         ),
         "an uninstalled generation cannot be planned",
     );
@@ -319,6 +320,7 @@ fn preparation_without_typed_inputs_refuses_instead_of_falling_back() {
             Some(&query_bindings),
             None,
             &super::super::ScanPreparationOptions::single_backend_fixture(),
+            &[],
         ),
         "no typed control registry was threaded in",
     );
@@ -356,4 +358,154 @@ fn a_frozen_snapshot_scan_pins_its_admitted_snapshot() {
         panic!("the fixture control freezes an Iceberg table handle");
     };
     assert_eq!(iceberg.snapshot_id, Some(11));
+}
+
+/// One scan-domain request the frontend resolves for a scan.
+fn source_scan_request(
+    binding_id: u32,
+    fragment_id: novarocks_sql::plan_read::FragmentId,
+    node_id: i32,
+    column_id: u32,
+    data_type: arrow::datatypes::DataType,
+    nullable: bool,
+) -> novarocks_sql::planning::query_execution::SqlRuntimeFilterSourceScanRequest {
+    novarocks_sql::planning::query_execution::SqlRuntimeFilterSourceScanRequest {
+        binding_id,
+        fragment_id,
+        node_id,
+        column_id: novarocks_sql::plan_read::ColumnId(column_id),
+        data_type,
+        nullable,
+    }
+}
+
+/// A runtime filter reaches the reader by naming a column, not a position.
+///
+/// The fixture scan outputs two columns, and the filter names the second one.
+/// The carrier must therefore bind the filter's id to the assignment that
+/// holds that column's own `ColumnHandle` -- the Iceberg field ID -- rather
+/// than to the first assignment or to any ordinal derived from the filter.
+#[test]
+fn a_runtime_filter_binds_to_the_assignment_holding_its_column_handle() {
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergAllColumns)
+        .expect("sealed all-columns iceberg fixture");
+    let bindings = prepare_scan_bindings_with_runtime_filters(
+        &plan,
+        &registry(vec![data_file("s3://bucket/data.parquet")]),
+        &[source_scan_request(
+            6,
+            0,
+            10,
+            3,
+            arrow::datatypes::DataType::Utf8,
+            true,
+        )],
+    )
+    .expect("typed scan preparation");
+
+    let (fragment_id, node_id) = only_scan_node(&bindings);
+    let source = bindings
+        .typed_scan(fragment_id, node_id)
+        .expect("typed connector scan")
+        .prepared
+        .table_scan
+        .source();
+    let assignments = source.assignments();
+    assert_eq!(
+        assignments.len(),
+        2,
+        "the fixture scan outputs id, category"
+    );
+
+    let carried = source.dynamic_filters();
+    assert_eq!(carried.len(), 1);
+    assert_eq!(carried[0].filter_id(), 6);
+    let bound = assignments
+        .iter()
+        .find(|assignment| assignment.variable() == carried[0].variable())
+        .expect("the binding names an assignment of this scan");
+    // Identity, not position: the bound assignment is the one carrying the
+    // named column's handle, and it is not the scan's first assignment.
+    assert_eq!(bound.column(), assignments[1].column());
+    assert_ne!(bound.column(), assignments[0].column());
+}
+
+/// A filter naming a column the scan does not output is refused, never dropped:
+/// a dropped binding would leave its producer publishing into a scan that can
+/// never apply it.
+#[test]
+fn a_runtime_filter_naming_an_unprojected_column_is_refused() {
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed ordinary iceberg fixture");
+    let error = expect_preparation_error(
+        prepare_scan_bindings_with_runtime_filters(
+            &plan,
+            &registry(vec![data_file("s3://bucket/data.parquet")]),
+            &[source_scan_request(
+                6,
+                0,
+                10,
+                3,
+                arrow::datatypes::DataType::Utf8,
+                true,
+            )],
+        ),
+        "a filter naming an unprojected column cannot be silently dropped",
+    );
+    assert!(
+        error.contains("runtime filter binding id=6")
+            && error.contains("does not resolve to exactly one physical output"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Resolution runs against the typed scans preparation just froze and needs no
+/// provider field ordinal at all.
+#[test]
+fn scan_domain_resolution_confirms_the_typed_carrier_binding() {
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergAllColumns)
+        .expect("sealed all-columns iceberg fixture");
+    let request = source_scan_request(6, 0, 10, 3, arrow::datatypes::DataType::Utf8, true);
+    let bindings = prepare_scan_bindings_with_runtime_filters(
+        &plan,
+        &registry(vec![data_file("s3://bucket/data.parquet")]),
+        std::slice::from_ref(&request),
+    )
+    .expect("typed scan preparation");
+
+    let resolutions =
+        crate::query_execution::preparation::runtime_filter_binding::resolve_runtime_filter_source_targets(
+            [request],
+            &bindings,
+        )
+        .expect("scan-domain resolution");
+    assert_eq!(resolutions.len(), 1);
+    assert_eq!(resolutions[0].binding_id, 6);
+    assert_eq!(resolutions[0].data_type, arrow::datatypes::DataType::Utf8);
+    assert!(resolutions[0].nullable);
+}
+
+/// A request the scan never bound is refused rather than resolved: the carrier
+/// is the only thing the backend reads.
+#[test]
+fn scan_domain_resolution_refuses_a_filter_the_scan_never_bound() {
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergAllColumns)
+        .expect("sealed all-columns iceberg fixture");
+    let bindings = prepare_scan_bindings_with_runtime_filters(
+        &plan,
+        &registry(vec![data_file("s3://bucket/data.parquet")]),
+        &[],
+    )
+    .expect("typed scan preparation");
+
+    let error =
+        crate::query_execution::preparation::runtime_filter_binding::resolve_runtime_filter_source_targets(
+            [source_scan_request(6, 0, 10, 3, arrow::datatypes::DataType::Utf8, true)],
+            &bindings,
+        )
+        .expect_err("an unbound filter cannot resolve");
+    assert!(
+        error.contains("runtime filter binding id=6") && error.contains("never offered"),
+        "unexpected error: {error}"
+    );
 }

@@ -114,6 +114,13 @@ pub(crate) fn prepare_fragments(
         preparation_facts.boundary_contracts(),
         &sealed_ids,
     )?;
+    // Every scan-domain request is handed to scan preparation, so the scan that
+    // owns it declares the filter on its own typed carrier. A filter added
+    // after the relation is frozen would never reach the reader.
+    let source_scan_requests = runtime_filter_facts
+        .source_scan_requests()
+        .cloned()
+        .collect::<Vec<_>>();
     let scan_bindings = prepare_scan_bindings(
         plan,
         controls,
@@ -121,11 +128,12 @@ pub(crate) fn prepare_fragments(
         query_table_bindings,
         resolver,
         scan_options,
+        &source_scan_requests,
     )?;
-    // Scan-domain target ordinals are derived only after the exact provider read
-    // is pinned.  Never materialize RF bindings against a later catalog view.
+    // Resolution runs against the typed scans preparation just froze, never
+    // against a later catalog view.
     let source_resolutions = runtime_filter_binding::resolve_runtime_filter_source_targets(
-        runtime_filter_facts.source_scan_requests().cloned(),
+        source_scan_requests,
         &scan_bindings,
     )?;
     let runtime_filter_facts =

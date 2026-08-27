@@ -29,6 +29,7 @@ use std::sync::Arc;
 use crate::catalog_application::query_bindings::{
     QueryScanMaterialization, QueryTableBindingStore,
 };
+use crate::catalog_application::query_materializer::metadata_table_alias_suffix;
 use crate::connector::typed_control_registry::{
     TypedConnectorControl, TypedConnectorControlRegistry,
 };
@@ -46,7 +47,8 @@ use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorReadSelect
 use novarocks_sql::plan_read::PlanScanNode;
 use novarocks_sql::plan_read::{DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId};
 use novarocks_sql::planning::query_execution::{
-    SqlScanPreparationCategory, SqlScanPreparationFacts, scan_preparation_facts,
+    SqlRuntimeFilterSourceScanRequest, SqlScanPreparationCategory, SqlScanPreparationFacts,
+    scan_preparation_facts,
 };
 
 mod projection;
@@ -151,6 +153,7 @@ impl ScanPreparationOptions {
     }
 }
 
+/// Scan preparation carries the complete frozen planning context explicitly.
 pub(super) fn prepare_scan_bindings(
     plan: &DistributedPlan,
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
@@ -158,6 +161,7 @@ pub(super) fn prepare_scan_bindings(
     query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn ScanBindingResolver>,
     options: &ScanPreparationOptions,
+    runtime_filter_scans: &[SqlRuntimeFilterSourceScanRequest],
 ) -> Result<ScanExecutionBindings, String> {
     let mut bindings = ScanExecutionBindings::default();
     let mut seen_scan_node_ids = std::collections::BTreeSet::new();
@@ -170,6 +174,7 @@ pub(super) fn prepare_scan_bindings(
             query_table_bindings,
             resolver,
             options,
+            runtime_filter_scans,
             &mut seen_scan_node_ids,
             &mut bindings,
         )?;
@@ -193,6 +198,7 @@ fn collect_scan_bindings(
     query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn ScanBindingResolver>,
     options: &ScanPreparationOptions,
+    runtime_filter_scans: &[SqlRuntimeFilterSourceScanRequest],
     seen_scan_node_ids: &mut std::collections::BTreeSet<i32>,
     bindings: &mut ScanExecutionBindings,
 ) -> Result<(), String> {
@@ -209,6 +215,7 @@ fn collect_scan_bindings(
             query_table_bindings,
             resolver,
             options,
+            runtime_filter_scans,
             bindings,
         )?;
     }
@@ -222,6 +229,7 @@ fn collect_scan_bindings(
                 query_table_bindings,
                 resolver,
                 options,
+                runtime_filter_scans,
                 seen_scan_node_ids,
                 bindings,
             )?;
@@ -243,6 +251,7 @@ fn prepare_scan_node(
     query_table_bindings: Option<&QueryTableBindingStore>,
     resolver: Option<&dyn ScanBindingResolver>,
     options: &ScanPreparationOptions,
+    runtime_filter_scans: &[SqlRuntimeFilterSourceScanRequest],
     bindings: &mut ScanExecutionBindings,
 ) -> Result<(), String> {
     let facts = scan_preparation_facts(scan);
@@ -287,18 +296,26 @@ fn prepare_scan_node(
                 "SQL frozen scan node_id={node_id} has timestamp selector {timestamp} without an admitted snapshot file set"
             ));
         }
-        // An Iceberg metadata table is a system relation. The connector
-        // implements `get_system_table_plan`, but the relation it names is
-        // `<table>$<SUFFIX>` and the suffix comes from the SQL scan's metadata
-        // table kind, which `SqlScanPreparationFacts` does not carry. Refusing
-        // here is what keeps a metadata scan from silently freezing the base
-        // table's DATA handle instead of guessing which system relation it is.
+        // A metadata table is a system relation of its base table. It reads
+        // through the same admitted materialization as an ordinary scan; only
+        // the relation family the connector freezes differs.
         SqlScanPreparationCategory::AdmittedMetadata => {
-            return Err(unsupported_relation(
-                node_id,
-                &facts,
-                ConnectorRelationKind::SystemTable,
-            ));
+            let query_table_bindings = query_table_bindings.ok_or_else(|| {
+                format!(
+                    "SQL metadata scan node_id={node_id} has binding token but no query-local binding store"
+                )
+            })?;
+            let materialization = query_table_bindings
+                .scan_materialization(facts.binding())?
+                .ok_or_else(|| {
+                    format!(
+                        "SQL metadata scan binding for '{}.{}.{}' has no scan materialization",
+                        facts.identity().catalog(),
+                        facts.identity().namespace(),
+                        facts.identity().table()
+                    )
+                })?;
+            ResolvedScanExecution::AdmittedSystemTable(materialization)
         }
         // A change-window read is its own relation family. The two endpoints
         // are stated by the scan; the exact query-local admission that names
@@ -350,6 +367,16 @@ fn prepare_scan_node(
     // backend materializes those on top of the physical read slots, so
     // offering one to the connector would ask for a column it does not have.
     let physical_columns = resolve_physical_columns(node_id, scan)?;
+    // The runtime filters this scan must offer the connector. They are resolved
+    // before the relation is frozen so the scan carrier declares them itself; a
+    // filter added afterwards would never reach the reader.
+    let dynamic_filters = scan_dynamic_filters(
+        fragment_id,
+        node_id,
+        &physical_columns,
+        runtime_filter_scans,
+    )?;
+    let dynamic_filters = dynamic_filters.as_slice();
     let (ranges, equality_required, typed_scan) = match &execution {
         // The opaque lane is produced only by the pre-pinned source refused
         // above; every variant is named so that adding a lane is a compile
@@ -358,6 +385,21 @@ fn prepare_scan_node(
             return Err(format!(
                 "scan preparation node_id={node_id}: a pre-pinned opaque connector read has no typed lowering"
             ));
+        }
+        ResolvedScanExecution::AdmittedSystemTable(materialization) => {
+            let prepared = prepare_typed_connector_scan(
+                node_id,
+                node_limit,
+                scan,
+                &physical_columns,
+                &facts,
+                materialization,
+                TypedRelationFreeze::SystemTable,
+                context,
+                options,
+                dynamic_filters,
+            )?;
+            (Vec::new(), Vec::new(), prepared)
         }
         ResolvedScanExecution::AdmittedChangeWindow(materialization) => {
             let window = facts.delta_window().ok_or_else(|| {
@@ -378,6 +420,7 @@ fn prepare_scan_node(
                 )),
                 context,
                 options,
+                dynamic_filters,
             )?;
             (Vec::new(), Vec::new(), prepared)
         }
@@ -396,6 +439,7 @@ fn prepare_scan_node(
                 },
                 context,
                 options,
+                dynamic_filters,
             )?;
             (Vec::new(), Vec::new(), prepared)
         }
@@ -432,6 +476,7 @@ fn prepare_typed_connector_scan(
     freeze: TypedRelationFreeze<'_>,
     context: &novarocks_spi::connector::ConnectorRequestContext,
     options: &ScanPreparationOptions,
+    dynamic_filters: &[(u32, String)],
 ) -> Result<PreparedTypedConnectorScan, String> {
     let typed = options.typed()?;
     let binding = materialization.planning_lease.binding();
@@ -458,20 +503,19 @@ fn prepare_typed_connector_scan(
     let declaration = binding
         .execution_declaration(context)
         .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
-    let relation = SchemaTableName::try_new(facts.identity().namespace(), facts.identity().table())
-        .map_err(|error| {
+    let relation_name = typed_relation_name(node_id, facts, freeze)?;
+    let relation = SchemaTableName::try_new(facts.identity().namespace(), &relation_name).map_err(
+        |error| {
             format!(
                 "typed connector scan node_id={node_id} cannot name relation '{}': {error}",
                 facts.identity().fqn()
             )
-        })?;
+        },
+    )?;
     let catalog = CatalogHandle::new(
         binding_key.instance_id.as_str(),
         binding_key.incarnation.to_bytes(),
     );
-    // Runtime-filter bindings are resolved after every scan is prepared, so no
-    // dynamic filter is offered here yet. Offering none is exact: the carrier
-    // then declares none, and nothing waits on a consumer that never applies.
     let prepared = prepare_typed_scan(
         &typed.session,
         catalog,
@@ -482,7 +526,7 @@ fn prepare_typed_connector_scan(
         &relation,
         freeze,
         node_scan_limit(node_limit),
-        &[],
+        dynamic_filters,
     )
     .map_err(|error| format!("scan preparation node_id={node_id}: {error}"))?;
     // The relation family the connector actually froze must be the family this
@@ -517,6 +561,72 @@ fn prepare_typed_connector_scan(
     })
 }
 
+/// The runtime filters one scan offers the connector, as `(filter id, scan
+/// output column name)` pairs.
+///
+/// A scan-domain request names one planner column of this scan, and the typed
+/// scan binds the filter to that output's assignment — so the filter reaches
+/// the reader as the connector's own `ColumnHandle`, never as an ordinal into
+/// some provider schema. A request naming a column this scan does not output is
+/// refused here: dropping it would leave the filter's producer waiting on a
+/// consumer that never applies it.
+fn scan_dynamic_filters(
+    fragment_id: FragmentId,
+    node_id: i32,
+    physical_columns: &[ResolvedScanColumn],
+    requests: &[SqlRuntimeFilterSourceScanRequest],
+) -> Result<Vec<(u32, String)>, String> {
+    requests
+        .iter()
+        .filter(|request| request.fragment_id == fragment_id && request.node_id == node_id)
+        .map(|request| {
+            let matched = physical_columns
+                .iter()
+                .filter(|column| column.planner.column_id == request.column_id)
+                .collect::<Vec<_>>();
+            let [column] = matched.as_slice() else {
+                return Err(format!(
+                    "runtime filter binding id={} scan-domain target column id {} does not resolve to exactly one physical output of scan node_id={node_id}",
+                    request.binding_id, request.column_id
+                ));
+            };
+            Ok((request.binding_id, column.planner.name.clone()))
+        })
+        .collect()
+}
+
+/// The relation name one lane asks the connector to freeze.
+///
+/// Every family but a system relation names the table itself. A system
+/// relation is addressed by the connector's own `<table>$<SUFFIX>` spelling,
+/// which is the only thing that tells it which one to materialize, so the
+/// suffix comes from the query materializer's single suffix vocabulary rather
+/// than from a second spelling built here.
+fn typed_relation_name(
+    node_id: i32,
+    facts: &SqlScanPreparationFacts,
+    freeze: TypedRelationFreeze<'_>,
+) -> Result<String, String> {
+    match freeze {
+        TypedRelationFreeze::Table { .. } | TypedRelationFreeze::ChangeWindow(_) => {
+            Ok(facts.identity().table().to_string())
+        }
+        TypedRelationFreeze::SystemTable => {
+            let kind = facts.metadata_table_kind().ok_or_else(|| {
+                format!(
+                    "typed connector scan node_id={node_id} on '{}' is a metadata scan with no metadata table kind",
+                    facts.identity().fqn()
+                )
+            })?;
+            Ok(format!(
+                "{}${}",
+                facts.identity().table(),
+                metadata_table_alias_suffix(kind)
+            ))
+        }
+    }
+}
+
 /// The typed relation version an admitted selector names.
 fn typed_relation_version(
     node_id: i32,
@@ -543,19 +653,6 @@ fn node_scan_limit(node_limit: i64) -> Option<u64> {
     (node_limit != NO_NODE_LIMIT)
         .then(|| u64::try_from(node_limit).ok())
         .flatten()
-}
-
-/// The stable refusal for a relation family this cut does not read.
-fn unsupported_relation(
-    node_id: i32,
-    facts: &SqlScanPreparationFacts,
-    kind: ConnectorRelationKind,
-) -> String {
-    format!(
-        "typed connector scan node_id={node_id} on '{}' names relation kind `{}`, which this read stack does not admit",
-        facts.identity().fqn(),
-        relation_kind_name(kind)
-    )
 }
 
 /// The stable wire vocabulary for one relation family.
@@ -628,10 +725,12 @@ fn validate_resolved_execution_kind(
         SqlScanPreparationCategory::Delta => {
             matches!(execution, ResolvedScanExecution::AdmittedChangeWindow(_))
         }
+        SqlScanPreparationCategory::AdmittedMetadata => {
+            matches!(execution, ResolvedScanExecution::AdmittedSystemTable(_))
+        }
         SqlScanPreparationCategory::AdmittedData
         | SqlScanPreparationCategory::AdmittedFrozenCurrent
         | SqlScanPreparationCategory::AdmittedFrozenSnapshot
-        | SqlScanPreparationCategory::AdmittedMetadata
         | SqlScanPreparationCategory::MvTargetState
         | SqlScanPreparationCategory::MvTargetLocator => {
             matches!(execution, ResolvedScanExecution::AdmittedConnectorRead(_))
@@ -644,10 +743,10 @@ fn validate_resolved_execution_kind(
     let required = match facts.category() {
         SqlScanPreparationCategory::ConnectorRead => "ConnectorRead",
         SqlScanPreparationCategory::Delta => "AdmittedChangeWindow",
+        SqlScanPreparationCategory::AdmittedMetadata => "AdmittedSystemTable",
         SqlScanPreparationCategory::AdmittedData
         | SqlScanPreparationCategory::AdmittedFrozenCurrent
         | SqlScanPreparationCategory::AdmittedFrozenSnapshot
-        | SqlScanPreparationCategory::AdmittedMetadata
         | SqlScanPreparationCategory::MvTargetState
         | SqlScanPreparationCategory::MvTargetLocator => "AdmittedConnectorRead",
         SqlScanPreparationCategory::FrozenTimestampWithoutAdmittedSnapshot => {

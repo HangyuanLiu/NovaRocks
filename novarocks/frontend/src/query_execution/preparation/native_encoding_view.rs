@@ -103,7 +103,11 @@ impl<'a> NativeScanBindingView<'a> {
     pub fn execution(self) -> NativeScanExecutionKind {
         match self.binding.execution {
             ResolvedScanExecution::ConnectorRead => NativeScanExecutionKind::ConnectorRead,
-            ResolvedScanExecution::AdmittedConnectorRead(_) => {
+            // A system relation is an admitted connector read like any other:
+            // the encoder agrees the lane, and which relation family was
+            // frozen is carried by the typed scan's own handle.
+            ResolvedScanExecution::AdmittedConnectorRead(_)
+            | ResolvedScanExecution::AdmittedSystemTable(_) => {
                 NativeScanExecutionKind::AdmittedConnectorRead
             }
             // The encoder-facing name is still `SealedConnectorScan`; it marks

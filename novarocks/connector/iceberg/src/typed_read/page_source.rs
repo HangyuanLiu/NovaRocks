@@ -62,6 +62,7 @@ use crate::iceberg::spec::{
     Literal, NameMapping, PartitionSpec, PrimitiveType, Schema, Struct, Type,
 };
 
+use super::change_window::IcebergChangeWindowHandle;
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, parse_type, unsupported};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager, SplitDeleteFilter};
 use super::schema_binding::{
@@ -562,13 +563,67 @@ impl ParquetFooterCache {
     }
 }
 
+/// The relation-level facts one page source reads a data file against.
+///
+/// A data scan and a change window are different relations with different
+/// handles, and neither handle converts into the other -- a change window has
+/// no snapshot, no pushdown predicate, and no table location. What a reader
+/// actually needs from either is the same four facts, so they are named here
+/// directly instead of forcing one relation to impersonate the other.
+#[derive(Clone, Debug)]
+pub struct IcebergReadRelation {
+    table_schema: Arc<Schema>,
+    partition_spec: PartitionSpec,
+    name_mapping: Option<Arc<NameMapping>>,
+    effective_predicate: TupleDomain<IcebergColumnHandle>,
+}
+
+impl IcebergReadRelation {
+    /// The facts a data scan of one split reads against.
+    pub fn of_table(
+        handle: &IcebergTableHandle,
+        partition_spec_id: i32,
+    ) -> Result<Self, ConnectorError> {
+        Ok(Self {
+            table_schema: Arc::new(handle.parse_table_schema()?),
+            partition_spec: handle.parse_partition_spec(partition_spec_id)?,
+            name_mapping: parse_name_mapping(handle.name_mapping_json())?,
+            effective_predicate: handle.effective_predicate()?,
+        })
+    }
+
+    /// The facts a change-window split reads against.
+    ///
+    /// A change window pushes no predicate down: its rows are the difference
+    /// of two pinned endpoints, and a filter the enumeration never saw could
+    /// only remove rows the difference owns.
+    pub fn of_change_window(
+        handle: &IcebergChangeWindowHandle,
+        partition_spec_id: i32,
+    ) -> Result<Self, ConnectorError> {
+        Ok(Self {
+            table_schema: Arc::new(handle.parse_table_schema()?),
+            partition_spec: handle.parse_partition_spec(partition_spec_id)?,
+            name_mapping: parse_name_mapping(handle.name_mapping_json())?,
+            effective_predicate: TupleDomain::all(),
+        })
+    }
+
+    pub fn table_schema(&self) -> &Arc<Schema> {
+        &self.table_schema
+    }
+}
+
 /// Everything one page source needs, all of it already frozen or process-local.
 pub struct IcebergPageSourceRequest<'a> {
-    pub table_handle: &'a IcebergTableHandle,
+    pub relation: &'a IcebergReadRelation,
     pub split: &'a IcebergSplit,
     /// The scan's ordered output columns; they become the page's prefix.
     pub columns: &'a [IcebergColumnHandle],
     pub delete_manager: Arc<DeleteManager>,
+    /// How the split's delete state is spent. An ordinary scan excludes
+    /// deleted rows; a change window's reverse side selects them.
+    pub delete_mode: DeleteEvaluationMode,
     pub footers: Arc<ParquetFooterCache>,
     pub access_binding: IcebergReadBinding,
     pub context: FileReadContext,
@@ -596,31 +651,42 @@ pub fn create_iceberg_page_source(
         )?;
     }
 
-    let table_schema = Arc::new(request.table_handle.parse_table_schema()?);
-    let partition_spec = request
-        .table_handle
-        .parse_partition_spec(split.partition_spec_id())?;
+    let table_schema = Arc::clone(&request.relation.table_schema);
+    let partition_spec = request.relation.partition_spec.clone();
+    if partition_spec.spec_id() != split.partition_spec_id() {
+        return Err(invalid(format!(
+            "iceberg data file {} was planned under partition spec {} but is read against spec {}",
+            split.path(),
+            split.partition_spec_id(),
+            partition_spec.spec_id()
+        )));
+    }
     let partition_values = parse_partition_values(split, &partition_spec, &table_schema)?;
-    let effective_predicate = request.table_handle.effective_predicate()?;
+    let effective_predicate = request.relation.effective_predicate.clone();
 
-    if let Some(fast_path) = try_partition_only_page_source(
-        split,
-        request.columns,
-        &partition_spec,
-        &partition_values,
-        &table_schema,
-        &effective_predicate,
-        request.budget,
-    )? {
+    // The fast path answers "every row of this file", which is only the right
+    // answer when deletes hide rows. A mode that *selects* rows -- the change
+    // window's reverse side, or reverse equality projection -- would get every
+    // row of the file back with the right shape and the wrong contents.
+    if request.delete_mode == DeleteEvaluationMode::ExcludeDeleted
+        && let Some(fast_path) = try_partition_only_page_source(
+            split,
+            request.columns,
+            &partition_spec,
+            &partition_values,
+            &table_schema,
+            &effective_predicate,
+            request.budget,
+        )?
+    {
         return Ok(Box::new(fast_path));
     }
 
-    let name_mapping = parse_name_mapping(request.table_handle)?;
-    let delete_filter = request.delete_manager.open_split(
-        split,
-        &table_schema,
-        DeleteEvaluationMode::ExcludeDeleted,
-    )?;
+    let name_mapping = request.relation.name_mapping.clone();
+    let delete_filter =
+        request
+            .delete_manager
+            .open_split(split, &table_schema, request.delete_mode)?;
     let hidden_columns = delete_filter.required_hidden_columns().to_vec();
 
     Ok(Box::new(IcebergParquetPageSource {
@@ -698,10 +764,8 @@ fn reject_encryption_material(
     )))
 }
 
-fn parse_name_mapping(
-    table_handle: &IcebergTableHandle,
-) -> Result<Option<Arc<NameMapping>>, ConnectorError> {
-    let Some(json) = table_handle.name_mapping_json() else {
+fn parse_name_mapping(json: Option<&str>) -> Result<Option<Arc<NameMapping>>, ConnectorError> {
+    let Some(json) = json else {
         return Ok(None);
     };
     let mapping: NameMapping = serde_json::from_str(json)
@@ -1913,11 +1977,23 @@ mod tests {
             handle: &IcebergTableHandle,
             columns: &[IcebergColumnHandle],
         ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+            self.page_source_with_mode(split, handle, columns, DeleteEvaluationMode::ExcludeDeleted)
+        }
+
+        fn page_source_with_mode(
+            &self,
+            split: &IcebergSplit,
+            handle: &IcebergTableHandle,
+            columns: &[IcebergColumnHandle],
+            delete_mode: DeleteEvaluationMode,
+        ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+            let relation = IcebergReadRelation::of_table(handle, split.partition_spec_id())?;
             create_iceberg_page_source(IcebergPageSourceRequest {
-                table_handle: handle,
+                relation: &relation,
                 split,
                 columns,
                 delete_manager: Arc::clone(&self.delete_manager),
+                delete_mode,
                 footers: Arc::clone(&self.footers),
                 access_binding: self.binding.clone(),
                 context: self.context.clone(),
@@ -2070,11 +2146,13 @@ mod tests {
             dynamic_filter: Arc<WireDynamicFilter>,
             scheduled_split_sequence_id: u64,
         ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+            let relation = IcebergReadRelation::of_table(handle, split.partition_spec_id())?;
             create_iceberg_page_source(IcebergPageSourceRequest {
-                table_handle: handle,
+                relation: &relation,
                 split,
                 columns,
                 delete_manager: Arc::clone(&self.delete_manager),
+                delete_mode: DeleteEvaluationMode::ExcludeDeleted,
                 footers: Arc::clone(&self.footers),
                 access_binding: self.binding.clone(),
                 context: self.context.clone(),
