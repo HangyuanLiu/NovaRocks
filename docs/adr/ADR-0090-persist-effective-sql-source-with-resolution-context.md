@@ -13,7 +13,7 @@ code-anchors:
   - "novarocks/parser/src/ast/mod.rs (RawQuerySlice)"
   - "novarocks/frontend/src/mv/domain/persistence/definition.rs (StoredMvDefinition)"
   - "novarocks/frontend/src/mv/domain/persistence/descriptor.rs (MvDescriptorV2)"
-  - "novarocks/frontend/src/view/repository.rs (StoredDatabaseViewsV2)"
+  - "novarocks/frontend/src/common/persisted_query_definition.rs (PersistedQueryDefinition)"
 ---
 
 ## 问题

@@ -24,8 +24,6 @@ mod catalog_projection_metrics;
 pub mod client_connection;
 pub mod common;
 pub mod connector;
-#[doc(hidden)]
-pub mod coordination;
 pub mod coordinator;
 pub mod deployment;
 pub mod dml;
@@ -43,6 +41,7 @@ pub mod runtime;
 pub mod runtime_filter;
 mod server;
 pub(crate) mod session_error;
+pub mod state_family;
 pub mod state_store;
 pub mod statistics;
 pub mod statistics_jobs;

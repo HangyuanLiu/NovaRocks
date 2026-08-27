@@ -2,9 +2,9 @@
 id: ADR-0066
 title: "StateStore-owned catalog attachment authority with a derived per-FE runtime projection"
 domain: [catalog-attachment]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0115
 date: 2026-08-13
 provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/881"

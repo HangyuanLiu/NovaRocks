@@ -25,8 +25,8 @@ use std::future::Future;
 use std::sync::Arc;
 
 use novarocks_spi::state_store::{
-    Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, StateStoreError,
-    StateStoreErrorKind, WriteTransaction,
+    Direction, Key, KeyRange, Precondition, RangeRequest, ReadTransaction, StateRecord, StateStore,
+    StateStoreError, StateStoreErrorKind, WriteTransaction,
 };
 use uuid::Uuid;
 
@@ -91,24 +91,13 @@ impl StateStoreMvRepository {
     }
 
     async fn scan_prefix(&self, prefix: Key) -> Result<Vec<StateRecord>, MvRepositoryError> {
-        let range = KeyRange::for_prefix(prefix).map_err(operation::state_store_error)?;
-        let mut transaction = self
-            .store
-            .begin_read()
-            .await
-            .map_err(operation::state_store_error)?;
-        let records = scan_transaction_range(
-            transaction.as_mut(),
-            range,
+        scan_read_prefix(
+            self.store.as_ref(),
+            prefix,
             self.store.limits().max_page_size,
         )
         .await
-        .map_err(operation::state_store_error)?;
-        transaction
-            .abort()
-            .await
-            .map_err(operation::state_store_error)?;
-        Ok(records)
+        .map_err(operation::state_store_error)
     }
 
     async fn read_record(&self, key: &Key) -> Result<Option<StateRecord>, MvRepositoryError> {
@@ -526,7 +515,7 @@ impl MvRepository for StateStoreMvRepository {
 }
 
 async fn scan_transaction_range(
-    transaction: &mut dyn novarocks_spi::state_store::ReadTransaction,
+    transaction: &mut dyn ReadTransaction,
     range: KeyRange,
     page_size: usize,
 ) -> Result<Vec<StateRecord>, StateStoreError> {
@@ -549,6 +538,18 @@ async fn scan_transaction_range(
     }
 }
 
+async fn scan_read_prefix(
+    store: &dyn StateStore,
+    prefix: Key,
+    page_size: usize,
+) -> Result<Vec<StateRecord>, StateStoreError> {
+    let range = KeyRange::for_prefix(prefix)?;
+    let mut transaction = store.begin_read().await?;
+    let records = scan_transaction_range(transaction.as_mut(), range, page_size).await?;
+    transaction.abort().await?;
+    Ok(records)
+}
+
 async fn scan_write_prefix(
     transaction: &mut dyn WriteTransaction,
     prefix: Key,
@@ -558,37 +559,60 @@ async fn scan_write_prefix(
     scan_transaction_range(transaction, range, page_size).await
 }
 
-/// Reject catalog attachment deletion when the current Accelerator still names
-/// that catalog as an MV target or upstream dependency.  Only current keys are
-/// consulted; historical MV families are intentionally not compatibility data.
-pub(crate) async fn ensure_no_catalog_references_transaction(
-    transaction: &mut dyn WriteTransaction,
+/// How the current Accelerator names a catalog.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MvCatalogReference {
+    /// A current MV writes its projection into this catalog.
+    Target,
+    /// A current MV reads an upstream object out of this catalog.
+    UpstreamDependency,
+}
+
+impl MvCatalogReference {
+    pub(crate) const fn describe(self) -> &'static str {
+        match self {
+            Self::Target => "a materialized view target",
+            Self::UpstreamDependency => "materialized view upstream dependencies",
+        }
+    }
+}
+
+/// Reads whether the current Accelerator still names `catalog` as an MV target
+/// or upstream dependency.  Only current keys are consulted; historical MV
+/// families are intentionally not compatibility data.
+///
+/// This is a plain read path, and deliberately so.  The same two prefixes used
+/// to be scanned inside the catalog attachment delete transaction, which read
+/// like a cross-family serializability fence between `DROP CATALOG` and MV DDL.
+/// It never was one: the family scanned here is a rebuildable Accelerator that
+/// may legitimately be wiped in whole, so the "guarantee" evaporated exactly
+/// when the cache was cleared, and the parties that actually race — concurrent
+/// MV DDL and an external catalog desired-state controller — were never
+/// participants in that transaction anyway.  Keeping the scan transactional
+/// only advertised a tool that does not exist.  The caller therefore treats
+/// this as an observation, not a fence; see
+/// `CatalogAttachmentRepository::observe_materialized_view_references`.
+pub(crate) async fn observe_catalog_references(
+    store: &dyn StateStore,
     catalog: &str,
     page_size: usize,
-) -> Result<(), StateStoreError> {
-    if !scan_write_prefix(
-        transaction,
+) -> Result<Option<MvCatalogReference>, StateStoreError> {
+    if !scan_read_prefix(
+        store,
         target_lookup_catalog_prefix(catalog).map_err(invalid_state_store)?,
         page_size,
     )
     .await?
     .is_empty()
     {
-        return Err(conflict_state_store(
-            "catalog has a materialized view target",
-        ));
+        return Ok(Some(MvCatalogReference::Target));
     }
     for prefix in dependency_by_upstream_catalog_prefixes(catalog).map_err(invalid_state_store)? {
-        if !scan_write_prefix(transaction, prefix, page_size)
-            .await?
-            .is_empty()
-        {
-            return Err(conflict_state_store(
-                "catalog has materialized view dependencies",
-            ));
+        if !scan_read_prefix(store, prefix, page_size).await?.is_empty() {
+            return Ok(Some(MvCatalogReference::UpstreamDependency));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn loaded_projection(
