@@ -114,7 +114,6 @@ assert_rejected "$models_tonic" \
 for forbidden in \
   tonic \
   novarocks-backend \
-  novarocks-connector-iceberg \
   novarocks-connector-starrocks \
   novarocks-execution \
   novarocks-frontend \
@@ -141,7 +140,6 @@ for lower_layer in \
   novarocks-state-store-foundationdb \
   novarocks-state-store-mysql \
   novarocks-state-store-sqlite \
-  novarocks-connector-iceberg \
   novarocks-connector-starrocks; do
   lower_layer_wire="$tmpdir/${lower_layer}-wire.json"
   add_normal_resolve_edge "$lower_layer" novarocks-proto-models "$lower_layer_wire"
