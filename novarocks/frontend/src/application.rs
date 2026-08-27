@@ -993,9 +993,22 @@ impl FrontendApplicationHost {
     }
 
     pub async fn shutdown(mut self) -> Result<(), FrontendApplicationError> {
-        self.release_resources().await.map_err(|error| {
-            FrontendApplicationError::new(FrontendApplicationErrorKind::Shutdown, error)
-        })
+        self.shutdown_until(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    /// Releases FE-owned resources under one absolute deadline. Individual
+    /// cleanup owners must not start a fresh full timeout after another owner
+    /// has already consumed the shutdown budget.
+    pub async fn shutdown_until(
+        mut self,
+        deadline: Instant,
+    ) -> Result<(), FrontendApplicationError> {
+        self.release_resources_until(deadline)
+            .await
+            .map_err(|error| {
+                FrontendApplicationError::new(FrontendApplicationErrorKind::Shutdown, error)
+            })
     }
 
     async fn open_configured(
@@ -1042,13 +1055,16 @@ impl FrontendApplicationHost {
         &mut self,
         primary: FrontendApplicationError,
     ) -> FrontendApplicationError {
-        match self.release_resources().await {
+        match self
+            .release_resources_until(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
+            .await
+        {
             Ok(()) => primary,
             Err(cleanup_error) => primary.with_cleanup_context(cleanup_error),
         }
     }
 
-    async fn release_resources(&mut self) -> Result<(), String> {
+    async fn release_resources_until(&mut self, deadline: Instant) -> Result<(), String> {
         // The worker owns durable attempt activity and must stop before the
         // coordinator/topology/StateStore it depends on are released.
         let mv_worker_error = self
@@ -1104,7 +1120,24 @@ impl FrontendApplicationHost {
         self.statistics_application_port.take();
         self.statistics_application_service.take();
         let catalog_controller_error = match self.catalog_controller.take() {
-            Some(controller) => controller.shutdown().await.err(),
+            Some(controller) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    Some(
+                        "frontend cleanup deadline elapsed before catalog controller shutdown"
+                            .to_string(),
+                    )
+                } else {
+                    tokio::time::timeout(remaining, controller.shutdown())
+                        .await
+                        .map_err(|_| {
+                            "frontend cleanup deadline elapsed shutting down catalog controller"
+                                .to_string()
+                        })
+                        .and_then(|result| result)
+                        .err()
+                }
+            }
             None => None,
         };
         self.catalog_application_port.take();
@@ -1123,10 +1156,7 @@ impl FrontendApplicationHost {
             }
         }
         if let Some(host) = self.state_store_host.as_mut() {
-            if let Err(error) = host
-                .shutdown(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
-                .await
-            {
+            if let Err(error) = host.shutdown(deadline).await {
                 let host_error = format!("shutdown frontend StateStore host failed: {error}");
                 if let Some(primary) = primary_error.as_mut() {
                     primary.push_str(&format!("; cleanup failed: {host_error}"));

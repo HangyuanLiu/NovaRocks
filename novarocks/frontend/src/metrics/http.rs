@@ -17,13 +17,14 @@
 
 use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 
-use crate::coordinator::QueryLifecycleConvergenceReader;
+use crate::coordinator::{QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot};
+use crate::workload_lifecycle::FrontendServingSnapshotReader;
 
 use super::FrontendMetricsRegistry;
 
@@ -35,12 +36,47 @@ pub(crate) struct MetricsHttpServer {
     stop_requested: Arc<AtomicBool>,
 }
 
+/// Preserves the debug route shape while the management listener starts before
+/// the coordinator exists. Installing the real reader is one-way.
+#[derive(Default)]
+pub(crate) struct LateBoundQueryLifecycleConvergenceReader {
+    reader: Mutex<Option<Arc<dyn QueryLifecycleConvergenceReader>>>,
+}
+
+impl LateBoundQueryLifecycleConvergenceReader {
+    pub(crate) fn install(
+        &self,
+        reader: Arc<dyn QueryLifecycleConvergenceReader>,
+    ) -> Result<(), String> {
+        let mut slot = self
+            .reader
+            .lock()
+            .expect("late-bound convergence reader lock poisoned");
+        if slot.is_some() {
+            return Err("frontend lifecycle convergence reader is already installed".to_string());
+        }
+        *slot = Some(reader);
+        Ok(())
+    }
+}
+
+impl QueryLifecycleConvergenceReader for LateBoundQueryLifecycleConvergenceReader {
+    fn latest_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
+        self.reader
+            .lock()
+            .expect("late-bound convergence reader lock poisoned")
+            .as_ref()
+            .and_then(|reader| reader.latest_convergence_snapshot())
+    }
+}
+
 impl MetricsHttpServer {
     pub(crate) fn start(
         host: &str,
         port: u16,
         registry: Arc<FrontendMetricsRegistry>,
-        convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
+        serving_reader: Arc<dyn FrontendServingSnapshotReader>,
+        convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
     ) -> Result<Self, String> {
         let bind_addr = parse_metrics_bind_addr(host, port)
             .map_err(|error| format!("parse frontend metrics HTTP bind address failed: {error}"))?;
@@ -66,8 +102,12 @@ impl MetricsHttpServer {
                     let listener = TokioTcpListener::from_std(listener).map_err(|error| {
                         format!("create frontend management HTTP listener failed: {error}")
                     })?;
-                    let app =
-                        super::management::frontend_management_router(registry, convergence_reader);
+                    let app = super::management::frontend_management_router_with_readers(
+                        registry,
+                        serving_reader,
+                        convergence_reader,
+                        crate::native::report_server::lifecycle_convergence_debug_enabled(),
+                    );
                     axum::serve(listener, app)
                         .with_graceful_shutdown(async move {
                             while !*shutdown_rx.borrow() {

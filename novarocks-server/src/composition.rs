@@ -582,6 +582,8 @@ pub fn compose_frontend_server_config(
         report_bind_host: config.server.host.clone(),
         report_grpc_port: config.server.grpc_port,
         metrics_http_port: config.server.http_port,
+        frontend_drain_timeout: Duration::from_millis(config.server.frontend_drain_timeout_ms),
+        frontend_cleanup_timeout: Duration::from_millis(config.server.frontend_cleanup_timeout_ms),
         mysql_listener,
         connector_control_factories: compose_frontend_control_factories(
             config,

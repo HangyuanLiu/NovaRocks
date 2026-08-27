@@ -143,29 +143,61 @@ pub async fn run_mysql_server_until_shutdown<F>(
 where
     F: Future<Output = ()> + Send,
 {
-    let ready_user = settings.user.clone();
-    let session_user = settings.user;
     let shutdown_factory = Arc::clone(&session_factory);
     let shutdown_connections = Arc::clone(&connections);
-    let connection_registry = Arc::clone(&connections);
-    serve_until_shutdown(
-        settings.bind_addr,
+    run_mysql_server_until_drain_then_shutdown(
+        settings,
+        session_factory,
+        connections,
         async move {
             shutdown.await;
+        },
+        async move {
             shutdown_factory.cancel_all(QueryCancellationReason::ServerShutdown);
             shutdown_connections
                 .terminate_all(crate::ClientConnectionTerminationReason::ServerShutdown);
         },
+        SESSION_DRAIN_TIMEOUT,
+    )
+    .await
+}
+
+/// Stops accepting new sockets at `drain`, but retains already accepted
+/// protocol tasks until the FE lifecycle owner performs final teardown.
+///
+/// This is deliberately separate from `run_mysql_server_until_shutdown`: an
+/// idle MySQL session is not an admitted workload and must not decide the FE
+/// drain deadline, while an admitted statement needs its socket and result
+/// path until it completes or the deadline cancellation wins.
+pub async fn run_mysql_server_until_drain_then_shutdown<F, G>(
+    settings: ResolvedMysqlListenerSettings,
+    session_factory: Arc<dyn QuerySessionFactory>,
+    connections: Arc<MysqlClientConnectionRegistry>,
+    drain: F,
+    finalize: G,
+    cleanup_timeout: Duration,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+    G: Future<Output = ()> + Send,
+{
+    let ready_user = settings.user.clone();
+    let session_user = settings.user;
+    serve_until_drain_then_shutdown(
+        settings.bind_addr,
+        drain,
+        finalize,
         move |stream, peer_addr| {
             serve_frontend_mysql_connection(
                 session_user.clone(),
                 Arc::clone(&session_factory),
-                Arc::clone(&connection_registry),
+                Arc::clone(&connections),
                 stream,
                 peer_addr,
             )
         },
         move |bound_addr| emit_standalone_ready(bound_addr, &ready_user),
+        cleanup_timeout,
     )
     .await
 }
@@ -259,6 +291,56 @@ where
 
     drop(listener);
     drain_session_tasks(&mut sessions, drain_timeout).await;
+    serve_result
+}
+
+async fn serve_until_drain_then_shutdown<F, G, H, HFut, R>(
+    bind_addr: SocketAddr,
+    drain: F,
+    finalize: G,
+    mut session_handler: H,
+    on_ready: R,
+    cleanup_timeout: Duration,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+    G: Future<Output = ()> + Send,
+    H: FnMut(TcpStream, SocketAddr) -> HFut,
+    HFut: Future<Output = ()> + Send + 'static,
+    R: FnOnce(SocketAddr),
+{
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .map_err(|error| format!("bind standalone mysql server on {bind_addr} failed: {error}"))?;
+    let bound_addr = listener
+        .local_addr()
+        .map_err(|error| format!("read standalone mysql server address failed: {error}"))?;
+    on_ready(bound_addr);
+
+    let mut sessions = JoinSet::new();
+    tokio::pin!(drain);
+    let serve_result = loop {
+        tokio::select! {
+            biased;
+            _ = &mut drain => break Ok(()),
+            completed = sessions.join_next(), if !sessions.is_empty() => {
+                if let Some(result) = completed { log_session_join_error(result); }
+            }
+            accepted = listener.accept() => match accepted {
+                Ok((stream, peer_addr)) => {
+                    sessions.spawn(session_handler(stream, peer_addr));
+                }
+                Err(error) => break Err(format!("accept standalone mysql connection failed: {error}")),
+            },
+        }
+    };
+    drop(listener);
+    if serve_result.is_err() {
+        drain_session_tasks(&mut sessions, cleanup_timeout).await;
+        return serve_result;
+    }
+    finalize.await;
+    drain_session_tasks(&mut sessions, cleanup_timeout).await;
     serve_result
 }
 
@@ -963,6 +1045,74 @@ mod tests {
             tokio::time::timeout(TEST_TIMEOUT, server)
                 .await
                 .expect("server should stop after session release")
+                .expect("server task should not panic")
+                .expect("server shutdown should succeed");
+        }
+
+        #[tokio::test]
+        async fn drain_stops_accepts_before_final_connection_teardown() {
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let (drain_tx, drain_rx) = oneshot::channel();
+            let (finalize_tx, finalize_rx) = oneshot::channel();
+            let (started_tx, started_rx) = oneshot::channel();
+            let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+            let (release_tx, release_rx) = oneshot::channel();
+            let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+            let server = tokio::spawn(serve_until_drain_then_shutdown(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                async move {
+                    let _ = drain_rx.await;
+                },
+                async move {
+                    let _ = finalize_rx.await;
+                },
+                move |_stream, _peer_addr| {
+                    let started_tx = Arc::clone(&started_tx);
+                    let release_rx = Arc::clone(&release_rx);
+                    async move {
+                        if let Some(started_tx) = started_tx.lock().expect("started lock").take() {
+                            let _ = started_tx.send(());
+                        }
+                        let release_rx = { release_rx.lock().expect("release lock").take() };
+                        if let Some(release_rx) = release_rx {
+                            let _ = release_rx.await;
+                        }
+                    }
+                },
+                move |addr| {
+                    let _ = ready_tx.send(addr);
+                },
+                TEST_TIMEOUT,
+            ));
+            let addr = tokio::time::timeout(TEST_TIMEOUT, ready_rx)
+                .await
+                .expect("server should bind within the test timeout")
+                .expect("ready sender should stay alive");
+            let _client = TcpStream::connect(addr)
+                .await
+                .expect("connect active session");
+            tokio::time::timeout(TEST_TIMEOUT, started_rx)
+                .await
+                .expect("session should start within the test timeout")
+                .expect("session start sender should stay alive");
+
+            drain_tx.send(()).expect("send drain");
+            wait_until_connect_refused(addr).await;
+            assert!(
+                !server.is_finished(),
+                "drain must not finalize existing protocol tasks"
+            );
+            finalize_tx.send(()).expect("send final teardown");
+            tokio::task::yield_now().await;
+            assert!(
+                !server.is_finished(),
+                "final teardown still waits for the protocol task to finish"
+            );
+
+            release_tx.send(()).expect("release active session");
+            tokio::time::timeout(TEST_TIMEOUT, server)
+                .await
+                .expect("server should stop after final teardown and session release")
                 .expect("server task should not panic")
                 .expect("server shutdown should succeed");
         }

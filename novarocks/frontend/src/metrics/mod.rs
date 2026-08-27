@@ -32,7 +32,7 @@ pub(crate) mod dml_publication;
 mod http;
 mod management;
 pub mod query_lifecycle;
-pub(crate) use http::MetricsHttpServer;
+pub(crate) use http::{LateBoundQueryLifecycleConvergenceReader, MetricsHttpServer};
 pub use query_lifecycle::FrontendQueryLifecycleMetricsSnapshot;
 
 static FRAGMENT_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {

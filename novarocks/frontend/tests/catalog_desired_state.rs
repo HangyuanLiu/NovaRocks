@@ -37,7 +37,8 @@ use std::time::{Duration, Instant};
 
 use common::state_store_fixture;
 use novarocks_frontend::catalog_application::desired_state::{
-    CatalogDesiredStateSource, CatalogDesiredStateSourceMode, CatalogSqlMutationAdmission,
+    CatalogDesiredStateSource, CatalogDesiredStateSourceInput, CatalogDesiredStateSourceMode,
+    CatalogSqlMutationAdmission,
 };
 use novarocks_frontend::catalog_application::{
     CatalogAdmission, CatalogApplicationErrorKind, CatalogApplicationPort, CatalogCreateCommand,
@@ -555,7 +556,7 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
                 19090,
                 std::num::NonZeroUsize::new(1).expect("one worker"),
             )
-            .with_catalog_desired_state_source_mode(mode),
+            .with_catalog_desired_state_source(CatalogDesiredStateSourceInput::ManagedControllerUnsupported),
             ClusterBackendOpenConfig::new(
                 novarocks_types::ClusterRole::Fe,
                 Duration::from_secs(1),

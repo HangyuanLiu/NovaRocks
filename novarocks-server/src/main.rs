@@ -143,14 +143,14 @@ async fn run_all_in_one(
         std::sync::Arc::clone(&backend.native_trust),
         backend.native_transport.clone(),
     );
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (frontend_stop_tx, frontend_stop_rx) = tokio::sync::watch::channel(false);
+    let (backend_stop_tx, backend_stop_rx) = tokio::sync::watch::channel(false);
     let frontend_runtime = runtime.clone();
-    let frontend_stop = stop_rx.clone();
     let frontend_run = async move {
         novarocks_frontend::run_frontend_server_until_shutdown(
             frontend,
             frontend_runtime,
-            wait_for_stop(frontend_stop),
+            wait_for_stop(frontend_stop_rx),
         )
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))
@@ -159,7 +159,7 @@ async fn run_all_in_one(
         novarocks_backend::run_backend_server_until_shutdown(
             backend,
             backend_runtime,
-            wait_for_stop(stop_rx),
+            wait_for_stop(backend_stop_rx),
         )
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))
@@ -167,7 +167,8 @@ async fn run_all_in_one(
     novarocks_server::supervisor::supervise_all_in_one(
         frontend_run,
         backend_run,
-        stop_tx,
+        frontend_stop_tx,
+        backend_stop_tx,
         termination_signal(),
     )
     .await
