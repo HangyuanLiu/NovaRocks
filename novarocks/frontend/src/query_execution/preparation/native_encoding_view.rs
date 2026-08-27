@@ -102,16 +102,18 @@ impl<'a> NativeScanBindingView<'a> {
 
     pub fn execution(self) -> NativeScanExecutionKind {
         match self.binding.execution {
-            ResolvedScanExecution::ConnectorRead => NativeScanExecutionKind::ConnectorRead,
             // A system relation is an admitted connector read like any other:
             // the encoder agrees the lane, and which relation family was
             // frozen is carried by the typed scan's own handle.
             // A pinned cohort read is an admitted connector read too: what is
             // different about it -- the exact file set -- is carried by the
-            // typed handle the connector froze, not by the encoder lane.
+            // typed handle the connector froze, not by the encoder lane. The
+            // same holds for a table-execute read: its frozen group is a fact
+            // of the handle, not of the lane.
             ResolvedScanExecution::AdmittedConnectorRead(_)
             | ResolvedScanExecution::AdmittedSystemTable(_)
-            | ResolvedScanExecution::AdmittedPinnedFileSet(_) => {
+            | ResolvedScanExecution::AdmittedPinnedFileSet(_)
+            | ResolvedScanExecution::AdmittedTableExecute(_) => {
                 NativeScanExecutionKind::AdmittedConnectorRead
             }
             // The encoder-facing name is still `SealedConnectorScan`; it marks
@@ -149,7 +151,6 @@ impl<'a> NativeScanBindingView<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeScanExecutionKind {
-    ConnectorRead,
     AdmittedConnectorRead,
     SealedConnectorScan,
 }

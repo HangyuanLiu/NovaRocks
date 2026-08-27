@@ -34,8 +34,9 @@ use std::sync::Arc;
 use novarocks_proto::FieldPath;
 use novarocks_proto::connector_read::{
     ConnectorRelationKind, ConnectorTableScanSource, ScanAssignment, TypedChangeWindow,
-    TypedColumnBinding, TypedConnectorSplitManager, TypedRelationVersion, ValidatedColumnHandle,
-    WireConstraint, encode_connector_expression, encode_tuple_domain, encode_value_type,
+    TypedColumnBinding, TypedConnectorSplitManager, TypedRelationVersion,
+    TypedTableExecuteProcedure, ValidatedColumnHandle, WireConstraint, encode_connector_expression,
+    encode_tuple_domain, encode_value_type,
 };
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::ConnectorPinnedFileSet;
@@ -91,6 +92,15 @@ pub(crate) enum TypedRelationFreeze<'a> {
     /// therefore not part of the window: this is a difference of two visible
     /// row sets, never a replay of the manifests between them.
     ChangeWindow(TypedChangeWindow),
+    /// The relation one distributed `ALTER TABLE ... EXECUTE` procedure
+    /// instance reads.
+    ///
+    /// The procedure names the exact frozen group it rewrites, and the
+    /// connector resolves that group back to its artifacts itself. It is a
+    /// freeze of its own because what such a read produces is not the
+    /// relation's rows: rewriting delete artifacts produces the rows those
+    /// artifacts remove, which no `Table` or `PinnedFileSet` read can describe.
+    TableExecute(TypedTableExecuteProcedure<'a>),
     /// One system relation of a table.
     ///
     /// It carries no pin of its own: the relation name already spells the
@@ -106,6 +116,7 @@ impl TypedRelationFreeze<'_> {
         match self {
             Self::Table { .. } | Self::PinnedFileSet(_) => ConnectorRelationKind::Table,
             Self::ChangeWindow(_) => ConnectorRelationKind::ChangeWindow,
+            Self::TableExecute(_) => ConnectorRelationKind::TableExecute,
             Self::SystemTable => ConnectorRelationKind::SystemTable,
         }
     }
@@ -249,6 +260,22 @@ pub(crate) fn prepare_typed_scan(
                         "typed scan relation {relation_name} exposes no change window from snapshot {} to snapshot {}",
                         window.from_snapshot_id(),
                         window.to_snapshot_id()
+                    )
+                })?;
+            (handle, dto::ScanWorkSource::RuntimeSplits)
+        }
+        TypedRelationFreeze::TableExecute(procedure) => {
+            let handle = metadata
+                .get_table_execute_plan(session, relation, procedure)
+                .map_err(|error| {
+                    format!(
+                        "typed scan cannot freeze the table-execute relation of {relation_name} for the rewrite group frozen in artifact {}: {error}",
+                        procedure.group().artifact_location()
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "typed scan relation {relation_name} exposes no table-execute relation"
                     )
                 })?;
             (handle, dto::ScanWorkSource::RuntimeSplits)
@@ -719,6 +746,15 @@ mod tests {
                 .expect("change window log")
                 .push(window);
             Ok(self.change_window.clone())
+        }
+
+        fn get_table_execute_plan(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+            _procedure: TypedTableExecuteProcedure<'_>,
+        ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+            Ok(None)
         }
     }
 

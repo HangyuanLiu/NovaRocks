@@ -411,9 +411,10 @@ fn scan_binding_for_source<'a>(
         ));
     }
     let valid_execution = match source {
-        SqlScanSourceRead::ConnectorRead => {
-            matches!(binding.execution(), NativeScanExecutionKind::ConnectorRead)
-        }
+        // A pre-pinned opaque connector read has no typed execution at all:
+        // scan preparation refuses it before a binding exists, so no execution
+        // variant can validly answer one here either.
+        SqlScanSourceRead::ConnectorRead => false,
         SqlScanSourceRead::Delta { .. } => {
             matches!(
                 binding.execution(),
@@ -422,6 +423,7 @@ fn scan_binding_for_source<'a>(
         }
         SqlScanSourceRead::Data
         | SqlScanSourceRead::PinnedFileSet
+        | SqlScanSourceRead::TableExecute
         | SqlScanSourceRead::FrozenInputSet
         | SqlScanSourceRead::MvTargetState
         | SqlScanSourceRead::MvTargetLocator
@@ -446,6 +448,7 @@ fn scan_source_kind(source: &SqlScanSourceRead) -> &'static str {
     match source {
         SqlScanSourceRead::ConnectorRead => "SqlConnectorRead",
         SqlScanSourceRead::PinnedFileSet => "SqlPinnedFileSet",
+        SqlScanSourceRead::TableExecute => "SqlTableExecute",
         SqlScanSourceRead::Data => "SqlData",
         SqlScanSourceRead::FrozenInputSet => "SqlFrozenInputSet",
         SqlScanSourceRead::Metadata => "SqlMetadata",
@@ -457,7 +460,6 @@ fn scan_source_kind(source: &SqlScanSourceRead) -> &'static str {
 
 fn resolved_execution_kind(execution: NativeScanExecutionKind) -> &'static str {
     match execution {
-        NativeScanExecutionKind::ConnectorRead => "ConnectorRead",
         NativeScanExecutionKind::AdmittedConnectorRead => "AdmittedConnectorRead",
         NativeScanExecutionKind::SealedConnectorScan => "SealedConnectorScan",
     }

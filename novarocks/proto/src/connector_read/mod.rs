@@ -18,7 +18,8 @@ mod value;
 
 pub use control::{
     TypedChangeWindow, TypedColumnBinding, TypedConnectorMetadata, TypedFilterApplication,
-    TypedLimitApplication, TypedRelationVersion, TypedSplitBatch, TypedSystemTablePlan,
+    TypedFrozenRewriteGroup, TypedLimitApplication, TypedRelationVersion, TypedSplitBatch,
+    TypedSystemTablePlan, TypedTableExecuteProcedure,
 };
 pub use execution::{
     TypedConnectorPageSourceProvider, TypedConnectorProviderFactory, TypedConnectorSplitManager,

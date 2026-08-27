@@ -48,7 +48,7 @@ pub(super) fn only_scan_node(
 #[test]
 fn a_pinned_cohort_read_freezes_the_relation_the_provider_named() {
     use novarocks_spi::connector::{
-        ConnectorControlResolver, ConnectorInstanceId, ConnectorPinnedFileSet, ConnectorTableHandle,
+        ConnectorControlResolver, ConnectorInstanceId, ConnectorPinnedFileSet,
     };
 
     let plan = native_scan_plan(NativeScanFixture::PinnedFileSet).expect("sealed pinned fixture");
@@ -73,11 +73,7 @@ fn a_pinned_cohort_read_freezes_the_relation_the_provider_named() {
             crate::query_execution::preparation::scan::ResolvedScanExecution::AdmittedPinnedFileSet(
                 crate::query_execution::preparation::scan::QueryPinnedFileSetRead {
                     pinned: pinned.clone(),
-                    source: ConnectorTableHandle::try_new(
-                        instance_id,
-                        bytes::Bytes::from_static(b"frozen-cohort-source"),
-                    )
-                    .expect("frozen source"),
+                    owner: instance_id,
                     planning_lease: lease,
                 },
             ),
@@ -339,6 +335,9 @@ fn a_variant_scan_assigns_only_its_physical_column() {
 
 /// A pre-pinned opaque read has no relation name or version left to freeze, so
 /// it fails closed rather than emitting the carrier it used to.
+///
+/// The refusal is on the scan's own category, before any resolver is
+/// consulted, so no execution the resolver could supply changes the outcome.
 #[test]
 fn a_pre_pinned_opaque_read_fails_closed() {
     let error = expect_preparation_error(
@@ -346,9 +345,7 @@ fn a_pre_pinned_opaque_read_fails_closed() {
             &native_scan_plan(NativeScanFixture::ConnectorRead)
                 .expect("sealed connector-read fixture"),
             &registry(vec![data_file("s3://bucket/data.parquet")]),
-            Some(&StaticResolver {
-                execution: ResolvedScanExecution::ConnectorRead,
-            }),
+            None,
         ),
         "a pre-pinned opaque read has no typed lowering",
     );

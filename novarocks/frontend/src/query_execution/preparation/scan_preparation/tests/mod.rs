@@ -485,6 +485,18 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
             .expect("fixture catalog change window handle"),
         ))
     }
+
+    fn get_table_execute_plan(
+        &self,
+        _session: &novarocks_spi::connector::read_stack::ConnectorSession,
+        _name: &novarocks_spi::connector::read_stack::SchemaTableName,
+        _procedure: novarocks_proto::connector_read::TypedTableExecuteProcedure<'_>,
+    ) -> Result<
+        Option<novarocks_proto::connector_read::CatalogTableHandle>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Ok(None)
+    }
 }
 
 impl novarocks_proto::connector_read::TypedConnectorSplitManager for FixtureTypedControl {

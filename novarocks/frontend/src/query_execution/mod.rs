@@ -36,7 +36,6 @@ pub mod control;
 mod core_bindings;
 pub mod distributed_rewrite;
 pub mod dml;
-pub(crate) mod frozen_connector_read;
 pub mod kernels;
 pub mod launch;
 pub mod lifecycle_plan;
@@ -47,6 +46,7 @@ pub mod native_fragment;
 pub(crate) mod outcome;
 pub(crate) mod pinned_connector_read;
 pub mod planning;
+pub(crate) mod rewrite_group_read;
 pub use crate::runtime::statement_result::StatementResult;
 pub use completion::{
     PreparedDistributedQuery as PreparedQueryDistributedOperation, PreparedImmediateQuery,

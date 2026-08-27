@@ -35,9 +35,6 @@ use novarocks_spi::connector::{
 use serde::{Deserialize, Serialize};
 
 use crate::delta::IcebergDeltaSplitPayload;
-use crate::file_reader::distributed_rewrite_reader::{
-    ICEBERG_REWRITE_POSITION_SPLIT_V1, IcebergRewritePositionSplitPayloadV1,
-};
 use crate::metadata_batch_reader::MetadataTableType;
 use crate::scan_model::{IcebergDataFileInfo, IcebergPhysicalPredicate};
 use crate::{access_binding::IcebergReadBinding, schema_mapping::is_variant_struct_data_type};
@@ -69,8 +66,6 @@ pub struct SplitPayload {
     pub name_mapping: Option<String>,
     #[serde(default)]
     pub delta: Option<IcebergDeltaSplitPayload>,
-    #[serde(default)]
-    pub distributed_rewrite_position: Option<IcebergRewritePositionSplitPayloadV1>,
     #[serde(default)]
     pub metadata: Option<IcebergMetadataSplitPayloadV1>,
 }
@@ -106,7 +101,6 @@ pub struct IcebergPreparedSplitSharedPayload {
     pub fact_columns: Vec<IcebergScanFactColumnV1>,
     pub name_mapping: Option<String>,
     pub delta: Option<IcebergDeltaSplitPayload>,
-    pub distributed_rewrite_position: Option<IcebergRewritePositionSplitPayloadV1>,
     pub metadata: Option<IcebergMetadataSplitPayloadV1>,
 }
 
@@ -217,15 +211,6 @@ pub fn validate_split_payload(payload: &SplitPayload) -> Result<(), ConnectorErr
         ));
     }
     validate_split_name_mapping(payload.name_mapping.as_deref())?;
-    if let Some(rewrite_position) = payload.distributed_rewrite_position.as_ref()
-        && (rewrite_position.version != ICEBERG_REWRITE_POSITION_SPLIT_V1
-            || rewrite_position.selected_delete_files.is_empty())
-    {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::CorruptData,
-            "Iceberg rewrite-position split is invalid",
-        ));
-    }
     Ok(())
 }
 

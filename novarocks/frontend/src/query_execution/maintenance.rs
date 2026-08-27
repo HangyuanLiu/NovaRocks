@@ -44,10 +44,11 @@ use novarocks_spi::connector::{
     CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
     ConnectorControlResolver, ConnectorDistributedRewriteAttemptCheckpoint,
     ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorMutationOperationId,
-    ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
-    ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
-    ConnectorWriteAbortOutcome, ConnectorWriteCohortId, ConnectorWriteInputShape,
-    ConnectorWriteReceipt, ExternalMutationOutcome, PreparedBatch,
+    ConnectorRewriteCohortRead, ConnectorTableObjectBindingFailure,
+    ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
+    ConnectorTableObjectSelector, ConnectorTableResolution, ConnectorWriteAbortOutcome,
+    ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
+    ExternalMutationOutcome, PreparedBatch,
 };
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
@@ -1507,11 +1508,18 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         Arc::new(crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()?);
     // A cohort that rewrites table rows names exactly the data files its
     // commit replaces, so its read is frozen from that set. A cohort that
-    // rewrites position deletes reads delete artifacts instead, and has no
-    // data file set to be frozen from.
-    let (resolver, physical_plan): (Box<dyn ScanBindingResolver>, _) = match cohort.pinned_source()
-    {
-        Some(pinned) => {
+    // rewrites delete artifacts reads no table rows at all, so it has no data
+    // file set to be frozen from and names its frozen group instead -- the
+    // same group its commit resolves the replaced artifacts from.
+    let owner = session
+        .lease()
+        .planning_lease()
+        .binding()
+        .descriptor()
+        .instance_id
+        .clone();
+    let (resolver, physical_plan): (Box<dyn ScanBindingResolver>, _) = match cohort.read() {
+        ConnectorRewriteCohortRead::PinnedFileSet(pinned) => {
             let source_binding =
                 crate::query_execution::distributed_rewrite::admit_pinned_rewrite_scan_binding(
                     table_bindings.as_ref(),
@@ -1519,7 +1527,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                 )?;
             let read = crate::query_execution::preparation::scan::QueryPinnedFileSetRead {
                 pinned: pinned.clone(),
-                source: cohort.source().clone(),
+                owner,
                 planning_lease: session.lease().planning_lease(),
             };
             let resolver =
@@ -1534,29 +1542,24 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                 );
             (Box::new(resolver), physical_plan)
         }
-        None => {
-            let read =
-                crate::query_execution::distributed_rewrite::plan_frozen_rewrite_connector_read(
-                    session.lease(),
-                    execution.topology(),
-                    cohort.source(),
-                    cohort.scan_schema(),
-                    (0..cohort.scan_schema().fields().len()).collect(),
-                    context.clone(),
-                )
-                .map_err(|error| format!("plan frozen rewrite source: {error}"))?;
+        ConnectorRewriteCohortRead::DeleteArtifactGroup(group) => {
             let source_binding =
-                crate::query_execution::distributed_rewrite::admit_frozen_rewrite_scan_binding(
+                crate::query_execution::distributed_rewrite::admit_rewrite_group_scan_binding(
                     table_bindings.as_ref(),
                     cohort.scan_schema(),
                 )?;
-            let resolver =
-                crate::query_execution::distributed_rewrite::frozen_rewrite_read_resolver(
-                    source_binding,
-                    read,
-                );
+            let read = crate::query_execution::preparation::scan::QueryRewriteGroupRead {
+                group: group.clone(),
+                group_digest: cohort.group_digest(),
+                owner,
+                planning_lease: session.lease().planning_lease(),
+            };
+            let resolver = crate::query_execution::distributed_rewrite::rewrite_group_read_resolver(
+                source_binding,
+                read,
+            );
             let physical_plan =
-                crate::query_execution::distributed_rewrite::frozen_rewrite_scan_physical_plan(
+                crate::query_execution::distributed_rewrite::rewrite_group_scan_physical_plan(
                     cohort.scan_schema(),
                     source_binding,
                 );

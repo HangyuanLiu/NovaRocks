@@ -179,6 +179,84 @@ impl TypedChangeWindow {
     }
 }
 
+/// The exact frozen rewrite group one distributed `ALTER TABLE ... EXECUTE`
+/// procedure instance owns.
+///
+/// A distributed rewrite freezes its whole file selection into one immutable
+/// external artifact before any worker runs, and cuts that selection into
+/// groups. The procedure instance reading this group must read exactly the
+/// files the group names -- the same set its commit replaces. Naming the group
+/// rather than restating a selection rule is what makes those two sets one
+/// fact: a rule re-evaluated later could select a different set, and a rewrite
+/// that reads an artifact its commit does not replace corrupts the relation
+/// rather than returning a wrong answer.
+///
+/// The artifact is named by location *and* content digest. Location alone
+/// would let a replacement written at the same place be read as the same plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TypedFrozenRewriteGroup<'a> {
+    artifact_location: &'a str,
+    artifact_digest_hex: &'a str,
+    group_digest_hex: &'a str,
+}
+
+impl<'a> TypedFrozenRewriteGroup<'a> {
+    pub const fn new(
+        artifact_location: &'a str,
+        artifact_digest_hex: &'a str,
+        group_digest_hex: &'a str,
+    ) -> Self {
+        Self {
+            artifact_location,
+            artifact_digest_hex,
+            group_digest_hex,
+        }
+    }
+
+    /// Where the immutable artifact lives.
+    pub const fn artifact_location(&self) -> &'a str {
+        self.artifact_location
+    }
+
+    /// The artifact's content digest, as lowercase hex.
+    pub const fn artifact_digest_hex(&self) -> &'a str {
+        self.artifact_digest_hex
+    }
+
+    /// The group inside that artifact, as lowercase hex.
+    pub const fn group_digest_hex(&self) -> &'a str {
+        self.group_digest_hex
+    }
+}
+
+/// The `ALTER TABLE ... EXECUTE` procedure a scan asks a connector to freeze.
+///
+/// Only a procedure that reads through a distributed scan appears here. A
+/// procedure the coordinator performs over metadata alone never reaches the
+/// read stack, and one that rewrites table rows reads them through
+/// [`TypedConnectorMetadata::get_pinned_file_set_handle`] like any other
+/// cohort -- its input is a set of data files, which the pinned lane already
+/// names exactly. What is left is the one procedure whose input is not table
+/// rows at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TypedTableExecuteProcedure<'a> {
+    /// Re-encode the delete artifacts of one frozen group into fresh ones.
+    ///
+    /// The read produces the rows those artifacts remove, not the rows of the
+    /// relation, so it pins no data file set and cannot travel the pinned
+    /// lane.
+    RewritePositionDeleteFiles(TypedFrozenRewriteGroup<'a>),
+}
+
+impl<'a> TypedTableExecuteProcedure<'a> {
+    /// The frozen group this procedure instance reads.
+    pub const fn group(&self) -> TypedFrozenRewriteGroup<'a> {
+        match self {
+            Self::RewritePositionDeleteFiles(group) => *group,
+        }
+    }
+}
+
 /// How a relation should be read at a point in time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TypedRelationVersion {
@@ -268,6 +346,22 @@ pub trait TypedConnectorMetadata: Send + Sync {
         session: &ConnectorSession,
         name: &SchemaTableName,
         window: TypedChangeWindow,
+    ) -> Result<Option<CatalogTableHandle>, ConnectorError>;
+
+    /// Freeze the relation one distributed `ALTER TABLE ... EXECUTE` procedure
+    /// instance reads.
+    ///
+    /// The returned handle pins the snapshot the procedure's frozen group was
+    /// selected against, exactly as [`Self::get_table_handle`] pins one, and it
+    /// names the group rather than any rule that could reselect it. `None`
+    /// means this connector exposes no table-execute relation over that
+    /// relation at all, which is different from a group it cannot serve: that
+    /// is an error.
+    fn get_table_execute_plan(
+        &self,
+        session: &ConnectorSession,
+        name: &SchemaTableName,
+        procedure: TypedTableExecuteProcedure<'_>,
     ) -> Result<Option<CatalogTableHandle>, ConnectorError>;
 }
 

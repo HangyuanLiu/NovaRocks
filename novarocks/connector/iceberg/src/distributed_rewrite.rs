@@ -37,15 +37,16 @@ use novarocks_spi::connector::{
     ConnectorDistributedRewriteOperation, ConnectorDistributedRewritePlan,
     ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
     ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorPinnedFileSet,
-    ConnectorRequestContext, ConnectorStagedReport, ConnectorStagedReportSummary,
-    ConnectorTableHandle, ConnectorWriteActivation, ConnectorWriteAttemptCompletion,
-    ConnectorWriteBaseVersion, ConnectorWriteCohortId, ConnectorWriteControl,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-    ConnectorWriteIntent, ConnectorWritePreparation, ConnectorWriteReceipt,
-    ConnectorWriteTargetRef, ConnectorWriterIdentity, ConnectorWriterTerminalState,
-    REWRITE_DATA_FILES_KIND, REWRITE_POSITION_DELETES_KIND,
+    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorFrozenRewriteGroup,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorPinnedFileSet, ConnectorRequestContext, ConnectorRewriteCohortRead,
+    ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorTableHandle,
+    ConnectorWriteActivation, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
+    ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
+    ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
+    ConnectorWritePreparation, ConnectorWriteReceipt, ConnectorWriteTargetRef,
+    ConnectorWriterIdentity, ConnectorWriterTerminalState, REWRITE_DATA_FILES_KIND,
+    REWRITE_POSITION_DELETES_KIND,
 };
 
 use crate::commit::write_control::{
@@ -56,7 +57,9 @@ use crate::manifest::{DataFileWithStats, data_file_with_stats_to_iceberg_data_fi
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
 use crate::row_lineage_synth::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
-use crate::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat};
+use crate::scan_model::{
+    IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
+};
 
 pub(crate) const ARTIFACT_VERSION: u16 = 1;
 pub(crate) const GROUP_PAYLOAD_VERSION: u16 = 1;
@@ -632,23 +635,6 @@ impl IcebergFrozenRewriteArtifactV1 {
     }
 }
 
-pub(crate) fn decode_group_payload(
-    payload: &[u8],
-) -> Result<IcebergRewriteGroupPayloadV1, ConnectorError> {
-    let decoded: IcebergRewriteGroupPayloadV1 =
-        decode_canonical_json(payload, "Iceberg rewrite group payload")?;
-    if decoded.version != GROUP_PAYLOAD_VERSION
-        || decoded.artifact_location.is_empty()
-        || decoded.artifact_location.len() > 16 * 1024
-        || decoded.artifact_location.ends_with('/')
-    {
-        return Err(invalid("Iceberg rewrite group payload is invalid"));
-    }
-    decode_digest(&decoded.group_digest_hex)?;
-    decode_digest(&decoded.artifact_digest_hex)?;
-    Ok(decoded)
-}
-
 pub(crate) fn load_frozen_rewrite_group(
     runtime: &IcebergMetadataContext,
     file_io: &crate::iceberg::io::FileIO,
@@ -999,16 +985,6 @@ fn cohort_plans_from_artifact(
                 b"iceberg-distributed-rewrite-group",
                 group_digest,
             )?;
-            let source = frozen_rewrite_source_handle(
-                request.operation().table(),
-                request.operation().kind(),
-                IcebergRewriteGroupPayloadV1 {
-                    version: GROUP_PAYLOAD_VERSION,
-                    group_digest_hex: group.group_digest_hex.clone(),
-                    artifact_digest_hex: hex::encode(artifact_digest),
-                    artifact_location: artifact_location.to_string(),
-                },
-            )?;
             let preparation = rewrite_preparation(
                 owner,
                 request,
@@ -1020,25 +996,35 @@ fn cohort_plans_from_artifact(
             // A data-file rewrite reads table rows, and its commit replaces
             // exactly the group's files, so the read is pinned to that same
             // set. Rewriting position deletes reads delete artifacts rather
-            // than rows, so it pins no data file set at all.
-            let pinned_source = match request.operation() {
+            // than rows, so it has no data file set to pin and names its
+            // frozen group instead -- the same group its commit resolves the
+            // replaced Puffin files from.
+            let read = match request.operation() {
                 ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
                     let base_snapshot_id = artifact.base_snapshot_id.ok_or_else(|| {
                         invalid("Iceberg rewrite group has no base snapshot to pin its files to")
                     })?;
-                    Some(ConnectorPinnedFileSet::try_new(
+                    ConnectorRewriteCohortRead::PinnedFileSet(ConnectorPinnedFileSet::try_new(
                         &artifact.namespace,
                         &artifact.table,
                         base_snapshot_id,
                         group.data_files.iter().map(|file| file.path.as_str()),
                     )?)
                 }
-                ConnectorDistributedRewriteOperation::RewritePositionDeletes { .. } => None,
+                ConnectorDistributedRewriteOperation::RewritePositionDeletes { .. } => {
+                    ConnectorRewriteCohortRead::DeleteArtifactGroup(
+                        ConnectorFrozenRewriteGroup::try_new(
+                            &artifact.namespace,
+                            &artifact.table,
+                            artifact_location,
+                            artifact_digest,
+                        )?,
+                    )
+                }
             };
             ConnectorDistributedRewriteCohortPlan::try_new(
                 cohort_id,
-                source,
-                pinned_source,
+                read,
                 scan_schema.clone(),
                 arrow_schema_digest(&scan_schema),
                 preparation,
@@ -1192,88 +1178,6 @@ fn rewrite_field_token(
     ConnectorWriteFieldToken::from_bytes(hash.finalize().into())
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FrozenRewriteSourceV1 {
-    version: u16,
-    operation_kind: String,
-    group: IcebergRewriteGroupPayloadV1,
-}
-
-/// Decode the provider-only source facts carried by a rewrite scan handle.
-pub(crate) fn decode_frozen_rewrite_source(
-    payload: &[u8],
-) -> Result<(String, String, String, IcebergRewriteGroupPayloadV1), ConnectorError> {
-    let value: Value = serde_json::from_slice(payload)
-        .map_err(|error| invalid(format!("decode Iceberg rewrite source: {error}")))?;
-    let namespace = value
-        .get("namespace")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| invalid("Iceberg rewrite source namespace is missing"))?
-        .to_string();
-    let table = value
-        .get("table")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| invalid("Iceberg rewrite source table is missing"))?
-        .to_string();
-    let frozen: FrozenRewriteSourceV1 = serde_json::from_value(
-        value
-            .get("frozen_rewrite")
-            .cloned()
-            .ok_or_else(|| invalid("Iceberg rewrite source facts are missing"))?,
-    )
-    .map_err(|error| invalid(format!("decode Iceberg rewrite source facts: {error}")))?;
-    if frozen.version != 1
-        || !matches!(
-            frozen.operation_kind.as_str(),
-            REWRITE_DATA_FILES_KIND | REWRITE_POSITION_DELETES_KIND
-        )
-    {
-        return Err(invalid("Iceberg rewrite source facts are invalid"));
-    }
-    decode_group_payload(&canonical_json(&frozen.group)?)?;
-    Ok((namespace, table, frozen.operation_kind, frozen.group))
-}
-
-fn frozen_rewrite_source_handle(
-    original: &ConnectorTableHandle,
-    operation_kind: &str,
-    group: IcebergRewriteGroupPayloadV1,
-) -> Result<ConnectorTableHandle, ConnectorError> {
-    let mut table: Value = serde_json::from_slice(original.payload())
-        .map_err(|error| invalid(format!("decode Iceberg rewrite target: {error}")))?;
-    let object = table
-        .as_object_mut()
-        .ok_or_else(|| invalid("Iceberg rewrite target payload is not an object"))?;
-    object.insert("table_info".to_string(), Value::Null);
-    object.insert("metadata_columns".to_string(), Value::Array(Vec::new()));
-    object.insert("prepared_files".to_string(), Value::Array(Vec::new()));
-    object.insert("explicit_files".to_string(), Value::Null);
-    object.insert(
-        "logical_type_columns".to_string(),
-        Value::Object(Default::default()),
-    );
-    object.insert("hidden_columns".to_string(), Value::Array(Vec::new()));
-    object.insert(
-        "frozen_rewrite".to_string(),
-        serde_json::to_value(FrozenRewriteSourceV1 {
-            version: 1,
-            operation_kind: operation_kind.to_string(),
-            group,
-        })
-        .map_err(|error| internal(format!("encode Iceberg rewrite source: {error}")))?,
-    );
-    let payload = canonical_json(&table)?;
-    if payload.len()
-        > novarocks_spi::connector::MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES
-    {
-        return Err(exhausted("Iceberg rewrite source handle exceeds 64 KiB"));
-    }
-    ConnectorTableHandle::try_new(original.owner().clone(), payload)
-}
-
 pub(crate) fn rewrite_input_schema(
     operation: &ConnectorDistributedRewriteOperation,
     physical_schema: SchemaRef,
@@ -1313,20 +1217,6 @@ pub(crate) fn frozen_rewrite_scan_schema(
     }
 }
 
-/// Decode the optional frozen-rewrite facts a rewrite source handle carries.
-/// An ordinary table handle has none and yields `None`.
-pub(crate) fn frozen_rewrite_source_facts(
-    payload: &[u8],
-) -> Result<Option<(String, IcebergRewriteGroupPayloadV1)>, ConnectorError> {
-    let value: Value = serde_json::from_slice(payload)
-        .map_err(|error| invalid(format!("decode Iceberg rewrite source: {error}")))?;
-    if value.get("frozen_rewrite").is_none_or(Value::is_null) {
-        return Ok(None);
-    }
-    let (_, _, operation_kind, group) = decode_frozen_rewrite_source(payload)?;
-    Ok(Some((operation_kind, group)))
-}
-
 fn group_payload(
     group: &IcebergFrozenRewriteGroupV1,
     artifact_digest: [u8; 32],
@@ -1340,6 +1230,80 @@ fn group_payload(
     })
 }
 
+/// Resolve one frozen rewrite group back to the delete artifacts it names, as
+/// the splits that re-encode them.
+///
+/// The group is the authority on which artifacts this procedure instance
+/// rewrites, and the commit replaces exactly that set. Nothing here reselects:
+/// the artifact is read back by location and content digest, the named group is
+/// looked up inside it, and the only judgement made is whether the pinned
+/// snapshot still holds every artifact the group named. It if does not, the
+/// cohort's commit could no longer replace what this read would consume, so the
+/// read fails rather than producing a delete file for artifacts somebody else
+/// already replaced.
+pub(crate) fn plan_rewrite_position_delete_splits(
+    runtime: &IcebergMetadataContext,
+    table: &crate::iceberg::table::Table,
+    snapshot_id: i64,
+    group_payload: &IcebergRewriteGroupPayloadV1,
+) -> Result<(IcebergDataFileInfo, Vec<IcebergDeleteFileInfo>), ConnectorError> {
+    let group = load_frozen_rewrite_group(runtime, table.file_io(), group_payload)?;
+    let live = live_delete_file_paths_at(runtime, table, snapshot_id)?;
+    select_rewrite_position_delete_artifacts(&group, &live, snapshot_id)
+}
+
+/// Pick out exactly the delete artifacts one frozen group names.
+///
+/// Everything this decides is a comparison against the group. It selects no
+/// artifact the group did not name -- a data file may carry vectors this
+/// procedure instance does not own -- and refuses rather than shrinking when an
+/// artifact the group named is missing from the file or has stopped being live.
+/// Both refusals matter for the same reason: the cohort's commit replaces
+/// exactly the named set, so a read over a different set would leave the
+/// relation describing deletes that no artifact holds.
+fn select_rewrite_position_delete_artifacts(
+    group: &IcebergFrozenRewriteGroupV1,
+    live_delete_paths: &BTreeSet<String>,
+    snapshot_id: i64,
+) -> Result<(IcebergDataFileInfo, Vec<IcebergDeleteFileInfo>), ConnectorError> {
+    // A position-delete group is cut one data file at a time, because the
+    // rewritten artifact addresses exactly one data file's rows.
+    let [data_file] = group.data_files.as_slice() else {
+        return Err(invalid(
+            "Iceberg rewrite position delete group must name exactly one data file",
+        ));
+    };
+    if group.selected_position_delete_files.is_empty() {
+        return Err(invalid(
+            "Iceberg rewrite position delete group names no delete artifact",
+        ));
+    }
+    let named = group
+        .selected_position_delete_files
+        .iter()
+        .collect::<BTreeSet<_>>();
+    let selected = data_file
+        .delete_files
+        .iter()
+        .filter(|delete| named.contains(&delete.path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected.len() != named.len() {
+        return Err(invalid(
+            "Iceberg rewrite position delete group names a delete artifact its data file does not carry",
+        ));
+    }
+    if let Some(missing) = named
+        .iter()
+        .find(|path| !live_delete_paths.contains(path.as_str()))
+    {
+        return Err(corrupt(format!(
+            "Iceberg rewrite position delete artifact {missing} is no longer live at snapshot {snapshot_id}"
+        )));
+    }
+    Ok((data_file.clone(), selected))
+}
+
 fn live_delete_file_paths(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
@@ -1347,6 +1311,32 @@ fn live_delete_file_paths(
     let Some(snapshot) = table.metadata().current_snapshot().cloned() else {
         return Ok(BTreeSet::new());
     };
+    live_delete_file_paths_of(runtime, table, snapshot)
+}
+
+/// The delete files alive at one exact snapshot of a relation.
+fn live_delete_file_paths_at(
+    runtime: &IcebergMetadataContext,
+    table: &crate::iceberg::table::Table,
+    snapshot_id: i64,
+) -> Result<BTreeSet<String>, ConnectorError> {
+    let snapshot = table
+        .metadata()
+        .snapshot_by_id(snapshot_id)
+        .cloned()
+        .ok_or_else(|| {
+            corrupt(format!(
+                "Iceberg relation no longer holds snapshot {snapshot_id}, which a rewrite was frozen at"
+            ))
+        })?;
+    live_delete_file_paths_of(runtime, table, snapshot)
+}
+
+fn live_delete_file_paths_of(
+    runtime: &IcebergMetadataContext,
+    table: &crate::iceberg::table::Table,
+    snapshot: std::sync::Arc<crate::iceberg::spec::Snapshot>,
+) -> Result<BTreeSet<String>, ConnectorError> {
     let file_io = table.file_io().clone();
     let metadata = table.metadata().clone();
     runtime
@@ -1986,7 +1976,116 @@ fn not_found(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scan_model::IcebergDeleteFileInfo;
+
+    fn dv(path: &str) -> IcebergDeleteFileInfo {
+        IcebergDeleteFileInfo {
+            path: path.to_string(),
+            file_format: IcebergDeleteFileFormat::Puffin,
+            file_content: IcebergDeleteFileContent::Position,
+            length: Some(1024),
+            content_offset: Some(4),
+            content_size_in_bytes: Some(32),
+            sequence_number: Some(7),
+            partition_spec_id: Some(0),
+            partition_key: None,
+            equality_column_names: Vec::new(),
+            equality_field_ids: Vec::new(),
+        }
+    }
+
+    /// One position-delete group whose data file carries `carried` vectors and
+    /// whose frozen selection names `named`.
+    fn position_delete_group(carried: &[&str], named: &[&str]) -> IcebergFrozenRewriteGroupV1 {
+        let mut data_file = IcebergDataFileInfo::for_test("s3://bucket/data-1.parquet", 64, 4);
+        data_file.delete_files = carried.iter().map(|path| dv(path)).collect();
+        IcebergFrozenRewriteGroupV1 {
+            group_digest_hex: hex::encode([1_u8; 32]),
+            partition_spec_id: Some(0),
+            partition_key: None,
+            data_files: vec![data_file],
+            selected_position_delete_files: named.iter().map(|path| (*path).to_string()).collect(),
+            owned_data_delete_files: Vec::new(),
+        }
+    }
+
+    fn live(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|path| (*path).to_string()).collect()
+    }
+
+    /// The group is the authority on what this procedure instance rewrites, and
+    /// its commit replaces exactly that set. A vector the data file carries but
+    /// the group did not name belongs to some other cohort -- reading it here
+    /// would repack deletes this commit never removes.
+    #[test]
+    fn a_rewrite_reads_exactly_the_delete_artifacts_its_group_names() {
+        let group = position_delete_group(
+            &[
+                "s3://bucket/dv-a.puffin",
+                "s3://bucket/dv-b.puffin",
+                "s3://bucket/dv-foreign.puffin",
+            ],
+            &["s3://bucket/dv-a.puffin", "s3://bucket/dv-b.puffin"],
+        );
+        let (data_file, selected) = select_rewrite_position_delete_artifacts(
+            &group,
+            &live(&[
+                "s3://bucket/dv-a.puffin",
+                "s3://bucket/dv-b.puffin",
+                "s3://bucket/dv-foreign.puffin",
+            ]),
+            42,
+        )
+        .expect("the group names two live artifacts its data file carries");
+        assert_eq!(data_file.path, "s3://bucket/data-1.parquet");
+        assert_eq!(
+            selected
+                .iter()
+                .map(|delete| delete.path.as_str())
+                .collect::<Vec<_>>(),
+            ["s3://bucket/dv-a.puffin", "s3://bucket/dv-b.puffin"]
+        );
+
+        // And an artifact the group names that its data file does not carry is
+        // a refusal, never a shorter read.
+        let error = select_rewrite_position_delete_artifacts(
+            &position_delete_group(
+                &["s3://bucket/dv-a.puffin"],
+                &["s3://bucket/dv-a.puffin", "s3://bucket/dv-b.puffin"],
+            ),
+            &live(&["s3://bucket/dv-a.puffin", "s3://bucket/dv-b.puffin"]),
+            42,
+        )
+        .expect_err("a named artifact the data file does not carry");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    /// A named artifact the pinned snapshot no longer holds means somebody else
+    /// already replaced it. Rewriting it anyway would commit a delete file for
+    /// artifacts this commit cannot remove, so the read fails closed.
+    #[test]
+    fn a_rewrite_refuses_a_delete_artifact_the_snapshot_no_longer_holds() {
+        let group = position_delete_group(
+            &["s3://bucket/dv-a.puffin", "s3://bucket/dv-b.puffin"],
+            &["s3://bucket/dv-a.puffin", "s3://bucket/dv-b.puffin"],
+        );
+        let error = select_rewrite_position_delete_artifacts(
+            &group,
+            &live(&["s3://bucket/dv-a.puffin"]),
+            42,
+        )
+        .expect_err("dv-b is no longer live at the pinned snapshot");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(
+            error.message().contains("s3://bucket/dv-b.puffin"),
+            "the refusal must name the missing artifact: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("42"),
+            "the refusal must name the pinned snapshot: {}",
+            error.message()
+        );
+    }
 
     #[test]
     fn data_groups_are_partition_owned_and_stably_sorted() {
@@ -2096,36 +2195,6 @@ mod tests {
         );
         assert_eq!(artifact_digest(b"same"), artifact_digest(b"same"));
         assert_ne!(artifact_digest(b"same"), artifact_digest(b"different"));
-    }
-
-    #[test]
-    fn frozen_source_round_trips_bounded_provider_facts() {
-        let owner = ConnectorInstanceId::parse("iceberg.rewrite").unwrap();
-        let original = ConnectorTableHandle::try_new(
-            owner,
-            Bytes::from_static(
-                br#"{"explicit_files":null,"hidden_columns":[],"logical_type_columns":{},"metadata_columns":[],"metadata_table_type":null,"namespace":"ns","prepared_files":[],"table":"t","table_info":null}"#,
-            ),
-        )
-        .unwrap();
-        let handle = frozen_rewrite_source_handle(
-            &original,
-            REWRITE_DATA_FILES_KIND,
-            IcebergRewriteGroupPayloadV1 {
-                version: 1,
-                group_digest_hex: "01".repeat(32),
-                artifact_digest_hex: "02".repeat(32),
-                artifact_location: "file:///warehouse/artifact".to_string(),
-            },
-        )
-        .unwrap();
-        let (namespace, table, kind, group) =
-            decode_frozen_rewrite_source(handle.payload()).unwrap();
-        assert_eq!(
-            (namespace.as_str(), table.as_str(), kind.as_str()),
-            ("ns", "t", REWRITE_DATA_FILES_KIND)
-        );
-        assert_eq!(group.group_digest_hex, "01".repeat(32));
     }
 
     #[test]

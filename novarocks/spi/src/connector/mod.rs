@@ -88,7 +88,8 @@ pub use distributed_rewrite::{
     ConnectorDistributedRewriteOperation, ConnectorDistributedRewritePlan,
     ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
     ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary,
-    ConnectorDistributedRewriteResolver, MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS,
+    ConnectorDistributedRewriteResolver, ConnectorFrozenRewriteGroup, ConnectorRewriteCohortRead,
+    MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS,
     MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES, REWRITE_DATA_FILES_KIND,
     REWRITE_POSITION_DELETES_KIND,
 };

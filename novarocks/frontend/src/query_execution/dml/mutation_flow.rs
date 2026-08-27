@@ -1943,7 +1943,7 @@ fn build_cow_update_distributed_write(
                 );
                 let read = crate::query_execution::preparation::scan::QueryPinnedFileSetRead {
                     pinned: pinned_source.clone(),
-                    source: source.clone(),
+                    owner: source.owner().clone(),
                     planning_lease: planning_lease.clone(),
                 };
                 let query = build_cow_rewrite_query(

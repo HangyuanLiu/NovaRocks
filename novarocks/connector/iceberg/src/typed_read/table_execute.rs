@@ -35,12 +35,13 @@ use std::sync::Arc;
 use novarocks_proto::connector_read::{MAX_DELETES_PER_SPLIT, MAX_JSON_BYTES, MAX_PATH_BYTES};
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
-    ConnectorSplit, ConnectorTableExecuteHandle as ConnectorTableExecuteHandleMarker,
-    ConnectorValueType, HostAddress, SchemaTableName, SplitWeight,
+    ConnectorSplit, ConnectorTableExecuteHandle as ConnectorTableExecuteHandleMarker, HostAddress,
+    SchemaTableName, SplitWeight,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use super::column_handle::invalid;
+use super::schema_binding::IcebergMetadataColumn;
 use super::split::{IcebergDeleteFile, IcebergDeleteFileContent, IcebergFileFormat};
 use super::table_handle::IcebergTableHandle;
 
@@ -49,9 +50,15 @@ use super::table_handle::IcebergTableHandle;
 /// These are the two columns an Iceberg position-delete file holds, in the
 /// order the writer expects them. The page source produces nothing else: it is
 /// re-encoding delete positions, not projecting table columns.
-pub const REWRITE_POSITION_DELETE_OUTPUT_COLUMNS: [(&str, ConnectorValueType); 2] = [
-    ("file_path", ConnectorValueType::Varchar),
-    ("pos", ConnectorValueType::BigInt),
+///
+/// They are stated as metadata columns of the relation being rewritten rather
+/// than as fresh names, because that is what they are -- the data file a
+/// removed row lives in, and its absolute position inside it -- and because the
+/// cohort's frozen scan schema is spelled from the same vocabulary. A second
+/// spelling here could disagree with it, and the writer binds by name.
+pub const REWRITE_POSITION_DELETE_OUTPUT_COLUMNS: [IcebergMetadataColumn; 2] = [
+    IcebergMetadataColumn::Path,
+    IcebergMetadataColumn::RowPosition,
 ];
 
 /// Length of a SHA-256 digest rendered as lowercase hex.
@@ -1050,13 +1057,10 @@ mod tests {
     }
 
     #[test]
-    fn the_rewrite_page_source_emits_exactly_file_path_and_pos() {
+    fn the_rewrite_page_source_emits_exactly_the_data_file_and_the_position() {
         assert_eq!(
-            REWRITE_POSITION_DELETE_OUTPUT_COLUMNS,
-            [
-                ("file_path", ConnectorValueType::Varchar),
-                ("pos", ConnectorValueType::BigInt),
-            ]
+            REWRITE_POSITION_DELETE_OUTPUT_COLUMNS.map(IcebergMetadataColumn::column_name),
+            ["_file", "_pos"]
         );
     }
 

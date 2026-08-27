@@ -197,17 +197,125 @@ impl ConnectorDistributedRewritePlanSummary {
     }
 }
 
+/// The immutable external artifact one rewrite cohort's group lives in.
+///
+/// A distributed rewrite freezes its whole selection into one artifact before
+/// any cohort exists, then cuts it into groups. A cohort whose input is not
+/// table rows names its group here instead of pinning a data file set: the
+/// group is resolved back to its exact artifact list by the provider that
+/// wrote it, and the commit replaces precisely that list.
+///
+/// The artifact is named by location *and* content digest, because a
+/// replacement written at the same location is a different plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorFrozenRewriteGroup {
+    schema_name: Arc<str>,
+    table_name: Arc<str>,
+    artifact_location: Arc<str>,
+    artifact_digest: [u8; 32],
+}
+
+impl ConnectorFrozenRewriteGroup {
+    pub fn try_new(
+        schema_name: impl AsRef<str>,
+        table_name: impl AsRef<str>,
+        artifact_location: impl AsRef<str>,
+        artifact_digest: [u8; 32],
+    ) -> Result<Self, ConnectorError> {
+        let schema_name = schema_name.as_ref();
+        let table_name = table_name.as_ref();
+        let artifact_location = artifact_location.as_ref();
+        if schema_name.is_empty() || table_name.is_empty() {
+            return Err(invalid(
+                "distributed rewrite cohort group requires a schema-qualified relation name",
+            ));
+        }
+        if artifact_location.is_empty()
+            || artifact_location.len() > MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES
+            || artifact_location.ends_with('/')
+        {
+            return Err(invalid(
+                "distributed rewrite cohort artifact location must be a non-empty bounded object location",
+            ));
+        }
+        Ok(Self {
+            schema_name: Arc::from(schema_name),
+            table_name: Arc::from(table_name),
+            artifact_location: Arc::from(artifact_location),
+            artifact_digest,
+        })
+    }
+
+    pub fn schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    pub fn table_name(&self) -> &str {
+        &self.table_name
+    }
+
+    pub fn artifact_location(&self) -> &str {
+        &self.artifact_location
+    }
+
+    pub const fn artifact_digest(&self) -> [u8; 32] {
+        self.artifact_digest
+    }
+
+    fn digest_into(&self, hash: &mut Sha256) {
+        digest_bytes(hash, self.schema_name.as_bytes());
+        digest_bytes(hash, self.table_name.as_bytes());
+        digest_bytes(hash, self.artifact_location.as_bytes());
+        hash.update(self.artifact_digest);
+    }
+}
+
+/// What one sealed cohort reads.
+///
+/// Both variants name their input exactly, and both name the same set the
+/// cohort's commit replaces. The choice is a fact of the operation, not a
+/// preference: a rewrite of table rows has a data file set to pin, and a
+/// rewrite of delete artifacts has none, because it never reads table rows at
+/// all. Modelling that as one optional pin would let a cohort with neither
+/// reach execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorRewriteCohortRead {
+    /// Exactly the data files this cohort rewrites.
+    PinnedFileSet(ConnectorPinnedFileSet),
+    /// Exactly the frozen group whose delete artifacts this cohort rewrites.
+    DeleteArtifactGroup(ConnectorFrozenRewriteGroup),
+}
+
+impl ConnectorRewriteCohortRead {
+    fn digest_into(&self, hash: &mut Sha256) {
+        // Which files a cohort reads is part of what it is, so two cohorts
+        // that differ only in their input never share a digest -- and the two
+        // read families are tagged apart before their facts are folded in.
+        match self {
+            Self::PinnedFileSet(pinned) => {
+                hash.update([0]);
+                digest_bytes(hash, pinned.namespace().as_bytes());
+                digest_bytes(hash, pinned.table().as_bytes());
+                hash.update(pinned.version_ordinal().to_be_bytes());
+                hash.update((pinned.files().len() as u64).to_be_bytes());
+                for file in pinned.files() {
+                    digest_bytes(hash, file.as_bytes());
+                }
+            }
+            Self::DeleteArtifactGroup(group) => {
+                hash.update([1]);
+                group.digest_into(hash);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ConnectorDistributedRewriteCohortPlan {
     cohort_id: ConnectorWriteCohortId,
-    /// Opaque frozen source used only to plan the rewrite scan.  It is not a
-    /// write target and must not be substituted for `preparation.table()`.
-    source: ConnectorTableHandle,
-    /// Exactly the data files this cohort rewrites, when its read is a scan of
-    /// table rows. A cohort whose read is not a data scan -- rewriting
-    /// position deletes reads delete artifacts, not rows -- pins no data file
-    /// set and is planned through `source` alone.
-    pinned_source: Option<ConnectorPinnedFileSet>,
+    /// Exactly what this cohort reads.  It is not a write target and must not
+    /// be substituted for `preparation.table()`.
+    read: ConnectorRewriteCohortRead,
     /// Schema of the frozen scan output.  SQL needs this to build the
     /// read-side physical carrier, but it is deliberately not the writer
     /// contract: the Provider-signed preparation below owns input shape.
@@ -218,26 +326,18 @@ pub struct ConnectorDistributedRewriteCohortPlan {
 }
 
 impl ConnectorDistributedRewriteCohortPlan {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         cohort_id: ConnectorWriteCohortId,
-        source: ConnectorTableHandle,
-        pinned_source: Option<ConnectorPinnedFileSet>,
+        read: ConnectorRewriteCohortRead,
         scan_schema: SchemaRef,
         scan_schema_digest: [u8; 32],
         preparation: ConnectorWritePreparation,
         group_digest: [u8; 32],
     ) -> Result<Self, ConnectorError> {
         preparation.validate()?;
-        if source.owner() != preparation.table().owner() {
-            return Err(invalid(
-                "distributed rewrite cohort source does not match preparation owner",
-            ));
-        }
         Ok(Self {
             cohort_id,
-            source,
-            pinned_source,
+            read,
             scan_schema,
             scan_schema_digest,
             preparation,
@@ -247,12 +347,10 @@ impl ConnectorDistributedRewriteCohortPlan {
     pub const fn cohort_id(&self) -> ConnectorWriteCohortId {
         self.cohort_id
     }
-    pub fn source(&self) -> &ConnectorTableHandle {
-        &self.source
-    }
-    /// The exact data files this cohort rewrites, when it reads table rows.
-    pub const fn pinned_source(&self) -> Option<&ConnectorPinnedFileSet> {
-        self.pinned_source.as_ref()
+    /// Exactly what this cohort reads, and therefore exactly what its commit
+    /// replaces.
+    pub const fn read(&self) -> &ConnectorRewriteCohortRead {
+        &self.read
     }
     pub fn scan_schema(&self) -> &SchemaRef {
         &self.scan_schema
@@ -273,23 +371,7 @@ impl ConnectorDistributedRewriteCohortPlan {
         hash.update(self.cohort_id.to_bytes());
         hash.update(self.group_digest);
         hash.update(self.scan_schema_digest);
-        digest_bytes(hash, self.source.owner().as_str().as_bytes());
-        digest_bytes(hash, self.source.payload());
-        // Which files a cohort rewrites is part of what it is, so two cohorts
-        // that differ only in their pinned set never share a digest.
-        match &self.pinned_source {
-            None => hash.update([0]),
-            Some(pinned) => {
-                hash.update([1]);
-                digest_bytes(hash, pinned.namespace().as_bytes());
-                digest_bytes(hash, pinned.table().as_bytes());
-                hash.update(pinned.version_ordinal().to_be_bytes());
-                hash.update((pinned.files().len() as u64).to_be_bytes());
-                for file in pinned.files() {
-                    digest_bytes(hash, file.as_bytes());
-                }
-            }
-        }
+        self.read.digest_into(hash);
         hash.update(self.preparation.digest());
     }
 }
@@ -340,8 +422,7 @@ impl ConnectorDistributedRewritePlan {
             .windows(2)
             .any(|pair| pair[0].cohort_id == pair[1].cohort_id)
             || cohorts.iter().any(|cohort| {
-                cohort.source.owner() != &request.owner.instance_id
-                    || cohort.preparation.owner() != &request.owner
+                cohort.preparation.owner() != &request.owner
                     || cohort.preparation.table() != request.operation.table()
                     || cohort.preparation.intent()
                         != rewrite_operation_intent(request.operation.kind())
@@ -425,8 +506,7 @@ impl ConnectorDistributedRewritePlan {
         }
         if self.target.owner() != &self.owner.instance_id
             || self.cohorts.iter().any(|cohort| {
-                cohort.source.owner() != &self.owner.instance_id
-                    || cohort.preparation.validate().is_err()
+                cohort.preparation.validate().is_err()
                     || cohort.preparation.owner() != &self.owner
                     || cohort.preparation.table() != &self.target
                     || cohort.preparation.intent()
@@ -1007,6 +1087,18 @@ mod tests {
         .unwrap()
     }
 
+    fn cohort_read() -> ConnectorRewriteCohortRead {
+        ConnectorRewriteCohortRead::DeleteArtifactGroup(
+            ConnectorFrozenRewriteGroup::try_new(
+                "db",
+                "orders",
+                "s3://warehouse/db/orders/_rewrite/0199",
+                [5; 32],
+            )
+            .unwrap(),
+        )
+    }
+
     fn preparation(
         request: &ConnectorDistributedRewritePlanningRequest,
         table: ConnectorTableHandle,
@@ -1049,8 +1141,7 @@ mod tests {
         let cohort = |schema_digest| {
             ConnectorDistributedRewriteCohortPlan::try_new(
                 cohort_id,
-                request.operation().table().clone(),
-                None,
+                cohort_read(),
                 Arc::clone(&schema),
                 schema_digest,
                 preparation(
@@ -1098,8 +1189,7 @@ mod tests {
         let cohort = |preparation| {
             ConnectorDistributedRewriteCohortPlan::try_new(
                 cohort_id,
-                request.operation().table().clone(),
-                None,
+                cohort_read(),
                 Arc::clone(&schema),
                 [3; 32],
                 preparation,

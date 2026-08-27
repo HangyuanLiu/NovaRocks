@@ -49,16 +49,16 @@ use novarocks_proto::connector_read::{
     CatalogTableHandle, ConnectorRelation, ScanAssignment, TypedChangeWindow, TypedColumnBinding,
     TypedConnectorMetadata, TypedConnectorSplitManager, TypedConnectorSplitSource,
     TypedFilterApplication, TypedLimitApplication, TypedRelationVersion, TypedSystemTablePlan,
-    ValidatedColumnHandle, ValidatedConnectorSplit, WireConstraint, WireDynamicFilterSnapshot,
-    decode_tuple_domain as decode_wire_tuple_domain,
+    TypedTableExecuteProcedure, ValidatedColumnHandle, ValidatedConnectorSplit, WireConstraint,
+    WireDynamicFilterSnapshot, decode_tuple_domain as decode_wire_tuple_domain,
     encode_tuple_domain as encode_wire_tuple_domain,
 };
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
     Assignment, Bound, ConnectorExpression, ConnectorSession, ConnectorSplitBatch,
     ConnectorSplitSource, ConnectorTableHandle as _, ConnectorValue, Constraint, Domain,
-    DynamicFilterSnapshot, OrderedAssignments, SchemaTableName, SystemTableDistribution,
-    TupleDomain,
+    DynamicFilterSnapshot, OrderedAssignments, SchemaTableName, SplitWeight,
+    SystemTableDistribution, TupleDomain,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
@@ -88,11 +88,15 @@ use crate::typed_read::{
     FilesTableSplitSourceParams, HiveTransactionHandle, ICEBERG_CHANGE_OP_COLUMN,
     IcebergChangeSplit, IcebergChangeWindowEndpoints, IcebergChangeWindowHandle,
     IcebergChangeWindowHandleParams, IcebergChangeWindowSplitSource, IcebergColumnHandle,
-    IcebergDeleteFileFacts, IcebergFileFormat, IcebergMetadataColumn, IcebergPinnedDataFileSet,
-    IcebergPlannedDataFile, IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions,
-    IcebergSystemTableExecution, IcebergSystemTableReference, IcebergTableHandle,
-    IcebergTableHandleParams, ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile, bounds_row_type,
-    change_op_column_handle, decode_tuple_domain as decode_iceberg_tuple_domain,
+    IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileFacts, IcebergDeleteFileParams,
+    IcebergFileFormat, IcebergMetadataColumn, IcebergPinnedDataFileSet, IcebergPlannedDataFile,
+    IcebergRewriteArtifactContentId, IcebergRewritePositionDeleteFilesHandle,
+    IcebergRewritePositionDeleteFilesSplit, IcebergRewritePositionDeleteFilesSplitParams,
+    IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions, IcebergSystemTableExecution,
+    IcebergSystemTableReference, IcebergTableExecuteHandle, IcebergTableExecuteHandleParams,
+    IcebergTableExecuteProcedureHandle, IcebergTableHandle, IcebergTableHandleParams,
+    REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile,
+    bounds_row_type, change_op_column_handle, decode_tuple_domain as decode_iceberg_tuple_domain,
     derived_row_type_json, encode_tuple_domain as encode_iceberg_tuple_domain,
     files_relation_schema_json, partition_row_type, plan_change_window_splits,
     system_relation_columns,
@@ -497,6 +501,34 @@ impl IcebergTypedBoundary {
         }
     }
 
+    /// The typed `ALTER TABLE ... EXECUTE` relation, decoded.
+    fn table_execute_handle(
+        &self,
+        table: &CatalogTableHandle,
+    ) -> Result<IcebergTableExecuteHandle, ConnectorError> {
+        self.ensure_owned(table)?;
+        match table.relation() {
+            ConnectorRelation::TableExecute(handle) => {
+                IcebergTableExecuteHandle::from_table_execute_handle_proto(handle)
+            }
+            ConnectorRelation::Table(_) => Err(unsupported(
+                "an iceberg data relation is not a table execute target",
+            )),
+            ConnectorRelation::TableFunction(_) => Err(unsupported(
+                "an iceberg table-function relation is not a table execute target",
+            )),
+            ConnectorRelation::ChangeWindow(_) => Err(unsupported(
+                "an iceberg change-window relation is not a table execute target",
+            )),
+            ConnectorRelation::SystemTable(_) => Err(unsupported(
+                "an iceberg system relation is not a table execute target",
+            )),
+            ConnectorRelation::MergeTable(_) => Err(unsupported(
+                "an iceberg merge relation is not a table execute target",
+            )),
+        }
+    }
+
     /// Whether this relation's rows carry Iceberg v3 row lineage.
     ///
     /// The answer is a table property, which the handle deliberately does not
@@ -657,6 +689,192 @@ impl IcebergTypedBoundary {
         )?;
         Ok(IcebergChangeWindowSplitSource::new(plan))
     }
+
+    /// Enumerate the delete artifacts one frozen rewrite group names.
+    ///
+    /// Exactly one split is produced, because a position-delete group names one
+    /// data file and the vectors that address it: the rewritten artifact is a
+    /// single ordered position list for that file, so cutting the read further
+    /// would ask two writers to produce halves of one file.
+    fn table_execute_split_source(
+        &self,
+        handle: &IcebergTableExecuteHandle,
+    ) -> Result<Box<dyn TypedConnectorSplitSource>, ConnectorError> {
+        let rewrite = match handle.procedure_handle() {
+            Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(rewrite)) => {
+                rewrite
+            }
+            Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => {
+                return Err(unsupported(
+                    "an iceberg optimize procedure reads data splits, not a table-execute relation",
+                ));
+            }
+        };
+        let table_handle = rewrite.table_handle();
+        let snapshot_id = table_handle.snapshot_id().ok_or_else(|| {
+            corrupt("an iceberg rewrite position delete relation carries no pinned snapshot")
+        })?;
+        let physical = self.load_pinned_relation(table_handle.schema_table_name())?;
+        let (data_file, selected) =
+            crate::distributed_rewrite::plan_rewrite_position_delete_splits(
+                &self.runtime,
+                &physical.table,
+                snapshot_id,
+                &crate::distributed_rewrite::IcebergRewriteGroupPayloadV1 {
+                    version: crate::distributed_rewrite::GROUP_PAYLOAD_VERSION,
+                    group_digest_hex: rewrite.group_digest_hex().to_string(),
+                    artifact_digest_hex: rewrite.artifact().artifact_digest_hex().to_string(),
+                    artifact_location: rewrite.artifact().artifact_location().to_string(),
+                },
+            )?;
+        let mut deletes = Vec::with_capacity(selected.len());
+        for delete in &selected {
+            deletes.push(rewrite_position_delete_file(delete)?);
+        }
+        let split = IcebergRewritePositionDeleteFilesSplit::try_new(
+            IcebergRewritePositionDeleteFilesSplitParams {
+                data_file_path: data_file.path.clone(),
+                data_file_size: data_file.size,
+                // Every data file of an Iceberg manifest belongs to exactly one
+                // partition spec, including the unpartitioned spec. A frozen
+                // group that recorded none did not come from a manifest walk,
+                // so the read fails rather than adopting the table's current
+                // default -- which may not be the spec the file was written
+                // under.
+                partition_spec_id: data_file.partition_spec_id.ok_or_else(|| {
+                    corrupt(format!(
+                        "iceberg rewrite position delete data file {} records no partition spec",
+                        data_file.path
+                    ))
+                })?,
+                partition_data_json: data_file
+                    .partition_key
+                    .clone()
+                    .unwrap_or_else(|| UNPARTITIONED_REWRITE_PARTITION_JSON.to_string()),
+                selected_position_deletes: deletes,
+                split_weight: SplitWeight::STANDARD,
+            },
+        )?;
+        Ok(Box::new(IcebergTypedSplitSource::new(
+            SingleSplitSource::new(split),
+        )))
+    }
+}
+
+/// The partition spelling a rewrite split carries for an unpartitioned file.
+///
+/// The split contract requires a non-empty partition JSON, and an
+/// unpartitioned data file has no partition struct to spell. The empty object
+/// is the spec's own encoding of "no partition fields", so it states that
+/// rather than inventing a placeholder value.
+const UNPARTITIONED_REWRITE_PARTITION_JSON: &str = "{}";
+
+/// The two columns a position-delete rewrite reads: the data file each removed
+/// row lives in, and its absolute position inside it.
+///
+/// They are metadata columns of the relation being rewritten, so both are named
+/// and typed by the one metadata-column vocabulary rather than spelled again
+/// here.
+fn rewrite_position_delete_column_bindings(
+    handle: &IcebergTableExecuteHandle,
+) -> Result<Vec<TypedColumnBinding>, ConnectorError> {
+    match handle.procedure_handle() {
+        Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_)) => {
+            let mut bindings = Vec::with_capacity(REWRITE_POSITION_DELETE_OUTPUT_COLUMNS.len());
+            for metadata in REWRITE_POSITION_DELETE_OUTPUT_COLUMNS {
+                bindings.push(TypedColumnBinding::new(
+                    metadata.column_name(),
+                    iceberg_column_to_wire(&pseudo_column(metadata)?)?,
+                    true,
+                ));
+            }
+            Ok(bindings)
+        }
+        Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => Err(unsupported(
+            "an iceberg optimize procedure reads the data relation's own columns",
+        )),
+    }
+}
+
+/// Restate one frozen delete artifact as the typed split's delete file.
+///
+/// Every fact is carried from the artifact the group named. A V2 Parquet
+/// position-delete file has no addressed content range, so re-encoding it would
+/// mean reading a whole file to find one data file's rows; the split contract
+/// refuses that, and this refuses it earlier with the artifact's own path.
+fn rewrite_position_delete_file(
+    delete: &crate::scan_model::IcebergDeleteFileInfo,
+) -> Result<IcebergDeleteFile, ConnectorError> {
+    if delete.file_content != crate::scan_model::IcebergDeleteFileContent::Position
+        || delete.file_format != crate::scan_model::IcebergDeleteFileFormat::Puffin
+    {
+        return Err(invalid(format!(
+            "iceberg rewrite position delete artifact {} is not a puffin deletion vector",
+            delete.path
+        )));
+    }
+    IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+        content: IcebergDeleteFileContent::PositionDeletes,
+        path: delete.path.clone(),
+        format: IcebergFileFormat::Puffin,
+        // A deletion vector publishes no manifest record count of its own that
+        // this rewrite depends on; the positions come from the vector itself.
+        record_count: 0,
+        file_size_in_bytes: delete.length.unwrap_or_default(),
+        equality_field_ids: Vec::new(),
+        row_position_lower_bound: None,
+        row_position_upper_bound: None,
+        data_sequence_number: delete.sequence_number.unwrap_or_default(),
+        content_offset: delete.content_offset,
+        content_size_in_bytes: delete.content_size_in_bytes,
+        decryption_data: None,
+    })
+}
+
+/// The enumeration of a relation cut into exactly one split.
+///
+/// A dynamic filter cannot narrow it: the split is the whole relation, and a
+/// filter that excluded it would drop rows the cohort's commit still replaces.
+#[derive(Debug)]
+struct SingleSplitSource {
+    split: Option<IcebergRewritePositionDeleteFilesSplit>,
+}
+
+impl SingleSplitSource {
+    const fn new(split: IcebergRewritePositionDeleteFilesSplit) -> Self {
+        Self { split: Some(split) }
+    }
+}
+
+impl ConnectorSplitSource for SingleSplitSource {
+    type Split = IcebergRewritePositionDeleteFilesSplit;
+    type Column = IcebergColumnHandle;
+
+    fn next_batch(
+        &mut self,
+        _max_size: usize,
+        _dynamic_filter: &DynamicFilterSnapshot<IcebergColumnHandle>,
+    ) -> Result<ConnectorSplitBatch<Self::Split>, ConnectorError> {
+        Ok(ConnectorSplitBatch::new(
+            self.split.take().into_iter().collect(),
+            true,
+        ))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.split.is_none()
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        self.split = None;
+        Ok(())
+    }
+}
+
+impl IcebergWireSplit for IcebergRewritePositionDeleteFilesSplit {
+    fn to_wire_split_proto(&self) -> dto::ConnectorSplit {
+        self.to_connector_split_proto()
+    }
 }
 
 /// Pair one snapshot's read view of a data file with its manifest facts.
@@ -789,9 +1007,14 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
             ConnectorRelation::SystemTable(reference) => {
                 self.system_relation_column_bindings(reference)
             }
+            // A table-execute relation exposes what its procedure reads, not
+            // the table's fields: re-encoding delete artifacts produces the
+            // rows those artifacts remove, addressed by data file and position.
+            ConnectorRelation::TableExecute(_) => {
+                rewrite_position_delete_column_bindings(&self.table_execute_handle(table)?)
+            }
             ConnectorRelation::Table(_)
             | ConnectorRelation::TableFunction(_)
-            | ConnectorRelation::TableExecute(_)
             | ConnectorRelation::MergeTable(_) => {
                 let handle = self.data_table_handle(table)?;
                 let schema = handle.parse_table_schema()?;
@@ -991,6 +1214,63 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
         ))
         .map(Some)
     }
+
+    fn get_table_execute_plan(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+        procedure: TypedTableExecuteProcedure<'_>,
+    ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+        if system_relation_of(name.table_name()).is_some() {
+            // A `<table>$<suffix>` relation is a view of one pinned metadata
+            // file. There is nothing to rewrite in it, which is absence rather
+            // than a procedure this connector failed to run.
+            return Ok(None);
+        }
+        let Some(physical) = self.load_relation(name)? else {
+            return Ok(None);
+        };
+        let metadata = physical.table.metadata();
+        // The snapshot the rewrite reads is the one its commit is validated
+        // against, so it is pinned here rather than resolved again on a worker.
+        let snapshot_id = metadata.current_snapshot_id().ok_or_else(|| {
+            invalid(format!(
+                "iceberg relation {}.{} has no snapshot to rewrite",
+                name.schema_name(),
+                name.table_name()
+            ))
+        })?;
+        let table_handle = pinned_table_handle(name, metadata, Some(snapshot_id))?;
+        let group = procedure.group();
+        // The group names exactly the artifacts this procedure rewrites -- the
+        // same set its commit replaces. It is carried, never re-derived: a rule
+        // re-evaluated here could select a different set, and a rewrite that
+        // reads an artifact its commit does not replace corrupts the relation.
+        let procedure_handle = match procedure {
+            TypedTableExecuteProcedure::RewritePositionDeleteFiles(_) => {
+                IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(
+                    IcebergRewritePositionDeleteFilesHandle::try_new(
+                        table_handle.clone(),
+                        IcebergRewriteArtifactContentId::try_new(
+                            group.artifact_location(),
+                            group.artifact_digest_hex(),
+                        )?,
+                        group.group_digest_hex(),
+                    )?,
+                )
+            }
+        };
+        let handle = IcebergTableExecuteHandle::try_new(IcebergTableExecuteHandleParams {
+            schema_table_name: name.clone(),
+            procedure_id: procedure_handle.procedure_id(),
+            table_location: table_handle.table_location().to_string(),
+            procedure_handle: Some(procedure_handle),
+        })?;
+        self.wrap_relation(dto::catalog_table_handle::Relation::TableExecute(
+            handle.to_table_execute_handle_proto(),
+        ))
+        .map(Some)
+    }
 }
 
 impl TypedConnectorSplitManager for IcebergTypedBoundary {
@@ -1026,6 +1306,15 @@ impl TypedConnectorSplitManager for IcebergTypedBoundary {
         // to either.
         if let ConnectorRelation::SystemTable(reference) = table.relation() {
             return self.system_relation_split_source(reference);
+        }
+
+        // A table-execute relation enumerates the artifacts its frozen group
+        // names, resolved from the immutable artifact the group points at.
+        // None of the data enumerator below applies: there is no snapshot walk,
+        // no pruning, and no delete closure to compute.
+        if let ConnectorRelation::TableExecute(_) = table.relation() {
+            let handle = self.table_execute_handle(table)?;
+            return self.table_execute_split_source(&handle);
         }
 
         let handle = self.data_table_handle(table)?;

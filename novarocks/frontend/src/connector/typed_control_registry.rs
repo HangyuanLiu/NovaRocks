@@ -263,6 +263,15 @@ mod tests {
         ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
             Ok(None)
         }
+
+        fn get_table_execute_plan(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+            _procedure: novarocks_proto::connector_read::TypedTableExecuteProcedure<'_>,
+        ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+            Ok(None)
+        }
     }
 
     impl TypedConnectorSplitManager for StubControl {
