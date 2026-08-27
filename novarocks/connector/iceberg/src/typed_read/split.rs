@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::connector_read::{
     MAX_AFFINITY_KEY_BYTES, MAX_DELETES_PER_SPLIT, MAX_ENCRYPTION_MATERIAL_BYTES,
     MAX_EQUALITY_FIELD_IDS, MAX_JSON_BYTES, MAX_PATH_BYTES,
 };

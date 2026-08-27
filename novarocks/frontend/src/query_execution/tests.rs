@@ -43,9 +43,9 @@ use crate::query_execution::statistics::{
 use crate::query_execution::terminal_set::QueryTerminalSet;
 use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
 use bytes::Bytes;
-use novarocks_proto::lifecycle::QueryOptions;
-use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
-use novarocks_proto::membership::BackendProcessDescriptor;
+use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
+use novarocks_proto_codec::membership::BackendProcessDescriptor;
 use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
 use novarocks_types::BackendProcessId;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -89,7 +89,7 @@ struct NoopConnectorBindingBarrier;
 impl ConnectorBindingInstallBarrier for NoopConnectorBindingBarrier {
     fn install_all(
         &self,
-        _execution_id: novarocks_proto::lifecycle::QueryExecutionId,
+        _execution_id: novarocks_proto_codec::lifecycle::QueryExecutionId,
         _plan: crate::query_execution::artifact::ConnectorBindingInstallPlan,
     ) -> Result<ConnectorBindingInstallLease, DistributedQueryError> {
         Ok(ConnectorBindingInstallLease)
@@ -263,19 +263,19 @@ fn query_control_typestate_initializes_before_native_assembly() {
     let parts = request.into_parts();
     let query_id = crate::query_execution::contract::QueryId::new(41, 73);
     let execution_id = execution_id(query_id);
-    let protocol_execution_id = novarocks_proto::lifecycle::QueryExecutionId::new(
+    let protocol_execution_id = novarocks_proto_codec::lifecycle::QueryExecutionId::new(
         query_id,
-        novarocks_proto::lifecycle::AttemptId::new(9).expect("nonzero protocol attempt"),
+        novarocks_proto_codec::lifecycle::AttemptId::new(9).expect("nonzero protocol attempt"),
     )
     .expect("valid protocol execution id");
-    let wire_query_options = novarocks_proto::lifecycle::QueryOptions::parse(
+    let wire_query_options = novarocks_proto_codec::lifecycle::QueryOptions::parse(
         novarocks_proto_models::novarocks::QueryOptions::default(),
     )
     .expect("valid protocol query options");
     let endpoint = "127.0.0.1:19031".parse().expect("valid endpoint");
     let descriptor = BackendProcessDescriptor::new(
         BackendProcessId::new_v7(),
-        novarocks_proto::lifecycle::QueryControlEndpoint::new("127.0.0.1", 19031)
+        novarocks_proto_codec::lifecycle::QueryControlEndpoint::new("127.0.0.1", 19031)
             .expect("valid endpoint"),
         "test-deployment",
         "test-build",

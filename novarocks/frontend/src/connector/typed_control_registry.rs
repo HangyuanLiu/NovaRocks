@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use novarocks_proto::connector_read::{TypedConnectorMetadata, TypedConnectorSplitManager};
+use novarocks_proto_codec::connector_read::{TypedConnectorMetadata, TypedConnectorSplitManager};
 use novarocks_spi::connector::ConnectorExecutionBindingKey;
 
 /// The pair of coordinator-side entry points one installed provider offers.
@@ -176,11 +176,11 @@ impl TypedConnectorControlRegistry {
 mod tests {
     use std::collections::BTreeSet;
 
-    use novarocks_proto::connector_read::{
+    use novarocks_proto_codec::connector_read::{
         CatalogTableHandle, TypedColumnBinding, TypedFilterApplication, TypedLimitApplication,
         TypedRelationVersion, TypedSystemTablePlan, WireConstraint, WireDynamicFilterSnapshot,
     };
-    use novarocks_proto::connector_read::{
+    use novarocks_proto_codec::connector_read::{
         ScanAssignment, TypedConnectorSplitSource, ValidatedColumnHandle,
     };
     use novarocks_spi::connector::read_stack::{ConnectorSession, SchemaTableName};
@@ -259,7 +259,7 @@ mod tests {
             &self,
             _session: &ConnectorSession,
             _name: &SchemaTableName,
-            _window: novarocks_proto::connector_read::TypedChangeWindow,
+            _window: novarocks_proto_codec::connector_read::TypedChangeWindow,
         ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
             Ok(None)
         }
@@ -268,7 +268,7 @@ mod tests {
             &self,
             _session: &ConnectorSession,
             _name: &SchemaTableName,
-            _procedure: novarocks_proto::connector_read::TypedTableExecuteProcedure<'_>,
+            _procedure: novarocks_proto_codec::connector_read::TypedTableExecuteProcedure<'_>,
         ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
             Ok(None)
         }

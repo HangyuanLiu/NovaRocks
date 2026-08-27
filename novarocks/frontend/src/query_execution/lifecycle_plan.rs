@@ -25,7 +25,7 @@ use crate::query_execution::contract::{
 use crate::query_execution::schedule::FragmentLifecycleProjection;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_proto::lifecycle::{
+use novarocks_proto_codec::lifecycle::{
     ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
     QueryControlEndpoint, QueryExecutionId, QueryOptions as ProtocolQueryOptions,
     RuntimeFilterContribution,
@@ -77,7 +77,7 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
 }
 
-fn protocol_contract_error(error: novarocks_proto::ProtocolError) -> DistributedQueryError {
+fn protocol_contract_error(error: novarocks_proto_codec::ProtocolError) -> DistributedQueryError {
     contract_error(error.to_string())
 }
 
@@ -120,7 +120,7 @@ fn protocol_unique_id(id: novarocks_types::UniqueId) -> common::UniqueId {
 }
 
 fn protocol_exchange_route(
-    route: &novarocks_proto::lifecycle::ExchangeRouteManifest,
+    route: &novarocks_proto_codec::lifecycle::ExchangeRouteManifest,
 ) -> novarocks::ExchangeRouteManifest {
     *route.as_proto()
 }
@@ -569,7 +569,7 @@ pub(crate) fn compile_query_init_plan(
             .unwrap_or_default();
         let runtime_filter = runtime_filter_by_backend.remove(&backend_idx);
         let manifest = ParticipantManifest::parse(novarocks::ParticipantManifest {
-            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                 options.execution_id,
             )),
             backend: Some(backend.as_proto().clone()),
@@ -620,10 +620,10 @@ mod tests {
     use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
     use crate::query_execution::contract::{QueryId, ResolvedQueryOptions};
     use crate::query_execution::schedule::FragmentLifecycleProjection;
-    use novarocks_proto::lifecycle::{
+    use novarocks_proto_codec::lifecycle::{
         AttemptId, QueryExecutionId, QueryOptions, RuntimeFilterContribution,
     };
-    use novarocks_proto::membership::BackendProcessDescriptor;
+    use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_proto_models::novarocks;
     use novarocks_types::{BackendProcessId, UniqueId};
 
@@ -648,7 +648,7 @@ mod tests {
             backend_idx,
             BackendProcessDescriptor::new(
                 process_ids[backend_idx],
-                novarocks_proto::lifecycle::QueryControlEndpoint::new(
+                novarocks_proto_codec::lifecycle::QueryControlEndpoint::new(
                     "127.0.0.1",
                     u16::try_from(19040 + backend_idx).expect("valid port"),
                 )
@@ -778,7 +778,7 @@ mod tests {
             backend(0).backend_idx(),
             BackendProcessDescriptor::new(
                 BackendProcessId::new_v7(),
-                novarocks_proto::lifecycle::QueryControlEndpoint::new("127.0.0.1", 19040)
+                novarocks_proto_codec::lifecycle::QueryControlEndpoint::new("127.0.0.1", 19040)
                     .expect("valid endpoint"),
                 "test-deployment",
                 "test-build",

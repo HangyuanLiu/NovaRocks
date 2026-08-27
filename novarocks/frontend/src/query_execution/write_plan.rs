@@ -35,7 +35,7 @@ use novarocks_spi::connector::{
 use sha2::{Digest, Sha256};
 
 use crate::query_execution::schedule::SchedulingPlan;
-use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_sql::plan_read::FragmentId;
 use novarocks_types::UniqueId;
 
@@ -377,7 +377,7 @@ mod tests {
     fn execution() -> QueryExecutionId {
         QueryExecutionId::new(
             crate::query_execution::contract::QueryId::new(13, 17),
-            novarocks_proto::lifecycle::AttemptId::new(5).expect("valid attempt"),
+            novarocks_proto_codec::lifecycle::AttemptId::new(5).expect("valid attempt"),
         )
         .expect("valid execution")
     }

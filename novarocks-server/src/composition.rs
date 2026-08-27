@@ -714,7 +714,7 @@ pub fn compose_backend_typed_provider_factories(
 ) -> anyhow::Result<
     Vec<(
         novarocks_spi::connector::ConnectorExecutionProviderKind,
-        std::sync::Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+        std::sync::Arc<dyn novarocks_proto_codec::connector_read::TypedConnectorProviderFactory>,
     )>,
 > {
     let binding = IcebergReadBinding::from_resources(compose_connector_file_planning_resources(

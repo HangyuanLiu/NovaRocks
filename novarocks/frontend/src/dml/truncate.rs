@@ -21,7 +21,7 @@
 //! or negative observation can authorize a follow-up mutation: the only
 //! allowed follow-up is one read-only adjudication on the retained session.
 
-use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     LakePublicationFamily, LakePublicationId, LakePublicationStatementTag, LakePublicationTarget,
     LakePublicationTerminal,

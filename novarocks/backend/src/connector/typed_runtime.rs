@@ -61,7 +61,7 @@ use novarocks_execution::exec::node::scan::{
 use novarocks_execution::exec::node::{BoxedExecIter, ExecResult};
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_execution::runtime_filter::RuntimeFilterConsumerContract;
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::connector_read::{
     ConnectorTableScanSource, ScheduledSplit, TypedConnectorPageSourceProvider,
     TypedConnectorSystemTableProvider, ValidatedColumnHandle, WireDynamicFilter,
 };
@@ -880,7 +880,7 @@ impl Drop for RegisteredPageSource {
 pub(crate) mod test_support {
     use std::collections::BTreeMap;
 
-    use novarocks_proto::connector_read::encode_value_type;
+    use novarocks_proto_codec::connector_read::encode_value_type;
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::read_stack::ConnectorValueType;
 
@@ -967,15 +967,17 @@ pub(crate) mod test_support {
     /// a decode test prove the binding resolves without opening any file.
     struct UnusedProvider;
 
-    impl novarocks_proto::connector_read::TypedConnectorPageSourceProvider for UnusedProvider {
+    impl novarocks_proto_codec::connector_read::TypedConnectorPageSourceProvider for UnusedProvider {
         fn create_page_source(
             &self,
             _session: &novarocks_spi::connector::read_stack::ConnectorSession,
-            _table: &novarocks_proto::connector_read::CatalogTableHandle,
-            _split: &novarocks_proto::connector_read::ValidatedConnectorSplit,
+            _table: &novarocks_proto_codec::connector_read::CatalogTableHandle,
+            _split: &novarocks_proto_codec::connector_read::ValidatedConnectorSplit,
             _scheduled_split_sequence_id: u64,
-            _columns: &[novarocks_proto::connector_read::ScanAssignment],
-            _dynamic_filter: &std::sync::Arc<novarocks_proto::connector_read::WireDynamicFilter>,
+            _columns: &[novarocks_proto_codec::connector_read::ScanAssignment],
+            _dynamic_filter: &std::sync::Arc<
+                novarocks_proto_codec::connector_read::WireDynamicFilter,
+            >,
         ) -> Result<
             Box<dyn novarocks_spi::connector::read_stack::ConnectorPageSource>,
             novarocks_spi::connector::ConnectorError,
@@ -987,12 +989,14 @@ pub(crate) mod test_support {
         }
     }
 
-    impl novarocks_proto::connector_read::TypedConnectorProviderFactory for UnusedProvider {
+    impl novarocks_proto_codec::connector_read::TypedConnectorProviderFactory for UnusedProvider {
         fn create_page_source_provider(
             &self,
             _request: &novarocks_spi::connector::ConnectorRequestContext,
         ) -> Result<
-            std::sync::Arc<dyn novarocks_proto::connector_read::TypedConnectorPageSourceProvider>,
+            std::sync::Arc<
+                dyn novarocks_proto_codec::connector_read::TypedConnectorPageSourceProvider,
+            >,
             novarocks_spi::connector::ConnectorError,
         > {
             Ok(std::sync::Arc::new(UnusedProvider))
@@ -1002,19 +1006,21 @@ pub(crate) mod test_support {
             &self,
             _request: &novarocks_spi::connector::ConnectorRequestContext,
         ) -> Result<
-            std::sync::Arc<dyn novarocks_proto::connector_read::TypedConnectorSystemTableProvider>,
+            std::sync::Arc<
+                dyn novarocks_proto_codec::connector_read::TypedConnectorSystemTableProvider,
+            >,
             novarocks_spi::connector::ConnectorError,
         > {
             Ok(std::sync::Arc::new(UnusedProvider))
         }
     }
 
-    impl novarocks_proto::connector_read::TypedConnectorSystemTableProvider for UnusedProvider {
+    impl novarocks_proto_codec::connector_read::TypedConnectorSystemTableProvider for UnusedProvider {
         fn create_system_page_source(
             &self,
             _session: &novarocks_spi::connector::read_stack::ConnectorSession,
-            _table: &novarocks_proto::connector_read::CatalogTableHandle,
-            _columns: &[novarocks_proto::connector_read::ScanAssignment],
+            _table: &novarocks_proto_codec::connector_read::CatalogTableHandle,
+            _columns: &[novarocks_proto_codec::connector_read::ScanAssignment],
         ) -> Result<
             Box<dyn novarocks_spi::connector::read_stack::ConnectorPageSource>,
             novarocks_spi::connector::ConnectorError,
@@ -1047,7 +1053,7 @@ pub(crate) mod test_support {
             .install(&key, crate::connector::TypedConnectorProviders::new(unused))
             .expect("fixture install");
 
-        let execution_id = novarocks_proto::lifecycle::QueryExecutionId::new(
+        let execution_id = novarocks_proto_codec::lifecycle::QueryExecutionId::new(
             QueryId::new(1, 2),
             AttemptId::new(1).expect("attempt"),
         )
@@ -1132,8 +1138,8 @@ mod tests {
 
     use arrow::array::{ArrayRef, Int64Array};
     use novarocks_execution::connector::{SplitQueueConfig, SplitQueueRegistry, TaskAttemptKey};
-    use novarocks_proto::FieldPath;
-    use novarocks_proto::connector_read::{
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::connector_read::{
         CatalogTableHandle, ScanAssignment, ValidatedConnectorSplit,
     };
     use novarocks_proto_models::connector_read as dto;
@@ -1726,7 +1732,7 @@ mod tests {
                 dto::ScanAssignment {
                     variable: "v0".to_owned(),
                     column: Some(test_support::column_handle(1)),
-                    value_type: Some(novarocks_proto::connector_read::encode_value_type(
+                    value_type: Some(novarocks_proto_codec::connector_read::encode_value_type(
                         novarocks_spi::connector::read_stack::ConnectorValueType::BigInt,
                     )),
                 },

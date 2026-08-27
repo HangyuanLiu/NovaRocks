@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use novarocks_proto::connector_read::canonical_scheduled_split_bytes;
+use novarocks_proto_codec::connector_read::canonical_scheduled_split_bytes;
 use novarocks_proto_models::connector_read as dto;
 use novarocks_types::UniqueId;
 
@@ -261,8 +261,8 @@ impl TaskUpdateRequest {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_proto::FieldPath;
-    use novarocks_proto::connector_read::ValidatedConnectorSplit;
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::connector_read::ValidatedConnectorSplit;
 
     use super::super::handle::CatalogHandle;
     use super::*;

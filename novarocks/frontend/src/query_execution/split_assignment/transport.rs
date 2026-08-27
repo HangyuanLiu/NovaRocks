@@ -23,7 +23,7 @@
 
 use std::fmt;
 
-use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_proto_models::connector_read as dto;
 use novarocks_types::UniqueId;
 

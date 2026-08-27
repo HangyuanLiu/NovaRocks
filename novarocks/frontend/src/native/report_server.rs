@@ -12,13 +12,13 @@ use std::thread::JoinHandle;
 use crate::coordinator::QueryTerminalIngress;
 use crate::topology::ClusterBackendService;
 use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
-use novarocks_proto::lifecycle::{
+use novarocks_proto_codec::lifecycle::{
     ParticipantTerminalOutcome, QueryTerminalReportAck, QueryTerminalReportOutcome,
 };
-use novarocks_proto::membership::{
+use novarocks_proto_codec::membership::{
     BackendAnnounceRejectionReason, BackendAnnounceRequest, BackendAnnounceResult,
 };
-use novarocks_proto::{ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::{ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{filter, novarocks as proto};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener as TokioTcpListener;
@@ -951,7 +951,7 @@ mod tests {
         DeploymentId, NativeCallerSubject, NativeClientAuthInterceptor, NativeTransportMode,
         NativeTrust, ValidatedSharedSecret,
     };
-    use novarocks_proto::lifecycle::{
+    use novarocks_proto_codec::lifecycle::{
         AttemptId, NegativeAttestation, ParticipantBackendIdentity, ParticipantTerminalOutcome,
         QueryExecutionId, QueryTerminalReportAck, QueryTerminalReportOutcome,
     };
@@ -1011,7 +1011,7 @@ mod tests {
         })
         .expect("backend identity");
         let attestation = NegativeAttestation::parse(proto::NegativeAttestation {
-            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                 execution_id,
             )),
             backend: Some(backend.as_proto().clone()),

@@ -49,7 +49,7 @@ typetag = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 novarocks-fs = { path = "../../fs" }
-novarocks-proto = { path = "../../proto" }
+novarocks-proto-codec = { path = "../../proto-codec" }
 novarocks-proto-models = { path = "../../proto-models" }
 novarocks-spi = { path = "../../spi" }
 novarocks-types = { path = "../../types" }

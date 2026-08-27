@@ -28,7 +28,7 @@ use std::time::Duration;
 use crate::connector::ConnectorRegistry;
 use novarocks_execution::runtime::fragment::FragmentSubmission;
 #[cfg(test)]
-use novarocks_proto::lifecycle::decode_query_execution_id;
+use novarocks_proto_codec::lifecycle::decode_query_execution_id;
 use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorExecutionResolver;
 use novarocks_types::{QueryExecutionId, QueryId, UniqueId};
@@ -193,7 +193,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::connector::ConnectorRegistry;
-    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_proto_models::{common, novarocks as proto, plan};
     use novarocks_types::QueryId;
 

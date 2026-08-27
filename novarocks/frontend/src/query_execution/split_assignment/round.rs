@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use novarocks_proto::connector_read::TypedConnectorSplitSource;
-use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto_codec::connector_read::TypedConnectorSplitSource;
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
 
 use super::super::connector_domain::CatalogHandle;
 use super::driver::{AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError};
@@ -194,8 +194,8 @@ impl RoundSplitAssignmentStop {
 mod tests {
     use std::sync::Mutex;
 
-    use novarocks_proto::FieldPath;
-    use novarocks_proto::connector_read::ValidatedConnectorSplit;
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::connector_read::ValidatedConnectorSplit;
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::read_stack::ConnectorSplitBatch;
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
@@ -249,7 +249,7 @@ mod tests {
         fn next_batch(
             &mut self,
             _max_size: usize,
-            _dynamic_filter: &novarocks_proto::connector_read::WireDynamicFilterSnapshot,
+            _dynamic_filter: &novarocks_proto_codec::connector_read::WireDynamicFilterSnapshot,
         ) -> Result<ConnectorSplitBatch<ValidatedConnectorSplit>, ConnectorError> {
             if self.closed.load(Ordering::Acquire) {
                 return Err(ConnectorError::new(

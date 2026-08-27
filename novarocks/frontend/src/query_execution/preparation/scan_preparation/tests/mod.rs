@@ -221,14 +221,14 @@ impl FixtureTypedControl {
         "__change_op",
     ];
 
-    fn bindings() -> Vec<novarocks_proto::connector_read::TypedColumnBinding> {
+    fn bindings() -> Vec<novarocks_proto_codec::connector_read::TypedColumnBinding> {
         use super::super::typed_predicate::test_support::column_handle;
 
         Self::COLUMN_NAMES
             .iter()
             .enumerate()
             .map(|(ordinal, name)| {
-                novarocks_proto::connector_read::TypedColumnBinding::new(
+                novarocks_proto_codec::connector_read::TypedColumnBinding::new(
                     *name,
                     column_handle(ordinal as i32 + 1, name),
                     false,
@@ -261,25 +261,25 @@ impl FixtureTypedControl {
     }
 }
 
-impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedControl {
+impl novarocks_proto_codec::connector_read::TypedConnectorMetadata for FixtureTypedControl {
     fn get_table_handle(
         &self,
         _session: &novarocks_spi::connector::read_stack::ConnectorSession,
         name: &novarocks_spi::connector::read_stack::SchemaTableName,
-        version: novarocks_proto::connector_read::TypedRelationVersion,
+        version: novarocks_proto_codec::connector_read::TypedRelationVersion,
         _reference: Option<&str>,
     ) -> Result<
-        Option<novarocks_proto::connector_read::CatalogTableHandle>,
+        Option<novarocks_proto_codec::connector_read::CatalogTableHandle>,
         novarocks_spi::connector::ConnectorError,
     > {
         use novarocks_proto_models::connector_read as dto;
 
         let snapshot_id = match version {
-            novarocks_proto::connector_read::TypedRelationVersion::Current => 1,
-            novarocks_proto::connector_read::TypedRelationVersion::SnapshotId(snapshot_id) => {
-                snapshot_id
-            }
-            novarocks_proto::connector_read::TypedRelationVersion::Reference => 1,
+            novarocks_proto_codec::connector_read::TypedRelationVersion::Current => 1,
+            novarocks_proto_codec::connector_read::TypedRelationVersion::SnapshotId(
+                snapshot_id,
+            ) => snapshot_id,
+            novarocks_proto_codec::connector_read::TypedRelationVersion::Reference => 1,
         };
         let raw = dto::CatalogTableHandle {
             catalog_name: self.catalog.clone(),
@@ -325,9 +325,9 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
             )),
         };
         Ok(Some(
-            novarocks_proto::connector_read::CatalogTableHandle::parse(
+            novarocks_proto_codec::connector_read::CatalogTableHandle::parse(
                 raw,
-                novarocks_proto::FieldPath::root("catalog_table_handle"),
+                novarocks_proto_codec::FieldPath::root("catalog_table_handle"),
             )
             .expect("fixture catalog table handle"),
         ))
@@ -339,7 +339,7 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
         name: &novarocks_spi::connector::read_stack::SchemaTableName,
         pinned: &novarocks_spi::connector::ConnectorPinnedFileSet,
     ) -> Result<
-        Option<novarocks_proto::connector_read::CatalogTableHandle>,
+        Option<novarocks_proto_codec::connector_read::CatalogTableHandle>,
         novarocks_spi::connector::ConnectorError,
     > {
         use novarocks_proto_models::connector_read as dto;
@@ -352,7 +352,7 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
             .get_table_handle(
                 session,
                 name,
-                novarocks_proto::connector_read::TypedRelationVersion::SnapshotId(
+                novarocks_proto_codec::connector_read::TypedRelationVersion::SnapshotId(
                     pinned.version_ordinal(),
                 ),
                 None,
@@ -368,9 +368,9 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
             });
         }
         Ok(Some(
-            novarocks_proto::connector_read::CatalogTableHandle::parse(
+            novarocks_proto_codec::connector_read::CatalogTableHandle::parse(
                 raw,
-                novarocks_proto::FieldPath::root("catalog_table_handle"),
+                novarocks_proto_codec::FieldPath::root("catalog_table_handle"),
             )
             .expect("fixture pinned catalog table handle"),
         ))
@@ -379,9 +379,9 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
     fn get_column_bindings(
         &self,
         _session: &novarocks_spi::connector::read_stack::ConnectorSession,
-        _table: &novarocks_proto::connector_read::CatalogTableHandle,
+        _table: &novarocks_proto_codec::connector_read::CatalogTableHandle,
     ) -> Result<
-        Vec<novarocks_proto::connector_read::TypedColumnBinding>,
+        Vec<novarocks_proto_codec::connector_read::TypedColumnBinding>,
         novarocks_spi::connector::ConnectorError,
     > {
         Ok(Self::bindings())
@@ -390,10 +390,10 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
     fn apply_filter(
         &self,
         _session: &novarocks_spi::connector::read_stack::ConnectorSession,
-        _table: &novarocks_proto::connector_read::CatalogTableHandle,
-        _constraint: &novarocks_proto::connector_read::WireConstraint,
+        _table: &novarocks_proto_codec::connector_read::CatalogTableHandle,
+        _constraint: &novarocks_proto_codec::connector_read::WireConstraint,
     ) -> Result<
-        Option<novarocks_proto::connector_read::TypedFilterApplication>,
+        Option<novarocks_proto_codec::connector_read::TypedFilterApplication>,
         novarocks_spi::connector::ConnectorError,
     > {
         Ok(None)
@@ -402,10 +402,10 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
     fn apply_projection(
         &self,
         _session: &novarocks_spi::connector::read_stack::ConnectorSession,
-        _table: &novarocks_proto::connector_read::CatalogTableHandle,
-        _assignments: &[novarocks_proto::connector_read::ScanAssignment],
+        _table: &novarocks_proto_codec::connector_read::CatalogTableHandle,
+        _assignments: &[novarocks_proto_codec::connector_read::ScanAssignment],
     ) -> Result<
-        Option<novarocks_proto::connector_read::CatalogTableHandle>,
+        Option<novarocks_proto_codec::connector_read::CatalogTableHandle>,
         novarocks_spi::connector::ConnectorError,
     > {
         Ok(None)
@@ -414,10 +414,10 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
     fn apply_limit(
         &self,
         _session: &novarocks_spi::connector::read_stack::ConnectorSession,
-        _table: &novarocks_proto::connector_read::CatalogTableHandle,
+        _table: &novarocks_proto_codec::connector_read::CatalogTableHandle,
         _limit: u64,
     ) -> Result<
-        Option<novarocks_proto::connector_read::TypedLimitApplication>,
+        Option<novarocks_proto_codec::connector_read::TypedLimitApplication>,
         novarocks_spi::connector::ConnectorError,
     > {
         Ok(None)
@@ -428,7 +428,7 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
         _session: &novarocks_spi::connector::read_stack::ConnectorSession,
         _name: &novarocks_spi::connector::read_stack::SchemaTableName,
     ) -> Result<
-        Option<novarocks_proto::connector_read::TypedSystemTablePlan>,
+        Option<novarocks_proto_codec::connector_read::TypedSystemTablePlan>,
         novarocks_spi::connector::ConnectorError,
     > {
         Ok(None)
@@ -440,9 +440,9 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
         &self,
         _session: &novarocks_spi::connector::read_stack::ConnectorSession,
         name: &novarocks_spi::connector::read_stack::SchemaTableName,
-        window: novarocks_proto::connector_read::TypedChangeWindow,
+        window: novarocks_proto_codec::connector_read::TypedChangeWindow,
     ) -> Result<
-        Option<novarocks_proto::connector_read::CatalogTableHandle>,
+        Option<novarocks_proto_codec::connector_read::CatalogTableHandle>,
         novarocks_spi::connector::ConnectorError,
     > {
         use novarocks_proto_models::connector_read as dto;
@@ -478,9 +478,9 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
             )),
         };
         Ok(Some(
-            novarocks_proto::connector_read::CatalogTableHandle::parse(
+            novarocks_proto_codec::connector_read::CatalogTableHandle::parse(
                 raw,
-                novarocks_proto::FieldPath::root("catalog_table_handle"),
+                novarocks_proto_codec::FieldPath::root("catalog_table_handle"),
             )
             .expect("fixture catalog change window handle"),
         ))
@@ -490,27 +490,27 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
         &self,
         _session: &novarocks_spi::connector::read_stack::ConnectorSession,
         _name: &novarocks_spi::connector::read_stack::SchemaTableName,
-        _procedure: novarocks_proto::connector_read::TypedTableExecuteProcedure<'_>,
+        _procedure: novarocks_proto_codec::connector_read::TypedTableExecuteProcedure<'_>,
     ) -> Result<
-        Option<novarocks_proto::connector_read::CatalogTableHandle>,
+        Option<novarocks_proto_codec::connector_read::CatalogTableHandle>,
         novarocks_spi::connector::ConnectorError,
     > {
         Ok(None)
     }
 }
 
-impl novarocks_proto::connector_read::TypedConnectorSplitManager for FixtureTypedControl {
+impl novarocks_proto_codec::connector_read::TypedConnectorSplitManager for FixtureTypedControl {
     fn get_splits(
         &self,
         _session: &novarocks_spi::connector::read_stack::ConnectorSession,
-        _table: &novarocks_proto::connector_read::CatalogTableHandle,
-        _columns: &[novarocks_proto::connector_read::ScanAssignment],
+        _table: &novarocks_proto_codec::connector_read::CatalogTableHandle,
+        _columns: &[novarocks_proto_codec::connector_read::ScanAssignment],
         _dynamic_filter_columns: &std::collections::BTreeSet<
-            novarocks_proto::connector_read::ValidatedColumnHandle,
+            novarocks_proto_codec::connector_read::ValidatedColumnHandle,
         >,
-        _constraint: &novarocks_proto::connector_read::WireConstraint,
+        _constraint: &novarocks_proto_codec::connector_read::WireConstraint,
     ) -> Result<
-        Box<dyn novarocks_proto::connector_read::TypedConnectorSplitSource>,
+        Box<dyn novarocks_proto_codec::connector_read::TypedConnectorSplitSource>,
         novarocks_spi::connector::ConnectorError,
     > {
         Err(novarocks_spi::connector::ConnectorError::new(

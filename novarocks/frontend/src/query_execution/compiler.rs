@@ -28,7 +28,7 @@ use crate::runtime::query_result::QueryResult;
 #[cfg(test)]
 use crate::runtime::query_result::build_string_query_result;
 use novarocks_parser::ast::Query;
-use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto_codec::lifecycle::QueryOptions;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
@@ -1263,8 +1263,8 @@ fn test_request_context_with_role(
     };
     use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
     use crate::common::query_cancellation::QueryCancellationSource;
-    use novarocks_proto::lifecycle::QueryControlEndpoint;
-    use novarocks_proto::membership::BackendProcessDescriptor;
+    use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
+    use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_types::BackendProcessId;
 
     let cancellation = QueryCancellationSource::new();
@@ -2731,7 +2731,7 @@ fn find_matching_paren(sql: &str, open: usize) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_proto::lifecycle::QueryOptions;
+    use novarocks_proto_codec::lifecycle::QueryOptions;
     use novarocks_proto_models::novarocks;
 
     #[test]

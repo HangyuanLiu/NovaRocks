@@ -40,7 +40,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int8Array};
 use novarocks_fs::{FileReadBudget, FileReadContext, FileReaderOptions};
-use novarocks_proto::connector_read::WireDynamicFilter;
+use novarocks_proto_codec::connector_read::WireDynamicFilter;
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{ConnectorPageSource, PageSourceMetrics, SourcePage};
 
@@ -920,9 +920,9 @@ mod tests {
         // through the wire. A lossy round trip would make the sign look like an
         // impostor claiming its reserved field id.
         let column = change_op_column_handle().expect("change op");
-        let validated = novarocks_proto::connector_read::ValidatedColumnHandle::parse(
+        let validated = novarocks_proto_codec::connector_read::ValidatedColumnHandle::parse(
             column.to_column_handle_proto(),
-            novarocks_proto::FieldPath::root("column"),
+            novarocks_proto_codec::FieldPath::root("column"),
         )
         .expect("a well-formed wire column handle");
         let decoded = IcebergColumnHandle::from_column_handle_proto(validated.as_proto())

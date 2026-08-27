@@ -25,10 +25,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_types::UniqueId;
 
-use novarocks_proto::connector_read::{TypedConnectorSplitSource, WireDynamicFilterSnapshot};
+use novarocks_proto_codec::connector_read::{TypedConnectorSplitSource, WireDynamicFilterSnapshot};
 
 use super::super::connector_domain::{PlanNodeAssignmentState, Split, SplitAssignmentError};
 use super::transport::{TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError};
@@ -460,8 +460,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    use novarocks_proto::FieldPath;
-    use novarocks_proto::connector_read::ValidatedConnectorSplit;
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::connector_read::ValidatedConnectorSplit;
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::read_stack::ConnectorSplitBatch;
     use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};

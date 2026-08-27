@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef};
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::common;
 use novarocks_types::SlotId;
 
@@ -126,7 +126,7 @@ fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) ->
 #[cfg(test)]
 mod tests {
     use super::decode_output_layout;
-    use novarocks_proto::FieldPath;
+    use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::common;
     use novarocks_types::SlotId;
 

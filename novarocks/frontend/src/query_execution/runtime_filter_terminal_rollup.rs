@@ -219,7 +219,7 @@ pub(crate) fn rollup(set: &QueryTerminalSet) -> RuntimeFilterTerminalRollup {
 
 fn add_contribution_totals(
     totals: &mut RuntimeFilterTerminalTotals,
-    contribution: &novarocks_proto::lifecycle::QueryTerminalProfileContributionV1,
+    contribution: &novarocks_proto_codec::lifecycle::QueryTerminalProfileContributionV1,
 ) -> Result<(), ()> {
     for channel in contribution.channels() {
         checked_add(&mut totals.channels.count, 1)?;
@@ -378,7 +378,7 @@ mod tests {
     };
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::terminal_set::QueryTerminalSet;
-    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
+    use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
     use novarocks_proto_models::{common, novarocks};
 
     fn execution_id() -> QueryExecutionId {
@@ -402,7 +402,7 @@ mod tests {
     ) -> QueryTerminalSnapshot {
         QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(execution_id())),
+            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id())),
             backend: Some(novarocks::ParticipantBackendIdentity {
                 endpoint: Some(novarocks::QueryControlEndpoint {
                     host: "127.0.0.1".to_string(),
@@ -490,7 +490,7 @@ mod tests {
     fn unavailable_snapshot(participant_seed: u64) -> QueryTerminalSnapshot {
         QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(execution_id())),
+            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id())),
             backend: Some(novarocks::ParticipantBackendIdentity {
                 endpoint: Some(novarocks::QueryControlEndpoint {
                     host: "127.0.0.1".to_string(),

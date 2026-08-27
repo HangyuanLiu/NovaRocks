@@ -39,7 +39,7 @@ use crate::query_execution::preparation::scan::{
     ResolvedScanColumn, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
 };
 use crate::query_execution::preparation::typed_scan::{TypedRelationFreeze, prepare_typed_scan};
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::connector_read::{
     ConnectorRelationKind, TypedChangeWindow, TypedFrozenRewriteGroup, TypedRelationVersion,
     TypedTableExecuteProcedure,
 };

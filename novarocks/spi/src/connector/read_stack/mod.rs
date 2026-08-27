@@ -24,7 +24,7 @@
 //! It deliberately contains no provider name, no generated wire DTO, no
 //! opaque payload, and no downcast. Concrete provider facts that cross the
 //! FE/BE boundary are carried by the central IDL's closed per-category
-//! `oneof`s, validated by `novarocks-proto`, and converted to concrete domain
+//! `oneof`s, validated by `novarocks-proto-codec`, and converted to concrete domain
 //! types only inside the provider that produced them.
 // Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
 

@@ -21,7 +21,7 @@ use novarocks_execution::runtime_filter::{
     PartitionId, RuntimeFilterBindingId, RuntimeFilterChannelId,
 };
 #[cfg(debug_assertions)]
-use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
+use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
 use novarocks_proto_models as proto;
 #[cfg(debug_assertions)]
 use novarocks_types::QueryId;

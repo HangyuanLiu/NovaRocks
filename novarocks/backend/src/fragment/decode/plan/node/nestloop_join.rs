@@ -28,7 +28,7 @@ use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::FieldPath;
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
 #[expect(

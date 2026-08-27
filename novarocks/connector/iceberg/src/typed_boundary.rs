@@ -44,8 +44,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use novarocks_proto::FieldPath;
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::FieldPath;
+use novarocks_proto_codec::connector_read::{
     CatalogTableHandle, ConnectorRelation, ScanAssignment, TypedChangeWindow, TypedColumnBinding,
     TypedConnectorMetadata, TypedConnectorSplitManager, TypedConnectorSplitSource,
     TypedFilterApplication, TypedLimitApplication, TypedRelationVersion, TypedSystemTablePlan,
@@ -3783,7 +3783,7 @@ mod tests {
         assert_eq!(split.affinity_key(), Some("s3://bucket/a.parquet"));
         assert_eq!(
             split.category(),
-            novarocks_proto::connector_read::SplitCategory::Data
+            novarocks_proto_codec::connector_read::SplitCategory::Data
         );
         assert_eq!(
             IcebergSplit::from_connector_split_proto(split.as_proto())

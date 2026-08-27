@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
-use novarocks_proto::lifecycle::{
+use novarocks_proto_codec::lifecycle::{
     FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifest,
     ParticipantManifestDigest, ParticipantTerminalOutcome, QueryControlEvent, QueryInitOutcome,
     QueryTerminalSnapshot, QueryTerminationReason, StageDigest, TerminalOutcomeContentId,

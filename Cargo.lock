@@ -3162,7 +3162,7 @@ dependencies = [
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-native-trust",
- "novarocks-proto",
+ "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-secret",
  "novarocks-spi",
@@ -3217,7 +3217,7 @@ dependencies = [
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",
  "novarocks-fs",
- "novarocks-proto",
+ "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-types",
@@ -3269,7 +3269,7 @@ dependencies = [
  "hex",
  "libm",
  "md-5",
- "novarocks-proto",
+ "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-types",
@@ -3324,7 +3324,7 @@ dependencies = [
  "novarocks-fs",
  "novarocks-native-trust",
  "novarocks-parser",
- "novarocks-proto",
+ "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-secret",
  "novarocks-spi",
@@ -3406,7 +3406,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-proto"
+name = "novarocks-proto-codec"
 version = "0.1.0"
 dependencies = [
  "novarocks-proto-models",
@@ -3451,7 +3451,7 @@ dependencies = [
  "novarocks-frontend",
  "novarocks-fs",
  "novarocks-native-trust",
- "novarocks-proto",
+ "novarocks-proto-codec",
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-state-store-foundationdb",

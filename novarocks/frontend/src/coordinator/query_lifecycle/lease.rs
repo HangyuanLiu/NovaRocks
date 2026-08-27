@@ -27,7 +27,7 @@ use crate::query_execution::lifecycle_plan::{
     QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard,
 };
 use crate::query_execution::terminal_set::QueryTerminalSet;
-use novarocks_proto::lifecycle::{
+use novarocks_proto_codec::lifecycle::{
     FragmentLiveObservation, ParticipantManifestDigest, ParticipantTerminalOutcome,
     QueryAbortRequest, QueryControlCommand, QueryControlEvent, QueryExecutionId, QueryTerminalAck,
     QueryTerminationReason, TerminalOutcomeContentId,
@@ -1044,7 +1044,7 @@ impl AttemptControl {
 
         let request =
             QueryAbortRequest::parse(novarocks_proto_models::novarocks::AbortQueryRequest {
-                execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                     self.execution_id,
                 )),
                 init_digest: participant.digest.as_bytes().to_vec(),
@@ -1808,9 +1808,9 @@ fn claim_terminal_snapshot_conflict(
 fn conflicting_terminal_outcome(
     outcome: &ParticipantTerminalOutcome,
 ) -> Result<ParticipantTerminalOutcome, String> {
-    let attestation = novarocks_proto::lifecycle::NegativeAttestation::parse(
+    let attestation = novarocks_proto_codec::lifecycle::NegativeAttestation::parse(
         novarocks_proto_models::novarocks::NegativeAttestation {
-            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                 outcome.execution_id(),
             )),
             backend: Some(outcome.backend().as_proto().clone()),
@@ -2128,10 +2128,10 @@ fn contract_violation(message: impl Into<String>) -> DistributedQueryError {
 /// CLS-R2.
 fn marker_execution_id(
     execution_id: QueryExecutionId,
-) -> Result<novarocks_proto::lifecycle::QueryExecutionId, DistributedQueryError> {
-    let attempt = novarocks_proto::lifecycle::AttemptId::new(execution_id.attempt_id().get())
+) -> Result<novarocks_proto_codec::lifecycle::QueryExecutionId, DistributedQueryError> {
+    let attempt = novarocks_proto_codec::lifecycle::AttemptId::new(execution_id.attempt_id().get())
         .map_err(|error| contract_violation(error.to_string()))?;
-    novarocks_proto::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
+    novarocks_proto_codec::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
         .map_err(|error| contract_violation(error.to_string()))
 }
 
@@ -2154,7 +2154,7 @@ fn terminal_ack_command(
     // `snapshot_digest` is the established ACK/release field name. Its value
     // is the immutable terminal outcome content ID retained at FE admission.
     let ack = QueryTerminalAck::parse(novarocks_proto_models::novarocks::QueryControlTerminalAck {
-        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             outcome.execution_id(),
         )),
         init_digest: outcome.init_digest().as_bytes().to_vec(),

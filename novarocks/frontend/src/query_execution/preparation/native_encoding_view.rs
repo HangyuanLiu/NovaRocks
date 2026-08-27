@@ -21,7 +21,7 @@
 //! mutable collections.  They expose only the frozen facts that an encoder may
 //! map into a native carrier.
 
-use novarocks_proto::connector_read::ConnectorTableScanSource;
+use novarocks_proto_codec::connector_read::ConnectorTableScanSource;
 use novarocks_spi::connector::ConnectorExecutionDeclaration;
 use novarocks_sql::plan_read::{ColumnId, FragmentId, OutputColumn, TypedExpr};
 use novarocks_types::schema::ColumnDef;
@@ -30,7 +30,7 @@ use super::scan::{
     PreparedTypedConnectorScan, ResolvedReadReason, ResolvedScanBinding, ResolvedScanColumnKind,
     ResolvedScanExecution, ScanExecutionBindings,
 };
-use novarocks_proto::lifecycle::ScanRangeParams;
+use novarocks_proto_codec::lifecycle::ScanRangeParams;
 
 /// Frozen scan facts attached to one prepared native-encoding input.
 #[derive(Clone, Copy)]

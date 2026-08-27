@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_native_trust::NativeTrust;
-use novarocks_proto::lifecycle::QueryControlEndpoint;
-use novarocks_proto::lifecycle::{
+use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
+use novarocks_proto_codec::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryStageAck,
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
 };
-use novarocks_proto::membership::BackendProcessDescriptor;
-use novarocks_proto::membership::{
+use novarocks_proto_codec::membership::BackendProcessDescriptor;
+use novarocks_proto_codec::membership::{
     BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
 };
 use novarocks_spi::connector::ConnectorExecutionInstaller;
@@ -73,7 +73,7 @@ pub struct BackendServerConfig {
     /// "installed" keeps exactly one meaning on this backend.
     pub typed_provider_factories: Vec<(
         novarocks_spi::connector::ConnectorExecutionProviderKind,
-        Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+        Arc<dyn novarocks_proto_codec::connector_read::TypedConnectorProviderFactory>,
     )>,
 }
 
@@ -452,7 +452,7 @@ fn compose_backend_application_services(
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
     typed_provider_factories: &[(
         novarocks_spi::connector::ConnectorExecutionProviderKind,
-        Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+        Arc<dyn novarocks_proto_codec::connector_read::TypedConnectorProviderFactory>,
     )],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let execution_runtime = Arc::new(ExecutionRuntime::new(execution_runtime_config).map_err(
@@ -518,7 +518,7 @@ fn seal_connector_execution_host(
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
     typed_provider_factories: &[(
         novarocks_spi::connector::ConnectorExecutionProviderKind,
-        Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+        Arc<dyn novarocks_proto_codec::connector_read::TypedConnectorProviderFactory>,
     )],
     typed_registry: Arc<crate::connector::TypedConnectorProviderRegistry>,
 ) -> Result<Arc<crate::ConnectorExecutionHost>, BackendApplicationError> {
@@ -963,8 +963,8 @@ mod tests {
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
     use novarocks_native_trust::NativeClientAuthInterceptor;
-    use novarocks_proto::lifecycle as protocol_lifecycle;
-    use novarocks_proto::lifecycle::{
+    use novarocks_proto_codec::lifecycle as protocol_lifecycle;
+    use novarocks_proto_codec::lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
         QueryAbortRequest, QueryControlEndpoint, QueryExecutionId, QueryInitRequest, QueryOptions,
         QueryTerminationReason,

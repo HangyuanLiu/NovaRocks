@@ -30,7 +30,7 @@ use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use novarocks_execution::exec::node::values::ValuesNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::FieldPath;
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{common as proto_common, expr, plan};
 use novarocks_types::SlotId;
 

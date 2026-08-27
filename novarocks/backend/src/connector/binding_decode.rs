@@ -1,16 +1,16 @@
 //! BE request framing for the shared connector execution codecs.
 
-use novarocks_proto::connector::{
+use novarocks_proto_codec::connector::{
     AdmittedConnectorExecutionDeclaration, decode_connector_execution_binding_key,
     decode_connector_execution_declaration,
 };
-use novarocks_proto::lifecycle::decode_query_execution_id;
-use novarocks_proto::provider::{
+use novarocks_proto_codec::lifecycle::decode_query_execution_id;
+use novarocks_proto_codec::provider::{
     EnsureConnectorExecutionBindingRejection, EnsureConnectorExecutionBindingRejectionReason,
     EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingOutcome,
     RetireConnectorExecutionBindingResult,
 };
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::novarocks::{
     EnsureConnectorExecutionBindingRequest, RetireConnectorExecutionBindingRequest,
 };

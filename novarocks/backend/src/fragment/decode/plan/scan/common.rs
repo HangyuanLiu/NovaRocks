@@ -32,7 +32,7 @@ use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_execution::exec::variant_read::{
     ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
 };
-use novarocks_proto::{FieldPath, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{common, plan};
 use novarocks_types::SlotId;
 

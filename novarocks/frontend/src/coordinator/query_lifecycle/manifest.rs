@@ -18,8 +18,8 @@
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::QueryInitPlan;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_proto::lifecycle::QueryExecutionId;
-use novarocks_proto::lifecycle::{ParticipantManifestDigest, QueryInitRequest};
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_proto_codec::lifecycle::{ParticipantManifestDigest, QueryInitRequest};
 use novarocks_proto_models::novarocks as protocol_wire;
 
 use super::QueryLifecycleTarget;
@@ -89,9 +89,9 @@ pub(super) fn materialize(
 /// role-local handoff into the existing Frontend orchestration API, not a
 /// lifecycle codec or a second wire representation.
 fn core_execution_id(
-    execution_id: novarocks_proto::lifecycle::QueryExecutionId,
+    execution_id: novarocks_proto_codec::lifecycle::QueryExecutionId,
 ) -> Result<QueryExecutionId, DistributedQueryError> {
-    let attempt = novarocks_proto::lifecycle::AttemptId::new(execution_id.attempt_id().get())
+    let attempt = novarocks_proto_codec::lifecycle::AttemptId::new(execution_id.attempt_id().get())
         .map_err(|error| contract_error(error.to_string()))?;
     QueryExecutionId::new(execution_id.query_id(), attempt)
         .map_err(|error| contract_error(error.to_string()))

@@ -24,7 +24,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use novarocks_proto::connector_read::{ConnectorTableScanSource, ValidatedColumnHandle};
+use novarocks_proto_codec::connector_read::{ConnectorTableScanSource, ValidatedColumnHandle};
 use novarocks_proto_models::connector_read as dto;
 
 use super::handle::TableHandle;
@@ -130,7 +130,7 @@ impl TableScanNode {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_proto::FieldPath;
+    use novarocks_proto_codec::FieldPath;
 
     use super::super::handle::CatalogHandle;
     use super::*;
@@ -234,7 +234,7 @@ mod tests {
     }
 
     fn table_handle() -> TableHandle {
-        let handle = novarocks_proto::connector_read::CatalogTableHandle::parse(
+        let handle = novarocks_proto_codec::connector_read::CatalogTableHandle::parse(
             catalog_table_handle(),
             FieldPath::root("catalog_table_handle"),
         )

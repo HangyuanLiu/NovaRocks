@@ -17,7 +17,7 @@
 
 //! Fragment-owned structural validation for native fragment wire payloads.
 
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 
 use super::expression::validate_proto_expr_shape_at;
@@ -105,7 +105,7 @@ pub(crate) fn validate_node_required_fields(
 #[cfg(test)]
 mod tests {
     use super::{validate_fragment_expressions, validate_node_required_fields};
-    use novarocks_proto::FieldPath;
+    use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::plan;
 
     #[test]

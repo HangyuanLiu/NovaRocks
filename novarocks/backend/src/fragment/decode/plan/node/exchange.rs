@@ -26,7 +26,7 @@ use novarocks_execution::exec::node::exchange_source::ExchangeSourceNode;
 use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::sort::{SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::FieldPath;
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
 pub(super) fn lower_exchange_receiver(

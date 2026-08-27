@@ -24,7 +24,7 @@ FORBIDDEN_INTERNAL = {
     "novarocks-frontend",
     "novarocks-fs",
     "novarocks-parser",
-    "novarocks-proto",
+    "novarocks-proto-codec",
     "novarocks-proto-models",
     "novarocks-server",
     "novarocks-spi",

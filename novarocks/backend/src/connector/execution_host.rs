@@ -19,12 +19,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use novarocks_proto::connector::AdmittedConnectorExecutionDeclaration;
+use novarocks_proto_codec::connector::AdmittedConnectorExecutionDeclaration;
 #[cfg(test)]
-use novarocks_proto::connector::{
+use novarocks_proto_codec::connector::{
     decode_connector_execution_declaration, encode_connector_execution_declaration,
 };
-use novarocks_proto::provider::{
+use novarocks_proto_codec::provider::{
     EnsureConnectorExecutionBindingRejection, EnsureConnectorExecutionBindingRejectionReason,
     EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingOutcome,
     RetireConnectorExecutionBindingResult,
@@ -55,7 +55,7 @@ struct ExecutionHostState {
     /// "installed" has exactly one meaning on this backend.
     typed_factories: BTreeMap<
         ConnectorExecutionProviderKind,
-        Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+        Arc<dyn novarocks_proto_codec::connector_read::TypedConnectorProviderFactory>,
     >,
     typed_registry: Arc<super::TypedConnectorProviderRegistry>,
     bindings: BTreeMap<ConnectorExecutionBindingKey, Arc<BindingCell>>,
@@ -229,7 +229,7 @@ impl ConnectorExecutionHost {
         typed_factories: impl IntoIterator<
             Item = (
                 ConnectorExecutionProviderKind,
-                Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+                Arc<dyn novarocks_proto_codec::connector_read::TypedConnectorProviderFactory>,
             ),
         >,
         typed_registry: Arc<super::TypedConnectorProviderRegistry>,
@@ -773,8 +773,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use bytes::Bytes;
-    use novarocks_proto::lifecycle::AttemptId;
-    use novarocks_proto::provider::EnsureConnectorExecutionBindingOutcome;
+    use novarocks_proto_codec::lifecycle::AttemptId;
+    use novarocks_proto_codec::provider::EnsureConnectorExecutionBindingOutcome;
     use novarocks_spi::connector::{
         ConnectorExecutionBindingKey, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
         ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,

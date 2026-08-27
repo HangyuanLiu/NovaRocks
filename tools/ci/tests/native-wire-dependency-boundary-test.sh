@@ -85,12 +85,12 @@ assert_rejected "$models_internal" \
 
 proto_missing_spi="$tmpdir/proto-missing-spi.json"
 jq '
-  (.packages[] | select(.name == "novarocks-proto") | .dependencies) |= map(
+  (.packages[] | select(.name == "novarocks-proto-codec") | .dependencies) |= map(
     select(.name != "novarocks-spi")
   )
 ' "$base_metadata" >"$proto_missing_spi"
 assert_rejected "$proto_missing_spi" \
-  "novarocks-proto internal normal dependencies must be exactly"
+  "novarocks-proto-codec internal normal dependencies must be exactly"
 
 for role in novarocks-frontend novarocks-backend; do
   role_missing_models="$tmpdir/${role}-missing-models.json"
@@ -124,9 +124,9 @@ for forbidden in \
   novarocks-state-store-mysql \
   novarocks-state-store-sqlite; do
   proto_forbidden="$tmpdir/proto-${forbidden}.json"
-  add_normal_resolve_edge novarocks-proto "$forbidden" "$proto_forbidden"
+  add_normal_resolve_edge novarocks-proto-codec "$forbidden" "$proto_forbidden"
   assert_rejected "$proto_forbidden" \
-    "novarocks-proto normal dependency closure contains forbidden packages:"
+    "novarocks-proto-codec normal dependency closure contains forbidden packages:"
   grep -Fq "$forbidden" "$proto_forbidden.stderr"
 done
 
@@ -153,13 +153,13 @@ done
 server_direct_wire="$tmpdir/server-direct-wire.json"
 jq '
   (.packages[] | select(.name == "novarocks-server") | .dependencies) += [{
-    name: "novarocks-proto", kind: null, optional: false
+    name: "novarocks-proto-codec", kind: null, optional: false
   }]
 ' "$base_metadata" >"$server_direct_wire"
 assert_rejected "$server_direct_wire" \
-  "novarocks-server must not directly declare normal wire dependencies: novarocks-proto"
+  "novarocks-server must not directly declare normal wire dependencies: novarocks-proto-codec"
 
-for forbidden in novarocks-proto novarocks-proto-models novarocks-spi; do
+for forbidden in novarocks-proto-codec novarocks-proto-models novarocks-spi; do
   failpoint_forbidden="$tmpdir/failpoint-${forbidden}.json"
   add_normal_resolve_edge novarocks-failpoint "$forbidden" "$failpoint_forbidden"
   assert_rejected "$failpoint_forbidden" \

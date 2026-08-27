@@ -41,7 +41,7 @@ FORBIDDEN_PROVIDER_CLOSURE = {
     "novarocks-execution",
     "novarocks-frontend",
     "novarocks-backend",
-    "novarocks-proto",
+    "novarocks-proto-codec",
     "novarocks-state-store-sqlite",
     "novarocks-connector-starrocks",
 }

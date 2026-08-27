@@ -39,7 +39,7 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterSessionRef, RuntimeFilterSnapshot, RuntimeFilterSubscriptionHandle,
     RuntimeFilterSubscriptionRequest,
 };
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::connector_read::{
     ConnectorTableScanSource, ValidatedColumnHandle, WireDynamicFilter,
 };
 use novarocks_spi::connector::ConnectorScalarValue;
@@ -414,8 +414,8 @@ mod tests {
         RuntimeFilterNullSemantics, RuntimeFilterScalarRef, SnapshotAcquireOutcome,
         UnavailableReason,
     };
-    use novarocks_proto::FieldPath;
-    use novarocks_proto::connector_read::encode_value_type;
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::connector_read::encode_value_type;
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::read_stack::ConnectorValueType;
 

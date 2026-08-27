@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::connector_read::{
     TypedConnectorPageSourceProvider, TypedConnectorProviderFactory,
     TypedConnectorSystemTableProvider,
 };

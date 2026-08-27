@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
 
 use crate::query_execution::artifact::ValidatedFragmentSchedule;
 use crate::query_execution::split_assignment::{

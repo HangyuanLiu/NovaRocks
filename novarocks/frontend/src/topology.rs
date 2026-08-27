@@ -31,7 +31,7 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_proto::membership::{BackendProcessDescriptor, BackendReportedState};
+use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
 use novarocks_types::{BackendProcessId, ClusterRole, NativeEndpoint};
 use novarocks_version::native_build_identity;
 use tokio::runtime::Handle;
@@ -984,8 +984,8 @@ fn advance_if_eligible_changed(
 mod tests {
     use super::ClusterBackendService;
     use crate::common::backend_topology::BackendTopologyPort;
-    use novarocks_proto::lifecycle::QueryControlEndpoint;
-    use novarocks_proto::membership::{BackendProcessDescriptor, BackendReportedState};
+    use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
+    use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
     use novarocks_types::BackendProcessId;
     use novarocks_version::native_build_identity;
     use std::net::SocketAddr;

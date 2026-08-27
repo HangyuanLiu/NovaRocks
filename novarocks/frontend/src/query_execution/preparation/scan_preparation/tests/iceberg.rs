@@ -87,10 +87,10 @@ fn a_pinned_cohort_read_freezes_the_relation_the_provider_named() {
         .expect("typed connector scan");
     assert_eq!(
         typed.prepared.table_scan.table().relation_kind(),
-        novarocks_proto::connector_read::ConnectorRelationKind::Table
+        novarocks_proto_codec::connector_read::ConnectorRelationKind::Table
     );
     let relation = typed.prepared.table_scan.table().handle().relation();
-    let novarocks_proto::connector_read::ConnectorRelation::Table(table) = relation else {
+    let novarocks_proto_codec::connector_read::ConnectorRelation::Table(table) = relation else {
         panic!("a pinned cohort read freezes a data relation, got {relation:?}");
     };
     let Some(novarocks_proto_models::connector_read::connector_table_handle::Handle::Iceberg(
@@ -137,7 +137,7 @@ fn an_ordinary_iceberg_scan_lowers_to_a_typed_data_relation() {
         .expect("typed connector scan");
     assert_eq!(
         typed.prepared.table_scan.table().relation_kind(),
-        novarocks_proto::connector_read::ConnectorRelationKind::Table
+        novarocks_proto_codec::connector_read::ConnectorRelationKind::Table
     );
     assert_eq!(
         typed.prepared.table_scan.table().catalog().instance_id(),
@@ -238,7 +238,7 @@ fn an_mv_target_scan_lowers_to_an_ordinary_pinned_data_handle() {
             .expect("typed connector scan");
         assert_eq!(
             typed.prepared.table_scan.table().relation_kind(),
-            novarocks_proto::connector_read::ConnectorRelationKind::Table,
+            novarocks_proto_codec::connector_read::ConnectorRelationKind::Table,
             "an MV target lane must not produce a specialized relation"
         );
     }
@@ -262,9 +262,9 @@ fn a_change_window_scan_lowers_to_a_typed_change_window_relation() {
         .expect("typed connector scan");
     assert_eq!(
         typed.prepared.table_scan.table().relation_kind(),
-        novarocks_proto::connector_read::ConnectorRelationKind::ChangeWindow
+        novarocks_proto_codec::connector_read::ConnectorRelationKind::ChangeWindow
     );
-    let novarocks_proto::connector_read::ConnectorRelation::ChangeWindow(window) =
+    let novarocks_proto_codec::connector_read::ConnectorRelation::ChangeWindow(window) =
         typed.prepared.table_scan.table().handle().relation()
     else {
         panic!("a change-window scan freezes a change-window relation");
@@ -428,7 +428,7 @@ fn a_frozen_snapshot_scan_pins_its_admitted_snapshot() {
         .expect("typed connector scan");
     // The fixture control echoes the requested version into the handle it
     // freezes, so the pinned snapshot is observable from the carrier.
-    let novarocks_proto::connector_read::ConnectorRelation::Table(table) =
+    let novarocks_proto_codec::connector_read::ConnectorRelation::Table(table) =
         typed.prepared.table_scan.table().handle().relation()
     else {
         panic!("a DATA scan freezes a table relation");

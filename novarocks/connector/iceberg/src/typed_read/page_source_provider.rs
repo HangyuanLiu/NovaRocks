@@ -30,7 +30,7 @@
 use std::sync::Arc;
 
 use novarocks_fs::{FileReadBudget, FileReadContext, FileReaderOptions};
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::connector_read::{
     CatalogTableHandle, ConnectorRelation, ScanAssignment, SplitCategory,
     TypedConnectorPageSourceProvider, ValidatedConnectorSplit, WireDynamicFilter,
 };
@@ -437,7 +437,7 @@ mod tests {
         FileCancellation, FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime,
         TokioFileTaskSpawner,
     };
-    use novarocks_proto::FieldPath;
+    use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::ConnectorErrorKind;
     use novarocks_spi::connector::read_stack::{
@@ -452,21 +452,21 @@ mod tests {
     /// The unconstrained filter every scan starts from. It answers nothing and
     /// is never waited on, so it cannot affect what a dispatch decides.
     struct UnconstrainedDynamicFilter {
-        covered: BTreeSet<novarocks_proto::connector_read::ValidatedColumnHandle>,
+        covered: BTreeSet<novarocks_proto_codec::connector_read::ValidatedColumnHandle>,
     }
 
-    impl DynamicFilter<novarocks_proto::connector_read::ValidatedColumnHandle>
+    impl DynamicFilter<novarocks_proto_codec::connector_read::ValidatedColumnHandle>
         for UnconstrainedDynamicFilter
     {
         fn columns_covered(
             &self,
-        ) -> &BTreeSet<novarocks_proto::connector_read::ValidatedColumnHandle> {
+        ) -> &BTreeSet<novarocks_proto_codec::connector_read::ValidatedColumnHandle> {
             &self.covered
         }
 
         fn current_predicate(
             &self,
-        ) -> TupleDomain<novarocks_proto::connector_read::ValidatedColumnHandle> {
+        ) -> TupleDomain<novarocks_proto_codec::connector_read::ValidatedColumnHandle> {
             TupleDomain::all()
         }
 

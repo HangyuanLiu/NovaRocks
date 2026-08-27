@@ -29,7 +29,7 @@ use novarocks_execution::exec::chunk::{
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::{FieldPath, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{expr, plan};
 use novarocks_types::SlotId;
 
@@ -320,7 +320,7 @@ mod tests {
     use super::*;
     use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
-    use novarocks_proto::ProtocolErrorKind;
+    use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::{common, expr, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {

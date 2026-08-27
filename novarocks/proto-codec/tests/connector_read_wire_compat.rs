@@ -19,8 +19,8 @@
 
 use std::collections::BTreeMap;
 
-use novarocks_proto::FieldPath;
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::FieldPath;
+use novarocks_proto_codec::connector_read::{
     ValidatedColumnHandle, canonical_scheduled_split_bytes, decode_tuple_domain,
     encode_tuple_domain,
 };

@@ -32,8 +32,10 @@ use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::scan::{BoundScanRanges, ScanSource};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::connector_read::{ConnectorRelation, ConnectorRelationKind, ScanWorkSource};
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::connector_read::{
+    ConnectorRelation, ConnectorRelationKind, ScanWorkSource,
+};
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{connector_read as dto, plan};
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
@@ -70,7 +72,7 @@ pub(super) fn lower_typed_connector_scan(
 ) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
     // One parse, and the only one: presence, bounds, known enums, uniqueness,
     // and the carrier's cross-field rules are the protocol layer's contract.
-    let scan_source = novarocks_proto::connector_read::ConnectorTableScanSource::parse(
+    let scan_source = novarocks_proto_codec::connector_read::ConnectorTableScanSource::parse(
         source.clone(),
         FieldPath::root("typed_connector_read"),
     )
@@ -282,7 +284,7 @@ fn connector_read_slot_ids(
 /// expression identifier minted by the producer, deliberately not the column's
 /// name, so comparing the two would reject every real scan.
 fn check_assignments_match_read_columns(
-    scan_source: &novarocks_proto::connector_read::ConnectorTableScanSource,
+    scan_source: &novarocks_proto_codec::connector_read::ConnectorTableScanSource,
     read_slot_ids: &[SlotId],
 ) -> Result<(), NativeFragmentLeafDecodeError> {
     let assignments = scan_source.assignments();
@@ -353,7 +355,7 @@ fn provider_refusal(
 
 /// The exact connector binding generation this relation belongs to.
 fn binding_key(
-    table: &novarocks_proto::connector_read::CatalogTableHandle,
+    table: &novarocks_proto_codec::connector_read::CatalogTableHandle,
 ) -> Result<ConnectorExecutionBindingKey, NativeFragmentLeafDecodeError> {
     // The carrier already proved the catalog name is a normalized instance id
     // and the incarnation is exactly 16 bytes; both conversions below therefore
@@ -590,7 +592,7 @@ mod tests {
         }
     }
 
-    fn decode_node_error(node: &plan::DistributedNode) -> novarocks_proto::ProtocolError {
+    fn decode_node_error(node: &plan::DistributedNode) -> novarocks_proto_codec::ProtocolError {
         let error = decode_node(
             node,
             &mut ExprArena::default(),
@@ -603,7 +605,7 @@ mod tests {
     fn decode_error(
         source: dto::ConnectorTableScanSource,
         columns: Vec<common::OutputColumn>,
-    ) -> novarocks_proto::ProtocolError {
+    ) -> novarocks_proto_codec::ProtocolError {
         let node = typed_scan_node(source, columns);
         let error = decode_node(
             &node,
@@ -620,7 +622,7 @@ mod tests {
         source.assignments.push(dto::ScanAssignment {
             variable: "v1".to_owned(),
             column: Some(test_support::column_handle(2)),
-            value_type: Some(novarocks_proto::connector_read::encode_value_type(
+            value_type: Some(novarocks_proto_codec::connector_read::encode_value_type(
                 novarocks_spi::connector::read_stack::ConnectorValueType::BigInt,
             )),
         });

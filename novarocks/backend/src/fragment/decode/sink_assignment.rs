@@ -19,7 +19,7 @@
 
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_types::UniqueId;
 

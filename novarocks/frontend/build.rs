@@ -36,7 +36,7 @@ fn main() {
     }
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc path");
     unsafe { env::set_var("PROTOC", protoc) };
-    // DTO ownership stays in novarocks-proto.  This crate generates only
+    // DTO ownership stays in novarocks-proto-codec.  This crate generates only
     // private FE transport traits and clients against those canonical types.
     tonic_build::configure()
         .build_client(true)

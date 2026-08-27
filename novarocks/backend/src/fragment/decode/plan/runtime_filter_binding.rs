@@ -24,7 +24,7 @@ use std::sync::Arc;
 use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter as execution;
-use novarocks_proto::{FieldPath, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{expr, plan};
 
 /// Backend-local producer attachment target decoded from the native fragment
@@ -1211,7 +1211,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use novarocks_proto::ProtocolErrorKind;
+    use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::expr;
 
     fn int64_type() -> novarocks_proto_models::common::TypeDesc {

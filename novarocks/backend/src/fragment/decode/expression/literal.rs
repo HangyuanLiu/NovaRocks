@@ -22,7 +22,7 @@ use arrow_buffer::i256;
 
 use super::error::NativeExpressionLeafDecodeError;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, LiteralValue};
-use novarocks_proto::{FieldPath, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{common, expr};
 
 #[allow(
@@ -331,7 +331,7 @@ mod tests {
     use arrow::datatypes::DataType;
     use arrow_buffer::i256;
     use novarocks_execution::exec::expr::{ExprNode, LiteralValue};
-    use novarocks_proto::ProtocolErrorKind;
+    use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::{common, expr};
 
     fn literal_error(

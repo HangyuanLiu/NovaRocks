@@ -60,7 +60,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use bytes::Bytes;
 use novarocks_fs::{FileReadContext, FileReadRange};
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::connector_read::{
     CatalogTableHandle, ConnectorRelation, ScanAssignment, TypedConnectorSystemTableProvider,
 };
 use novarocks_spi::connector::read_stack::{

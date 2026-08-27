@@ -53,10 +53,10 @@ use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploym
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use novarocks_proto::lifecycle::{
+use novarocks_proto_codec::lifecycle::{
     AttemptId as ProtocolAttemptId, QueryExecutionId as ProtocolQueryExecutionId,
 };
-use novarocks_proto::lifecycle::{ExchangeRouteManifest, QueryExecutionId, StageFragment};
+use novarocks_proto_codec::lifecycle::{ExchangeRouteManifest, QueryExecutionId, StageFragment};
 use novarocks_proto_models::plan::RuntimeFilterBindingTable;
 use novarocks_proto_models::{common, novarocks};
 use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
@@ -611,7 +611,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             .runtime_filter_contributions
             .into_iter()
             .map(|(backend_idx, contribution)| {
-                novarocks_proto::lifecycle::RuntimeFilterContribution::parse(contribution)
+                novarocks_proto_codec::lifecycle::RuntimeFilterContribution::parse(contribution)
                     .map(|contribution| (backend_idx, contribution))
                     .map_err(|error| contract_error(error.to_string()))
             })
@@ -1306,7 +1306,7 @@ pub fn fragment_instance_id_for_contract_test(
 ) -> UniqueId {
     let execution_id = QueryExecutionId::new(
         query_id,
-        novarocks_proto::lifecycle::AttemptId::new(1)
+        novarocks_proto_codec::lifecycle::AttemptId::new(1)
             .expect("contract fixtures use a nonzero initial attempt"),
     )
     .expect("contract fixtures use a nonzero query id");
@@ -1980,10 +1980,10 @@ mod tests {
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-    use novarocks_proto::lifecycle::{
+    use novarocks_proto_codec::lifecycle::{
         AttemptId, ExchangeRouteManifest, QueryControlEndpoint, QueryExecutionId,
     };
-    use novarocks_proto::membership::BackendProcessDescriptor;
+    use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_proto_models::{common, novarocks};
     use novarocks_sql::plan_read::{
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,

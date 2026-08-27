@@ -37,8 +37,8 @@ use novarocks_execution::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
 use novarocks_execution::runtime::profile::Profiler;
-use novarocks_proto::connector::AdmittedConnectorExecutionDeclaration;
-use novarocks_proto::lifecycle::{QueryExecutionId, StageFragment};
+use novarocks_proto_codec::connector::AdmittedConnectorExecutionDeclaration;
+use novarocks_proto_codec::lifecycle::{QueryExecutionId, StageFragment};
 use novarocks_spi::connector::{ConnectorExecutionBindingKey, WriteCommitEvidenceLimits};
 use tracing::error;
 
@@ -358,7 +358,7 @@ impl NativeFragmentService {
         &self,
         execution_id: QueryExecutionId,
         fragment_instance_id: novarocks_types::UniqueId,
-        assignments: &[novarocks_proto::connector_read::SplitAssignment],
+        assignments: &[novarocks_proto_codec::connector_read::SplitAssignment],
     ) -> crate::query_lifecycle::task_update::TaskUpdateAck {
         use crate::query_lifecycle::task_update::{
             TaskUpdateAcceptedNode, TaskUpdateAck, TaskUpdateRejectionReason,
@@ -813,14 +813,14 @@ impl NativeFragmentIngress for NativeFragmentService {
         &self,
         execution_id: QueryExecutionId,
         declaration: AdmittedConnectorExecutionDeclaration,
-    ) -> novarocks_proto::provider::EnsureConnectorExecutionBindingResult {
+    ) -> novarocks_proto_codec::provider::EnsureConnectorExecutionBindingResult {
         self.execution_host.ensure(execution_id, &declaration)
     }
 
     fn retire_connector_execution_binding(
         &self,
         key: ConnectorExecutionBindingKey,
-    ) -> novarocks_proto::provider::RetireConnectorExecutionBindingResult {
+    ) -> novarocks_proto_codec::provider::RetireConnectorExecutionBindingResult {
         self.execution_host.retire(&key)
     }
 
@@ -1001,8 +1001,8 @@ mod tests {
     use novarocks_execution::runtime::fragment::{
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
     };
-    use novarocks_proto::lifecycle::{AttemptId as ProtocolAttemptId, QueryExecutionId};
-    use novarocks_proto::lifecycle::{
+    use novarocks_proto_codec::lifecycle::{AttemptId as ProtocolAttemptId, QueryExecutionId};
+    use novarocks_proto_codec::lifecycle::{
         ParticipantBackendIdentity, ParticipantManifest, QueryControlAttach, QueryControlEndpoint,
         QueryInitOutcome, QueryInitRequest, QueryOptions, StageFragment,
     };
@@ -1479,9 +1479,9 @@ mod tests {
             )],
             no_more_splits: true,
         };
-        let assignment = novarocks_proto::connector_read::SplitAssignment::parse(
+        let assignment = novarocks_proto_codec::connector_read::SplitAssignment::parse(
             raw,
-            novarocks_proto::FieldPath::root("split_assignment"),
+            novarocks_proto_codec::FieldPath::root("split_assignment"),
         )
         .expect("valid assignment");
 

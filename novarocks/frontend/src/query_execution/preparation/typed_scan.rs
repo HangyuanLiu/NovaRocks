@@ -31,8 +31,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks_proto::FieldPath;
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::FieldPath;
+use novarocks_proto_codec::connector_read::{
     ConnectorRelationKind, ConnectorTableScanSource, ScanAssignment, TypedChangeWindow,
     TypedColumnBinding, TypedConnectorSplitManager, TypedRelationVersion,
     TypedTableExecuteProcedure, ValidatedColumnHandle, WireConstraint, encode_connector_expression,
@@ -565,7 +565,7 @@ mod tests {
     use std::time::SystemTime;
 
     use arrow::datatypes::DataType;
-    use novarocks_proto::connector_read::{
+    use novarocks_proto_codec::connector_read::{
         CatalogTableHandle, ConnectorRelation, ScanWorkSource, TypedConnectorMetadata,
         TypedConnectorSplitSource, TypedFilterApplication, TypedLimitApplication,
         TypedSystemTablePlan,

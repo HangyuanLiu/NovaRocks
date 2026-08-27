@@ -32,7 +32,7 @@ from pathlib import Path
 
 
 MODELS = "novarocks-proto-models"
-PROTO = "novarocks-proto"
+PROTO = "novarocks-proto-codec"
 SPI = "novarocks-spi"
 TYPES = "novarocks-types"
 FRONTEND = "novarocks-frontend"

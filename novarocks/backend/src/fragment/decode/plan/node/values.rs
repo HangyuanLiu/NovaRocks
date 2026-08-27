@@ -31,7 +31,7 @@ use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use novarocks_execution::exec::expr::{ExprArena, cast_array_to_target};
 use novarocks_execution::exec::node::values::ValuesNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::FieldPath;
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{common as proto_common, plan};
 
 #[expect(

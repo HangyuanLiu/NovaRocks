@@ -22,9 +22,9 @@
 //! admitted and staged, which is why it reuses the existing entry lookup rather
 //! than establishing a second task registry.
 
-use novarocks_proto::connector_read::SplitAssignment;
-use novarocks_proto::lifecycle::{QueryExecutionId, decode_query_execution_id};
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::connector_read::SplitAssignment;
+use novarocks_proto_codec::lifecycle::{QueryExecutionId, decode_query_execution_id};
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::novarocks as proto;
 use novarocks_types::UniqueId;
 
@@ -196,7 +196,7 @@ impl TaskUpdateRequest {
             )
         })?;
         let fragment_instance_id = UniqueId::new(fragment_instance_id.hi, fragment_instance_id.lo);
-        let assignments = novarocks_proto::connector_read::parse_task_update_assignments(
+        let assignments = novarocks_proto_codec::connector_read::parse_task_update_assignments(
             &raw.assignments,
             root.field("assignments"),
         )?;

@@ -49,7 +49,7 @@ use novarocks_fs::{
     ParquetPhysicalType, ParquetStatisticsSortOrder, ParquetStatisticsValue, PhysicalPruning,
     inspect_parquet_metadata, open_file_reader,
 };
-use novarocks_proto::connector_read::{ValidatedColumnHandle, WireDynamicFilter};
+use novarocks_proto_codec::connector_read::{ValidatedColumnHandle, WireDynamicFilter};
 use novarocks_spi::connector::read_stack::{
     BoundsMatch, ColumnValueBounds, ConnectorPageSource, ConnectorSplit, ConnectorValue,
     ConnectorValueType, Domain, PageSourceMetrics, SourcePage, TupleDomain,
@@ -2169,7 +2169,7 @@ mod tests {
                 IcebergColumnHandle::base_column_of(schema, covered_field_id).expect("handle");
             let validated = ValidatedColumnHandle::parse(
                 handle.to_column_handle_proto(),
-                novarocks_proto::FieldPath::root("column"),
+                novarocks_proto_codec::FieldPath::root("column"),
             )
             .expect("a well-formed wire column handle");
             Arc::new(Self {

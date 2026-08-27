@@ -51,7 +51,7 @@ use crate::query_execution::post_compile::{PostCompileIntent, prepare_compiled_d
 use crate::query_execution::{PreparedQueryDistributedOperation, PreparedQueryOperation};
 use crate::view::ViewRequestContext;
 use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
-use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_sql::compiler::{

@@ -44,8 +44,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use novarocks_proto::connector_read::TypedConnectorProviderFactory;
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::connector_read::TypedConnectorProviderFactory;
+use novarocks_proto_codec::connector_read::{
     TypedConnectorPageSourceProvider, TypedConnectorSystemTableProvider,
 };
 use novarocks_spi::connector::{
@@ -315,7 +315,7 @@ impl fmt::Debug for TypedConnectorProviderRegistry {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_proto::connector_read::{
+    use novarocks_proto_codec::connector_read::{
         CatalogTableHandle, ScanAssignment, ValidatedConnectorSplit, WireDynamicFilter,
     };
     use novarocks_spi::connector::read_stack::{ConnectorPageSource, ConnectorSession};

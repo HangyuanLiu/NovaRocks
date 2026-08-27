@@ -47,7 +47,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::connector_read::{
     MAX_ASSIGNMENT_RETAINED_BYTES, ScheduledSplit, SplitAssignment,
 };
 use novarocks_types::{QueryExecutionId, UniqueId};

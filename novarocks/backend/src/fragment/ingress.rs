@@ -19,8 +19,8 @@
 
 use std::fmt;
 
-use novarocks_proto::connector::AdmittedConnectorExecutionDeclaration;
-use novarocks_proto::provider::{
+use novarocks_proto_codec::connector::AdmittedConnectorExecutionDeclaration;
+use novarocks_proto_codec::provider::{
     EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingResult,
 };
 use novarocks_spi::connector::ConnectorExecutionBindingKey;

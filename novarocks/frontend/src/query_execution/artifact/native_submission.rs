@@ -33,7 +33,7 @@ use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::ConnectorWriteCohortId;
 use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentId as PlannerFragmentId};
 use novarocks_types::UniqueId;
@@ -365,7 +365,7 @@ impl NativeSubmissionAttachment {
 mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
-    use novarocks_proto::lifecycle::AttemptId;
+    use novarocks_proto_codec::lifecycle::AttemptId;
 
     #[allow(
         dead_code,

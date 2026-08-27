@@ -20,7 +20,7 @@
 use super::{decode_type, lower_required_child};
 use arrow::datatypes::DataType;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
-use novarocks_proto::FieldPath;
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::expr;
 use novarocks_types::SlotId;
 

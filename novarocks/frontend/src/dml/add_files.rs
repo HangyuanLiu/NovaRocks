@@ -20,7 +20,7 @@
 //! Source data is caller-owned. This flow never creates a cleanup or delete
 //! intent for it, including after an unknown or a negative adjudication.
 
-use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     LakePublicationFamily, LakePublicationId, LakePublicationStatementTag, LakePublicationTarget,
     LakePublicationTerminal,

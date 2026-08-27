@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_proto::connector_read::ValidatedColumnHandle;
+use novarocks_proto_codec::connector_read::ValidatedColumnHandle;
 use novarocks_spi::connector::read_stack::{
     Bound, ConnectorValue, ConnectorValueType, Domain, MAX_CONNECTOR_DECIMAL_PRECISION,
     MAX_CONNECTOR_VALUE_BYTES, Range, TupleDomain, ValueSet,
@@ -465,8 +465,8 @@ fn unnest(mut expr: &TypedExpr) -> &TypedExpr {
 
 #[cfg(test)]
 pub(super) mod test_support {
-    use novarocks_proto::FieldPath;
-    use novarocks_proto::connector_read::ValidatedColumnHandle;
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::connector_read::ValidatedColumnHandle;
     use novarocks_proto_models::connector_read as dto;
     use novarocks_sql::plan_read::{
         BinOp, DistributedNodeKind, ExprKind, LiteralValue, OutputColumn, PlanScanNode, TypedExpr,

@@ -33,7 +33,7 @@ use crate::connector::backend::ResolvedTable;
 use crate::query_execution::dml::iceberg_writer;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use novarocks_parser::ast::{Insert, Query};
-use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{ConnectorWriteOperationId, LakePublicationId};
 use novarocks_sql::semantic::{Literal, ObjectName};
 
