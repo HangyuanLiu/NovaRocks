@@ -2,9 +2,9 @@
 id: ADR-0114
 title: "Trino-aligned typed connector read stack with runtime split assignment"
 domain: [provider-spi, distributed-query-lifecycle]
-status: active
+status: superseded
 supersedes: [ADR-0034, ADR-0039, ADR-0053]
-superseded-by: null
+superseded-by: ADR-0119
 date: 2026-08-27
 provenance:
   - "discussion: 2026-08-26/27 Trino-aligned typed Iceberg read stack, B1-B23 裁决"

@@ -22,7 +22,7 @@
 //! split: the typed carrier has no split list, and a count taken here would
 //! pin the query's parallelism to whatever enumeration happened to produce
 //! first.
-// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
+// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
 
 use std::sync::Arc;
 
@@ -31,7 +31,7 @@ use crate::catalog_application::query_bindings::{
 };
 use crate::catalog_application::query_materializer::metadata_table_alias_suffix;
 use crate::connector::typed_control_registry::{
-    InstalledReadControl, TypedConnectorControlRegistry,
+    ConnectorReadControlRegistry, InstalledReadControl,
 };
 use crate::query_execution::connector_domain::CatalogHandle;
 use crate::query_execution::preparation::scan::{
@@ -69,13 +69,13 @@ const NO_NODE_LIMIT: i64 = -1;
 /// planner hands it.
 #[derive(Clone)]
 pub(crate) struct TypedScanPreparation {
-    control: Arc<TypedConnectorControlRegistry>,
+    control: Arc<ConnectorReadControlRegistry>,
     session: ConnectorSession,
 }
 
 impl TypedScanPreparation {
     pub(crate) fn new(
-        control: Arc<TypedConnectorControlRegistry>,
+        control: Arc<ConnectorReadControlRegistry>,
         session: ConnectorSession,
     ) -> Self {
         Self { control, session }
@@ -129,7 +129,7 @@ impl ScanPreparationOptions {
     /// Attach the statement's typed connector control and session.
     pub(crate) fn with_typed_connector_control(
         mut self,
-        control: Arc<TypedConnectorControlRegistry>,
+        control: Arc<ConnectorReadControlRegistry>,
         session: ConnectorSession,
     ) -> Self {
         self.typed = Some(TypedScanPreparation::new(control, session));
@@ -990,6 +990,10 @@ fn validate_resolved_execution_kind(
         facts.source_kind_label()
     ))
 }
+
+#[cfg(test)]
+#[path = "tests/mod.rs"]
+mod integration_tests;
 
 #[cfg(test)]
 mod tests {

@@ -60,9 +60,6 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef, TimeUnit};
 use bytes::Bytes;
 use novarocks_fs::{FileReadContext, FileReadRange};
-use novarocks_proto_codec::connector_read::{
-    CatalogTableHandle, ConnectorRelation, ScanAssignment, TypedConnectorSystemTableProvider,
-};
 use novarocks_spi::connector::read_stack::{
     ConnectorPageSource, ConnectorSession, PageSourceMetrics, SourcePage,
 };
@@ -2521,8 +2518,8 @@ impl IcebergSystemTableProvider {
     /// The `$files` reader for one manifest of the pinned snapshot.
     ///
     /// `$files` is the one distributed system relation, so it arrives as a
-    /// split rather than through [`TypedConnectorSystemTableProvider`], whose
-    /// contract has no split at all.
+    /// split rather than through the direct whole-relation provider path,
+    /// whose contract has no split at all.
     pub fn create_files_page_source(
         &self,
         split: &FilesTableSplit,
@@ -2709,63 +2706,6 @@ fn read_snapshot_file_rows(
 }
 
 /// Turn a protocol-validated relation into the Iceberg system-table reference.
-pub fn iceberg_system_table_reference(
-    table: &CatalogTableHandle,
-) -> Result<IcebergSystemTableReference, ConnectorError> {
-    match table.relation() {
-        ConnectorRelation::SystemTable(reference) => {
-            IcebergSystemTableReference::from_system_table_reference_proto(reference)
-        }
-        ConnectorRelation::Table(_) => Err(invalid(
-            "an iceberg system page source reads a system relation, not a table",
-        )),
-        ConnectorRelation::TableFunction(_) => Err(invalid(
-            "an iceberg system page source reads a system relation, not a table function",
-        )),
-        ConnectorRelation::ChangeWindow(_) => Err(invalid(
-            "an iceberg system page source reads a system relation, not a change window",
-        )),
-        ConnectorRelation::TableExecute(_) => Err(invalid(
-            "an iceberg system page source reads a system relation, not a table execute target",
-        )),
-        ConnectorRelation::MergeTable(_) => Err(invalid(
-            "an iceberg system page source reads a system relation, not a merge target",
-        )),
-    }
-}
-
-/// The scan's ordered columns, in assignment order.
-fn system_scan_columns(
-    columns: &[ScanAssignment],
-) -> Result<Vec<IcebergColumnHandle>, ConnectorError> {
-    columns
-        .iter()
-        .map(|assignment| {
-            IcebergColumnHandle::from_column_handle_proto(assignment.column().as_proto())
-        })
-        .collect()
-}
-
-impl TypedConnectorSystemTableProvider for IcebergSystemTableProvider {
-    fn create_system_page_source(
-        &self,
-        _session: &ConnectorSession,
-        table: &CatalogTableHandle,
-        columns: &[ScanAssignment],
-    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
-        let reference = iceberg_system_table_reference(table)?;
-        let columns = system_scan_columns(columns)?;
-        match reference.system_table_type().execution() {
-            IcebergSystemTableExecution::SingleBackendDirectPageSource => {
-                self.create_single_backend_page_source(&reference, &columns)
-            }
-            IcebergSystemTableExecution::DistributedSplits => Err(invalid(format!(
-                "iceberg {} is scheduled through a split source, not the direct system page source",
-                reference.system_table_type().suffix()
-            ))),
-        }
-    }
-}
 
 impl<P> novarocks_spi::connector::read_stack::adapter::ProviderReadSystemTableProvider<P>
     for IcebergSystemTableProvider

@@ -122,7 +122,7 @@ code-anchors:
 - ADR-0089 — Predicate-driven Parquet page pruning 为何只在 FS reader-open 按实际 physical leaf 计算（active）
 - ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0112 — MV 运行态为何只属于当前进程、StateStore为何只保留 lake-source Accelerator（active）
-- ADR-0114 — Connector read 为何改用 Trino 对齐的 typed handle/split/page-source 与运行时 split 投递（active）
+- ADR-0119 — Connector read 内部 runtime SPI 与 wire codec 为何分离（active）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 
 #### 历史
@@ -136,6 +136,7 @@ code-anchors:
 - ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（superseded → ADR-0110）
 - ADR-0084 — durable statistics job target binding（superseded → ADR-0111）
 - ADR-0061 — MV repartition 为何由 Provider 在单次原子 write commit 中同时切换 partition spec 与 snapshot（superseded → ADR-0112）
+- ADR-0114 — Connector read 为何改用 Trino 对齐的 typed handle/split/page-source 与运行时 split 投递（superseded → ADR-0119）
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
 ### distributed-query-lifecycle
 

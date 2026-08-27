@@ -382,10 +382,18 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
         second_typed.declaration.binding_key().incarnation,
         admitted_incarnation
     );
+    let first_relation = first_typed.prepared.table_scan.table().relation();
+    let second_relation = second_typed.prepared.table_scan.table().relation();
+    assert_eq!(second_relation.kind(), first_relation.kind());
     assert_eq!(
-        second_typed.prepared.table_scan.table().handle(),
-        first_typed.prepared.table_scan.table().handle(),
-        "a topology-only re-plan must freeze the very same relation handle"
+        second_relation.table().binding(),
+        first_relation.table().binding(),
+        "a topology-only re-plan must retain the same provider generation"
+    );
+    assert_eq!(
+        second_relation.transaction().binding(),
+        first_relation.transaction().binding(),
+        "a topology-only re-plan must retain the same provider transaction generation"
     );
 }
 

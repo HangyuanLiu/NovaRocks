@@ -95,7 +95,7 @@ pub(crate) fn execute_bound_distributed_write_request(
 
 pub(crate) fn scan_preparation_options(
     typed_connector_control: &std::sync::Arc<
-        crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
     >,
     settings: &novarocks_sql::compiler::SessionOptimizerSettings,
     execution: &QueryExecutionContext,

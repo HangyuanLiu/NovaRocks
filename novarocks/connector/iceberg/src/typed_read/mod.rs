@@ -79,10 +79,7 @@ pub use page_source::{
     IcebergPageSourceRequest, IcebergParquetPageSource, IcebergPartitionOnlyPageSource,
     IcebergReadRelation, ParquetFooterCache, create_iceberg_page_source,
 };
-pub use page_source_provider::{
-    IcebergPageSourceProvider, IcebergPageSourceProviderOptions, iceberg_change_window_handle,
-    iceberg_change_window_split, iceberg_data_split, iceberg_scan_columns, iceberg_table_handle,
-};
+pub use page_source_provider::{IcebergPageSourceProvider, IcebergPageSourceProviderOptions};
 pub use rewrite_position_page_source::{
     IcebergRewritePositionDeleteFilesPageSourceRequest,
     create_iceberg_rewrite_position_delete_files_page_source,
@@ -107,9 +104,8 @@ pub use split_source::{
 };
 pub use system_page_source::{
     IcebergSystemPageSource, IcebergSystemTableProvider, bounds_row_type, derived_row_type_json,
-    files_relation_schema_json, iceberg_system_table_reference, partition_row_type,
-    partitions_view_schema, project_system_relation_columns, system_relation_columns,
-    system_relation_schema,
+    files_relation_schema_json, partition_row_type, partitions_view_schema,
+    project_system_relation_columns, system_relation_columns, system_relation_schema,
 };
 pub use system_table::{
     FilesTableSplit, FilesTableSplitParams, FilesTableSplitSource, FilesTableSplitSourceParams,

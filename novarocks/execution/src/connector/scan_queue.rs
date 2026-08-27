@@ -39,7 +39,7 @@
 //! Provider neutrality: the queue moves role-owned received splits and reads
 //! only their sequence, plan node, canonical bytes, and retained size. It
 //! imports neither a wire model nor a provider implementation.
-// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
+// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;

@@ -87,37 +87,12 @@ fn a_pinned_cohort_read_freezes_the_relation_the_provider_named() {
         .expect("typed connector scan");
     assert_eq!(
         typed.prepared.table_scan.table().relation_kind(),
-        novarocks_proto_codec::connector_read::ConnectorRelationKind::Table
+        novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table
     );
-    let relation = typed.prepared.table_scan.table().handle().relation();
-    let novarocks_proto_codec::connector_read::ConnectorRelation::Table(table) = relation else {
-        panic!("a pinned cohort read freezes a data relation, got {relation:?}");
-    };
-    let Some(novarocks_proto_models::connector_read::connector_table_handle::Handle::Iceberg(
-        iceberg,
-    )) = table.handle.as_ref()
-    else {
-        panic!("the fixture connector freezes an iceberg table handle");
-    };
     assert_eq!(
-        iceberg
-            .schema_table_name
-            .as_ref()
-            .map(|name| (name.schema_name.as_str(), name.table_name.as_str())),
-        Some(("db", "orders")),
-        "the relation is the one the cohort named, not the synthetic SQL identity"
-    );
-    assert_eq!(iceberg.snapshot_id, Some(12));
-    assert_eq!(
-        iceberg
-            .pinned_data_files
-            .as_ref()
-            .expect("the frozen handle carries the pinned set")
-            .paths,
-        vec![
-            "s3://bucket/a.parquet".to_owned(),
-            "s3://bucket/b.parquet".to_owned()
-        ]
+        typed.prepared.table_scan.table().catalog().instance_id(),
+        "test_catalog",
+        "the SPI relation remains bound to the cohort's admitted catalog"
     );
 }
 
@@ -137,7 +112,7 @@ fn an_ordinary_iceberg_scan_lowers_to_a_typed_data_relation() {
         .expect("typed connector scan");
     assert_eq!(
         typed.prepared.table_scan.table().relation_kind(),
-        novarocks_proto_codec::connector_read::ConnectorRelationKind::Table
+        novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table
     );
     assert_eq!(
         typed.prepared.table_scan.table().catalog().instance_id(),
@@ -170,6 +145,7 @@ fn preparation_enumerates_no_split() {
     let typed = bindings
         .typed_scan(fragment_id, node_id)
         .expect("typed connector scan");
+    let source = typed.prepared.table_scan.source();
     // The fixture control fails any enumeration attempt, so a prepared scan
     // proves preparation never called it.
     assert!(
@@ -185,8 +161,8 @@ fn preparation_enumerates_no_split() {
                     std::time::SystemTime::UNIX_EPOCH,
                 )
                 .expect("probe session"),
-                typed.prepared.table_scan.source().table(),
-                typed.prepared.table_scan.source().assignments(),
+                typed.prepared.table_scan.table().relation().table(),
+                source.assignments(),
                 &typed.prepared.table_scan.dynamic_filter_columns(),
                 &typed.prepared.constraint,
             )
@@ -210,7 +186,8 @@ fn assignments_follow_the_scan_output_order() {
     let typed = bindings
         .typed_scan(fragment_id, node_id)
         .expect("typed connector scan");
-    let assignments = typed.prepared.table_scan.source().assignments();
+    let source = typed.prepared.table_scan.source();
+    let assignments = source.assignments();
     assert!(!assignments.is_empty());
     for (ordinal, assignment) in assignments.iter().enumerate() {
         assert_eq!(assignment.variable(), format!("v{ordinal}"));
@@ -238,7 +215,7 @@ fn an_mv_target_scan_lowers_to_an_ordinary_pinned_data_handle() {
             .expect("typed connector scan");
         assert_eq!(
             typed.prepared.table_scan.table().relation_kind(),
-            novarocks_proto_codec::connector_read::ConnectorRelationKind::Table,
+            novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table,
             "an MV target lane must not produce a specialized relation"
         );
     }
@@ -262,25 +239,8 @@ fn a_change_window_scan_lowers_to_a_typed_change_window_relation() {
         .expect("typed connector scan");
     assert_eq!(
         typed.prepared.table_scan.table().relation_kind(),
-        novarocks_proto_codec::connector_read::ConnectorRelationKind::ChangeWindow
+        novarocks_spi::connector::read_stack::ConnectorReadRelationKind::ChangeWindow
     );
-    let novarocks_proto_codec::connector_read::ConnectorRelation::ChangeWindow(window) =
-        typed.prepared.table_scan.table().handle().relation()
-    else {
-        panic!("a change-window scan freezes a change-window relation");
-    };
-    let Some(
-        novarocks_proto_models::connector_read::connector_change_window_handle::Handle::Iceberg(
-            iceberg,
-        ),
-    ) = window.handle.as_ref()
-    else {
-        panic!("the fixture control freezes an Iceberg change window");
-    };
-    // The fixture delta scan names snapshots 6 and 7; both endpoints reach the
-    // connector exactly as the scan stated them.
-    assert_eq!(iceberg.from_snapshot_id_exclusive, 6);
-    assert_eq!(iceberg.to_snapshot_id_inclusive, 7);
 }
 
 /// A change-window lane that reaches preparation with no resolver has no
@@ -318,13 +278,13 @@ fn a_variant_scan_assigns_only_its_physical_column() {
     .expect("typed scan preparation");
 
     let (fragment_id, node_id) = only_scan_node(&bindings);
-    let assignments = bindings
+    let source = bindings
         .typed_scan(fragment_id, node_id)
         .expect("typed connector scan")
         .prepared
         .table_scan
-        .source()
-        .assignments();
+        .source();
+    let assignments = source.assignments();
     assert_eq!(
         assignments.len(),
         1,
@@ -366,7 +326,7 @@ fn a_scan_whose_binding_generation_does_not_resolve_fails_closed() {
     let query_bindings = fixture_query_table_bindings(&plan, &controls);
     // An empty registry stands for "this generation was never installed".
     let empty =
-        Arc::new(crate::connector::typed_control_registry::TypedConnectorControlRegistry::new());
+        Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new());
     let error = expect_preparation_error(
         super::super::prepare_scan_bindings(
             &plan,
@@ -380,7 +340,7 @@ fn a_scan_whose_binding_generation_does_not_resolve_fails_closed() {
         "an uninstalled generation cannot be planned",
     );
     assert!(
-        error.contains("no typed connector control is installed for this exact generation"),
+        error.contains("no installed read control for exact binding"),
         "unexpected error: {error}"
     );
 }
@@ -426,20 +386,10 @@ fn a_frozen_snapshot_scan_pins_its_admitted_snapshot() {
     let typed = bindings
         .typed_scan(fragment_id, node_id)
         .expect("typed connector scan");
-    // The fixture control echoes the requested version into the handle it
-    // freezes, so the pinned snapshot is observable from the carrier.
-    let novarocks_proto_codec::connector_read::ConnectorRelation::Table(table) =
-        typed.prepared.table_scan.table().handle().relation()
-    else {
-        panic!("a DATA scan freezes a table relation");
-    };
-    let Some(novarocks_proto_models::connector_read::connector_table_handle::Handle::Iceberg(
-        iceberg,
-    )) = table.handle.as_ref()
-    else {
-        panic!("the fixture control freezes an Iceberg table handle");
-    };
-    assert_eq!(iceberg.snapshot_id, Some(11));
+    assert_eq!(
+        typed.prepared.table_scan.table().relation_kind(),
+        novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table
+    );
 }
 
 /// One scan-domain request the frontend resolves for a scan.

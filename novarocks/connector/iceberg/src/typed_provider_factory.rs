@@ -26,8 +26,6 @@ use std::sync::Arc;
 
 use novarocks_proto_codec::connector_read::{
     ConnectorReadExecutionBundle, ConnectorReadExecutionBundleFactory,
-    TypedConnectorPageSourceProvider, TypedConnectorProviderFactory,
-    TypedConnectorSystemTableProvider,
 };
 use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadFactory, ProviderReadFactoryAdapter, ProviderReadPageSourceProvider,
@@ -88,39 +86,6 @@ impl std::fmt::Debug for IcebergTypedProviderFactory {
         formatter
             .debug_struct("IcebergTypedProviderFactory")
             .finish_non_exhaustive()
-    }
-}
-
-impl TypedConnectorProviderFactory for IcebergTypedProviderFactory {
-    fn create_page_source_provider(
-        &self,
-        request: &ConnectorRequestContext,
-    ) -> Result<Arc<dyn TypedConnectorPageSourceProvider>, ConnectorError> {
-        let context = self
-            .binding
-            .file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
-        Ok(Arc::new(IcebergPageSourceProvider::new(
-            self.binding.clone(),
-            context,
-            self.options,
-        )))
-    }
-
-    fn create_system_table_provider(
-        &self,
-        request: &ConnectorRequestContext,
-    ) -> Result<Arc<dyn TypedConnectorSystemTableProvider>, ConnectorError> {
-        let context = self
-            .binding
-            .file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
-        // A system relation shares the fragment's page-row budget but neither
-        // its footer cache nor its delete manager: it opens metadata files, not
-        // data files, so there is nothing for those two to hold.
-        Ok(Arc::new(IcebergSystemTableProvider::new(
-            self.binding.clone(),
-            context,
-            self.options.budget.max_rows,
-        )))
     }
 }
 

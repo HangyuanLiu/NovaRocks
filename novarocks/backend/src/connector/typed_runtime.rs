@@ -90,11 +90,18 @@ const BLOCKED_PAGE_SOURCE_BACKOFF: Duration = Duration::from_millis(1);
 /// reports an unconstrained, complete, non-awaitable predicate. A blocked or
 /// awaitable filter here would fabricate feedback that no one produces.
 pub fn complete_all_scan_dynamic_filter(
+    wire_scan: &novarocks_proto_codec::connector_read::ConnectorTableScanSource,
     scan: &novarocks_proto_codec::connector_read::DecodedConnectorReadScan,
 ) -> Arc<ConnectorReadDynamicFilter> {
+    let filtered_variables: BTreeSet<&str> = wire_scan
+        .dynamic_filters()
+        .iter()
+        .map(|binding| binding.variable())
+        .collect();
     let covered: BTreeSet<ConnectorReadColumnHandle> = scan
         .assignments()
         .iter()
+        .filter(|assignment| filtered_variables.contains(assignment.variable()))
         .map(|assignment| assignment.column().clone())
         .collect();
     Arc::new(CompleteAllDynamicFilter::new(covered))
@@ -216,7 +223,7 @@ impl TypedConnectorScanSource {
         slot_ids: Vec<SlotId>,
         runtime_filter: RuntimeFilterSessionResolver,
     ) -> Self {
-        let dynamic_filter = complete_all_scan_dynamic_filter(&scan);
+        let dynamic_filter = complete_all_scan_dynamic_filter(&wire_scan, &scan);
         Self {
             shared: Arc::new(TypedConnectorScanShared {
                 wire_scan,
@@ -883,7 +890,7 @@ impl Drop for RegisteredPageSource {
 pub(crate) mod test_support {
     use std::collections::BTreeMap;
 
-    use novarocks_proto_codec::connector_read::encode_value_type;
+    use novarocks_proto_codec::connector_read::{ConnectorReadCodec, encode_value_type};
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::read_stack::ConnectorValueType;
 
@@ -966,80 +973,256 @@ pub(crate) mod test_support {
         }
     }
 
-    /// A provider that is installed but never asked to read anything. It lets
-    /// a decode test prove the binding resolves without opening any file.
-    struct UnusedProvider;
+    #[derive(Clone, Debug)]
+    struct FixtureTable;
+    #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct FixtureColumn(i32);
+    #[derive(Clone, Debug)]
+    struct FixtureSplit;
 
-    impl novarocks_proto_codec::connector_read::TypedConnectorPageSourceProvider for UnusedProvider {
+    impl novarocks_spi::connector::read_stack::ColumnHandle for FixtureColumn {}
+    impl novarocks_spi::connector::read_stack::ConnectorSplit for FixtureSplit {
+        fn retained_size_in_bytes(&self) -> u64 {
+            64
+        }
+    }
+
+    struct FixtureRuntime {
+        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+    }
+
+    impl FixtureRuntime {
+        fn new() -> Self {
+            Self {
+                descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor {
+                    provider_id: novarocks_spi::connector::ConnectorProviderId::parse("fixture")
+                        .expect("provider id"),
+                    instance_id: novarocks_spi::connector::ConnectorInstanceId::try_from_canonical(
+                        "test.typed",
+                    )
+                    .expect("instance id"),
+                },
+            }
+        }
+    }
+
+    impl novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime for FixtureRuntime {
+        type Table = FixtureTable;
+        type Column = FixtureColumn;
+        type Transaction = ();
+        type Split = FixtureSplit;
+
+        fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+        fn incarnation(&self) -> novarocks_spi::connector::ConnectorInstanceIncarnation {
+            novarocks_spi::connector::ConnectorInstanceIncarnation::from_bytes([1; 16])
+        }
+        fn transaction(&self) -> Self::Transaction {}
+    }
+
+    #[derive(Clone)]
+    struct FixtureCodec {
+        adapter: novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter<FixtureRuntime>,
+    }
+
+    fn fixture_codec() -> FixtureCodec {
+        FixtureCodec {
+            adapter: novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter::new(
+                std::sync::Arc::new(FixtureRuntime::new()),
+            ),
+        }
+    }
+
+    impl novarocks_proto_codec::connector_read::ConnectorReadCodec for FixtureCodec {
+        fn owner(&self) -> &str {
+            "fixture"
+        }
+        fn decode_relation(
+            &self,
+            _relation: &novarocks_proto_codec::connector_read::CatalogTableHandle,
+        ) -> Result<
+            novarocks_spi::connector::read_stack::ConnectorReadRelation,
+            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+        > {
+            let table = self.adapter.wrap_table(FixtureTable);
+            self.adapter
+                .relation(
+                    novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table,
+                    table,
+                )
+                .map_err(|error| {
+                    novarocks_proto_codec::connector_read::ConnectorReadCodecError::invalid(
+                        self.owner(),
+                        novarocks_proto_codec::FieldPath::root("table"),
+                        error.to_string(),
+                    )
+                })
+        }
+        fn encode_relation(
+            &self,
+            _: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
+        ) -> Result<
+            dto::CatalogTableHandle,
+            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+        > {
+            unreachable!("fixture only decodes")
+        }
+        fn decode_column(
+            &self,
+            _: &novarocks_proto_codec::connector_read::ValidatedColumnHandle,
+        ) -> Result<
+            novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+        > {
+            Ok(self.adapter.wrap_column(FixtureColumn(1)))
+        }
+        fn encode_column(
+            &self,
+            _: &novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+        ) -> Result<dto::ColumnHandle, novarocks_proto_codec::connector_read::ConnectorReadCodecError>
+        {
+            unreachable!("fixture only decodes")
+        }
+        fn decode_transaction(
+            &self,
+            _: &novarocks_proto_codec::connector_read::ValidatedTransactionHandle,
+        ) -> Result<
+            novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
+            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+        > {
+            Ok(self.adapter.wrap_transaction(()))
+        }
+        fn encode_transaction(
+            &self,
+            _: &novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
+        ) -> Result<
+            dto::ConnectorTransactionHandle,
+            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+        > {
+            unreachable!("fixture only decodes")
+        }
+        fn decode_split(
+            &self,
+            _: &novarocks_proto_codec::connector_read::ValidatedConnectorSplit,
+        ) -> Result<
+            novarocks_spi::connector::read_stack::ConnectorReadSplit,
+            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+        > {
+            Ok(self.adapter.wrap_split(FixtureSplit))
+        }
+        fn encode_split(
+            &self,
+            _: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
+        ) -> Result<
+            dto::ConnectorSplit,
+            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
+        > {
+            unreachable!("fixture only decodes")
+        }
+    }
+
+    struct InertPageProvider;
+    impl novarocks_spi::connector::read_stack::ConnectorReadPageSourceProvider for InertPageProvider {
         fn create_page_source(
             &self,
-            _session: &novarocks_spi::connector::read_stack::ConnectorSession,
-            _table: &novarocks_proto_codec::connector_read::CatalogTableHandle,
-            _split: &novarocks_proto_codec::connector_read::ValidatedConnectorSplit,
-            _scheduled_split_sequence_id: u64,
-            _columns: &[novarocks_proto_codec::connector_read::ScanAssignment],
-            _dynamic_filter: &std::sync::Arc<
-                novarocks_proto_codec::connector_read::WireDynamicFilter,
-            >,
+            _: &novarocks_spi::connector::read_stack::ConnectorSession,
+            _: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
+            _: u64,
+            _: &[novarocks_spi::connector::read_stack::Assignment<
+                novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+            >],
+            _: &std::sync::Arc<novarocks_spi::connector::read_stack::ConnectorReadDynamicFilter>,
         ) -> Result<
             Box<dyn novarocks_spi::connector::read_stack::ConnectorPageSource>,
             novarocks_spi::connector::ConnectorError,
         > {
             Err(novarocks_spi::connector::ConnectorError::new(
                 novarocks_spi::connector::ConnectorErrorKind::Internal,
-                "this fixture provider is never read from",
+                "fixture page provider is never read",
             ))
         }
     }
-
-    impl novarocks_proto_codec::connector_read::TypedConnectorProviderFactory for UnusedProvider {
-        fn create_page_source_provider(
-            &self,
-            _request: &novarocks_spi::connector::ConnectorRequestContext,
-        ) -> Result<
-            std::sync::Arc<
-                dyn novarocks_proto_codec::connector_read::TypedConnectorPageSourceProvider,
-            >,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            Ok(std::sync::Arc::new(UnusedProvider))
-        }
-
-        fn create_system_table_provider(
-            &self,
-            _request: &novarocks_spi::connector::ConnectorRequestContext,
-        ) -> Result<
-            std::sync::Arc<
-                dyn novarocks_proto_codec::connector_read::TypedConnectorSystemTableProvider,
-            >,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            Ok(std::sync::Arc::new(UnusedProvider))
-        }
-    }
-
-    impl novarocks_proto_codec::connector_read::TypedConnectorSystemTableProvider for UnusedProvider {
+    struct InertSystemProvider;
+    impl novarocks_spi::connector::read_stack::ConnectorReadSystemTableProvider
+        for InertSystemProvider
+    {
         fn create_system_page_source(
             &self,
-            _session: &novarocks_spi::connector::read_stack::ConnectorSession,
-            _table: &novarocks_proto_codec::connector_read::CatalogTableHandle,
-            _columns: &[novarocks_proto_codec::connector_read::ScanAssignment],
+            _: &novarocks_spi::connector::read_stack::ConnectorSession,
+            _: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _: &[novarocks_spi::connector::read_stack::Assignment<
+                novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+            >],
         ) -> Result<
             Box<dyn novarocks_spi::connector::read_stack::ConnectorPageSource>,
             novarocks_spi::connector::ConnectorError,
         > {
             Err(novarocks_spi::connector::ConnectorError::new(
                 novarocks_spi::connector::ConnectorErrorKind::Internal,
-                "this fixture provider is never read from",
+                "fixture system provider is never read",
             ))
         }
+    }
+    struct FixtureFactory;
+    impl novarocks_spi::connector::read_stack::ConnectorReadProviderFactory for FixtureFactory {
+        fn create_page_source_provider(
+            &self,
+            _: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<
+            std::sync::Arc<
+                dyn novarocks_spi::connector::read_stack::ConnectorReadPageSourceProvider,
+            >,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            Ok(std::sync::Arc::new(InertPageProvider))
+        }
+        fn create_system_table_provider(
+            &self,
+            _: &novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<
+            std::sync::Arc<
+                dyn novarocks_spi::connector::read_stack::ConnectorReadSystemTableProvider,
+            >,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            Ok(std::sync::Arc::new(InertSystemProvider))
+        }
+    }
+
+    pub(crate) fn decoded_scan() -> novarocks_proto_codec::connector_read::DecodedConnectorReadScan
+    {
+        let raw = novarocks_proto_codec::connector_read::ConnectorTableScanSource::parse(
+            scan_source_proto(),
+            novarocks_proto_codec::FieldPath::root("scan"),
+        )
+        .expect("scan");
+        novarocks_proto_codec::connector_read::DecodedConnectorReadScan::decode(
+            &fixture_codec(),
+            &raw,
+        )
+        .expect("decoded scan")
+    }
+
+    pub(crate) fn decoded_scheduled_split(
+        plan_node_id: i32,
+        sequence_id: u64,
+    ) -> novarocks_proto_codec::connector_read::DecodedScheduledReadSplit {
+        let raw = novarocks_proto_codec::connector_read::ScheduledSplit::parse(
+            split_proto(plan_node_id, sequence_id),
+            novarocks_proto_codec::FieldPath::root("split"),
+        )
+        .expect("split");
+        fixture_codec()
+            .decode_scheduled_split(&raw)
+            .expect("decoded split")
     }
 
     /// The runtime bundle a typed decode needs, wired to the same binding
     /// generation `catalog_table_handle` names.
     pub(crate) fn typed_scan_runtime() -> crate::fragment::decode::plan::context::TypedScanRuntime {
         use novarocks_types::{AttemptId, QueryId};
-
         let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
             instance_id: novarocks_spi::connector::ConnectorInstanceId::try_from_canonical(
                 "test.typed",
@@ -1049,13 +1232,15 @@ pub(crate) mod test_support {
                 [1; 16],
             ),
         };
-        let providers =
-            std::sync::Arc::new(crate::connector::TypedConnectorProviderRegistry::new());
-        let unused = std::sync::Arc::new(UnusedProvider);
-        providers
-            .install(&key, crate::connector::TypedConnectorProviders::new(unused))
-            .expect("fixture install");
-
+        let executions =
+            std::sync::Arc::new(crate::connector::InstalledReadExecutionRegistry::default());
+        executions.install_or_resolve(
+            key,
+            crate::connector::InstalledReadExecution::new(
+                std::sync::Arc::new(FixtureFactory),
+                std::sync::Arc::new(fixture_codec()),
+            ),
+        );
         let execution_id = novarocks_proto_codec::lifecycle::QueryExecutionId::new(
             QueryId::new(1, 2),
             AttemptId::new(1).expect("attempt"),
@@ -1077,10 +1262,11 @@ pub(crate) mod test_support {
         )
         .expect("session");
         crate::fragment::decode::plan::context::TypedScanRuntime::new(
-            providers,
+            executions,
             queues,
             session,
-            std::sync::Arc::new(|| None),
+            std::sync::Arc::new(|| Ok(None)),
+            std::sync::Arc::new(crate::fragment::ingress::TypedReadAttemptContext::new()),
         )
     }
 
@@ -1142,14 +1328,11 @@ mod tests {
     use arrow::array::{ArrayRef, Int64Array};
     use novarocks_execution::connector::{SplitQueueConfig, SplitQueueRegistry, TaskAttemptKey};
     use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_codec::connector_read::{
-        CatalogTableHandle, ConnectorTableScanSource, ScanAssignment, ScheduledSplit,
-        TypedConnectorPageSourceProvider, TypedConnectorSystemTableProvider,
-        ValidatedConnectorSplit, WireDynamicFilter,
-    };
+    use novarocks_proto_codec::connector_read::ConnectorTableScanSource;
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::read_stack::{
-        ConnectorPageSource, PageSourceMetrics, SourcePage,
+        ConnectorPageSource, ConnectorReadDynamicFilter, ConnectorReadPageSourceProvider,
+        ConnectorReadSystemTableProvider, PageSourceMetrics, SourcePage,
     };
     use novarocks_spi::connector::{ConnectorCancellation, ConnectorError, ConnectorErrorKind};
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId, UniqueId};
@@ -1239,15 +1422,17 @@ mod tests {
         }
     }
 
-    impl TypedConnectorPageSourceProvider for ScriptedProvider {
+    impl ConnectorReadPageSourceProvider for ScriptedProvider {
         fn create_page_source(
             &self,
             _session: &ConnectorSession,
-            _table: &CatalogTableHandle,
-            _split: &ValidatedConnectorSplit,
+            _table: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _split: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
             _scheduled_split_sequence_id: u64,
-            _columns: &[ScanAssignment],
-            _dynamic_filter: &Arc<WireDynamicFilter>,
+            _columns: &[novarocks_spi::connector::read_stack::Assignment<
+                novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+            >],
+            _dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
         ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
             if self.fail_open {
                 return Err(ConnectorError::new(
@@ -1276,15 +1461,17 @@ mod tests {
         observed: Arc<Mutex<Option<usize>>>,
     }
 
-    impl TypedConnectorPageSourceProvider for FilterRecordingProvider {
+    impl ConnectorReadPageSourceProvider for FilterRecordingProvider {
         fn create_page_source(
             &self,
             _session: &ConnectorSession,
-            _table: &CatalogTableHandle,
-            _split: &ValidatedConnectorSplit,
+            _table: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _split: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
             _scheduled_split_sequence_id: u64,
-            _columns: &[ScanAssignment],
-            dynamic_filter: &Arc<WireDynamicFilter>,
+            _columns: &[novarocks_spi::connector::read_stack::Assignment<
+                novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+            >],
+            dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
         ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
             *self.observed.lock().expect("observed lock") =
                 Some(dynamic_filter.columns_covered().len());
@@ -1299,7 +1486,7 @@ mod tests {
 
     /// A scan whose attempt installed no runtime filter.
     fn no_runtime_filter() -> RuntimeFilterSessionResolver {
-        Arc::new(|| None)
+        Arc::new(|| Ok(None))
     }
 
     fn int_page(values: Vec<i64>) -> SourcePage {
@@ -1309,13 +1496,9 @@ mod tests {
     }
 
     fn scheduled_split(sequence_id: u64) -> crate::fragment::ingress::ReceivedReadSplit {
-        crate::fragment::ingress::ReceivedReadSplit::from_scheduled(
-            ScheduledSplit::parse(
-                test_support::split_proto(NODE, sequence_id),
-                FieldPath::root("scheduled_split"),
-            )
-            .expect("valid scheduled split"),
-        )
+        let (evidence, split) =
+            test_support::decoded_scheduled_split(NODE, sequence_id).into_parts();
+        crate::fragment::ingress::ReceivedReadSplit::new(evidence, split)
     }
 
     fn attempt_queues() -> Arc<TaskAttemptSplitQueues<crate::fragment::ingress::ReceivedReadSplit>>
@@ -1353,6 +1536,7 @@ mod tests {
     ) -> TypedConnectorScanSource {
         TypedConnectorScanSource::new(
             scan_source(),
+            test_support::decoded_scan(),
             provider,
             session(),
             request(cancellation),
@@ -1411,12 +1595,14 @@ mod tests {
         closes: Arc<AtomicUsize>,
     }
 
-    impl TypedConnectorSystemTableProvider for ScriptedSystemTables {
+    impl ConnectorReadSystemTableProvider for ScriptedSystemTables {
         fn create_system_page_source(
             &self,
             _session: &ConnectorSession,
-            _table: &CatalogTableHandle,
-            _columns: &[ScanAssignment],
+            _table: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _columns: &[novarocks_spi::connector::read_stack::Assignment<
+                novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+            >],
         ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
             self.opens.fetch_add(1, Ordering::AcqRel);
             let pages = std::mem::take(&mut *self.script.lock().expect("script lock"));
@@ -1433,7 +1619,7 @@ mod tests {
         provider: Arc<ScriptedSystemTables>,
     ) -> TypedConnectorSystemTableScanSource {
         TypedConnectorSystemTableScanSource::new(
-            scan_source(),
+            test_support::decoded_scan(),
             provider,
             session(),
             request(Arc::new(NeverCancelled)),
@@ -1734,24 +1920,12 @@ mod tests {
         });
         // The seam: a backend-driven filter replaces the default one, and the
         // provider is handed exactly what was substituted.
-        let mut covered = BTreeSet::new();
-        covered.insert(
-            ScanAssignment::parse(
-                dto::ScanAssignment {
-                    variable: "v0".to_owned(),
-                    column: Some(test_support::column_handle(1)),
-                    value_type: Some(novarocks_proto_codec::connector_read::encode_value_type(
-                        novarocks_spi::connector::read_stack::ConnectorValueType::BigInt,
-                    )),
-                },
-                FieldPath::root("assignment"),
-            )
-            .expect("valid assignment")
+        let covered = BTreeSet::from([test_support::decoded_scan().assignments()[0]
             .column()
-            .clone(),
-        );
+            .clone()]);
         let source = TypedConnectorScanSource::new(
             scan_source(),
+            test_support::decoded_scan(),
             provider,
             session(),
             request(Arc::new(NeverCancelled)),
@@ -1788,7 +1962,7 @@ mod tests {
         }];
         let scan = ConnectorTableScanSource::parse(proto, FieldPath::root("scan"))
             .expect("valid typed scan source");
-        let filter = complete_all_scan_dynamic_filter(&scan);
+        let filter = complete_all_scan_dynamic_filter(&scan, &test_support::decoded_scan());
         assert_eq!(filter.columns_covered().len(), 1);
         // Truthful and unconstrained: never blocked, never awaitable.
         assert!(filter.current_predicate().is_all());
@@ -1798,7 +1972,7 @@ mod tests {
 
         // A scan with no binding covers nothing at all.
         assert!(
-            complete_all_scan_dynamic_filter(&scan_source())
+            complete_all_scan_dynamic_filter(&scan_source(), &test_support::decoded_scan())
                 .columns_covered()
                 .is_empty()
         );

@@ -26,7 +26,7 @@
 //! FE/BE boundary are carried by the central IDL's closed per-category
 //! `oneof`s, validated by `novarocks-proto-codec`, and converted to concrete domain
 //! types only inside the provider that produced them.
-// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
+// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
 
 pub mod adapter;
 pub mod dynamic_filter;

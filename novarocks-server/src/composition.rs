@@ -571,7 +571,7 @@ pub fn compose_frontend_server_config(
     // One registry: the control factory installs into it and the planner
     // resolves from it, so a generation is either reachable to both or neither.
     let typed_connector_control =
-        std::sync::Arc::new(novarocks_frontend::TypedConnectorControlRegistry::new());
+        std::sync::Arc::new(novarocks_frontend::ConnectorReadControlRegistry::new());
     Ok(FrontendServerConfig {
         execution,
         backend_open,
@@ -676,7 +676,7 @@ fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntim
 pub fn compose_frontend_control_factories(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
-    typed_control: std::sync::Arc<novarocks_frontend::TypedConnectorControlRegistry>,
+    typed_control: std::sync::Arc<novarocks_frontend::ConnectorReadControlRegistry>,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorControlFactory>>> {
     let planning_resources = compose_connector_file_planning_resources(config, runtime.clone())?;
     // The installer runs only after the provider has built and validated its
@@ -709,9 +709,7 @@ pub fn compose_backend_read_execution_bundle_factories(
 ) -> anyhow::Result<
     Vec<(
         novarocks_spi::connector::ConnectorExecutionProviderKind,
-        std::sync::Arc<
-            dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory,
-        >,
+        std::sync::Arc<dyn novarocks_backend::ConnectorReadExecutionBundleFactory>,
     )>,
 > {
     let binding = IcebergReadBinding::from_resources(compose_connector_file_planning_resources(
@@ -952,7 +950,7 @@ mod tests {
         let factories = compose_frontend_control_factories(
             &config,
             runtime.handle().clone(),
-            std::sync::Arc::new(novarocks_frontend::TypedConnectorControlRegistry::new()),
+            std::sync::Arc::new(novarocks_frontend::ConnectorReadControlRegistry::new()),
         )
         .expect("frontend factories");
         let installers = compose_backend_execution_installers(&config, runtime.handle().clone())
@@ -989,7 +987,7 @@ mod tests {
         let error = match compose_frontend_control_factories(
             &config,
             runtime.handle().clone(),
-            std::sync::Arc::new(novarocks_frontend::TypedConnectorControlRegistry::new()),
+            std::sync::Arc::new(novarocks_frontend::ConnectorReadControlRegistry::new()),
         ) {
             Ok(_) => panic!("incomplete frontend resources must fail before role startup"),
             Err(error) => error,

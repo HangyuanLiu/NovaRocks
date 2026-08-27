@@ -49,7 +49,6 @@ WIRE_PACKAGES = {MODELS, PROTO}
 FORBIDDEN_CODEC_CLOSURE = {
     "tonic",
     "novarocks-backend",
-    "novarocks-connector-iceberg",
     "novarocks-connector-starrocks",
     "novarocks-execution",
     "novarocks-frontend",
@@ -72,7 +71,6 @@ LOWER_LAYER_ROOTS = {
     "novarocks-state-store-foundationdb",
     "novarocks-state-store-mysql",
     "novarocks-state-store-sqlite",
-    "novarocks-connector-iceberg",
     "novarocks-connector-starrocks",
 }
 

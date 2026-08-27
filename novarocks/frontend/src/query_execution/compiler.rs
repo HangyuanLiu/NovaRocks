@@ -118,7 +118,7 @@ pub(crate) trait DmlQueryExecutionKernel:
     /// the kernel was composed.
     fn typed_connector_control(
         &self,
-    ) -> &std::sync::Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>;
+    ) -> &std::sync::Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>;
     fn catalog_application(
         &self,
     ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
@@ -135,7 +135,7 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
 
     fn typed_connector_control(
         &self,
-    ) -> &std::sync::Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>
+    ) -> &std::sync::Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>
     {
         self.typed_connector_control()
     }
@@ -167,7 +167,7 @@ impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
 
     fn typed_connector_control(
         &self,
-    ) -> &std::sync::Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>
+    ) -> &std::sync::Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>
     {
         self.typed_connector_control()
     }
@@ -1397,7 +1397,7 @@ fn optimizer_settings_for_execution(
 /// planning resolves exactly the generation the control factory installed.
 pub(crate) fn scan_preparation_options(
     typed_connector_control: &std::sync::Arc<
-        crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
     >,
     settings: &novarocks_sql::compiler::SessionOptimizerSettings,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
@@ -2002,7 +2002,7 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
 pub(crate) fn prepare_dml_change_stream_write_with_execution(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     typed_connector_control: &std::sync::Arc<
-        crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
     >,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     plan: novarocks_sql::planning::dml::DmlChangeStreamPlan,
@@ -2036,7 +2036,7 @@ pub(crate) fn prepare_dml_change_stream_write_with_execution(
 pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     typed_connector_control: &std::sync::Arc<
-        crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
     >,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     distributed_plan: novarocks_sql::plan_read::DistributedPlan,

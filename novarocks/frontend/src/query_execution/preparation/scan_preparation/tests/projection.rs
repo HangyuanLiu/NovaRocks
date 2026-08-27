@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::super::super::typed_predicate::test_support::column_handle;
 use super::iceberg::only_scan_node;
 use super::*;
 use novarocks_sql::plan_read::ColumnId;
@@ -97,25 +96,30 @@ fn target_locator_projection_preserves_planner_ids_and_metadata_contract() {
     // The ordered assignments are what preparation actually asks the connector
     // for, and they are exactly the physical columns above -- in that order.
     let (fragment_id, node_id) = only_scan_node(&bindings);
-    let assignments = bindings
+    let typed = bindings
         .typed_scan(fragment_id, node_id)
-        .expect("typed connector scan")
-        .prepared
-        .table_scan
-        .source()
-        .assignments();
+        .expect("typed connector scan");
+    let source = typed.prepared.table_scan.source();
+    let assignments = source.assignments();
     assert_eq!(
         assignments
             .iter()
-            .map(|assignment| assignment.column().clone())
+            .map(|assignment| assignment.variable())
             .collect::<Vec<_>>(),
-        vec![
-            column_handle(1, "id"),
-            column_handle(10, ICEBERG_FILE_PATH_COL),
-            column_handle(11, ICEBERG_ROW_POS_COL),
-            column_handle(12, ICEBERG_ROW_ID_COL),
-            column_handle(13, ICEBERG_LAST_UPDATED_SEQ_COL),
-        ]
+        vec!["v0", "v1", "v2", "v3", "v4"]
+    );
+    let relation_binding = typed
+        .prepared
+        .table_scan
+        .table()
+        .relation()
+        .table()
+        .binding();
+    assert!(
+        assignments
+            .iter()
+            .all(|assignment| assignment.column().binding() == relation_binding),
+        "every ordered assignment must belong to the scan relation's generation"
     );
 }
 

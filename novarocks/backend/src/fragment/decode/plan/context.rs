@@ -127,10 +127,6 @@ impl TypedScanRuntime {
     ) -> Result<(), String> {
         self.read_context.register(plan_node_id, execution)
     }
-
-    pub(crate) fn read_context(&self) -> Arc<crate::fragment::ingress::TypedReadAttemptContext> {
-        Arc::clone(&self.read_context)
-    }
 }
 
 /// All non-wire dependencies required while lowering one native fragment.

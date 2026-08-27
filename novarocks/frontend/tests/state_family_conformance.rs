@@ -234,7 +234,7 @@ async fn open_application(
         backend_config(),
         Vec::new(),
         std::sync::Arc::new(
-            novarocks_frontend::connector::typed_control_registry::TypedConnectorControlRegistry::default(),
+            novarocks_frontend::connector::typed_control_registry::ConnectorReadControlRegistry::default(),
         ),
         tokio::runtime::Handle::current(),
         test_native_trust(),

@@ -40,13 +40,17 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterSubscriptionRequest,
 };
 use novarocks_proto_codec::connector_read::{
-    ConnectorTableScanSource, DecodedConnectorReadScan, ValidatedColumnHandle, WireDynamicFilter,
+    ConnectorTableScanSource, DecodedConnectorReadScan, ValidatedColumnHandle,
 };
 use novarocks_spi::connector::ConnectorScalarValue;
 use novarocks_spi::connector::read_stack::{
     BoundsMatch, ColumnValueBounds, CompleteAllDynamicFilter, ConnectorReadColumnHandle,
     ConnectorReadDynamicFilter, ConnectorValue, DynamicFilter, TupleDomain,
 };
+
+/// Backend-private oracle keyed by a decoded carrier column while the frozen
+/// scan's carrier-to-SPI correspondence is being established.
+type RawScanDynamicFilter = dyn DynamicFilter<ValidatedColumnHandle>;
 
 /// The dynamic-filter columns a typed scan really has.
 ///
@@ -92,7 +96,7 @@ pub(crate) fn scan_dynamic_filter(
     scan: &ConnectorTableScanSource,
     session: Option<&RuntimeFilterSessionRef>,
     contracts: &BTreeMap<u32, RuntimeFilterConsumerContract>,
-) -> Result<Arc<WireDynamicFilter>, RuntimeFilterContractViolation> {
+) -> Result<Arc<RawScanDynamicFilter>, RuntimeFilterContractViolation> {
     let bindings = scan_dynamic_filter_column_bindings(scan);
     let columns_covered: BTreeSet<ValidatedColumnHandle> = bindings.values().cloned().collect();
     let (Some(session), false) = (session, contracts.is_empty()) else {
@@ -169,7 +173,7 @@ pub(crate) fn scan_dynamic_filter_spi(
 struct SpiScanDynamicFilter {
     columns: BTreeSet<ConnectorReadColumnHandle>,
     raw_by_spi: BTreeMap<ConnectorReadColumnHandle, ValidatedColumnHandle>,
-    inner: Arc<WireDynamicFilter>,
+    inner: Arc<RawScanDynamicFilter>,
 }
 
 impl DynamicFilter<ConnectorReadColumnHandle> for SpiScanDynamicFilter {
@@ -685,7 +689,7 @@ mod tests {
         }
     }
 
-    fn live_filter(oracle: Option<Oracle>) -> Arc<WireDynamicFilter> {
+    fn live_filter(oracle: Option<Oracle>) -> Arc<RawScanDynamicFilter> {
         let subscription =
             RuntimeFilterSubscriptionHandle::Live(Arc::new(Live(oracle.map(snapshot))));
         let session: RuntimeFilterSessionRef = Arc::new(FakeSession {

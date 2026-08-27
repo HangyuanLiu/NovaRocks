@@ -5,10 +5,8 @@
 //! cross-field consistency, and canonical bytes for replay comparison. It does
 //! not own connector semantics: a provider variant is carried and validated
 //! structurally, and only the provider that produced it interprets it.
-// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
+// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
 
-mod control;
-mod execution;
 mod handle;
 mod predicate;
 mod runtime_codec;
@@ -17,16 +15,6 @@ mod split;
 mod task_update;
 mod value;
 
-pub use control::{
-    TypedChangeWindow, TypedColumnBinding, TypedConnectorMetadata, TypedFilterApplication,
-    TypedFrozenRewriteGroup, TypedLimitApplication, TypedRelationVersion, TypedSplitBatch,
-    TypedSystemTablePlan, TypedTableExecuteProcedure,
-};
-pub use execution::{
-    TypedConnectorPageSourceProvider, TypedConnectorProviderFactory, TypedConnectorSplitManager,
-    TypedConnectorSplitSource, TypedConnectorSystemTableProvider, WireConstraint,
-    WireDynamicFilter, WireDynamicFilterSnapshot,
-};
 pub use handle::{
     CatalogTableHandle, ConnectorRelation, ConnectorRelationKind, TableExecuteProcedure,
     ValidatedConnectorChangeWindowHandle, ValidatedConnectorMergeTableHandle,
