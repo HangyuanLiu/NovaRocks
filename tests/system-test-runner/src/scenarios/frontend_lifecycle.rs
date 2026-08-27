@@ -18,6 +18,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(CatalogPartialReadiness),
         Box::new(GracefulDrain),
         Box::new(ForcedDrain),
+        Box::new(BlueGreenSessionCutover),
     ]
 }
 
@@ -231,6 +232,43 @@ struct GracefulDrain;
 
 struct ForcedDrain;
 
+struct BlueGreenSessionCutover;
+
+impl Scenario for BlueGreenSessionCutover {
+    fn name(&self) -> &'static str {
+        "frontend-lifecycle/blue-green-session-cutover"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let snapshot = scenario_root.join("blue-catalogs.toml");
+        write_rest_static_snapshot(&snapshot, "lnp8_blue")?;
+        Ok(static_snapshot_launch_config(&snapshot))
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let green_snapshot = context.scenario_root().join("green-catalogs.toml");
+        write_rest_static_snapshot(&green_snapshot, "lnp8_green")?;
+        let mut green = context
+            .launch_peer_cluster("green", static_snapshot_launch_config(&green_snapshot))
+            .context("launch green 1FE+3BE cluster")?;
+        let result = run_blue_green_cutover(context, &mut green);
+        let cleanup = ServerHandle::shutdown(&mut green).context("stop green cluster");
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(cleanup)) => Err(cleanup),
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("green cleanup also failed: {cleanup:#}")))
+            }
+        }
+    }
+}
+
 impl Scenario for ForcedDrain {
     fn name(&self) -> &'static str {
         "frontend-lifecycle/forced-drain"
@@ -436,6 +474,132 @@ fn assert_idle_session_statement_is_rejected(connection: &mut mysql::Conn) -> Re
     ensure!(
         error.contains("FRONTEND_DRAINING") || error.contains("frontend is draining"),
         "post-drain SQL returned an unexpected error: {error}"
+    );
+    Ok(())
+}
+
+fn static_snapshot_launch_config(snapshot: &Path) -> ScenarioLaunchConfig {
+    ScenarioLaunchConfig {
+        config_overlay: CrossProcessConfigOverlay {
+            fe: Some(format!(
+                "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n",
+                snapshot.display()
+            )),
+            be: None,
+        },
+        ..Default::default()
+    }
+}
+
+fn write_rest_static_snapshot(snapshot: &Path, instance_id: &str) -> Result<()> {
+    let rest_uri = std::env::var("NOVAROCKS_ICEBERG_REST_URI").context(
+        "blue/green scenario requires NOVAROCKS_ICEBERG_REST_URI; source docker/iceberg-rest/runtime/current/env.sh",
+    )?;
+    let warehouse = std::env::var("NOVAROCKS_ICEBERG_REST_WAREHOUSE").context(
+        "blue/green scenario requires NOVAROCKS_ICEBERG_REST_WAREHOUSE; source docker/iceberg-rest/runtime/current/env.sh",
+    )?;
+    fs::write(
+        snapshot,
+        format!(
+            "format_version = 1\n\
+             [[catalogs]]\n\
+             instance_id = \"{instance_id}\"\n\
+             provider_id = \"iceberg\"\n\
+             display_name = \"{instance_id}\"\n\
+             config_format_version = 1\n\
+             [catalogs.properties]\n\
+             type = \"iceberg\"\n\
+             \"iceberg.catalog.type\" = \"rest\"\n\
+             uri = \"{rest_uri}\"\n\
+             warehouse = \"{warehouse}\"\n"
+        ),
+    )
+    .with_context(|| {
+        format!(
+            "write blue/green StaticFile snapshot {}",
+            snapshot.display()
+        )
+    })
+}
+
+fn run_blue_green_cutover(
+    context: &mut ScenarioContext,
+    green: &mut novarocks_cluster_harness::CrossProcessServerHandle,
+) -> Result<()> {
+    ensure!(
+        green.be_count() == REQUIRED_BACKENDS,
+        "green cutover requires native 1FE+3BE, received 1FE+{}BE",
+        green.be_count()
+    );
+    let green_ready = green.frontend_management_get("/readyz", Duration::from_secs(5))?;
+    ensure!(
+        green_ready.status == 200,
+        "green frontend did not become ready: {green_ready:?}"
+    );
+    context.action("launched an independent green 1FE+3BE cluster against the shared REST catalog");
+
+    let mut blue_idle = mysql_actor::connect(
+        context.mysql_user(),
+        context.mysql_port(),
+        context.remaining("connect blue pre-cutover session")?,
+    )?;
+    blue_idle
+        .query_drop("SET CATALOG lnp8_blue")
+        .context("select blue StaticFile catalog")?;
+    let blue_user = context.mysql_user().to_string();
+    let blue_port = context.mysql_port();
+    let (blue_query_tx, blue_query_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = (|| -> Result<Vec<i64>> {
+            let mut connection =
+                mysql_actor::connect(&blue_user, blue_port, Duration::from_secs(30))?;
+            connection
+                .query("SELECT sleep(2)")
+                .context("run pre-cutover blue query")
+        })();
+        let _ = blue_query_tx.send(result);
+    });
+    wait_for_active_statement(context)?;
+    context.action("admitted one blue query before removing the blue route");
+
+    context
+        .handle()
+        .begin_fe_drain()
+        .context("SIGTERM blue frontend after green readiness")?;
+    wait_for_drain_observation(context)?;
+    assert_idle_session_statement_is_rejected(&mut blue_idle)?;
+    context.action(
+        "blue accepted no new session statement after route cutover and returned SQLSTATE 1053",
+    );
+
+    let mut green_connection = mysql_actor::connect(
+        green.mysql_user(),
+        green.runtime().fe_mysql_port,
+        context.remaining("connect green post-cutover session")?,
+    )?;
+    green_connection
+        .query_drop("SET CATALOG lnp8_green")
+        .context("select green StaticFile catalog")?;
+    let green_rows: Vec<(i64,)> = green_connection
+        .query("SELECT 1")
+        .context("run a new query through green")?;
+    ensure!(green_rows == vec![(1,)]);
+    context.action("green accepted a new query after blue route withdrawal");
+
+    let blue_rows = blue_query_rx
+        .recv_timeout(context.remaining("wait for pre-cutover blue query")?)
+        .map_err(|error| anyhow::anyhow!("blue pre-cutover query did not finish: {error}"))??;
+    ensure!(
+        blue_rows.len() == 1,
+        "blue query returned unexpected rows: {blue_rows:?}"
+    );
+    let deadline = context.deadline();
+    context
+        .handle()
+        .wait_fe_exit_until(deadline)
+        .context("wait for drained blue frontend exit")?;
+    context.action(
+        "blue pre-cutover attempt terminated on blue; no query attempt was migrated to green",
     );
     Ok(())
 }
