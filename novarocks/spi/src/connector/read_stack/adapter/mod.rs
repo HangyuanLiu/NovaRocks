@@ -131,6 +131,9 @@ impl<T, C: Ord + Clone + Debug> ProviderReadFilterApplication<T, C> {
     }
 }
 
+pub type ProviderReadFilterResult<T, C> =
+    Result<Option<ProviderReadFilterApplication<T, C>>, ConnectorError>;
+
 #[derive(Clone, Debug)]
 pub struct ProviderReadLimitApplication<T> {
     handle: T,
@@ -212,7 +215,7 @@ pub trait ProviderReadMetadata: ProviderReadRuntime {
         session: &ConnectorSession,
         table: &Self::Table,
         constraint: &Constraint<Self::Column>,
-    ) -> Result<Option<ProviderReadFilterApplication<Self::Table, Self::Column>>, ConnectorError>;
+    ) -> ProviderReadFilterResult<Self::Table, Self::Column>;
 
     fn apply_projection(
         &self,
