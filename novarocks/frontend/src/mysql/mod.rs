@@ -613,7 +613,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
                     .await;
             }
         };
-        match session.execute_batch(query).await {
+        let outcome = match session.execute_batch(query).await {
             Ok(StatementResult::Query(result)) => write_query_result(result, results).await,
             Ok(StatementResult::Ok) => results.completed(OkResponse::default()).await,
             Err(error) => {
@@ -621,7 +621,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
                     .error(mysql_error_kind(&error), error.message().as_bytes())
                     .await
             }
-        }
+        };
+        // Query sessions may retain their admission while the protocol streams
+        // a result. Release it only after this response has reached its final
+        // protocol outcome.
+        session.complete_statement();
+        outcome
     }
 }
 

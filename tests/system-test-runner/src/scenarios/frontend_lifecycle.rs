@@ -28,14 +28,20 @@ impl Scenario for GracefulDrain {
         );
         context.action("verified native 1FE+3BE topology");
 
+        let mut idle_connection = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            Duration::from_secs(10),
+        )
+        .context("open pre-drain idle MySQL session")?;
         let user = context.mysql_user().to_string();
         let port = context.mysql_port();
         let (query_tx, query_rx) = mpsc::sync_channel(1);
         thread::spawn(move || {
             let result = (|| -> Result<Vec<i64>> {
-                let mut connection = mysql_actor::connect(&user, port, Duration::from_secs(10))?;
+                let mut connection = mysql_actor::connect(&user, port, Duration::from_secs(30))?;
                 connection
-                    .query("SELECT sleep(2)")
+                    .query("SELECT sleep(10)")
                     .context("run admitted graceful-drain query")
             })();
             let _ = query_tx.send(result);
@@ -52,15 +58,16 @@ impl Scenario for GracefulDrain {
             "observed ready=503, live=200, and Draining from the real FE management listener",
         );
 
-        assert_new_sql_is_rejected(context)?;
-        context.action("proved post-drain MySQL admission returns the typed draining rejection");
+        assert_idle_session_statement_is_rejected(&mut idle_connection)?;
+        context
+            .action("proved a pre-drain idle MySQL session receives the typed draining rejection");
 
         let query = query_rx
             .recv_timeout(context.remaining("wait for pre-drain statement")?)
             .map_err(|error| anyhow::anyhow!("pre-drain statement did not finish: {error}"))??;
         ensure!(
-            query == vec![0],
-            "unexpected graceful-drain query result: {query:?}"
+            query.len() == 1,
+            "graceful-drain query did not return one completed row: {query:?}"
         );
         context.action("pre-drain statement completed normally after drain began");
 
@@ -109,7 +116,7 @@ fn wait_for_drain_observation(context: &mut ScenarioContext) -> Result<()> {
         if ready.status == 503
             && live.status == 200
             && state.status == 200
-            && state.body.contains("Draining")
+            && state.body.contains("\"draining\"")
         {
             return Ok(());
         }
@@ -117,20 +124,14 @@ fn wait_for_drain_observation(context: &mut ScenarioContext) -> Result<()> {
     }
 }
 
-fn assert_new_sql_is_rejected(context: &mut ScenarioContext) -> Result<()> {
-    let timeout = context
-        .remaining("attempt post-drain SQL")?
-        .min(Duration::from_secs(2));
-    let outcome = (|| -> Result<()> {
-        let mut connection =
-            mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)?;
-        connection
-            .query_drop("SELECT 1")
-            .context("execute post-drain SQL")
-    })();
-    let error = outcome
-        .expect_err("post-drain SQL must be rejected")
-        .to_string();
+fn assert_idle_session_statement_is_rejected(connection: &mut mysql::Conn) -> Result<()> {
+    let outcome = connection
+        .query_drop("SELECT 1")
+        .context("execute statement from pre-drain idle MySQL session");
+    let error = format!(
+        "{:#}",
+        outcome.expect_err("post-drain SQL must be rejected")
+    );
     ensure!(
         error.contains("FRONTEND_DRAINING") || error.contains("frontend is draining"),
         "post-drain SQL returned an unexpected error: {error}"

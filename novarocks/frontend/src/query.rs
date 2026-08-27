@@ -595,6 +595,7 @@ impl QuerySessionFactory for FrontendQueryService {
         Ok(Arc::new(FrontendQuerySession {
             service: self.clone(),
             lease: Mutex::new(Some(lease)),
+            active_statements: Mutex::new(Vec::new()),
             state: Mutex::new(FrontendSessionState::default()),
         }))
     }
@@ -644,6 +645,7 @@ impl Default for FrontendSessionState {
 struct FrontendQuerySession {
     service: FrontendQueryService,
     lease: Mutex<Option<QuerySessionLease>>,
+    active_statements: Mutex<Vec<FrontendWorkloadLease>>,
     state: Mutex<FrontendSessionState>,
 }
 
@@ -688,7 +690,7 @@ impl FrontendQuerySession {
                 "command admission requires exactly one statement",
             ));
         };
-        match parsed_statement {
+        let result = match parsed_statement {
             ParsedStatement::Session(statement) => {
                 self.execute_session_statement(trimmed, statement, cancellation)
                     .await
@@ -697,6 +699,20 @@ impl FrontendQuerySession {
                 self.execute_typed_statement(trimmed.to_string(), statement.clone(), cancellation)
                     .await
             }
+        };
+        if matches!(&result, Ok(StatementResult::Query(_))) {
+            let mut active_statements = self.active_statements.lock().map_err(poisoned_state)?;
+            // A QueryResult is consumed by the MySQL protocol after this
+            // method returns. Retain the admission through that write so an
+            // FE drain observes streaming work and can cancel it at deadline.
+            active_statements.push(admission);
+        }
+        result
+    }
+
+    fn complete_active_statement(&self) {
+        if let Ok(mut active_statements) = self.active_statements.lock() {
+            active_statements.clear();
         }
     }
 
@@ -1480,6 +1496,10 @@ impl QuerySession for FrontendQuerySession {
             .unwrap_or(StatementResult::Ok))
     }
 
+    fn complete_statement(&self) {
+        self.complete_active_statement();
+    }
+
     fn cancel_current(&self, reason: QueryCancellationReason) {
         let token = self
             .lease
@@ -1496,6 +1516,7 @@ impl QuerySession for FrontendQuerySession {
 
     fn close(&self) {
         self.cancel_current(QueryCancellationReason::ClientDisconnected);
+        self.complete_active_statement();
         if let Ok(mut lease) = self.lease.lock() {
             lease.take();
         }

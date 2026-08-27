@@ -256,6 +256,11 @@ pub trait QuerySession: Send + Sync + 'static {
 
     async fn execute_batch(&self, sql: &str) -> Result<StatementResult, QueryServiceError>;
 
+    /// Releases any statement admission retained while the protocol writes a
+    /// query result. Non-frontend test/session owners intentionally use this
+    /// no-op default.
+    fn complete_statement(&self) {}
+
     fn cancel_current(&self, reason: QueryCancellationReason);
 
     fn close(&self);
