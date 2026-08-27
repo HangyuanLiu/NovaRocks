@@ -52,18 +52,28 @@ pub(crate) struct TypedScanRuntime {
     providers: Arc<crate::connector::TypedConnectorProviderRegistry>,
     queues: Arc<novarocks_execution::connector::TaskAttemptSplitQueues>,
     session: novarocks_spi::connector::read_stack::ConnectorSession,
-    /// Absent when this attempt installed no runtime filter. A typed scan then
-    /// uses the truthful unconstrained filter rather than pretending to have
-    /// feedback it never received.
-    runtime_filter: Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>,
+    /// Resolves this attempt's runtime-filter session, or `None` when it
+    /// installed none — in which case a typed scan uses the truthful
+    /// unconstrained filter rather than pretending to have feedback it never
+    /// received.
+    ///
+    /// A resolver rather than a resolved session: a fragment does not hold its
+    /// admission permit while its plan is decoded, and the lifecycle refuses a
+    /// session without one, so resolving here would always answer `None`.
+    runtime_filter: RuntimeFilterSessionResolver,
 }
+
+/// Looks up the attempt's runtime-filter session at the moment it is needed.
+pub(crate) type RuntimeFilterSessionResolver = Arc<
+    dyn Fn() -> Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef> + Send + Sync,
+>;
 
 impl TypedScanRuntime {
     pub(crate) fn new(
         providers: Arc<crate::connector::TypedConnectorProviderRegistry>,
         queues: Arc<novarocks_execution::connector::TaskAttemptSplitQueues>,
         session: novarocks_spi::connector::read_stack::ConnectorSession,
-        runtime_filter: Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>,
+        runtime_filter: RuntimeFilterSessionResolver,
     ) -> Self {
         Self {
             providers,
@@ -85,10 +95,8 @@ impl TypedScanRuntime {
         self.session.clone()
     }
 
-    pub(crate) fn runtime_filter(
-        &self,
-    ) -> Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef> {
-        self.runtime_filter.clone()
+    pub(crate) fn runtime_filter(&self) -> RuntimeFilterSessionResolver {
+        Arc::clone(&self.runtime_filter)
     }
 }
 
