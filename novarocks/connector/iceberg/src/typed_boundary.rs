@@ -62,7 +62,7 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorPinnedFileSet,
+    ConnectorPinnedFileSet, REWRITE_POSITION_DELETES_KIND,
 };
 
 use crate::file_pruning::file_may_satisfy_physical_predicates;
@@ -1231,17 +1231,24 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
             return Ok(None);
         };
         let metadata = physical.table.metadata();
-        // The snapshot the rewrite reads is the one its commit is validated
-        // against, so it is pinned here rather than resolved again on a worker.
-        let snapshot_id = metadata.current_snapshot_id().ok_or_else(|| {
-            invalid(format!(
-                "iceberg relation {}.{} has no snapshot to rewrite",
-                name.schema_name(),
-                name.table_name()
-            ))
-        })?;
-        let table_handle = pinned_table_handle(name, metadata, Some(snapshot_id))?;
         let group = procedure.group();
+        let loaded = crate::distributed_rewrite::load_frozen_rewrite_group(
+            &self.runtime,
+            physical.table.file_io(),
+            &crate::distributed_rewrite::IcebergRewriteGroupPayloadV1 {
+                version: crate::distributed_rewrite::GROUP_PAYLOAD_VERSION,
+                group_digest_hex: group.group_digest_hex().to_string(),
+                artifact_digest_hex: group.artifact_digest_hex().to_string(),
+                artifact_location: group.artifact_location().to_string(),
+            },
+        )?;
+        let snapshot_id =
+            validate_rewrite_position_delete_artifact(name, metadata, &loaded.artifact)?;
+        // The immutable artifact, rather than the observation-time current
+        // snapshot, owns the generation this procedure reads and commits
+        // against. `pinned_table_handle` verifies that exact snapshot remains
+        // available without resolving a later one.
+        let table_handle = pinned_table_handle(name, metadata, Some(snapshot_id))?;
         // The group names exactly the artifacts this procedure rewrites -- the
         // same set its commit replaces. It is carried, never re-derived: a rule
         // re-evaluated here could select a different set, and a rewrite that
@@ -1271,6 +1278,45 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
         ))
         .map(Some)
     }
+}
+
+/// Check every identity fence the frozen rewrite artifact carries before the
+/// TableExecute relation can admit split dispatch or any writer side effect.
+fn validate_rewrite_position_delete_artifact(
+    name: &SchemaTableName,
+    metadata: &TableMetadata,
+    artifact: &crate::distributed_rewrite::IcebergFrozenRewriteArtifactV1,
+) -> Result<i64, ConnectorError> {
+    let snapshot_id = artifact.base_snapshot_id.ok_or_else(|| {
+        invalid(format!(
+            "iceberg rewrite-position artifact for {}.{} has no base snapshot",
+            name.schema_name(),
+            name.table_name()
+        ))
+    })?;
+    if artifact.operation_kind != REWRITE_POSITION_DELETES_KIND
+        || artifact.namespace != name.schema_name()
+        || artifact.table != name.table_name()
+        || artifact.target_ref != "main"
+        || metadata.uuid().to_string() != artifact.table_uuid
+        || metadata.current_snapshot_id() != Some(snapshot_id)
+        || metadata.current_schema_id() != artifact.schema_id
+        || metadata.default_partition_spec_id() != artifact.default_spec_id
+    {
+        return Err(invalid(format!(
+            "iceberg rewrite-position artifact does not match the frozen relation {}.{}",
+            name.schema_name(),
+            name.table_name()
+        )));
+    }
+    if metadata.snapshot_by_id(snapshot_id).is_none() {
+        return Err(invalid(format!(
+            "iceberg rewrite-position artifact base snapshot {snapshot_id} is unavailable for {}.{}",
+            name.schema_name(),
+            name.table_name()
+        )));
+    }
+    Ok(snapshot_id)
 }
 
 impl TypedConnectorSplitManager for IcebergTypedBoundary {
@@ -2565,6 +2611,24 @@ mod tests {
             .metadata
     }
 
+    fn rewrite_position_artifact(
+        metadata: &TableMetadata,
+        relation: &SchemaTableName,
+    ) -> crate::distributed_rewrite::IcebergFrozenRewriteArtifactV1 {
+        crate::distributed_rewrite::IcebergFrozenRewriteArtifactV1 {
+            version: crate::distributed_rewrite::ARTIFACT_VERSION,
+            operation_kind: REWRITE_POSITION_DELETES_KIND.to_string(),
+            namespace: relation.schema_name().to_string(),
+            table: relation.table_name().to_string(),
+            table_uuid: metadata.uuid().to_string(),
+            target_ref: "main".to_string(),
+            base_snapshot_id: metadata.current_snapshot_id(),
+            schema_id: metadata.current_schema_id(),
+            default_spec_id: metadata.default_partition_spec_id(),
+            groups: Vec::new(),
+        }
+    }
+
     fn long_domain(value: i64) -> Domain {
         Domain::new(
             ValueSet::of_values(
@@ -2718,6 +2782,63 @@ mod tests {
             .is_err()
         );
         assert!(pin_snapshot(&metadata, TypedRelationVersion::Reference, Some("absent")).is_err());
+    }
+
+    #[test]
+    fn rewrite_position_table_execute_requires_the_exact_frozen_artifact_fences() {
+        let metadata = metadata_with_history();
+        let relation = name("db", "t");
+        let artifact = rewrite_position_artifact(&metadata, &relation);
+        assert_eq!(
+            validate_rewrite_position_delete_artifact(&relation, &metadata, &artifact)
+                .expect("exact artifact"),
+            12
+        );
+
+        let mut wrong_operation = artifact.clone();
+        wrong_operation.operation_kind = "rewrite_data_files".to_string();
+        assert!(
+            validate_rewrite_position_delete_artifact(&relation, &metadata, &wrong_operation)
+                .is_err()
+        );
+
+        let mut wrong_relation = artifact.clone();
+        wrong_relation.table = "other".to_string();
+        assert!(
+            validate_rewrite_position_delete_artifact(&relation, &metadata, &wrong_relation)
+                .is_err()
+        );
+
+        let mut wrong_uuid = artifact.clone();
+        wrong_uuid.table_uuid = "not-this-table".to_string();
+        assert!(
+            validate_rewrite_position_delete_artifact(&relation, &metadata, &wrong_uuid).is_err()
+        );
+
+        let mut wrong_ref = artifact.clone();
+        wrong_ref.target_ref = "branch".to_string();
+        assert!(
+            validate_rewrite_position_delete_artifact(&relation, &metadata, &wrong_ref).is_err()
+        );
+
+        let mut stale_snapshot = artifact.clone();
+        stale_snapshot.base_snapshot_id = Some(11);
+        assert!(
+            validate_rewrite_position_delete_artifact(&relation, &metadata, &stale_snapshot)
+                .is_err()
+        );
+
+        let mut wrong_schema = artifact.clone();
+        wrong_schema.schema_id += 1;
+        assert!(
+            validate_rewrite_position_delete_artifact(&relation, &metadata, &wrong_schema).is_err()
+        );
+
+        let mut wrong_spec = artifact;
+        wrong_spec.default_spec_id += 1;
+        assert!(
+            validate_rewrite_position_delete_artifact(&relation, &metadata, &wrong_spec).is_err()
+        );
     }
 
     #[test]
