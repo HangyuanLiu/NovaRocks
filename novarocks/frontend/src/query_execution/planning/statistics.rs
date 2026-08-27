@@ -28,6 +28,7 @@ use crate::connector::unified_statistics::{
 use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
 };
+use novarocks_execution::exec::statistics::statistics_scalar_bounds_supported;
 use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
 use novarocks_sql::planning::catalog::materialization_statistics_facts;
 use novarocks_sql::planning::dml::{
@@ -271,22 +272,29 @@ fn metric_request(
     let mut metrics = Vec::with_capacity(1 + columns.len() * 5);
     metrics.push(StatisticsMetric::RowCount);
     for column in columns {
-        let column = Arc::<str>::from(column.name.as_str());
-        metrics.extend([
-            StatisticsMetric::NullCount {
-                column: Arc::clone(&column),
-            },
-            StatisticsMetric::Minimum {
-                column: Arc::clone(&column),
-            },
-            StatisticsMetric::Maximum {
-                column: Arc::clone(&column),
-            },
-            StatisticsMetric::AverageSize {
-                column: Arc::clone(&column),
-            },
-            StatisticsMetric::ThetaNdv { column },
-        ]);
+        let name = Arc::<str>::from(column.name.as_str());
+        metrics.push(StatisticsMetric::NullCount {
+            column: Arc::clone(&name),
+        });
+        // A collection fails closed when any requested metric produces
+        // nothing, and the collector answers a type it cannot bound with
+        // silence rather than an error. Asking a `STRING` column for a
+        // minimum would therefore throw away the row count, null counts, and
+        // NDV sketches of every column in the table. Ask only for the bounds
+        // that can exist; a column with no bound vocabulary still contributes
+        // everything else it can measure.
+        if statistics_scalar_bounds_supported(&column.data_type) {
+            metrics.push(StatisticsMetric::Minimum {
+                column: Arc::clone(&name),
+            });
+            metrics.push(StatisticsMetric::Maximum {
+                column: Arc::clone(&name),
+            });
+        }
+        metrics.push(StatisticsMetric::AverageSize {
+            column: Arc::clone(&name),
+        });
+        metrics.push(StatisticsMetric::ThetaNdv { column: name });
     }
     StatisticsMetricRequest::try_new(metrics)
 }

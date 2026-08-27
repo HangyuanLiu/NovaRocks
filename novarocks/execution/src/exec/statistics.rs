@@ -30,7 +30,7 @@ use arrow::array::{
     Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, UInt8Array, UInt16Array,
     UInt32Array, UInt64Array,
 };
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use datasketches::theta::ThetaSketch;
@@ -662,6 +662,33 @@ fn array_scalar_bounds(
     Ok(Vec::new())
 }
 
+/// Whether [`array_scalar_bounds`] can express a bound for `data_type`.
+///
+/// A requester must consult this before asking for `Minimum`/`Maximum`.
+/// [`StatisticsScalarAccumulator`] serves `NullCount`, `AverageSize`,
+/// `Minimum`, and `Maximum` from a single pass, so it cannot refuse a type it
+/// has no bound vocabulary for — a `STRING` column still owes the first two.
+/// It contributes no bound and stays silent instead. Nothing notices until
+/// `finish_visible_row`, which fails the collection when any *requested*
+/// metric produced nothing. Asking for a bound that cannot exist therefore
+/// discards every other column's statistics for the whole table, rather than
+/// leaving that one bound unknown.
+pub fn statistics_scalar_bounds_supported(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+    ) || novarocks_types::largeint::is_largeint_data_type(data_type)
+}
+
 fn array_hashes(array: &ArrayRef) -> Result<Vec<u64>, StatisticsFragmentError> {
     let mut values = Vec::new();
     macro_rules! hash_values {
@@ -942,6 +969,48 @@ mod tests {
     use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
 
     use super::{StatisticsBatchCollector, StatisticsFragmentPartial};
+
+    #[test]
+    fn bound_support_predicate_agrees_with_the_measured_bounds() {
+        use arrow::array::{
+            ArrayRef, BooleanArray, Date32Array, FixedSizeBinaryArray, Float64Array, Int32Array,
+            StringArray, TimestampMicrosecondArray,
+        };
+
+        // The predicate is a requester's only view of what the accumulator can
+        // actually measure, and the accumulator reports a type it cannot bound
+        // by staying silent rather than by failing. If the two ever disagree,
+        // the requester asks for a bound that never arrives and the whole
+        // table's collection is discarded at `finish_visible_row`.
+        let cases: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(Float64Array::from(vec![1.0])),
+            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(BooleanArray::from(vec![true])),
+            Arc::new(Date32Array::from(vec![1])),
+            Arc::new(TimestampMicrosecondArray::from(vec![1])),
+            // Bounded today only through the LARGEINT width; a decimal and a
+            // shorter fixed-size binary are both unbounded, and the predicate
+            // has to say so.
+            Arc::new(Decimal128Array::from(vec![1i128])),
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter([[0u8; 16]].into_iter()).expect("largeint"),
+            ),
+            Arc::new(FixedSizeBinaryArray::try_from_iter([[0u8; 8]].into_iter()).expect("binary")),
+        ];
+
+        for array in cases {
+            let data_type = array.data_type().clone();
+            let measured = !super::array_scalar_bounds(&array)
+                .expect("scalar bounds")
+                .is_empty();
+            assert_eq!(
+                measured,
+                super::statistics_scalar_bounds_supported(&data_type),
+                "{data_type} disagrees about scalar bound support",
+            );
+        }
+    }
 
     #[test]
     fn fragment_payload_roundtrips_after_arrow_collection() {
