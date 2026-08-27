@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorMutationRouteInput,
-    ConnectorMutationTargetField, ConnectorRowMutationActivationRequest,
+    ConnectorMutationTargetField, ConnectorPinnedFileSet, ConnectorRowMutationActivationRequest,
     ConnectorRowMutationCohortRecipe, ConnectorRowMutationEffect,
     ConnectorRowMutationExecutionPlan, ConnectorRowMutationPreparation, ConnectorRowMutationRoute,
     ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
@@ -247,7 +247,12 @@ fn activate_iceberg_cow_row_mutation_from_frozen(
             ))
         })?;
         validate_matched_rows_against_frozen_file(&old_file, &matched_rows, data_file)?;
-        let (source, scan_schema, source_digest) = freeze_iceberg_cow_source(
+        let IcebergFrozenCowSource {
+            source,
+            pinned_source,
+            scan_schema,
+            digest: source_digest,
+        } = freeze_iceberg_cow_source(
             preparation,
             &frozen,
             data_file.clone(),
@@ -298,6 +303,7 @@ fn activate_iceberg_cow_row_mutation_from_frozen(
             selection,
             selection_ordinals,
             source,
+            pinned_source,
             preparation.base_version().digest(),
             scan_schema,
             scan_bindings,
@@ -1083,12 +1089,21 @@ fn validate_matched_rows_against_frozen_file(
     Ok(())
 }
 
+/// What one COW rewrite cohort reads: an opaque owner witness, the exact file
+/// it rewrites, its scan schema, and the source digest that seals it.
+struct IcebergFrozenCowSource {
+    source: ConnectorTableHandle,
+    pinned_source: ConnectorPinnedFileSet,
+    scan_schema: SchemaRef,
+    digest: [u8; 32],
+}
+
 fn freeze_iceberg_cow_source(
     preparation: &ConnectorRowMutationPreparation,
     frozen: &IcebergFrozenCowBase,
     data_file: DataFileWithStats,
     max_handle_payload_bytes: usize,
-) -> Result<(ConnectorTableHandle, SchemaRef, [u8; 32]), ConnectorError> {
+) -> Result<IcebergFrozenCowSource, ConnectorError> {
     let snapshot = frozen
         .metadata
         .snapshot_by_id(frozen.snapshot_id)
@@ -1141,7 +1156,24 @@ fn freeze_iceberg_cow_source(
         preparation.owner().instance_id.clone(),
         Bytes::from(encoded),
     )?;
-    Ok((source, scan_schema, digest))
+    // The cohort's commit replaces exactly this one data file, so the read
+    // that produces its replacement rows is defined by the same single name.
+    let pinned_source = ConnectorPinnedFileSet::try_new(
+        &source_payload.namespace,
+        &source_payload.table,
+        frozen.snapshot_id,
+        source_payload
+            .explicit_files
+            .iter()
+            .flatten()
+            .map(|file| file.path.as_str()),
+    )?;
+    Ok(IcebergFrozenCowSource {
+        source,
+        pinned_source,
+        scan_schema,
+        digest,
+    })
 }
 
 fn iceberg_cow_scan_bindings(

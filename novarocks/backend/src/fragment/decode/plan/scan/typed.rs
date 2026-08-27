@@ -83,11 +83,14 @@ pub(super) fn lower_typed_connector_scan(
     match table.relation() {
         // A system relation is read like any other: what differs is only how
         // its work reaches this backend, which the carrier states separately as
-        // its work source.
-        ConnectorRelation::Table(_) | ConnectorRelation::SystemTable(_) => {}
+        // its work source. A table-execute relation is read like any other too:
+        // its splits name delete artifacts rather than data files, and the
+        // connector's own page source is what knows the difference.
+        ConnectorRelation::Table(_)
+        | ConnectorRelation::SystemTable(_)
+        | ConnectorRelation::TableExecute(_) => {}
         ConnectorRelation::TableFunction(_)
         | ConnectorRelation::ChangeWindow(_)
-        | ConnectorRelation::TableExecute(_)
         | ConnectorRelation::MergeTable(_) => {
             return Err(unsupported_relation(table.relation_kind()));
         }
@@ -199,7 +202,7 @@ struct TypedScanRuntimeInputs {
     session: novarocks_spi::connector::read_stack::ConnectorSession,
     request: novarocks_spi::connector::ConnectorRequestContext,
     /// Absent when this attempt installed no runtime filter.
-    runtime_filter: Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>,
+    runtime_filter: crate::fragment::decode::plan::context::RuntimeFilterSessionResolver,
 }
 
 /// Resolve the typed scan's runtime inputs from the fragment decode context.
@@ -968,28 +971,6 @@ mod tests {
                     },
                 ),
                 "change_window",
-            ),
-            (
-                dto::catalog_table_handle::Relation::TableExecute(
-                    dto::ConnectorTableExecuteHandle {
-                        handle: Some(dto::connector_table_execute_handle::Handle::Iceberg(
-                            dto::IcebergTableExecuteHandle {
-                                schema_table_name: Some(test_support::schema_table_name()),
-                                procedure_id: dto::IcebergProcedureId::Optimize as i32,
-                                table_location: "s3://bucket/warehouse/db/t".to_owned(),
-                                procedure_handle: Some(
-                                    dto::iceberg_table_execute_handle::ProcedureHandle::Optimize(
-                                        dto::IcebergOptimizeHandle {
-                                            table_handle: Some(test_support::iceberg_table_handle()),
-                                            min_file_size_bytes: 1024,
-                                        },
-                                    ),
-                                ),
-                            },
-                        )),
-                    },
-                ),
-                "table_execute",
             ),
             (
                 dto::catalog_table_handle::Relation::MergeTable(dto::ConnectorMergeTableHandle {

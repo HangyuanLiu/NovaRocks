@@ -28,11 +28,12 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorRequestContext,
-    ConnectorSealedWriteCohortSet, ConnectorTableHandle, ConnectorWriteBaseVersion,
-    ConnectorWriteCohortId, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-    ConnectorWriteIntent, ConnectorWriteOperationId, ConnectorWritePreparation,
-    ConnectorWriteTargetRef, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorPinnedFileSet,
+    ConnectorRequestContext, ConnectorSealedWriteCohortSet, ConnectorTableHandle,
+    ConnectorWriteBaseVersion, ConnectorWriteCohortId, ConnectorWriteFieldToken,
+    ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWriteOperationId,
+    ConnectorWritePreparation, ConnectorWriteTargetRef, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 
 pub const CONNECTOR_ROW_MUTATION_CONTRACT_VERSION: u32 = 2;
@@ -942,6 +943,10 @@ impl ConnectorRowMutationScanBinding {
 pub enum ConnectorRowMutationCohortRecipeBody {
     Rewrite {
         source: ConnectorTableHandle,
+        /// Exactly the files this cohort rewrites. The cohort's commit
+        /// replaces precisely these, so the read that produces its rows must
+        /// be defined by the same set rather than by anything re-derived.
+        pinned_source: ConnectorPinnedFileSet,
         base_version_digest: [u8; 32],
         scan_schema: SchemaRef,
         scan_schema_digest: [u8; 32],
@@ -988,6 +993,7 @@ impl ConnectorRowMutationCohortRecipe {
         selection: &ConnectorRowMutationSelection,
         selection_ordinals: Vec<ConnectorRowMutationSelectionOrdinal>,
         source: ConnectorTableHandle,
+        pinned_source: ConnectorPinnedFileSet,
         base_version_digest: [u8; 32],
         scan_schema: SchemaRef,
         mut scan_bindings: Vec<ConnectorRowMutationScanBinding>,
@@ -1004,6 +1010,7 @@ impl ConnectorRowMutationCohortRecipe {
             selection_ordinals,
             ConnectorRowMutationCohortRecipeBody::Rewrite {
                 source,
+                pinned_source,
                 base_version_digest,
                 scan_schema,
                 scan_schema_digest,
@@ -2054,6 +2061,19 @@ fn route_digest(
     hasher.update(preparation.digest());
     hasher.finalize().into()
 }
+/// A pinned file set is part of the cohort's identity: two cohorts that differ
+/// only in which files they rewrite are two different cohorts.
+fn digest_pinned_file_set(hasher: &mut Sha256, pinned: &ConnectorPinnedFileSet) {
+    hasher.update(b"pinned-file-set\0");
+    digest_bytes(hasher, pinned.namespace().as_bytes());
+    digest_bytes(hasher, pinned.table().as_bytes());
+    hasher.update(pinned.version_ordinal().to_be_bytes());
+    hasher.update((pinned.files().len() as u64).to_be_bytes());
+    for file in pinned.files() {
+        digest_bytes(hasher, file.as_bytes());
+    }
+}
+
 fn cohort_recipe_digest(
     cohort: ConnectorWriteCohortId,
     route: ConnectorWriteRouteId,
@@ -2076,6 +2096,7 @@ fn cohort_recipe_digest(
         ConnectorRowMutationCohortRecipeBody::Append => hasher.update([1]),
         ConnectorRowMutationCohortRecipeBody::Rewrite {
             source,
+            pinned_source,
             base_version_digest,
             scan_schema_digest,
             scan_bindings,
@@ -2086,6 +2107,7 @@ fn cohort_recipe_digest(
             hasher.update([2]);
             digest_bytes(&mut hasher, source.owner().as_str().as_bytes());
             digest_bytes(&mut hasher, source.payload());
+            digest_pinned_file_set(&mut hasher, pinned_source);
             hasher.update(base_version_digest);
             hasher.update(scan_schema_digest);
             hasher.update(b"scan-bindings\0");
@@ -3020,12 +3042,16 @@ mod tests {
             Bytes::from_static(b"frozen-source"),
         )
         .expect("source");
+        let pinned_source =
+            ConnectorPinnedFileSet::try_new("db", "t", 11, ["s3://w/db/t/a.parquet"])
+                .expect("pinned source");
         let rewrite_recipe = ConnectorRowMutationCohortRecipe::try_rewrite(
             rewrite_cohort,
             rewrite_route.route_id(),
             &rewrite_selection,
             vec![ConnectorRowMutationSelectionOrdinal::new(0)],
             source.clone(),
+            pinned_source.clone(),
             base.digest(),
             scan_schema.clone(),
             vec![
@@ -3052,6 +3078,7 @@ mod tests {
             &rewrite_selection,
             vec![ConnectorRowMutationSelectionOrdinal::new(0)],
             source.clone(),
+            pinned_source.clone(),
             base.digest(),
             scan_schema.clone(),
             vec![
@@ -3082,6 +3109,7 @@ mod tests {
                 &rewrite_selection,
                 vec![ConnectorRowMutationSelectionOrdinal::new(0)],
                 source.clone(),
+                pinned_source.clone(),
                 [9; 32],
                 scan_schema.clone(),
                 scan_bindings.clone(),
@@ -3100,6 +3128,7 @@ mod tests {
                     Bytes::new(),
                 )
                 .expect("foreign source"),
+                pinned_source.clone(),
                 base.digest(),
                 scan_schema.clone(),
                 scan_bindings.clone(),
@@ -3114,6 +3143,7 @@ mod tests {
                 &rewrite_selection,
                 vec![ConnectorRowMutationSelectionOrdinal::new(0)],
                 source.clone(),
+                pinned_source.clone(),
                 base.digest(),
                 Arc::new(Schema::new(vec![
                     Field::new("value", DataType::Utf8, false),
@@ -3132,6 +3162,7 @@ mod tests {
                 &rewrite_selection,
                 vec![ConnectorRowMutationSelectionOrdinal::new(0)],
                 source.clone(),
+                pinned_source.clone(),
                 base.digest(),
                 Arc::new(Schema::new(vec![
                     Field::new("value", DataType::Int64, false),
@@ -3167,6 +3198,7 @@ mod tests {
                 &rewrite_selection,
                 vec![ConnectorRowMutationSelectionOrdinal::new(0)],
                 source.clone(),
+                pinned_source.clone(),
                 base.digest(),
                 scan_schema.clone(),
                 scan_bindings.clone(),
@@ -3186,6 +3218,7 @@ mod tests {
                 &rewrite_selection,
                 vec![ConnectorRowMutationSelectionOrdinal::new(0)],
                 source,
+                pinned_source,
                 base.digest(),
                 scan_schema,
                 scan_bindings.clone(),

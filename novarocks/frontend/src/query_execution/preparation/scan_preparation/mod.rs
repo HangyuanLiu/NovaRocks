@@ -35,12 +35,13 @@ use crate::connector::typed_control_registry::{
 };
 use crate::query_execution::connector_domain::CatalogHandle;
 use crate::query_execution::preparation::scan::{
-    PreparedTypedConnectorScan, ResolvedScanBinding, ResolvedScanColumn, ResolvedScanExecution,
-    ScanBindingResolver, ScanExecutionBindings,
+    PreparedTypedConnectorScan, QueryPinnedFileSetRead, QueryRewriteGroupRead, ResolvedScanBinding,
+    ResolvedScanColumn, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
 };
 use crate::query_execution::preparation::typed_scan::{TypedRelationFreeze, prepare_typed_scan};
 use novarocks_proto::connector_read::{
-    ConnectorRelationKind, TypedChangeWindow, TypedRelationVersion,
+    ConnectorRelationKind, TypedChangeWindow, TypedFrozenRewriteGroup, TypedRelationVersion,
+    TypedTableExecuteProcedure,
 };
 use novarocks_spi::connector::read_stack::{ConnectorSession, SchemaTableName};
 use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorReadSelector};
@@ -354,11 +355,24 @@ fn prepare_scan_node(
         // to freeze typed, so this lane must fail closed rather than reach the
         // opaque carrier it used to emit.
         SqlScanPreparationCategory::ConnectorRead => {
-            let _ = resolver;
             return Err(format!(
                 "scan source {} node_id={node_id} is a pre-pinned opaque connector read, which the typed connector scan stack does not admit",
                 facts.source_kind_label()
             ));
+        }
+        // A cohort read names its relation, its version, and exactly the files
+        // it may touch. All three were minted by the connector's own mutation
+        // or rewrite preparation, so the resolver hands them over whole rather
+        // than preparation resolving any of them again.
+        SqlScanPreparationCategory::AdmittedPinnedFileSet => {
+            resolve_through_binding_resolver(node_id, scan, &facts, resolver)?
+        }
+        // A procedure cohort read names its relation and the exact frozen group
+        // it rewrites. Both were minted by the connector's own rewrite
+        // preparation, so the resolver hands them over whole rather than
+        // preparation resolving either again.
+        SqlScanPreparationCategory::AdmittedTableExecute => {
+            resolve_through_binding_resolver(node_id, scan, &facts, resolver)?
         }
     };
     validate_resolved_execution_kind(node_id, &facts, &execution)?;
@@ -382,14 +396,6 @@ fn prepare_scan_node(
     )?;
     let dynamic_filters = dynamic_filters.as_slice();
     let (ranges, equality_required, typed_scan) = match &execution {
-        // The opaque lane is produced only by the pre-pinned source refused
-        // above; every variant is named so that adding a lane is a compile
-        // error here rather than a silent opaque read.
-        ResolvedScanExecution::ConnectorRead => {
-            return Err(format!(
-                "scan preparation node_id={node_id}: a pre-pinned opaque connector read has no typed lowering"
-            ));
-        }
         ResolvedScanExecution::AdmittedSystemTable(materialization) => {
             let prepared = prepare_typed_connector_scan(
                 node_id,
@@ -447,6 +453,34 @@ fn prepare_scan_node(
             )?;
             (Vec::new(), Vec::new(), prepared)
         }
+        ResolvedScanExecution::AdmittedPinnedFileSet(read) => {
+            let prepared = prepare_typed_pinned_file_set_scan(
+                node_id,
+                node_limit,
+                scan,
+                &physical_columns,
+                &facts,
+                read,
+                context,
+                options,
+                dynamic_filters,
+            )?;
+            (Vec::new(), Vec::new(), prepared)
+        }
+        ResolvedScanExecution::AdmittedTableExecute(read) => {
+            let prepared = prepare_typed_table_execute_scan(
+                node_id,
+                node_limit,
+                scan,
+                &physical_columns,
+                &facts,
+                read,
+                context,
+                options,
+                dynamic_filters,
+            )?;
+            (Vec::new(), Vec::new(), prepared)
+        }
     };
     let required_reads = resolve_effective_required_reads(node_id, scan, &equality_required)?;
     bindings.insert_binding(ResolvedScanBinding {
@@ -482,31 +516,6 @@ fn prepare_typed_connector_scan(
     options: &ScanPreparationOptions,
     dynamic_filters: &[(u32, String)],
 ) -> Result<PreparedTypedConnectorScan, String> {
-    let typed = options.typed()?;
-    let binding = materialization.planning_lease.binding();
-    if materialization.table.owner() != &binding.descriptor().instance_id {
-        return Err(format!(
-            "typed connector scan node_id={node_id} has a table handle owned by another instance than its planning lease"
-        ));
-    }
-    let binding_key = ConnectorExecutionBindingKey {
-        instance_id: binding.descriptor().instance_id.clone(),
-        incarnation: binding.incarnation(),
-    };
-    if binding_key.instance_id.as_str() != facts.identity().catalog() {
-        return Err(format!(
-            "typed connector scan node_id={node_id} resolves instance '{}' but the scan names catalog '{}'",
-            binding_key.instance_id.as_str(),
-            facts.identity().catalog()
-        ));
-    }
-    let control: TypedConnectorControl = typed
-        .control
-        .resolve(&binding_key)
-        .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
-    let declaration = binding
-        .execution_declaration(context)
-        .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
     let relation_name = typed_relation_name(node_id, facts, freeze)?;
     let relation = SchemaTableName::try_new(facts.identity().namespace(), &relation_name).map_err(
         |error| {
@@ -516,6 +525,199 @@ fn prepare_typed_connector_scan(
             )
         },
     )?;
+    // An admitted scan names its catalog, and that name is a claim about which
+    // connector instance owns the relation. A pinned cohort read makes no such
+    // claim: its SQL identity is query-local and synthetic, so it is checked
+    // against its source handle's owner instead.
+    let instance_id = &materialization
+        .planning_lease
+        .binding()
+        .descriptor()
+        .instance_id;
+    if instance_id.as_str() != facts.identity().catalog() {
+        return Err(format!(
+            "typed connector scan node_id={node_id} resolves instance '{}' but the scan names catalog '{}'",
+            instance_id.as_str(),
+            facts.identity().catalog()
+        ));
+    }
+    prepare_typed_relation_scan(
+        node_id,
+        node_limit,
+        scan,
+        physical_columns,
+        facts,
+        &materialization.planning_lease,
+        materialization.table.owner(),
+        &relation,
+        freeze,
+        context,
+        options,
+        dynamic_filters,
+    )
+}
+
+/// Lower one provider-frozen cohort read of a pinned file set.
+///
+/// The relation is named by the cohort itself, never by the synthetic SQL
+/// identity that carries the read through planning: that identity is
+/// query-local, so resolving it against a catalog would find nothing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Every argument is a distinct frozen fact of one scan; grouping them would hide which of them the connector sees."
+)]
+fn prepare_typed_pinned_file_set_scan(
+    node_id: i32,
+    node_limit: i64,
+    scan: &PlanScanNode,
+    physical_columns: &[ResolvedScanColumn],
+    facts: &SqlScanPreparationFacts,
+    read: &QueryPinnedFileSetRead,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    options: &ScanPreparationOptions,
+    dynamic_filters: &[(u32, String)],
+) -> Result<PreparedTypedConnectorScan, String> {
+    let relation = SchemaTableName::try_new(read.pinned.namespace(), read.pinned.table())
+        .map_err(|error| {
+            format!(
+                "typed connector scan node_id={node_id} cannot name pinned relation '{}.{}': {error}",
+                read.pinned.namespace(),
+                read.pinned.table()
+            )
+        })?;
+    prepare_typed_relation_scan(
+        node_id,
+        node_limit,
+        scan,
+        physical_columns,
+        facts,
+        &read.planning_lease,
+        &read.owner,
+        &relation,
+        TypedRelationFreeze::PinnedFileSet(&read.pinned),
+        context,
+        options,
+        dynamic_filters,
+    )
+}
+
+/// Lower one distributed procedure's cohort read of its own relation.
+///
+/// The relation is named by the group's own schema-qualified name, never by the
+/// synthetic SQL identity that carries the read through planning: that identity
+/// is query-local, so resolving it against a catalog would find nothing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Every argument is a distinct frozen fact of one scan; grouping them would hide which of them the connector sees."
+)]
+fn prepare_typed_table_execute_scan(
+    node_id: i32,
+    node_limit: i64,
+    scan: &PlanScanNode,
+    physical_columns: &[ResolvedScanColumn],
+    facts: &SqlScanPreparationFacts,
+    read: &QueryRewriteGroupRead,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    options: &ScanPreparationOptions,
+    dynamic_filters: &[(u32, String)],
+) -> Result<PreparedTypedConnectorScan, String> {
+    let relation = SchemaTableName::try_new(read.group.schema_name(), read.group.table_name())
+        .map_err(|error| {
+            format!(
+                "typed connector scan node_id={node_id} cannot name rewrite relation '{}.{}': {error}",
+                read.group.schema_name(),
+                read.group.table_name()
+            )
+        })?;
+    let artifact_digest_hex = hex::encode(read.group.artifact_digest());
+    let group_digest_hex = hex::encode(read.group_digest);
+    prepare_typed_relation_scan(
+        node_id,
+        node_limit,
+        scan,
+        physical_columns,
+        facts,
+        &read.planning_lease,
+        &read.owner,
+        &relation,
+        TypedRelationFreeze::TableExecute(TypedTableExecuteProcedure::RewritePositionDeleteFiles(
+            TypedFrozenRewriteGroup::new(
+                read.group.artifact_location(),
+                &artifact_digest_hex,
+                &group_digest_hex,
+            ),
+        )),
+        context,
+        options,
+        dynamic_filters,
+    )
+}
+
+/// Recover one scan's execution from the resolver that admitted it.
+///
+/// The lanes that reach here name their relation themselves, so preparation has
+/// nothing to look up: an absent resolver, or one that does not recognize the
+/// scan, is a failure rather than a reason to resolve the SQL identity.
+fn resolve_through_binding_resolver(
+    node_id: i32,
+    scan: &PlanScanNode,
+    facts: &SqlScanPreparationFacts,
+    resolver: Option<&dyn ScanBindingResolver>,
+) -> Result<ResolvedScanExecution, String> {
+    let source_context = facts.source_context();
+    let resolver = resolver.ok_or_else(|| {
+        format!("scan source {source_context} node_id={node_id} requires scan binding resolver")
+    })?;
+    resolver
+        .resolve_scan(node_id, scan)
+        .map_err(|error| {
+            format!(
+                "scan binding resolver failed for required source {source_context} node_id={node_id}: {error}"
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "scan binding resolver returned no binding for required source {source_context} node_id={node_id}"
+            )
+        })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Every argument is a distinct frozen fact of one scan; grouping them would hide which of them the connector sees."
+)]
+fn prepare_typed_relation_scan(
+    node_id: i32,
+    node_limit: i64,
+    scan: &PlanScanNode,
+    physical_columns: &[ResolvedScanColumn],
+    facts: &SqlScanPreparationFacts,
+    planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    source_owner: &novarocks_spi::connector::ConnectorInstanceId,
+    relation: &SchemaTableName,
+    freeze: TypedRelationFreeze<'_>,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+    options: &ScanPreparationOptions,
+    dynamic_filters: &[(u32, String)],
+) -> Result<PreparedTypedConnectorScan, String> {
+    let typed = options.typed()?;
+    let binding = planning_lease.binding();
+    if source_owner != &binding.descriptor().instance_id {
+        return Err(format!(
+            "typed connector scan node_id={node_id} has a table handle owned by another instance than its planning lease"
+        ));
+    }
+    let binding_key = ConnectorExecutionBindingKey {
+        instance_id: binding.descriptor().instance_id.clone(),
+        incarnation: binding.incarnation(),
+    };
+    let control: TypedConnectorControl = typed
+        .control
+        .resolve(&binding_key)
+        .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
+    let declaration = binding
+        .execution_declaration(context)
+        .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
     let catalog = CatalogHandle::new(
         binding_key.instance_id.as_str(),
         binding_key.incarnation.to_bytes(),
@@ -527,7 +729,7 @@ fn prepare_typed_connector_scan(
         node_id,
         scan,
         physical_columns,
-        &relation,
+        relation,
         freeze,
         node_scan_limit(node_limit),
         dynamic_filters,
@@ -561,7 +763,7 @@ fn prepare_typed_connector_scan(
         declaration,
         prepared,
         residual_predicates,
-        planning_lease: materialization.planning_lease.clone(),
+        planning_lease: planning_lease.clone(),
     })
 }
 
@@ -612,8 +814,23 @@ fn typed_relation_name(
     freeze: TypedRelationFreeze<'_>,
 ) -> Result<String, String> {
     match freeze {
-        TypedRelationFreeze::Table { .. } | TypedRelationFreeze::ChangeWindow(_) => {
-            Ok(facts.identity().table().to_string())
+        TypedRelationFreeze::Table { .. }
+        | TypedRelationFreeze::ChangeWindow(_)
+        | TypedRelationFreeze::PinnedFileSet(_)
+        | TypedRelationFreeze::TableExecute(_) => {
+            // A time-travel overlay's name is an analyzer key, not a relation
+            // the catalog holds: the rewriter mints `__sqlx1_tt_<table>_<id>`
+            // so a query-local pin cannot be mistaken for a durable object.
+            // The connector is asked for the relation that key already
+            // normalizes to, at the snapshot the selector pinned; asking for
+            // the synthetic name resolves nothing.
+            let table = facts.identity().table();
+            Ok(
+                crate::catalog_application::query_bindings::parse_time_travel_overlay_identity(
+                    table,
+                )
+                .map_or_else(|| table.to_string(), |(base, _)| base.to_string()),
+            )
         }
         TypedRelationFreeze::SystemTable => {
             let kind = facts.metadata_table_kind().ok_or_else(|| {
@@ -723,8 +940,14 @@ fn validate_resolved_execution_kind(
     execution: &ResolvedScanExecution,
 ) -> Result<(), String> {
     let valid = match facts.category() {
-        SqlScanPreparationCategory::ConnectorRead => {
-            matches!(execution, ResolvedScanExecution::ConnectorRead)
+        // The opaque lane is refused before any execution is resolved, so no
+        // execution variant can validly answer it.
+        SqlScanPreparationCategory::ConnectorRead => false,
+        SqlScanPreparationCategory::AdmittedPinnedFileSet => {
+            matches!(execution, ResolvedScanExecution::AdmittedPinnedFileSet(_))
+        }
+        SqlScanPreparationCategory::AdmittedTableExecute => {
+            matches!(execution, ResolvedScanExecution::AdmittedTableExecute(_))
         }
         SqlScanPreparationCategory::Delta => {
             matches!(execution, ResolvedScanExecution::AdmittedChangeWindow(_))
@@ -746,6 +969,8 @@ fn validate_resolved_execution_kind(
     }
     let required = match facts.category() {
         SqlScanPreparationCategory::ConnectorRead => "ConnectorRead",
+        SqlScanPreparationCategory::AdmittedPinnedFileSet => "AdmittedPinnedFileSet",
+        SqlScanPreparationCategory::AdmittedTableExecute => "AdmittedTableExecute",
         SqlScanPreparationCategory::Delta => "AdmittedChangeWindow",
         SqlScanPreparationCategory::AdmittedMetadata => "AdmittedSystemTable",
         SqlScanPreparationCategory::AdmittedData

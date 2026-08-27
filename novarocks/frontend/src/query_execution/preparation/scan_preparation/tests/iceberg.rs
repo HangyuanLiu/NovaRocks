@@ -40,6 +40,87 @@ pub(super) fn only_scan_node(
     keys.pop().expect("one typed scan")
 }
 
+/// A provider-frozen cohort read reaches the connector as exactly the file set
+/// the cohort froze -- no more, no fewer, and in one canonical spelling. The
+/// scan's own SQL identity is query-local and synthetic, so the relation the
+/// connector is asked for comes from the pinned set rather than from the name
+/// the statement planned under.
+#[test]
+fn a_pinned_cohort_read_freezes_the_relation_the_provider_named() {
+    use novarocks_spi::connector::{
+        ConnectorControlResolver, ConnectorInstanceId, ConnectorPinnedFileSet,
+    };
+
+    let plan = native_scan_plan(NativeScanFixture::PinnedFileSet).expect("sealed pinned fixture");
+    let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
+        "s3://bucket/current.parquet",
+    )]));
+    let instance_id = ConnectorInstanceId::parse("test_catalog").expect("fixture instance");
+    let lease = controls
+        .acquire_current(&instance_id)
+        .expect("fixture planning lease");
+    // Offered unsorted and out of order: one pinned read must have one
+    // spelling, whoever assembled the list.
+    let pinned = ConnectorPinnedFileSet::try_new(
+        "db",
+        "orders",
+        12,
+        ["s3://bucket/b.parquet", "s3://bucket/a.parquet"],
+    )
+    .expect("pinned file set");
+    let resolver = super::StaticResolver {
+        execution:
+            crate::query_execution::preparation::scan::ResolvedScanExecution::AdmittedPinnedFileSet(
+                crate::query_execution::preparation::scan::QueryPinnedFileSetRead {
+                    pinned: pinned.clone(),
+                    owner: instance_id,
+                    planning_lease: lease,
+                },
+            ),
+    };
+
+    let bindings = super::prepare_scan_bindings_with_controls(&plan, &controls, Some(&resolver))
+        .expect("pinned cohort scan preparation");
+    let (fragment_id, node_id) = only_scan_node(&bindings);
+    let typed = bindings
+        .typed_scan(fragment_id, node_id)
+        .expect("typed connector scan");
+    assert_eq!(
+        typed.prepared.table_scan.table().relation_kind(),
+        novarocks_proto::connector_read::ConnectorRelationKind::Table
+    );
+    let relation = typed.prepared.table_scan.table().handle().relation();
+    let novarocks_proto::connector_read::ConnectorRelation::Table(table) = relation else {
+        panic!("a pinned cohort read freezes a data relation, got {relation:?}");
+    };
+    let Some(novarocks_proto_models::connector_read::connector_table_handle::Handle::Iceberg(
+        iceberg,
+    )) = table.handle.as_ref()
+    else {
+        panic!("the fixture connector freezes an iceberg table handle");
+    };
+    assert_eq!(
+        iceberg
+            .schema_table_name
+            .as_ref()
+            .map(|name| (name.schema_name.as_str(), name.table_name.as_str())),
+        Some(("db", "orders")),
+        "the relation is the one the cohort named, not the synthetic SQL identity"
+    );
+    assert_eq!(iceberg.snapshot_id, Some(12));
+    assert_eq!(
+        iceberg
+            .pinned_data_files
+            .as_ref()
+            .expect("the frozen handle carries the pinned set")
+            .paths,
+        vec![
+            "s3://bucket/a.parquet".to_owned(),
+            "s3://bucket/b.parquet".to_owned()
+        ]
+    );
+}
+
 #[test]
 fn an_ordinary_iceberg_scan_lowers_to_a_typed_data_relation() {
     let bindings = prepare_scan_bindings(
@@ -254,6 +335,9 @@ fn a_variant_scan_assigns_only_its_physical_column() {
 
 /// A pre-pinned opaque read has no relation name or version left to freeze, so
 /// it fails closed rather than emitting the carrier it used to.
+///
+/// The refusal is on the scan's own category, before any resolver is
+/// consulted, so no execution the resolver could supply changes the outcome.
 #[test]
 fn a_pre_pinned_opaque_read_fails_closed() {
     let error = expect_preparation_error(
@@ -261,9 +345,7 @@ fn a_pre_pinned_opaque_read_fails_closed() {
             &native_scan_plan(NativeScanFixture::ConnectorRead)
                 .expect("sealed connector-read fixture"),
             &registry(vec![data_file("s3://bucket/data.parquet")]),
-            Some(&StaticResolver {
-                execution: ResolvedScanExecution::ConnectorRead,
-            }),
+            None,
         ),
         "a pre-pinned opaque read has no typed lowering",
     );

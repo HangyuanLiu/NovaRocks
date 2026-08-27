@@ -169,6 +169,7 @@ fn fixture_typed_control_registry(
         let control = Arc::new(FixtureTypedControl {
             catalog: catalog.clone(),
             incarnation: key.incarnation.to_bytes(),
+            pinned_requests: std::sync::Mutex::new(Vec::new()),
         });
         registry
             .install(
@@ -190,6 +191,9 @@ fn fixture_typed_control_registry(
 struct FixtureTypedControl {
     catalog: String,
     incarnation: [u8; 16],
+    /// Every pinned file set the fixture was asked to freeze, so a test can
+    /// prove preparation offered the connector exactly the cohort's own set.
+    pinned_requests: std::sync::Mutex<Vec<novarocks_spi::connector::ConnectorPinnedFileSet>>,
 }
 
 impl FixtureTypedControl {
@@ -314,6 +318,7 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
                             name_mapping_json: None,
                             table_location: "s3://bucket/table".to_owned(),
                             storage_properties: std::collections::BTreeMap::new(),
+                            pinned_data_files: None,
                         },
                     )),
                 },
@@ -325,6 +330,49 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
                 novarocks_proto::FieldPath::root("catalog_table_handle"),
             )
             .expect("fixture catalog table handle"),
+        ))
+    }
+
+    fn get_pinned_file_set_handle(
+        &self,
+        session: &novarocks_spi::connector::read_stack::ConnectorSession,
+        name: &novarocks_spi::connector::read_stack::SchemaTableName,
+        pinned: &novarocks_spi::connector::ConnectorPinnedFileSet,
+    ) -> Result<
+        Option<novarocks_proto::connector_read::CatalogTableHandle>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        use novarocks_proto_models::connector_read as dto;
+
+        self.pinned_requests
+            .lock()
+            .expect("fixture pinned request lock")
+            .push(pinned.clone());
+        let handle = self
+            .get_table_handle(
+                session,
+                name,
+                novarocks_proto::connector_read::TypedRelationVersion::SnapshotId(
+                    pinned.version_ordinal(),
+                ),
+                None,
+            )?
+            .expect("fixture pinned relation");
+        let mut raw = handle.into_proto();
+        if let Some(dto::catalog_table_handle::Relation::Table(dto::ConnectorTableHandle {
+            handle: Some(dto::connector_table_handle::Handle::Iceberg(iceberg)),
+        })) = raw.relation.as_mut()
+        {
+            iceberg.pinned_data_files = Some(dto::IcebergPinnedDataFileSet {
+                paths: pinned.files().iter().map(|file| file.to_string()).collect(),
+            });
+        }
+        Ok(Some(
+            novarocks_proto::connector_read::CatalogTableHandle::parse(
+                raw,
+                novarocks_proto::FieldPath::root("catalog_table_handle"),
+            )
+            .expect("fixture pinned catalog table handle"),
         ))
     }
 
@@ -436,6 +484,18 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
             )
             .expect("fixture catalog change window handle"),
         ))
+    }
+
+    fn get_table_execute_plan(
+        &self,
+        _session: &novarocks_spi::connector::read_stack::ConnectorSession,
+        _name: &novarocks_spi::connector::read_stack::SchemaTableName,
+        _procedure: novarocks_proto::connector_read::TypedTableExecuteProcedure<'_>,
+    ) -> Result<
+        Option<novarocks_proto::connector_read::CatalogTableHandle>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Ok(None)
     }
 }
 

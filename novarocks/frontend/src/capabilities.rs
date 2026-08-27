@@ -676,6 +676,8 @@ pub fn bind_statistics_table_reader(
 pub struct StatisticsAttemptExecutorPorts {
     execution_role: novarocks_types::ClusterRole,
     connector_control: Arc<dyn ConnectorControlRegistry>,
+    typed_connector_control:
+        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
     backend_topology: BackendTopologyService,
     query_execution: QueryExecutionService,
     attempt_timeout: Duration,
@@ -685,6 +687,9 @@ impl StatisticsAttemptExecutorPorts {
     pub fn new(
         execution_role: novarocks_types::ClusterRole,
         connector_control: Arc<dyn ConnectorControlRegistry>,
+        typed_connector_control: Arc<
+            crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+        >,
         backend_topology: BackendTopologyService,
         query_execution: QueryExecutionService,
         attempt_timeout: Duration,
@@ -692,6 +697,7 @@ impl StatisticsAttemptExecutorPorts {
         Self {
             execution_role,
             connector_control,
+            typed_connector_control,
             backend_topology,
             query_execution,
             attempt_timeout,
@@ -708,6 +714,7 @@ pub fn statistics_attempt_executor(
             crate::statistics_jobs::attempt_executor::StatisticsAttemptExecutionPorts::new(
                 ports.execution_role,
                 ports.connector_control,
+                ports.typed_connector_control,
                 ports.backend_topology,
                 ports.query_execution,
                 ports.attempt_timeout,

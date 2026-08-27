@@ -23,6 +23,7 @@ use super::{
 const MAX_HANDLE_COLUMNS: usize = 4096;
 const MAX_PARTITION_SPECS: usize = 4096;
 const MAX_STORAGE_PROPERTIES: usize = 256;
+const MAX_PINNED_DATA_FILES: usize = 4096;
 
 const INSTANCE_INCARNATION_BYTES: usize = 16;
 const TRANSACTION_UUID_BYTES: usize = 16;
@@ -313,6 +314,39 @@ impl ValidatedTransactionHandle {
 // Table handles
 // ---------------------------------------------------------------------------
 
+/// A pinned file set names the exact files one read may touch.
+///
+/// The list is bounded because it is the only unbounded-by-nature field on a
+/// table handle: a cohort's list is small, and one that is not is a wire
+/// hazard rather than a larger rewrite. Sortedness and uniqueness are checked
+/// rather than repaired: two spellings of the same file, or a list whose order
+/// depends on who built it, would make the same pinned read two different
+/// reads.
+fn validate_pinned_data_file_set(
+    raw: Option<&dto::IcebergPinnedDataFileSet>,
+    path: FieldPath,
+) -> Result<(), ProtocolError> {
+    let Some(pinned) = raw else {
+        return Ok(());
+    };
+    if pinned.paths.len() > MAX_PINNED_DATA_FILES {
+        return Err(out_of_range(
+            path,
+            "pinned data file count exceeds the hard limit",
+        ));
+    }
+    for (ordinal, file) in pinned.paths.iter().enumerate() {
+        bounded_text(file, MAX_PATH_BYTES, path.index(ordinal), false)?;
+    }
+    if pinned.paths.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(inconsistent(
+            path,
+            "pinned data file paths must be sorted and unique",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_iceberg_table_handle(
     raw: &dto::IcebergTableHandle,
     path: FieldPath,
@@ -358,6 +392,10 @@ fn validate_iceberg_table_handle(
         MAX_PATH_BYTES,
         path.field("table_location"),
         false,
+    )?;
+    validate_pinned_data_file_set(
+        raw.pinned_data_files.as_ref(),
+        path.field("pinned_data_files"),
     )?;
     validate_storage_properties(&raw.storage_properties, path.field("storage_properties"))
 }
@@ -652,16 +690,15 @@ fn validate_iceberg_system_table_reference(
                 "iceberg system table type must be specified",
             ));
         }
-        // The closed worker-visible set. PARTITIONS is deliberately absent --
-        // it is a view over the same pinned snapshot's FILES relation -- and
-        // there is no ALL_* variant to widen a pinned reference into a scan of
-        // every snapshot.
+        // The closed worker-visible set. There is no ALL_* variant, so a
+        // pinned reference can never widen into a scan of every snapshot.
         dto::IcebergSystemTableType::Files
         | dto::IcebergSystemTableType::Entries
         | dto::IcebergSystemTableType::Snapshots
         | dto::IcebergSystemTableType::History
         | dto::IcebergSystemTableType::Refs
-        | dto::IcebergSystemTableType::Manifests => {}
+        | dto::IcebergSystemTableType::Manifests
+        | dto::IcebergSystemTableType::Partitions => {}
     }
     bounded_text(
         &raw.metadata_file_location,
@@ -1288,6 +1325,7 @@ mod tests {
             limit: None,
             projected_columns: vec![column(1), column(2)],
             name_mapping_json: None,
+            pinned_data_files: None,
             table_location: "s3://bucket/warehouse/sales/orders".to_owned(),
             storage_properties: BTreeMap::from([(
                 "s3.endpoint".to_owned(),
@@ -1753,6 +1791,58 @@ mod tests {
             .expect_err("empty partition spec json")
             .kind(),
             ProtocolErrorKind::InvalidValue
+        );
+    }
+
+    /// A pinned file set is the whole definition of the read that carries it,
+    /// so its spelling has to be canonical: an unsorted or repeated list would
+    /// make the same pinned read two different reads on the wire, and an
+    /// unbounded one is a wire hazard rather than a larger rewrite.
+    #[test]
+    fn a_pinned_data_file_set_must_be_bounded_sorted_and_unique() {
+        let pinned = |paths: Vec<String>| {
+            let mut iceberg = iceberg_table_handle();
+            iceberg.pinned_data_files = Some(dto::IcebergPinnedDataFileSet { paths });
+            ValidatedConnectorTableHandle::parse(
+                dto::ConnectorTableHandle {
+                    handle: Some(dto::connector_table_handle::Handle::Iceberg(iceberg)),
+                },
+                FieldPath::root("connector_table_handle"),
+            )
+        };
+
+        // An empty pin is a legal read of no rows, not an absent restriction.
+        assert!(pinned(Vec::new()).is_ok());
+        assert!(pinned(vec!["s3://b/a".to_owned(), "s3://b/b".to_owned()]).is_ok());
+
+        let unsorted = pinned(vec!["s3://b/b".to_owned(), "s3://b/a".to_owned()])
+            .expect_err("unsorted pinned data files");
+        assert_eq!(unsorted.kind(), ProtocolErrorKind::InconsistentFields);
+        assert_eq!(
+            unsorted.path().to_string(),
+            "connector_table_handle.iceberg.pinned_data_files"
+        );
+        assert_eq!(
+            pinned(vec!["s3://b/a".to_owned(), "s3://b/a".to_owned()])
+                .expect_err("repeated pinned data file")
+                .kind(),
+            ProtocolErrorKind::InconsistentFields
+        );
+        assert_eq!(
+            pinned(vec![String::new()])
+                .expect_err("empty pinned data file")
+                .kind(),
+            ProtocolErrorKind::InvalidValue
+        );
+        assert_eq!(
+            pinned(
+                (0..=MAX_PINNED_DATA_FILES)
+                    .map(|ordinal| format!("s3://b/{ordinal:08}"))
+                    .collect()
+            )
+            .expect_err("too many pinned data files")
+            .kind(),
+            ProtocolErrorKind::OutOfRange
         );
     }
 

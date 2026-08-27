@@ -257,6 +257,17 @@ message ConnectorTransactionHandle {
 // Table handles
 // ---------------------------------------------------------------------------
 
+// Exactly the data files one read is restricted to.
+//
+// This names a file set, not a rule. A mutation or rewrite cohort commits a
+// replacement for precisely these files, so a read that skipped one of them,
+// or added one outside them, would corrupt the relation rather than return a
+// wrong answer. Nothing here may be re-derived from the snapshot, a predicate,
+// or a size threshold.
+message IcebergPinnedDataFileSet {
+  repeated string paths = 1;  // sorted, unique, non-empty; at most 4096.
+}
+
 // A worker-visible Iceberg table handle. Only DATA relations use it; system
 // relations, table functions, and table execute have their own entry points.
 message IcebergTableHandle {
@@ -273,6 +284,9 @@ message IcebergTableHandle {
   optional string name_mapping_json = 11;
   string table_location = 12;
   map<string, string> storage_properties = 13;
+  // Absent means the whole pinned snapshot. Present means exactly this file
+  // set and nothing else -- including an empty set, which reads no rows.
+  IcebergPinnedDataFileSet pinned_data_files = 14;
 }
 
 message ConnectorTableHandle {
@@ -339,6 +353,14 @@ enum IcebergSystemTableType {
   ICEBERG_SYSTEM_TABLE_TYPE_HISTORY = 4;
   ICEBERG_SYSTEM_TABLE_TYPE_REFS = 5;
   ICEBERG_SYSTEM_TABLE_TYPE_MANIFESTS = 6;
+  // `$partitions` aggregates the rows `$files` produces for the same pinned
+  // snapshot. It is a kind of its own rather than a FILES reference the worker
+  // is told to aggregate: a FILES reference reaching a backend reads as the
+  // un-aggregated relation, which answers a different question with a
+  // plausible shape -- one row per data file instead of one row per partition.
+  // Both kinds are minted by the same resolution, from the same metadata file,
+  // uuid and snapshot, so the two cannot describe different snapshots.
+  ICEBERG_SYSTEM_TABLE_TYPE_PARTITIONS = 7;
 }
 
 // An immutable metadata reference. The selected backend validates the UUID and

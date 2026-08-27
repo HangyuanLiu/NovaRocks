@@ -35,7 +35,6 @@ use crate::commit::write_execution::IcebergDataWriteExecution;
 use crate::execution_declaration::prepare_iceberg_execution_binding;
 use crate::file_reader::batch_reader::IcebergBatchReader;
 use crate::file_reader::delta_reader::IcebergDeltaBatchReader;
-use crate::file_reader::distributed_rewrite_reader::IcebergRewritePositionBatchReader;
 use crate::file_reader::execution_payload::{
     ICEBERG_PREPARED_SCAN_UNIT_V1, ICEBERG_PREPARED_SPLIT_SHARED_V2,
     IcebergPreparedMetadataUnitPayloadV1, IcebergPreparedSplitSharedPayload,
@@ -160,7 +159,6 @@ impl IcebergReadOnlyConnectorInstance {
                     fact_columns: payload.fact_columns,
                     name_mapping: payload.name_mapping,
                     delta: payload.delta,
-                    distributed_rewrite_position: payload.distributed_rewrite_position,
                     metadata: Some(metadata),
                 },
                 "prepared metadata split shared payload",
@@ -192,16 +190,13 @@ impl IcebergReadOnlyConnectorInstance {
                 "Iceberg split has no frozen scan units",
             ));
         }
-        if (payload.delta.is_some() || payload.distributed_rewrite_position.is_some())
-            && payload.units.len() != 1
-        {
+        if payload.delta.is_some() && payload.units.len() != 1 {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 "Iceberg special scan split must carry exactly one frozen unit",
             ));
         }
-        let special_unit =
-            payload.delta.is_some() || payload.distributed_rewrite_position.is_some();
+        let special_unit = payload.delta.is_some();
         let fact_columns = payload.fact_columns.clone();
         let facts_are_conservative =
             payload.limit.is_some() || !payload.physical_predicates.is_empty() || special_unit;
@@ -221,7 +216,6 @@ impl IcebergReadOnlyConnectorInstance {
                 fact_columns: payload.fact_columns,
                 name_mapping: payload.name_mapping,
                 delta: payload.delta,
-                distributed_rewrite_position: payload.distributed_rewrite_position,
                 metadata: None,
             },
             "prepared split shared payload",
@@ -324,15 +318,6 @@ impl IcebergReadOnlyConnectorInstance {
             return IcebergDeltaBatchReader::try_new(
                 delta.source,
                 delta.delete_side,
-                self.binding.clone(),
-                request,
-            )
-            .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>);
-        }
-        if let Some(rewrite_position) = shared.distributed_rewrite_position {
-            return IcebergRewritePositionBatchReader::try_new(
-                prepared.data_file,
-                rewrite_position,
                 self.binding.clone(),
                 request,
             )

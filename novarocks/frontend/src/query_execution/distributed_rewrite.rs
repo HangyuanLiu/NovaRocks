@@ -26,18 +26,16 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::SchemaRef;
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteAttemptCheckpoint, ConnectorDistributedRewriteAttemptDisposition,
     ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan,
     ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorErrorKind,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorWriteAbortOutcome,
-    ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteExecutionId,
-    ConnectorWriteOperationId, ConnectorWriteReceipt, ExternalMutationOutcome,
+    ConnectorRequestContext, ConnectorWriteAbortOutcome, ConnectorWriteAttemptCompletion,
+    ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteOperationId,
+    ConnectorWriteReceipt, ExternalMutationOutcome,
 };
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::common::backend_topology::BackendTopologySnapshot;
 use crate::connector::distributed_rewrite_application::{
     DistributedRewriteApplicationSession, DistributedRewriteSealing, SealedDistributedRewrite,
 };
@@ -46,7 +44,7 @@ use crate::query_execution::contract::{
     ConnectorWritePlanningTemplate,
 };
 use crate::query_execution::outcome::ConnectorWriteCompletion;
-use crate::query_execution::preparation::scan::PlannedConnectorRead;
+use crate::query_execution::preparation::scan::{QueryPinnedFileSetRead, QueryRewriteGroupRead};
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use novarocks_sql::binding::SqlTableBindingId;
@@ -82,71 +80,78 @@ impl DistributedRewriteSealing for QueryExecutionService {
     }
 }
 
-/// Plan one frozen source through the scan-planning capability retained by a
-/// composite rewrite lease.  The plan is opaque to this module: it has no
-/// Iceberg files, catalog client, or provider report decoding.
-pub(crate) fn plan_frozen_rewrite_connector_read(
-    lease: &ConnectorDistributedRewriteLease,
-    topology: &BackendTopologySnapshot,
-    source: &ConnectorTableHandle,
-    expected_schema: &SchemaRef,
-    projection: Vec<usize>,
-    context: ConnectorRequestContext,
-) -> Result<PlannedConnectorRead, ConnectorError> {
-    crate::query_execution::frozen_connector_read::plan_frozen_connector_read(
-        lease.planning_lease(),
-        topology,
-        source,
-        expected_schema,
-        projection,
-        context,
-    )
-}
-
-/// Admit the synthetic source used by one opaque frozen rewrite read.
-///
-/// The exact connector authority remains in `FrozenRewriteReadResolver`, but
-/// the physical SQL artifact still carries a request-local token from the
-/// same store retained through preparation.  This prevents the resolver-only
-/// path from reintroducing an unbound scan carrier after `ConnectorPinned`
-/// was removed.
-pub(crate) fn admit_frozen_rewrite_scan_binding(
+/// Admit the synthetic source used by one pinned rewrite cohort read.
+pub(crate) fn admit_pinned_rewrite_scan_binding(
     bindings: &QueryTableBindingStore,
     input_schema: &arrow::datatypes::SchemaRef,
 ) -> Result<SqlTableBindingId, String> {
-    crate::query_execution::frozen_connector_read::admit_frozen_connector_scan_binding(
+    crate::query_execution::pinned_connector_read::admit_pinned_file_set_scan_binding(
         bindings,
         &frozen_rewrite_identity(),
         input_schema,
     )
 }
 
-/// Build the minimal physical source for one opaque frozen rewrite read.
-/// Execution preparation replaces this SQL-owned connector-read node exactly
-/// once with the `PlannedConnectorRead` above; no normal table lookup may
-/// run.
-pub(crate) fn frozen_rewrite_scan_physical_plan(
+/// Build the minimal physical source for one pinned rewrite cohort read.
+/// Preparation freezes the relation restricted to exactly the files the
+/// provider pinned for this cohort; no normal table lookup may run.
+pub(crate) fn pinned_rewrite_scan_physical_plan(
     input_schema: &arrow::datatypes::SchemaRef,
     binding: SqlTableBindingId,
 ) -> FrozenConnectorScanPlan {
-    crate::query_execution::frozen_connector_read::frozen_connector_scan_physical_plan(
+    crate::query_execution::pinned_connector_read::pinned_file_set_scan_physical_plan(
         &frozen_rewrite_identity(),
         input_schema,
         binding,
     )
 }
 
-/// One-shot injection point for the exact frozen source plan.  Keeping this
-/// local to rewrite execution makes a second provider catalog lookup during
-/// fragment preparation structurally impossible.
-pub(crate) type FrozenRewriteReadResolver =
-    crate::query_execution::frozen_connector_read::FrozenConnectorReadResolver;
-
-pub(crate) fn frozen_rewrite_read_resolver(
+pub(crate) fn pinned_rewrite_read_resolver(
     binding: SqlTableBindingId,
-    read: PlannedConnectorRead,
-) -> FrozenRewriteReadResolver {
-    FrozenRewriteReadResolver::new(binding, frozen_rewrite_identity(), read)
+    read: QueryPinnedFileSetRead,
+) -> crate::query_execution::pinned_connector_read::PinnedFileSetReadResolver {
+    crate::query_execution::pinned_connector_read::PinnedFileSetReadResolver::new(
+        binding,
+        frozen_rewrite_identity(),
+        read,
+    )
+}
+
+/// Admit the synthetic source used by one procedure cohort's group read.
+pub(crate) fn admit_rewrite_group_scan_binding(
+    bindings: &QueryTableBindingStore,
+    input_schema: &arrow::datatypes::SchemaRef,
+) -> Result<SqlTableBindingId, String> {
+    crate::query_execution::rewrite_group_read::admit_table_execute_scan_binding(
+        bindings,
+        &frozen_rewrite_identity(),
+        input_schema,
+    )
+}
+
+/// Build the minimal physical source for one procedure cohort's group read.
+/// Preparation freezes the relation the group names; no normal table lookup
+/// may run.
+pub(crate) fn rewrite_group_scan_physical_plan(
+    input_schema: &arrow::datatypes::SchemaRef,
+    binding: SqlTableBindingId,
+) -> FrozenConnectorScanPlan {
+    crate::query_execution::rewrite_group_read::table_execute_scan_physical_plan(
+        &frozen_rewrite_identity(),
+        input_schema,
+        binding,
+    )
+}
+
+pub(crate) fn rewrite_group_read_resolver(
+    binding: SqlTableBindingId,
+    read: QueryRewriteGroupRead,
+) -> crate::query_execution::rewrite_group_read::RewriteGroupReadResolver {
+    crate::query_execution::rewrite_group_read::RewriteGroupReadResolver::new(
+        binding,
+        frozen_rewrite_identity(),
+        read,
+    )
 }
 
 fn frozen_rewrite_identity() -> FrozenConnectorScanIdentity {
@@ -767,7 +772,15 @@ mod tests {
                 let digest = [u8::try_from(index).unwrap_or_default(); 32];
                 ConnectorDistributedRewriteCohortPlan::try_new(
                     ConnectorWriteCohortId::derive(operation_id, b"test", digest).unwrap(),
-                    table.clone(),
+                    novarocks_spi::connector::ConnectorRewriteCohortRead::DeleteArtifactGroup(
+                        novarocks_spi::connector::ConnectorFrozenRewriteGroup::try_new(
+                            "db",
+                            "orders",
+                            "s3://warehouse/db/orders/_rewrite/0199",
+                            digest,
+                        )
+                        .unwrap(),
+                    ),
                     schema.clone(),
                     [3; 32],
                     preparation(key.clone(), table.clone(), &schema),

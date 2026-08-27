@@ -47,6 +47,77 @@ pub const MAX_PARTITION_SPECS: usize = 4096;
 /// Maximum number of storage properties carried on a table handle.
 pub const MAX_STORAGE_PROPERTIES: usize = 4096;
 
+/// Maximum number of data files one pinned file set may name.
+pub const MAX_PINNED_DATA_FILES: usize = 4096;
+
+/// Exactly the data files one read may touch.
+///
+/// This is a *set*, not a rule: a mutation or rewrite cohort commits a
+/// replacement for precisely these files, so re-deriving the selection from
+/// the snapshot, a predicate, or a size threshold would let the read and the
+/// commit disagree -- which corrupts the relation instead of returning a wrong
+/// answer. The set is minted by the connector's own mutation or rewrite
+/// preparation and only carried by everything downstream.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergPinnedDataFileSet {
+    paths: BTreeSet<Arc<str>>,
+}
+
+impl IcebergPinnedDataFileSet {
+    /// An empty set is legal and reads no rows; it is not "no restriction".
+    pub fn try_new<P: AsRef<str>>(
+        paths: impl IntoIterator<Item = P>,
+    ) -> Result<Self, ConnectorError> {
+        let mut set = BTreeSet::new();
+        for path in paths {
+            let path = path.as_ref();
+            if path.is_empty() || path.len() > MAX_PATH_BYTES {
+                return Err(invalid(
+                    "iceberg pinned data file path must be non-empty and bounded",
+                ));
+            }
+            if !set.insert(Arc::from(path)) {
+                return Err(invalid(format!(
+                    "iceberg pinned data file `{path}` is named more than once"
+                )));
+            }
+            if set.len() > MAX_PINNED_DATA_FILES {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "iceberg pinned data file count exceeds the hard limit",
+                ));
+            }
+        }
+        Ok(Self { paths: set })
+    }
+
+    pub const fn paths(&self) -> &BTreeSet<Arc<str>> {
+        &self.paths
+    }
+
+    pub fn contains(&self, path: &str) -> bool {
+        self.paths.contains(path)
+    }
+
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+
+    fn to_proto(&self) -> dto::IcebergPinnedDataFileSet {
+        dto::IcebergPinnedDataFileSet {
+            paths: self.paths.iter().map(|path| path.to_string()).collect(),
+        }
+    }
+
+    fn from_proto(raw: &dto::IcebergPinnedDataFileSet) -> Result<Self, ConnectorError> {
+        Self::try_new(&raw.paths)
+    }
+}
+
 /// The exact facts one worker-visible Iceberg table handle is built from.
 #[derive(Clone, Debug)]
 pub struct IcebergTableHandleParams {
@@ -71,6 +142,9 @@ pub struct IcebergTableHandleParams {
     pub name_mapping_json: Option<String>,
     pub table_location: String,
     pub storage_properties: BTreeMap<String, String>,
+    /// `None` reads the whole pinned snapshot. `Some` reads exactly this file
+    /// set, with no pruning of any kind applied on top of it.
+    pub pinned_data_files: Option<IcebergPinnedDataFileSet>,
 }
 
 /// One planned read of one pinned Iceberg snapshot.
@@ -89,6 +163,7 @@ pub struct IcebergTableHandle {
     name_mapping_json: Option<Arc<str>>,
     table_location: Arc<str>,
     storage_properties: BTreeMap<String, String>,
+    pinned_data_files: Option<IcebergPinnedDataFileSet>,
 }
 
 impl IcebergTableHandle {
@@ -107,7 +182,17 @@ impl IcebergTableHandle {
             name_mapping_json,
             table_location,
             storage_properties,
+            pinned_data_files,
         } = params;
+
+        // A file set names files of one snapshot. Without a snapshot there is
+        // no relation state those names belong to, so the pin would be a list
+        // of paths with nothing to check them against.
+        if pinned_data_files.is_some() && snapshot_id.is_none() {
+            return Err(invalid(
+                "iceberg pinned data file set requires a pinned snapshot",
+            ));
+        }
 
         if !(1..=3).contains(&format_version) {
             return Err(invalid(
@@ -180,11 +265,29 @@ impl IcebergTableHandle {
             name_mapping_json: name_mapping_json.map(|value| Arc::from(value.as_str())),
             table_location: Arc::from(table_location.as_str()),
             storage_properties,
+            pinned_data_files,
         })
     }
 
     pub const fn snapshot_id(&self) -> Option<i64> {
         self.snapshot_id
+    }
+
+    /// The exact file set this read is restricted to, when it has one.
+    pub const fn pinned_data_files(&self) -> Option<&IcebergPinnedDataFileSet> {
+        self.pinned_data_files.as_ref()
+    }
+
+    /// Whether planning may narrow this read at all.
+    ///
+    /// A pinned file set is the read's whole definition. A filter or a limit
+    /// accepted on top of it would let a pushdown decide which of the pinned
+    /// files -- or how many of their rows -- reach the reader, and a rewrite
+    /// that reads less than its commit replaces corrupts the relation rather
+    /// than returning a wrong answer. The engine keeps every predicate and its
+    /// own limit operator for such a read.
+    pub const fn accepts_pushdown(&self) -> bool {
+        self.pinned_data_files.is_none()
     }
 
     pub fn table_schema_json(&self) -> &str {
@@ -407,6 +510,10 @@ impl IcebergTableHandle {
                 .map(|value| value.to_string()),
             table_location: self.table_location.to_string(),
             storage_properties: self.storage_properties.clone(),
+            pinned_data_files: self
+                .pinned_data_files
+                .as_ref()
+                .map(IcebergPinnedDataFileSet::to_proto),
         }
     }
 
@@ -458,6 +565,11 @@ impl IcebergTableHandle {
             name_mapping_json: raw.name_mapping_json.clone(),
             table_location: raw.table_location.clone(),
             storage_properties: raw.storage_properties.clone(),
+            pinned_data_files: raw
+                .pinned_data_files
+                .as_ref()
+                .map(IcebergPinnedDataFileSet::from_proto)
+                .transpose()?,
         })
     }
 
@@ -645,6 +757,7 @@ pub(super) mod tests {
             name_mapping_json: None,
             table_location: "s3://warehouse/db/t".to_string(),
             storage_properties: BTreeMap::new(),
+            pinned_data_files: None,
         }
     }
 
@@ -941,6 +1054,81 @@ pub(super) mod tests {
                 uuid: vec![1, 2, 3],
             })
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_pinned_file_set_round_trips_and_refuses_narrowing() {
+        let schema = partitioned_schema();
+        let spec = identity_partition_spec(&schema);
+        let mut params = table_handle_params(&schema, Some(&spec));
+        params.pinned_data_files = Some(
+            IcebergPinnedDataFileSet::try_new(["s3://w/db/t/b.parquet", "s3://w/db/t/a.parquet"])
+                .expect("pinned file set"),
+        );
+        let handle = IcebergTableHandle::try_new(params).expect("handle");
+
+        let pinned = handle.pinned_data_files().expect("pinned file set");
+        assert_eq!(pinned.len(), 2);
+        assert!(pinned.contains("s3://w/db/t/a.parquet"));
+        assert!(!pinned.contains("s3://w/db/t/c.parquet"));
+        assert!(!handle.accepts_pushdown());
+        // The set travels in one canonical order, so the same pinned read is
+        // never two different reads on the wire.
+        assert_eq!(
+            handle.to_proto().pinned_data_files.expect("wire set").paths,
+            vec![
+                "s3://w/db/t/a.parquet".to_string(),
+                "s3://w/db/t/b.parquet".to_string()
+            ]
+        );
+
+        let encoded = handle.to_table_handle_proto();
+        assert_eq!(
+            IcebergTableHandle::from_table_handle_proto(&encoded).expect("decoded"),
+            handle
+        );
+        // A projection is not a narrowing of the file set, so it survives it.
+        let projected = handle
+            .apply_projection(
+                &OrderedAssignments::try_new(vec![
+                    Assignment::try_new(
+                        "v_id",
+                        IcebergColumnHandle::base_column_of(&schema, 1).expect("id"),
+                        ConnectorValueType::BigInt,
+                    )
+                    .expect("assignment"),
+                ])
+                .expect("assignments"),
+            )
+            .expect("projection")
+            .into_handle();
+        assert_eq!(projected.pinned_data_files(), handle.pinned_data_files());
+    }
+
+    #[test]
+    fn a_pinned_file_set_rejects_a_snapshotless_relation_and_a_repeated_path() {
+        let schema = partitioned_schema();
+        let spec = identity_partition_spec(&schema);
+        let mut params = table_handle_params(&schema, Some(&spec));
+        params.snapshot_id = None;
+        params.pinned_data_files =
+            Some(IcebergPinnedDataFileSet::try_new(["s3://w/db/t/a.parquet"]).expect("set"));
+        assert!(IcebergTableHandle::try_new(params).is_err());
+
+        assert!(
+            IcebergPinnedDataFileSet::try_new([
+                "s3://w/db/t/a.parquet".to_string(),
+                "s3://w/db/t/a.parquet".to_string(),
+            ])
+            .is_err()
+        );
+        assert!(IcebergPinnedDataFileSet::try_new([String::new()]).is_err());
+        // An empty pin is a legal read of no rows, not an absent restriction.
+        assert!(
+            IcebergPinnedDataFileSet::try_new(Vec::<String>::new())
+                .expect("empty set")
+                .is_empty()
         );
     }
 

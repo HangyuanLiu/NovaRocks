@@ -48,7 +48,15 @@ use super::delete_manager::{DeleteEvaluationMode, DeleteManager};
 use super::page_source::{
     IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache, create_iceberg_page_source,
 };
+use super::rewrite_position_page_source::{
+    IcebergRewritePositionDeleteFilesPageSourceRequest,
+    create_iceberg_rewrite_position_delete_files_page_source,
+};
 use super::split::IcebergSplit;
+use super::table_execute::{
+    IcebergRewritePositionDeleteFilesSplit, IcebergTableExecuteHandle,
+    IcebergTableExecuteProcedureHandle,
+};
 use super::table_handle::IcebergTableHandle;
 
 /// Reader policy the fragment instance chose, not something a split carries.
@@ -167,6 +175,25 @@ impl TypedConnectorPageSourceProvider for IcebergPageSourceProvider {
             );
         }
 
+        // A rewrite-position split opens no data file at all: it reads the
+        // delete artifacts its frozen group named and re-encodes the positions
+        // they hold. The data relation's reader has nothing to contribute to
+        // that, so both carriers are decoded here as their own pair.
+        if split.category() == SplitCategory::RewritePositionDeleteFiles {
+            let handle = iceberg_table_execute_handle(table)?;
+            let rewrite_split = iceberg_rewrite_position_delete_files_split(split)?;
+            expect_rewrite_position_delete_files(&handle)?;
+            return create_iceberg_rewrite_position_delete_files_page_source(
+                IcebergRewritePositionDeleteFilesPageSourceRequest {
+                    split: &rewrite_split,
+                    columns: &columns,
+                    access_binding: self.access_binding.clone(),
+                    context: self.context.clone(),
+                    budget: self.options.budget,
+                },
+            );
+        }
+
         let table_handle = iceberg_table_handle(table)?;
         let split = iceberg_data_split(split)?;
         let relation = IcebergReadRelation::of_table(&table_handle, split.partition_spec_id())?;
@@ -280,6 +307,73 @@ pub fn iceberg_change_window_split(
         )),
         SplitCategory::RewritePositionDeleteFiles => Err(invalid(
             "the iceberg change-window reader reads a change-window split, not a rewrite-position-delete split",
+        )),
+    }
+}
+
+/// Turn a protocol-validated relation into the Iceberg TABLE EXECUTE handle.
+pub fn iceberg_table_execute_handle(
+    table: &CatalogTableHandle,
+) -> Result<IcebergTableExecuteHandle, ConnectorError> {
+    match table.relation() {
+        ConnectorRelation::TableExecute(handle) => {
+            IcebergTableExecuteHandle::from_table_execute_handle_proto(handle)
+        }
+        ConnectorRelation::Table(_) => Err(invalid(
+            "a rewrite-position split names a table execute target, not a table",
+        )),
+        ConnectorRelation::TableFunction(_) => Err(invalid(
+            "a rewrite-position split names a table execute target, not a table function",
+        )),
+        ConnectorRelation::ChangeWindow(_) => Err(invalid(
+            "a rewrite-position split names a table execute target, not a change window",
+        )),
+        ConnectorRelation::SystemTable(_) => Err(invalid(
+            "a rewrite-position split names a table execute target, not a system relation",
+        )),
+        ConnectorRelation::MergeTable(_) => Err(invalid(
+            "a rewrite-position split names a table execute target, not a merge target",
+        )),
+    }
+}
+
+/// Prove the table-execute relation a rewrite-position split arrived with is
+/// the procedure that reads delete artifacts.
+///
+/// `OPTIMIZE` is the other procedure with a worker-visible handle, and it reads
+/// ordinary data splits; pairing it with this split would run a delete-artifact
+/// reader for a procedure whose commit replaces data files.
+fn expect_rewrite_position_delete_files(
+    handle: &IcebergTableExecuteHandle,
+) -> Result<(), ConnectorError> {
+    match handle.procedure_handle() {
+        Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_)) => Ok(()),
+        Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => Err(invalid(
+            "a rewrite-position split names a table execute target that does not rewrite position deletes",
+        )),
+    }
+}
+
+/// Turn a protocol-validated split into the Iceberg REWRITE POSITION DELETE
+/// split.
+pub fn iceberg_rewrite_position_delete_files_split(
+    split: &ValidatedConnectorSplit,
+) -> Result<IcebergRewritePositionDeleteFilesSplit, ConnectorError> {
+    match split.category() {
+        SplitCategory::RewritePositionDeleteFiles => {
+            IcebergRewritePositionDeleteFilesSplit::from_connector_split_proto(split.as_proto())
+        }
+        SplitCategory::Data => Err(invalid(
+            "the iceberg rewrite-position reader reads a rewrite-position-delete split, not a data split",
+        )),
+        SplitCategory::TableChanges => Err(invalid(
+            "the iceberg rewrite-position reader reads a rewrite-position-delete split, not a table-changes split",
+        )),
+        SplitCategory::ChangeWindow => Err(invalid(
+            "the iceberg rewrite-position reader reads a rewrite-position-delete split, not a change-window split",
+        )),
+        SplitCategory::SystemFiles => Err(invalid(
+            "the iceberg rewrite-position reader reads a rewrite-position-delete split, not a system-files split",
         )),
     }
 }

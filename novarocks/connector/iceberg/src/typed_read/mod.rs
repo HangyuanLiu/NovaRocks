@@ -38,6 +38,7 @@ pub mod delete_manager;
 pub mod merge;
 pub mod page_source;
 pub mod page_source_provider;
+pub mod rewrite_position_page_source;
 pub mod schema_binding;
 pub mod split;
 pub mod split_source;
@@ -79,6 +80,10 @@ pub use page_source_provider::{
     IcebergPageSourceProvider, IcebergPageSourceProviderOptions, iceberg_change_window_handle,
     iceberg_change_window_split, iceberg_data_split, iceberg_scan_columns, iceberg_table_handle,
 };
+pub use rewrite_position_page_source::{
+    IcebergRewritePositionDeleteFilesPageSourceRequest,
+    create_iceberg_rewrite_position_delete_files_page_source,
+};
 pub use schema_binding::{
     ALWAYS_BOUND_METADATA_COLUMNS, FileFieldIdCoverage, ICEBERG_METADATA_FIELD_ID_IS_DELETED,
     ICEBERG_METADATA_FIELD_ID_PATH, ICEBERG_METADATA_FIELD_ID_ROW_POSITION, IcebergBoundColumn,
@@ -104,9 +109,9 @@ pub use system_page_source::{
 };
 pub use system_table::{
     FilesTableSplit, FilesTableSplitParams, FilesTableSplitSource, FilesTableSplitSourceParams,
-    IcebergPartitionsView, IcebergSystemTableExecution, IcebergSystemTableReference,
-    IcebergSystemTableReferenceParams, IcebergSystemTableType, MAX_FILES_TABLE_MANIFESTS,
-    TrinoManifestContent, TrinoManifestFile, TrinoManifestFileParams,
+    IcebergSystemTableExecution, IcebergSystemTableReference, IcebergSystemTableReferenceParams,
+    IcebergSystemTableType, MAX_FILES_TABLE_MANIFESTS, TrinoManifestContent, TrinoManifestFile,
+    TrinoManifestFileParams,
 };
 pub use table_execute::{
     IcebergOptimizeHandle, IcebergProcedureExecution, IcebergProcedureId,
@@ -116,6 +121,6 @@ pub use table_execute::{
     REWRITE_POSITION_DELETE_OUTPUT_COLUMNS,
 };
 pub use table_handle::{
-    HiveTransactionHandle, IcebergTableHandle, IcebergTableHandleParams,
+    HiveTransactionHandle, IcebergPinnedDataFileSet, IcebergTableHandle, IcebergTableHandleParams,
     identity_partition_source_field_ids,
 };

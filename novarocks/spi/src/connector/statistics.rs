@@ -493,6 +493,7 @@ pub struct StatisticsCollectionPlan {
     table: ConnectorTableHandle,
     pub data_version: StatisticsDataVersion,
     evidence_revision: StatisticsEvidenceRevision,
+    base_version_ordinal: Option<i64>,
     pub metrics: StatisticsMetricRequest,
     scan_columns: Vec<StatisticsScanColumn>,
     provider_payload: Bytes,
@@ -503,6 +504,7 @@ impl StatisticsCollectionPlan {
         table: ConnectorTableHandle,
         data_version: StatisticsDataVersion,
         evidence_revision: StatisticsEvidenceRevision,
+        base_version_ordinal: Option<i64>,
         metrics: StatisticsMetricRequest,
         scan_columns: Vec<StatisticsScanColumn>,
         provider_payload: Bytes,
@@ -526,6 +528,7 @@ impl StatisticsCollectionPlan {
             table,
             data_version,
             evidence_revision,
+            base_version_ordinal,
             metrics,
             scan_columns,
             provider_payload: bounded_payload(provider_payload, "statistics collection plan")?,
@@ -540,6 +543,26 @@ impl StatisticsCollectionPlan {
     /// it unchanged to the final evidence and must never synthesize a token.
     pub fn evidence_revision(&self) -> &StatisticsEvidenceRevision {
         &self.evidence_revision
+    }
+
+    /// The provider's own version ordinal for the pin `data_version` names,
+    /// stated in the neutral vocabulary the engine can act on.
+    ///
+    /// `data_version` is an opaque token: Core can compare two of them but
+    /// cannot ask a relation to be read at one. This ordinal is the same pin
+    /// expressed as something a typed scan can name, so the collection
+    /// measures exactly the version its evidence is stamped with rather than
+    /// whatever the catalog's current version has become. It is the
+    /// read-side counterpart of
+    /// [`ConnectorRowMutationPreparation::base_version_ordinal`].
+    ///
+    /// `None` means the provider has no version ordinal at all. Core must then
+    /// refuse the collection: measuring the current version instead would
+    /// publish statistics for data nobody asked about.
+    ///
+    /// [`ConnectorRowMutationPreparation::base_version_ordinal`]: crate::connector::ConnectorRowMutationPreparation::base_version_ordinal
+    pub const fn base_version_ordinal(&self) -> Option<i64> {
+        self.base_version_ordinal
     }
 
     /// Provider-resolved compact schema for the normal connector scan. An

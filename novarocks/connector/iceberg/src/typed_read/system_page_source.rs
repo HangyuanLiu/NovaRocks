@@ -29,11 +29,14 @@
 //! manifest, and this module turns that manifest into the frozen 27-column
 //! `$files` shape.
 //!
-//! `$partitions` is not a relation of its own. It is the aggregation Trino calls
-//! `PartitionsView`, computed over the same pinned snapshot's `$files` rows --
-//! see [`IcebergPartitionsView`]. Giving it a worker enum variant would mean a
-//! second manifest walk, a second split shape, and a second aggregation, all to
-//! produce rows `$files` already produces.
+//! `$partitions` is the aggregation Trino calls `PartitionsView`, computed over
+//! the same pinned snapshot's `$files` rows. It carries its own reference kind
+//! because a `$files` reference reaching a backend reads as the un-aggregated
+//! relation -- one row per data file where the query asked for one row per
+//! partition -- but both kinds are minted by one resolution, so they can never
+//! describe different snapshots. It is read on a single backend: an aggregate
+//! over one manifest would report a partition that only part of the snapshot
+//! describes.
 //!
 //! Three rules shape every schema here:
 //!
@@ -75,8 +78,8 @@ use crate::iceberg::spec::{
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, type_to_json, unsupported};
 use super::system_table::{
-    FilesTableSplit, IcebergPartitionsView, IcebergSystemTableExecution,
-    IcebergSystemTableReference, IcebergSystemTableType, TrinoManifestFile,
+    FilesTableSplit, IcebergSystemTableExecution, IcebergSystemTableReference,
+    IcebergSystemTableType, TrinoManifestFile,
 };
 
 /// The Arrow rendering of `TIMESTAMP WITH TIME ZONE`.
@@ -703,6 +706,10 @@ pub fn system_relation_schema(
         IcebergSystemTableType::History => history_fields(),
         IcebergSystemTableType::Refs => refs_fields(),
         IcebergSystemTableType::Manifests => manifests_fields(),
+        IcebergSystemTableType::Partitions => partitions_fields(
+            partition_row_type(schema, specs)?.as_ref(),
+            partitions_metrics_row_type(schema)?.as_ref(),
+        ),
     };
     Ok(Arc::new(ArrowSchema::new(fields)))
 }
@@ -2551,45 +2558,6 @@ impl IcebergSystemTableProvider {
         )?))
     }
 
-    /// The `$partitions` reader: the aggregation over this pinned snapshot's
-    /// own `$files` rows.
-    ///
-    /// It walks every manifest of the snapshot rather than one, because an
-    /// aggregate over a single manifest would report a partition that only part
-    /// of the snapshot describes.
-    pub fn create_partitions_view_page_source(
-        &self,
-        view: &IcebergPartitionsView,
-        columns: &[IcebergColumnHandle],
-    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
-        let mut reader = FrozenMetadataReader::new(&self.binding, &self.context);
-        let metadata = reader.load_metadata(view.files())?;
-        let specs = metadata
-            .partition_specs_iter()
-            .map(|spec| spec.as_ref().clone())
-            .collect::<Vec<_>>();
-        let table_schema = metadata.current_schema().as_ref().clone();
-        let schema = partitions_view_schema(&table_schema, &specs)?;
-        let projection = project_system_relation_columns(&schema, columns)?;
-
-        let rows = read_snapshot_file_rows(
-            &mut reader,
-            &metadata,
-            view.files(),
-            EntryStatusRule::SkipDeleted,
-        )?;
-        let aggregates = aggregate_partitions(&rows);
-        let relation_columns = partitions_columns(&schema, &aggregates, &table_schema)?;
-        Ok(Box::new(IcebergSystemPageSource::new(
-            &schema,
-            relation_columns,
-            &projection,
-            aggregates.len(),
-            self.max_page_rows,
-            reader.bytes_read,
-        )?))
-    }
-
     /// The five single-backend relations, read straight from the frozen
     /// metadata file.
     fn create_single_backend_page_source(
@@ -2622,6 +2590,22 @@ impl IcebergSystemTableProvider {
                 )?;
                 let columns = entries_columns(&schema, &rows, &table_schema)?;
                 (columns, rows.len())
+            }
+            // The aggregation reads the same rows `$files` produces for this
+            // pinned snapshot and then groups them. It walks every manifest
+            // rather than one, because an aggregate over a single manifest
+            // would report a partition that only part of the snapshot
+            // describes -- which is why it cannot be a distributed relation.
+            IcebergSystemTableType::Partitions => {
+                let rows = read_snapshot_file_rows(
+                    &mut reader,
+                    &metadata,
+                    reference,
+                    EntryStatusRule::SkipDeleted,
+                )?;
+                let aggregates = aggregate_partitions(&rows);
+                let columns = partitions_columns(&schema, &aggregates, &table_schema)?;
+                (columns, aggregates.len())
             }
             IcebergSystemTableType::Snapshots => {
                 let columns = snapshots_columns(&schema, &metadata)?;
@@ -3847,22 +3831,25 @@ mod tests {
         let warehouse = runtime.block_on(build_warehouse(dir.path()));
         let provider = provider(&binding, &context);
 
-        let view = IcebergPartitionsView::try_new(reference(
+        let partitions = reference(
             &warehouse,
-            IcebergSystemTableType::Files,
+            IcebergSystemTableType::Partitions,
             Some(SNAPSHOT_ID),
-        ))
-        .expect("view");
+        );
         let specs = warehouse
             .metadata
             .partition_specs_iter()
             .map(|spec| spec.as_ref().clone())
             .collect::<Vec<_>>();
-        let schema =
-            partitions_view_schema(warehouse.metadata.current_schema(), &specs).expect("schema");
+        let schema = system_relation_schema(
+            IcebergSystemTableType::Partitions,
+            warehouse.metadata.current_schema(),
+            &specs,
+        )
+        .expect("schema");
 
         let mut source = provider
-            .create_partitions_view_page_source(&view, &all_columns(&schema))
+            .create_single_backend_page_source(&partitions, &all_columns(&schema))
             .expect("page source");
         let pages = drain(source.as_mut());
         let columns = &pages[0];

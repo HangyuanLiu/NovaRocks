@@ -195,6 +195,7 @@ pub fn build_frontend_query_session_factory(
         core_capabilities::StatisticsAttemptExecutorPorts::new(
             role,
             Arc::clone(&connector_control),
+            Arc::clone(&typed_connector_control),
             topology.clone(),
             query_execution.clone(),
             host.lake_publication_runtime_policy()

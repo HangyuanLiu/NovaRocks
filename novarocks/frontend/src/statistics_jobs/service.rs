@@ -678,9 +678,11 @@ fn map_application_result(
     result: StatisticsStatementResult,
 ) -> application::StatisticsApplicationResult {
     match result {
-        StatisticsStatementResult::JobSubmitted(job)
-        | StatisticsStatementResult::JobCompleted(job) => {
+        StatisticsStatementResult::JobSubmitted(job) => {
             application::StatisticsApplicationResult::JobSubmitted(job_view(job))
+        }
+        StatisticsStatementResult::JobCompleted(job) => {
+            application::StatisticsApplicationResult::JobCompleted(job_view(job))
         }
         StatisticsStatementResult::JobCancellationRequested(job) => {
             application::StatisticsApplicationResult::JobCancellationRequested(job_view(job))

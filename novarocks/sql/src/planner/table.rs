@@ -86,6 +86,26 @@ pub enum SqlScanKind {
     /// A connector-neutral external scan. Its exact execution authority is
     /// recovered by `binding` at the application preparation boundary.
     ConnectorRead,
+    /// A scan of one relation restricted to exactly the files a provider froze
+    /// for one mutation or rewrite cohort.
+    ///
+    /// SQL carries no file here and never could: the set is minted by the
+    /// connector's own preparation, and the application recovers it by
+    /// `binding` at the preparation boundary. It is a kind of its own because
+    /// a pinned read may not be narrowed -- neither by a predicate the
+    /// optimizer pushes nor by anything the connector would re-derive -- while
+    /// an ordinary `Data` scan may be.
+    PinnedFileSet,
+    /// A scan of the relation one distributed `ALTER TABLE ... EXECUTE`
+    /// procedure instance reads.
+    ///
+    /// SQL carries no procedure facts here: the frozen group is minted by the
+    /// connector's own rewrite preparation, and the application recovers it by
+    /// `binding` at the preparation boundary. It is a kind of its own because
+    /// what such a scan outputs is not the relation's rows -- rewriting delete
+    /// artifacts produces the rows those artifacts remove -- so neither a
+    /// `Data` predicate nor a pinned file set describes it.
+    TableExecute,
     Data {
         version: SqlTableVersionSelector,
     },

@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorControlPlanningLease, ConnectorExecutionDeclaration,
+    ConnectorFrozenRewriteGroup, ConnectorInstanceId, ConnectorPinnedFileSet,
     ConnectorPredicateDisposition, ConnectorScan, ConnectorSplit, ConnectorSplitPlanningMetrics,
     ConnectorStaticPredicate,
 };
@@ -39,24 +40,20 @@ pub(crate) trait ScanBindingResolver: Send + Sync {
         node_id: i32,
         scan: &PlanScanNode,
     ) -> Result<Option<ResolvedScanExecution>, String>;
-
-    /// Supplies the opaque connector execution read for a source whose
-    /// metadata was resolved and pinned before generic preparation.  Normal
-    /// query planning leaves this unimplemented; statistics collection uses
-    /// it to guarantee that preparation does not perform another latest
-    /// metadata lookup.
-    fn resolve_connector_read(
-        &self,
-        _node_id: i32,
-        _scan: &PlanScanNode,
-    ) -> Result<Option<PlannedConnectorRead>, String> {
-        Ok(None)
-    }
 }
 
+/// How one scan's relation was admitted, and by what.
+///
+/// Every variant is an admission, and the shared prefix says so on purpose:
+/// preparation refuses a scan it cannot name an admission for, so "admitted"
+/// is the property that makes a variant belong to this enum at all rather than
+/// a word repeated for want of a better one.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Every variant is an admission; the prefix states the property that admits it to this enum."
+)]
 pub(crate) enum ResolvedScanExecution {
-    ConnectorRead,
     /// A query-local opaque read admission.  Core may inspect only its SPI
     /// schema and selector while preparation asks the exact lease to plan it.
     AdmittedConnectorRead(QueryScanMaterialization),
@@ -74,6 +71,71 @@ pub(crate) enum ResolvedScanExecution {
     /// two endpoints come from the SQL scan itself, and the connector freezes
     /// one change-window relation pinned to both of them.
     AdmittedChangeWindow(QueryScanMaterialization),
+    /// One provider-frozen cohort read of a pinned file set.
+    AdmittedPinnedFileSet(QueryPinnedFileSetRead),
+    /// One provider-frozen cohort read of a distributed
+    /// `ALTER TABLE ... EXECUTE` procedure's own relation.
+    AdmittedTableExecute(QueryRewriteGroupRead),
+}
+
+/// The exact facts one provider-frozen cohort read is planned from.
+///
+/// The file set was minted by the connector's own mutation or rewrite
+/// preparation and is only carried here: the engine neither derives it nor may
+/// narrow it, because the cohort's commit replaces precisely those files.
+#[derive(Clone)]
+pub(crate) struct QueryPinnedFileSetRead {
+    /// The relation, the version, and exactly the files this cohort reads.
+    /// All three are the connector's own; the SQL name that carries the read
+    /// through planning is query-local and synthetic, so it names nothing the
+    /// connector could resolve.
+    pub(crate) pinned: ConnectorPinnedFileSet,
+    /// The instance that pinned the set. It is the exact-owner witness for
+    /// this read; the relation itself is frozen from the pinned set above.
+    pub(crate) owner: ConnectorInstanceId,
+    pub(crate) planning_lease: ConnectorControlPlanningLease,
+}
+
+impl std::fmt::Debug for QueryPinnedFileSetRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PinnedFileSetRead")
+            .field("namespace", &self.pinned.namespace())
+            .field("table", &self.pinned.table())
+            .field("version_ordinal", &self.pinned.version_ordinal())
+            .field("files", &self.pinned.files().len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The exact facts one distributed procedure's cohort read is planned from.
+///
+/// The group was minted by the connector's own rewrite preparation and is only
+/// carried here. It names the artifacts the cohort reads, which are the same
+/// artifacts its commit replaces: the engine neither derives that set nor could
+/// -- re-deriving it from a rule would let the read and the commit disagree.
+#[derive(Clone)]
+pub(crate) struct QueryRewriteGroupRead {
+    /// The relation and the immutable artifact this cohort's group lives in.
+    pub(crate) group: ConnectorFrozenRewriteGroup,
+    /// The group inside that artifact.
+    pub(crate) group_digest: [u8; 32],
+    /// The instance that minted the group. It is the exact-owner witness for
+    /// this read; the SQL name that carries it through planning is query-local
+    /// and synthetic, so it names nothing the connector could resolve.
+    pub(crate) owner: ConnectorInstanceId,
+    pub(crate) planning_lease: ConnectorControlPlanningLease,
+}
+
+impl std::fmt::Debug for QueryRewriteGroupRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RewriteGroupRead")
+            .field("namespace", &self.group.schema_name())
+            .field("table", &self.group.table_name())
+            .field("artifact_location", &self.group.artifact_location())
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

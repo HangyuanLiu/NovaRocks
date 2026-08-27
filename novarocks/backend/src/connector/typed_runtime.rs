@@ -47,6 +47,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::connector::runtime::ConnectorBatchTransform;
+use crate::fragment::decode::plan::context::RuntimeFilterSessionResolver;
 use crate::runtime_filter::typed_dynamic_filter::scan_dynamic_filter;
 use novarocks_execution::connector::{
     ConnectorPageAdapter, PageConversion, SplitPoll, SplitQueue, TaskAttemptSplitQueues,
@@ -59,7 +60,7 @@ use novarocks_execution::exec::node::scan::{
 };
 use novarocks_execution::exec::node::{BoxedExecIter, ExecResult};
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
-use novarocks_execution::runtime_filter::{RuntimeFilterConsumerContract, RuntimeFilterSessionRef};
+use novarocks_execution::runtime_filter::RuntimeFilterConsumerContract;
 use novarocks_proto::connector_read::{
     ConnectorTableScanSource, ScheduledSplit, TypedConnectorPageSourceProvider,
     TypedConnectorSystemTableProvider, ValidatedColumnHandle, WireDynamicFilter,
@@ -114,10 +115,14 @@ struct TypedConnectorScanShared {
     scan: ConnectorTableScanSource,
     provider: Arc<dyn TypedConnectorPageSourceProvider>,
     session: ConnectorSession,
-    /// The attempt's runtime-filter session, absent when this attempt installed
-    /// none. Retained because the consumer contracts that make a live filter
-    /// possible are decoded after this source is built.
-    runtime_filter: Option<RuntimeFilterSessionRef>,
+    /// Resolves the attempt's runtime-filter session at the moment it is
+    /// needed. Held as a resolver rather than a session because a fragment
+    /// does not hold its admission permit while its plan is decoded, and the
+    /// lifecycle refuses a session without one.
+    runtime_filter: RuntimeFilterSessionResolver,
+    /// This fragment's runtime-filter consumer contracts, by the filter id the
+    /// scan carrier binds. Empty when the scan consumes no runtime filter.
+    runtime_filter_contracts: BTreeMap<u32, RuntimeFilterConsumerContract>,
     /// Deadline and cancellation, exactly as the opaque connector path uses
     /// them: checked before every open and on every driver turn.
     request: ConnectorRequestContext,
@@ -213,7 +218,7 @@ impl TypedConnectorScanSource {
         queues: Arc<TaskAttemptSplitQueues>,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
-        runtime_filter: Option<RuntimeFilterSessionRef>,
+        runtime_filter: RuntimeFilterSessionResolver,
     ) -> Self {
         let dynamic_filter = complete_all_scan_dynamic_filter(&scan);
         Self {
@@ -222,6 +227,7 @@ impl TypedConnectorScanSource {
                 provider,
                 session,
                 runtime_filter,
+                runtime_filter_contracts: BTreeMap::new(),
                 request,
                 plan_node_id,
                 slot_ids,
@@ -270,13 +276,48 @@ impl TypedConnectorScanSource {
     /// installed provider, the session, and the request all belong to this
     /// fragment instance and are unaffected by which filter the page sources
     /// consult.
+    /// Carry this fragment's consumer contracts without subscribing yet.
+    fn with_recorded_contracts(
+        &self,
+        contracts: BTreeMap<u32, RuntimeFilterConsumerContract>,
+    ) -> Self {
+        let mut rebuilt = self.with_substituted_filter(Arc::clone(&self.shared.dynamic_filter));
+        Arc::get_mut(&mut rebuilt.shared)
+            .expect("a freshly rebuilt typed scan source is not shared")
+            .runtime_filter_contracts = contracts;
+        rebuilt
+    }
+
+    /// Subscribe to the live filter, now that the attempt will hand out its
+    /// runtime-filter session.
+    ///
+    /// Absent session or absent contract both mean this scan receives no
+    /// feedback, and it keeps the truthful unconstrained filter rather than
+    /// claiming one that could never narrow.
+    fn live_dynamic_filter(&self) -> Result<Option<Arc<WireDynamicFilter>>, String> {
+        if self.shared.runtime_filter_contracts.is_empty() {
+            return Ok(None);
+        }
+        let Some(session) = (self.shared.runtime_filter)() else {
+            return Ok(None);
+        };
+        scan_dynamic_filter(
+            &self.shared.scan,
+            Some(&session),
+            &self.shared.runtime_filter_contracts,
+        )
+        .map(Some)
+        .map_err(|error| error.to_string())
+    }
+
     fn with_substituted_filter(&self, dynamic_filter: Arc<WireDynamicFilter>) -> Self {
         Self {
             shared: Arc::new(TypedConnectorScanShared {
                 scan: self.shared.scan.clone(),
                 provider: Arc::clone(&self.shared.provider),
                 session: self.shared.session.clone(),
-                runtime_filter: self.shared.runtime_filter.clone(),
+                runtime_filter: Arc::clone(&self.shared.runtime_filter),
+                runtime_filter_contracts: self.shared.runtime_filter_contracts.clone(),
                 request: self.shared.request.clone(),
                 plan_node_id: self.shared.plan_node_id,
                 slot_ids: self.shared.slot_ids.clone(),
@@ -317,8 +358,14 @@ impl ScanSource for TypedConnectorScanSource {
                 waiter.wake();
             }
         }));
+        // Subscribing here rather than at decode: this is the first moment the
+        // attempt will hand out its runtime-filter session.
+        let shared = match self.live_dynamic_filter()? {
+            Some(dynamic_filter) => self.with_substituted_filter(dynamic_filter).shared,
+            None => Arc::clone(&self.shared),
+        };
         Ok(Arc::new(TypedConnectorScanOp {
-            shared: Arc::clone(&self.shared),
+            shared,
             queue,
             waiter,
             sources: Arc::new(TypedPageSourceGroup::default()),
@@ -340,9 +387,6 @@ impl ScanSource for TypedConnectorScanSource {
         &self,
         contracts: &[RuntimeFilterConsumerBinding],
     ) -> Result<Option<Arc<dyn ScanSource>>, String> {
-        let Some(session) = self.shared.runtime_filter.as_ref() else {
-            return Ok(None);
-        };
         let by_filter_id: BTreeMap<u32, RuntimeFilterConsumerContract> = contracts
             .iter()
             .map(|binding| {
@@ -355,9 +399,11 @@ impl ScanSource for TypedConnectorScanSource {
         if by_filter_id.is_empty() {
             return Ok(None);
         }
-        let dynamic_filter = scan_dynamic_filter(&self.shared.scan, Some(session), &by_filter_id)
-            .map_err(|error| error.to_string())?;
-        Ok(Some(Arc::new(self.with_substituted_filter(dynamic_filter))))
+        // Recorded, not subscribed. Subscribing needs the attempt's
+        // runtime-filter session, which the lifecycle will not hand out while
+        // this fragment is still being decoded, so the subscription happens
+        // when the scan binds.
+        Ok(Some(Arc::new(self.with_recorded_contracts(by_filter_id))))
     }
 }
 
@@ -889,6 +935,7 @@ pub(crate) mod test_support {
             limit: None,
             projected_columns: vec![iceberg_column_handle(1)],
             name_mapping_json: None,
+            pinned_data_files: None,
             table_location: "s3://bucket/warehouse/db/t".to_owned(),
             storage_properties: BTreeMap::new(),
         }
@@ -1021,7 +1068,10 @@ pub(crate) mod test_support {
         )
         .expect("session");
         crate::fragment::decode::plan::context::TypedScanRuntime::new(
-            providers, queues, session, None,
+            providers,
+            queues,
+            session,
+            std::sync::Arc::new(|| None),
         )
     }
 
@@ -1236,6 +1286,11 @@ mod tests {
         }
     }
 
+    /// A scan whose attempt installed no runtime filter.
+    fn no_runtime_filter() -> RuntimeFilterSessionResolver {
+        Arc::new(|| None)
+    }
+
     fn int_page(values: Vec<i64>) -> SourcePage {
         let positions = values.len();
         let column: ArrayRef = Arc::new(Int64Array::from(values));
@@ -1290,7 +1345,7 @@ mod tests {
             queues,
             NODE,
             vec![SlotId::new(1)],
-            None,
+            no_runtime_filter(),
         )
     }
 
@@ -1689,7 +1744,7 @@ mod tests {
             Arc::clone(&queues),
             NODE,
             vec![SlotId::new(1)],
-            None,
+            no_runtime_filter(),
         )
         .with_backend_dynamic_filter(Arc::new(CompleteAllDynamicFilter::new(covered)));
         let op = bind(&source);

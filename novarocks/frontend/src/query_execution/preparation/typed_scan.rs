@@ -34,10 +34,12 @@ use std::sync::Arc;
 use novarocks_proto::FieldPath;
 use novarocks_proto::connector_read::{
     ConnectorRelationKind, ConnectorTableScanSource, ScanAssignment, TypedChangeWindow,
-    TypedColumnBinding, TypedConnectorSplitManager, TypedRelationVersion, ValidatedColumnHandle,
-    WireConstraint, encode_connector_expression, encode_tuple_domain, encode_value_type,
+    TypedColumnBinding, TypedConnectorSplitManager, TypedRelationVersion,
+    TypedTableExecuteProcedure, ValidatedColumnHandle, WireConstraint, encode_connector_expression,
+    encode_tuple_domain, encode_value_type,
 };
 use novarocks_proto_models::connector_read as dto;
+use novarocks_spi::connector::ConnectorPinnedFileSet;
 use novarocks_spi::connector::read_stack::{
     ConnectorSession, ConnectorValueType, SchemaTableName, SystemTableDistribution, TupleDomain,
 };
@@ -75,6 +77,14 @@ pub(crate) enum TypedRelationFreeze<'a> {
         version: TypedRelationVersion,
         reference: Option<&'a str>,
     },
+    /// One relation restricted to exactly the files a provider froze for one
+    /// mutation or rewrite cohort.
+    ///
+    /// The set is the whole definition of the read. It is a freeze of its own
+    /// rather than a `Table` with a pushdown, because a pushdown may be
+    /// declined and a declined file set would silently widen the read to the
+    /// whole snapshot -- which a cohort's commit then contradicts.
+    PinnedFileSet(&'a ConnectorPinnedFileSet),
     /// The set difference between the rows visible at two snapshots.
     ///
     /// Both endpoints are pinned by the frozen handle. A row written and
@@ -82,6 +92,15 @@ pub(crate) enum TypedRelationFreeze<'a> {
     /// therefore not part of the window: this is a difference of two visible
     /// row sets, never a replay of the manifests between them.
     ChangeWindow(TypedChangeWindow),
+    /// The relation one distributed `ALTER TABLE ... EXECUTE` procedure
+    /// instance reads.
+    ///
+    /// The procedure names the exact frozen group it rewrites, and the
+    /// connector resolves that group back to its artifacts itself. It is a
+    /// freeze of its own because what such a read produces is not the
+    /// relation's rows: rewriting delete artifacts produces the rows those
+    /// artifacts remove, which no `Table` or `PinnedFileSet` read can describe.
+    TableExecute(TypedTableExecuteProcedure<'a>),
     /// One system relation of a table.
     ///
     /// It carries no pin of its own: the relation name already spells the
@@ -95,8 +114,9 @@ impl TypedRelationFreeze<'_> {
     /// The relation family this freeze must produce.
     pub(crate) const fn relation_kind(self) -> ConnectorRelationKind {
         match self {
-            Self::Table { .. } => ConnectorRelationKind::Table,
+            Self::Table { .. } | Self::PinnedFileSet(_) => ConnectorRelationKind::Table,
             Self::ChangeWindow(_) => ConnectorRelationKind::ChangeWindow,
+            Self::TableExecute(_) => ConnectorRelationKind::TableExecute,
             Self::SystemTable => ConnectorRelationKind::SystemTable,
         }
     }
@@ -208,6 +228,23 @@ pub(crate) fn prepare_typed_scan(
                 })?;
             (handle, dto::ScanWorkSource::RuntimeSplits)
         }
+        TypedRelationFreeze::PinnedFileSet(pinned) => {
+            let handle = metadata
+                .get_pinned_file_set_handle(session, relation, pinned)
+                .map_err(|error| {
+                    format!(
+                        "typed scan cannot freeze relation {relation_name} restricted to the {} data files pinned at version {}: {error}",
+                        pinned.files().len(),
+                        pinned.version_ordinal()
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "typed scan relation {relation_name} does not expose a pinned file set read"
+                    )
+                })?;
+            (handle, dto::ScanWorkSource::RuntimeSplits)
+        }
         TypedRelationFreeze::ChangeWindow(window) => {
             let handle = metadata
                 .get_change_window_plan(session, relation, window)
@@ -223,6 +260,22 @@ pub(crate) fn prepare_typed_scan(
                         "typed scan relation {relation_name} exposes no change window from snapshot {} to snapshot {}",
                         window.from_snapshot_id(),
                         window.to_snapshot_id()
+                    )
+                })?;
+            (handle, dto::ScanWorkSource::RuntimeSplits)
+        }
+        TypedRelationFreeze::TableExecute(procedure) => {
+            let handle = metadata
+                .get_table_execute_plan(session, relation, procedure)
+                .map_err(|error| {
+                    format!(
+                        "typed scan cannot freeze the table-execute relation of {relation_name} for the rewrite group frozen in artifact {}: {error}",
+                        procedure.group().artifact_location()
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "typed scan relation {relation_name} exposes no table-execute relation"
                     )
                 })?;
             (handle, dto::ScanWorkSource::RuntimeSplits)
@@ -561,6 +614,8 @@ mod tests {
         system_table: Option<SystemTableDistribution>,
         /// Every relation name the stub was asked for a system table plan.
         system_tables_requested: Mutex<Vec<String>>,
+        /// Every pinned file set the stub was asked to freeze.
+        pinned_file_sets_requested: Mutex<Vec<ConnectorPinnedFileSet>>,
     }
 
     impl StubControl {
@@ -578,6 +633,7 @@ mod tests {
                 change_windows_requested: Mutex::new(Vec::new()),
                 system_table: Some(SystemTableDistribution::SingleCoordinator),
                 system_tables_requested: Mutex::new(Vec::new()),
+                pinned_file_sets_requested: Mutex::new(Vec::new()),
             }
         }
     }
@@ -590,6 +646,19 @@ mod tests {
             _version: TypedRelationVersion,
             _reference: Option<&str>,
         ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+            Ok(self.handle.clone())
+        }
+
+        fn get_pinned_file_set_handle(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+            pinned: &ConnectorPinnedFileSet,
+        ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+            self.pinned_file_sets_requested
+                .lock()
+                .expect("pinned file set lock")
+                .push(pinned.clone());
             Ok(self.handle.clone())
         }
 
@@ -678,6 +747,15 @@ mod tests {
                 .push(window);
             Ok(self.change_window.clone())
         }
+
+        fn get_table_execute_plan(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+            _procedure: TypedTableExecuteProcedure<'_>,
+        ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+            Ok(None)
+        }
     }
 
     impl TypedConnectorSplitManager for StubControl {
@@ -734,6 +812,7 @@ mod tests {
                                 enforced_predicate: Some(all_domain()),
                                 limit: None,
                                 projected_columns: Vec::new(),
+                                pinned_data_files: None,
                                 name_mapping_json: None,
                                 table_location: "s3://bucket/table".to_owned(),
                                 storage_properties: BTreeMap::new(),

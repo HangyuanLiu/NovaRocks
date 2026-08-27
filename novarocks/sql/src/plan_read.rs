@@ -435,6 +435,8 @@ pub struct SqlTableDefRead {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlScanSourceRead {
     ConnectorRead,
+    PinnedFileSet,
+    TableExecute,
     Data,
     FrozenInputSet,
     Metadata,
@@ -856,6 +858,8 @@ fn sql_scan_source_read(source: &crate::planner::table::ScanSource) -> SqlScanSo
     match source {
         crate::planner::table::ScanSource::Sql(source) => match &source.kind {
             crate::planner::table::SqlScanKind::ConnectorRead => SqlScanSourceRead::ConnectorRead,
+            crate::planner::table::SqlScanKind::PinnedFileSet => SqlScanSourceRead::PinnedFileSet,
+            crate::planner::table::SqlScanKind::TableExecute => SqlScanSourceRead::TableExecute,
             crate::planner::table::SqlScanKind::Data { .. } => SqlScanSourceRead::Data,
             crate::planner::table::SqlScanKind::FrozenInputSet { .. } => {
                 SqlScanSourceRead::FrozenInputSet

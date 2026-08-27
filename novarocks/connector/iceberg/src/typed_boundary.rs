@@ -49,19 +49,20 @@ use novarocks_proto::connector_read::{
     CatalogTableHandle, ConnectorRelation, ScanAssignment, TypedChangeWindow, TypedColumnBinding,
     TypedConnectorMetadata, TypedConnectorSplitManager, TypedConnectorSplitSource,
     TypedFilterApplication, TypedLimitApplication, TypedRelationVersion, TypedSystemTablePlan,
-    ValidatedColumnHandle, ValidatedConnectorSplit, WireConstraint, WireDynamicFilterSnapshot,
-    decode_tuple_domain as decode_wire_tuple_domain,
+    TypedTableExecuteProcedure, ValidatedColumnHandle, ValidatedConnectorSplit, WireConstraint,
+    WireDynamicFilterSnapshot, decode_tuple_domain as decode_wire_tuple_domain,
     encode_tuple_domain as encode_wire_tuple_domain,
 };
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
     Assignment, Bound, ConnectorExpression, ConnectorSession, ConnectorSplitBatch,
     ConnectorSplitSource, ConnectorTableHandle as _, ConnectorValue, Constraint, Domain,
-    DynamicFilterSnapshot, OrderedAssignments, SchemaTableName, SystemTableDistribution,
-    TupleDomain,
+    DynamicFilterSnapshot, OrderedAssignments, SchemaTableName, SplitWeight,
+    SystemTableDistribution, TupleDomain,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
+    ConnectorPinnedFileSet,
 };
 
 use crate::file_pruning::file_may_satisfy_physical_predicates;
@@ -87,13 +88,18 @@ use crate::typed_read::{
     FilesTableSplitSourceParams, HiveTransactionHandle, ICEBERG_CHANGE_OP_COLUMN,
     IcebergChangeSplit, IcebergChangeWindowEndpoints, IcebergChangeWindowHandle,
     IcebergChangeWindowHandleParams, IcebergChangeWindowSplitSource, IcebergColumnHandle,
-    IcebergDeleteFileFacts, IcebergFileFormat, IcebergMetadataColumn, IcebergPlannedDataFile,
+    IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileFacts, IcebergDeleteFileParams,
+    IcebergFileFormat, IcebergMetadataColumn, IcebergPinnedDataFileSet, IcebergPlannedDataFile,
+    IcebergRewriteArtifactContentId, IcebergRewritePositionDeleteFilesHandle,
+    IcebergRewritePositionDeleteFilesSplit, IcebergRewritePositionDeleteFilesSplitParams,
     IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions, IcebergSystemTableExecution,
-    IcebergSystemTableReference, IcebergTableHandle, IcebergTableHandleParams,
-    ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile, bounds_row_type, change_op_column_handle,
-    decode_tuple_domain as decode_iceberg_tuple_domain, derived_row_type_json,
-    encode_tuple_domain as encode_iceberg_tuple_domain, files_relation_schema_json,
-    partition_row_type, plan_change_window_splits, system_relation_columns,
+    IcebergSystemTableReference, IcebergTableExecuteHandle, IcebergTableExecuteHandleParams,
+    IcebergTableExecuteProcedureHandle, IcebergTableHandle, IcebergTableHandleParams,
+    REWRITE_POSITION_DELETE_OUTPUT_COLUMNS, ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile,
+    bounds_row_type, change_op_column_handle, decode_tuple_domain as decode_iceberg_tuple_domain,
+    derived_row_type_json, encode_tuple_domain as encode_iceberg_tuple_domain,
+    files_relation_schema_json, partition_row_type, plan_change_window_splits,
+    system_relation_columns,
 };
 
 /// The Iceberg table property carrying the default name mapping.
@@ -132,28 +138,23 @@ pub enum IcebergSystemRelation {
     History,
     Refs,
     Manifests,
-    /// `$partitions` aggregates the very rows `$files` produces for the same
-    /// pinned snapshot. It is deliberately absent from the wire's system-table
-    /// enum: minting a seventh reference kind would give the aggregation its
-    /// own resolution path, and the two could then disagree about which
-    /// snapshot they describe.
+    /// The aggregation over the very rows `$files` produces for the same
+    /// pinned snapshot. It has its own reference kind rather than borrowing
+    /// FILES: a FILES reference reaching a backend reads as the un-aggregated
+    /// relation, one row per data file instead of one row per partition. Both
+    /// are minted by one resolution, so they cannot describe different
+    /// snapshots.
     Partitions,
 }
 
 impl IcebergSystemRelation {
     /// How a worker is told to read this relation, when a worker can.
     ///
-    /// `None` is `$partitions` and only `$partitions`: it is an aggregation
-    /// over `$files`, and the wire has no reference kind that says so. A FILES
-    /// reference would reach a backend as the un-aggregated `$files` relation,
-    /// which answers a different question with a plausible shape -- one row per
-    /// data file instead of one row per partition -- so it is refused at
-    /// planning instead.
-    ///
     /// FILES is distributed because it walks every manifest of the snapshot,
-    /// which is real divisible I/O. The other five read only the single pinned
+    /// which is real divisible I/O. The others read only the single pinned
     /// metadata file, so spreading them over the cluster would multiply one
-    /// small read rather than divide any work.
+    /// small read rather than divide any work -- and `$partitions`, which does
+    /// walk every manifest, still has to see all of them at once to aggregate.
     const fn worker_plan(self) -> Option<(dto::IcebergSystemTableType, SystemTableDistribution)> {
         match self {
             Self::Files => Some((
@@ -180,7 +181,15 @@ impl IcebergSystemRelation {
                 dto::IcebergSystemTableType::Manifests,
                 SystemTableDistribution::SingleCoordinator,
             )),
-            Self::Partitions => None,
+            // Minted by the same resolution as FILES, from the same metadata
+            // file, uuid and snapshot, so the aggregation and the relation it
+            // aggregates can never describe different snapshots. It is single
+            // backend because an aggregate over one manifest would report a
+            // partition that only part of the snapshot describes.
+            Self::Partitions => Some((
+                dto::IcebergSystemTableType::Partitions,
+                SystemTableDistribution::SingleCoordinator,
+            )),
         }
     }
 }
@@ -374,15 +383,25 @@ impl IcebergTypedBoundary {
         constraint: &WireConstraint,
     ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
         let schema = handle.parse_table_schema()?;
-        let static_predicate = handle
-            .effective_predicate()?
-            .intersect(&wire_domain_to_iceberg(constraint.summary())?)?;
-        if static_predicate.is_none() {
-            // Planning already proved the scan reads nothing, so no manifest
-            // needs to be opened at all.
-            return Ok(Vec::new());
-        }
-        let predicates = physical_predicates(&static_predicate, &schema);
+        let pinned = handle.pinned_data_files();
+        // A pinned read is defined by its file set, so nothing here may narrow
+        // it. The offered constraint is deliberately not consulted: unlike an
+        // ordinary scan, whose pruning only changes which rows a query sees,
+        // dropping a file from a rewrite makes its commit replace a file the
+        // reader never produced rows for.
+        let predicates = if pinned.is_some() {
+            Vec::new()
+        } else {
+            let static_predicate = handle
+                .effective_predicate()?
+                .intersect(&wire_domain_to_iceberg(constraint.summary())?)?;
+            if static_predicate.is_none() {
+                // Planning already proved the scan reads nothing, so no
+                // manifest needs to be opened at all.
+                return Ok(Vec::new());
+            }
+            physical_predicates(&static_predicate, &schema)
+        };
 
         let physical = self.load_pinned_relation(handle.schema_table_name())?;
         let table = physical.table.clone();
@@ -395,8 +414,14 @@ impl IcebergTypedBoundary {
             .map_err(unavailable)?;
 
         let mut planned = Vec::with_capacity(read_snapshot.files.len());
+        let mut pinned_seen = 0_usize;
         for read_file in read_snapshot.files {
-            if !predicates.is_empty()
+            if let Some(pinned) = pinned {
+                if !pinned.contains(&read_file.path) {
+                    continue;
+                }
+                pinned_seen += 1;
+            } else if !predicates.is_empty()
                 && !file_may_satisfy_physical_predicates(
                     &pruning_view(handle, &schema, &read_file)?,
                     &predicates,
@@ -405,6 +430,20 @@ impl IcebergTypedBoundary {
                 continue;
             }
             planned.push(planned_data_file(read_file, &facts)?);
+        }
+        // A pinned file the snapshot no longer holds is not an empty read: the
+        // cohort was frozen against a relation state that has since changed,
+        // and reading the rest would commit a replacement for rows nobody
+        // produced. It fails here, before a single split is scheduled.
+        if let Some(pinned) = pinned
+            && pinned_seen != pinned.len()
+        {
+            return Err(corrupt(format!(
+                "iceberg pinned read of {}.{} names {} data files but snapshot {snapshot_id} holds only {pinned_seen} of them",
+                handle.schema_table_name().schema_name(),
+                handle.schema_table_name().table_name(),
+                pinned.len(),
+            )));
         }
         Ok(planned)
     }
@@ -458,6 +497,34 @@ impl IcebergTypedBoundary {
             )),
             ConnectorRelation::MergeTable(_) => Err(unsupported(
                 "an iceberg merge relation is not a change window",
+            )),
+        }
+    }
+
+    /// The typed `ALTER TABLE ... EXECUTE` relation, decoded.
+    fn table_execute_handle(
+        &self,
+        table: &CatalogTableHandle,
+    ) -> Result<IcebergTableExecuteHandle, ConnectorError> {
+        self.ensure_owned(table)?;
+        match table.relation() {
+            ConnectorRelation::TableExecute(handle) => {
+                IcebergTableExecuteHandle::from_table_execute_handle_proto(handle)
+            }
+            ConnectorRelation::Table(_) => Err(unsupported(
+                "an iceberg data relation is not a table execute target",
+            )),
+            ConnectorRelation::TableFunction(_) => Err(unsupported(
+                "an iceberg table-function relation is not a table execute target",
+            )),
+            ConnectorRelation::ChangeWindow(_) => Err(unsupported(
+                "an iceberg change-window relation is not a table execute target",
+            )),
+            ConnectorRelation::SystemTable(_) => Err(unsupported(
+                "an iceberg system relation is not a table execute target",
+            )),
+            ConnectorRelation::MergeTable(_) => Err(unsupported(
+                "an iceberg merge relation is not a table execute target",
             )),
         }
     }
@@ -622,6 +689,192 @@ impl IcebergTypedBoundary {
         )?;
         Ok(IcebergChangeWindowSplitSource::new(plan))
     }
+
+    /// Enumerate the delete artifacts one frozen rewrite group names.
+    ///
+    /// Exactly one split is produced, because a position-delete group names one
+    /// data file and the vectors that address it: the rewritten artifact is a
+    /// single ordered position list for that file, so cutting the read further
+    /// would ask two writers to produce halves of one file.
+    fn table_execute_split_source(
+        &self,
+        handle: &IcebergTableExecuteHandle,
+    ) -> Result<Box<dyn TypedConnectorSplitSource>, ConnectorError> {
+        let rewrite = match handle.procedure_handle() {
+            Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(rewrite)) => {
+                rewrite
+            }
+            Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => {
+                return Err(unsupported(
+                    "an iceberg optimize procedure reads data splits, not a table-execute relation",
+                ));
+            }
+        };
+        let table_handle = rewrite.table_handle();
+        let snapshot_id = table_handle.snapshot_id().ok_or_else(|| {
+            corrupt("an iceberg rewrite position delete relation carries no pinned snapshot")
+        })?;
+        let physical = self.load_pinned_relation(table_handle.schema_table_name())?;
+        let (data_file, selected) =
+            crate::distributed_rewrite::plan_rewrite_position_delete_splits(
+                &self.runtime,
+                &physical.table,
+                snapshot_id,
+                &crate::distributed_rewrite::IcebergRewriteGroupPayloadV1 {
+                    version: crate::distributed_rewrite::GROUP_PAYLOAD_VERSION,
+                    group_digest_hex: rewrite.group_digest_hex().to_string(),
+                    artifact_digest_hex: rewrite.artifact().artifact_digest_hex().to_string(),
+                    artifact_location: rewrite.artifact().artifact_location().to_string(),
+                },
+            )?;
+        let mut deletes = Vec::with_capacity(selected.len());
+        for delete in &selected {
+            deletes.push(rewrite_position_delete_file(delete)?);
+        }
+        let split = IcebergRewritePositionDeleteFilesSplit::try_new(
+            IcebergRewritePositionDeleteFilesSplitParams {
+                data_file_path: data_file.path.clone(),
+                data_file_size: data_file.size,
+                // Every data file of an Iceberg manifest belongs to exactly one
+                // partition spec, including the unpartitioned spec. A frozen
+                // group that recorded none did not come from a manifest walk,
+                // so the read fails rather than adopting the table's current
+                // default -- which may not be the spec the file was written
+                // under.
+                partition_spec_id: data_file.partition_spec_id.ok_or_else(|| {
+                    corrupt(format!(
+                        "iceberg rewrite position delete data file {} records no partition spec",
+                        data_file.path
+                    ))
+                })?,
+                partition_data_json: data_file
+                    .partition_key
+                    .clone()
+                    .unwrap_or_else(|| UNPARTITIONED_REWRITE_PARTITION_JSON.to_string()),
+                selected_position_deletes: deletes,
+                split_weight: SplitWeight::STANDARD,
+            },
+        )?;
+        Ok(Box::new(IcebergTypedSplitSource::new(
+            SingleSplitSource::new(split),
+        )))
+    }
+}
+
+/// The partition spelling a rewrite split carries for an unpartitioned file.
+///
+/// The split contract requires a non-empty partition JSON, and an
+/// unpartitioned data file has no partition struct to spell. The empty object
+/// is the spec's own encoding of "no partition fields", so it states that
+/// rather than inventing a placeholder value.
+const UNPARTITIONED_REWRITE_PARTITION_JSON: &str = "{}";
+
+/// The two columns a position-delete rewrite reads: the data file each removed
+/// row lives in, and its absolute position inside it.
+///
+/// They are metadata columns of the relation being rewritten, so both are named
+/// and typed by the one metadata-column vocabulary rather than spelled again
+/// here.
+fn rewrite_position_delete_column_bindings(
+    handle: &IcebergTableExecuteHandle,
+) -> Result<Vec<TypedColumnBinding>, ConnectorError> {
+    match handle.procedure_handle() {
+        Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_)) => {
+            let mut bindings = Vec::with_capacity(REWRITE_POSITION_DELETE_OUTPUT_COLUMNS.len());
+            for metadata in REWRITE_POSITION_DELETE_OUTPUT_COLUMNS {
+                bindings.push(TypedColumnBinding::new(
+                    metadata.column_name(),
+                    iceberg_column_to_wire(&pseudo_column(metadata)?)?,
+                    true,
+                ));
+            }
+            Ok(bindings)
+        }
+        Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => Err(unsupported(
+            "an iceberg optimize procedure reads the data relation's own columns",
+        )),
+    }
+}
+
+/// Restate one frozen delete artifact as the typed split's delete file.
+///
+/// Every fact is carried from the artifact the group named. A V2 Parquet
+/// position-delete file has no addressed content range, so re-encoding it would
+/// mean reading a whole file to find one data file's rows; the split contract
+/// refuses that, and this refuses it earlier with the artifact's own path.
+fn rewrite_position_delete_file(
+    delete: &crate::scan_model::IcebergDeleteFileInfo,
+) -> Result<IcebergDeleteFile, ConnectorError> {
+    if delete.file_content != crate::scan_model::IcebergDeleteFileContent::Position
+        || delete.file_format != crate::scan_model::IcebergDeleteFileFormat::Puffin
+    {
+        return Err(invalid(format!(
+            "iceberg rewrite position delete artifact {} is not a puffin deletion vector",
+            delete.path
+        )));
+    }
+    IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+        content: IcebergDeleteFileContent::PositionDeletes,
+        path: delete.path.clone(),
+        format: IcebergFileFormat::Puffin,
+        // A deletion vector publishes no manifest record count of its own that
+        // this rewrite depends on; the positions come from the vector itself.
+        record_count: 0,
+        file_size_in_bytes: delete.length.unwrap_or_default(),
+        equality_field_ids: Vec::new(),
+        row_position_lower_bound: None,
+        row_position_upper_bound: None,
+        data_sequence_number: delete.sequence_number.unwrap_or_default(),
+        content_offset: delete.content_offset,
+        content_size_in_bytes: delete.content_size_in_bytes,
+        decryption_data: None,
+    })
+}
+
+/// The enumeration of a relation cut into exactly one split.
+///
+/// A dynamic filter cannot narrow it: the split is the whole relation, and a
+/// filter that excluded it would drop rows the cohort's commit still replaces.
+#[derive(Debug)]
+struct SingleSplitSource {
+    split: Option<IcebergRewritePositionDeleteFilesSplit>,
+}
+
+impl SingleSplitSource {
+    const fn new(split: IcebergRewritePositionDeleteFilesSplit) -> Self {
+        Self { split: Some(split) }
+    }
+}
+
+impl ConnectorSplitSource for SingleSplitSource {
+    type Split = IcebergRewritePositionDeleteFilesSplit;
+    type Column = IcebergColumnHandle;
+
+    fn next_batch(
+        &mut self,
+        _max_size: usize,
+        _dynamic_filter: &DynamicFilterSnapshot<IcebergColumnHandle>,
+    ) -> Result<ConnectorSplitBatch<Self::Split>, ConnectorError> {
+        Ok(ConnectorSplitBatch::new(
+            self.split.take().into_iter().collect(),
+            true,
+        ))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.split.is_none()
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        self.split = None;
+        Ok(())
+    }
+}
+
+impl IcebergWireSplit for IcebergRewritePositionDeleteFilesSplit {
+    fn to_wire_split_proto(&self) -> dto::ConnectorSplit {
+        self.to_connector_split_proto()
+    }
 }
 
 /// Pair one snapshot's read view of a data file with its manifest facts.
@@ -695,6 +948,48 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
             .map(Some)
     }
 
+    fn get_pinned_file_set_handle(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+        pinned: &ConnectorPinnedFileSet,
+    ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+        if system_relation_of(name.table_name()).is_some() {
+            // A `<table>$<suffix>` relation is a view of one metadata file. It
+            // has no data files at all, so a pinned data-file set cannot name
+            // anything in it.
+            return Ok(None);
+        }
+        let Some(physical) = self.load_relation(name)? else {
+            return Ok(None);
+        };
+        let metadata = physical.table.metadata();
+        let snapshot_id = pinned.version_ordinal();
+        // The version the cohort was frozen at must still be a snapshot of
+        // this relation. Pinning against a snapshot the metadata no longer
+        // holds would name files with nothing to check them against.
+        if metadata.snapshot_by_id(snapshot_id).is_none() {
+            return Err(corrupt(format!(
+                "iceberg relation {}.{} no longer holds snapshot {snapshot_id}, which a pinned read was frozen at",
+                name.schema_name(),
+                name.table_name()
+            )));
+        }
+        let files = IcebergPinnedDataFileSet::try_new(pinned.files())?;
+        if files.len() != pinned.files().len() {
+            return Err(invalid(
+                "iceberg pinned read was offered the same data file more than once",
+            ));
+        }
+        self.wrap_table(pinned_table_handle_with_files(
+            name,
+            metadata,
+            Some(snapshot_id),
+            Some(files),
+        )?)
+        .map(Some)
+    }
+
     fn get_column_bindings(
         &self,
         _session: &ConnectorSession,
@@ -712,9 +1007,14 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
             ConnectorRelation::SystemTable(reference) => {
                 self.system_relation_column_bindings(reference)
             }
+            // A table-execute relation exposes what its procedure reads, not
+            // the table's fields: re-encoding delete artifacts produces the
+            // rows those artifacts remove, addressed by data file and position.
+            ConnectorRelation::TableExecute(_) => {
+                rewrite_position_delete_column_bindings(&self.table_execute_handle(table)?)
+            }
             ConnectorRelation::Table(_)
             | ConnectorRelation::TableFunction(_)
-            | ConnectorRelation::TableExecute(_)
             | ConnectorRelation::MergeTable(_) => {
                 let handle = self.data_table_handle(table)?;
                 let schema = handle.parse_table_schema()?;
@@ -755,6 +1055,13 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
         let Some(handle) = self.pushdown_table_handle(table)? else {
             return Ok(None);
         };
+        if !handle.accepts_pushdown() {
+            // A pinned read is defined by its file set. A domain accepted here
+            // would become an `enforced_predicate` the split source prunes by,
+            // and a rewrite that reads fewer files than its commit replaces
+            // corrupts the relation. The engine keeps the whole predicate.
+            return Ok(None);
+        }
         let applied = handle.apply_filter(&wire_constraint_to_iceberg(constraint)?)?;
         if applied.handle() == &handle {
             // The connector accepted nothing, so the engine keeps the whole
@@ -806,6 +1113,11 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
         let Some(handle) = self.pushdown_table_handle(table)? else {
             return Ok(None);
         };
+        if !handle.accepts_pushdown() {
+            // A zero limit accepted on a pinned read would mark its split
+            // source exhausted and rewrite the cohort's files to nothing.
+            return Ok(None);
+        }
         let applied = handle.apply_limit(limit)?;
         if applied.handle() == &handle {
             return Ok(None);
@@ -902,6 +1214,63 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
         ))
         .map(Some)
     }
+
+    fn get_table_execute_plan(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+        procedure: TypedTableExecuteProcedure<'_>,
+    ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+        if system_relation_of(name.table_name()).is_some() {
+            // A `<table>$<suffix>` relation is a view of one pinned metadata
+            // file. There is nothing to rewrite in it, which is absence rather
+            // than a procedure this connector failed to run.
+            return Ok(None);
+        }
+        let Some(physical) = self.load_relation(name)? else {
+            return Ok(None);
+        };
+        let metadata = physical.table.metadata();
+        // The snapshot the rewrite reads is the one its commit is validated
+        // against, so it is pinned here rather than resolved again on a worker.
+        let snapshot_id = metadata.current_snapshot_id().ok_or_else(|| {
+            invalid(format!(
+                "iceberg relation {}.{} has no snapshot to rewrite",
+                name.schema_name(),
+                name.table_name()
+            ))
+        })?;
+        let table_handle = pinned_table_handle(name, metadata, Some(snapshot_id))?;
+        let group = procedure.group();
+        // The group names exactly the artifacts this procedure rewrites -- the
+        // same set its commit replaces. It is carried, never re-derived: a rule
+        // re-evaluated here could select a different set, and a rewrite that
+        // reads an artifact its commit does not replace corrupts the relation.
+        let procedure_handle = match procedure {
+            TypedTableExecuteProcedure::RewritePositionDeleteFiles(_) => {
+                IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(
+                    IcebergRewritePositionDeleteFilesHandle::try_new(
+                        table_handle.clone(),
+                        IcebergRewriteArtifactContentId::try_new(
+                            group.artifact_location(),
+                            group.artifact_digest_hex(),
+                        )?,
+                        group.group_digest_hex(),
+                    )?,
+                )
+            }
+        };
+        let handle = IcebergTableExecuteHandle::try_new(IcebergTableExecuteHandleParams {
+            schema_table_name: name.clone(),
+            procedure_id: procedure_handle.procedure_id(),
+            table_location: table_handle.table_location().to_string(),
+            procedure_handle: Some(procedure_handle),
+        })?;
+        self.wrap_relation(dto::catalog_table_handle::Relation::TableExecute(
+            handle.to_table_execute_handle_proto(),
+        ))
+        .map(Some)
+    }
 }
 
 impl TypedConnectorSplitManager for IcebergTypedBoundary {
@@ -937,6 +1306,15 @@ impl TypedConnectorSplitManager for IcebergTypedBoundary {
         // to either.
         if let ConnectorRelation::SystemTable(reference) = table.relation() {
             return self.system_relation_split_source(reference);
+        }
+
+        // A table-execute relation enumerates the artifacts its frozen group
+        // names, resolved from the immutable artifact the group points at.
+        // None of the data enumerator below applies: there is no snapshot walk,
+        // no pruning, and no delete closure to compute.
+        if let ConnectorRelation::TableExecute(_) = table.relation() {
+            let handle = self.table_execute_handle(table)?;
+            return self.table_execute_split_source(&handle);
         }
 
         let handle = self.data_table_handle(table)?;
@@ -1165,6 +1543,15 @@ fn pinned_table_handle(
     metadata: &TableMetadata,
     snapshot_id: Option<i64>,
 ) -> Result<IcebergTableHandle, ConnectorError> {
+    pinned_table_handle_with_files(name, metadata, snapshot_id, None)
+}
+
+fn pinned_table_handle_with_files(
+    name: &SchemaTableName,
+    metadata: &TableMetadata,
+    snapshot_id: Option<i64>,
+    pinned_data_files: Option<IcebergPinnedDataFileSet>,
+) -> Result<IcebergTableHandle, ConnectorError> {
     let schema = pinned_schema(metadata, snapshot_id)?;
     let mut partition_spec_jsons = BTreeMap::new();
     for spec in metadata.partition_specs_iter() {
@@ -1201,6 +1588,7 @@ fn pinned_table_handle(
         name_mapping_json: metadata.properties().get(NAME_MAPPING_PROPERTY).cloned(),
         table_location: metadata.location().to_string(),
         storage_properties: reader_visible_storage_properties(metadata.properties()),
+        pinned_data_files,
     })
 }
 
@@ -2461,6 +2849,99 @@ mod tests {
         }
     }
 
+    /// A pinned read is the file set and nothing else, so neither pushdown may
+    /// narrow it. Both are declined outright rather than accepted-and-ignored:
+    /// an accepted domain becomes an `enforced_predicate` the split source
+    /// prunes by, and an accepted zero limit marks it exhausted.
+    #[test]
+    fn a_pinned_read_declines_every_pushdown_that_could_narrow_it() {
+        let fixture = fixture();
+        let metadata = metadata_with_history();
+        let pinned = IcebergPinnedDataFileSet::try_new(["file:///t/data/a.parquet"])
+            .expect("pinned file set");
+        let handle = pinned_table_handle_with_files(
+            &name("db", "t"),
+            &metadata,
+            Some(12),
+            Some(pinned.clone()),
+        )
+        .expect("pinned handle");
+        let wrapped = fixture.boundary.wrap_table(handle).expect("wrap");
+
+        let schema = table_schema();
+        let region = IcebergColumnHandle::base_column_of(&schema, 2).expect("region");
+        let summary = TupleDomain::with_column_domains(BTreeMap::from([(
+            iceberg_column_to_wire(&region).expect("wire region"),
+            string_domain("emea"),
+        )]))
+        .expect("summary");
+        assert!(
+            fixture
+                .boundary
+                .apply_filter(&session(), &wrapped, &Constraint::of_summary(summary))
+                .expect("apply filter")
+                .is_none()
+        );
+        assert!(
+            fixture
+                .boundary
+                .apply_limit(&session(), &wrapped, 0)
+                .expect("apply limit")
+                .is_none()
+        );
+        // A projection is not a narrowing of the file set, so it still applies
+        // and carries the pin forward untouched.
+        let projected = fixture
+            .boundary
+            .apply_projection(&session(), &wrapped, &[])
+            .expect("apply projection");
+        assert!(projected.is_none());
+        assert_eq!(
+            fixture
+                .boundary
+                .data_table_handle(&wrapped)
+                .expect("data handle")
+                .pinned_data_files(),
+            Some(&pinned)
+        );
+    }
+
+    /// A pinned set names files of one snapshot. If the relation no longer
+    /// holds that snapshot, the cohort was frozen against a state that has
+    /// since changed, and reading whatever is there now would commit a
+    /// replacement for rows nobody produced.
+    #[test]
+    fn a_pinned_read_of_a_vanished_snapshot_is_refused_before_any_split() {
+        let fixture = fixture();
+        fixture.create_table("db", "t", StdHashMap::new());
+        let pinned = ConnectorPinnedFileSet::try_new("db", "t", 4321, ["file:///t/data/a.parquet"])
+            .expect("pinned file set");
+
+        let error = fixture
+            .boundary
+            .get_pinned_file_set_handle(&session(), &name("db", "t"), &pinned)
+            .expect_err("a vanished snapshot must be refused");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.to_string().contains("4321"));
+
+        // A relation this connector does not hold is absence, not an error.
+        assert!(
+            fixture
+                .boundary
+                .get_pinned_file_set_handle(&session(), &name("db", "absent"), &pinned)
+                .expect("absent relation")
+                .is_none()
+        );
+        // A system relation has no data files for a pinned set to name.
+        assert!(
+            fixture
+                .boundary
+                .get_pinned_file_set_handle(&session(), &name("db", "t$files"), &pinned)
+                .expect("system relation")
+                .is_none()
+        );
+    }
+
     #[test]
     fn filter_pushdown_splits_enforced_from_unenforced_and_keeps_the_residual() {
         let fixture = fixture();
@@ -2650,24 +3131,65 @@ mod tests {
         }
     }
 
-    /// `$partitions` is a relation this connector can name and cannot carry:
-    /// the wire's reference kinds do not include the aggregation, and a FILES
-    /// reference would reach a backend as un-aggregated `$files` -- one row per
-    /// data file where the query asked for one row per partition. Refusing is
-    /// the only answer that is not silently wrong.
+    /// The aggregation and the relation it aggregates are minted by one
+    /// resolution, so they name the same pinned snapshot. Reaching a backend as
+    /// a FILES reference instead would answer a different question with a
+    /// plausible shape -- one row per data file where the query asked for one
+    /// row per partition -- so `$partitions` carries its own reference kind.
     #[test]
-    fn partitions_is_refused_rather_than_answered_with_files_rows() {
+    fn partitions_and_files_pin_the_same_snapshot_under_different_kinds() {
         let fixture = fixture();
         fixture.create_table("db", "t", StdHashMap::new());
 
-        let error = fixture
+        let files = fixture
+            .boundary
+            .get_system_table_plan(&session(), &name("db", "t$files"))
+            .expect("files plan")
+            .expect("files plan exists");
+        let partitions = fixture
             .boundary
             .get_system_table_plan(&session(), &name("db", "t$partitions"))
-            .expect_err("partitions has no worker plan");
-        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-        assert!(
-            error.to_string().contains("aggregation over $files"),
-            "{error}"
+            .expect("partitions plan")
+            .expect("partitions plan exists");
+
+        // An aggregate over one manifest would describe only part of the
+        // snapshot, so this one cannot be spread over the cluster.
+        assert_eq!(
+            partitions.distribution(),
+            SystemTableDistribution::SingleCoordinator
+        );
+        assert_eq!(files.distribution(), SystemTableDistribution::AllNodes);
+
+        // Read the raw wire facts rather than the validating decoder: a
+        // freshly created table has no snapshot, and both kinds refuse to
+        // decode without one. What matters here is that one resolution stamped
+        // both, so they cannot describe different snapshots.
+        let raw_reference = |handle: &CatalogTableHandle| -> dto::IcebergSystemTableReference {
+            match handle.as_proto().relation.as_ref().expect("relation") {
+                dto::catalog_table_handle::Relation::SystemTable(system) => {
+                    match system.reference.as_ref().expect("reference") {
+                        dto::connector_system_table_reference::Reference::Iceberg(iceberg) => {
+                            iceberg.clone()
+                        }
+                    }
+                }
+                other => panic!("expected a system relation, got {other:?}"),
+            }
+        };
+        let files_reference = raw_reference(files.handle());
+        let partitions_reference = raw_reference(partitions.handle());
+        assert_ne!(
+            files_reference.system_table_type, partitions_reference.system_table_type,
+            "the aggregation must not reach a backend as the relation it aggregates"
+        );
+        assert_eq!(
+            files_reference.metadata_file_location,
+            partitions_reference.metadata_file_location
+        );
+        assert_eq!(files_reference.table_uuid, partitions_reference.table_uuid);
+        assert_eq!(
+            files_reference.snapshot_id,
+            partitions_reference.snapshot_id
         );
     }
 

@@ -199,6 +199,77 @@ pub fn frozen_connector_resolved_analyzer_table(
     input_schema: SchemaRef,
     binding: SqlTableBindingId,
 ) -> ResolvedAnalyzerTable {
+    synthetic_resolved_analyzer_table(
+        identity,
+        input_schema,
+        binding,
+        crate::planner::table::SqlScanKind::ConnectorRead,
+    )
+}
+
+/// Build the query-local analyzer table for one real relation read at one
+/// exact version.
+///
+/// This is the read an internal collection performs: no SQL text named the
+/// table, but the relation and its version are both real and stated, so the
+/// binding says so rather than presenting the read as a synthetic opaque
+/// source. Preparation then resolves it through the ordinary admitted-data
+/// lane, pinned to `version_ordinal`.
+pub fn pinned_version_resolved_analyzer_table(
+    identity: &FrozenConnectorScanIdentity,
+    input_schema: SchemaRef,
+    binding: SqlTableBindingId,
+    version_ordinal: i64,
+) -> ResolvedAnalyzerTable {
+    synthetic_resolved_analyzer_table(
+        identity,
+        input_schema,
+        binding,
+        crate::planner::table::SqlScanKind::Data {
+            version: crate::planner::table::SqlTableVersionSelector::Snapshot(version_ordinal),
+        },
+    )
+}
+
+/// Build the query-local analyzer table for a provider-frozen cohort read of a
+/// pinned file set.  SQL receives the same token, static identity, and Arrow
+/// schema as any synthetic source; the file set itself never enters SQL.
+pub fn pinned_file_set_resolved_analyzer_table(
+    identity: &FrozenConnectorScanIdentity,
+    input_schema: SchemaRef,
+    binding: SqlTableBindingId,
+) -> ResolvedAnalyzerTable {
+    synthetic_resolved_analyzer_table(
+        identity,
+        input_schema,
+        binding,
+        crate::planner::table::SqlScanKind::PinnedFileSet,
+    )
+}
+
+/// Build the query-local analyzer table for one distributed
+/// `ALTER TABLE ... EXECUTE` procedure read.  SQL receives the same token,
+/// static identity, and Arrow schema as any synthetic source; the frozen group
+/// itself never enters SQL.
+pub fn table_execute_resolved_analyzer_table(
+    identity: &FrozenConnectorScanIdentity,
+    input_schema: SchemaRef,
+    binding: SqlTableBindingId,
+) -> ResolvedAnalyzerTable {
+    synthetic_resolved_analyzer_table(
+        identity,
+        input_schema,
+        binding,
+        crate::planner::table::SqlScanKind::TableExecute,
+    )
+}
+
+fn synthetic_resolved_analyzer_table(
+    identity: &FrozenConnectorScanIdentity,
+    input_schema: SchemaRef,
+    binding: SqlTableBindingId,
+    kind: crate::planner::table::SqlScanKind,
+) -> ResolvedAnalyzerTable {
     let columns = column_defs(&input_schema);
     let planner_identity = identity.planner_identity();
     ResolvedAnalyzerTable::from_planner(
@@ -209,11 +280,7 @@ pub fn frozen_connector_resolved_analyzer_table(
             columns,
             iceberg_row_lineage_metadata_columns: Vec::new(),
             source: crate::planner::table::ScanSource::Sql(
-                crate::planner::table::SqlScanSource::new(
-                    binding,
-                    planner_identity,
-                    crate::planner::table::SqlScanKind::ConnectorRead,
-                ),
+                crate::planner::table::SqlScanSource::new(binding, planner_identity, kind),
             ),
         },
     )
@@ -258,6 +325,51 @@ pub fn build_frozen_connector_scan_plan(
     input_schema: &SchemaRef,
     binding: SqlTableBindingId,
 ) -> FrozenConnectorScanPlan {
+    build_synthetic_scan_plan(
+        identity,
+        input_schema,
+        binding,
+        crate::planner::table::SqlScanKind::ConnectorRead,
+    )
+}
+
+/// Construct the synthetic scan carrier for one provider-frozen cohort read of
+/// a pinned file set.  The physical tree stays opaque outside SQL.
+pub fn build_pinned_file_set_scan_plan(
+    identity: &FrozenConnectorScanIdentity,
+    input_schema: &SchemaRef,
+    binding: SqlTableBindingId,
+) -> FrozenConnectorScanPlan {
+    build_synthetic_scan_plan(
+        identity,
+        input_schema,
+        binding,
+        crate::planner::table::SqlScanKind::PinnedFileSet,
+    )
+}
+
+/// Construct the synthetic scan carrier for one distributed
+/// `ALTER TABLE ... EXECUTE` procedure read.  The physical tree stays opaque
+/// outside SQL.
+pub fn build_table_execute_scan_plan(
+    identity: &FrozenConnectorScanIdentity,
+    input_schema: &SchemaRef,
+    binding: SqlTableBindingId,
+) -> FrozenConnectorScanPlan {
+    build_synthetic_scan_plan(
+        identity,
+        input_schema,
+        binding,
+        crate::planner::table::SqlScanKind::TableExecute,
+    )
+}
+
+fn build_synthetic_scan_plan(
+    identity: &FrozenConnectorScanIdentity,
+    input_schema: &SchemaRef,
+    binding: SqlTableBindingId,
+    kind: crate::planner::table::SqlScanKind,
+) -> FrozenConnectorScanPlan {
     let mut factory = ColumnRefFactory::new();
     let mut output_columns = Vec::with_capacity(input_schema.fields().len());
     for field in input_schema.fields() {
@@ -281,7 +393,7 @@ pub fn build_frozen_connector_scan_plan(
         source: crate::planner::table::ScanSource::Sql(crate::planner::table::SqlScanSource::new(
             binding,
             identity.planner_identity(),
-            crate::planner::table::SqlScanKind::ConnectorRead,
+            kind,
         )),
     };
     FrozenConnectorScanPlan(crate::planner::physical::PhysicalPlanNode {
@@ -315,10 +427,52 @@ pub fn matches_frozen_connector_scan(
     binding: SqlTableBindingId,
     identity: &FrozenConnectorScanIdentity,
 ) -> bool {
+    matches_synthetic_scan(
+        scan,
+        binding,
+        identity,
+        &crate::planner::table::SqlScanKind::ConnectorRead,
+    )
+}
+
+/// Compare a sealed/read-only scan projection with the exact application
+/// binding that admitted a pinned-file-set cohort read.
+pub fn matches_pinned_file_set_scan(
+    scan: &PlanScanNode,
+    binding: SqlTableBindingId,
+    identity: &FrozenConnectorScanIdentity,
+) -> bool {
+    matches_synthetic_scan(
+        scan,
+        binding,
+        identity,
+        &crate::planner::table::SqlScanKind::PinnedFileSet,
+    )
+}
+
+/// Compare a sealed/read-only scan projection with the exact application
+/// binding that admitted a table-execute procedure read.
+pub fn matches_table_execute_scan(
+    scan: &PlanScanNode,
+    binding: SqlTableBindingId,
+    identity: &FrozenConnectorScanIdentity,
+) -> bool {
+    matches_synthetic_scan(
+        scan,
+        binding,
+        identity,
+        &crate::planner::table::SqlScanKind::TableExecute,
+    )
+}
+
+fn matches_synthetic_scan(
+    scan: &PlanScanNode,
+    binding: SqlTableBindingId,
+    identity: &FrozenConnectorScanIdentity,
+    kind: &crate::planner::table::SqlScanKind,
+) -> bool {
     let crate::planner::table::ScanSource::Sql(source) = &scan.table.source;
-    source.kind == crate::planner::table::SqlScanKind::ConnectorRead
-        && source.binding == binding
-        && source.table == identity.planner_identity()
+    &source.kind == kind && source.binding == binding && source.table == identity.planner_identity()
 }
 
 /// The execution-relevant category of one sealed SQL scan. This is a copied
@@ -326,6 +480,8 @@ pub fn matches_frozen_connector_scan(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlScanPreparationCategory {
     ConnectorRead,
+    AdmittedPinnedFileSet,
+    AdmittedTableExecute,
     AdmittedData,
     AdmittedFrozenCurrent,
     AdmittedFrozenSnapshot,
@@ -475,6 +631,8 @@ impl SqlScanPreparationFacts {
     pub fn source_kind_label(&self) -> &'static str {
         match self.category {
             SqlScanPreparationCategory::ConnectorRead => "SqlConnectorRead",
+            SqlScanPreparationCategory::AdmittedPinnedFileSet => "SqlPinnedFileSet",
+            SqlScanPreparationCategory::AdmittedTableExecute => "SqlTableExecute",
             SqlScanPreparationCategory::AdmittedData => "SqlData",
             SqlScanPreparationCategory::AdmittedFrozenCurrent
             | SqlScanPreparationCategory::AdmittedFrozenSnapshot
@@ -523,6 +681,12 @@ pub fn scan_preparation_facts(scan: &PlanScanNode) -> SqlScanPreparationFacts {
     };
     match &source.kind {
         crate::planner::table::SqlScanKind::ConnectorRead => {}
+        crate::planner::table::SqlScanKind::PinnedFileSet => {
+            facts.category = SqlScanPreparationCategory::AdmittedPinnedFileSet;
+        }
+        crate::planner::table::SqlScanKind::TableExecute => {
+            facts.category = SqlScanPreparationCategory::AdmittedTableExecute;
+        }
         crate::planner::table::SqlScanKind::Data { .. } => {
             facts.category = SqlScanPreparationCategory::AdmittedData;
         }

@@ -91,6 +91,7 @@ pub enum NativeEncoderPlanFixture {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeScanFixture {
     ConnectorRead,
+    PinnedFileSet,
     DeltaWithStaleUnprojectedColumn,
     DeltaForPreparedBinding,
     DeltaWithInvalidProjection,
@@ -197,6 +198,13 @@ pub fn native_scan_plan(fixture: NativeScanFixture) -> Result<DistributedPlan, S
     match fixture {
         NativeScanFixture::ConnectorRead => native_scan_fixture_plan(
             SqlScanKind::ConnectorRead,
+            ordinary_iceberg_columns(),
+            vec![output_column(1, "id", DataType::Int32)],
+            Some(vec!["id".to_string()]),
+            Vec::new(),
+        ),
+        NativeScanFixture::PinnedFileSet => native_scan_fixture_plan(
+            SqlScanKind::PinnedFileSet,
             ordinary_iceberg_columns(),
             vec![output_column(1, "id", DataType::Int32)],
             Some(vec!["id".to_string()]),
@@ -2488,6 +2496,7 @@ mod tests {
         }
         for fixture in [
             NativeScanFixture::ConnectorRead,
+            NativeScanFixture::PinnedFileSet,
             NativeScanFixture::DeltaWithStaleUnprojectedColumn,
             NativeScanFixture::DeltaForPreparedBinding,
             NativeScanFixture::DeltaWithInvalidProjection,

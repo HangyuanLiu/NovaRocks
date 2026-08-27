@@ -309,11 +309,38 @@ impl NativeFragmentService {
         // A fragment with no installed runtime filter gets `None`, which the
         // typed scan turns into the truthful unconstrained filter rather than
         // a live one that never narrows.
-        let runtime_filter = self
-            .lifecycle
-            .runtime_filter_session_for_fragment(execution_id, fragment_instance_id, false)
-            .ok()
-            .flatten();
+        // Resolved lazily, not here.
+        //
+        // A fragment does not hold its admission permit while its plan is being
+        // decoded, and the lifecycle refuses a session without one. Resolving
+        // eagerly therefore always failed, and swallowing that failure turned a
+        // contract violation into a silent degrade: every typed scan received
+        // the truthful unconstrained filter, so a live runtime filter could
+        // never reach a page source and no row group was ever pruned.
+        use crate::fragment::decode::plan::context::RuntimeFilterSessionResolver;
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let runtime_filter: RuntimeFilterSessionResolver = Arc::new(move || {
+            match lifecycle.runtime_filter_session_for_fragment(
+                execution_id,
+                fragment_instance_id,
+                false,
+            ) {
+                // `None` is the ordinary answer for an attempt that installed
+                // no runtime filter at all.
+                Ok(session) => session,
+                // Not ordinary: the lifecycle refused to hand out a session it
+                // may have. Reporting it is the difference between "this query
+                // has no runtime filter" and "this query silently lost one".
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "runtime filter session unavailable for a typed scan; it will read unfiltered"
+                    );
+                    None
+                }
+            }
+        });
+
         crate::fragment::decode::plan::context::TypedScanRuntime::new(
             self.execution_host.typed_providers(),
             queues,

@@ -559,13 +559,22 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             namespace,
             &alias,
         )?;
+        // The columns SQL analyzes must be the ones the typed reader produces.
+        // The connector's own alias materialization still reports the retired
+        // schema — `committed_at` as a bare `Int64`, `summary` as `Utf8` —
+        // while both the frozen contract and the typed reader say
+        // `TIMESTAMP WITH TIME ZONE` and `MAP`. Analyzing the retired shape
+        // renders a raw epoch integer, and ordering by it fails at the
+        // exchange with a schema mismatch.
+        let columns =
+            frozen_metadata_columns(metadata_table_type).unwrap_or(materialization.columns);
         Ok(QueryTableBinding {
             resolved: novarocks_sql::planning::catalog::resolved_metadata_table(
                 catalog,
                 namespace,
                 table,
                 metadata_table_type,
-                materialization.columns,
+                columns,
                 materialization.row_lineage_metadata_columns,
                 binding_id,
             ),
@@ -583,6 +592,43 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             frozen_snapshot_materializations: BTreeMap::new(),
             admitted_change_scans: BTreeMap::new(),
         })
+    }
+}
+
+/// The frozen column contract for one metadata relation, when it is fully
+/// determined by the relation kind alone.
+///
+/// `$files`, `$entries` and `$partitions` are not: their `partition`,
+/// `lower_bounds` and `upper_bounds` columns are derived from the table's own
+/// partition spec and schema, and the contract entry point omits them rather
+/// than guess. Those facts live in the connector and no typed column binding
+/// carries a type today, so those three keep resolving through the connector's
+/// alias materialization until the derived types can cross the control plane.
+/// Returning `None` for them is that staged state, stated rather than hidden.
+fn frozen_metadata_columns(
+    kind: novarocks_sql::planning::catalog::MetadataTableKind,
+) -> Option<Vec<novarocks_types::schema::ColumnDef>> {
+    use novarocks_sql::planning::catalog::MetadataTableKind;
+
+    match kind {
+        MetadataTableKind::Files | MetadataTableKind::Entries | MetadataTableKind::Partitions => {
+            None
+        }
+        MetadataTableKind::Snapshots
+        | MetadataTableKind::History
+        | MetadataTableKind::Refs
+        | MetadataTableKind::Manifests => Some(
+            novarocks_sql::planning::catalog::metadata_table_schema(kind)
+                .into_iter()
+                .map(|column| novarocks_types::schema::ColumnDef {
+                    name: column.name,
+                    data_type: column.data_type,
+                    nullable: column.nullable,
+                    write_default: None,
+                    logical_type: column.logical_type,
+                })
+                .collect(),
+        ),
     }
 }
 

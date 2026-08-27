@@ -28,6 +28,8 @@ use crate::connector::unified_statistics::{
 use crate::query_execution::kernels::{
     DmlExecutionKernel, MvExecutionKernel, QueryPreparationKernel,
 };
+use arrow::datatypes::DataType;
+use novarocks_execution::exec::statistics::statistics_scalar_bounds_supported;
 use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
 use novarocks_sql::planning::catalog::materialization_statistics_facts;
 use novarocks_sql::planning::dml::{
@@ -265,30 +267,57 @@ fn map_resolution_failure(error: StatisticsResolutionFailure) -> DmlStatisticsFa
     }
 }
 
+/// The metric set a visible-row collection may ask of these columns.
+///
+/// Every requester of a *collection* builds its request here, because a
+/// collection fails closed as a whole: `finish_visible_row` rejects the
+/// result when any requested metric produced nothing, so two requesters that
+/// disagree about what is askable do not degrade one column, they discard the
+/// table. Read paths such as `SHOW TABLE STATS` are free to ask about a metric
+/// that cannot exist, since an unavailable answer is a fine answer to a
+/// question about what is known.
+pub(crate) fn visible_row_metric_request<'a>(
+    columns: impl IntoIterator<Item = (&'a str, &'a DataType)>,
+) -> Result<StatisticsMetricRequest, novarocks_spi::connector::ConnectorError> {
+    let columns = columns.into_iter();
+    let mut metrics = Vec::with_capacity(1 + columns.size_hint().0 * 5);
+    metrics.push(StatisticsMetric::RowCount);
+    for (column_name, data_type) in columns {
+        let name = Arc::<str>::from(column_name);
+        metrics.push(StatisticsMetric::NullCount {
+            column: Arc::clone(&name),
+        });
+        // A collection fails closed when any requested metric produces
+        // nothing, and the collector answers a type it cannot bound with
+        // silence rather than an error. Asking a `STRING` column for a
+        // minimum would therefore throw away the row count, null counts, and
+        // NDV sketches of every column in the table. Ask only for the bounds
+        // that can exist; a column with no bound vocabulary still contributes
+        // everything else it can measure.
+        if statistics_scalar_bounds_supported(data_type) {
+            metrics.push(StatisticsMetric::Minimum {
+                column: Arc::clone(&name),
+            });
+            metrics.push(StatisticsMetric::Maximum {
+                column: Arc::clone(&name),
+            });
+        }
+        metrics.push(StatisticsMetric::AverageSize {
+            column: Arc::clone(&name),
+        });
+        metrics.push(StatisticsMetric::ThetaNdv { column: name });
+    }
+    StatisticsMetricRequest::try_new(metrics)
+}
+
 fn metric_request(
     columns: &[novarocks_types::schema::ColumnDef],
 ) -> Result<StatisticsMetricRequest, novarocks_spi::connector::ConnectorError> {
-    let mut metrics = Vec::with_capacity(1 + columns.len() * 5);
-    metrics.push(StatisticsMetric::RowCount);
-    for column in columns {
-        let column = Arc::<str>::from(column.name.as_str());
-        metrics.extend([
-            StatisticsMetric::NullCount {
-                column: Arc::clone(&column),
-            },
-            StatisticsMetric::Minimum {
-                column: Arc::clone(&column),
-            },
-            StatisticsMetric::Maximum {
-                column: Arc::clone(&column),
-            },
-            StatisticsMetric::AverageSize {
-                column: Arc::clone(&column),
-            },
-            StatisticsMetric::ThetaNdv { column },
-        ]);
-    }
-    StatisticsMetricRequest::try_new(metrics)
+    visible_row_metric_request(
+        columns
+            .iter()
+            .map(|column| (column.name.as_str(), &column.data_type)),
+    )
 }
 
 #[cfg(test)]

@@ -17,9 +17,10 @@
 
 -- @tags=iceberg,statistics,ndv
 -- Verify ANALYZE publishes the native Puffin statistics artifact and refreshes
--- the same-session statistics view. Theta NDV is deliberately not promoted to
--- an exact optimizer denominator, so this join must retain the bounded
--- many-to-many fallback rather than treating a sketch as authoritative NDV.
+-- the same-session statistics view. The measured Theta NDV then reaches the
+-- optimizer as an Estimated statistic -- approximate, but far better than the
+-- no-statistics equijoin default -- so this join must size itself from the
+-- collected distinct counts rather than from that default.
 
 -- @skip_result_check=true
 CREATE DATABASE iceberg_cat_${suite_uuid0}.ndv_db_${uuid0};

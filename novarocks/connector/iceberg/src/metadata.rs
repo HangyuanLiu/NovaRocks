@@ -51,9 +51,6 @@ use novarocks_spi::connector::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::file_reader::distributed_rewrite_reader::{
-    ICEBERG_REWRITE_POSITION_SPLIT_V1, IcebergRewritePositionSplitPayloadV1,
-};
 use crate::file_reader::execution_payload::{
     ICEBERG_SPLIT_V5, IcebergFrozenScanUnitPayload, IcebergMetadataSplitPayloadV1,
     IcebergScanFactColumnV1, SplitPayload, canonical_split_name_mapping,
@@ -577,23 +574,11 @@ impl ConnectorScanPlanning for IcebergMetadata {
     ) -> Result<ConnectorScan, ConnectorError> {
         self.validate_context(&request.context)?;
         validate_static_predicates(&request.static_predicates)?;
-        let frozen_rewrite =
-            crate::distributed_rewrite::frozen_rewrite_source_facts(table.payload())?;
-        let mut table = self.table_payload(table)?;
-        let rewrite_position = match frozen_rewrite.as_ref() {
-            Some((operation_kind, group)) => {
-                self.hydrate_frozen_rewrite_source(&mut table, operation_kind, group)?
-            }
-            None => None,
-        };
-        let output_schema = match frozen_rewrite.as_ref() {
-            Some((operation_kind, _)) => {
-                self.frozen_rewrite_output_schema(&table, operation_kind, &request.projection)?
-            }
-            None if table.metadata_table_type.is_some() => {
-                projected_metadata_schema(&table, &request.projection)?
-            }
-            None => projected_schema(&table, &request.projection)?,
+        let table = self.table_payload(table)?;
+        let output_schema = if table.metadata_table_type.is_some() {
+            projected_metadata_schema(&table, &request.projection)?
+        } else {
+            projected_schema(&table, &request.projection)?
         };
         if let ConnectorScanSelection::ChangeWindow(window) = request.selection {
             if table.metadata_table_type.is_some() {
@@ -667,7 +652,6 @@ impl ConnectorScanPlanning for IcebergMetadata {
                 mode: IcebergScanModeV1::ChangeWindow {
                     delta: Box::new(delta),
                 },
-                rewrite_position: None,
             };
             return ConnectorScan::try_new_change_window(
                 ConnectorExecutionBindingKey {
@@ -694,9 +678,6 @@ impl ConnectorScanPlanning for IcebergMetadata {
             unreachable!("change-window scans return above")
         };
         let (snapshot_id, table_uuid) = match selector {
-            // A frozen rewrite cohort reads exactly the file set its artifact
-            // froze, so it resolves no snapshot and carries no table pin.
-            _ if frozen_rewrite.is_some() => (None, None),
             ConnectorReadSelector::Current => {
                 let table_info = table.table_info.as_ref().ok_or_else(|| {
                     corrupt("Iceberg current scan is missing its resolved table pin")
@@ -734,7 +715,6 @@ impl ConnectorScanPlanning for IcebergMetadata {
             fact_columns,
             physical_predicates,
             mode: IcebergScanModeV1::Snapshot,
-            rewrite_position,
         };
         ConnectorScan::try_new_snapshot(
             ConnectorExecutionBindingKey {
@@ -769,14 +749,6 @@ impl ConnectorScanPlanning for IcebergMetadata {
             return self.plan_change_window_splits(&scan, delta.as_ref().as_ref(), request);
         }
         let files = self.scan_files(&scan)?;
-        if let Some(rewrite_position) = scan.rewrite_position.clone() {
-            return self.plan_frozen_rewrite_position_splits(
-                scan,
-                files,
-                rewrite_position,
-                request,
-            );
-        }
         if !matches!(scan.purpose, IcebergReadPurposeV1::Query)
             && files.iter().any(|file| {
                 file.delete_files.iter().any(|delete| {
@@ -1037,7 +1009,6 @@ impl IcebergMetadata {
                     source,
                     delete_side: delta.delete_side.clone(),
                 }),
-                distributed_rewrite_position: None,
                 metadata: None,
             };
             let payload = encode_payload(
@@ -1074,110 +1045,6 @@ impl IcebergMetadata {
                 candidate_units_pruned: 0,
                 composite_splits_planned: count,
                 scan_units_planned: count,
-            },
-        )
-    }
-
-    /// Plan the single split that rewrites one group's position deletes. The
-    /// group froze exactly one data file and the Puffin delete files that are
-    /// replaced; the split carries them so the writer reads back only those
-    /// positions.
-    fn plan_frozen_rewrite_position_splits(
-        &self,
-        scan: IcebergScanPayload,
-        files: Vec<IcebergDataFileInfo>,
-        rewrite_position: IcebergFrozenRewritePositionScanV1,
-        request: ConnectorSplitPlanningRequest,
-    ) -> Result<ConnectorSplitPlanningResult, ConnectorError> {
-        if rewrite_position.selected_position_delete_files.is_empty() {
-            return Err(corrupt(
-                "Iceberg rewrite-position artifact group is invalid",
-            ));
-        }
-        let [file] = files.as_slice() else {
-            return Err(corrupt(
-                "Iceberg rewrite-position scan does not match its frozen input",
-            ));
-        };
-        let selected = file
-            .delete_files
-            .iter()
-            .filter(|delete| {
-                rewrite_position
-                    .selected_position_delete_files
-                    .contains(&delete.path)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if selected.len() != rewrite_position.selected_position_delete_files.len()
-            || selected.iter().any(|delete| {
-                !matches!(
-                    delete.file_content,
-                    crate::scan_model::IcebergDeleteFileContent::Position
-                ) || !matches!(
-                    delete.file_format,
-                    crate::scan_model::IcebergDeleteFileFormat::Puffin
-                ) || delete.content_offset.is_none()
-                    || delete.content_size_in_bytes.is_none()
-            })
-        {
-            return Err(corrupt(
-                "Iceberg rewrite-position artifact selects invalid Puffin files",
-            ));
-        }
-        let estimated_bytes = u64::try_from(file.size).map_err(|_| {
-            corrupt("Iceberg rewrite-position source has a negative size".to_string())
-        })?;
-        let payload = SplitPayload {
-            version: ICEBERG_SPLIT_V5,
-            owner_instance_id: self.descriptor.instance_id.as_str().to_string(),
-            incarnation: self.incarnation.to_bytes(),
-            namespace: scan.table.namespace.clone(),
-            table: scan.table.table.clone(),
-            snapshot_id: None,
-            table_uuid: None,
-            schema_id: None,
-            units: vec![IcebergFrozenScanUnitPayload {
-                estimated_bytes: Some(estimated_bytes),
-                data_file: file.clone(),
-                row_groups: None,
-            }],
-            projection: Vec::new(),
-            limit: None,
-            physical_predicates: Vec::new(),
-            fact_columns: Vec::new(),
-            name_mapping: None,
-            delta: None,
-            distributed_rewrite_position: Some(IcebergRewritePositionSplitPayloadV1 {
-                version: ICEBERG_REWRITE_POSITION_SPLIT_V1,
-                selected_delete_files: selected,
-            }),
-            metadata: None,
-        };
-        let encoded = encode_payload(
-            &payload,
-            "rewrite-position split",
-            request.context.max_handle_payload_bytes(),
-        )?;
-        if encoded.len() > request.context.max_total_payload_bytes() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::ResourceExhausted,
-                "Iceberg rewrite-position split payload exceeds the request budget",
-            ));
-        }
-        let splits = vec![ConnectorSplit::try_new(
-            self.descriptor.instance_id.clone(),
-            format!("rewrite-position-{}", rewrite_position.group_digest_hex),
-            encoded,
-            Some(estimated_bytes),
-        )?];
-        ConnectorSplitPlanningResult::try_new(
-            splits,
-            ConnectorSplitPlanningMetrics {
-                candidate_units_considered: 1,
-                candidate_units_pruned: 0,
-                composite_splits_planned: 1,
-                scan_units_planned: 1,
             },
         )
     }
@@ -1231,7 +1098,6 @@ impl IcebergMetadata {
             fact_columns: Vec::new(),
             name_mapping: None,
             delta: None,
-            distributed_rewrite_position: None,
             metadata: Some(IcebergMetadataSplitPayloadV1 {
                 metadata_table_type,
                 serialized_table,
@@ -1271,71 +1137,6 @@ impl IcebergMetadata {
     /// artifact, not the current snapshot, is the authority for what a rewrite
     /// reads. Returns the position-delete facts when the cohort rewrites
     /// position deletes.
-    fn hydrate_frozen_rewrite_source(
-        &self,
-        table: &mut IcebergTablePayload,
-        operation_kind: &str,
-        group: &crate::distributed_rewrite::IcebergRewriteGroupPayloadV1,
-    ) -> Result<Option<IcebergFrozenRewritePositionScanV1>, ConnectorError> {
-        let physical = self
-            .runtime
-            .load_table_classified(&table.namespace, &table.table)
-            .map_err(classified_control_error)?;
-        let group = crate::distributed_rewrite::load_frozen_rewrite_group(
-            &self.runtime,
-            physical.table.file_io(),
-            group,
-        )?;
-        table.prepared_files = group.data_files.clone();
-        table.explicit_files = Some(group.data_files);
-        if operation_kind != novarocks_spi::connector::REWRITE_POSITION_DELETES_KIND {
-            return Ok(None);
-        }
-        Ok(Some(IcebergFrozenRewritePositionScanV1 {
-            group_digest_hex: group.group_digest_hex,
-            selected_position_delete_files: group.selected_position_delete_files,
-        }))
-    }
-
-    /// The scan schema of one frozen rewrite cohort, projected. It has to match
-    /// the schema planning froze into the cohort plan field-for-field, so it is
-    /// resolved through the same definition planning used.
-    fn frozen_rewrite_output_schema(
-        &self,
-        table: &IcebergTablePayload,
-        operation_kind: &str,
-        projection: &[usize],
-    ) -> Result<SchemaRef, ConnectorError> {
-        let physical = self
-            .runtime
-            .load_table_classified(&table.namespace, &table.table)
-            .map_err(classified_control_error)?;
-        let metadata = physical.table.metadata();
-        let storage =
-            crate::schema_mapping::sql_read_schema_from_iceberg(metadata.current_schema())
-                .map_err(corrupt)?;
-        let schema = crate::distributed_rewrite::frozen_rewrite_scan_schema(
-            operation_kind,
-            storage,
-            crate::schema_facts::row_lineage_enabled(metadata),
-        );
-        if projection.is_empty() {
-            return Ok(schema);
-        }
-        let fields = projection
-            .iter()
-            .map(|index| {
-                schema.fields().get(*index).cloned().ok_or_else(|| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        format!("Iceberg rewrite projection index {index} is outside its schema"),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Arc::new(Schema::new(fields)))
-    }
-
     fn scan_files(
         &self,
         scan: &IcebergScanPayload,
@@ -1421,18 +1222,6 @@ struct IcebergScanPayload {
     fact_columns: Vec<IcebergScanFactColumnV1>,
     physical_predicates: Vec<IcebergPhysicalPredicate>,
     mode: IcebergScanModeV1,
-    /// Frozen position-delete rewrite facts resolved while the scan began. The
-    /// artifact is read once, at `begin_scan`, so split planning never reloads
-    /// it.
-    #[serde(default)]
-    rewrite_position: Option<IcebergFrozenRewritePositionScanV1>,
-}
-
-/// The one rewrite group a frozen position-delete cohort replaces.
-#[derive(Clone, Deserialize, Serialize)]
-struct IcebergFrozenRewritePositionScanV1 {
-    group_digest_hex: String,
-    selected_position_delete_files: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1774,7 +1563,6 @@ fn push_data_split(
         fact_columns: scan.fact_columns.clone(),
         name_mapping: name_mapping.clone(),
         delta: None,
-        distributed_rewrite_position: None,
         metadata: None,
     };
     let payload = encode_payload(&payload, "split", context.max_handle_payload_bytes())?;
@@ -2456,7 +2244,6 @@ mod plan_splits_pruning_tests {
             fact_columns: Vec::new(),
             physical_predicates: predicates,
             mode: IcebergScanModeV1::Snapshot,
-            rewrite_position: None,
         };
         let context = context();
         let handle = ConnectorScanHandle::try_new(
@@ -2519,7 +2306,6 @@ mod plan_splits_pruning_tests {
             fact_columns: Vec::new(),
             physical_predicates: Vec::new(),
             mode: IcebergScanModeV1::Snapshot,
-            rewrite_position: None,
         };
 
         let error = provider

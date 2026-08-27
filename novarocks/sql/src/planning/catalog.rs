@@ -30,6 +30,14 @@ use novarocks_parser::ast::{SetExpr, Statement, TableFactor};
 use novarocks_types::naming::TableIdentity;
 use novarocks_types::schema::{CatalogTable, ColumnDef};
 
+/// The frozen column contract for one metadata relation.
+///
+/// SQL owns it because no typed column binding carries a type: the connector
+/// names a metadata relation's columns and this states what they are. It is
+/// re-exported through the planning surface so an application catalog can
+/// analyze the same columns the typed reader produces, rather than whatever
+/// shape a provider's own alias materialization happens to report.
+pub use crate::analyzer::iceberg_metadata::{MetadataColumn, metadata_table_schema};
 pub use crate::catalog::memory::PlannerMemoryCatalog;
 pub use crate::catalog::{
     IcebergMetadataTableProvider, PlannerTableProvider, ResolvedAnalyzerTable, TableLookupMode,
