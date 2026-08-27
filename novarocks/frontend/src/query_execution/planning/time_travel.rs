@@ -580,10 +580,6 @@ pub(crate) fn external_schema_columns_for_statement(
 /// SQLX-1 query-local overlays use `__sqlx1_tt_<table>_<snapshot_id>`;
 /// recognize the legacy form as well so old statement materialization cannot
 /// mistake either identity for a durable catalog object.
-#[allow(
-    dead_code,
-    reason = "Retained to distinguish query-local time-travel overlay identities from durable catalog relations."
-)]
 fn is_synthetic_time_travel_table(table_name: &str) -> bool {
     if let Some(encoded) = table_name.strip_prefix("__sqlx1_tt_")
         && let Some((base, snapshot)) = encoded.rsplit_once('_')

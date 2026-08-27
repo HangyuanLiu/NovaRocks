@@ -199,7 +199,7 @@ struct TypedScanRuntimeInputs {
     session: novarocks_spi::connector::read_stack::ConnectorSession,
     request: novarocks_spi::connector::ConnectorRequestContext,
     /// Absent when this attempt installed no runtime filter.
-    runtime_filter: Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>,
+    runtime_filter: crate::fragment::decode::plan::context::RuntimeFilterSessionResolver,
 }
 
 /// Resolve the typed scan's runtime inputs from the fragment decode context.

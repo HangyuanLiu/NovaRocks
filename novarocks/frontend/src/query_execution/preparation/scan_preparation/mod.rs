@@ -613,7 +613,19 @@ fn typed_relation_name(
 ) -> Result<String, String> {
     match freeze {
         TypedRelationFreeze::Table { .. } | TypedRelationFreeze::ChangeWindow(_) => {
-            Ok(facts.identity().table().to_string())
+            // A time-travel overlay's name is an analyzer key, not a relation
+            // the catalog holds: the rewriter mints `__sqlx1_tt_<table>_<id>`
+            // so a query-local pin cannot be mistaken for a durable object.
+            // The connector is asked for the relation that key already
+            // normalizes to, at the snapshot the selector pinned; asking for
+            // the synthetic name resolves nothing.
+            let table = facts.identity().table();
+            Ok(
+                crate::catalog_application::query_bindings::parse_time_travel_overlay_identity(
+                    table,
+                )
+                .map_or_else(|| table.to_string(), |(base, _)| base.to_string()),
+            )
         }
         TypedRelationFreeze::SystemTable => {
             let kind = facts.metadata_table_kind().ok_or_else(|| {
