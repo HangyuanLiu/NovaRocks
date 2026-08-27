@@ -419,6 +419,7 @@ pub struct SqlScanPreparationFacts {
     frozen_snapshot_id: Option<i64>,
     frozen_timestamp_millis: Option<i64>,
     delta_window: Option<SqlScanPreparationDeltaWindow>,
+    metadata_table_kind: Option<crate::planner::table::SqlMetadataTableKind>,
     mv_target: Option<SqlMvTargetScanPreparationFacts>,
     connector_read_purpose: ConnectorReadPurpose,
     refresh_projected_names: Option<Vec<String>>,
@@ -447,6 +448,16 @@ impl SqlScanPreparationFacts {
 
     pub fn delta_window(&self) -> Option<SqlScanPreparationDeltaWindow> {
         self.delta_window
+    }
+
+    /// Which system relation an `AdmittedMetadata` scan reads.
+    ///
+    /// The `$suffix` spelling is stripped before these facts exist, so this is
+    /// the only place the kind survives. Without it the connector cannot be
+    /// asked for the relation at all: it recognizes a system relation by its
+    /// suffix and nothing else.
+    pub fn metadata_table_kind(&self) -> Option<crate::planner::table::SqlMetadataTableKind> {
+        self.metadata_table_kind
     }
 
     pub fn mv_target(&self) -> Option<&SqlMvTargetScanPreparationFacts> {
@@ -505,6 +516,7 @@ pub fn scan_preparation_facts(scan: &PlanScanNode) -> SqlScanPreparationFacts {
         frozen_snapshot_id: None,
         frozen_timestamp_millis: None,
         delta_window: None,
+        metadata_table_kind: None,
         mv_target: None,
         connector_read_purpose: ConnectorReadPurpose::Query,
         refresh_projected_names: None,
@@ -531,8 +543,9 @@ pub fn scan_preparation_facts(scan: &PlanScanNode) -> SqlScanPreparationFacts {
             facts.category = SqlScanPreparationCategory::FrozenTimestampWithoutAdmittedSnapshot;
             facts.frozen_timestamp_millis = Some(*timestamp);
         }
-        crate::planner::table::SqlScanKind::Metadata { .. } => {
+        crate::planner::table::SqlScanKind::Metadata { kind, .. } => {
             facts.category = SqlScanPreparationCategory::AdmittedMetadata;
+            facts.metadata_table_kind = Some(*kind);
         }
         crate::planner::table::SqlScanKind::Delta {
             from_snapshot_id,

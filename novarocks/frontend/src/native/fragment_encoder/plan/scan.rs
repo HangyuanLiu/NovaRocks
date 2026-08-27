@@ -26,6 +26,7 @@ use crate::query_execution::preparation::{
     NativeScanBindingView, NativeScanColumnKind, NativeScanColumnView, NativeScanExecutionKind,
 };
 use novarocks_proto_models::{common, plan};
+use novarocks_sql::plan_read::ColumnId;
 use novarocks_sql::plan_read::{
     ExchangeFlavor, ExchangeReceiver, OutputColumn as AnalysisOutputColumn, SqlPlanScanNodeRead,
     SqlScanSourceRead, SqlTableDefRead,
@@ -37,6 +38,14 @@ pub(super) fn encode_scan_node(
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanNode, String> {
     let binding = scan_binding_for_source(node_id, &src.table.source, ctx)?;
+    // The columns the engine derives above the connector. They are part of the
+    // node's output and none of them is read, so nothing that counts what the
+    // connector produces may include them.
+    let synthetic_ids = src
+        .variant_columns
+        .iter()
+        .map(|column| column.synthetic_column_id)
+        .collect::<HashSet<_>>();
     let columns = match binding {
         Some(binding) => encode_bound_scan_output_columns(src, binding)?,
         None => encode_output_columns(&src.columns)?,
@@ -61,6 +70,7 @@ pub(super) fn encode_scan_node(
             Some(node_id),
             Some(&src.columns),
             Some(&columns),
+            &synthetic_ids,
             binding,
             ctx,
         )?),
@@ -220,6 +230,7 @@ pub(super) fn encode_table_def_with_context(
     scan_node_id: Option<i32>,
     scan_columns: Option<&[AnalysisOutputColumn]>,
     scan_output_columns: Option<&[common::OutputColumn]>,
+    synthetic_output_column_ids: &HashSet<ColumnId>,
     binding: Option<NativeScanBindingView<'_>>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::TableDef, String> {
@@ -247,6 +258,7 @@ pub(super) fn encode_table_def_with_context(
             &src.source,
             scan_node_id,
             scan_output_columns,
+            synthetic_output_column_ids,
             ctx,
         )?),
     })
@@ -458,6 +470,7 @@ fn encode_scan_source(
     src: &SqlScanSourceRead,
     scan_node_id: Option<i32>,
     scan_output_columns: Option<&[common::OutputColumn]>,
+    synthetic_output_column_ids: &HashSet<ColumnId>,
     ctx: &NativePlanEncodeContext<'_>,
 ) -> Result<plan::ScanSource, String> {
     use plan::scan_source::Kind;
@@ -472,15 +485,25 @@ fn encode_scan_source(
         // slot `i`. The encoder therefore copies them in place and only
         // agrees the two lengths; sorting or deduplicating here would read one
         // column into another column's slot.
+        //
+        // Only the physical columns are counted. A scan node's output also
+        // carries the columns the engine derives above the connector — VARIANT
+        // path columns are the case that exists — and the connector produces
+        // none of them, so counting the whole output would reject every scan
+        // that projects one.
         let output_columns = scan_output_columns.unwrap_or_default();
-        if source.assignments().len() != output_columns.len() {
+        let physical_output_columns = output_columns
+            .iter()
+            .filter(|column| !synthetic_output_column_ids.contains(&ColumnId(column.column_id)))
+            .count();
+        if source.assignments().len() != physical_output_columns {
             return Err(format!(
-                "typed connector scan node_id={} assigns {} columns but the encoded scan node declares {} output columns",
+                "typed connector scan node_id={} assigns {} columns but the encoded scan node declares {} physical output columns",
                 scan_node_id
                     .map(|node_id| node_id.to_string())
                     .unwrap_or_else(|| "<none>".to_string()),
                 source.assignments().len(),
-                output_columns.len(),
+                physical_output_columns,
             ));
         }
         return Ok(plan::ScanSource {

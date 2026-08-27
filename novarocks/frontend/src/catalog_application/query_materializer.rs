@@ -592,7 +592,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
 /// to materialize, so it must stay exactly the connector's own vocabulary. The
 /// match is exhaustive on purpose: a new relation must fail to compile here
 /// rather than resolve to some other relation's schema.
-fn metadata_table_alias_suffix(
+pub(crate) fn metadata_table_alias_suffix(
     kind: novarocks_sql::planning::catalog::MetadataTableKind,
 ) -> &'static str {
     use novarocks_sql::planning::catalog::MetadataTableKind;

@@ -19,6 +19,17 @@
 //!
 //! SQL owns runtime-filter semantics. Core only matches each request against
 //! the exact connector read already pinned during scan preparation.
+//!
+//! A scan-domain target is a *provider schema field index*: the backend matches
+//! it against the per-scan-unit domain facts a split carries
+//! (`novarocks/execution/src/runtime_filter/scan_domain.rs`, which compares
+//! `ConnectorScanUnitColumn::field_ordinal`). The opaque read froze that index
+//! in `PlannedConnectorRead::provider_field_ordinals`; the typed carrier names
+//! a column by `ValidatedColumnHandle` instead and exposes no such index, and
+//! reading one out of the handle would mean interpreting a provider variant
+//! inside the frontend. So this resolution has no typed authority yet and
+//! refuses rather than inventing an ordinal that would silently target another
+//! column.
 
 use crate::query_execution::preparation::scan::ScanExecutionBindings;
 use novarocks_sql::planning::query_execution::{
@@ -46,7 +57,7 @@ fn resolve_target(
     let read = scan_bindings
         .connector_read(request.fragment_id, request.node_id)
         .ok_or_else(|| format!(
-            "runtime filter binding id={} scan-domain target requires a pinned connector read for fragment_id={} node_id={}",
+            "runtime filter binding id={} scan-domain target for fragment_id={} node_id={} has no frozen provider field ordinal: the typed connector scan names its columns by column handle, and this stack has no scan-domain identity to freeze in its place",
             request.binding_id, request.fragment_id, request.node_id
         ))?;
     let physical = binding
