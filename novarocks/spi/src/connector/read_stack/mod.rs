@@ -65,10 +65,12 @@ pub use runtime::{
     ConnectorReadColumnHandle, ConnectorReadConstraint, ConnectorReadDynamicFilter,
     ConnectorReadDynamicFilterSnapshot, ConnectorReadFilterApplication,
     ConnectorReadFrozenRewriteGroup, ConnectorReadLimitApplication, ConnectorReadMetadata,
-    ConnectorReadPageSourceProvider, ConnectorReadProviderFactory, ConnectorReadRelationVersion,
-    ConnectorReadSplit, ConnectorReadSplitFacts, ConnectorReadSplitManager,
-    ConnectorReadSplitSource, ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider,
+    ConnectorReadPageSourceProvider, ConnectorReadProviderFactory, ConnectorReadRelation,
+    ConnectorReadRelationKind, ConnectorReadRelationVersion, ConnectorReadSplit,
+    ConnectorReadSplitFacts, ConnectorReadSplitManager, ConnectorReadSplitSource,
+    ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider,
     ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle, ConnectorReadTransactionHandle,
+    ConnectorReadWorkSource,
 };
 pub use session::{ConnectorSession, MAX_SESSION_PROPERTIES, SessionPropertyValue};
 pub use split::{ConnectorSplit, HostAddress, STANDARD_SPLIT_WEIGHT_RAW, SplitWeight};

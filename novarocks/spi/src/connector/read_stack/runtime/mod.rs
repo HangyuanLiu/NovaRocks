@@ -385,6 +385,68 @@ pub enum ConnectorReadRelationVersion {
     Reference,
 }
 
+/// The neutral category of a frozen read relation. The central IDL remains
+/// the closed source of truth for its wire representation; this enum retains
+/// only the business category after a codec has decoded the carrier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorReadRelationKind {
+    Table,
+    TableFunction,
+    ChangeWindow,
+    SystemTable,
+    TableExecute,
+    MergeTable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorReadWorkSource {
+    RuntimeSplits,
+    WholeRelation,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConnectorReadRelation {
+    kind: ConnectorReadRelationKind,
+    table: ConnectorReadTableHandle,
+    transaction: ConnectorReadTransactionHandle,
+}
+
+impl ConnectorReadRelation {
+    pub const fn new(
+        kind: ConnectorReadRelationKind,
+        table: ConnectorReadTableHandle,
+        transaction: ConnectorReadTransactionHandle,
+    ) -> Self {
+        Self {
+            kind,
+            table,
+            transaction,
+        }
+    }
+
+    pub const fn kind(&self) -> ConnectorReadRelationKind {
+        self.kind
+    }
+
+    pub const fn table(&self) -> &ConnectorReadTableHandle {
+        &self.table
+    }
+
+    pub const fn transaction(&self) -> &ConnectorReadTransactionHandle {
+        &self.transaction
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ConnectorReadRelationKind,
+        ConnectorReadTableHandle,
+        ConnectorReadTransactionHandle,
+    ) {
+        (self.kind, self.table, self.transaction)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectorReadChangeWindow {
     from_snapshot_id: i64,

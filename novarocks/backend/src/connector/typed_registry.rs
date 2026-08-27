@@ -40,11 +40,11 @@
 //! It never matches a provider variant, so it compiles with no provider crate
 //! in the dependency graph.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use novarocks_proto_codec::connector_read::TypedConnectorProviderFactory;
+use novarocks_proto_codec::connector_read::{ConnectorReadCodec, TypedConnectorProviderFactory};
 use novarocks_proto_codec::connector_read::{
     TypedConnectorPageSourceProvider, TypedConnectorSystemTableProvider,
 };
@@ -52,6 +52,79 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorExecutionBindingKey, ConnectorInstanceIncarnation,
     ConnectorRequestContext,
 };
+
+use novarocks_spi::connector::read_stack::ConnectorReadProviderFactory;
+
+/// One exact binding's complete worker read unit. The factory and codec must
+/// travel together because every recovered handle belongs to the factory that
+/// will consume it.
+#[derive(Clone)]
+pub struct InstalledReadExecution {
+    factory: Arc<dyn ConnectorReadProviderFactory>,
+    codec: Arc<dyn ConnectorReadCodec>,
+}
+
+impl InstalledReadExecution {
+    pub fn new(
+        factory: Arc<dyn ConnectorReadProviderFactory>,
+        codec: Arc<dyn ConnectorReadCodec>,
+    ) -> Self {
+        Self { factory, codec }
+    }
+
+    pub fn factory(&self) -> Arc<dyn ConnectorReadProviderFactory> {
+        Arc::clone(&self.factory)
+    }
+
+    pub fn codec(&self) -> Arc<dyn ConnectorReadCodec> {
+        Arc::clone(&self.codec)
+    }
+}
+
+impl fmt::Debug for InstalledReadExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledReadExecution")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Passive exact-key BE mirror. It has no provider discovery or generation
+/// authority; callers obtain the key from existing Host admission first.
+#[derive(Default)]
+pub struct InstalledReadExecutionRegistry {
+    installed: Mutex<BTreeMap<ConnectorExecutionBindingKey, InstalledReadExecution>>,
+}
+
+impl InstalledReadExecutionRegistry {
+    pub fn install_or_resolve(
+        &self,
+        key: ConnectorExecutionBindingKey,
+        execution: InstalledReadExecution,
+    ) -> InstalledReadExecution {
+        let mut installed = self
+            .installed
+            .lock()
+            .expect("installed read execution registry lock");
+        installed.entry(key).or_insert(execution).clone()
+    }
+
+    pub fn resolve(&self, key: &ConnectorExecutionBindingKey) -> Option<InstalledReadExecution> {
+        self.installed
+            .lock()
+            .expect("installed read execution registry lock")
+            .get(key)
+            .cloned()
+    }
+
+    pub fn retire(&self, key: &ConnectorExecutionBindingKey) -> bool {
+        self.installed
+            .lock()
+            .expect("installed read execution registry lock")
+            .remove(key)
+            .is_some()
+    }
+}
 
 /// The worker-side provider factory of exactly one connector binding
 /// generation.

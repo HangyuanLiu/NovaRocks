@@ -27,8 +27,117 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use novarocks_proto_codec::connector_read::{TypedConnectorMetadata, TypedConnectorSplitManager};
+use novarocks_proto_codec::connector_read::{
+    ConnectorReadCodec, TypedConnectorMetadata, TypedConnectorSplitManager,
+};
 use novarocks_spi::connector::ConnectorExecutionBindingKey;
+use novarocks_spi::connector::read_stack::{ConnectorReadMetadata, ConnectorReadSplitManager};
+
+/// A connector-owned RAII registration lease.  The registry observes it only
+/// weakly: dropping a failed catalog creation can remove its own exact slot
+/// without a Host/RPC side effect or a new frontend authority.
+pub trait ReadControlRegistrationLease: Send + Sync {}
+
+/// One exact binding's complete transport-neutral coordinator read unit.
+///
+/// The service traits and their matching codec are installed and resolved as
+/// one value.  A role never chooses a codec independently of the services
+/// that minted its opaque handles.
+#[derive(Clone)]
+pub struct InstalledReadControl {
+    metadata: Arc<dyn ConnectorReadMetadata>,
+    splits: Arc<dyn ConnectorReadSplitManager>,
+    codec: Arc<dyn ConnectorReadCodec>,
+    registration_lease: Option<std::sync::Weak<dyn ReadControlRegistrationLease>>,
+}
+
+impl InstalledReadControl {
+    pub fn new(
+        metadata: Arc<dyn ConnectorReadMetadata>,
+        splits: Arc<dyn ConnectorReadSplitManager>,
+        codec: Arc<dyn ConnectorReadCodec>,
+    ) -> Self {
+        Self {
+            metadata,
+            splits,
+            codec,
+            registration_lease: None,
+        }
+    }
+
+    pub fn with_registration_lease(
+        mut self,
+        lease: std::sync::Weak<dyn ReadControlRegistrationLease>,
+    ) -> Self {
+        self.registration_lease = Some(lease);
+        self
+    }
+
+    pub fn metadata(&self) -> Arc<dyn ConnectorReadMetadata> {
+        Arc::clone(&self.metadata)
+    }
+
+    pub fn splits(&self) -> Arc<dyn ConnectorReadSplitManager> {
+        Arc::clone(&self.splits)
+    }
+
+    pub fn codec(&self) -> Arc<dyn ConnectorReadCodec> {
+        Arc::clone(&self.codec)
+    }
+
+    pub fn registration_is_live(&self) -> bool {
+        self.registration_lease
+            .as_ref()
+            .is_none_or(|lease| lease.strong_count() > 0)
+    }
+}
+
+impl fmt::Debug for InstalledReadControl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledReadControl")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Passive FE-local registry for complete read units.  It is keyed by the
+/// exact authority decision made elsewhere and deliberately permits old and
+/// new generations to coexist while their callers still hold leases.
+#[derive(Default)]
+pub struct InstalledReadControlRegistry {
+    installed: Mutex<BTreeMap<ConnectorExecutionBindingKey, InstalledReadControl>>,
+}
+
+impl InstalledReadControlRegistry {
+    pub fn install_or_resolve(
+        &self,
+        key: ConnectorExecutionBindingKey,
+        control: InstalledReadControl,
+    ) -> InstalledReadControl {
+        let mut installed = self
+            .installed
+            .lock()
+            .expect("installed read control registry lock");
+        installed.entry(key).or_insert(control).clone()
+    }
+
+    pub fn resolve(&self, key: &ConnectorExecutionBindingKey) -> Option<InstalledReadControl> {
+        self.installed
+            .lock()
+            .expect("installed read control registry lock")
+            .get(key)
+            .cloned()
+    }
+
+    /// Conditional retirement leaves a concurrent replacement untouched.
+    pub fn retire(&self, key: &ConnectorExecutionBindingKey) -> bool {
+        self.installed
+            .lock()
+            .expect("installed read control registry lock")
+            .remove(key)
+            .is_some()
+    }
+}
 
 /// The pair of coordinator-side entry points one installed provider offers.
 #[derive(Clone)]

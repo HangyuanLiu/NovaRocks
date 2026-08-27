@@ -11,6 +11,7 @@ mod control;
 mod execution;
 mod handle;
 mod predicate;
+mod runtime_codec;
 mod scan;
 mod split;
 mod task_update;
@@ -36,6 +37,10 @@ pub use handle::{
 pub use predicate::{
     ValidatedColumnHandle, decode_connector_expression, decode_tuple_domain,
     encode_connector_expression, encode_tuple_domain,
+};
+pub use runtime_codec::{
+    ConnectorReadCodec, ConnectorReadCodecError, DecodedConnectorReadScan,
+    DecodedScheduledReadSplit, ReceivedScheduledSplitEvidence,
 };
 pub use scan::{ConnectorTableScanSource, DynamicFilterBinding, ScanAssignment, ScanWorkSource};
 pub use split::{SplitCategory, ValidatedConnectorSplit};
