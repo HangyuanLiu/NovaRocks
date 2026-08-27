@@ -694,6 +694,7 @@ mod tests {
                                 name_mapping_json: None,
                                 from_snapshot_id_exclusive: 6,
                                 to_snapshot_id_inclusive: 7,
+                                partition_spec_jsons: std::collections::BTreeMap::new(),
                             },
                         )),
                     },

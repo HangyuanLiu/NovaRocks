@@ -109,6 +109,7 @@ pub fn decode_value_type(
             }
             match simple {
                 dto::ValueTypeKind::Boolean => ConnectorValueType::Boolean,
+                dto::ValueTypeKind::TinyInt => ConnectorValueType::TinyInt,
                 dto::ValueTypeKind::Integer => ConnectorValueType::Integer,
                 dto::ValueTypeKind::BigInt => ConnectorValueType::BigInt,
                 dto::ValueTypeKind::Real => ConnectorValueType::Real,
@@ -143,6 +144,7 @@ pub fn encode_value_type(value_type: ConnectorValueType) -> dto::ValueType {
     encoded.kind = match value_type {
         ConnectorValueType::NonComparable => dto::ValueTypeKind::NonComparable,
         ConnectorValueType::Boolean => dto::ValueTypeKind::Boolean,
+        ConnectorValueType::TinyInt => dto::ValueTypeKind::TinyInt,
         ConnectorValueType::Integer => dto::ValueTypeKind::Integer,
         ConnectorValueType::BigInt => dto::ValueTypeKind::BigInt,
         ConnectorValueType::Real => dto::ValueTypeKind::Real,
@@ -181,6 +183,17 @@ pub fn decode_value(
         .ok_or_else(|| missing(path.clone(), "value must be present"))?;
     let decoded = match value {
         dto::value::Value::Boolean(value) => ConnectorValue::Boolean(*value),
+        // The wire carries it as a 32-bit varint because proto has no narrower
+        // signed integer; a value outside the eight-bit range is a producer
+        // bug, not a value to truncate.
+        dto::value::Value::TinyInt(value) => {
+            ConnectorValue::TinyInt(i8::try_from(*value).map_err(|_| {
+                out_of_range(
+                    path.clone().field("tiny_int"),
+                    "tiny int value must be within -128..=127",
+                )
+            })?)
+        }
         dto::value::Value::Integer(value) => ConnectorValue::Integer(*value),
         dto::value::Value::BigInt(value) => ConnectorValue::BigInt(*value),
         dto::value::Value::Real(value) => ConnectorValue::Real(*value),
@@ -245,6 +258,7 @@ pub fn decode_value(
 pub fn encode_value(value: &ConnectorValue) -> dto::Value {
     let encoded = match value {
         ConnectorValue::Boolean(value) => dto::value::Value::Boolean(*value),
+        ConnectorValue::TinyInt(value) => dto::value::Value::TinyInt(i32::from(*value)),
         ConnectorValue::Integer(value) => dto::value::Value::Integer(*value),
         ConnectorValue::BigInt(value) => dto::value::Value::BigInt(*value),
         ConnectorValue::Real(value) => dto::value::Value::Real(*value),

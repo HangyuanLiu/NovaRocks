@@ -39,6 +39,10 @@ package novarocks.connector_read;
 enum ValueTypeKind {
   VALUE_TYPE_KIND_UNSPECIFIED = 0;
   VALUE_TYPE_KIND_BOOLEAN = 1;
+  // An eight-bit signed integer. The engine has one and Iceberg does not, so
+  // a column of this type is always engine-derived; widening it to INTEGER
+  // would be exactly the implicit downgrade this vocabulary refuses.
+  VALUE_TYPE_KIND_TINY_INT = 18;
   VALUE_TYPE_KIND_INTEGER = 2;
   VALUE_TYPE_KIND_BIG_INT = 3;
   VALUE_TYPE_KIND_REAL = 4;
@@ -82,6 +86,7 @@ message DecimalValue {
 message Value {
   oneof value {
     bool boolean = 1;
+    int32 tiny_int = 17;               // -128..=127.
     int32 integer = 2;
     int64 big_int = 3;
     float real = 4;

@@ -355,7 +355,8 @@ fn artifact_scalar(value: &ConnectorValue) -> Option<ConnectorScalarValue> {
         // No accepted artifact representation: float and decimal ordering,
         // time-of-day, zoned timestamps, and opaque byte payloads are not part
         // of the prepared-unit contract either.
-        ConnectorValue::Real(_)
+        ConnectorValue::TinyInt(_)
+        | ConnectorValue::Real(_)
         | ConnectorValue::Double(_)
         | ConnectorValue::Decimal { .. }
         | ConnectorValue::TimeMicros(_)

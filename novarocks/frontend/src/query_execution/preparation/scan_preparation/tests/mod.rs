@@ -401,6 +401,7 @@ impl novarocks_proto::connector_read::TypedConnectorMetadata for FixtureTypedCon
                             name_mapping_json: None,
                             from_snapshot_id_exclusive: window.from_snapshot_id(),
                             to_snapshot_id_inclusive: window.to_snapshot_id(),
+                            partition_spec_jsons: std::collections::BTreeMap::new(),
                         },
                     )),
                 },

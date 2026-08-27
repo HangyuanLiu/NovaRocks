@@ -1703,7 +1703,10 @@ fn physical_value(value: &ConnectorValue) -> Option<IcebergPhysicalPredicateValu
         ConnectorValue::Integer(value) => Some(IcebergPhysicalPredicateValue::Int32(*value)),
         ConnectorValue::BigInt(value) => Some(IcebergPhysicalPredicateValue::Int64(*value)),
         ConnectorValue::Date(value) => Some(IcebergPhysicalPredicateValue::Date32(*value)),
-        ConnectorValue::Real(_)
+        // No Iceberg field is eight-bit, so a tiny int can only be an
+        // engine-derived column, which no manifest carries statistics for.
+        ConnectorValue::TinyInt(_)
+        | ConnectorValue::Real(_)
         | ConnectorValue::Double(_)
         | ConnectorValue::Decimal { .. }
         | ConnectorValue::TimeMicros(_)

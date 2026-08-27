@@ -97,6 +97,9 @@ pub(crate) fn lower_scan_predicates(
 pub(crate) fn connector_value_type(data_type: &DataType) -> Option<ConnectorValueType> {
     match data_type {
         DataType::Boolean => Some(ConnectorValueType::Boolean),
+        // Eight-bit columns exist in the engine and nowhere in Iceberg, so a
+        // column of this type is always one the engine derived.
+        DataType::Int8 => Some(ConnectorValueType::TinyInt),
         DataType::Int32 => Some(ConnectorValueType::Integer),
         DataType::Int64 => Some(ConnectorValueType::BigInt),
         DataType::Float32 => Some(ConnectorValueType::Real),
@@ -352,6 +355,13 @@ fn lower_literal(expr: &TypedExpr, expected: ConnectorValueType) -> Option<Conne
         ConnectorValueType::NonComparable => return None,
         ConnectorValueType::Boolean => match literal {
             LiteralValue::Bool(value) => ConnectorValue::Boolean(*value),
+            _ => return None,
+        },
+        // An eight-bit column is engine-derived. The literal a query writes
+        // against it is an ordinary integer literal, so it is accepted only
+        // when it actually fits.
+        ConnectorValueType::TinyInt => match literal {
+            LiteralValue::Int(value) => ConnectorValue::TinyInt(i8::try_from(*value).ok()?),
             _ => return None,
         },
         ConnectorValueType::Integer => match literal {

@@ -38,6 +38,9 @@ pub const MAX_CONNECTOR_DECIMAL_PRECISION: u8 = 38;
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ConnectorValueType {
     Boolean,
+    /// An eight-bit signed integer. Only an engine-derived column has this
+    /// type; no Iceberg field does.
+    TinyInt,
     Integer,
     BigInt,
     Real,
@@ -84,6 +87,7 @@ impl ConnectorValueType {
 #[derive(Clone, Debug)]
 pub enum ConnectorValue {
     Boolean(bool),
+    TinyInt(i8),
     Integer(i32),
     BigInt(i64),
     Real(f32),
@@ -115,6 +119,7 @@ impl ConnectorValue {
     pub fn value_type(&self) -> ConnectorValueType {
         match self {
             Self::Boolean(_) => ConnectorValueType::Boolean,
+            Self::TinyInt(_) => ConnectorValueType::TinyInt,
             Self::Integer(_) => ConnectorValueType::Integer,
             Self::BigInt(_) => ConnectorValueType::BigInt,
             Self::Real(_) => ConnectorValueType::Real,
@@ -143,7 +148,7 @@ impl ConnectorValue {
     /// Number of payload bytes this value retains, for bounds accounting.
     pub fn payload_bytes(&self) -> usize {
         match self {
-            Self::Boolean(_) => 1,
+            Self::Boolean(_) | Self::TinyInt(_) => 1,
             Self::Integer(_) | Self::Date(_) | Self::Real(_) => 4,
             Self::BigInt(_)
             | Self::Double(_)

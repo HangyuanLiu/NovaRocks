@@ -1570,6 +1570,13 @@ fn connector_value_at(
         ConnectorValueType::Boolean => {
             ConnectorValue::Boolean(downcast::<BooleanArray>(column, path)?.value(row))
         }
+        // Only an engine-derived column is eight-bit, and no such column is
+        // read from a file, so no predicate can name one here.
+        ConnectorValueType::TinyInt => {
+            return Err(corrupt(format!(
+                "iceberg predicate column of {path} is eight-bit, which no iceberg field is"
+            )));
+        }
         ConnectorValueType::Integer => {
             ConnectorValue::Integer(downcast::<Int32Array>(column, path)?.value(row))
         }
