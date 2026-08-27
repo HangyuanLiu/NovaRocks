@@ -511,16 +511,23 @@ fn attach_leaf_consumers(
         }
         plan::distributed_node::Payload::Physical(physical) => match physical.kind.as_ref() {
             Some(plan::plan_node::Kind::Scan(_)) => {
-                set_native_scan_specs(&mut lowered.node, specs).map_err(|_| {
+                set_native_scan_specs(&mut lowered.node, specs).map_err(|error| {
+                    let detail = match error {
+                        SetScanSpecsError::NoScanBoundary => format!(
+                            "native node_id={} scan lowering lost Scan boundary",
+                            wire_node.node_id
+                        ),
+                        SetScanSpecsError::SourceRefused(reason) => format!(
+                            "native node_id={} scan source refused its runtime-filter contracts: {reason}",
+                            wire_node.node_id
+                        ),
+                    };
                     NativeFragmentDecodeError::inconsistent(
                         path.clone()
                             .field("payload")
                             .field("physical")
                             .field("scan"),
-                        format!(
-                            "native node_id={} scan lowering lost Scan boundary",
-                            wire_node.node_id
-                        ),
+                        detail,
                     )
                 })?;
             }
@@ -603,20 +610,34 @@ fn wrap_source_boundary(
     };
 }
 
+/// Why a decoded leaf could not take its runtime-filter consumer specs.
+enum SetScanSpecsError {
+    /// The lowered subtree had no Scan boundary to attach them to.
+    NoScanBoundary,
+    /// The scan's own source refused the contracts.
+    SourceRefused(String),
+}
+
 fn set_native_scan_specs(
     node: &mut ExecNode,
     specs: Vec<RuntimeFilterConsumerBinding>,
-) -> Result<(), Vec<RuntimeFilterConsumerBinding>> {
+) -> Result<(), SetScanSpecsError> {
     match &mut node.kind {
         ExecNodeKind::Scan(scan) => {
-            *scan = scan.clone().with_runtime_filter_consumers(specs);
+            // A source that consults a live filter subscribes here, once the
+            // contracts it needs are known.
+            *scan = scan
+                .clone()
+                .with_runtime_filter_consumers(specs)
+                .install_runtime_filter_contracts()
+                .map_err(SetScanSpecsError::SourceRefused)?;
             Ok(())
         }
         ExecNodeKind::Project(project) if project.is_subordinate => {
             set_native_scan_specs(&mut project.input, specs)
         }
         ExecNodeKind::Filter(filter) => set_native_scan_specs(&mut filter.input, specs),
-        _ => Err(specs),
+        _ => Err(SetScanSpecsError::NoScanBoundary),
     }
 }
 
@@ -1019,31 +1040,24 @@ fn consumer_spec(
     binding: &DecodedRuntimeFilterBinding,
     expr_id: novarocks_execution::exec::expr::ExprId,
 ) -> Result<RuntimeFilterConsumerBinding, String> {
-    let DecodedBindingRole::Consumer { contract, target } = &binding.role else {
+    let DecodedBindingRole::Consumer { contract, .. } = &binding.role else {
         return Err(format!(
             "native runtime-filter binding_id={} expected consumer role",
             binding.binding_id
         ));
     };
-    let scan_domain = match target {
-        DecodedConsumerBindingTarget::DirectInput { .. } => None,
-        DecodedConsumerBindingTarget::SourceBoundary { scan_domain } => {
-            scan_domain.as_ref().map(|target| {
-                execution::scan_domain::RuntimeFilterScanDomainBinding::new(
-                    execution::RuntimeFilterBindingId::new(binding.binding_id),
-                    execution::scan_domain::RuntimeFilterScanDomainTarget::new(
-                        target.field_ordinal,
-                        target.data_type.clone(),
-                        target.nullable,
-                    ),
-                )
-            })
-        }
-    };
+    // A scan-domain consumer reaches its connector scan through that scan's own
+    // carrier: `ConnectorTableScanSource::dynamic_filters` maps this binding id
+    // to a `ScanAssignment` variable and so to a typed `ColumnHandle`, and
+    // `ScanSource::with_runtime_filter_contracts` turns the pair into the live
+    // dynamic filter the reader consults. The decoded scan-domain target states
+    // only the type contract -- already checked against the consumer expression
+    // by `validate_scan_domain_target` -- so there is no column identity left
+    // for the sealed-unit evaluator to key on, and none is fabricated here.
     Ok(RuntimeFilterConsumerBinding::new(
         expr_id,
         contract.clone(),
-        scan_domain,
+        None,
     ))
 }
 

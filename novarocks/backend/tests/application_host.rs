@@ -103,6 +103,7 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
             sink_io_max_blocking_threads: 1,
         },
         execution_installers: Vec::new(),
+        typed_provider_factories: Vec::new(),
     }
 }
 

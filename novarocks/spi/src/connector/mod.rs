@@ -44,6 +44,7 @@ mod view_metadata;
 mod write;
 
 pub mod conformance;
+pub mod read_stack;
 
 pub use cleanup_maintenance::{
     BatchReceipt, BatchReceiptSummary, CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION,

@@ -207,7 +207,6 @@ fn encode_role(
                     let scan_domain_target = scan_domain_target
                         .map(|target| {
                             Ok(plan::RuntimeFilterScanDomainTarget {
-                                field_ordinal: target.field_ordinal,
                                 r#type: Some(semantic_encoder::encode_type(&target.data_type)?),
                                 nullable: target.nullable,
                             })
@@ -498,7 +497,6 @@ mod tests {
                 activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
                 target: RuntimeFilterConsumerTarget::SourceBoundary {
                     scan_domain_target: Some(RuntimeFilterScanDomainTarget {
-                        field_ordinal: 17,
                         data_type: DataType::Int32,
                         nullable: true,
                     }),
@@ -514,7 +512,6 @@ mod tests {
             panic!("structured source-boundary target");
         };
         let target = target.scan_domain_target.expect("scan-domain target");
-        assert_eq!(target.field_ordinal, 17);
         assert!(target.nullable);
         assert!(target.r#type.is_some());
     }

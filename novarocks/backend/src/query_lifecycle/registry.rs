@@ -2192,6 +2192,81 @@ impl QueryLifecycleRegistry {
         })
     }
 
+    /// Admits one runtime split assignment against an already staged task.
+    ///
+    /// Unlike `admit_fragment` this neither creates nor mutates lifecycle
+    /// state: it only decides whether this exact attempt may still receive
+    /// work. The delivery window opens once the participant is staged, which
+    /// is strictly after the Init + ControlReady barrier froze the admitted
+    /// participant set, so an assignment can never introduce a participant.
+    pub(crate) fn admit_task_update(
+        &self,
+        execution_id: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+    ) -> Result<(), QueryLifecycleError> {
+        let entry = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&execution_id)
+            .cloned();
+        let Some(entry) = entry else {
+            return Err(self.admission_error(
+                execution_id,
+                QueryLifecycleErrorCode::Terminated,
+                "query is not active",
+            ));
+        };
+        if !entry
+            .expected_fragment_instance_ids
+            .contains(&fragment_instance_id)
+        {
+            return Err(self.admission_error(
+                execution_id,
+                QueryLifecycleErrorCode::InvalidManifest,
+                "fragment instance is outside the participant manifest",
+            ));
+        }
+        let state = entry.state.lock().expect("query lifecycle entry lock");
+        if state.termination_reason.is_some()
+            || matches!(
+                state.phase,
+                QueryLifecyclePhase::TerminalRetained
+                    | QueryLifecyclePhase::Terminating
+                    | QueryLifecyclePhase::Tombstone
+            )
+        {
+            drop(state);
+            return Err(self.admission_error(
+                execution_id,
+                QueryLifecycleErrorCode::Terminated,
+                "query lifecycle has terminated",
+            ));
+        }
+        if !matches!(
+            state.phase,
+            QueryLifecyclePhase::Staged | QueryLifecyclePhase::Running
+        ) {
+            drop(state);
+            return Err(self.admission_error(
+                execution_id,
+                QueryLifecycleErrorCode::Conflict,
+                "task has not been staged",
+            ));
+        }
+        if !state.accepted_fragments.contains(&fragment_instance_id) {
+            drop(state);
+            return Err(self.admission_error(
+                execution_id,
+                QueryLifecycleErrorCode::Conflict,
+                "fragment instance is not an admitted task",
+            ));
+        }
+        drop(state);
+        Ok(())
+    }
+
     /// Returns a fragment-bound execution capability from the already
     /// initialized exact attempt. This lookup never creates, revives, or
     /// extends lifecycle retention.

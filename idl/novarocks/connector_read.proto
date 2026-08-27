@@ -1,0 +1,758 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+// NovaRocks-native typed connector read contract.
+//
+// Every handle and split category is its own closed `oneof`; a provider
+// variant is selected structurally, never by a class id, message name, or
+// private payload. The generic scheduler reads only the neutral envelope
+// promoted onto ConnectorSplit and must not interpret a provider variant.
+//
+// Owner: produced by the FE native plan/assignment encoder, validated by
+// novarocks-proto, and consumed by the BE native decode adapter. Provider
+// semantics belong to the provider that produced the variant.
+// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
+package novarocks.connector_read;
+
+// ---------------------------------------------------------------------------
+// Typed values
+// ---------------------------------------------------------------------------
+
+// The exact type of a Value. Decimal precision/scale and fixed width are part
+// of the type, so two values only compare when their whole ValueType matches.
+enum ValueTypeKind {
+  VALUE_TYPE_KIND_UNSPECIFIED = 0;
+  VALUE_TYPE_KIND_BOOLEAN = 1;
+  // An eight-bit signed integer. The engine has one and Iceberg does not, so
+  // a column of this type is always engine-derived; widening it to INTEGER
+  // would be exactly the implicit downgrade this vocabulary refuses.
+  VALUE_TYPE_KIND_TINY_INT = 18;
+  VALUE_TYPE_KIND_INTEGER = 2;
+  VALUE_TYPE_KIND_BIG_INT = 3;
+  VALUE_TYPE_KIND_REAL = 4;
+  VALUE_TYPE_KIND_DOUBLE = 5;
+  VALUE_TYPE_KIND_DECIMAL = 6;
+  VALUE_TYPE_KIND_DATE = 7;
+  VALUE_TYPE_KIND_TIME_MICROS = 8;
+  VALUE_TYPE_KIND_TIMESTAMP_MICROS = 9;
+  VALUE_TYPE_KIND_TIMESTAMP_TZ_MICROS = 10;
+  VALUE_TYPE_KIND_TIMESTAMP_NANOS = 11;
+  VALUE_TYPE_KIND_TIMESTAMP_TZ_NANOS = 12;
+  VALUE_TYPE_KIND_VARCHAR = 13;
+  VALUE_TYPE_KIND_VARBINARY = 14;
+  VALUE_TYPE_KIND_UUID = 15;
+  VALUE_TYPE_KIND_FIXED = 16;
+  // A column whose engine type has no comparable counterpart: ROW, ARRAY, MAP
+  // and the binary-carried variant types. Such a column can be projected and
+  // read, and can never appear in a Value, a Domain, or a comparison, so no
+  // Value arm exists for it. It states only that no comparable counterpart
+  // exists; the column's actual shape is carried by the plan node's own output
+  // column, which the fragment decoder agrees with these assignments.
+  VALUE_TYPE_KIND_NON_COMPARABLE = 17;
+}
+
+// Decimal and fixed parameters are present exactly when the kind requires them.
+message ValueType {
+  ValueTypeKind kind = 1;
+  optional uint32 decimal_precision = 2;  // 1..=38, DECIMAL only.
+  optional int32 decimal_scale = 3;       // 0..=precision, DECIMAL only.
+  optional uint32 fixed_length = 4;       // FIXED only.
+}
+
+// A 16-byte two's-complement unscaled magnitude plus its exact type parameters.
+message DecimalValue {
+  bytes unscaled = 1;      // exactly 16 bytes, big-endian two's complement.
+  uint32 precision = 2;    // 1..=38.
+  int32 scale = 3;         // 0..=precision.
+}
+
+// One exactly typed, non-null value. NULL is carried by Domain.null_allowed.
+message Value {
+  oneof value {
+    bool boolean = 1;
+    int32 tiny_int = 17;               // -128..=127.
+    int32 integer = 2;
+    int64 big_int = 3;
+    float real = 4;
+    double double_value = 5;
+    DecimalValue decimal = 6;
+    int32 date = 7;                    // days since the Unix epoch.
+    int64 time_micros = 8;             // microseconds since midnight.
+    int64 timestamp_micros = 9;
+    int64 timestamp_tz_micros = 10;
+    int64 timestamp_nanos = 11;
+    int64 timestamp_tz_nanos = 12;
+    string varchar = 13;               // <= 64 KiB.
+    bytes varbinary = 14;              // <= 64 KiB.
+    bytes uuid = 15;                   // exactly 16 bytes.
+    bytes fixed = 16;                  // <= 64 KiB.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Predicates
+// ---------------------------------------------------------------------------
+
+enum BoundKind {
+  BOUND_KIND_UNSPECIFIED = 0;
+  BOUND_KIND_UNBOUNDED = 1;
+  BOUND_KIND_INCLUSIVE = 2;
+  BOUND_KIND_EXCLUSIVE = 3;
+}
+
+// The bounding value is present exactly when the kind is not UNBOUNDED.
+message Bound {
+  BoundKind kind = 1;
+  optional Value value = 2;
+}
+
+message Range {
+  Bound low = 1;
+  Bound high = 2;
+}
+
+// Sorted, non-overlapping ranges of one exact type. An empty list is the empty
+// set; a single fully unbounded range is the whole set. Discrete values are
+// unit ranges, so there is no second representation.
+message ValueSet {
+  ValueType value_type = 1;
+  repeated Range ranges = 2;  // <= 4096.
+}
+
+message Domain {
+  ValueSet values = 1;
+  bool null_allowed = 2;
+}
+
+message ColumnDomain {
+  ColumnHandle column = 1;
+  Domain domain = 2;
+}
+
+// `none = true` is the unsatisfiable predicate and must carry no column
+// domains. Otherwise an absent column is unconstrained, so an empty list is
+// the unconstrained predicate.
+message TupleDomain {
+  bool none = 1;
+  repeated ColumnDomain column_domains = 2;  // <= 4096, canonical column order.
+}
+
+// The residual expression a connector accepted beyond a TupleDomain.
+message ConnectorExpression {
+  oneof node {
+    ConstantExpression constant = 1;
+    VariableExpression variable = 2;
+    FieldDereferenceExpression field_dereference = 3;
+    CallExpression call = 4;
+  }
+}
+
+message ConstantExpression {
+  ValueType value_type = 1;
+  optional Value value = 2;  // absent is the typed NULL literal.
+}
+
+message VariableExpression {
+  string name = 1;  // non-empty, <= 256 bytes.
+  ValueType value_type = 2;
+}
+
+message FieldDereferenceExpression {
+  ConnectorExpression target = 1;
+  uint32 field_index = 2;
+  ValueType value_type = 3;
+}
+
+message CallExpression {
+  string function_name = 1;  // non-empty ASCII, <= 256 bytes.
+  ValueType value_type = 2;
+  repeated ConnectorExpression arguments = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Shared identity
+// ---------------------------------------------------------------------------
+
+message SchemaTableName {
+  string schema_name = 1;  // non-empty, <= 1024 bytes.
+  string table_name = 2;   // non-empty, <= 1024 bytes.
+}
+
+message HostAddress {
+  string host = 1;  // non-empty, <= 255 bytes.
+  uint32 port = 2;  // 1..=65535.
+}
+
+// ---------------------------------------------------------------------------
+// Column handles
+// ---------------------------------------------------------------------------
+
+enum ColumnIdentityCategory {
+  COLUMN_IDENTITY_CATEGORY_UNSPECIFIED = 0;
+  COLUMN_IDENTITY_CATEGORY_PRIMITIVE = 1;
+  COLUMN_IDENTITY_CATEGORY_STRUCT = 2;
+  COLUMN_IDENTITY_CATEGORY_ARRAY = 3;
+  COLUMN_IDENTITY_CATEGORY_MAP = 4;
+}
+
+// Iceberg column identity: field id, name, category, and children in schema
+// order. PRIMITIVE must have no children.
+message ColumnIdentity {
+  int32 field_id = 1;
+  string name = 2;
+  ColumnIdentityCategory category = 3;
+  repeated ColumnIdentity children = 4;
+}
+
+message IcebergColumnHandle {
+  ColumnIdentity base_column_identity = 1;
+  string base_type_json = 2;          // Iceberg type JSON of the base column.
+  repeated int32 field_id_path = 3;   // dereference path below the base column.
+  string type_json = 4;               // Iceberg type JSON of the projected column.
+  bool nullable = 5;
+  optional string comment = 6;
+}
+
+// Closed set of column handles. A generic consumer keys on this whole message.
+message ColumnHandle {
+  oneof handle {
+    IcebergColumnHandle iceberg = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Transaction handles
+// ---------------------------------------------------------------------------
+
+// Iceberg reuses Trino's Hive-shaped transaction marker. The frontend
+// transaction manager is the only owner; a worker never resolves it.
+message HiveTransactionHandle {
+  bool auto_commit = 1;
+  bytes uuid = 2;  // exactly 16 bytes.
+}
+
+message ConnectorTransactionHandle {
+  oneof handle {
+    HiveTransactionHandle iceberg = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Table handles
+// ---------------------------------------------------------------------------
+
+// A worker-visible Iceberg table handle. Only DATA relations use it; system
+// relations, table functions, and table execute have their own entry points.
+message IcebergTableHandle {
+  SchemaTableName schema_table_name = 1;
+  optional int64 snapshot_id = 2;
+  string table_schema_json = 3;
+  optional int32 spec_id = 4;
+  map<int32, string> partition_spec_jsons = 5;
+  int32 format_version = 6;                    // 1, 2, or 3.
+  TupleDomain unenforced_predicate = 7;
+  TupleDomain enforced_predicate = 8;
+  optional uint64 limit = 9;
+  repeated IcebergColumnHandle projected_columns = 10;  // pushdown fact; unordered.
+  optional string name_mapping_json = 11;
+  string table_location = 12;
+  map<string, string> storage_properties = 13;
+}
+
+message ConnectorTableHandle {
+  oneof handle {
+    IcebergTableHandle iceberg = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Table function handles (Trino table_changes)
+// ---------------------------------------------------------------------------
+
+message TableChangesFunctionHandle {
+  SchemaTableName schema_table_name = 1;
+  string table_schema_json = 2;
+  repeated IcebergColumnHandle columns = 3;  // ordered output columns.
+  optional string name_mapping_json = 4;
+  int64 start_snapshot_id = 5;
+  int64 end_snapshot_id = 6;
+}
+
+message ConnectorTableFunctionHandle {
+  oneof handle {
+    TableChangesFunctionHandle iceberg_table_changes = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Change-window handles (NovaRocks incremental materialized views)
+// ---------------------------------------------------------------------------
+
+// The window is an endpoint visible-row set difference, not a manifest replay.
+message IcebergChangeWindowHandle {
+  SchemaTableName schema_table_name = 1;
+  string table_schema_json = 2;
+  repeated IcebergColumnHandle columns = 3;  // ordered output columns.
+  optional string name_mapping_json = 4;
+  int64 from_snapshot_id_exclusive = 5;
+  int64 to_snapshot_id_inclusive = 6;
+  // Every partition spec a split of this window may name. A window spans two
+  // snapshots, so files written under different specs can appear on both
+  // sides of the difference and every one of them must be decodable without
+  // resolving the relation through the catalog again.
+  map<int32, string> partition_spec_jsons = 7;
+}
+
+message ConnectorChangeWindowHandle {
+  oneof handle {
+    IcebergChangeWindowHandle iceberg = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// System relation references
+// ---------------------------------------------------------------------------
+
+// Worker-visible system relations. PARTITIONS is deliberately absent: it is a
+// view bound to the same pinned snapshot's FILES relation.
+enum IcebergSystemTableType {
+  ICEBERG_SYSTEM_TABLE_TYPE_UNSPECIFIED = 0;
+  ICEBERG_SYSTEM_TABLE_TYPE_FILES = 1;
+  ICEBERG_SYSTEM_TABLE_TYPE_ENTRIES = 2;
+  ICEBERG_SYSTEM_TABLE_TYPE_SNAPSHOTS = 3;
+  ICEBERG_SYSTEM_TABLE_TYPE_HISTORY = 4;
+  ICEBERG_SYSTEM_TABLE_TYPE_REFS = 5;
+  ICEBERG_SYSTEM_TABLE_TYPE_MANIFESTS = 6;
+}
+
+// An immutable metadata reference. The selected backend validates the UUID and
+// snapshot against the metadata file; it never re-resolves through the catalog
+// and never falls back to the latest snapshot.
+message IcebergSystemTableReference {
+  SchemaTableName schema_table_name = 1;
+  IcebergSystemTableType system_table_type = 2;
+  string metadata_file_location = 3;
+  string table_uuid = 4;
+  optional int64 snapshot_id = 5;
+}
+
+message ConnectorSystemTableReference {
+  oneof reference {
+    IcebergSystemTableReference iceberg = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Table execute handles
+// ---------------------------------------------------------------------------
+
+// Trino's eight procedures plus the single NovaRocks extension. Only OPTIMIZE
+// reuses an ordinary data split; REWRITE_POSITION_DELETE_FILES has its own.
+enum IcebergProcedureId {
+  ICEBERG_PROCEDURE_ID_UNSPECIFIED = 0;
+  ICEBERG_PROCEDURE_ID_OPTIMIZE = 1;
+  ICEBERG_PROCEDURE_ID_OPTIMIZE_MANIFESTS = 2;
+  ICEBERG_PROCEDURE_ID_DROP_EXTENDED_STATS = 3;
+  ICEBERG_PROCEDURE_ID_ROLLBACK_TO_SNAPSHOT = 4;
+  ICEBERG_PROCEDURE_ID_EXPIRE_SNAPSHOTS = 5;
+  ICEBERG_PROCEDURE_ID_REMOVE_ORPHAN_FILES = 6;
+  ICEBERG_PROCEDURE_ID_ADD_FILES = 7;
+  ICEBERG_PROCEDURE_ID_ADD_FILES_FROM_TABLE = 8;
+  ICEBERG_PROCEDURE_ID_REWRITE_POSITION_DELETE_FILES = 9;
+}
+
+message IcebergOptimizeHandle {
+  IcebergTableHandle table_handle = 1;
+  uint64 min_file_size_bytes = 2;
+}
+
+// References one exact frozen rewrite artifact and group. The artifact is
+// external immutable content addressed by its own content id; a scan or page
+// source never derives a digest of its own.
+message IcebergRewriteArtifactContentId {
+  string artifact_location = 1;
+  string artifact_digest_hex = 2;  // 64 lowercase hex characters.
+}
+
+message IcebergRewritePositionDeleteFilesHandle {
+  IcebergTableHandle table_handle = 1;
+  IcebergRewriteArtifactContentId artifact = 2;
+  string group_digest_hex = 3;  // 64 lowercase hex characters.
+}
+
+message IcebergTableExecuteHandle {
+  SchemaTableName schema_table_name = 1;
+  IcebergProcedureId procedure_id = 2;
+  string table_location = 3;
+  oneof procedure_handle {
+    IcebergOptimizeHandle optimize = 10;
+    IcebergRewritePositionDeleteFilesHandle rewrite_position_delete_files = 11;
+  }
+}
+
+message ConnectorTableExecuteHandle {
+  oneof handle {
+    IcebergTableExecuteHandle iceberg = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Merge table handles
+// ---------------------------------------------------------------------------
+
+message IcebergInsertTableHandle {
+  SchemaTableName schema_table_name = 1;
+  string table_schema_json = 2;
+  string table_location = 3;
+  int32 format_version = 4;
+  optional int32 spec_id = 5;
+}
+
+message IcebergMergeTableHandle {
+  IcebergTableHandle table_handle = 1;
+  IcebergInsertTableHandle insert_table_handle = 2;
+}
+
+message ConnectorMergeTableHandle {
+  oneof handle {
+    IcebergMergeTableHandle iceberg = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// File and delete descriptors
+// ---------------------------------------------------------------------------
+
+enum IcebergFileFormat {
+  ICEBERG_FILE_FORMAT_UNSPECIFIED = 0;
+  ICEBERG_FILE_FORMAT_ORC = 1;
+  ICEBERG_FILE_FORMAT_PARQUET = 2;
+  ICEBERG_FILE_FORMAT_AVRO = 3;
+  // Puffin carries deletion vectors as an addressed blob inside a container
+  // file. It is a delete artifact format only; a data file is never Puffin.
+  ICEBERG_FILE_FORMAT_PUFFIN = 4;
+}
+
+enum IcebergDeleteFileContent {
+  ICEBERG_DELETE_FILE_CONTENT_UNSPECIFIED = 0;
+  ICEBERG_DELETE_FILE_CONTENT_POSITION_DELETES = 1;
+  ICEBERG_DELETE_FILE_CONTENT_EQUALITY_DELETES = 2;
+}
+
+// Typed extension point only. Parquet modular encryption is not implemented in
+// this contract; a non-empty value is rejected by both producer and consumer.
+message ParquetFileDecryptionData {
+  bytes key_metadata = 1;  // <= 64 KiB, redacted in every debug rendering.
+  bytes aad_prefix = 2;    // <= 64 KiB, redacted in every debug rendering.
+}
+
+// One applicable delete file, carried inline with its data split. The file
+// format field is the only format authority; a suffix is never inspected.
+message IcebergDeleteFile {
+  IcebergDeleteFileContent content = 1;
+  string path = 2;
+  IcebergFileFormat format = 3;
+  int64 record_count = 4;
+  int64 file_size_in_bytes = 5;
+  repeated int32 equality_field_ids = 6;  // schema order; <= 4096.
+  optional int64 row_position_lower_bound = 7;
+  optional int64 row_position_upper_bound = 8;
+  int64 data_sequence_number = 9;
+  optional int64 content_offset = 10;        // Puffin deletion vector only.
+  optional int64 content_size_in_bytes = 11; // Puffin deletion vector only.
+  optional ParquetFileDecryptionData decryption_data = 12;
+}
+
+// ---------------------------------------------------------------------------
+// Data splits
+// ---------------------------------------------------------------------------
+
+// One byte range of one Iceberg data file, self-contained: it carries the full
+// applicable delete closure and every fact the reader needs.
+message IcebergSplit {
+  string path = 1;                 // <= 16 KiB.
+  int64 start = 2;
+  int64 length = 3;
+  int64 file_size = 4;
+  int64 file_record_count = 5;
+  IcebergFileFormat file_format = 6;
+  int32 partition_spec_id = 7;
+  string partition_data_json = 8;
+  repeated IcebergDeleteFile deletes = 9;  // <= 1024, planner order.
+  TupleDomain file_statistics_domain = 10;
+  optional int64 data_sequence_number = 11;
+  optional int64 file_first_row_id = 12;
+  optional ParquetFileDecryptionData decryption_data = 13;
+}
+
+message DataSplit {
+  oneof provider {
+    IcebergSplit iceberg = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Table-changes splits
+// ---------------------------------------------------------------------------
+
+enum TableChangesChangeType {
+  TABLE_CHANGES_CHANGE_TYPE_UNSPECIFIED = 0;
+  TABLE_CHANGES_CHANGE_TYPE_ADDED_FILE = 1;
+  TABLE_CHANGES_CHANGE_TYPE_DELETED_FILE = 2;
+}
+
+message TableChangesSplit {
+  TableChangesChangeType change_type = 1;
+  int64 snapshot_id = 2;
+  int64 snapshot_timestamp_millis = 3;
+  int64 change_ordinal = 4;
+  string path = 5;
+  int64 start = 6;
+  int64 length = 7;
+  int64 file_size = 8;
+  int64 file_record_count = 9;
+  IcebergFileFormat file_format = 10;
+  int32 partition_spec_id = 11;
+  string partition_data_json = 12;
+  optional ParquetFileDecryptionData decryption_data = 13;
+}
+
+message TableChangesSplitCategory {
+  oneof provider {
+    TableChangesSplit iceberg = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Change-window splits
+// ---------------------------------------------------------------------------
+
+// Rows newly visible at the window's upper endpoint.
+message IcebergAddedRows {
+  IcebergSplit data = 1;
+  repeated int64 restricted_row_ids = 2;  // optional narrowing; <= 4096.
+}
+
+// Rows of a still-present data file that became invisible by position. The
+// backend loads the delete artifacts named here and builds its own private
+// inclusion set; no position list crosses the wire.
+message IcebergPositionDeletedRows {
+  IcebergSplit data = 1;
+  repeated IcebergDeleteFile newly_applied_deletes = 2;
+  repeated IcebergDeleteFile previously_applied_deletes = 3;
+}
+
+// Rows of a still-present data file that became invisible by equality match.
+message IcebergEqualityDeletedRows {
+  IcebergSplit data = 1;
+  repeated IcebergDeleteFile newly_applied_equality_deletes = 2;
+  repeated IcebergDeleteFile previously_applied_deletes = 3;
+}
+
+// Every row of a data file that disappeared between the two endpoints, minus
+// the rows already invisible at the lower endpoint.
+message IcebergDeletedDataFileRows {
+  IcebergSplit data = 1;
+  repeated IcebergDeleteFile previously_applied_deletes = 2;
+}
+
+message IcebergChangeSplit {
+  oneof rows {
+    IcebergAddedRows added_rows = 10;
+    IcebergPositionDeletedRows position_deleted_rows = 11;
+    IcebergEqualityDeletedRows equality_deleted_rows = 12;
+    IcebergDeletedDataFileRows deleted_data_file_rows = 13;
+  }
+}
+
+message ChangeWindowSplitCategory {
+  oneof provider {
+    IcebergChangeSplit iceberg = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// System-relation splits
+// ---------------------------------------------------------------------------
+
+message TrinoManifestFile {
+  string path = 1;
+  int64 length = 2;
+  int32 partition_spec_id = 3;
+  int32 content = 4;
+  int64 sequence_number = 5;
+  int64 min_sequence_number = 6;
+  int64 added_snapshot_id = 7;
+  optional int32 added_files_count = 8;
+  optional int32 existing_files_count = 9;
+  optional int32 deleted_files_count = 10;
+  optional int64 added_rows_count = 11;
+  optional int64 existing_rows_count = 12;
+  optional int64 deleted_rows_count = 13;
+  optional int64 first_row_id = 14;
+  bytes key_metadata = 15;  // non-empty is NOT_SUPPORTED in this contract.
+}
+
+// One manifest of the pinned snapshot's $files relation.
+message FilesTableSplit {
+  TrinoManifestFile manifest = 1;
+  string table_schema_json = 2;
+  string metadata_table_schema_json = 3;
+  map<int32, string> partition_spec_jsons = 4;
+  optional string partition_column_type_json = 5;
+  optional string bounds_column_type_json = 6;
+  optional string encryption_key_id = 7;
+}
+
+message SystemFilesSplitCategory {
+  oneof provider {
+    FilesTableSplit iceberg = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rewrite-position-delete splits
+// ---------------------------------------------------------------------------
+
+// One data file plus the exact Puffin position-delete descriptors selected by
+// the frozen rewrite artifact. Output is (file_path VARCHAR, pos BIGINT).
+message IcebergRewritePositionDeleteFilesSplit {
+  string data_file_path = 1;
+  int64 data_file_size = 2;
+  int32 partition_spec_id = 3;
+  string partition_data_json = 4;
+  repeated IcebergDeleteFile selected_position_deletes = 5;
+}
+
+message RewritePositionDeleteFilesSplitCategory {
+  oneof provider {
+    IcebergRewritePositionDeleteFilesSplit iceberg = 10;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The scheduled split envelope
+// ---------------------------------------------------------------------------
+
+// Fields 1..=5 are the neutral view the generic scheduler consumes. The
+// category oneof is provider data the scheduler must not interpret.
+message ConnectorSplit {
+  uint64 split_weight_raw = 1;         // positive; 100 is one standard split.
+  bool remotely_accessible = 2;
+  repeated HostAddress addresses = 3;  // <= 256.
+  optional string affinity_key = 4;    // <= 4 KiB.
+  uint64 retained_size_in_bytes = 5;
+  oneof category {
+    DataSplit data = 10;
+    TableChangesSplitCategory table_changes = 11;
+    ChangeWindowSplitCategory change_window = 12;
+    SystemFilesSplitCategory system_files = 13;
+    RewritePositionDeleteFilesSplitCategory rewrite_position_delete_files = 14;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The scan node contract
+// ---------------------------------------------------------------------------
+
+// The catalog-scoped, transaction-bound relation a scan reads. Exactly one
+// relation kind is present.
+message CatalogTableHandle {
+  string catalog_name = 1;                        // normalized ConnectorInstanceId.
+  bytes instance_incarnation = 2;                 // exactly 16 bytes.
+  ConnectorTransactionHandle transaction = 3;
+  oneof relation {
+    ConnectorTableHandle table = 10;
+    ConnectorTableFunctionHandle table_function = 11;
+    ConnectorChangeWindowHandle change_window = 12;
+    ConnectorSystemTableReference system_table = 13;
+    ConnectorTableExecuteHandle table_execute = 14;
+    ConnectorMergeTableHandle merge_table = 15;
+  }
+}
+
+// One ordered output column of a scan: the plan variable, the connector
+// column it binds, and its exact type.
+message ScanAssignment {
+  // An opaque expression identifier, non-empty and unique within one scan. It
+  // is what a ConnectorExpression names this column by; it is deliberately not
+  // the output column's name, and carries no meaning of its own. The ordered
+  // position is the output contract: assignments[i] produces page channel i.
+  string variable = 1;
+  ColumnHandle column = 2;
+  ValueType value_type = 3;
+}
+
+// One dynamic filter the backend resolves against this scan's assignments.
+message DynamicFilterBinding {
+  uint32 filter_id = 1;
+  string variable = 2;  // must name one of this scan's assignments.
+}
+
+// How one scan's work reaches the backend that runs it.
+//
+// It is an engine decision about execution, not a fact of the provider's
+// relation handle, so it travels on the scan node. A neutral backend reads it
+// to choose a lane and never matches a provider variant to re-derive it.
+enum ScanWorkSource {
+  SCAN_WORK_SOURCE_UNSPECIFIED = 0;
+  // Splits arrive at runtime on the task-update queue. Every ordinary read
+  // uses this, including the distributed system relations.
+  SCAN_WORK_SOURCE_RUNTIME_SPLITS = 1;
+  // No split at all: one backend reads the relation itself from an immutable
+  // metadata file. Only a system relation the coordinator resolved to a single
+  // task may use this, and reading it on more than one task duplicates every
+  // row, so the coordinator alone keeps it to one.
+  SCAN_WORK_SOURCE_WHOLE_RELATION = 2;
+}
+
+// The typed replacement for the opaque connector read source. It carries no
+// split list, no private payload, and no Arrow IPC schema.
+message ConnectorTableScanSource {
+  CatalogTableHandle table = 1;
+  repeated ScanAssignment assignments = 2;      // ordered output; <= 4096.
+  TupleDomain enforced_predicate = 3;
+  TupleDomain unenforced_predicate = 4;
+  optional ConnectorExpression remaining_expression = 5;
+  repeated DynamicFilterBinding dynamic_filters = 6;
+  uint64 max_batch_rows = 7;                    // required nonzero.
+  uint64 max_batch_bytes = 8;                   // required nonzero.
+  ScanWorkSource work_source = 9;               // required, never unspecified.
+}
+
+// ---------------------------------------------------------------------------
+// Runtime split assignment
+// ---------------------------------------------------------------------------
+
+// One split placed in one task's plan-node queue. `sequence_id` is monotonic
+// within one (task attempt, plan node); an exact replay is idempotent and the
+// same sequence with different canonical bytes is a conflict.
+message ScheduledSplit {
+  uint64 sequence_id = 1;
+  int32 plan_node_id = 2;
+  ConnectorSplit split = 3;
+}
+
+// A batch of splits for one plan node. `no_more_splits` is terminal for that
+// plan node and idempotent; no split may follow it.
+message SplitAssignment {
+  int32 plan_node_id = 1;
+  repeated ScheduledSplit splits = 2;  // <= 4096.
+  bool no_more_splits = 3;
+}

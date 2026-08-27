@@ -21,15 +21,13 @@
 //! mutable collections.  They expose only the frozen facts that an encoder may
 //! map into a native carrier.
 
-use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorExecutionDeclaration, ConnectorPredicateDisposition,
-    ConnectorScan, ConnectorSplit, ConnectorStaticPredicate,
-};
+use novarocks_proto::connector_read::ConnectorTableScanSource;
+use novarocks_spi::connector::ConnectorExecutionDeclaration;
 use novarocks_sql::plan_read::{ColumnId, FragmentId, OutputColumn, TypedExpr};
 use novarocks_types::schema::ColumnDef;
 
 use super::scan::{
-    PlannedConnectorRead, ResolvedReadReason, ResolvedScanBinding, ResolvedScanColumnKind,
+    PreparedTypedConnectorScan, ResolvedReadReason, ResolvedScanBinding, ResolvedScanColumnKind,
     ResolvedScanExecution, ScanExecutionBindings,
 };
 use novarocks_proto::lifecycle::ScanRangeParams;
@@ -63,20 +61,23 @@ impl<'a> NativeScanFactsView<'a> {
         self.bindings.scan_ranges(fragment_id, node_id)
     }
 
+    /// The typed connector scan of one plan node, when it reads through a
+    /// connector at all. It reports presence, never a split count: a typed
+    /// scan has no frozen split set.
     pub fn connector_read(
         self,
         fragment_id: FragmentId,
         node_id: i32,
     ) -> Option<NativeConnectorReadView<'a>> {
         self.bindings
-            .connector_read(fragment_id, node_id)
-            .map(|read| NativeConnectorReadView { read })
+            .typed_scan(fragment_id, node_id)
+            .map(|scan| NativeConnectorReadView { scan })
     }
 
     pub fn connector_read_for_node(self, node_id: i32) -> Option<NativeConnectorReadView<'a>> {
         self.bindings
-            .connector_read_for_node(node_id)
-            .map(|read| NativeConnectorReadView { read })
+            .typed_scan_for_node(node_id)
+            .map(|scan| NativeConnectorReadView { scan })
     }
 
     #[allow(
@@ -102,10 +103,18 @@ impl<'a> NativeScanBindingView<'a> {
     pub fn execution(self) -> NativeScanExecutionKind {
         match self.binding.execution {
             ResolvedScanExecution::ConnectorRead => NativeScanExecutionKind::ConnectorRead,
-            ResolvedScanExecution::AdmittedConnectorRead(_) => {
+            // A system relation is an admitted connector read like any other:
+            // the encoder agrees the lane, and which relation family was
+            // frozen is carried by the typed scan's own handle.
+            ResolvedScanExecution::AdmittedConnectorRead(_)
+            | ResolvedScanExecution::AdmittedSystemTable(_) => {
                 NativeScanExecutionKind::AdmittedConnectorRead
             }
-            ResolvedScanExecution::SealedConnectorScan(_) => {
+            // The encoder-facing name is still `SealedConnectorScan`; it marks
+            // the change-window lane, which no longer carries a provider-sealed
+            // opaque scan. Renaming the encoder-visible variant is a separate
+            // change to the native fragment encoder.
+            ResolvedScanExecution::AdmittedChangeWindow(_) => {
                 NativeScanExecutionKind::SealedConnectorScan
             }
         }
@@ -199,43 +208,25 @@ pub enum NativeRequiredReadReason {
     EqualityDeleteKey,
 }
 
-/// Frozen connector read facts.  Provider leases and FE-local read sessions
-/// intentionally remain private to preparation.
+/// Frozen typed connector scan facts.  Provider leases and the connector's own
+/// split manager intentionally remain private to preparation: an encoder may
+/// read the carrier and the binding generation, never drive enumeration.
 #[derive(Clone, Copy)]
 pub struct NativeConnectorReadView<'a> {
-    read: &'a PlannedConnectorRead,
+    scan: &'a PreparedTypedConnectorScan,
 }
 
 impl<'a> NativeConnectorReadView<'a> {
     pub fn declaration(self) -> &'a ConnectorExecutionDeclaration {
-        &self.read.declaration
+        &self.scan.declaration
     }
 
-    pub fn scan(self) -> &'a ConnectorScan {
-        &self.read.scan
-    }
-
-    pub fn provider_field_ordinals(self) -> &'a [u32] {
-        &self.read.provider_field_ordinals
-    }
-
-    pub fn splits(self) -> &'a [ConnectorSplit] {
-        &self.read.splits
-    }
-
-    pub fn static_predicates(self) -> &'a [ConnectorStaticPredicate] {
-        &self.read.static_predicates
-    }
-
-    pub fn predicate_dispositions(self) -> &'a [ConnectorPredicateDisposition] {
-        &self.read.predicate_dispositions
+    /// The validated typed scan carrier, exactly as preparation froze it.
+    pub fn table_scan_source(self) -> &'a ConnectorTableScanSource {
+        self.scan.prepared.table_scan.source()
     }
 
     pub fn residual_predicates(self) -> &'a [TypedExpr] {
-        &self.read.residual_predicates
-    }
-
-    pub fn batch(self) -> ConnectorBatchBudget {
-        self.read.batch
+        &self.scan.residual_predicates
     }
 }

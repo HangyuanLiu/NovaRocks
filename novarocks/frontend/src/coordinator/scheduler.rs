@@ -228,9 +228,15 @@ impl FrontendFragmentScheduler {
                     .iter()
                     .map(|&node_id| {
                         let file_ranges = fragment.scan_range_count(node_id).unwrap_or_default();
-                        let connector_splits =
-                            fragment.connector_split_count(node_id).unwrap_or_default();
-                        file_ranges.max(connector_splits)
+                        // A connector scan's work arrives at runtime, so its
+                        // parallelism is the live backend fanout capped below,
+                        // not a split count planning happened to freeze.
+                        let connector_parallelism = if fragment.reads_through_connector(node_id) {
+                            backend_count
+                        } else {
+                            0
+                        };
+                        file_ranges.max(connector_parallelism)
                     })
                     .max()
                     .unwrap_or_default()

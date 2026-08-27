@@ -1700,11 +1700,13 @@ impl<'a> AnalyzerContext<'a> {
                 Ok(())
             }
             Relation::IcebergMetadataScan(rel) => {
-                let cols = crate::analyzer::iceberg_metadata::metadata_table_schema(
-                    rel.metadata_table_type,
-                );
+                // The relation already carries the resolved schema, including
+                // the schema-derived partition and bound columns a frozen
+                // shape cannot know about. Re-deriving the frozen shape here
+                // would leave a partitioned table's `partition` unresolvable on
+                // this path only.
                 let qualifier = rel.alias.as_deref().unwrap_or(&rel.table.name);
-                for col in &cols {
+                for col in &rel.table.columns {
                     scope.add_column(
                         Some(qualifier),
                         &col.name,

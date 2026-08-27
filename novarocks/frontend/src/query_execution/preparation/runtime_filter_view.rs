@@ -358,7 +358,6 @@ impl RuntimeFilterConsumerTarget {
                 Self::SourceBoundary {
                     scan_domain_target: scan_domain.as_ref().map(|target| {
                         RuntimeFilterScanDomainTarget {
-                            field_ordinal: target.field_ordinal,
                             data_type: target.data_type.clone(),
                             nullable: target.nullable,
                         }
@@ -369,9 +368,12 @@ impl RuntimeFilterConsumerTarget {
     }
 }
 
+/// The exact type contract a scan-domain consumer applies under.
+///
+/// It names no column: the filter reaches the scan through the typed carrier's
+/// own `filter id -> variable -> ColumnHandle` binding.
 #[derive(Clone)]
 pub struct RuntimeFilterScanDomainTarget {
-    pub field_ordinal: u32,
     pub data_type: DataType,
     pub nullable: bool,
 }

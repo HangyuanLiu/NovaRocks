@@ -1050,3 +1050,125 @@ fn stream_status_error(status: tonic::Status) -> QueryLifecycleTransportError {
         )),
     }
 }
+
+/// Native transport for runtime split assignment.
+///
+/// One client per admitted backend, resolved once for the round. Delivery is
+/// synchronous from the driver's point of view: the driver keeps one update in
+/// flight per task and uses the acknowledgement for backpressure, so there is
+/// no queue of unacknowledged updates to reconcile after a failure.
+pub(crate) struct GrpcTaskUpdateTransport {
+    clients: std::collections::BTreeMap<usize, Client>,
+}
+
+#[allow(
+    dead_code,
+    reason = "Constructed by the coordinator round driver in the same PR."
+)]
+impl GrpcTaskUpdateTransport {
+    pub(crate) fn new(
+        backends: &[(usize, RuntimeEndpoint)],
+        data_runtime: FrontendDataRuntime,
+    ) -> Result<Self, String> {
+        let mut clients = std::collections::BTreeMap::new();
+        for (backend_idx, endpoint) in backends {
+            if clients
+                .insert(
+                    *backend_idx,
+                    Client::new(endpoint.native_endpoint().clone(), data_runtime.clone()),
+                )
+                .is_some()
+            {
+                return Err(format!("duplicate task update backend {backend_idx}"));
+            }
+        }
+        Ok(Self { clients })
+    }
+}
+
+impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskUpdateTransport {
+    fn send(
+        &self,
+        execution_id: novarocks_proto::lifecycle::QueryExecutionId,
+        target: &crate::query_execution::split_assignment::AssignmentTarget,
+        fragment_instance_id: novarocks_types::UniqueId,
+        assignments: Vec<novarocks_proto_models::connector_read::SplitAssignment>,
+    ) -> Result<
+        crate::query_execution::split_assignment::TaskUpdateOutcome,
+        crate::query_execution::split_assignment::TaskUpdateTransportError,
+    > {
+        use crate::query_execution::split_assignment::{
+            TaskUpdateOutcome, TaskUpdateTransportError,
+        };
+
+        let client = self.clients.get(&target.backend_idx).ok_or_else(|| {
+            TaskUpdateTransportError::new(format!(
+                "task update client for backend {} is missing",
+                target.backend_idx
+            ))
+        })?;
+        let request = novarocks_proto_models::novarocks::TaskUpdateRequest {
+            execution_id: Some(ProtoQueryExecutionId {
+                query_id: Some(ProtoUniqueId {
+                    hi: execution_id.query_id().high(),
+                    lo: execution_id.query_id().low(),
+                }),
+                attempt_id: execution_id.attempt_id().get(),
+            }),
+            fragment_instance_id: Some(ProtoUniqueId {
+                hi: fragment_instance_id.high(),
+                lo: fragment_instance_id.low(),
+            }),
+            assignments,
+        };
+        let response = client
+            .data_runtime
+            .block_on(async {
+                let mut grpc = client.grpc().await?;
+                grpc.task_update(request)
+                    .await
+                    .map(|value| value.into_inner())
+                    .map_err(|error| format!("task_update rpc failed: {error}"))
+            })
+            .map_err(TaskUpdateTransportError::new)?
+            .map_err(TaskUpdateTransportError::new)?;
+
+        match response.outcome {
+            Some(novarocks_proto_models::novarocks::task_update_response::Outcome::Accepted(
+                accepted,
+            )) => Ok(TaskUpdateOutcome::Accepted(
+                accepted
+                    .nodes
+                    .into_iter()
+                    .map(
+                        |node| crate::query_execution::split_assignment::AcceptedPlanNode {
+                            plan_node_id: node.plan_node_id,
+                            accepted_through_sequence: node.accepted_through_sequence,
+                            no_more_splits: node.no_more_splits,
+                            queued_splits: node.queued_splits,
+                        },
+                    )
+                    .collect(),
+            )),
+            Some(novarocks_proto_models::novarocks::task_update_response::Outcome::Rejection(
+                rejection,
+            )) => {
+                let reason =
+                    novarocks_proto_models::novarocks::TaskUpdateRejectionReason::try_from(
+                        rejection.reason,
+                    )
+                    .map(|reason| reason.as_str_name().to_owned())
+                    .unwrap_or_else(|_| "UNKNOWN".to_owned());
+                Ok(TaskUpdateOutcome::Rejected {
+                    reason,
+                    detail: rejection.safe_detail,
+                })
+            }
+            // A response with no outcome cannot be interpreted, and guessing
+            // "accepted" would lose splits silently.
+            None => Err(TaskUpdateTransportError::new(
+                "task update response carried no outcome",
+            )),
+        }
+    }
+}

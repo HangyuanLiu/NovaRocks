@@ -2,9 +2,9 @@
 id: ADR-0053
 title: "Connector change-window scan admission"
 domain: [provider-spi, frontend-mv]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0114
 date: 2026-08-11
 provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/861"

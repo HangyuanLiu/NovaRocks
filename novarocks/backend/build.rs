@@ -19,8 +19,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 const IDL_DIR: &str = "../../idl/novarocks";
-const NATIVE_PROTO_FILES: [&str; 5] = [
+const NATIVE_PROTO_FILES: [&str; 6] = [
     "common.proto",
+    "connector_read.proto",
     "expr.proto",
     "filter.proto",
     "plan.proto",

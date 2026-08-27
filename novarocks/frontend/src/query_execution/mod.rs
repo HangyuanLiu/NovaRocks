@@ -22,6 +22,13 @@ pub mod assembly;
 pub mod backend_command;
 pub mod completion;
 pub(crate) mod connector_binding;
+// MIGRATION: the typed-scan lowering that consumes these lands in the same PR.
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "Consumed by the frontend typed-scan lowering in the same PR."
+)]
+pub(crate) mod connector_domain;
 pub(crate) mod connector_write_transaction;
 pub mod constant_eval;
 pub mod contract;
@@ -66,11 +73,17 @@ pub use schedule::FragmentInstancePlacement;
 pub mod post_compile;
 pub mod prepared_write;
 pub(crate) mod profile;
-pub mod read_session;
 pub(crate) mod row_mutation;
 pub(crate) mod runtime_filter_terminal_rollup;
 pub(crate) mod schedule;
 pub mod service;
+// MIGRATION: the typed-scan lowering that consumes these lands in the same PR.
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "Consumed by the frontend typed-scan lowering in the same PR."
+)]
+pub(crate) mod split_assignment;
 pub mod statistics;
 pub(crate) mod terminal_codec;
 pub mod terminal_set;

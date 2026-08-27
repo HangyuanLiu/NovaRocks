@@ -323,6 +323,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             let planned =
                 crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
                     query_kernel.connector_control().as_ref(),
+                    query_kernel.typed_connector_control(),
                     execution,
                     sealed,
                     target_bindings.as_ref(),
@@ -425,6 +426,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             let planned =
                 crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
                     query_kernel.connector_control().as_ref(),
+                    query_kernel.typed_connector_control(),
                     execution,
                     sealed,
                     target_bindings.as_ref(),

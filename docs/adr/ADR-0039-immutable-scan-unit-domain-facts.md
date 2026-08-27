@@ -2,9 +2,9 @@
 id: ADR-0039
 title: "Immutable scan-unit domain facts"
 domain: [provider-spi, runtime-filter]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0114
 date: 2026-08-03
 provenance:
   - "discussion: 2026-08-03 immutable scan-unit physical facts"

@@ -378,14 +378,7 @@ impl<'a> super::AnalyzerContext<'a> {
                     // as `Relation::Scan`).
                     let column_ids: Vec<crate::column_id::ColumnId> = cols
                         .iter()
-                        .map(|col| {
-                            scope.add_column(
-                                Some(qualifier),
-                                &col.name,
-                                col.data_type.clone(),
-                                col.nullable,
-                            )
-                        })
+                        .map(|col| scope.add_table_column(Some(qualifier), col))
                         .collect();
 
                     let relation = Relation::IcebergMetadataScan(IcebergMetadataScanRelation {

@@ -1046,7 +1046,6 @@ mod tests {
             backend_idx: 8,
             endpoint: RuntimeEndpoint::new("127.0.0.1", 19048).expect("endpoint"),
             scan_ranges: BTreeMap::new(),
-            connector_splits: BTreeMap::new(),
             destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         };
@@ -1097,7 +1096,6 @@ mod tests {
                     )
                     .expect("endpoint"),
                     scan_ranges: BTreeMap::new(),
-                    connector_splits: BTreeMap::new(),
                     destinations: Vec::new(),
                     per_exch_num_senders: BTreeMap::new(),
                 }],

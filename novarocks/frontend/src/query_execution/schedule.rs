@@ -28,7 +28,6 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::lifecycle_plan::QueryInitPlanHeader;
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_proto::lifecycle::{ExchangeRouteManifest, ScanRangeParams};
-use novarocks_spi::connector::ConnectorSplit;
 use novarocks_sql::plan_read::FragmentId;
 use novarocks_types::UniqueId;
 
@@ -41,9 +40,6 @@ pub struct FragmentInstancePlacement {
     pub backend_idx: usize,
     pub endpoint: RuntimeEndpoint,
     pub scan_ranges: BTreeMap<i32, Vec<ScanRangeParams>>,
-    /// Opaque provider splits assigned by the frontend scheduler.  They never
-    /// enter `InstanceParams.per_node_scan_ranges`.
-    pub connector_splits: BTreeMap<i32, Vec<ConnectorSplit>>,
     pub destinations: Vec<FragmentDestination>,
     pub per_exch_num_senders: BTreeMap<i32, i32>,
 }

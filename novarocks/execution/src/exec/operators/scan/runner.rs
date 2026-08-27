@@ -233,8 +233,10 @@ impl ScanAsyncRunner {
                 self.current_morsel = Some(morsel.clone());
                 self.row_position_state = self.build_row_position_state(&morsel)?;
                 let start = Instant::now();
-                // Preserve the old `ScanNode::execute_iter` behavior: an `Empty`
-                // morsel yields an empty iterator without touching the op.
+                // An `Empty` morsel means there is nothing to read, and is
+                // answered without touching the operator. `OperatorDriven`
+                // means the opposite — the operator owns the work — so it must
+                // reach it.
                 let iter = if matches!(morsel, ScanMorsel::Empty) {
                     Box::new(std::iter::empty()) as crate::exec::node::BoxedExecIter
                 } else {

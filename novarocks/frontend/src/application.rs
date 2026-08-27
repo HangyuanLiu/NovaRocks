@@ -129,6 +129,12 @@ impl std::error::Error for FrontendApplicationError {}
 
 pub struct FrontendApplicationHost {
     connector_control: Arc<ConnectorControlHost>,
+    /// Coordinator-side typed connector controls, keyed by the exact binding
+    /// generation. The composition root hands in the same instance its control
+    /// factories install into, so planning and installation never disagree
+    /// about which generation exists.
+    typed_connector_control:
+        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     dml_service: Option<Arc<DmlService>>,
@@ -323,6 +329,12 @@ impl FrontendApplicationHost {
             execution,
             backend,
             connector_factories,
+            // No composition root supplied one, so this host owns a private,
+            // empty registry: a typed scan then fails to resolve rather than
+            // reaching some other host's generation.
+            Arc::new(
+                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
+            ),
             data_runtime,
             native_trust,
             native_transport,
@@ -340,6 +352,9 @@ impl FrontendApplicationHost {
         execution: FrontendExecutionConfig,
         backend: ClusterBackendOpenConfig,
         connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
+        typed_connector_control: Arc<
+            crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+        >,
         data_runtime: Handle,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
@@ -360,6 +375,7 @@ impl FrontendApplicationHost {
                     )
                 })?,
             ),
+            typed_connector_control,
             catalog_runtime_projection,
             statistics_service: None,
             dml_service: None,
@@ -731,6 +747,17 @@ impl FrontendApplicationHost {
     ) -> Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> {
         Arc::clone(&self.connector_control)
             as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>
+    }
+
+    /// The typed connector control registry this host was composed with.
+    ///
+    /// It is a constructor-supplied capability, not something a request may
+    /// resolve from the host: query preparation receives it once, when the
+    /// session factory is built.
+    pub fn typed_connector_control(
+        &self,
+    ) -> Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry> {
+        Arc::clone(&self.typed_connector_control)
     }
 
     pub fn connector_control_factory_resolver(
@@ -1111,6 +1138,9 @@ mod tests {
             ),
             backend,
             Vec::new(),
+            std::sync::Arc::new(
+                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
+            ),
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),

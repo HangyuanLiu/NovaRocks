@@ -586,7 +586,13 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
     }
 }
 
-fn metadata_table_alias_suffix(
+/// Connector read-alias suffix for one metadata relation.
+///
+/// The suffix is the only thing that tells the connector which system relation
+/// to materialize, so it must stay exactly the connector's own vocabulary. The
+/// match is exhaustive on purpose: a new relation must fail to compile here
+/// rather than resolve to some other relation's schema.
+pub(crate) fn metadata_table_alias_suffix(
     kind: novarocks_sql::planning::catalog::MetadataTableKind,
 ) -> &'static str {
     use novarocks_sql::planning::catalog::MetadataTableKind;
@@ -598,7 +604,9 @@ fn metadata_table_alias_suffix(
         MetadataTableKind::Files => "FILES",
         MetadataTableKind::Manifests => "MANIFESTS",
         MetadataTableKind::Partitions => "PARTITIONS",
-        MetadataTableKind::LogicalIcebergMetadata => "LOGICAL_ICEBERG_METADATA",
+        // Was `LOGICAL_ICEBERG_METADATA`. The alias is retired; `$entries` is
+        // the only spelling, and it maps to the wire's ENTRIES worker type.
+        MetadataTableKind::Entries => "ENTRIES",
     }
 }
 

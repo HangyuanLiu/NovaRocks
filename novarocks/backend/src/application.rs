@@ -68,6 +68,13 @@ pub struct BackendServerConfig {
     /// Backend only owns registration and lifecycle of these contributions; it
     /// never constructs a provider-specific installer or catalog binding.
     pub execution_installers: Vec<Arc<dyn ConnectorExecutionInstaller>>,
+    /// Worker-side typed provider factories, one per provider kind. A binding
+    /// generation gets its typed entry when the execution host ensures it, so
+    /// "installed" keeps exactly one meaning on this backend.
+    pub typed_provider_factories: Vec<(
+        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+    )>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -322,6 +329,26 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
         }
     }
 
+    fn task_update(
+        &self,
+        request: crate::query_lifecycle::task_update::TaskUpdateRequest,
+    ) -> crate::query_lifecycle::task_update::TaskUpdateAck {
+        // Admission and delivery are deliberately separate: the lifecycle
+        // decides whether this exact attempt may still receive work, and the
+        // fragment runtime owns the queue the work lands in.
+        if let Err(error) = self
+            .registry
+            .admit_task_update(request.execution_id(), request.fragment_instance_id())
+        {
+            return crate::query_lifecycle::task_update::rejection_from_lifecycle_error(&error);
+        }
+        self.fragments.deliver_split_assignments(
+            request.execution_id(),
+            request.fragment_instance_id(),
+            request.assignments(),
+        )
+    }
+
     fn start_prepared_query(&self, request: QueryStartRequest) -> QueryStartAck {
         self.registry.start_prepared_query(request)
     }
@@ -423,6 +450,10 @@ fn compose_backend_application_services(
     query_lifecycle_config: QueryLifecycleRegistryConfig,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
+    typed_provider_factories: &[(
+        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+    )],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let execution_runtime = Arc::new(ExecutionRuntime::new(execution_runtime_config).map_err(
         |error| BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error),
@@ -431,7 +462,15 @@ fn compose_backend_application_services(
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
         BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
     );
-    let execution_host = seal_connector_execution_host(execution_installers)?;
+    // One registry per backend: the execution host writes it on ensure and the
+    // fragment runtime reads it at decode, so both agree on which generation is
+    // installed.
+    let typed_providers = Arc::new(crate::connector::TypedConnectorProviderRegistry::new());
+    let execution_host = seal_connector_execution_host(
+        execution_installers,
+        typed_provider_factories,
+        Arc::clone(&typed_providers),
+    )?;
     let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(
         Arc::clone(&controls),
         Arc::clone(&execution_host),
@@ -477,6 +516,11 @@ fn compose_backend_application_services(
 
 fn seal_connector_execution_host(
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
+    typed_provider_factories: &[(
+        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+    )],
+    typed_registry: Arc<crate::connector::TypedConnectorProviderRegistry>,
 ) -> Result<Arc<crate::ConnectorExecutionHost>, BackendApplicationError> {
     #[cfg(test)]
     if execution_installers.is_empty() {
@@ -484,14 +528,18 @@ fn seal_connector_execution_host(
         // composition root. Production startup never takes this branch.
         return Ok(Arc::new(crate::ConnectorExecutionHost::empty_for_tests()));
     }
-    crate::ConnectorExecutionHost::try_new(execution_installers.iter().cloned())
-        .map(Arc::new)
-        .map_err(|error| {
-            BackendApplicationError::new(
-                BackendApplicationErrorKind::Configuration,
-                format!("seal connector execution installer set: {error}"),
-            )
-        })
+    crate::ConnectorExecutionHost::try_new(
+        execution_installers.iter().cloned(),
+        typed_provider_factories.iter().cloned(),
+        typed_registry,
+    )
+    .map(Arc::new)
+    .map_err(|error| {
+        BackendApplicationError::new(
+            BackendApplicationErrorKind::Configuration,
+            format!("seal connector execution installer set: {error}"),
+        )
+    })
 }
 
 impl BackendApplicationHost {
@@ -602,6 +650,7 @@ impl BackendApplicationHost {
             write_commit_evidence_limits,
             execution_runtime_config,
             execution_installers,
+            typed_provider_factories,
         } = config;
         let readiness_endpoint =
             NativeEndpoint::from_host_port(&advertise_endpoint.host, advertise_endpoint.port)
@@ -618,6 +667,7 @@ impl BackendApplicationHost {
             query_lifecycle_config,
             write_commit_evidence_limits,
             &execution_installers,
+            &typed_provider_factories,
         )?;
         let process_descriptor = BackendProcessDescriptor::new(
             services.query_lifecycle_ingress.backend_process_id(),
@@ -1035,6 +1085,7 @@ mod tests {
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
             execution_runtime_config: execution_runtime_config(),
             execution_installers: Vec::new(),
+            typed_provider_factories: Vec::new(),
         }
     }
 
@@ -1173,6 +1224,7 @@ mod tests {
             execution_runtime_config(),
             query_lifecycle_registry_config(Duration::from_millis(5_000)),
             WriteCommitEvidenceLimits::default(),
+            &[],
             &[],
         )
         .expect("compose backend application services");

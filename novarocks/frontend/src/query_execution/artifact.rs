@@ -45,7 +45,6 @@ use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::{
     PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet, PreparedOutputColumn,
 };
-use crate::query_execution::read_session::ConnectorReadSessionSet;
 use crate::query_execution::schedule::{
     FragmentInstancePlacement, FragmentLifecycleProjection, SchedulingPlan,
 };
@@ -88,55 +87,6 @@ fn protocol_execution_id(
 /// split. Known-cost splits use deterministic largest-processing-time
 /// placement; unknown-cost splits retain their source order and balance only
 /// split counts. The returned vectors are restored to source split order so a
-/// provider sees a stable per-instance sequence after placement.
-fn place_connector_splits_by_cost(
-    splits: &[novarocks_spi::connector::ConnectorSplit],
-    instance_count: usize,
-) -> Result<Vec<Vec<novarocks_spi::connector::ConnectorSplit>>, DistributedQueryError> {
-    if instance_count == 0 {
-        return Err(contract_error(
-            "connector split placement requires at least one fragment instance",
-        ));
-    }
-
-    let mut placements =
-        vec![Vec::<(usize, novarocks_spi::connector::ConnectorSplit)>::new(); instance_count];
-    let mut known_loads = vec![0_u128; instance_count];
-    let mut split_counts = vec![0_usize; instance_count];
-    let mut known = splits
-        .iter()
-        .enumerate()
-        .filter_map(|(index, split)| split.estimated_bytes().map(|bytes| (index, bytes, split)))
-        .collect::<Vec<_>>();
-    known.sort_by_key(|(index, bytes, _)| (std::cmp::Reverse(*bytes), *index));
-    for (index, bytes, split) in known {
-        let instance = (0..instance_count)
-            .min_by_key(|instance| (known_loads[*instance], split_counts[*instance], *instance))
-            .expect("non-empty placement range");
-        known_loads[instance] += u128::from(bytes);
-        split_counts[instance] += 1;
-        placements[instance].push((index, split.clone()));
-    }
-
-    for (index, split) in splits.iter().enumerate() {
-        if split.estimated_bytes().is_some() {
-            continue;
-        }
-        let instance = (0..instance_count)
-            .min_by_key(|instance| (split_counts[*instance], *instance))
-            .expect("non-empty placement range");
-        split_counts[instance] += 1;
-        placements[instance].push((index, split.clone()));
-    }
-
-    Ok(placements
-        .into_iter()
-        .map(|mut splits| {
-            splits.sort_by_key(|(index, _)| *index);
-            splits.into_iter().map(|(_, split)| split).collect()
-        })
-        .collect())
-}
 
 static NEXT_HANDOFF_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -195,6 +145,23 @@ impl PreparedDistributedQuery {
 
     pub fn runtime_filter_artifact_id(&self) -> RuntimeFilterArtifactId {
         RuntimeFilterArtifactId(self.handoff_id)
+    }
+
+    /// Every typed connector scan this round must enumerate splits for.
+    ///
+    /// Preparation deliberately never calls a split manager: enumeration is
+    /// lazy and belongs to the execution round, which owns the sources it
+    /// opens and closes them when the round ends.
+    pub(crate) fn typed_scans(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            FragmentId,
+            i32,
+            &crate::query_execution::preparation::scan::PreparedTypedConnectorScan,
+        ),
+    > + '_ {
+        self.prepared.scan_bindings().typed_scans()
     }
 
     /// Borrow-only identity and fragment-set view used by the Frontend RF
@@ -846,7 +813,6 @@ impl ConnectorBindingReadyDistributedQuery {
             stage_bindings,
             connector_write_plans,
         } = self;
-        let connector_read_sessions = ConnectorReadSessionSet::from_prepared(&prepared);
         finish_sealed_native_submission(
             attachment,
             handoff_id,
@@ -855,7 +821,6 @@ impl ConnectorBindingReadyDistributedQuery {
             query_lifecycle_lease,
             connector_binding_lease,
             connector_write_plans,
-            connector_read_sessions,
         )
     }
 }
@@ -922,14 +887,16 @@ impl<'a> SchedulingFragmentView<'a> {
             .map(<[_]>::len)
     }
 
-    /// Number of provider-neutral opaque splits available to schedule for a
-    /// connector read.  The frontend uses this only as placement cardinality;
-    /// split payloads remain opaque until artifact assembly patches the
-    /// already-encoded carrier for each BE.
-    pub fn connector_split_count(self, node_id: PlanNodeId) -> Option<usize> {
+    /// Whether this scan node reads through a connector.
+    ///
+    /// It deliberately reports presence, not a count. A typed connector scan
+    /// has no frozen split set: its work arrives at runtime, so planning
+    /// cannot count it, and a count taken here would pin the query's
+    /// parallelism to whatever enumeration happened to produce first.
+    pub fn reads_through_connector(self, node_id: PlanNodeId) -> bool {
         self.view
             .connector_read(self.fragment.fragment_id(), node_id)
-            .map(|read| read.splits.len())
+            .is_some()
     }
 
     pub fn is_terminal_write(self) -> bool {
@@ -1099,6 +1066,18 @@ pub struct ValidatedFragmentSchedule {
 }
 
 impl ValidatedFragmentSchedule {
+    /// Where each fragment's instances were admitted.
+    ///
+    /// Deliberately narrower than the whole plan: split assignment needs only
+    /// the placements, and handing out the plan would let a caller re-derive
+    /// routing decisions this schedule already froze.
+    pub(crate) fn fragment_placements(
+        &self,
+    ) -> &BTreeMap<FragmentId, Vec<crate::query_execution::schedule::FragmentInstancePlacement>>
+    {
+        &self.inner.by_fragment
+    }
+
     pub fn validate(
         view: FragmentSchedulingView<'_>,
         execution_id: QueryExecutionId,
@@ -1173,7 +1152,6 @@ impl ValidatedFragmentSchedule {
                         backend_idx: placement.backend_idx,
                         endpoint: placement.endpoint.clone(),
                         scan_ranges: BTreeMap::new(),
-                        connector_splits: BTreeMap::new(),
                         destinations: Vec::new(),
                         per_exch_num_senders: BTreeMap::new(),
                     })
@@ -1203,36 +1181,20 @@ impl ValidatedFragmentSchedule {
                         .or_default()
                         .push(range.clone());
                 }
-                if let Some(connector_read) = view.inner.connector_read(fragment_id, node_id) {
-                    for instance in &mut instances {
-                        instance.connector_splits.entry(node_id).or_default();
-                    }
-                    let assigned =
-                        place_connector_splits_by_cost(&connector_read.splits, instance_count)?;
-                    for (instance, splits) in instances.iter_mut().zip(assigned) {
-                        instance
-                            .connector_splits
-                            .entry(node_id)
-                            .or_default()
-                            .extend(splits);
-                    }
-                }
             }
+            // A connector scan legitimately starts with no work: its splits
+            // arrive at runtime, and a task that ends up with none still has to
+            // be admitted so it can be told there are none. Only frozen scan
+            // ranges can make an instance provably empty at planning time.
             let total_ranges = instances
                 .iter()
                 .flat_map(|instance| instance.scan_ranges.values())
                 .map(Vec::len)
-                .sum::<usize>()
-                + instances
-                    .iter()
-                    .flat_map(|instance| instance.connector_splits.values())
-                    .map(Vec::len)
-                    .sum::<usize>();
+                .sum::<usize>();
             if total_ranges > 0
-                && instances.iter().any(|instance| {
-                    instance.scan_ranges.values().all(Vec::is_empty)
-                        && instance.connector_splits.values().all(Vec::is_empty)
-                })
+                && instances
+                    .iter()
+                    .any(|instance| instance.scan_ranges.values().all(Vec::is_empty))
             {
                 return Err(contract_error(format!(
                     "frontend schedule fragment {fragment_id} creates an empty scan instance"
@@ -1668,7 +1630,6 @@ pub struct StagePreparedDistributedQuery {
     query_lifecycle_lease: QueryLifecycleLease,
     connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
-    connector_read_sessions: ConnectorReadSessionSet,
 }
 
 fn native_submission_encoding_view<'a>(
@@ -1738,7 +1699,6 @@ fn finish_sealed_native_submission(
     query_lifecycle_lease: QueryLifecycleLease,
     connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
-    connector_read_sessions: ConnectorReadSessionSet,
 ) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
     if !attachment.matches(handoff_id, execution_id) {
         let error =
@@ -1746,7 +1706,6 @@ fn finish_sealed_native_submission(
         let kind = error.kind();
         let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
         let message = connector_binding_lease.abort_preserving(message);
-        let message = connector_read_sessions.abort_preserving(message);
         return Err(DistributedQueryError::new(kind, message));
     }
     let (submissions, root_fetch, writer_registrations, expected_output) = attachment.into_parts();
@@ -1758,7 +1717,6 @@ fn finish_sealed_native_submission(
                 let kind = error.kind();
                 let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
                 let message = connector_binding_lease.abort_preserving(message);
-                let message = connector_read_sessions.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
@@ -1778,7 +1736,6 @@ fn finish_sealed_native_submission(
                 let kind = error.kind();
                 let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
                 let message = connector_binding_lease.abort_preserving(message);
-                let message = connector_read_sessions.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
@@ -1789,7 +1746,6 @@ fn finish_sealed_native_submission(
                 let kind = error.kind();
                 let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
                 let message = connector_binding_lease.abort_preserving(message);
-                let message = connector_read_sessions.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
@@ -1803,7 +1759,6 @@ fn finish_sealed_native_submission(
         let kind = error.kind();
         let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
         let message = connector_binding_lease.abort_preserving(message);
-        let message = connector_read_sessions.abort_preserving(message);
         return Err(DistributedQueryError::new(kind, message));
     }
     Ok(StagePreparedDistributedQuery {
@@ -1814,7 +1769,6 @@ fn finish_sealed_native_submission(
         query_lifecycle_lease,
         connector_binding_lease,
         connector_write_plans,
-        connector_read_sessions,
     })
 }
 
@@ -1861,7 +1815,6 @@ impl StagePreparedDistributedQuery {
                 .query_lifecycle_lease
                 .abort_preserving(error.message().to_string());
             let message = self.connector_binding_lease.abort_preserving(message);
-            let message = self.connector_read_sessions.abort_preserving(message);
             return Err(DistributedQueryError::new(kind, message));
         }
         Ok(StagedDistributedQuery {
@@ -1872,7 +1825,6 @@ impl StagePreparedDistributedQuery {
             query_lifecycle_lease: self.query_lifecycle_lease,
             connector_binding_lease: self.connector_binding_lease,
             connector_write_plans: self.connector_write_plans,
-            connector_read_sessions: self.connector_read_sessions,
         })
     }
 }
@@ -1902,7 +1854,6 @@ pub struct StagedDistributedQuery {
     query_lifecycle_lease: QueryLifecycleLease,
     connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
-    connector_read_sessions: ConnectorReadSessionSet,
 }
 
 impl StagedDistributedQuery {
@@ -1914,24 +1865,12 @@ impl StagedDistributedQuery {
         self,
         barrier: &dyn QueryLaunchBarrier,
     ) -> Result<RunningDistributedQuery, DistributedQueryError> {
-        if let Err(error) = self.connector_read_sessions.start_all() {
-            let message = self
-                .query_lifecycle_lease
-                .abort_preserving(error.to_string());
-            let message = self.connector_binding_lease.abort_preserving(message);
-            let message = self.connector_read_sessions.abort_preserving(message);
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::Failed,
-                message,
-            ));
-        }
         if let Err(error) = barrier.start_all(&self.batches) {
             let kind = error.kind();
             let message = self
                 .query_lifecycle_lease
                 .abort_preserving(error.message().to_string());
             let message = self.connector_binding_lease.abort_preserving(message);
-            let message = self.connector_read_sessions.abort_preserving(message);
             return Err(DistributedQueryError::new(kind, message));
         }
         Ok(RunningDistributedQuery {
@@ -1941,7 +1880,6 @@ impl StagedDistributedQuery {
             query_lifecycle_lease: self.query_lifecycle_lease,
             connector_binding_lease: self.connector_binding_lease,
             connector_write_plans: self.connector_write_plans,
-            connector_read_sessions: self.connector_read_sessions,
         })
     }
 }
@@ -1955,7 +1893,6 @@ pub struct RunningDistributedQuery {
     query_lifecycle_lease: QueryLifecycleLease,
     connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
-    connector_read_sessions: ConnectorReadSessionSet,
 }
 
 impl RunningDistributedQuery {
@@ -1967,7 +1904,6 @@ impl RunningDistributedQuery {
             query_lifecycle_lease: self.query_lifecycle_lease,
             connector_binding_lease: self.connector_binding_lease,
             connector_write_plans: self.connector_write_plans,
-            connector_read_sessions: self.connector_read_sessions,
         }
     }
 }
@@ -1979,7 +1915,6 @@ pub struct RunningNativeExecutionParts {
     pub query_lifecycle_lease: QueryLifecycleLease,
     pub connector_binding_lease: ConnectorBindingInstallLease,
     pub connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
-    pub connector_read_sessions: ConnectorReadSessionSet,
 }
 
 fn build_expected_output_schema(
@@ -2039,7 +1974,7 @@ mod tests {
 
     use super::{
         attach_connector_write_plans, build_fragment_lifecycle_projection,
-        derive_fragment_instance_id, place_connector_splits_by_cost,
+        derive_fragment_instance_id,
     };
     use crate::common::backend_topology::LiveBackendTarget;
     use crate::query_execution::contract::QueryId;
@@ -2081,7 +2016,6 @@ mod tests {
             endpoint: RuntimeEndpoint::new("127.0.0.1", 19040 + backend_idx as i32)
                 .expect("valid endpoint"),
             scan_ranges: BTreeMap::new(),
-            connector_splits: BTreeMap::new(),
             destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         }
@@ -2107,95 +2041,6 @@ mod tests {
                     .collect()
             })
             .collect()
-    }
-
-    #[test]
-    fn connector_split_placement_uses_lpt_for_known_costs() {
-        let splits = [
-            connector_split("split-0", Some(8)),
-            connector_split("split-1", Some(7)),
-            connector_split("split-2", Some(6)),
-            connector_split("split-3", Some(5)),
-        ];
-
-        let actual = placed_split_ids(
-            place_connector_splits_by_cost(&splits, 3).expect("known-cost placement succeeds"),
-        );
-
-        assert_eq!(
-            actual,
-            vec![
-                vec!["split-0".to_owned()],
-                vec!["split-1".to_owned()],
-                vec!["split-2".to_owned(), "split-3".to_owned()],
-            ]
-        );
-    }
-
-    #[test]
-    fn connector_split_placement_balances_unknown_costs_by_count() {
-        let splits = [
-            connector_split("unknown-0", None),
-            connector_split("unknown-1", None),
-            connector_split("unknown-2", None),
-            connector_split("unknown-3", None),
-            connector_split("unknown-4", None),
-        ];
-
-        let actual = placed_split_ids(
-            place_connector_splits_by_cost(&splits, 3).expect("unknown-cost placement succeeds"),
-        );
-
-        assert_eq!(
-            actual,
-            vec![
-                vec!["unknown-0".to_owned(), "unknown-3".to_owned()],
-                vec!["unknown-1".to_owned(), "unknown-4".to_owned()],
-                vec!["unknown-2".to_owned()],
-            ]
-        );
-    }
-
-    #[test]
-    fn connector_split_placement_has_stable_ties_and_restores_source_order() {
-        let splits = [
-            connector_split("split-0", Some(10)),
-            connector_split("split-1", Some(1)),
-            connector_split("split-2", Some(10)),
-            connector_split("split-3", Some(1)),
-            connector_split("split-4", None),
-        ];
-
-        let actual = placed_split_ids(
-            place_connector_splits_by_cost(&splits, 2).expect("mixed placement succeeds"),
-        );
-
-        // Equal-size known splits choose the lower instance index. The lower-cost
-        // known split is assigned after the larger source-later split, so each
-        // instance must be restored to original split sequence before exposure.
-        assert_eq!(
-            actual,
-            vec![
-                vec![
-                    "split-0".to_owned(),
-                    "split-1".to_owned(),
-                    "split-4".to_owned()
-                ],
-                vec!["split-2".to_owned(), "split-3".to_owned()],
-            ]
-        );
-    }
-
-    #[test]
-    fn connector_split_placement_rejects_zero_instances() {
-        let error = place_connector_splits_by_cost(&[connector_split("split-0", Some(1))], 0)
-            .expect_err("zero instances violate the placement contract");
-
-        assert!(
-            error
-                .to_string()
-                .contains("connector split placement requires at least one fragment instance")
-        );
     }
 
     fn exchange_route(

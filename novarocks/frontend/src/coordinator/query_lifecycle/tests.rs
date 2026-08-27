@@ -3254,6 +3254,15 @@ impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
         ))
     }
 
+    async fn task_update(
+        &self,
+        _request: Request<proto::TaskUpdateRequest>,
+    ) -> Result<Response<proto::TaskUpdateResponse>, Status> {
+        Err(Status::unimplemented(
+            "this lifecycle wire fixture does not serve task updates",
+        ))
+    }
+
     async fn start_prepared_query(
         &self,
         request: Request<proto::StartPreparedQueryRequest>,

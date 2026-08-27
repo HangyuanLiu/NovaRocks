@@ -209,8 +209,13 @@ pub trait ConnectorBindingInstallBarrier: Send + Sync + 'static {
 }
 
 /// Derive the only permitted instance distribution plan from prepared reads
-/// and placement-frozen writers at their actual BE placements. A scan node
-/// having an empty assigned split set is still installed: an empty source can
+/// and placement-frozen writers at their actual BE placements.
+///
+/// The read half is derived from the connector scan nodes of each placed
+/// fragment, not from any split placement: splits are assigned at runtime, so
+/// every backend that runs a fragment with a connector scan may later receive
+/// a split for it and must already have that instance installed. A scan node
+/// with no assigned split is therefore still installed — an empty source can
 /// be opened by the fragment and must resolve its real instance without a
 /// query-local fallback. Write-only fragments install the exact declaration
 /// retained by their planning lease, never a declaration for a later current
@@ -240,18 +245,13 @@ pub(crate) fn compile_install_plan(
                     placement.backend_idx, entry.0, endpoint
                 )));
             }
-            for &node_id in placement.connector_splits.keys() {
-                let read = prepared
-                    .scan_bindings()
-                    .connector_read(fragment_id, node_id)
-                    .ok_or_else(|| {
-                        contract_error(format!(
-                            "scheduled connector split has no prepared read for fragment {fragment_id} node {node_id}"
-                        ))
-                    })?;
-                let instance_id = read.declaration.binding_key().instance_id.clone();
+            for (_, scan) in prepared
+                .scan_bindings()
+                .typed_scans_for_fragment(fragment_id)
+            {
+                let instance_id = scan.declaration.binding_key().instance_id.clone();
                 match entry.1.get(&instance_id) {
-                    Some(existing) if existing != &read.declaration => {
+                    Some(existing) if existing != &scan.declaration => {
                         return Err(contract_error(format!(
                             "connector instance '{}' has conflicting declarations for backend {}",
                             instance_id.as_str(),
@@ -260,7 +260,7 @@ pub(crate) fn compile_install_plan(
                     }
                     Some(_) => {}
                     None => {
-                        entry.1.insert(instance_id, read.declaration.clone());
+                        entry.1.insert(instance_id, scan.declaration.clone());
                     }
                 }
             }
