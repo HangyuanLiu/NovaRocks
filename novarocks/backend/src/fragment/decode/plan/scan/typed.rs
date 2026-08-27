@@ -99,7 +99,7 @@ pub(super) fn lower_typed_connector_scan(
     // refused on its own terms rather than as a side effect of which providers
     // happen to be installed. Moving any of it below `typed_scan_runtime_inputs`
     // would let "no provider is installed" mask "this plan is not executable".
-    let read_slot_ids = connector_read_slot_ids(scan, variant_path_plan);
+    let read_slot_ids = connector_read_slot_ids(output_columns, variant_path_plan);
     check_assignments_match_read_columns(&scan_source, &read_slot_ids)?;
     let layout = output_columns.layout();
     let output_schema = output_columns.output_schema();
@@ -252,11 +252,20 @@ fn typed_scan_runtime_inputs(
 /// after the read. Only the physical ones have an assignment, so only they name
 /// a page channel; the synthetic ones are dropped here and would have to be
 /// materialized on top of the read.
+/// The slots the connector itself produces, in page-channel order.
+///
+/// Derived from the node's decoded output rather than from every column the
+/// scan lists: a scan node carries the whole relation's columns and the
+/// required set narrows them, so reading from the full list would ask the
+/// connector for columns the query never reads — including the metadata
+/// pseudo-columns no data file holds. The synthetic columns are then removed,
+/// because the engine builds those above the connector.
 fn connector_read_slot_ids(
-    scan: &plan::ScanNode,
+    output_columns: &DecodedScanOutputColumns,
     variant_path_plan: &NativeVariantPathPlan,
 ) -> Vec<SlotId> {
-    scan.columns
+    output_columns
+        .columns()
         .iter()
         .map(|column| SlotId::new(column.column_id))
         .filter(|slot_id| !variant_path_plan.output_slot_ids.contains(slot_id))
@@ -749,22 +758,26 @@ mod tests {
         );
     }
 
-    /// `required_columns` narrows the decoded output but never the columns the
-    /// connector reads, so the assignment count is agreed against the wire
-    /// column list. Agreeing it against the narrowed output instead — which is
-    /// what this decoder used to do — would call a correctly-assigned scan a
-    /// count mismatch and hide the projection it actually cannot perform.
+    /// The connector reads exactly what the node outputs.
+    ///
+    /// A scan node carries every column of its relation and `required_columns`
+    /// narrows them, so a producer that assigned the un-narrowed list would ask
+    /// the connector for columns the query never reads — including the metadata
+    /// pseudo-columns no data file holds. Assignments are therefore agreed
+    /// against the narrowed output, and a producer that sends the wider list is
+    /// a count mismatch.
     #[test]
-    fn typed_scan_decode_counts_assignments_before_required_columns_narrow_the_output() {
+    fn typed_scan_decode_agrees_assignments_against_the_narrowed_output() {
         let node = typed_scan_node_with_required(
             scan_source_with_two_assignments(),
             vec![output_column(1, "id"), output_column(2, "flag")],
             vec!["id".to_string()],
         );
         let error = decode_node_error(&node);
-        assert_eq!(error.kind(), ProtocolErrorKind::Unsupported);
+        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
         assert!(
-            error.detail().contains("derives no column"),
+            error.detail().contains("assigns 2 columns")
+                && error.detail().contains("1 connector read columns"),
             "unexpected detail: {}",
             error.detail()
         );
@@ -793,7 +806,7 @@ mod tests {
         // is not among them.
         assert_eq!(test_support::scan_source_proto().assignments.len(), 1);
         assert_eq!(
-            connector_read_slot_ids(scan, &variant_path_plan),
+            connector_read_slot_ids(&output_columns, &variant_path_plan),
             vec![SlotId::new(1)]
         );
 

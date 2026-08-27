@@ -212,11 +212,6 @@ pub struct IcebergChangeWindowPageSource {
 }
 
 impl IcebergChangeWindowPageSource {
-    /// The sign every row of this split carries.
-    pub const fn change_op(&self) -> i8 {
-        self.change_op
-    }
-
     fn project(&self, page: SourcePage) -> Result<SourcePage, ConnectorError> {
         let (rows, base_columns) = page.into_columns()?;
         if base_columns.len() != self.base_channel_count {
@@ -915,6 +910,27 @@ mod tests {
             .expect("a narrowed added-rows split is not implemented");
         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
         assert!(error.to_string().contains("row ids"));
+    }
+
+    #[test]
+    fn the_sign_column_the_frontend_binds_is_the_one_this_reader_recognizes() {
+        // The frontend appends `change_op_column_handle()` to a change
+        // window's bindings, and the provider decodes each scan assignment back
+        // through the wire. A lossy round trip would make the sign look like an
+        // impostor claiming its reserved field id.
+        let column = change_op_column_handle().expect("change op");
+        let validated = novarocks_proto::connector_read::ValidatedColumnHandle::parse(
+            column.to_column_handle_proto(),
+            novarocks_proto::FieldPath::root("column"),
+        )
+        .expect("a well-formed wire column handle");
+        let decoded = IcebergColumnHandle::from_column_handle_proto(validated.as_proto())
+            .expect("decode the sign column");
+
+        assert_eq!(decoded, column);
+        let projection = ChangeOpProjection::of(&[decoded]).expect("the sign is recognized");
+        assert_eq!(projection.slots, vec![OutputSlot::ChangeOp]);
+        assert!(projection.base_columns.is_empty());
     }
 
     #[test]

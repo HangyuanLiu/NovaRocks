@@ -164,6 +164,27 @@ struct PositionCacheKey {
 /// One split's equality deletes, grouped by their schema-ordered key.
 type EqualityGroups<'a> = BTreeMap<Vec<i32>, Vec<&'a IcebergDeleteFile>>;
 
+/// One side's loaded equality artifacts and the key columns they must read,
+/// keyed by top-level schema position.
+type LoadedEqualityDeletes = (
+    Vec<Arc<LoadedEqualityDelete>>,
+    BTreeMap<usize, IcebergColumnHandle>,
+);
+
+/// Everything the loading of one side needs.
+///
+/// A change window's reverse side loads two sides in one open, so grouping
+/// the per-side inputs keeps that from becoming an eight-argument call whose
+/// two invocations differ only in the middle.
+struct SideLoad<'a, 'b> {
+    split: &'a IcebergSplit,
+    scope: &'a DeleteScope,
+    closure: &'a GatedClosure<'b>,
+    position_work: &'a [(PositionCacheKey, &'b IcebergDeleteFile)],
+    table_schema: &'a Schema,
+    access: Option<&'a FsAccessHandle>,
+}
+
 /// One equality-delete file after decoding.
 struct LoadedEqualityDelete {
     path: Arc<str>,
@@ -337,25 +358,20 @@ impl DeleteManager {
 
     /// Load one side's artifacts and fold its equality key columns into the
     /// shared hidden suffix.
-    #[allow(clippy::too_many_arguments)]
     fn resolve_side(
         &self,
         state: &mut DeleteManagerState,
-        split: &IcebergSplit,
-        scope: &DeleteScope,
-        closure: &GatedClosure<'_>,
-        position_work: &[(PositionCacheKey, &IcebergDeleteFile)],
-        table_schema: &Schema,
-        access: Option<&FsAccessHandle>,
+        load: SideLoad<'_, '_>,
         hidden_columns: &mut BTreeMap<usize, IcebergColumnHandle>,
     ) -> Result<ResolvedDeletes, ConnectorError> {
-        let deleted_positions = self.load_position_deletes(state, split, position_work, access)?;
+        let deleted_positions =
+            self.load_position_deletes(state, load.split, load.position_work, load.access)?;
         let (equality, side_hidden) = self.load_equality_deletes(
             state,
-            scope,
-            &closure.equality_groups,
-            table_schema,
-            access,
+            load.scope,
+            &load.closure.equality_groups,
+            load.table_schema,
+            load.access,
         )?;
         hidden_columns.extend(side_hidden);
         Ok(ResolvedDeletes {
@@ -420,13 +436,7 @@ impl DeleteManager {
         groups: &EqualityGroups<'_>,
         table_schema: &Schema,
         access: Option<&FsAccessHandle>,
-    ) -> Result<
-        (
-            Vec<Arc<LoadedEqualityDelete>>,
-            BTreeMap<usize, IcebergColumnHandle>,
-        ),
-        ConnectorError,
-    > {
+    ) -> Result<LoadedEqualityDeletes, ConnectorError> {
         let mut applications = Vec::new();
         // Keyed by top-level schema position so the hidden suffix is ordered
         // by the table schema and carries each column exactly once, however
