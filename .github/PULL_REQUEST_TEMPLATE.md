@@ -9,7 +9,7 @@
 ## ADR
 
 <!-- Does this PR embody a design decision or accept a compromise?
-     If yes: add/supersede an ADR under docs/adr/ (use the /adr skill) and reference it here.
+     If yes: add/supersede an ADR under docs/adr/ (use the $ops-capture skill) and reference it here.
      If no: state N/A. -->
 
 - ADR: N/A
