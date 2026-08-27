@@ -21,6 +21,7 @@ mod local_runtime;
 mod registry;
 pub(crate) mod rpc;
 pub(crate) mod stage;
+pub(crate) mod task_update;
 
 pub(crate) use contract::{
     BackendQueryControl, QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,

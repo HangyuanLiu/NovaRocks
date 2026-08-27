@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -33,7 +33,7 @@ use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
 use novarocks_proto::lifecycle as protocol_lifecycle;
 use novarocks_proto::lifecycle::{
     AttemptId, FragmentLiveObservation, ParticipantBackendIdentity, ParticipantManifest,
-    ParticipantRole, QueryControlCommand as ProtocolQueryControlCommand, QueryControlEndpoint,
+    QueryControlCommand as ProtocolQueryControlCommand, QueryControlEndpoint,
     QueryControlEvent as ProtocolQueryControlEvent, QueryExecutionId, QueryInitAck,
     QueryInitOutcome, QueryInitRequest, QueryOptions, QueryTerminationAck, QueryTerminationReason,
     RuntimeFilterContribution,
@@ -928,9 +928,8 @@ fn manifest(
         .expect("fixture backend endpoint");
     let backend = ParticipantBackendIdentity::new(fixture_process_id(), endpoint)
         .expect("fixture backend identity");
-    let (roles, fragments, runtime_filter) = if service_only {
+    let (fragments, runtime_filter) = if service_only {
         (
-            BTreeSet::from([ParticipantRole::RuntimeFilterService]),
             Vec::<proto_common::UniqueId>::new(),
             Some(
                 RuntimeFilterContribution::parse(proto::RuntimeFilterContribution {
@@ -942,7 +941,6 @@ fn manifest(
         )
     } else {
         (
-            BTreeSet::from([ParticipantRole::FragmentExecutor]),
             vec![proto_id(UniqueId::new(100, backend_idx as i64 + 1))],
             None,
         )
@@ -950,7 +948,6 @@ fn manifest(
     ParticipantManifest::new(
         execution_id,
         backend,
-        roles,
         fragments,
         QueryOptions::parse(proto::QueryOptions::default()).expect("fixture query options"),
         1_900_000_000_000,
@@ -2398,14 +2395,16 @@ fn frontend_query_lifecycle_lease_service_only_participant_joins_barrier() {
         .into_iter()
         .find(|(target, _)| target.backend_idx() == 2)
         .expect("service-only InitQuery");
-    assert_eq!(
+    // A service-only participant is identified by its payload: a runtime
+    // filter contribution and no fragment instances.
+    assert!(
         service_request
             .1
             .manifest()
             .expect("Protocol manifest")
-            .roles()
-            .expect("Protocol roles"),
-        vec![proto::QueryParticipantRole::RuntimeFilterService]
+            .runtime_filter()
+            .expect("Protocol runtime filter")
+            .is_some()
     );
     assert!(
         service_request
@@ -3140,7 +3139,6 @@ fn live_init_request(
         ParticipantManifest::new(
             execution_id,
             protocol_backend_from_live(backend.clone()),
-            [ParticipantRole::FragmentExecutor],
             [proto_id(UniqueId::new(finst_high, 1))],
             QueryOptions::parse(proto::QueryOptions::default()).expect("fixture query options"),
             1_900_000_000_000,
@@ -3251,6 +3249,15 @@ impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
         Ok(Response::new(
             self.ingress.stage_fragments(request).as_proto().clone(),
+        ))
+    }
+
+    async fn task_update(
+        &self,
+        _request: Request<proto::TaskUpdateRequest>,
+    ) -> Result<Response<proto::TaskUpdateResponse>, Status> {
+        Err(Status::unimplemented(
+            "this lifecycle wire fixture does not serve task updates",
         ))
     }
 

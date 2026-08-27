@@ -16,6 +16,7 @@
 // under the License.
 
 //! Process-neutral fragment execution contracts.
+pub mod connector;
 pub mod exec;
 pub mod runtime;
 pub mod runtime_filter;

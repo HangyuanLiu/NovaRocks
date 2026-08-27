@@ -52,9 +52,16 @@ impl Scenario for BackendSelfRegistration {
         let initial_process_ids = (0..REQUIRED_BACKENDS)
             .map(|index| context.handle().backend_process_id(index))
             .collect::<Result<Vec<_>>>()?;
+        // A parsed process identity is valid by construction, so the fact
+        // worth asserting is that the three backends are three *different*
+        // processes — a shared identity would mean the topology is not what
+        // this acceptance claims to exercise.
+        let distinct = initial_process_ids
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
         ensure!(
-            initial_process_ids.iter().all(|id| !id.is_empty()),
-            "every self-registered backend must expose a process identity"
+            distinct.len() == initial_process_ids.len(),
+            "self-registered backends share a process identity: {initial_process_ids:?}"
         );
         context.action(format!(
             "observed {} eligible self-registered backend process identities",

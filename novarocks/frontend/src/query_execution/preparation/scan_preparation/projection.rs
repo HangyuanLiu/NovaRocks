@@ -79,6 +79,58 @@ pub(super) fn resolve_physical_columns(
         .collect()
 }
 
+/// The physical columns one typed connector scan actually reads.
+///
+/// The physical columns one typed connector scan reads, in scan output order.
+///
+/// This is the same set the wire declares as `required_columns`, resolved
+/// through the same helper, because the backend filters its own decoded output
+/// by exactly that list and then reads whatever survives. Deriving the
+/// assignments from any wider list — every column the relation has, say — makes
+/// the two sides describe different columns, and for an Iceberg relation the
+/// wider list also contains the metadata pseudo-columns (`_file`, `_pos`) that
+/// no data file holds and no connector column binding names.
+pub(super) fn resolve_read_physical_columns(
+    node_id: i32,
+    scan: &PlanScanNode,
+) -> Result<Vec<ResolvedScanColumn>, String> {
+    // Resolved first so a projection that cannot be resolved at all is
+    // reported as the projection defect it is, rather than as whichever
+    // required name happened to reach the read resolver first.
+    let physical = resolve_physical_columns(node_id, scan)?;
+    // No equality-delete columns: those are a mutation-lane fact, and a typed
+    // read never adds one of its own.
+    let required = resolve_effective_required_reads(node_id, scan, &[])?;
+    let mut required_ids = required
+        .iter()
+        .filter_map(|read| read.planner_column_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    // A VARIANT path column is built above the connector out of a physical
+    // source column. The derived column is required, the source it is derived
+    // from may not be named anywhere else, and dropping it would leave the
+    // materialization with no input.
+    required_ids.extend(
+        scan.variant_columns
+            .iter()
+            .map(|variant| variant.source_column_id),
+    );
+    Ok(physical
+        .into_iter()
+        .filter(|column| required_ids.contains(&column.planner.column_id))
+        .collect())
+}
+
+/// The names one scan effectively projects, or `None` when nothing narrows it.
+fn effective_projection_names(scan: &PlanScanNode) -> Option<Vec<String>> {
+    match refresh_scan_projected_names(scan) {
+        Some(projected) => Some(merge_required_columns_with_projected(
+            scan.required_columns.clone(),
+            &projected,
+        )),
+        None => scan.required_columns.clone(),
+    }
+}
+
 fn refresh_scan_projected_names(scan: &PlanScanNode) -> Option<Vec<String>> {
     scan_preparation_facts(scan)
         .refresh_projected_names()
@@ -216,6 +268,11 @@ fn resolved_source_column<'a>(
         .map(|column| (column, ResolvedScanColumnKind::IcebergMetadataColumn))
 }
 
+/// The connector-schema column names one scan effectively reads.
+#[allow(
+    dead_code,
+    reason = "The eager projection-ordinal path that consumed this is gone; the typed stack resolves every output column through the connector's own column bindings."
+)]
 pub(super) fn effective_scan_column_names(scan: &PlanScanNode) -> Vec<String> {
     if let Some(projected) = refresh_scan_projected_names(scan) {
         return merge_required_columns_with_projected(scan.required_columns.clone(), &projected);

@@ -17,7 +17,7 @@
 
 //! The Hadoop filesystem catalog implementation.
 //!
-//! Design: ADR-0114 (docs/adr/ADR-0114-iceberg-provider-private-catalog-owner.md)
+//! Design: ADR-0118 (docs/adr/ADR-0118-iceberg-provider-private-catalog-owner.md)
 
 use std::sync::Arc;
 

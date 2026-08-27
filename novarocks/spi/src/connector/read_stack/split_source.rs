@@ -1,0 +1,121 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Lazy split enumeration.
+//!
+//! A split source is a per-scan, per-attempt owned resource. It produces at
+//! most one outstanding batch at a time, and closing it is idempotent and may
+//! race with an outstanding request.
+
+use std::fmt::Debug;
+
+use crate::connector::ConnectorError;
+
+use super::dynamic_filter::DynamicFilterSnapshot;
+
+/// One batch of splits, plus whether enumeration has finished.
+#[derive(Debug)]
+pub struct ConnectorSplitBatch<S> {
+    splits: Vec<S>,
+    no_more_splits: bool,
+}
+
+impl<S> ConnectorSplitBatch<S> {
+    pub const fn new(splits: Vec<S>, no_more_splits: bool) -> Self {
+        Self {
+            splits,
+            no_more_splits,
+        }
+    }
+
+    /// An empty batch that does not finish the source.
+    pub const fn empty() -> Self {
+        Self {
+            splits: Vec::new(),
+            no_more_splits: false,
+        }
+    }
+
+    /// The final, empty batch.
+    pub const fn finished() -> Self {
+        Self {
+            splits: Vec::new(),
+            no_more_splits: true,
+        }
+    }
+
+    pub fn splits(&self) -> &[S] {
+        &self.splits
+    }
+
+    pub fn into_splits(self) -> Vec<S> {
+        self.splits
+    }
+
+    /// An empty batch is not end of enumeration unless this is set.
+    pub const fn no_more_splits(&self) -> bool {
+        self.no_more_splits
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.splits.is_empty()
+    }
+}
+
+/// A connector-owned, lazily advancing split enumerator.
+pub trait ConnectorSplitSource: Send {
+    type Split;
+    type Column: Ord + Clone + Debug;
+
+    /// Produce up to `max_size` splits.
+    ///
+    /// The caller keeps at most one outstanding request. An empty batch means
+    /// "nothing right now", never "finished".
+    fn next_batch(
+        &mut self,
+        max_size: usize,
+        dynamic_filter: &DynamicFilterSnapshot<Self::Column>,
+    ) -> Result<ConnectorSplitBatch<Self::Split>, ConnectorError>;
+
+    fn is_finished(&self) -> bool;
+
+    /// Idempotent. A normal batch that completed before the close may still be
+    /// delivered to the caller that requested it.
+    fn close(&mut self) -> Result<(), ConnectorError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_batch_is_not_the_end_of_enumeration() {
+        let batch = ConnectorSplitBatch::<u32>::empty();
+        assert!(batch.is_empty());
+        assert!(!batch.no_more_splits());
+        let finished = ConnectorSplitBatch::<u32>::finished();
+        assert!(finished.is_empty());
+        assert!(finished.no_more_splits());
+    }
+
+    #[test]
+    fn a_batch_can_carry_splits_and_finish_at_once() {
+        let batch = ConnectorSplitBatch::new(vec![1_u32, 2], true);
+        assert_eq!(batch.splits().len(), 2);
+        assert!(batch.no_more_splits());
+    }
+}

@@ -63,6 +63,7 @@ code-anchors:
 - ADR-0043 — Runtime Filter row/scan evaluator 为何统一由 Execution 拥有、Backend 只提供 artifact query（active）
 - ADR-0044 — Runtime Filter participant 物理生命周期为何由 Backend 拥有、Execution 保留语义值与 evaluator（active）
 - ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（active）
+- ADR-0114 — participant 分类为何以载荷为唯一权威表示，删除自证式派生的 participant_roles 字段（active）
 
 #### 历史
 
@@ -70,6 +71,9 @@ code-anchors:
 - ADR-0076 — Runtime Filter terminal observation 为何由 Backend participant 有界聚合、并仅经 typed QLC contribution 出域（superseded → ADR-0078）
 - ADR-0078 — Runtime Filter terminal observation 为何只作观测，且以 P0/P1/P2 查询终止契约交付（superseded → ADR-0106）
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
+- ADR-0053 — MV snapshot change window 复用 exact-generation scan planning（superseded → ADR-0114）
+- ADR-0039 — scan unit 的 immutable、bounded physical domain facts（superseded → ADR-0114）
+- ADR-0034 — cluster composite split 与 Backend local scan unit 的两级生命周期（superseded → ADR-0114）
 
 ### join-execution
 
@@ -98,14 +102,11 @@ code-anchors:
 - ADR-0024 — 无需 BE staging 的 data mutation 为何使用 FE-only frozen plan 与 marker-only reconcile（active）
 - ADR-0028 — metadata maintenance 为何由 FE 以 exact lease、durable plan 与 marker reconcile 执行（active）
 - ADR-0029 — distributed rewrite 为何以 frozen groups、C1 cohorts 与 FE aggregate commit 实现单 snapshot（active）
-- ADR-0034 — cluster composite split 与 Backend local scan unit 为何采用冻结、认证、再调度的两级生命周期（active）
-- ADR-0039 — scan unit为何以immutable、bounded的physical domain facts服务后续执行侧（active）
 - ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（active）
 - ADR-0104 — Connector execution binding 为何使用 SPI domain declaration、sealed Host 与可重放失败状态机（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0051 — distributed write 为何在 preparation 与 planning 之间强制 exact-generation Provider activation（active）
 - ADR-0052 — SHOW CREATE 为何以 exact lease 的有界 table-definition facts 取代 concrete table decode（active）
-- ADR-0053 — MV snapshot change window 为何复用 exact-generation scan planning 并返回 sealed neutral admission（active）
 - ADR-0055 — row-DML 调用方为何只读 Provider 签发的 strategy，而 SQL 谓词合法性为何留在 Core（active）
 - ADR-0056 — 摘除 Core 对 provider 的测试依赖时，无法用冻结 SPI facts 表达的断言为何归位到实现旁而非复刻或删除（active）
 - ADR-0063 — Copy-on-Write row mutation 的match与rewrite读源为何由Provider按exact base签发（active）
@@ -119,7 +120,8 @@ code-anchors:
 - ADR-0089 — Predicate-driven Parquet page pruning 为何只在 FS reader-open 按实际 physical leaf 计算（active）
 - ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0112 — MV 运行态为何只属于当前进程、StateStore为何只保留 lake-source Accelerator（active）
-- ADR-0114 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
+- ADR-0114 — Connector read 为何改用 Trino 对齐的 typed handle/split/page-source 与运行时 split 投递（active）
+- ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 
 #### 历史
 
@@ -146,6 +148,7 @@ code-anchors:
 - ADR-0012 — Query session admission 与 router 为何由 frontend 拥有、core 只保留 wire/compiler kernel（active）
 - ADR-0102 — MySQL KILL 为何经 exact generation token 与 protocol-owned connection lifecycle 实现（active）
 - ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（active）
+- ADR-0114 — participant 分类为何以载荷为唯一权威表示，删除自证式派生的 participant_roles 字段（active）
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
 
 #### 历史
@@ -193,7 +196,7 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 
 
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
-- ADR-0114 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
+- ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 
 #### 历史
 
@@ -236,14 +239,32 @@ fencing/takeover 仍须单独裁决。
 
 ### catalog-attachment
 
-领域哲学：「集群挂了哪些外部 catalog」是 StateStore 里的单一权威事实，frontend 是它唯一的 owner；每个 FE
-把同一份 durable 记录派生成自己的只读运行时投影，查询热路径只读内存、绝不逐次访问共享存储。change hint 只是
-唤醒信号，拿到提示后一律重读权威记录，丢通知与 retention gap 都退化为有界全量重建。DDL 以 durable commit /
+领域哲学：「集群挂了哪些外部 catalog」是一份**精确全量的期望态快照**，来自三个互斥 source mode 之一
+（静态文件 / StateStore / 未来的 managed controller）；frontend 是它唯一的 owner，每个 FE 把同一份快照派生成
+自己的只读运行时投影，查询热路径只读内存、绝不逐次访问共享存储。StateStore 只是其中一个 mode，而不是通用真源。
+枚举不完整是全局失败（绝不退化成空快照），单个 catalog 物化失败只隔离该 catalog。change hint 只是唤醒信号，
+拿到提示后一律重读权威记录，丢通知与 retention gap 都退化为有界全量重建。DDL 以 durable commit /
 exact-version delete 为线性化点，发布本地 control generation 才让 SQL catalog 名可解析、撤销发布先于退役
 generation；`Absent`（未知）与 `Unavailable`（本机未物化）永远分开，store 不可用时 DDL 与超预算的 read
-admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。
+admission 一律 fail closed，不存在内存 fallback 或 legacy 双写。跨 family 的同事务约束不可用：被读的一侧若是
+可清除的加速态，那个「保证」会在缓存被清空时静默消失。
 
-- ADR-0066 — 外部 catalog attachment 为何由 StateStore 单一持久化、各 FE 只派生只读投影（active）
+- ADR-0115 — catalog 期望态为何收敛为单一 typed 快照 + 三个互斥 source mode（active）
+- ADR-0116 — `DROP CATALOG` 的 MV 引用检查为何降级为 best-effort 运维保护（active）
+
+历史：
+
+- ADR-0066 — 外部 catalog attachment 为何由 StateStore 单一持久化、各 FE 只派生只读投影（superseded → ADR-0115）
+
+### frontend-state-families
+
+领域哲学：湖是用户数据与已发布语义的唯一共享真源，因此每一份 frontend 本地状态只可能是三类之一：外部期望态的
+投影、只属于当前进程/attempt 的运行态、可从外部权威确定性重建的加速态。第四类（既无外部真源、又要求持久）
+不允许存在。分类是编译期穷尽的闭合枚举，运行态在类型上无法携带持久前缀，持久前缀与记录版本只在 manifest 中
+定义一次；完成态的判据是扫描真实 store 内容，而不是检查源码里还有没有某个字面量。
+
+- ADR-0114 — frontend 本地状态为何采用闭合三分类 manifest、且持久前缀只在 manifest 定义（active）
+- ADR-0117 — 本地 view registry 为何是进程运行态而非 frontend durable 真源（active）
 
 ### frontend-durable-records
 

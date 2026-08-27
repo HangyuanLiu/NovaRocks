@@ -290,6 +290,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+    use crate::catalog_application::desired_state::CatalogDesiredStateSource;
     use crate::catalog_application::{
         CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind,
         CatalogApplicationPort, CatalogCreateCommand, CatalogDropCommand,
@@ -750,7 +751,7 @@ mod tests {
                 .expect("control host"),
         );
         let port = Arc::new(FrontendCatalogApplicationPort::new(
-            repository,
+            CatalogDesiredStateSource::dynamic_state_store(repository),
             Arc::clone(&control),
             crate::catalog_application::CatalogRuntimeProjection::new().publisher(),
             tokio::runtime::Handle::current(),
@@ -870,7 +871,7 @@ mod tests {
                 .expect("control host"),
         );
         let port = Arc::new(FrontendCatalogApplicationPort::new(
-            repository.clone(),
+            CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
             control,
             crate::catalog_application::CatalogRuntimeProjection::new().publisher(),
             tokio::runtime::Handle::current(),
@@ -913,7 +914,7 @@ mod tests {
                 .expect("control host"),
         );
         let port = Arc::new(FrontendCatalogApplicationPort::new(
-            repository.clone(),
+            CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
             Arc::clone(&control),
             Arc::new(RejectingPublisher),
             tokio::runtime::Handle::current(),
@@ -1058,7 +1059,7 @@ mod tests {
                 .expect("control host"),
         );
         let port = Arc::new(FrontendCatalogApplicationPort::new(
-            repository.clone(),
+            CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
             Arc::clone(&control),
             Arc::new(RejectingPublisher),
             tokio::runtime::Handle::current(),

@@ -15,7 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// MIGRATION: consumed by the frontend typed-scan lowering in the same PR.
 pub(crate) mod control_host;
+#[allow(
+    dead_code,
+    reason = "Consumed by the frontend typed-scan lowering in the same PR."
+)]
+pub mod typed_control_registry;
 
 pub mod backend;
 pub mod cleanup_maintenance;

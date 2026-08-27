@@ -259,6 +259,26 @@ impl AnalyzerScope {
         ));
     }
 
+    /// Register one already-resolved table column, allocating its id.
+    ///
+    /// Unlike [`Self::add_column`] this keeps the column's logical type, so a
+    /// JSON-tagged column stays distinguishable from the `Utf8` that carries
+    /// it. Dropping the tag is what would silently turn JSON into text.
+    pub(super) fn add_table_column(
+        &mut self,
+        qualifier: Option<&str>,
+        col: &ColumnDef,
+    ) -> ColumnId {
+        let id = self.factory.borrow_mut().create(
+            qualifier.map(|s| s.to_string()),
+            col.name.clone(),
+            col.data_type.clone(),
+            col.nullable,
+        );
+        self.insert_table_column_binding(qualifier, col, id);
+        id
+    }
+
     /// Register a single column (used for subquery output columns, etc.).
     pub(super) fn add_column(
         &mut self,

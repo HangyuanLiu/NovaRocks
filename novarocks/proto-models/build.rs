@@ -2,8 +2,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 const IDL_DIR: &str = "../../idl/novarocks";
-const PROTO_FILES: [&str; 5] = [
+const PROTO_FILES: [&str; 6] = [
     "common.proto",
+    "connector_read.proto",
     "expr.proto",
     "filter.proto",
     "plan.proto",
@@ -30,6 +31,10 @@ fn main() {
         .collect::<Vec<_>>();
     let mut config = prost_build::Config::new();
     config.file_descriptor_set_path(out_dir.join("novarocks_descriptor.bin"));
+    // Connector-read maps are generated as BTreeMap so a message encodes to the
+    // same bytes every time. Runtime split assignment compares an exact replay
+    // byte for byte, which a hash-ordered map would break.
+    config.btree_map([".novarocks.connector_read"]);
     config
         .compile_protos(&proto_paths, &[PathBuf::from(IDL_DIR)])
         .expect("compile NovaRocks native protobuf DTOs");

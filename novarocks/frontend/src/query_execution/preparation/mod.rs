@@ -24,6 +24,12 @@ pub(crate) mod runtime_filter_view;
 pub(crate) mod scan;
 pub(crate) mod scan_preparation;
 mod topology;
+#[allow(
+    dead_code,
+    reason = "Predicate lowering exposes the full typed vocabulary; scan preparation uses the entry points, the round driver uses the rest."
+)]
+pub(crate) mod typed_predicate;
+pub(crate) mod typed_scan;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -53,6 +59,7 @@ pub(crate) fn prepare_fragments(
     resolver: Option<&dyn scan::ScanBindingResolver>,
     scan_options: ScanPreparationOptions,
 ) -> Result<PreparedFragmentSet, String> {
+    let scan_options = &scan_options;
     let preparation_facts =
         novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
     let runtime_filter_facts =
@@ -107,6 +114,13 @@ pub(crate) fn prepare_fragments(
         preparation_facts.boundary_contracts(),
         &sealed_ids,
     )?;
+    // Every scan-domain request is handed to scan preparation, so the scan that
+    // owns it declares the filter on its own typed carrier. A filter added
+    // after the relation is frozen would never reach the reader.
+    let source_scan_requests = runtime_filter_facts
+        .source_scan_requests()
+        .cloned()
+        .collect::<Vec<_>>();
     let scan_bindings = prepare_scan_bindings(
         plan,
         controls,
@@ -114,11 +128,12 @@ pub(crate) fn prepare_fragments(
         query_table_bindings,
         resolver,
         scan_options,
+        &source_scan_requests,
     )?;
-    // Scan-domain target ordinals are derived only after the exact provider read
-    // is pinned.  Never materialize RF bindings against a later catalog view.
+    // Resolution runs against the typed scans preparation just froze, never
+    // against a later catalog view.
     let source_resolutions = runtime_filter_binding::resolve_runtime_filter_source_targets(
-        runtime_filter_facts.source_scan_requests().cloned(),
+        source_scan_requests,
         &scan_bindings,
     )?;
     let runtime_filter_facts =
@@ -130,7 +145,7 @@ pub(crate) fn prepare_fragments(
     let mut by_fragment = BTreeMap::new();
     let mut expected_range_keys = BTreeSet::new();
     let mut expected_binding_node_ids = BTreeSet::new();
-    let mut expected_connector_read_keys = BTreeSet::new();
+    let mut expected_typed_scan_keys = BTreeSet::new();
     for fragment in plan.fragments() {
         let mut scan_nodes = Vec::new();
         collect_scan_nodes(fragment.fragment_id, &fragment.root, &mut scan_nodes);
@@ -154,10 +169,10 @@ pub(crate) fn prepare_fragments(
                 ));
             }
             if scan_bindings
-                .connector_read(fragment.fragment_id, *node_id)
+                .typed_scan(fragment.fragment_id, *node_id)
                 .is_some()
             {
-                expected_connector_read_keys.insert((fragment.fragment_id, *node_id));
+                expected_typed_scan_keys.insert((fragment.fragment_id, *node_id));
             }
         }
         let scan_node_ids = scan_nodes.into_iter().map(|(node_id, _)| node_id).collect();
@@ -240,9 +255,9 @@ pub(crate) fn prepare_fragments(
         &scan_bindings.binding_node_ids().collect(),
     )?;
     validate_binding_keys(
-        "connector reads",
-        &expected_connector_read_keys,
-        &scan_bindings.connector_read_keys().collect(),
+        "typed connector scans",
+        &expected_typed_scan_keys,
+        &scan_bindings.typed_scan_keys().collect(),
     )?;
     Ok(PreparedFragmentSet::new(
         by_fragment,

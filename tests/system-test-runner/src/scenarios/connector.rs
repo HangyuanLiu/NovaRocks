@@ -11,6 +11,10 @@ use std::thread;
 use std::time::Duration;
 
 const CONNECTOR_READER_OPEN: &str = "NOVAROCKS_CONNECTOR_UNIT_READER_OPEN";
+const TYPED_SPLIT_ACCEPTED: &str = "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED";
+const TYPED_SPLIT_NO_MORE: &str = "NOVAROCKS_TASK_SPLIT_NO_MORE";
+const TYPED_PAGE_SOURCE_OPEN: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN";
+const TYPED_PAGE_SOURCE_CLOSE: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE";
 const CONNECTOR_READER_CLOSE: &str = "NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
@@ -19,7 +23,120 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(DistributedReaderKillConnection),
         Box::new(GenerationReplacement),
         Box::new(PredicatePageIndexPruning),
+        Box::new(TypedReadData),
     ]
+}
+
+/// Proves a typed connector read works on the real 1FE+3BE topology, and that
+/// its splits are delivered at runtime rather than frozen into the plan.
+///
+/// A correct result alone would not show that: a single backend reading every
+/// file would produce exactly the same rows. The evidence that distinguishes
+/// the two is which processes accepted split assignments.
+struct TypedReadData;
+
+impl Scenario for TypedReadData {
+    fn name(&self) -> &'static str {
+        "connector/iceberg-typed-read-data"
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        Ok(connector_launch_config())
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect typed read control session")?,
+        )?;
+
+        const CATALOG: &str = "typed_read_catalog";
+        const DATABASE: &str = "typed_read_db";
+        const TABLE: &str = "typed_read_data";
+        let warehouse = create_warehouse(context, "iceberg-typed-read-data")?;
+
+        // Three files, three backends: fewer splits than backends could not
+        // show distribution even if it worked.
+        context.action("create three independent Iceberg data files");
+        create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
+
+        context.action("read every row through the typed connector stack");
+        let counted: Vec<i64> = control
+            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            .context("count rows through the typed connector read")?;
+        if counted != [300_000] {
+            bail!("typed connector read returned {counted:?} rows, expected [300000]");
+        }
+        // A count alone can be right while the values are not; the sum pins
+        // which rows were read, not just how many.
+        let summed: Vec<i64> = control
+            .query(format!("SELECT sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            .context("sum values through the typed connector read")?;
+        if summed != [45_000_150_000] {
+            bail!("typed connector read summed {summed:?}, expected [45000150000]");
+        }
+
+        context.action("assert splits reached more than one backend process");
+        let logs = wait_for_backend_logs(context, "observe typed split assignments", |logs| {
+            logs.iter()
+                .filter(|log| log.contains(TYPED_SPLIT_ACCEPTED))
+                .count()
+                >= 2
+        })?;
+        assert_typed_split_evidence(&logs)?;
+
+        await_resource_convergence(context, &baseline, "typed connector read")?;
+        Ok(())
+    }
+}
+
+/// Every backend that accepted a split must have opened a page source for it
+/// and closed it, and must have been told the assignment is terminal.
+///
+/// Counting opens against closes is what separates "read and released" from
+/// "read and leaked"; counting accepted backends is what separates a
+/// distributed read from one backend doing all of it.
+fn assert_typed_split_evidence(logs: &[String]) -> Result<()> {
+    let mut accepting_backends = 0_usize;
+    for (index, log) in logs.iter().enumerate() {
+        let accepted = log.matches(TYPED_SPLIT_ACCEPTED).count();
+        if accepted == 0 {
+            continue;
+        }
+        accepting_backends += 1;
+        if !log.contains(TYPED_SPLIT_NO_MORE) {
+            bail!(
+                "BE[{index}] accepted {accepted} split assignments but was never told the \
+                 assignment is terminal, so its scan could still be waiting"
+            );
+        }
+        let opens = log.matches(TYPED_PAGE_SOURCE_OPEN).count();
+        let closes = log.matches(TYPED_PAGE_SOURCE_CLOSE).count();
+        if opens == 0 {
+            bail!(
+                "BE[{index}] accepted {accepted} split assignments and opened no page source: \
+                 the splits arrived and were never read"
+            );
+        }
+        if opens != closes {
+            bail!("BE[{index}] opened {opens} page sources and closed {closes}");
+        }
+    }
+    if accepting_backends < 2 {
+        bail!(
+            "only {accepting_backends} backend accepted a split assignment; a read served by one \
+             backend cannot show that assignment is distributed at runtime"
+        );
+    }
+    Ok(())
 }
 
 struct DistributedReaderCancel;

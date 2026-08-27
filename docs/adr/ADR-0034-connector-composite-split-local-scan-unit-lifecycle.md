@@ -2,9 +2,9 @@
 id: ADR-0034
 title: "Connector composite split and local scan-unit lifecycle"
 domain: [provider-spi, distributed-query-lifecycle]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0114
 date: 2026-08-03
 provenance:
   - "discussion: 2026-08-03 connector composite scheduling and local reader lifecycle"

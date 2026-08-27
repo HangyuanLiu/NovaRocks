@@ -13,6 +13,8 @@ pub mod canonical;
 
 /// Shared wire codecs for connector execution declarations and binding keys.
 pub mod connector;
+/// Structural validation and canonical encoding for the typed connector read wire.
+pub mod connector_read;
 
 /// Validated connector execution-binding declaration and result values.
 pub mod provider;

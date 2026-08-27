@@ -45,6 +45,7 @@ fn type_to_proto(t: &InternalType) -> common::TypeDesc {
             precision: *precision,
             scale: *scale,
             time_unit: None,
+            time_zone: None,
         }),
         InternalType::List(el) => Kind::List(Box::new(common::ListType {
             element: Some(Box::new(type_to_proto(el))),

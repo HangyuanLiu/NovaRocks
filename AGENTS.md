@@ -131,7 +131,13 @@ SQL client
 
 - `novarocks/frontend/src/**`
   FE application composition, SQL admission, connector control host, and
-  distributed query coordination.
+  distributed query coordination. `state_family/**` is the closed manifest of
+  every frontend-local state family: it owns each family's classification
+  (`ExternalProjection` / `ProcessRuntime` / `Accelerator`) and is the single
+  definition point for persistent key prefixes and record versions, so a
+  runtime family structurally cannot own durable state (ADR-0114).
+  `catalog_application/desired_state.rs` owns the catalog desired-state
+  snapshot and its mutually exclusive source modes (ADR-0115).
 
 - `novarocks/backend/src/**`
   BE application composition, native gRPC services, query lifecycle registry,

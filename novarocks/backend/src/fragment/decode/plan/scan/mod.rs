@@ -19,6 +19,7 @@
 
 mod common;
 mod generic;
+mod typed;
 mod variant_path;
 
 use super::context::NativePlanDecodeContext;
@@ -59,25 +60,35 @@ pub(crate) fn lower_scan_node(
     })?;
     let source_path = path.clone().field("table").field("source");
     let output_columns = common::decode_scan_output_columns(scan, path.clone())?;
-    match source {
-        plan::scan_source::Kind::ConnectorRead(source) => {
-            let variant_path_plan = variant_path::parse_native_scan_variant_path_columns(
-                scan,
-                table,
-                output_columns.columns(),
-            )
+    // VARIANT path columns are a property of the plan node, not of either
+    // carrier: `ScanNode.columns` carries the synthetic columns next to the
+    // physical ones no matter which source reads them. Parsing them once, above
+    // the carrier match, is what lets both lowerings agree on which of the
+    // node's columns the connector actually reads.
+    let variant_path_plan =
+        variant_path::parse_native_scan_variant_path_columns(scan, table, output_columns.columns())
             .map_err(|error| error.into_native(path.clone()))?;
-            generic::lower_connector_read_scan(
-                node,
-                scan,
-                source,
-                &output_columns,
-                variant_path_plan,
-                ctx,
-                arena,
-            )
-            .map_err(|error| error.into_native(source_path.field("connector_read")))
-        }
+    match source {
+        plan::scan_source::Kind::TypedConnectorRead(source) => typed::lower_typed_connector_scan(
+            node,
+            scan,
+            source,
+            &output_columns,
+            &variant_path_plan,
+            ctx,
+            arena,
+        )
+        .map_err(|error| error.into_native(source_path.field("typed_connector_read"))),
+        plan::scan_source::Kind::ConnectorRead(source) => generic::lower_connector_read_scan(
+            node,
+            scan,
+            source,
+            &output_columns,
+            variant_path_plan,
+            ctx,
+            arena,
+        )
+        .map_err(|error| error.into_native(source_path.field("connector_read"))),
     }
 }
 

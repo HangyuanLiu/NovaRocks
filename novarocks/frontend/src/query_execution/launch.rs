@@ -25,7 +25,7 @@
 use std::collections::BTreeSet;
 
 use novarocks_proto::lifecycle::{
-    ParticipantManifestDigest, ParticipantRole, QueryStageRequest, QueryStartRequest, StageDigest,
+    ParticipantManifestDigest, QueryStageRequest, QueryStartRequest, StageDigest,
     StageDigestVersion, StageFragment,
 };
 use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
@@ -44,7 +44,6 @@ pub const DEFAULT_STAGE_MAX_FRAGMENTS: usize =
 pub struct StageParticipantBinding {
     target: QueryLifecycleTarget,
     init_digest: ParticipantManifestDigest,
-    roles: BTreeSet<ParticipantRole>,
     expected_fragment_instance_ids: BTreeSet<UniqueId>,
 }
 
@@ -52,21 +51,11 @@ impl StageParticipantBinding {
     pub fn new(
         target: QueryLifecycleTarget,
         init_digest: ParticipantManifestDigest,
-        roles: impl IntoIterator<Item = ParticipantRole>,
         expected_fragment_instance_ids: impl IntoIterator<Item = UniqueId>,
     ) -> Result<Self, ProtocolError> {
-        let roles = roles.into_iter().collect::<BTreeSet<_>>();
-        if roles.is_empty() {
-            return Err(ProtocolError::new(
-                FieldPath::root("stage_participant_binding").field("roles"),
-                ProtocolErrorKind::InvalidValue,
-                "stage participant must have at least one role",
-            ));
-        }
         Ok(Self {
             target,
             init_digest,
-            roles,
             expected_fragment_instance_ids: expected_fragment_instance_ids.into_iter().collect(),
         })
     }
@@ -79,16 +68,8 @@ impl StageParticipantBinding {
         self.init_digest
     }
 
-    pub fn roles(&self) -> &BTreeSet<ParticipantRole> {
-        &self.roles
-    }
-
     pub fn expected_fragment_instance_ids(&self) -> &BTreeSet<UniqueId> {
         &self.expected_fragment_instance_ids
-    }
-
-    pub fn is_fragment_executor(&self) -> bool {
-        self.roles.contains(&ParticipantRole::FragmentExecutor)
     }
 }
 
@@ -206,7 +187,6 @@ mod tests {
                 BackendProcessId::new_v7(),
             ),
             ParticipantManifestDigest::new([3; 32]),
-            [ParticipantRole::FragmentExecutor],
             expected,
         )
         .expect("valid Stage participant binding")

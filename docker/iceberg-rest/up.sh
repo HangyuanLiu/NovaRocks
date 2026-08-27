@@ -382,7 +382,6 @@ grpc_port = $fe_grpc_port
 
 [cluster]
 role = "fe"
-backends = ["127.0.0.1:$be_grpc_port"]
 
 [runtime]
 exchange_wait_ms = 300000
@@ -427,6 +426,9 @@ grpc_port = $be_grpc_port
 [cluster]
 role = "be"
 advertise_host = "127.0.0.1"
+# Backends self-register: there is no frontend-side backend list any more, so a
+# backend has to be told where its frontend is.
+frontend_endpoint = "127.0.0.1:$fe_grpc_port"
 
 [runtime]
 exchange_wait_ms = 300000

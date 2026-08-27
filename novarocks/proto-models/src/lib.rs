@@ -15,6 +15,10 @@ pub mod common {
     include!(concat!(env!("OUT_DIR"), "/novarocks.common.rs"));
 }
 
+pub mod connector_read {
+    include!(concat!(env!("OUT_DIR"), "/novarocks.connector_read.rs"));
+}
+
 #[allow(clippy::module_inception)]
 pub mod expr {
     include!(concat!(env!("OUT_DIR"), "/novarocks.expr.rs"));
@@ -31,7 +35,7 @@ pub mod plan {
 
 #[allow(clippy::large_enum_variant)]
 pub mod novarocks {
-    use super::{common, filter, plan};
+    use super::{common, connector_read, filter, plan};
 
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
 }

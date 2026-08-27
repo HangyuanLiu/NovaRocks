@@ -178,3 +178,351 @@ fn retired_request_self_attestation_fields_remain_reserved() {
         );
     }
 }
+
+#[test]
+fn typed_connector_read_handle_and_split_oneofs_are_closed() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    // Every handle and split family selects its provider through its own closed
+    // oneof. A generic consumer must never be able to reach a variant by class
+    // id, message name, or an escape hatch field, so the exact variant list is
+    // part of the contract.
+    for (message_name, oneof_name, expected_variants) in [
+        (
+            "novarocks.connector_read.ColumnHandle",
+            "handle",
+            &["iceberg"][..],
+        ),
+        (
+            "novarocks.connector_read.ConnectorTransactionHandle",
+            "handle",
+            &["iceberg"][..],
+        ),
+        (
+            "novarocks.connector_read.ConnectorTableHandle",
+            "handle",
+            &["iceberg"][..],
+        ),
+        (
+            "novarocks.connector_read.ConnectorTableFunctionHandle",
+            "handle",
+            &["iceberg_table_changes"][..],
+        ),
+        (
+            "novarocks.connector_read.ConnectorChangeWindowHandle",
+            "handle",
+            &["iceberg"][..],
+        ),
+        (
+            "novarocks.connector_read.ConnectorSystemTableReference",
+            "reference",
+            &["iceberg"][..],
+        ),
+        (
+            "novarocks.connector_read.ConnectorTableExecuteHandle",
+            "handle",
+            &["iceberg"][..],
+        ),
+        (
+            "novarocks.connector_read.ConnectorMergeTableHandle",
+            "handle",
+            &["iceberg"][..],
+        ),
+        (
+            "novarocks.connector_read.DataSplit",
+            "provider",
+            &["iceberg"][..],
+        ),
+        (
+            "novarocks.connector_read.TableChangesSplitCategory",
+            "provider",
+            &["iceberg"][..],
+        ),
+        (
+            "novarocks.connector_read.ChangeWindowSplitCategory",
+            "provider",
+            &["iceberg"][..],
+        ),
+        (
+            "novarocks.connector_read.SystemFilesSplitCategory",
+            "provider",
+            &["iceberg"][..],
+        ),
+        (
+            "novarocks.connector_read.RewritePositionDeleteFilesSplitCategory",
+            "provider",
+            &["iceberg"][..],
+        ),
+        (
+            "novarocks.connector_read.ConnectorSplit",
+            "category",
+            &[
+                "data",
+                "table_changes",
+                "change_window",
+                "system_files",
+                "rewrite_position_delete_files",
+            ][..],
+        ),
+        (
+            "novarocks.connector_read.CatalogTableHandle",
+            "relation",
+            &[
+                "table",
+                "table_function",
+                "change_window",
+                "system_table",
+                "table_execute",
+                "merge_table",
+            ][..],
+        ),
+        (
+            "novarocks.connector_read.IcebergChangeSplit",
+            "rows",
+            &[
+                "added_rows",
+                "position_deleted_rows",
+                "equality_deleted_rows",
+                "deleted_data_file_rows",
+            ][..],
+        ),
+        (
+            "novarocks.connector_read.IcebergTableExecuteHandle",
+            "procedure_handle",
+            &["optimize", "rewrite_position_delete_files"][..],
+        ),
+    ] {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        let oneof = message
+            .oneofs()
+            .find(|oneof| oneof.name() == oneof_name)
+            .unwrap_or_else(|| panic!("{message_name} must declare the {oneof_name} oneof"));
+        let variants = oneof
+            .fields()
+            .map(|field| field.name().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            variants, expected_variants,
+            "{message_name}.{oneof_name} variant set changed"
+        );
+    }
+}
+
+#[test]
+fn the_typed_connector_scan_source_carries_no_split_list_or_private_payload() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    let scan_source = pool
+        .get_message_by_name("novarocks.connector_read.ConnectorTableScanSource")
+        .expect("ConnectorTableScanSource descriptor");
+    let fields = scan_source
+        .fields()
+        .map(|field| (field.number(), field.name().to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fields,
+        vec![
+            (1, "table".to_owned()),
+            (2, "assignments".to_owned()),
+            (3, "enforced_predicate".to_owned()),
+            (4, "unenforced_predicate".to_owned()),
+            (5, "remaining_expression".to_owned()),
+            (6, "dynamic_filters".to_owned()),
+            (7, "max_batch_rows".to_owned()),
+            (8, "max_batch_bytes".to_owned()),
+        ]
+    );
+
+    // The whole point of the typed source: no eager split list, no provider
+    // payload, and no Arrow IPC schema crossing the boundary.
+    for forbidden in [
+        "splits",
+        "scan_payload",
+        "split_payload",
+        "expected_schema_ipc",
+    ] {
+        assert!(
+            scan_source.fields().all(|field| field.name() != forbidden),
+            "ConnectorTableScanSource must not carry {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn the_split_envelope_exposes_only_neutral_scheduling_facts() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    let split = pool
+        .get_message_by_name("novarocks.connector_read.ConnectorSplit")
+        .expect("ConnectorSplit descriptor");
+    let neutral = split
+        .fields()
+        .filter(|field| field.containing_oneof().is_none())
+        .map(|field| (field.number(), field.name().to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        neutral,
+        vec![
+            (1, "split_weight_raw".to_owned()),
+            (2, "remotely_accessible".to_owned()),
+            (3, "addresses".to_owned()),
+            (5, "retained_size_in_bytes".to_owned()),
+        ]
+    );
+    // `affinity_key` is optional, so proto3 places it in a synthetic oneof; it
+    // is still part of the neutral envelope.
+    assert!(
+        split
+            .fields()
+            .any(|field| field.number() == 4 && field.name() == "affinity_key")
+    );
+
+    // A split never carries a digest or a self-attested identity: scheduling
+    // identity is the task-attempt-scoped sequence alone.
+    for forbidden in ["digest", "content_id", "membership_digest", "split_id"] {
+        assert!(
+            split.fields().all(|field| field.name() != forbidden),
+            "ConnectorSplit must not carry {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn runtime_split_assignment_messages_carry_sequence_and_terminal_facts() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    let scheduled = pool
+        .get_message_by_name("novarocks.connector_read.ScheduledSplit")
+        .expect("ScheduledSplit descriptor");
+    assert_eq!(
+        scheduled
+            .fields()
+            .map(|field| (field.number(), field.name().to_owned()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "sequence_id".to_owned()),
+            (2, "plan_node_id".to_owned()),
+            (3, "split".to_owned()),
+        ]
+    );
+
+    let assignment = pool
+        .get_message_by_name("novarocks.connector_read.SplitAssignment")
+        .expect("SplitAssignment descriptor");
+    assert_eq!(
+        assignment
+            .fields()
+            .map(|field| (field.number(), field.name().to_owned()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "plan_node_id".to_owned()),
+            (2, "splits".to_owned()),
+            (3, "no_more_splits".to_owned()),
+        ]
+    );
+
+    let request = pool
+        .get_message_by_name("novarocks.TaskUpdateRequest")
+        .expect("TaskUpdateRequest descriptor");
+    assert_eq!(
+        request
+            .fields()
+            .map(|field| (field.number(), field.name().to_owned()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, "execution_id".to_owned()),
+            (2, "fragment_instance_id".to_owned()),
+            (3, "assignments".to_owned()),
+        ]
+    );
+
+    let service = pool
+        .get_service_by_name("novarocks.NovaRocksGrpc")
+        .expect("service descriptor");
+    assert!(
+        service
+            .methods()
+            .any(|method| method.name() == "TaskUpdate"),
+        "the runtime split-assignment RPC must exist"
+    );
+}
+
+#[test]
+fn the_worker_system_relation_set_stays_closed() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    let system_table_type = pool
+        .get_enum_by_name("novarocks.connector_read.IcebergSystemTableType")
+        .expect("IcebergSystemTableType descriptor");
+    assert_eq!(
+        system_table_type
+            .values()
+            .map(|value| value.name().to_owned())
+            .collect::<Vec<_>>(),
+        vec![
+            "ICEBERG_SYSTEM_TABLE_TYPE_UNSPECIFIED".to_owned(),
+            "ICEBERG_SYSTEM_TABLE_TYPE_FILES".to_owned(),
+            "ICEBERG_SYSTEM_TABLE_TYPE_ENTRIES".to_owned(),
+            "ICEBERG_SYSTEM_TABLE_TYPE_SNAPSHOTS".to_owned(),
+            "ICEBERG_SYSTEM_TABLE_TYPE_HISTORY".to_owned(),
+            "ICEBERG_SYSTEM_TABLE_TYPE_REFS".to_owned(),
+            "ICEBERG_SYSTEM_TABLE_TYPE_MANIFESTS".to_owned(),
+        ],
+        "PARTITIONS is a view over the pinned FILES relation, and there is no \
+         ALL_* or unknown worker variant"
+    );
+}
+
+#[test]
+fn retired_participant_role_projection_remains_reserved() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    // `participant_roles` was a projection the sender mechanically derived from
+    // two other fields of the same message: FragmentExecutor followed from a
+    // non-empty `expected_fragment_instance_ids` (field 4) and
+    // RuntimeFilterService from the presence of `runtime_filter` (field 8). Both
+    // derivation inputs travel inside `ParticipantManifest` itself, so the
+    // receiver can rebuild the role set unaided and validating the carried copy
+    // produced no fact it did not already hold. The payload is now the sole
+    // participant role authority (ADR-0114).
+    let manifest = pool
+        .get_message_by_name("novarocks.ParticipantManifest")
+        .expect("ParticipantManifest descriptor");
+    assert!(
+        manifest.reserved_ranges().any(|range| range.contains(&3)),
+        "ParticipantManifest field 3 must remain reserved"
+    );
+    assert!(
+        manifest
+            .reserved_names()
+            .any(|name| name == "participant_roles"),
+        "ParticipantManifest participant_roles name must remain reserved"
+    );
+    assert!(
+        manifest.fields().all(|field| field.number() != 3),
+        "ParticipantManifest must not reuse retired tag 3"
+    );
+    assert!(
+        manifest
+            .fields()
+            .all(|field| field.name() != "participant_roles"),
+        "ParticipantManifest must not reuse retired name participant_roles"
+    );
+
+    // The projection's role vocabulary was retired with it. Nothing else on the
+    // wire names these values, so the enum must stay out of the contract rather
+    // than linger as a second, drift-prone role authority.
+    assert!(
+        pool.get_enum_by_name("novarocks.QueryParticipantRole")
+            .is_none(),
+        "retired QueryParticipantRole enum must not return to the wire contract"
+    );
+}

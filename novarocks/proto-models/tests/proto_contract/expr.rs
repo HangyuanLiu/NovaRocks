@@ -92,6 +92,7 @@ fn type_to_proto(ty: &IType) -> common::TypeDesc {
             precision: None,
             scale: None,
             time_unit: None,
+            time_zone: None,
         })),
     }
 }

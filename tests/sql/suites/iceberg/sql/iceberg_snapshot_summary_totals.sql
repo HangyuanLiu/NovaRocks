@@ -39,16 +39,19 @@ INSERT INTO iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0} VALUES (3, 30
 
 -- query 5
 -- Latest append summary carries exact total records/data-files + engine-name.
+-- `summary` is a MAP, so a key is read by subscript. It used to be a rendered
+-- string and these were LIKE patterns; asserting on a rendering asserted the
+-- shape of the rendering rather than the value.
 -- Use a subquery so ORDER BY can reference committed_at without it appearing
 -- in the golden output.
 SELECT total_data_files_is_2, total_records_is_3, has_total_files_size, has_engine_name
 FROM (
   SELECT
     committed_at,
-    summary LIKE '%"total-data-files":"2"%'  AS total_data_files_is_2,
-    summary LIKE '%"total-records":"3"%'     AS total_records_is_3,
-    summary LIKE '%total-files-size%'        AS has_total_files_size,
-    summary LIKE '%engine-name%'             AS has_engine_name
+    summary['total-data-files'] = '2'        AS total_data_files_is_2,
+    summary['total-records'] = '3'           AS total_records_is_3,
+    summary['total-files-size'] IS NOT NULL  AS has_total_files_size,
+    summary['engine-name'] IS NOT NULL       AS has_engine_name
   FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0}$snapshots
   ORDER BY committed_at DESC
   LIMIT 1
@@ -64,8 +67,8 @@ SELECT total_records_is_2, has_engine_name
 FROM (
   SELECT
     committed_at,
-    summary LIKE '%"total-records":"2"%' AS total_records_is_2,
-    summary LIKE '%engine-name%'         AS has_engine_name
+    summary['total-records'] = '2'          AS total_records_is_2,
+    summary['engine-name'] IS NOT NULL      AS has_engine_name
   FROM iceberg_cat_${suite_uuid0}.iv32_db_${uuid0}.t_${uuid0}$snapshots
   ORDER BY committed_at DESC
   LIMIT 1

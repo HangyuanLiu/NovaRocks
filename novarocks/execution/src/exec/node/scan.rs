@@ -48,6 +48,16 @@ pub enum ScanMorsel {
     Schema {
         table_name: String,
     },
+    /// The scan's work is not described by a morsel at all: the operator owns
+    /// it and produces rows until it says it is done.
+    ///
+    /// Deliberately not [`Self::Empty`]. An empty morsel means "nothing to
+    /// read", and the runner short-circuits it without ever touching the
+    /// operator — which is right for a scan whose work is fully described by
+    /// its morsels, and silently wrong for one whose work arrives afterwards.
+    /// A typed connector scan reads splits delivered to its task at runtime,
+    /// so its morsel has to reach the operator or the splits are never read.
+    OperatorDriven,
     Empty,
 }
 
@@ -76,6 +86,7 @@ impl ScanMorsel {
                     .unwrap_or_else(|| "none".to_string())
             ),
             ScanMorsel::Schema { table_name } => format!("schema_table={table_name}"),
+            ScanMorsel::OperatorDriven => "operator_driven".to_string(),
             ScanMorsel::Empty => "empty".to_string(),
         }
     }
@@ -354,6 +365,21 @@ pub trait ScanSource: Send + Sync {
     fn profile_name(&self) -> Option<String> {
         None
     }
+
+    /// Rebuild this source around the fragment's runtime-filter consumer
+    /// contracts.
+    ///
+    /// The contracts are decoded after the source is lowered, so a source that
+    /// can consult a live filter learns of them here rather than at
+    /// construction. Returning `None` keeps the source exactly as it was built,
+    /// which is what every source that cannot consult a filter does.
+    fn with_runtime_filter_contracts(
+        &self,
+        contracts: &[crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding],
+    ) -> Result<Option<Arc<dyn ScanSource>>, String> {
+        let _ = contracts;
+        Ok(None)
+    }
 }
 
 // Compile-time object-safety assertion for `ScanSource`.
@@ -429,6 +455,21 @@ impl ScanNode {
     ) -> Self {
         self.native_runtime_filter_specs = specs;
         self
+    }
+
+    /// Hand this node's runtime-filter consumer contracts to its source.
+    ///
+    /// Call after [`Self::with_runtime_filter_consumers`]: a source that reads
+    /// through a typed connector uses the contracts to subscribe to the live
+    /// filter it will consult per row group.
+    pub fn install_runtime_filter_contracts(mut self) -> Result<Self, String> {
+        if let Some(source) = self
+            .source
+            .with_runtime_filter_contracts(&self.native_runtime_filter_specs)?
+        {
+            self.source = source;
+        }
+        Ok(self)
     }
 
     pub fn with_output_chunk_schema(mut self, output_chunk_schema: ChunkSchemaRef) -> Self {

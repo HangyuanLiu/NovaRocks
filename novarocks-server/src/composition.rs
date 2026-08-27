@@ -37,7 +37,7 @@ use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageLakeTargetSnapshotObservation, IcebergStoragePartitionTransform,
     IcebergStorageRefreshTechnique,
 };
-use novarocks_connector_starrocks::{StarRocksExecutionBindings, StarRocksExecutionInstaller};
+use novarocks_connector_starrocks::StarRocksExecutionInstaller;
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
@@ -385,9 +385,7 @@ pub fn compose_backend_execution_installers(
         ))];
     let expected = ConnectorExecutionProviderKind::Iceberg;
     let mut installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
-        vec![std::sync::Arc::new(StarRocksExecutionInstaller::new(
-            StarRocksExecutionBindings::new(),
-        ))];
+        vec![std::sync::Arc::new(StarRocksExecutionInstaller::new())];
     for installer in &iceberg_installers {
         if installer.provider_kind() != expected {
             anyhow::bail!(
@@ -471,7 +469,8 @@ pub fn compose_backend_server_config(
         )
         .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
-        execution_installers: compose_backend_execution_installers(config, runtime)?,
+        execution_installers: compose_backend_execution_installers(config, runtime.clone())?,
+        typed_provider_factories: compose_backend_typed_provider_factories(config, runtime)?,
     })
 }
 
@@ -567,6 +566,10 @@ pub fn compose_frontend_server_config(
     .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
     let state_store_provider_registry = state_store_provider_registry(config)?;
     let state_store_input = state_store_input(config)?;
+    // One registry: the control factory installs into it and the planner
+    // resolves from it, so a generation is either reachable to both or neither.
+    let typed_connector_control =
+        std::sync::Arc::new(novarocks_frontend::TypedConnectorControlRegistry::new());
     Ok(FrontendServerConfig {
         execution,
         backend_open,
@@ -574,7 +577,12 @@ pub fn compose_frontend_server_config(
         report_grpc_port: config.server.grpc_port,
         metrics_http_port: config.server.http_port,
         mysql_listener,
-        connector_control_factories: compose_frontend_control_factories(config, runtime)?,
+        connector_control_factories: compose_frontend_control_factories(
+            config,
+            runtime,
+            std::sync::Arc::clone(&typed_connector_control),
+        )?,
+        typed_connector_control,
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
         state_store_input,
         state_store_provider_registry,
@@ -666,13 +674,62 @@ fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntim
 pub fn compose_frontend_control_factories(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
+    typed_control: std::sync::Arc<novarocks_frontend::TypedConnectorControlRegistry>,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorControlFactory>>> {
     let planning_resources = compose_connector_file_planning_resources(config, runtime.clone())?;
+    // The observer runs while the control generation is being created, so the
+    // typed entry and the SPI binding become visible together.
+    let sink = std::sync::Arc::clone(&typed_control);
     let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
         IcebergReadBinding::from_resources(planning_resources),
         runtime,
-    ));
+    ))
+    .with_typed_boundary_observer(std::sync::Arc::new(move |key, boundary| {
+        let boundary = std::sync::Arc::new(boundary);
+        if let Err(error) = sink.install(
+            key.clone(),
+            novarocks_frontend::TypedConnectorControl::new(
+                std::sync::Arc::clone(&boundary) as _,
+                boundary as _,
+            ),
+        ) {
+            tracing::warn!(
+                target: "novarocks::composition",
+                %error,
+                "typed connector control was not installed for this generation"
+            );
+        }
+    }));
     Ok(vec![std::sync::Arc::new(factory)])
+}
+
+/// The worker-side typed provider factory of every built-in provider.
+///
+/// StarRocks has no typed read contract yet, so it deliberately contributes no
+/// factory: a typed StarRocks scan must fail to resolve rather than reach a
+/// placeholder that would look like support.
+pub fn compose_backend_typed_provider_factories(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<
+    Vec<(
+        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        std::sync::Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+    )>,
+> {
+    let binding = IcebergReadBinding::from_resources(compose_connector_file_planning_resources(
+        config, runtime,
+    )?);
+    let factory = std::sync::Arc::new(
+        novarocks_connector_iceberg::typed_provider_factory::IcebergTypedProviderFactory::new(
+            binding,
+            novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::with_default_budget(),
+        ),
+    );
+    Ok(vec![(
+        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg,
+        factory,
+    )])
 }
 
 pub fn compose_iceberg_execution_resources(
@@ -895,8 +952,12 @@ mod tests {
     fn frontend_and_backend_compose_distinct_iceberg_role_capabilities() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let config = crate::app_config::NovaRocksConfig::default();
-        let factories = compose_frontend_control_factories(&config, runtime.handle().clone())
-            .expect("frontend factories");
+        let factories = compose_frontend_control_factories(
+            &config,
+            runtime.handle().clone(),
+            std::sync::Arc::new(novarocks_frontend::TypedConnectorControlRegistry::new()),
+        )
+        .expect("frontend factories");
         let installers = compose_backend_execution_installers(&config, runtime.handle().clone())
             .expect("backend installers");
         let iceberg = novarocks_spi::connector::ConnectorProviderId::parse(
@@ -928,7 +989,11 @@ mod tests {
             enable_path_style_access: Some(true),
         });
 
-        let error = match compose_frontend_control_factories(&config, runtime.handle().clone()) {
+        let error = match compose_frontend_control_factories(
+            &config,
+            runtime.handle().clone(),
+            std::sync::Arc::new(novarocks_frontend::TypedConnectorControlRegistry::new()),
+        ) {
             Ok(_) => panic!("incomplete frontend resources must fail before role startup"),
             Err(error) => error,
         };

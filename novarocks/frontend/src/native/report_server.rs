@@ -847,6 +847,13 @@ impl NovaRocksGrpc for FrontendReportService {
         Err(Self::rejected("StageFragments"))
     }
 
+    async fn task_update(
+        &self,
+        _request: tonic::Request<proto::TaskUpdateRequest>,
+    ) -> Result<tonic::Response<proto::TaskUpdateResponse>, tonic::Status> {
+        Err(Self::rejected("TaskUpdate"))
+    }
+
     async fn start_prepared_query(
         &self,
         _request: tonic::Request<proto::StartPreparedQueryRequest>,

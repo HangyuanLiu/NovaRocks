@@ -161,6 +161,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             let distributed_plan = compile_mv_first_refresh_connector_write(analyzed, &statistics)?;
             prepare_sealed_iceberg_write_native_assembly(
                 query_kernel.connector_control().as_ref(),
+                query_kernel.typed_connector_control(),
                 execution,
                 distributed_plan,
                 bindings.as_ref(),
@@ -257,6 +258,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 compile_join_first_refresh_connector_write(analyzed, &statistics)?;
             prepare_sealed_iceberg_write_native_assembly(
                 query_kernel.connector_control().as_ref(),
+                query_kernel.typed_connector_control(),
                 execution,
                 distributed_plan,
                 bindings.as_ref(),

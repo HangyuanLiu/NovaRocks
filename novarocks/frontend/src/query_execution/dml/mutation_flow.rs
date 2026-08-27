@@ -471,6 +471,7 @@ fn compile_dml_change_stream_write(
     Ok(
         crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
             state.connector_control().as_ref(),
+            state.typed_connector_control(),
             execution,
             sealed,
             table_bindings.as_ref(),
@@ -2957,6 +2958,7 @@ fn execute_exact_cow_match_query(
         Some(table_bindings.as_ref()),
         Some(&resolver),
         crate::query_execution::dml::write::scan_preparation_options(
+            state.typed_connector_control(),
             execution.optimizer_settings(),
             execution,
         )?,
@@ -4413,6 +4415,9 @@ mod tests {
             Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
             None,
             Arc::clone(&connector_control),
+            std::sync::Arc::new(
+                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
+            ),
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),

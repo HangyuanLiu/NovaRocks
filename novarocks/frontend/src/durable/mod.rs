@@ -224,35 +224,6 @@ impl DurableRecordStore {
         Ok(EncodedRecord(value))
     }
 
-    /// Compatibility adapter for existing pure codec call sites. Repository
-    /// mutation paths must retain [`Self::put_record`] and never write this
-    /// raw value directly.
-    pub(crate) fn encode_compat_value<R: DurableRecord>(
-        &self,
-        record: &R,
-    ) -> Result<Value, DurableRecordError> {
-        self.encode(record).map(|record| record.0)
-    }
-
-    /// Encode a bounded, non-record StateStore value such as a state index.
-    pub(crate) fn encode_small_value(
-        &self,
-        value_kind: &'static str,
-        bytes: impl Into<Bytes>,
-        encoded_limit: usize,
-    ) -> Result<Value, DurableRecordError> {
-        let bytes = bytes.into();
-        let limit_bytes = encoded_limit.min(self.limits.max_value_bytes);
-        if bytes.len() > limit_bytes {
-            return Err(DurableRecordError::SmallValueBudgetExceeded {
-                value_kind,
-                actual_bytes: bytes.len(),
-                limit_bytes,
-            });
-        }
-        Value::try_from(bytes).map_err(DurableRecordError::from)
-    }
-
     pub(crate) async fn put_record(
         &self,
         transaction: &mut dyn WriteTransaction,

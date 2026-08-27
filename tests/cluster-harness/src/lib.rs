@@ -1933,7 +1933,7 @@ pub trait ServerHandle: Send {
     fn kill_query_until(&mut self, connection_id: u32, _deadline: Instant) -> Result<()> {
         self.kill_query(connection_id)
     }
-    fn backend_process_id(&self, index: usize) -> Result<String> {
+    fn backend_process_id(&self, index: usize) -> Result<novarocks_types::BackendProcessId> {
         bail!("backend process identity is unsupported by this server mode (index={index})")
     }
     fn fe_log_count(&self, needle: &str) -> Result<usize> {
@@ -2120,6 +2120,18 @@ pub trait ServerHandle: Send {
     }
 }
 
+/// File name of the FE durable SQLite StateStore inside a launch runtime dir.
+const FE_STATE_STORE_FILE_NAME: &str = "frontend-state.sqlite";
+
+/// Every file that belongs to the FE durable SQLite StateStore, relative to
+/// `FE_STATE_STORE_FILE_NAME`.
+///
+/// The store runs in WAL mode (`novarocks/state-store/sqlite`), so SQLite keeps
+/// the write-ahead journal and the shared-memory index next to the main
+/// database file. Destroying the store means destroying all three: a surviving
+/// `-wal` would let a replacement store replay already-committed records.
+const FE_STATE_STORE_FILE_SUFFIXES: [&str; 3] = ["", "-wal", "-shm"];
+
 /// Render the per-process TOML config for cross-process mode.
 ///
 /// `be_index` is used when `role == Be` to select which BE's ports to use.
@@ -2269,7 +2281,7 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
             "path".to_string(),
             Value::String(
                 runtime_dir
-                    .join("frontend-state.sqlite")
+                    .join(FE_STATE_STORE_FILE_NAME)
                     .to_string_lossy()
                     .into_owned(),
             ),
@@ -2974,6 +2986,52 @@ impl CrossProcessServerHandle {
         &self.runtime_dir
     }
 
+    /// Path of this launch's FE durable SQLite StateStore.
+    ///
+    /// `render_cross_process_launch_config` renders exactly this path into the
+    /// generated FE config, and `merge_safe_config_overlay` rejects any overlay
+    /// that touches `[state_store]`, so the launched FE cannot own a different
+    /// durable store.
+    pub fn fe_state_store_path(&self) -> PathBuf {
+        self.runtime_dir.join(FE_STATE_STORE_FILE_NAME)
+    }
+
+    /// Restart the FE against a brand-new empty durable store, using this
+    /// handle's startup timeout.
+    pub fn wipe_fe_state_store_and_restart(&mut self) -> Result<()> {
+        self.wipe_fe_state_store_and_restart_until(Instant::now() + self.startup_timeout)
+    }
+
+    /// Stop the FE, destroy its durable StateStore, then start the FE again and
+    /// wait until it is ready, all before `deadline`.
+    ///
+    /// BE processes are deliberately left running, so a caller observes exactly
+    /// one FE that lost every durable record while the lake and the live
+    /// backends stayed where they were. Stop, start and readiness reuse the
+    /// same `ServerHandle::kill_fe` / `ServerHandle::restart_fe_until` paths an
+    /// ordinary FE restart uses; only the store destruction is new.
+    ///
+    /// The reused restart path ends in the `SHOW BACKENDS` topology barrier.
+    /// Backends self-register, so the restarted FE rebuilds membership from
+    /// their announcements rather than from anything the destroyed store held;
+    /// the barrier therefore converges without the store contributing to it.
+    pub fn wipe_fe_state_store_and_restart_until(&mut self, deadline: Instant) -> Result<()> {
+        ServerHandle::kill_fe(self)
+            .context("stop cross-process FE before destroying its durable state store")?;
+        let removed = remove_fe_state_store(&self.runtime_dir, &self.fe_config_path)
+            .context("destroy cross-process FE durable state store")?;
+        println!(
+            "destroyed cross-process FE durable state store {}: removed={:?}",
+            self.fe_state_store_path().display(),
+            removed
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+        );
+        ServerHandle::restart_fe_until(self, deadline)
+            .context("restart cross-process FE against an empty durable state store")
+    }
+
     /// MySQL user parsed from the supplied base config.
     pub fn mysql_user(&self) -> &str {
         &self.mysql_user
@@ -3573,7 +3631,7 @@ impl ServerHandle for CrossProcessServerHandle {
             })
     }
 
-    fn backend_process_id(&self, index: usize) -> Result<String> {
+    fn backend_process_id(&self, index: usize) -> Result<novarocks_types::BackendProcessId> {
         self.ensure_be_index(index)?;
         let grpc_port = self.be_grpc_ports[index];
         let rows = query_frontend_backend_topology(
@@ -3594,6 +3652,13 @@ impl ServerHandle for CrossProcessServerHandle {
                 anyhow::anyhow!(
                     "SHOW BACKENDS has no row for cross-process BE[{index}] grpc_port={grpc_port}"
                 )
+            })?
+            // The harness is where wire text becomes a typed fact: a caller
+            // comparing two process identities must not be handed two strings
+            // that merely look alike.
+            .parse::<novarocks_types::BackendProcessId>()
+            .with_context(|| {
+                format!("SHOW BACKENDS process_id for BE[{index}] is not a backend process id")
             })
     }
 
@@ -3834,7 +3899,7 @@ impl ServerHandle for CrossProcessServerHandle {
             });
             if observed
                 .as_ref()
-                .is_some_and(|row| row.alive && row.process_id != old_process_id)
+                .is_some_and(|row| row.alive && row.process_id != old_process_id.to_string())
             {
                 println!(
                     "cross-process BE[{index}] process-identity barrier PASS: old_process_id={old_process_id} new_process_id={}",
@@ -4373,6 +4438,51 @@ fn is_bind_conflict(stderr: &str) -> bool {
         || stderr.contains("eaddrinuse")
         || stderr.contains("os error 48")
         || (stderr.contains("bind") && stderr.contains("in use"))
+}
+
+/// Destroy the FE durable SQLite StateStore of one launch runtime directory and
+/// return the files that were actually removed.
+///
+/// Every candidate path is `runtime_dir` joined with a literal file name, so
+/// this can never reach outside the launch it was handed. A file that is
+/// already absent is already destroyed and is not an error.
+fn remove_fe_state_store(runtime_dir: &Path, fe_config_path: &Path) -> Result<Vec<PathBuf>> {
+    // A wipe that destroys nothing is indistinguishable from a wipe that
+    // worked, so a caller asserting "the FE lost every durable record" would
+    // pass while the records were still there. Only the SQLite provider keeps
+    // its store in this directory; refuse rather than quietly no-op if the
+    // launched FE owns its durable state somewhere this function cannot reach.
+    let rendered = fs::read_to_string(fe_config_path)
+        .with_context(|| format!("read {}", fe_config_path.display()))?;
+    let parsed = rendered
+        .parse::<Value>()
+        .with_context(|| format!("parse {}", fe_config_path.display()))?;
+    let provider = parsed
+        .get("state_store")
+        .and_then(|section| section.get("provider"))
+        .and_then(Value::as_str);
+    if provider != Some("sqlite") {
+        bail!(
+            "cannot destroy the FE durable state store: {} declares [state_store] provider {:?}, \
+             but only \"sqlite\" keeps its store under the launch runtime directory",
+            fe_config_path.display(),
+            provider
+        );
+    }
+    let mut removed = Vec::new();
+    for suffix in FE_STATE_STORE_FILE_SUFFIXES {
+        let path = runtime_dir.join(format!("{FE_STATE_STORE_FILE_NAME}{suffix}"));
+        match fs::remove_file(&path) {
+            Ok(()) => removed.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("remove FE durable state store file {}", path.display())
+                });
+            }
+        }
+    }
+    Ok(removed)
 }
 
 fn create_runtime_dir(runtime_root: &Path) -> Result<PathBuf> {
@@ -5563,6 +5673,71 @@ enable_path_style_access = true
                 );
             }
         }
+    }
+
+    #[test]
+    fn remove_fe_state_store_destroys_sidecars_keeps_other_artifacts_and_tolerates_absence() {
+        let repo_root = std::env::current_dir().expect("current dir");
+        let runtime_root = repo_root.join("tests/cluster-harness/.test-runtime");
+        fs::create_dir_all(&runtime_root).expect("create runtime root");
+        let dir = runtime_root.join(format!(
+            "remove_fe_state_store_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock before unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create wipe test dir");
+
+        let store = dir.join(FE_STATE_STORE_FILE_NAME);
+        let wal = dir.join(format!("{FE_STATE_STORE_FILE_NAME}-wal"));
+        let shm = dir.join(format!("{FE_STATE_STORE_FILE_NAME}-shm"));
+        // The wipe must not touch anything else the launch keeps in the same
+        // runtime directory: the lake warehouse and the process logs live here.
+        let unrelated = dir.join("fe.log");
+        for path in [&store, &wal, &shm, &unrelated] {
+            fs::write(path, b"x").expect("create fixture file");
+        }
+        let fe_config = dir.join("fe.toml");
+        fs::write(&fe_config, "[state_store]\nprovider = \"sqlite\"\n")
+            .expect("write sqlite FE config");
+
+        let removed = remove_fe_state_store(&dir, &fe_config).expect("remove FE state store");
+        assert_eq!(
+            removed,
+            vec![store.clone(), wal.clone(), shm.clone()],
+            "the main database and both WAL sidecars must be destroyed"
+        );
+        assert!(!store.exists(), "main database must be gone");
+        assert!(!wal.exists(), "WAL journal must be gone");
+        assert!(!shm.exists(), "shared-memory index must be gone");
+        assert!(
+            unrelated.exists(),
+            "wiping the durable store must not remove unrelated runtime artifacts"
+        );
+
+        let removed_again =
+            remove_fe_state_store(&dir, &fe_config).expect("absent store is not an error");
+        assert!(
+            removed_again.is_empty(),
+            "a second wipe removes nothing and still succeeds: {removed_again:?}"
+        );
+
+        // A provider that keeps its store outside this directory must fail
+        // loudly: a silent no-op would let a caller assert "the FE lost every
+        // durable record" while every record was still readable.
+        let remote_config = dir.join("fe-mysql.toml");
+        fs::write(&remote_config, "[state_store]\nprovider = \"mysql\"\n")
+            .expect("write mysql FE config");
+        let refusal = remove_fe_state_store(&dir, &remote_config)
+            .expect_err("a non-sqlite durable store must refuse the wipe");
+        assert!(
+            format!("{refusal:#}").contains("only \"sqlite\""),
+            "refusal must name the supported provider: {refusal:#}"
+        );
+
+        fs::remove_dir_all(&dir).expect("cleanup wipe test dir");
     }
 
     #[test]

@@ -35,6 +35,13 @@ pub enum SqlTableVersionSelector {
 
 /// SQL-level metadata table identity.  Provider-specific metadata APIs are
 /// deliberately not represented in the compiler vocabulary.
+///
+/// This is a closed set. Six of the seven variants are the wire's worker set
+/// (`IcebergSystemTableType`: FILES, ENTRIES, SNAPSHOTS, HISTORY, REFS,
+/// MANIFESTS); `Partitions` is a view over the same pinned `$files` snapshot
+/// and never travels as a worker type. There is no alias, no `ALL_*` variant,
+/// and no unknown variant, so every consumer must match exhaustively and a new
+/// relation is a compile error rather than a silent gap.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SqlMetadataTableKind {
     Snapshots,
@@ -43,10 +50,18 @@ pub enum SqlMetadataTableKind {
     Files,
     Manifests,
     Partitions,
-    LogicalIcebergMetadata,
+    /// Trino `$entries`: the manifest entries of the pinned snapshot.
+    ///
+    /// This replaces the former `LogicalIcebergMetadata` alias. That alias
+    /// accepted two spellings for one relation and described a flattened
+    /// `$files` superset rather than Trino's nested `data_file` ROW; both are
+    /// gone.
+    Entries,
 }
 
 impl SqlMetadataTableKind {
+    /// Resolve a `<table>$<suffix>` suffix. An unrecognized suffix is refused
+    /// here — there is deliberately no catch-all relation to fall back to.
     pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().as_str() {
             "snapshots" => Ok(Self::Snapshots),
@@ -55,8 +70,11 @@ impl SqlMetadataTableKind {
             "files" => Ok(Self::Files),
             "manifests" => Ok(Self::Manifests),
             "partitions" => Ok(Self::Partitions),
-            "entries" | "logical_iceberg_metadata" => Ok(Self::LogicalIcebergMetadata),
-            _ => Err(format!("unsupported Iceberg metadata table type: {value}")),
+            "entries" => Ok(Self::Entries),
+            _ => Err(format!(
+                "unsupported Iceberg metadata table type: {value} (expected one of \
+                 snapshots, history, refs, files, manifests, partitions, entries)"
+            )),
         }
     }
 }
@@ -479,6 +497,72 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn metadata_table_kind_parses_the_seven_relation_suffixes() {
+        for (suffix, expected) in [
+            ("snapshots", SqlMetadataTableKind::Snapshots),
+            ("history", SqlMetadataTableKind::History),
+            ("refs", SqlMetadataTableKind::Refs),
+            ("files", SqlMetadataTableKind::Files),
+            ("manifests", SqlMetadataTableKind::Manifests),
+            ("partitions", SqlMetadataTableKind::Partitions),
+            ("entries", SqlMetadataTableKind::Entries),
+        ] {
+            assert_eq!(
+                SqlMetadataTableKind::parse(suffix),
+                Ok(expected),
+                "lowercase {suffix}"
+            );
+            assert_eq!(
+                SqlMetadataTableKind::parse(&suffix.to_uppercase()),
+                Ok(expected),
+                "uppercase {suffix}"
+            );
+        }
+    }
+
+    #[test]
+    fn entries_resolves_without_the_logical_iceberg_metadata_alias() {
+        assert_eq!(
+            SqlMetadataTableKind::parse("entries"),
+            Ok(SqlMetadataTableKind::Entries)
+        );
+        // The retired alias must not resolve to anything at all.
+        let error = SqlMetadataTableKind::parse("logical_iceberg_metadata")
+            .expect_err("the LogicalIcebergMetadata alias is removed");
+        assert!(error.contains("logical_iceberg_metadata"), "{error}");
+    }
+
+    #[test]
+    fn unknown_metadata_suffix_is_refused_naming_the_closed_set() {
+        // `all_entries` / `all_manifests` are Trino relations this stack does
+        // not implement; they must be refused, never silently aliased.
+        for unknown in ["all_entries", "all_manifests", "metadata_log_entries", ""] {
+            let error = SqlMetadataTableKind::parse(unknown)
+                .unwrap_err_or_relation_name(&format!("`{unknown}` must be refused"));
+            assert!(
+                error.contains("unsupported Iceberg metadata table type"),
+                "{error}"
+            );
+            assert!(error.contains("entries"), "{error}");
+        }
+    }
+
+    /// Small readability helper: a metadata suffix that resolves is a test
+    /// failure, and the panic should say which suffix leaked through.
+    trait UnwrapErrOrRelationName {
+        fn unwrap_err_or_relation_name(self, context: &str) -> String;
+    }
+
+    impl UnwrapErrOrRelationName for Result<SqlMetadataTableKind, String> {
+        fn unwrap_err_or_relation_name(self, context: &str) -> String {
+            match self {
+                Ok(kind) => panic!("{context}, but it resolved to {kind:?}"),
+                Err(error) => error,
+            }
+        }
+    }
 
     struct NeverCancelled;
 

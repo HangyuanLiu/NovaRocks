@@ -79,6 +79,20 @@ pub fn metadata_table_output_columns(
         DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
     };
     let list_of = |value: DataType| DataType::List(Arc::new(Field::new("item", value, true)));
+    // The frozen relation contract states these two exactly, and the typed
+    // reader produces them; declaring anything narrower here makes analysis
+    // disagree with what the scan actually returns.
+    let timestamp_tz = || DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+    let map_varchar_to_varchar = || {
+        let entries = DataType::Struct(
+            vec![
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(Field::new("value", DataType::Utf8, true)),
+            ]
+            .into(),
+        );
+        DataType::Map(Arc::new(Field::new("entries", entries, false)), false)
+    };
     let files = || -> Result<Vec<MetadataOutputColumn>, String> {
         Ok(vec![
             column("content", DataType::Int32, false),
@@ -103,15 +117,18 @@ pub fn metadata_table_output_columns(
     };
     match metadata_table_type {
         MetadataTableType::Snapshots => Ok(vec![
-            column("committed_at", DataType::Int64, false),
+            column("committed_at", timestamp_tz(), false),
             column("snapshot_id", DataType::Int64, false),
             column("parent_id", DataType::Int64, true),
             column("operation", DataType::Utf8, true),
             column("manifest_list", DataType::Utf8, false),
-            column("summary", DataType::Utf8, false),
+            // A real map, not a rendered string: reading one value out of it
+            // is the whole reason the column exists, and a string forces every
+            // caller to parse the map back out.
+            column("summary", map_varchar_to_varchar(), true),
         ]),
         MetadataTableType::History => Ok(vec![
-            column("made_current_at", DataType::Int64, false),
+            column("made_current_at", timestamp_tz(), false),
             column("snapshot_id", DataType::Int64, false),
             column("parent_id", DataType::Int64, true),
             column("is_current_ancestor", DataType::Boolean, false),

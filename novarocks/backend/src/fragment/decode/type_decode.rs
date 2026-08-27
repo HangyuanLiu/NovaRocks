@@ -123,6 +123,7 @@ fn encode_type_inner(
 fn encode_scalar_type(data_type: &DataType) -> Result<common::TypeDesc, String> {
     use common::PrimitiveType;
 
+    let mut time_zone: Option<String> = None;
     let (primitive, precision, scale, time_unit) = match data_type {
         DataType::Null => (PrimitiveType::NullType, None, None, None),
         DataType::Boolean => (PrimitiveType::Boolean, None, None, None),
@@ -151,7 +152,8 @@ fn encode_scalar_type(data_type: &DataType) -> Result<common::TypeDesc, String> 
             )
         }
         DataType::Date32 => (PrimitiveType::Date, None, None, None),
-        DataType::Timestamp(unit, _) => {
+        DataType::Timestamp(unit, zone) => {
+            time_zone = zone.as_ref().map(|zone| zone.to_string());
             let time_unit = match unit {
                 TimeUnit::Microsecond => None,
                 TimeUnit::Nanosecond => Some(TIME_UNIT_NANOS),
@@ -179,7 +181,9 @@ fn encode_scalar_type(data_type: &DataType) -> Result<common::TypeDesc, String> 
             ));
         }
     };
-    Ok(scalar_desc(primitive, precision, scale, time_unit))
+    Ok(scalar_desc_with_zone(
+        primitive, precision, scale, time_unit, time_zone,
+    ))
 }
 
 #[cfg(test)]
@@ -189,6 +193,16 @@ fn scalar_desc(
     scale: Option<i32>,
     time_unit: Option<i32>,
 ) -> common::TypeDesc {
+    scalar_desc_with_zone(primitive, precision, scale, time_unit, None)
+}
+
+fn scalar_desc_with_zone(
+    primitive: common::PrimitiveType,
+    precision: Option<i32>,
+    scale: Option<i32>,
+    time_unit: Option<i32>,
+    time_zone: Option<String>,
+) -> common::TypeDesc {
     common::TypeDesc {
         kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
             r#type: primitive as i32,
@@ -196,6 +210,7 @@ fn scalar_desc(
             precision,
             scale,
             time_unit,
+            time_zone,
         })),
     }
 }
@@ -281,7 +296,14 @@ fn decode_scalar_type(scalar: &common::ScalarType) -> Result<DataType, String> {
                     ));
                 }
             };
-            Ok(DataType::Timestamp(unit, None))
+            // Present exactly when the producer's timestamp carried one. A
+            // zoned timestamp and an unzoned one are different types, so
+            // decoding both to the unzoned one rewrote the column.
+            let zone = scalar
+                .time_zone
+                .as_ref()
+                .map(|zone| std::sync::Arc::from(zone.as_str()));
+            Ok(DataType::Timestamp(unit, zone))
         }
         PrimitiveType::Time => Ok(DataType::Time64(TimeUnit::Microsecond)),
         PrimitiveType::Varchar | PrimitiveType::Char | PrimitiveType::Json => Ok(DataType::Utf8),

@@ -28,7 +28,7 @@
 
 //! The unified provider-private transaction.
 //!
-//! Design: ADR-0114 (docs/adr/ADR-0114-iceberg-provider-private-catalog-owner.md)
+//! Design: ADR-0118 (docs/adr/ADR-0118-iceberg-provider-private-catalog-owner.md)
 //!
 //! All three constructors on [`super::NovaRocksCatalog`] return this one type.
 //! It exists because the vendored `iceberg::Transaction::commit` cannot express

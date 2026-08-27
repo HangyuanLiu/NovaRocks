@@ -44,10 +44,23 @@ use novarocks_spi::connector::{
 };
 use std::sync::Arc;
 
+/// Notified with the coordinator-side typed boundary of each created control
+/// generation.
+///
+/// The boundary must share the control generation's own catalog runtime, so it
+/// can only be minted here. The observer lets the composition root register it
+/// without this crate learning what a frontend registry is.
+pub type IcebergTypedBoundaryObserver = Arc<
+    dyn Fn(&ConnectorExecutionBindingKey, crate::typed_boundary::IcebergTypedBoundary)
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone)]
 pub struct IcebergConnectorFactory {
     control_resources: IcebergMetadataResources,
     provider_id: ConnectorProviderId,
+    typed_boundary_observer: Option<IcebergTypedBoundaryObserver>,
 }
 
 impl IcebergConnectorFactory {
@@ -56,7 +69,14 @@ impl IcebergConnectorFactory {
             control_resources,
             provider_id: ConnectorProviderId::parse(PROVIDER_ID)
                 .expect("static Iceberg provider ID is valid"),
+            typed_boundary_observer: None,
         }
+    }
+
+    /// Register the composition root's typed-boundary sink.
+    pub fn with_typed_boundary_observer(mut self, observer: IcebergTypedBoundaryObserver) -> Self {
+        self.typed_boundary_observer = Some(observer);
+        self
     }
 
     pub fn provider_id(&self) -> &ConnectorProviderId {
@@ -135,6 +155,21 @@ impl ConnectorControlFactory for IcebergConnectorFactory {
             instance_id: descriptor.instance_id.clone(),
             incarnation,
         };
+        if let Some(observer) = self.typed_boundary_observer.as_ref() {
+            // Minted from this generation's own runtime, so the coordinator
+            // never opens a second catalog path for the same binding.
+            observer(
+                &key,
+                unpublished.typed_boundary(
+                    descriptor.clone(),
+                    incarnation,
+                    crate::typed_read::table_handle::HiveTransactionHandle::new(
+                        true,
+                        incarnation.to_bytes(),
+                    ),
+                ),
+            );
+        }
         let metadata_maintenance = Arc::new(IcebergMetadataMaintenanceAdapter::new(
             key.clone(),
             Arc::clone(&unpublished.runtime),
@@ -218,6 +253,25 @@ pub struct IcebergUnpublishedControl {
 impl IcebergUnpublishedControl {
     pub(crate) fn runtime(&self) -> &Arc<IcebergMetadataContext> {
         &self.runtime
+    }
+
+    /// Mint the coordinator-side typed boundary for this control generation.
+    ///
+    /// The runtime handle stays crate-private: the composition root gets a
+    /// ready boundary rather than the runtime it is built from, so nothing
+    /// outside this crate can assemble a second control path over it.
+    pub fn typed_boundary(
+        &self,
+        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+        incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation,
+        transaction: crate::typed_read::table_handle::HiveTransactionHandle,
+    ) -> crate::typed_boundary::IcebergTypedBoundary {
+        crate::typed_boundary::IcebergTypedBoundary::new(
+            descriptor,
+            incarnation,
+            transaction,
+            Arc::clone(self.runtime()),
+        )
     }
 
     pub fn durable_properties(&self) -> &[(String, String)] {

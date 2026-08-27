@@ -15,307 +15,497 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Typed connector lowering of Iceberg scans.
+
 use super::*;
-use crate::connector::scan_model::{FixtureColumnStats, FixturePartitionValue};
 
-/// A read unit that carries min/max statistics for `id`. The fixture never
-/// decodes the bounds; they exist so the unit models a statistics-bearing file
-/// whose bytes must survive Core untouched.
-fn data_file_with_i32_stats(path: &str, min: i32, max: i32) -> FixtureScanFile {
-    let mut file = data_file(path);
-    file.column_stats = std::collections::BTreeMap::from([(
-        "id".to_string(),
-        FixtureColumnStats {
-            null_count: Some(0),
-            value_count: Some(10),
-            lower_bound: Some(min.to_le_bytes().to_vec()),
-            upper_bound: Some(max.to_le_bytes().to_vec()),
-        },
-    )]);
-    file
-}
-
-fn identity_partition_file(path: &str, id: i32) -> FixtureScanFile {
-    let mut file = data_file(path);
-    file.partition_values = vec![FixturePartitionValue {
-        field_name: "id".to_string(),
-        transform: "identity".to_string(),
-        value: Some(id.to_string()),
-    }];
-    file
-}
-
-fn planned_data_files(
-    bindings: &crate::query_execution::preparation::scan::ScanExecutionBindings,
-    node_id: i32,
-) -> Vec<FixtureScanFile> {
-    let planned = bindings
-        .connector_read(0, node_id)
-        .expect("opaque connector read");
-    planned
-        .splits
-        .iter()
-        .map(|split| {
-            crate::connector::scan_model::planned_split_file_for_test(split)
-                .expect("decode fixture split")
-        })
-        .collect()
-}
-
-/// Predicate pushdown must reach the connector while Core keeps the matching
-/// residual and returns the connector's own unit verbatim.
-///
-/// Whether a statistics bound excludes a unit is provider semantics, so the
-/// fixture connector never prunes and this test supplies only the unit a
-/// pruning provider would have selected. The pruning decision itself is
-/// asserted by the provider's file-pruning unit tests.
-#[test]
-fn ordinary_iceberg_scan_uses_opaque_connector_read_and_preserves_residual() {
-    let bindings = prepare_scan_bindings(
-        &native_scan_plan(NativeScanFixture::OrdinaryIcebergWithIdEqualityPredicate)
-            .expect("sealed equality fixture"),
-        &registry(vec![data_file_with_i32_stats(
-            "s3://bucket/id-10-20.parquet",
-            10,
-            20,
-        )]),
-        None,
-    )
-    .expect("prepare pruned scan");
-    assert!(
-        bindings
-            .scan_ranges(0, 10)
-            .is_some_and(|ranges| ranges.is_empty())
-    );
-    let read = bindings
-        .connector_read(0, 10)
-        .expect("opaque connector read");
-    assert_eq!(read.splits.len(), 1);
-    assert_eq!(
-        planned_data_files(&bindings, 10)[0].path,
-        "s3://bucket/id-10-20.parquet"
-    );
-    assert_eq!(read.static_predicates.len(), 1);
-    assert_eq!(read.residual_predicates.len(), 1);
-    assert!(read.predicate_dispositions.iter().all(|disposition| {
-        disposition.kind == novarocks_spi::connector::ConnectorPredicateDispositionKind::PruningOnly
-    }));
-}
-
-#[test]
-fn delta_scan_uses_opaque_connector_read() {
-    let resolver = StaticResolver {
-        execution: resolved_data_delta(),
-    };
-
-    let bindings = prepare_scan_bindings(
-        &native_scan_plan(NativeScanFixture::DeltaForPreparedBinding)
-            .expect("sealed delta fixture"),
-        &registry(vec![data_file("s3://bucket/delta.parquet")]),
-        Some(&resolver),
-    )
-    .expect("prepare delta scan");
-
-    assert!(matches!(
-        bindings.binding(10).expect("binding").execution,
-        ResolvedScanExecution::SealedConnectorScan(_)
-    ));
-    assert!(
-        bindings
-            .scan_ranges(0, 10)
-            .expect("delta ranges")
-            .is_empty()
-    );
-    let planned = bindings
-        .connector_read(0, 10)
-        .expect("delta connector read");
-    assert_eq!(
-        planned.declaration.provider_kind(),
-        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg,
-        "the planned read must carry the typed connector declaration"
-    );
-    assert_eq!(planned.splits.len(), 1);
-    assert_eq!(planned.splits[0].split_id(), "fixture-0");
-}
-
-#[test]
-fn explicit_files_plan_opaque_connector_splits() {
-    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
-        .expect("sealed ordinary fixture");
-    let bindings = prepare_scan_bindings(
-        &plan,
-        &registry(vec![data_file("s3://bucket/explicit.parquet")]),
-        None,
-    )
-    .expect("prepare explicit scan");
-    let ranges = bindings.scan_ranges(0, 10).expect("ranges");
-    assert!(ranges.is_empty());
-    let planned = bindings.connector_read(0, 10).expect("connector read");
-    assert_eq!(
-        planned.declaration.provider_kind(),
-        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
-    );
-    assert_eq!(
-        planned.declaration.binding_key().instance_id(),
-        "test_catalog"
-    );
-    assert_eq!(planned.splits.len(), 1);
-    assert_eq!(planned.splits[0].split_id(), "fixture-0");
-    assert_eq!(planned.splits[0].owner().as_str(), "test_catalog");
-}
-
-#[test]
-fn sqlx2_frozen_snapshot_scan_uses_its_exact_admitted_file_set() {
-    let plan =
-        native_scan_plan(NativeScanFixture::FrozenSnapshotEleven).expect("sealed frozen fixture");
-    let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
-        "s3://bucket/current.parquet",
-    )]));
-    let store = fixture_query_table_bindings(&plan, &controls);
-    let DistributedNodeKind::Scan(scan) = &plan.fragments()[0].root.payload else {
-        panic!("fixture root must remain a scan");
-    };
-    let facts = scan_preparation_facts(scan);
-    let selected = store
-        .frozen_snapshot_materialization(facts.binding(), 11)
-        .expect("select admitted snapshot files");
-    let crate::catalog_application::query_bindings::QueryScanMaterialization { selector, .. } =
-        selected;
-
-    assert_eq!(
-        selector,
-        novarocks_spi::connector::ConnectorReadSelector::SnapshotId(11),
-        "FrozenInputSet must retain its admitted snapshot selector"
-    );
-    super::super::prepare_scan_bindings(
-        &plan,
-        &controls,
-        &crate::connector::test_request_context(),
-        Some(&store),
-        None,
-        super::super::ScanPreparationOptions::single_backend_fixture(),
-    )
-    .expect("prepare selected frozen snapshot scan");
-}
-
-#[test]
-fn sqlx2_frozen_snapshot_scan_rejects_a_selector_without_admitted_files() {
-    let controls = crate::connector::FixtureControlResolver::new(registry(vec![data_file(
-        "s3://bucket/current.parquet",
-    )]));
-    let admitted = native_scan_plan(NativeScanFixture::FrozenSnapshotEleven)
-        .expect("sealed admitted frozen fixture");
-    let store = fixture_query_table_bindings(&admitted, &controls);
-    let plan = native_scan_plan(NativeScanFixture::FrozenSnapshotTwelve)
-        .expect("sealed unadmitted frozen fixture");
-
-    let error = match super::super::prepare_scan_bindings(
-        &plan,
-        &controls,
-        &crate::connector::test_request_context(),
-        Some(&store),
-        None,
-        super::super::ScanPreparationOptions::single_backend_fixture(),
-    ) {
-        Ok(_) => panic!("unadmitted frozen snapshot must fail before split planning"),
+/// `ScanExecutionBindings` holds connector leases and split managers, so it is
+/// deliberately not `Debug`; a refusal is therefore asserted through a match.
+fn expect_preparation_error(
+    result: Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String>,
+    expectation: &str,
+) -> String {
+    match result {
+        Ok(_) => panic!("{expectation}"),
         Err(error) => error,
-    };
-    assert!(
-        error.contains("snapshot 12 has no admitted connector materialization"),
-        "{error}"
-    );
+    }
 }
 
-/// A partition-valued unit takes the same opaque path as any other: Core keeps
-/// the residual and never reads the partition values.
-///
-/// Identity-partition exclusion is provider semantics, so the fixture does not
-/// prune and this test supplies only the surviving unit; the exclusion itself is
-/// asserted by the provider's file-pruning unit tests.
+/// The one scan node every single-scan fixture plan has.
+pub(super) fn only_scan_node(
+    bindings: &crate::query_execution::preparation::scan::ScanExecutionBindings,
+) -> (novarocks_sql::plan_read::FragmentId, i32) {
+    let mut keys = bindings.typed_scan_keys().collect::<Vec<_>>();
+    assert_eq!(keys.len(), 1, "the fixture plan has exactly one scan");
+    keys.pop().expect("one typed scan")
+}
+
 #[test]
-fn identity_partition_predicate_stays_on_opaque_connector_path() {
+fn an_ordinary_iceberg_scan_lowers_to_a_typed_data_relation() {
     let bindings = prepare_scan_bindings(
-        &native_scan_plan(NativeScanFixture::OrdinaryIcebergWithIdEqualityPredicate)
-            .expect("sealed equality fixture"),
-        &registry(vec![identity_partition_file(
-            "s3://bucket/id-12.parquet",
-            12,
-        )]),
+        &native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+            .expect("sealed ordinary iceberg fixture"),
+        &registry(vec![data_file("s3://bucket/data.parquet")]),
         None,
     )
-    .expect("prepare connector scan");
-    let read = bindings
-        .connector_read(0, 10)
-        .expect("opaque connector read");
-    assert_eq!(read.splits.len(), 1);
+    .expect("typed scan preparation");
+
+    let (fragment_id, node_id) = only_scan_node(&bindings);
+    let typed = bindings
+        .typed_scan(fragment_id, node_id)
+        .expect("typed connector scan");
     assert_eq!(
-        planned_data_files(&bindings, 10)[0].path,
-        "s3://bucket/id-12.parquet"
+        typed.prepared.table_scan.table().relation_kind(),
+        novarocks_proto::connector_read::ConnectorRelationKind::Table
     );
-    assert_eq!(read.residual_predicates.len(), 1);
-}
-
-#[test]
-fn large_plain_file_preserves_provider_owned_split_and_byte_estimate() {
-    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
-        .expect("sealed ordinary fixture");
-    let mut file = data_file("s3://bucket/large.parquet");
-    file.size = 300 * 1024 * 1024;
-    let bindings =
-        prepare_scan_bindings(&plan, &registry(vec![file]), None).expect("prepare large-file scan");
-    assert!(bindings.scan_ranges(0, 10).expect("ranges").is_empty());
-    let planned = bindings.connector_read(0, 10).expect("connector read");
-
-    assert_eq!(planned.splits.len(), 1);
-    assert_eq!(planned.splits[0].estimated_bytes(), Some(300 * 1024 * 1024));
-    let file = crate::connector::scan_model::planned_split_file_for_test(&planned.splits[0])
-        .expect("decode fixture split");
-    assert_eq!(file.path, "s3://bucket/large.parquet");
-    assert_eq!(file.size, 300 * 1024 * 1024);
-}
-
-/// A connector split-planning failure must reach the caller verbatim, carrying
-/// the connector's own error kind and message under the scan node that asked
-/// for it. Core must neither reword nor reclassify a provider refusal.
-#[test]
-fn connector_planning_error_is_preserved_exactly_with_scan_node_context() {
-    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
-        .expect("sealed ordinary fixture");
-    // The scan carrier names `test_table`; registering units only for another
-    // table makes the connector refuse to plan with its own NotFound.
-    let registry = registry_for_tables(HashMap::from([(
-        "other_table".to_string(),
-        vec![data_file("s3://bucket/other.parquet")],
-    )]));
-
-    let err = match prepare_scan_bindings(&plan, &registry, None) {
-        Ok(_) => panic!("a connector that cannot plan the scan must fail preparation"),
-        Err(err) => err,
-    };
-
     assert_eq!(
-        err,
-        "scan preparation node_id=10: NotFound: no planned files for fixture table test_table"
+        typed.prepared.table_scan.table().catalog().instance_id(),
+        typed.declaration.binding_key().instance_id.as_str(),
+        "the frozen relation and its declaration name one generation"
     );
 }
 
+/// Preparation must hand the connector's enumerator on untouched. Nothing here
+/// may produce a split set, and in particular the opaque carrier — the only
+/// thing that ever carried one — must have no entry at all.
 #[test]
-fn unsupported_predicate_does_not_guess_pruning() {
+fn preparation_enumerates_no_split() {
     let bindings = prepare_scan_bindings(
-        &native_scan_plan(NativeScanFixture::UnsupportedPredicate)
-            .expect("sealed unsupported predicate fixture"),
+        &native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+            .expect("sealed ordinary iceberg fixture"),
         &registry(vec![
-            data_file_with_i32_stats("s3://bucket/id-1-5.parquet", 1, 5),
-            data_file_with_i32_stats("s3://bucket/id-10-20.parquet", 10, 20),
+            data_file("s3://bucket/a.parquet"),
+            data_file("s3://bucket/b.parquet"),
         ]),
         None,
     )
-    .expect("unsupported pruning predicate must preserve scan semantics");
+    .expect("typed scan preparation");
 
-    let read = bindings
-        .connector_read(0, 10)
-        .expect("opaque connector read");
-    assert!(read.static_predicates.is_empty());
-    assert_eq!(read.residual_predicates.len(), 1);
-    assert_eq!(read.splits.len(), 2);
+    assert!(
+        bindings.connector_reads().next().is_none(),
+        "no opaque connector read with a frozen split list may be produced"
+    );
+    let (fragment_id, node_id) = only_scan_node(&bindings);
+    let typed = bindings
+        .typed_scan(fragment_id, node_id)
+        .expect("typed connector scan");
+    // The fixture control fails any enumeration attempt, so a prepared scan
+    // proves preparation never called it.
+    assert!(
+        typed
+            .prepared
+            .split_manager
+            .get_splits(
+                &novarocks_spi::connector::read_stack::ConnectorSession::try_new(
+                    "probe",
+                    "probe",
+                    "UTC",
+                    "en_US",
+                    std::time::SystemTime::UNIX_EPOCH,
+                )
+                .expect("probe session"),
+                typed.prepared.table_scan.source().table(),
+                typed.prepared.table_scan.source().assignments(),
+                &typed.prepared.table_scan.dynamic_filter_columns(),
+                &typed.prepared.constraint,
+            )
+            .is_err(),
+        "the fixture enumerator refuses, so preparation cannot have used it"
+    );
+}
+
+/// The ordered assignments are the output-order authority, so they follow the
+/// scan's own output order and are never sorted into the connector's order.
+#[test]
+fn assignments_follow_the_scan_output_order() {
+    let bindings = prepare_scan_bindings(
+        &native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+            .expect("sealed ordinary iceberg fixture"),
+        &registry(vec![data_file("s3://bucket/data.parquet")]),
+        None,
+    )
+    .expect("typed scan preparation");
+    let (fragment_id, node_id) = only_scan_node(&bindings);
+    let typed = bindings
+        .typed_scan(fragment_id, node_id)
+        .expect("typed connector scan");
+    let assignments = typed.prepared.table_scan.source().assignments();
+    assert!(!assignments.is_empty());
+    for (ordinal, assignment) in assignments.iter().enumerate() {
+        assert_eq!(assignment.variable(), format!("v{ordinal}"));
+    }
+}
+
+/// An MV target scan is an ordinary pinned DATA read: the lane it came from is
+/// not an execution difference the typed stack can observe.
+#[test]
+fn an_mv_target_scan_lowers_to_an_ordinary_pinned_data_handle() {
+    for fixture in [
+        NativeScanFixture::TargetStateProjection,
+        NativeScanFixture::TargetLocatorProjection,
+    ] {
+        let plan = native_scan_plan(fixture).expect("sealed MV target fixture");
+        let bindings = prepare_scan_bindings(
+            &plan,
+            &registry(vec![data_file("s3://bucket/target.parquet")]),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("MV target lowering for {fixture:?}: {error}"));
+        let (fragment_id, node_id) = only_scan_node(&bindings);
+        let typed = bindings
+            .typed_scan(fragment_id, node_id)
+            .expect("typed connector scan");
+        assert_eq!(
+            typed.prepared.table_scan.table().relation_kind(),
+            novarocks_proto::connector_read::ConnectorRelationKind::Table,
+            "an MV target lane must not produce a specialized relation"
+        );
+    }
+}
+
+/// A change-window read is its own relation family. It lowers to a typed
+/// change-window relation pinned to both endpoints -- the set difference of
+/// the rows visible at each, never a replay of the manifests between them.
+#[test]
+fn a_change_window_scan_lowers_to_a_typed_change_window_relation() {
+    let bindings = prepare_scan_bindings_with_delta_resolver(
+        &native_scan_plan(NativeScanFixture::DeltaForPreparedBinding)
+            .expect("sealed delta fixture"),
+        &registry(vec![data_file("s3://bucket/data.parquet")]),
+    )
+    .expect("typed change-window preparation");
+
+    let (fragment_id, node_id) = only_scan_node(&bindings);
+    let typed = bindings
+        .typed_scan(fragment_id, node_id)
+        .expect("typed connector scan");
+    assert_eq!(
+        typed.prepared.table_scan.table().relation_kind(),
+        novarocks_proto::connector_read::ConnectorRelationKind::ChangeWindow
+    );
+    let novarocks_proto::connector_read::ConnectorRelation::ChangeWindow(window) =
+        typed.prepared.table_scan.table().handle().relation()
+    else {
+        panic!("a change-window scan freezes a change-window relation");
+    };
+    let Some(
+        novarocks_proto_models::connector_read::connector_change_window_handle::Handle::Iceberg(
+            iceberg,
+        ),
+    ) = window.handle.as_ref()
+    else {
+        panic!("the fixture control freezes an Iceberg change window");
+    };
+    // The fixture delta scan names snapshots 6 and 7; both endpoints reach the
+    // connector exactly as the scan stated them.
+    assert_eq!(iceberg.from_snapshot_id_exclusive, 6);
+    assert_eq!(iceberg.to_snapshot_id_inclusive, 7);
+}
+
+/// A change-window lane that reaches preparation with no resolver has no
+/// query-local admission to freeze, and must say so rather than reading the
+/// relation whole.
+#[test]
+fn a_change_window_scan_without_its_query_local_admission_fails_closed() {
+    let error = expect_preparation_error(
+        prepare_scan_bindings(
+            &native_scan_plan(NativeScanFixture::DeltaForPreparedBinding)
+                .expect("sealed delta fixture"),
+            &registry(vec![data_file("s3://bucket/data.parquet")]),
+            None,
+        ),
+        "a change-window scan has no admission without its resolver",
+    );
+    assert!(
+        error.contains("SqlDelta") && error.contains("requires scan binding resolver"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A synthetic VARIANT output has no connector column. Only the physical
+/// columns are assigned; the backend materializes the synthetic one on top of
+/// those read slots.
+#[test]
+fn a_variant_scan_assigns_only_its_physical_column() {
+    let plan =
+        native_scan_plan(NativeScanFixture::VariantProjection).expect("sealed VARIANT fixture");
+    let bindings = prepare_scan_bindings(
+        &plan,
+        &registry(vec![data_file("s3://bucket/variant.parquet")]),
+        None,
+    )
+    .expect("typed scan preparation");
+
+    let (fragment_id, node_id) = only_scan_node(&bindings);
+    let assignments = bindings
+        .typed_scan(fragment_id, node_id)
+        .expect("typed connector scan")
+        .prepared
+        .table_scan
+        .source()
+        .assignments();
+    assert_eq!(
+        assignments.len(),
+        1,
+        "a synthetic VARIANT output is not a connector column"
+    );
+    assert_eq!(assignments[0].variable(), "v0");
+}
+
+/// A pre-pinned opaque read has no relation name or version left to freeze, so
+/// it fails closed rather than emitting the carrier it used to.
+#[test]
+fn a_pre_pinned_opaque_read_fails_closed() {
+    let error = expect_preparation_error(
+        prepare_scan_bindings(
+            &native_scan_plan(NativeScanFixture::ConnectorRead)
+                .expect("sealed connector-read fixture"),
+            &registry(vec![data_file("s3://bucket/data.parquet")]),
+            Some(&StaticResolver {
+                execution: ResolvedScanExecution::ConnectorRead,
+            }),
+        ),
+        "a pre-pinned opaque read has no typed lowering",
+    );
+    assert!(
+        error.contains("pre-pinned opaque connector read"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A scan whose binding generation is not installed must fail closed: an
+/// absent typed control is never permission to reach some other generation.
+#[test]
+fn a_scan_whose_binding_generation_does_not_resolve_fails_closed() {
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed ordinary iceberg fixture");
+    let connectors = registry(vec![data_file("s3://bucket/data.parquet")]);
+    let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
+    let query_bindings = fixture_query_table_bindings(&plan, &controls);
+    // An empty registry stands for "this generation was never installed".
+    let empty =
+        Arc::new(crate::connector::typed_control_registry::TypedConnectorControlRegistry::new());
+    let error = expect_preparation_error(
+        super::super::prepare_scan_bindings(
+            &plan,
+            &controls,
+            &crate::connector::test_request_context(),
+            Some(&query_bindings),
+            None,
+            &fixture_scan_preparation_options(empty),
+            &[],
+        ),
+        "an uninstalled generation cannot be planned",
+    );
+    assert!(
+        error.contains("no typed connector control is installed for this exact generation"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Preparation without the statement's typed control inputs is a contract
+/// error, not permission to fall back to the opaque carrier.
+#[test]
+fn preparation_without_typed_inputs_refuses_instead_of_falling_back() {
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed ordinary iceberg fixture");
+    let connectors = registry(vec![data_file("s3://bucket/data.parquet")]);
+    let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
+    let query_bindings = fixture_query_table_bindings(&plan, &controls);
+    let error = expect_preparation_error(
+        super::super::prepare_scan_bindings(
+            &plan,
+            &controls,
+            &crate::connector::test_request_context(),
+            Some(&query_bindings),
+            None,
+            &super::super::ScanPreparationOptions::single_backend_fixture(),
+            &[],
+        ),
+        "no typed control registry was threaded in",
+    );
+    assert!(
+        error.contains("typed control registry"),
+        "unexpected error: {error}"
+    );
+}
+
+/// A frozen snapshot selector reaches the connector as an exact pin.
+#[test]
+fn a_frozen_snapshot_scan_pins_its_admitted_snapshot() {
+    let bindings = prepare_scan_bindings(
+        &native_scan_plan(NativeScanFixture::FrozenSnapshotEleven)
+            .expect("sealed frozen-snapshot fixture"),
+        &registry(vec![data_file("s3://bucket/data.parquet")]),
+        None,
+    )
+    .expect("typed scan preparation");
+    let (fragment_id, node_id) = only_scan_node(&bindings);
+    let typed = bindings
+        .typed_scan(fragment_id, node_id)
+        .expect("typed connector scan");
+    // The fixture control echoes the requested version into the handle it
+    // freezes, so the pinned snapshot is observable from the carrier.
+    let novarocks_proto::connector_read::ConnectorRelation::Table(table) =
+        typed.prepared.table_scan.table().handle().relation()
+    else {
+        panic!("a DATA scan freezes a table relation");
+    };
+    let Some(novarocks_proto_models::connector_read::connector_table_handle::Handle::Iceberg(
+        iceberg,
+    )) = table.handle.as_ref()
+    else {
+        panic!("the fixture control freezes an Iceberg table handle");
+    };
+    assert_eq!(iceberg.snapshot_id, Some(11));
+}
+
+/// One scan-domain request the frontend resolves for a scan.
+fn source_scan_request(
+    binding_id: u32,
+    fragment_id: novarocks_sql::plan_read::FragmentId,
+    node_id: i32,
+    column_id: u32,
+    data_type: arrow::datatypes::DataType,
+    nullable: bool,
+) -> novarocks_sql::planning::query_execution::SqlRuntimeFilterSourceScanRequest {
+    novarocks_sql::planning::query_execution::SqlRuntimeFilterSourceScanRequest {
+        binding_id,
+        fragment_id,
+        node_id,
+        column_id: novarocks_sql::plan_read::ColumnId(column_id),
+        data_type,
+        nullable,
+    }
+}
+
+/// A runtime filter reaches the reader by naming a column, not a position.
+///
+/// The fixture scan outputs two columns, and the filter names the second one.
+/// The carrier must therefore bind the filter's id to the assignment that
+/// holds that column's own `ColumnHandle` -- the Iceberg field ID -- rather
+/// than to the first assignment or to any ordinal derived from the filter.
+#[test]
+fn a_runtime_filter_binds_to_the_assignment_holding_its_column_handle() {
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergAllColumns)
+        .expect("sealed all-columns iceberg fixture");
+    let bindings = prepare_scan_bindings_with_runtime_filters(
+        &plan,
+        &registry(vec![data_file("s3://bucket/data.parquet")]),
+        &[source_scan_request(
+            6,
+            0,
+            10,
+            3,
+            arrow::datatypes::DataType::Utf8,
+            true,
+        )],
+    )
+    .expect("typed scan preparation");
+
+    let (fragment_id, node_id) = only_scan_node(&bindings);
+    let source = bindings
+        .typed_scan(fragment_id, node_id)
+        .expect("typed connector scan")
+        .prepared
+        .table_scan
+        .source();
+    let assignments = source.assignments();
+    assert_eq!(
+        assignments.len(),
+        2,
+        "the fixture scan outputs id, category"
+    );
+
+    let carried = source.dynamic_filters();
+    assert_eq!(carried.len(), 1);
+    assert_eq!(carried[0].filter_id(), 6);
+    let bound = assignments
+        .iter()
+        .find(|assignment| assignment.variable() == carried[0].variable())
+        .expect("the binding names an assignment of this scan");
+    // Identity, not position: the bound assignment is the one carrying the
+    // named column's handle, and it is not the scan's first assignment.
+    assert_eq!(bound.column(), assignments[1].column());
+    assert_ne!(bound.column(), assignments[0].column());
+}
+
+/// A filter naming a column the scan does not output is refused, never dropped:
+/// a dropped binding would leave its producer publishing into a scan that can
+/// never apply it.
+#[test]
+fn a_runtime_filter_naming_an_unprojected_column_is_refused() {
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+        .expect("sealed ordinary iceberg fixture");
+    let error = expect_preparation_error(
+        prepare_scan_bindings_with_runtime_filters(
+            &plan,
+            &registry(vec![data_file("s3://bucket/data.parquet")]),
+            &[source_scan_request(
+                6,
+                0,
+                10,
+                3,
+                arrow::datatypes::DataType::Utf8,
+                true,
+            )],
+        ),
+        "a filter naming an unprojected column cannot be silently dropped",
+    );
+    assert!(
+        error.contains("runtime filter binding id=6")
+            && error.contains("does not resolve to exactly one physical output"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Resolution runs against the typed scans preparation just froze and needs no
+/// provider field ordinal at all.
+#[test]
+fn scan_domain_resolution_confirms_the_typed_carrier_binding() {
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergAllColumns)
+        .expect("sealed all-columns iceberg fixture");
+    let request = source_scan_request(6, 0, 10, 3, arrow::datatypes::DataType::Utf8, true);
+    let bindings = prepare_scan_bindings_with_runtime_filters(
+        &plan,
+        &registry(vec![data_file("s3://bucket/data.parquet")]),
+        std::slice::from_ref(&request),
+    )
+    .expect("typed scan preparation");
+
+    let resolutions =
+        crate::query_execution::preparation::runtime_filter_binding::resolve_runtime_filter_source_targets(
+            [request],
+            &bindings,
+        )
+        .expect("scan-domain resolution");
+    assert_eq!(resolutions.len(), 1);
+    assert_eq!(resolutions[0].binding_id, 6);
+    assert_eq!(resolutions[0].data_type, arrow::datatypes::DataType::Utf8);
+    assert!(resolutions[0].nullable);
+}
+
+/// A request the scan never bound is refused rather than resolved: the carrier
+/// is the only thing the backend reads.
+#[test]
+fn scan_domain_resolution_refuses_a_filter_the_scan_never_bound() {
+    let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergAllColumns)
+        .expect("sealed all-columns iceberg fixture");
+    let bindings = prepare_scan_bindings_with_runtime_filters(
+        &plan,
+        &registry(vec![data_file("s3://bucket/data.parquet")]),
+        &[],
+    )
+    .expect("typed scan preparation");
+
+    let error =
+        crate::query_execution::preparation::runtime_filter_binding::resolve_runtime_filter_source_targets(
+            [source_scan_request(6, 0, 10, 3, arrow::datatypes::DataType::Utf8, true)],
+            &bindings,
+        )
+        .expect_err("an unbound filter cannot resolve");
+    assert!(
+        error.contains("runtime filter binding id=6") && error.contains("never offered"),
+        "unexpected error: {error}"
+    );
 }

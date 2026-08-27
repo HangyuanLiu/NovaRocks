@@ -33,12 +33,20 @@ use crate::mv::domain::persistence::definition::{
 };
 use crate::mv::domain::persistence::dependency::MV_ACCELERATOR_DEPENDENCY_SUBJECT;
 use crate::mv::domain::persistence::schema::{MvPartitionContract, MvSchemaContract};
+use crate::state_family::StateFamily;
 
 use super::catalog::schema_catalog;
 use super::key::{MvKeyKind, expected_record_kind};
 
 const MAGIC: &[u8; 4] = b"NRMA";
-const ENVELOPE_VERSION: u8 = 1;
+/// Record version of the MV accelerator family.
+///
+/// Declared by the manifest, not here: a second literal could disagree with
+/// the version the manifest publishes and nothing would catch it.
+const ENVELOPE_VERSION: u8 = match StateFamily::MvAccelerator.record_version() {
+    Some(version) => version,
+    None => panic!("MV accelerator is a durable accelerator family"),
+};
 const HEADER_BYTES_BEFORE_FINGERPRINT: usize = 12;
 const OPERATION_ID_BYTES: usize = 16;
 const PAYLOAD_LENGTH_BYTES: usize = 4;

@@ -26,7 +26,7 @@ use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_failpoint::QueryLifecycleFaultKind;
 use novarocks_proto::lifecycle::terminal::p0_max_encoded_len;
 use novarocks_proto::lifecycle::{
-    FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifestDigest, ParticipantRole,
+    FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifestDigest,
     ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach, QueryControlEndpoint,
     QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitOutcome, QueryInitRequest,
     QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
@@ -1291,17 +1291,6 @@ impl QueryLifecycleRegistry {
         // The admission boundary derives the manifest identity exactly once and
         // retains it on the entry; later comparisons read the retained value.
         let digest = validated(manifest.digest());
-        if validated(manifest.roles()).contains(&ParticipantRole::FragmentExecutor)
-            && manifest.expected_fragment_instance_ids().is_empty()
-        {
-            let ack = QueryInitAck::new(
-                execution_id,
-                digest,
-                QueryInitOutcome::QueryInitRejectedInvalidManifest,
-            );
-            self.log_init(&ack);
-            return ack;
-        }
         let manifest_backend = validated(manifest.backend());
         if validated(manifest_backend.process_id()) != self.local_process_id {
             let ack = QueryInitAck::new(
@@ -1615,7 +1604,7 @@ impl QueryLifecycleRegistry {
             state.local_drained_event_permit = Some(local_drained_event_permit);
             state.terminal_snapshot_event_permit = Some(terminal_snapshot_event_permit);
             state.terminal_event_permit = Some(terminal_event_permit);
-            if !validated(entry.manifest.roles()).contains(&ParticipantRole::FragmentExecutor) {
+            if entry.expected_fragment_instance_ids.is_empty() {
                 state.pre_start_deadline = None;
             }
         }
@@ -2153,7 +2142,7 @@ impl QueryLifecycleRegistry {
                 "query control is not ready",
             ));
         }
-        if !validated(entry.manifest.roles()).contains(&ParticipantRole::FragmentExecutor) {
+        if entry.expected_fragment_instance_ids.is_empty() {
             drop(state);
             return Err(self.admission_error(
                 execution_id,
@@ -2190,6 +2179,81 @@ impl QueryLifecycleRegistry {
             entry,
             committed: false,
         })
+    }
+
+    /// Admits one runtime split assignment against an already staged task.
+    ///
+    /// Unlike `admit_fragment` this neither creates nor mutates lifecycle
+    /// state: it only decides whether this exact attempt may still receive
+    /// work. The delivery window opens once the participant is staged, which
+    /// is strictly after the Init + ControlReady barrier froze the admitted
+    /// participant set, so an assignment can never introduce a participant.
+    pub(crate) fn admit_task_update(
+        &self,
+        execution_id: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+    ) -> Result<(), QueryLifecycleError> {
+        let entry = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&execution_id)
+            .cloned();
+        let Some(entry) = entry else {
+            return Err(self.admission_error(
+                execution_id,
+                QueryLifecycleErrorCode::Terminated,
+                "query is not active",
+            ));
+        };
+        if !entry
+            .expected_fragment_instance_ids
+            .contains(&fragment_instance_id)
+        {
+            return Err(self.admission_error(
+                execution_id,
+                QueryLifecycleErrorCode::InvalidManifest,
+                "fragment instance is outside the participant manifest",
+            ));
+        }
+        let state = entry.state.lock().expect("query lifecycle entry lock");
+        if state.termination_reason.is_some()
+            || matches!(
+                state.phase,
+                QueryLifecyclePhase::TerminalRetained
+                    | QueryLifecyclePhase::Terminating
+                    | QueryLifecyclePhase::Tombstone
+            )
+        {
+            drop(state);
+            return Err(self.admission_error(
+                execution_id,
+                QueryLifecycleErrorCode::Terminated,
+                "query lifecycle has terminated",
+            ));
+        }
+        if !matches!(
+            state.phase,
+            QueryLifecyclePhase::Staged | QueryLifecyclePhase::Running
+        ) {
+            drop(state);
+            return Err(self.admission_error(
+                execution_id,
+                QueryLifecycleErrorCode::Conflict,
+                "task has not been staged",
+            ));
+        }
+        if !state.accepted_fragments.contains(&fragment_instance_id) {
+            drop(state);
+            return Err(self.admission_error(
+                execution_id,
+                QueryLifecycleErrorCode::Conflict,
+                "fragment instance is not an admitted task",
+            ));
+        }
+        drop(state);
+        Ok(())
     }
 
     /// Returns a fragment-bound execution capability from the already

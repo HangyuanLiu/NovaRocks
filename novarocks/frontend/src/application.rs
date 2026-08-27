@@ -28,11 +28,13 @@ use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
 
 use crate::catalog_application::FrontendCatalogApplicationPort;
+use crate::catalog_application::desired_state::{
+    CatalogDesiredStateSource, CatalogDesiredStateSourceMode,
+};
 use crate::catalog_attachment::CatalogAttachmentRepository;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::common::admitted_query_context::LakePublicationRuntimePolicy;
 use crate::connector::ConnectorControlHost;
-use crate::coordination::FrontendCoordinationRuntime;
 use crate::coordinator::{FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader};
 use crate::dml::DmlService;
 use crate::mv::maintenance::MaintenanceCoordinatorConfig;
@@ -76,7 +78,6 @@ fn test_native_trust() -> Arc<NativeTrust> {
 pub enum FrontendApplicationErrorKind {
     DeploymentSource,
     StateStoreHost,
-    CoordinationOpen,
     ViewServiceOpen,
     TableMaintenanceServiceOpen,
     MvServiceOpen,
@@ -129,6 +130,12 @@ impl std::error::Error for FrontendApplicationError {}
 
 pub struct FrontendApplicationHost {
     connector_control: Arc<ConnectorControlHost>,
+    /// Coordinator-side typed connector controls, keyed by the exact binding
+    /// generation. The composition root hands in the same instance its control
+    /// factories install into, so planning and installation never disagree
+    /// about which generation exists.
+    typed_connector_control:
+        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     dml_service: Option<Arc<DmlService>>,
@@ -144,7 +151,6 @@ pub struct FrontendApplicationHost {
     mv_refresh_provider_activation: Option<Arc<FrontendMvRefreshProviderActivationPort>>,
     mv_background_engine_sink: Option<Arc<dyn crate::mv::background::MvBackgroundEngineSink>>,
     state_store_host: Option<StateStoreHost>,
-    coordination: Option<Arc<FrontendCoordinationRuntime>>,
     query_execution: Option<QueryExecutionService>,
     query_control: crate::query_execution::control::QueryControlService,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
@@ -209,6 +215,12 @@ pub struct FrontendExecutionConfig {
     query_control_timeouts: FrontendQueryControlTimeouts,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     catalog_projection: CatalogProjectionConfig,
+    /// The deployment's catalog desired-state source mode, selected once.
+    ///
+    /// Frozen here rather than consulted per statement so that "which authority
+    /// owns catalog desired state" cannot change while the process runs, and so
+    /// an unimplemented mode is rejected before startup opens anything.
+    catalog_desired_state_source_mode: CatalogDesiredStateSourceMode,
 }
 
 impl FrontendExecutionConfig {
@@ -234,6 +246,7 @@ impl FrontendExecutionConfig {
             )
             .expect("default lake publication policy is safe"),
             catalog_projection: CatalogProjectionConfig::default(),
+            catalog_desired_state_source_mode: CatalogDesiredStateSourceMode::DynamicStateStore,
         }
     }
 
@@ -284,6 +297,23 @@ impl FrontendExecutionConfig {
         self.catalog_projection = config;
         self
     }
+
+    /// Selects the deployment's catalog desired-state source mode.
+    ///
+    /// Only [`CatalogDesiredStateSourceMode::DynamicStateStore`] is implemented;
+    /// selecting another mode makes `open` fail before it produces any startup
+    /// side effect.
+    pub fn with_catalog_desired_state_source_mode(
+        mut self,
+        mode: CatalogDesiredStateSourceMode,
+    ) -> Self {
+        self.catalog_desired_state_source_mode = mode;
+        self
+    }
+
+    pub const fn catalog_desired_state_source_mode(&self) -> CatalogDesiredStateSourceMode {
+        self.catalog_desired_state_source_mode
+    }
 }
 
 impl FrontendApplicationHost {
@@ -323,6 +353,12 @@ impl FrontendApplicationHost {
             execution,
             backend,
             connector_factories,
+            // No composition root supplied one, so this host owns a private,
+            // empty registry: a typed scan then fails to resolve rather than
+            // reaching some other host's generation.
+            Arc::new(
+                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
+            ),
             data_runtime,
             native_trust,
             native_transport,
@@ -340,10 +376,27 @@ impl FrontendApplicationHost {
         execution: FrontendExecutionConfig,
         backend: ClusterBackendOpenConfig,
         connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
+        typed_connector_control: Arc<
+            crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+        >,
         data_runtime: Handle,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
+        // The selected catalog desired-state source mode is decided here, ahead
+        // of every startup side effect: nothing is open yet, no StateStore host
+        // exists, no controller is running, so a mode this build implements no
+        // authority for fails with nothing to unwind. Doing this later would
+        // mean either a partially opened frontend to clean up or — worse — a
+        // path that quietly serves an unimplemented mode from the dynamic
+        // StateStore authority.
+        let catalog_source_mode = execution.catalog_desired_state_source_mode();
+        if let Err(error) = catalog_source_mode.require_implemented() {
+            return Err(FrontendApplicationError::new(
+                FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
+                error,
+            ));
+        }
         let data_runtime = FrontendDataRuntime::new_with_native_trust(
             data_runtime,
             native_trust,
@@ -360,6 +413,7 @@ impl FrontendApplicationHost {
                     )
                 })?,
             ),
+            typed_connector_control,
             catalog_runtime_projection,
             statistics_service: None,
             dml_service: None,
@@ -375,7 +429,6 @@ impl FrontendApplicationHost {
             mv_refresh_provider_activation: None,
             mv_background_engine_sink: None,
             state_store_host: None,
-            coordination: None,
             query_execution: None,
             query_control: FrontendQueryControl::service(),
             coordinator: None,
@@ -393,36 +446,39 @@ impl FrontendApplicationHost {
         {
             return Err(host.cleanup_open_error(error).await);
         }
-        if let Some(store) = host.state_store() {
-            match FrontendCoordinationRuntime::open(store).await {
-                Ok(coordination) => host.coordination = Some(Arc::new(coordination)),
-                Err(error) => {
-                    return Err(host
-                        .cleanup_open_error(FrontendApplicationError::new(
-                            FrontendApplicationErrorKind::CoordinationOpen,
-                            error,
-                        ))
-                        .await);
+        host.catalog_application_port = match host.state_store() {
+            Some(store) => {
+                let attachments = match CatalogAttachmentRepository::open(store).await {
+                    Ok(repository) => repository,
+                    Err(error) => {
+                        return Err(host
+                            .cleanup_open_error(FrontendApplicationError::new(
+                                FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
+                                error,
+                            ))
+                            .await);
+                    }
+                };
+                match CatalogDesiredStateSource::select(catalog_source_mode, Some(attachments)) {
+                    Ok(source) => Some(Arc::new(FrontendCatalogApplicationPort::new(
+                        source,
+                        Arc::clone(&host.connector_control),
+                        host.catalog_runtime_projection.publisher(),
+                        tokio::runtime::Handle::current(),
+                    ))),
+                    Err(error) => {
+                        return Err(host
+                            .cleanup_open_error(FrontendApplicationError::new(
+                                FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
+                                error,
+                            ))
+                            .await);
+                    }
                 }
             }
-        }
-        host.catalog_application_port = match host.state_store() {
-            Some(store) => match CatalogAttachmentRepository::open(store).await {
-                Ok(repository) => Some(Arc::new(FrontendCatalogApplicationPort::new(
-                    repository,
-                    Arc::clone(&host.connector_control),
-                    host.catalog_runtime_projection.publisher(),
-                    tokio::runtime::Handle::current(),
-                ))),
-                Err(error) => {
-                    return Err(host
-                        .cleanup_open_error(FrontendApplicationError::new(
-                            FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
-                            error,
-                        ))
-                        .await);
-                }
-            },
+            // No StateStore means no desired-state source at all in this
+            // process, which is distinct from a configured source that is
+            // failing: the port admits nothing rather than reporting an outage.
             None => Some(Arc::new(FrontendCatalogApplicationPort::unavailable(
                 Arc::clone(&host.connector_control),
                 host.catalog_runtime_projection.publisher(),
@@ -483,17 +539,9 @@ impl FrontendApplicationHost {
         host.statistics_service = Some(Arc::new(FrontendStatisticsService::new()));
         let statistics = host.statistics_service();
         host.dml_service = Some(Arc::new(DmlService::new(statistics)));
-        match FrontendViewService::open(host.state_store(), tokio::runtime::Handle::current()).await
-        {
-            Ok(view_service) => host.view_service = Some(Arc::new(view_service)),
-            Err(error) => {
-                let error = FrontendApplicationError::new(
-                    FrontendApplicationErrorKind::ViewServiceOpen,
-                    error,
-                );
-                return Err(host.cleanup_open_error(error).await);
-            }
-        }
+        // Local views are process runtime state, so this service has nothing to
+        // load and no store to fail against.
+        host.view_service = Some(Arc::new(FrontendViewService::new()));
         let table_maintenance_open = FrontendTableMaintenanceService::open(
             host.state_store(),
             tokio::runtime::Handle::current(),
@@ -709,10 +757,6 @@ impl FrontendApplicationHost {
             .and_then(StateStoreHost::state_store)
     }
 
-    pub(crate) fn coordination(&self) -> Option<Arc<FrontendCoordinationRuntime>> {
-        self.coordination.as_ref().map(Arc::clone)
-    }
-
     pub fn execution_role(&self) -> novarocks_types::ClusterRole {
         self.execution_role
     }
@@ -733,7 +777,18 @@ impl FrontendApplicationHost {
             as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>
     }
 
-    pub fn connector_connector_factory_resolver(
+    /// The typed connector control registry this host was composed with.
+    ///
+    /// It is a constructor-supplied capability, not something a request may
+    /// resolve from the host: query preparation receives it once, when the
+    /// session factory is built.
+    pub fn typed_connector_control(
+        &self,
+    ) -> Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry> {
+        Arc::clone(&self.typed_connector_control)
+    }
+
+    pub fn connector_control_factory_resolver(
         &self,
     ) -> Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver> {
         Arc::clone(&self.connector_control)
@@ -972,7 +1027,6 @@ impl FrontendApplicationHost {
         self.mv_refresh_provider_activation.take();
         self.mv_background_engine_sink.take();
         self.mv_repository.take();
-        self.coordination.take();
         if let Some(catalog_controller_error) = catalog_controller_error {
             let error = format!("shutdown catalog controller failed: {catalog_controller_error}");
             if let Some(primary) = primary_error.as_mut() {
@@ -1111,6 +1165,9 @@ mod tests {
             ),
             backend,
             Vec::new(),
+            std::sync::Arc::new(
+                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
+            ),
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),

@@ -17,7 +17,7 @@
 
 //! Shared delegation onto one concrete Iceberg catalog client.
 //!
-//! Design: ADR-0114 (docs/adr/ADR-0114-iceberg-provider-private-catalog-owner.md)
+//! Design: ADR-0118 (docs/adr/ADR-0118-iceberg-provider-private-catalog-owner.md)
 //!
 //! Every concrete implementation owns an `Arc<dyn iceberg::Catalog>`, and for
 //! reads and single-frontier mutations they behave identically, so that

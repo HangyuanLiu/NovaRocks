@@ -246,6 +246,7 @@ pub(crate) fn encode_type(data_type: &DataType) -> Result<common::TypeDesc, Dist
             precision,
             scale,
             time_unit,
+            time_zone: None,
         })),
     })
 }

@@ -87,10 +87,14 @@ pub struct SqlRuntimeFilterSourceScanRequest {
     pub nullable: bool,
 }
 
+/// The frozen scan-domain contract one source-boundary consumer resolved to.
+///
+/// It names no column: preparation binds the filter onto the scan's own typed
+/// carrier by column handle, so the only thing left to agree on here is the
+/// exact type and nullability the consumer expression was built against.
 #[derive(Clone, Debug)]
 pub struct SqlRuntimeFilterSourceResolution {
     pub binding_id: u32,
-    pub field_ordinal: u32,
     pub data_type: DataType,
     pub nullable: bool,
 }
@@ -211,7 +215,6 @@ pub enum SqlRuntimeFilterConsumerTarget {
 }
 #[derive(Clone, Debug)]
 pub struct SqlRuntimeFilterScanDomainTarget {
-    pub field_ordinal: u32,
     pub data_type: DataType,
     pub nullable: bool,
 }
@@ -479,7 +482,6 @@ pub fn finalize_runtime_filter_facts(
             ));
         };
         *scan_domain = Some(SqlRuntimeFilterScanDomainTarget {
-            field_ordinal: resolution.field_ordinal,
             data_type: resolution.data_type.clone(),
             nullable: resolution.nullable,
         });
@@ -1014,7 +1016,6 @@ mod tests {
             draft,
             vec![SqlRuntimeFilterSourceResolution {
                 binding_id: 3,
-                field_ordinal: 17,
                 data_type: DataType::Int64,
                 nullable: false,
             }],
@@ -1041,7 +1042,7 @@ mod tests {
             .find(|binding| binding.binding_id == 3)
             .unwrap();
         assert!(
-            matches!(&consumer.role, SqlRuntimeFilterBindingRoleFacts::Consumer { target: SqlRuntimeFilterConsumerTarget::SourceBoundary { scan_domain: Some(target) }, .. } if target.field_ordinal == 17)
+            matches!(&consumer.role, SqlRuntimeFilterBindingRoleFacts::Consumer { target: SqlRuntimeFilterConsumerTarget::SourceBoundary { scan_domain: Some(target) }, .. } if target.data_type == DataType::Int64 && !target.nullable)
         );
     }
 }

@@ -17,7 +17,7 @@
 
 //! Typed results for the provider-private Iceberg catalog owner.
 //!
-//! Design: ADR-0114 (docs/adr/ADR-0114-iceberg-provider-private-catalog-owner.md)
+//! Design: ADR-0118 (docs/adr/ADR-0118-iceberg-provider-private-catalog-owner.md)
 //!
 //! Two rules shape everything in this module.
 //!

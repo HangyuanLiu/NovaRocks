@@ -18,9 +18,8 @@
 use std::time::Duration;
 
 use novarocks_proto::lifecycle::{
-    AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantRole,
-    QueryControlEndpoint, QueryExecutionId, QueryInitRequest, QueryOptions,
-    RuntimeFilterContribution,
+    AttemptId, ParticipantBackendIdentity, ParticipantManifest, QueryControlEndpoint,
+    QueryExecutionId, QueryInitRequest, QueryOptions, RuntimeFilterContribution,
 };
 use novarocks_proto_models::novarocks;
 use novarocks_types::{BackendProcessId, QueryId};
@@ -43,7 +42,6 @@ fn request_with_runtime_filter() -> QueryInitRequest {
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
         )
         .expect("valid backend"),
-        [ParticipantRole::RuntimeFilterService],
         [],
         QueryOptions::parse(novarocks::QueryOptions::default()).expect("valid query options"),
         10_000,
