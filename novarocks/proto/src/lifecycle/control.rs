@@ -627,7 +627,6 @@ mod tests {
                     ],
                 }),
             }),
-            participant_roles: vec![1],
             expected_fragment_instance_ids: vec![id(11, 12)],
             query_options: Some(novarocks::QueryOptions::default()),
             query_deadline_unix_ms: 1_000,

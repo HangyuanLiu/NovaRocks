@@ -26,7 +26,7 @@ use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_failpoint::QueryLifecycleFaultKind;
 use novarocks_proto::lifecycle::terminal::p0_max_encoded_len;
 use novarocks_proto::lifecycle::{
-    FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifestDigest, ParticipantRole,
+    FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifestDigest,
     ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach, QueryControlEndpoint,
     QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitOutcome, QueryInitRequest,
     QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
@@ -1291,17 +1291,6 @@ impl QueryLifecycleRegistry {
         // The admission boundary derives the manifest identity exactly once and
         // retains it on the entry; later comparisons read the retained value.
         let digest = validated(manifest.digest());
-        if validated(manifest.roles()).contains(&ParticipantRole::FragmentExecutor)
-            && manifest.expected_fragment_instance_ids().is_empty()
-        {
-            let ack = QueryInitAck::new(
-                execution_id,
-                digest,
-                QueryInitOutcome::QueryInitRejectedInvalidManifest,
-            );
-            self.log_init(&ack);
-            return ack;
-        }
         let manifest_backend = validated(manifest.backend());
         if validated(manifest_backend.process_id()) != self.local_process_id {
             let ack = QueryInitAck::new(
@@ -1615,7 +1604,7 @@ impl QueryLifecycleRegistry {
             state.local_drained_event_permit = Some(local_drained_event_permit);
             state.terminal_snapshot_event_permit = Some(terminal_snapshot_event_permit);
             state.terminal_event_permit = Some(terminal_event_permit);
-            if !validated(entry.manifest.roles()).contains(&ParticipantRole::FragmentExecutor) {
+            if entry.expected_fragment_instance_ids.is_empty() {
                 state.pre_start_deadline = None;
             }
         }
@@ -2153,7 +2142,7 @@ impl QueryLifecycleRegistry {
                 "query control is not ready",
             ));
         }
-        if !validated(entry.manifest.roles()).contains(&ParticipantRole::FragmentExecutor) {
+        if entry.expected_fragment_instance_ids.is_empty() {
             drop(state);
             return Err(self.admission_error(
                 execution_id,

@@ -966,8 +966,8 @@ mod tests {
     use novarocks_proto::lifecycle as protocol_lifecycle;
     use novarocks_proto::lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
-        ParticipantRole, QueryAbortRequest, QueryControlEndpoint, QueryExecutionId,
-        QueryInitRequest, QueryOptions, QueryTerminationReason,
+        QueryAbortRequest, QueryControlEndpoint, QueryExecutionId, QueryInitRequest, QueryOptions,
+        QueryTerminationReason,
     };
     use novarocks_proto_models::novarocks as protocol;
     use novarocks_proto_models::novarocks::{
@@ -1103,7 +1103,6 @@ mod tests {
                     QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid backend endpoint"),
                 )
                 .expect("valid backend identity"),
-                [ParticipantRole::FragmentExecutor],
                 [novarocks_proto_models::common::UniqueId {
                     hi: query_low,
                     lo: 1,

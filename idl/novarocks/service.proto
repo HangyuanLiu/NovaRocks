@@ -93,12 +93,6 @@ message QueryExecutionId {
   uint64 attempt_id = 2;
 }
 
-enum QueryParticipantRole {
-  QUERY_PARTICIPANT_ROLE_UNSPECIFIED = 0;
-  FRAGMENT_EXECUTOR = 1;
-  RUNTIME_FILTER_SERVICE = 2;
-}
-
 message QueryControlEndpoint {
   string host = 1;
   uint32 port = 2;
@@ -174,7 +168,8 @@ message RuntimeFilterContribution {
 message ParticipantManifest {
   QueryExecutionId execution_id = 1;
   ParticipantBackendIdentity backend = 2;
-  repeated QueryParticipantRole participant_roles = 3;
+  reserved 3;
+  reserved "participant_roles";
   repeated novarocks.common.UniqueId expected_fragment_instance_ids = 4;
   QueryOptions query_options = 5;
   uint64 query_deadline_unix_ms = 6;

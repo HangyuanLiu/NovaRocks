@@ -19,7 +19,7 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::lifecycle_plan::QueryInitPlan;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::lifecycle::QueryExecutionId;
-use novarocks_proto::lifecycle::{ParticipantManifestDigest, ParticipantRole, QueryInitRequest};
+use novarocks_proto::lifecycle::{ParticipantManifestDigest, QueryInitRequest};
 use novarocks_proto_models::novarocks as protocol_wire;
 
 use super::QueryLifecycleTarget;
@@ -59,14 +59,10 @@ pub(super) fn materialize(
                 ))
             })?,
         );
-        let fragment_participant = manifest
-            .roles()
-            .map_err(|error| {
-                contract_error(format!(
-                    "query lifecycle backend {backend_idx} manifest is invalid: {error}"
-                ))
-            })?
-            .contains(&ParticipantRole::FragmentExecutor);
+        // A fragment participant is defined by its payload: the manifest
+        // carries at least one expected fragment instance. The declared role
+        // set is a redundant projection of the same fact.
+        let fragment_participant = !manifest.expected_fragment_instance_ids().is_empty();
         let request = QueryInitRequest::parse(protocol_wire::InitQueryRequest {
             manifest: Some(manifest.as_proto().clone()),
         })

@@ -479,3 +479,50 @@ fn the_worker_system_relation_set_stays_closed() {
          ALL_* or unknown worker variant"
     );
 }
+
+#[test]
+fn retired_participant_role_projection_remains_reserved() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    // `participant_roles` was a projection the sender mechanically derived from
+    // two other fields of the same message: FragmentExecutor followed from a
+    // non-empty `expected_fragment_instance_ids` (field 4) and
+    // RuntimeFilterService from the presence of `runtime_filter` (field 8). Both
+    // derivation inputs travel inside `ParticipantManifest` itself, so the
+    // receiver can rebuild the role set unaided and validating the carried copy
+    // produced no fact it did not already hold. The payload is now the sole
+    // participant role authority (ADR-0114).
+    let manifest = pool
+        .get_message_by_name("novarocks.ParticipantManifest")
+        .expect("ParticipantManifest descriptor");
+    assert!(
+        manifest.reserved_ranges().any(|range| range.contains(&3)),
+        "ParticipantManifest field 3 must remain reserved"
+    );
+    assert!(
+        manifest
+            .reserved_names()
+            .any(|name| name == "participant_roles"),
+        "ParticipantManifest participant_roles name must remain reserved"
+    );
+    assert!(
+        manifest.fields().all(|field| field.number() != 3),
+        "ParticipantManifest must not reuse retired tag 3"
+    );
+    assert!(
+        manifest
+            .fields()
+            .all(|field| field.name() != "participant_roles"),
+        "ParticipantManifest must not reuse retired name participant_roles"
+    );
+
+    // The projection's role vocabulary was retired with it. Nothing else on the
+    // wire names these values, so the enum must stay out of the contract rather
+    // than linger as a second, drift-prone role authority.
+    assert!(
+        pool.get_enum_by_name("novarocks.QueryParticipantRole")
+            .is_none(),
+        "retired QueryParticipantRole enum must not return to the wire contract"
+    );
+}
