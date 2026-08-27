@@ -902,7 +902,7 @@ mod tests {
         run_frontend_server_until_shutdown, run_frontend_server_until_shutdown_with_ports,
         run_frontend_server_with_signal_and_ports,
     };
-    use crate::catalog_application::CatalogAdmission;
+    use crate::catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
     use crate::native::transport::FrontendNativeTransport;
     use crate::state_store::{
         StateStoreProviderRegistry,
@@ -1028,7 +1028,8 @@ mod tests {
                 "127.0.0.1",
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
-            ),
+            )
+            .with_catalog_desired_state_source(CatalogDesiredStateSourceInput::DynamicStateStore),
             frontend_backend_open_config(),
             vec![Arc::new(EchoingControlFactory)],
             Arc::new(

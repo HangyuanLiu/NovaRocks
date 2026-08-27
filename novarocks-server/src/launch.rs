@@ -419,7 +419,21 @@ mod tests {
         let frontend_endpoint = (role == "be")
             .then_some("frontend_endpoint = \"127.0.0.1:19080\"\n")
             .unwrap_or_default();
-        std::fs::write(path, format!("{extra}\n[native_trust]\ndeployment_id = \"test-deployment\"\nshared_secret = \"0123456789abcdef0123456789abcdef\"\n\n[server]\nhost = \"{host}\"\ngrpc_port = {grpc}\nhttp_port = {http}\n\n[cluster]\nrole = \"{role}\"\n{frontend_endpoint}{mysql}")).expect("write config");
+        let catalog_source = if role == "fe" {
+            let catalogs = path.with_extension("catalogs.toml");
+            std::fs::write(&catalogs, "format_version = 1\ncatalogs = []\n")
+                .expect("write catalog snapshot");
+            format!(
+                "\n[catalog_source]\nstatic_file_path = \"{}\"\n",
+                catalogs
+                    .file_name()
+                    .expect("catalog file name")
+                    .to_string_lossy()
+            )
+        } else {
+            String::new()
+        };
+        std::fs::write(path, format!("{extra}\n[native_trust]\ndeployment_id = \"test-deployment\"\nshared_secret = \"0123456789abcdef0123456789abcdef\"\n\n[server]\nhost = \"{host}\"\ngrpc_port = {grpc}\nhttp_port = {http}\n\n[cluster]\nrole = \"{role}\"\n{frontend_endpoint}{mysql}{catalog_source}")).expect("write config");
     }
 
     fn args(values: &[&str]) -> Vec<String> {
