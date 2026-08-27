@@ -31,7 +31,7 @@ use novarocks_native_trust::{
 };
 use novarocks_secret::SecretValue;
 use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
-use novarocks_types::{BackendProcessId, NativeEndpoint};
+use novarocks_types::NativeEndpoint;
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
     PKCS_ED25519,
@@ -1933,7 +1933,7 @@ pub trait ServerHandle: Send {
     fn kill_query_until(&mut self, connection_id: u32, _deadline: Instant) -> Result<()> {
         self.kill_query(connection_id)
     }
-    fn backend_process_id(&self, index: usize) -> Result<BackendProcessId> {
+    fn backend_process_id(&self, index: usize) -> Result<String> {
         bail!("backend process identity is unsupported by this server mode (index={index})")
     }
     fn fe_log_count(&self, needle: &str) -> Result<usize> {
@@ -3573,7 +3573,7 @@ impl ServerHandle for CrossProcessServerHandle {
             })
     }
 
-    fn backend_process_id(&self, index: usize) -> Result<BackendProcessId> {
+    fn backend_process_id(&self, index: usize) -> Result<String> {
         self.ensure_be_index(index)?;
         let grpc_port = self.be_grpc_ports[index];
         let rows = query_frontend_backend_topology(
@@ -3594,10 +3594,6 @@ impl ServerHandle for CrossProcessServerHandle {
                 anyhow::anyhow!(
                     "SHOW BACKENDS has no row for cross-process BE[{index}] grpc_port={grpc_port}"
                 )
-            })?
-            .parse::<BackendProcessId>()
-            .map_err(|error| {
-                anyhow::anyhow!("SHOW BACKENDS reported an unparsable BackendProcessId: {error}")
             })
     }
 
@@ -3836,13 +3832,10 @@ impl ServerHandle for CrossProcessServerHandle {
                     row.grpc_port == self.be_grpc_ports[index] && row.is_eligible_live()
                 })
             });
-            if observed.as_ref().is_some_and(|row| {
-                row.alive
-                    && row
-                        .process_id
-                        .parse::<BackendProcessId>()
-                        .is_ok_and(|observed| observed != old_process_id)
-            }) {
+            if observed
+                .as_ref()
+                .is_some_and(|row| row.alive && row.process_id != old_process_id)
+            {
                 println!(
                     "cross-process BE[{index}] process-identity barrier PASS: old_process_id={old_process_id} new_process_id={}",
                     observed.expect("observed row checked").process_id
