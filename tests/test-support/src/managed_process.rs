@@ -1030,6 +1030,57 @@ impl ManagedProcess {
         }
     }
 
+    /// Sends SIGTERM without reaping the child. Callers that need to inspect a
+    /// graceful drain window must follow this with `wait_for_successful_exit_until`.
+    #[cfg(unix)]
+    pub fn request_termination(&mut self) -> Result<()> {
+        if self.stopped || self.process_group.awaiting_reap() {
+            bail!("cannot request SIGTERM for {} after final stop", self.label);
+        }
+        self.signal_group(SIGTERM)
+            .with_context(|| format!("send SIGTERM to {} process group", self.label))
+    }
+
+    /// Reaps a previously signalled process and requires a successful exit by
+    /// the supplied absolute deadline.
+    #[cfg(unix)]
+    pub fn wait_for_successful_exit_until(&mut self, deadline: Instant) -> Result<ExitStatus> {
+        loop {
+            if self.leader_exit_observed()? {
+                let status = self.finish_group_with_signal(
+                    SIGKILL,
+                    "reap process group after graceful SIGTERM",
+                    short_output_join_deadline(),
+                )?;
+                self.ensure_output_io_ok("wait for graceful process exit")?;
+                if status.success() {
+                    return Ok(status);
+                }
+                bail!(
+                    "{} did not exit successfully after SIGTERM: status={status}; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                    self.label,
+                    self.stdout_tail(),
+                    self.stderr_tail(),
+                    self.log_path.display()
+                );
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "{} timed out waiting for graceful SIGTERM exit; stdout_tail={:?}; stderr_tail={:?}; log={}",
+                    self.label,
+                    self.stdout_tail(),
+                    self.stderr_tail(),
+                    self.log_path.display()
+                );
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(POLL_INTERVAL),
+            );
+        }
+    }
+
     pub fn kill_now(&mut self) -> Result<()> {
         let cleanup_deadline = short_output_join_deadline();
         if self.stopped {

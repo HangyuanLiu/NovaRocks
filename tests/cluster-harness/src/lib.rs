@@ -3083,6 +3083,24 @@ impl CrossProcessServerHandle {
         &self.mysql_user
     }
 
+    /// Begins the real FE SIGTERM drain without waiting for process exit, so a
+    /// system scenario can inspect management/readiness during the drain.
+    #[cfg(unix)]
+    pub fn begin_fe_drain(&mut self) -> Result<()> {
+        self.fe_process
+            .request_termination()
+            .context("send SIGTERM to cross-process FE")
+    }
+
+    /// Waits for a prior `begin_fe_drain` request to finish successfully.
+    #[cfg(unix)]
+    pub fn wait_fe_exit_until(&mut self, deadline: Instant) -> Result<()> {
+        self.fe_process
+            .wait_for_successful_exit_until(deadline)
+            .context("wait for cross-process FE graceful exit")
+            .map(|_| ())
+    }
+
     /// Keep generated config and logs when the handle is dropped.
     pub fn retain_runtime_artifacts(&mut self) {
         self.retain_runtime_artifacts = true;
