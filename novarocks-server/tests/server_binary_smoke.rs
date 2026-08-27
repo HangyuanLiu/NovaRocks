@@ -27,7 +27,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use novarocks_test_support::{ManagedProcess, ReadyMarker, ReservedTcpPort};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempDir};
@@ -415,8 +415,11 @@ fn same_config_pair_has_cross_process_and_all_in_one_listener_parity_without_sta
     let mut all_in_one = spawn_all_in_one(&pair, &[]);
     assert_role_scoped_surfaces(&pair, false);
     all_in_one
-        .interrupt_and_wait(Duration::from_secs(10))
-        .expect("shut down all-in-one roles cleanly");
+        .request_termination()
+        .expect("send SIGTERM to all-in-one roles");
+    all_in_one
+        .wait_for_successful_exit_until(Instant::now() + Duration::from_secs(10))
+        .expect("drain and stop all-in-one roles cleanly after SIGTERM");
 
     for port in [
         pair.fe_mysql_port,
