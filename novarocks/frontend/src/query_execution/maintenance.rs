@@ -38,6 +38,7 @@ use crate::connector::metadata_maintenance::{
 use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
+use crate::query_execution::preparation::scan::ScanBindingResolver;
 use crate::runtime::query_result::QueryResult;
 use novarocks_spi::connector::{
     CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
@@ -1502,31 +1503,66 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         .iter()
         .find(|candidate| candidate.cohort_id() == cohort_id)
         .ok_or_else(|| "distributed rewrite execution names an unknown cohort".to_string())?;
-    let read = crate::query_execution::distributed_rewrite::plan_frozen_rewrite_connector_read(
-        session.lease(),
-        execution.topology(),
-        cohort.source(),
-        cohort.scan_schema(),
-        (0..cohort.scan_schema().fields().len()).collect(),
-        context.clone(),
-    )
-    .map_err(|error| format!("plan frozen rewrite source: {error}"))?;
     let table_bindings =
         Arc::new(crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()?);
-    let source_binding =
-        crate::query_execution::distributed_rewrite::admit_frozen_rewrite_scan_binding(
-            table_bindings.as_ref(),
-            cohort.scan_schema(),
-        )?;
-    let resolver = crate::query_execution::distributed_rewrite::frozen_rewrite_read_resolver(
-        source_binding,
-        read,
-    );
-    let physical_plan =
-        crate::query_execution::distributed_rewrite::frozen_rewrite_scan_physical_plan(
-            cohort.scan_schema(),
-            source_binding,
-        );
+    // A cohort that rewrites table rows names exactly the data files its
+    // commit replaces, so its read is frozen from that set. A cohort that
+    // rewrites position deletes reads delete artifacts instead, and has no
+    // data file set to be frozen from.
+    let (resolver, physical_plan): (Box<dyn ScanBindingResolver>, _) = match cohort.pinned_source()
+    {
+        Some(pinned) => {
+            let source_binding =
+                crate::query_execution::distributed_rewrite::admit_pinned_rewrite_scan_binding(
+                    table_bindings.as_ref(),
+                    cohort.scan_schema(),
+                )?;
+            let read = crate::query_execution::preparation::scan::QueryPinnedFileSetRead {
+                pinned: pinned.clone(),
+                source: cohort.source().clone(),
+                planning_lease: session.lease().planning_lease(),
+            };
+            let resolver =
+                crate::query_execution::distributed_rewrite::pinned_rewrite_read_resolver(
+                    source_binding,
+                    read,
+                );
+            let physical_plan =
+                crate::query_execution::distributed_rewrite::pinned_rewrite_scan_physical_plan(
+                    cohort.scan_schema(),
+                    source_binding,
+                );
+            (Box::new(resolver), physical_plan)
+        }
+        None => {
+            let read =
+                crate::query_execution::distributed_rewrite::plan_frozen_rewrite_connector_read(
+                    session.lease(),
+                    execution.topology(),
+                    cohort.source(),
+                    cohort.scan_schema(),
+                    (0..cohort.scan_schema().fields().len()).collect(),
+                    context.clone(),
+                )
+                .map_err(|error| format!("plan frozen rewrite source: {error}"))?;
+            let source_binding =
+                crate::query_execution::distributed_rewrite::admit_frozen_rewrite_scan_binding(
+                    table_bindings.as_ref(),
+                    cohort.scan_schema(),
+                )?;
+            let resolver =
+                crate::query_execution::distributed_rewrite::frozen_rewrite_read_resolver(
+                    source_binding,
+                    read,
+                );
+            let physical_plan =
+                crate::query_execution::distributed_rewrite::frozen_rewrite_scan_physical_plan(
+                    cohort.scan_schema(),
+                    source_binding,
+                );
+            (Box::new(resolver), physical_plan)
+        }
+    };
     let target_binding =
         crate::query_execution::planning::write_sink::admit_prepared_frozen_connector_write_target(
             table_bindings.as_ref(),
@@ -1561,7 +1597,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         connector_control,
         context,
         Some(table_bindings.as_ref()),
-        Some(&resolver),
+        Some(resolver.as_ref()),
         crate::query_execution::dml::write::scan_preparation_options(
             typed_connector_control,
             &optimizer_settings,

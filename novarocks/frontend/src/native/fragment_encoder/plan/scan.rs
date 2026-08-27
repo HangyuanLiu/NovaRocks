@@ -421,6 +421,7 @@ fn scan_binding_for_source<'a>(
             )
         }
         SqlScanSourceRead::Data
+        | SqlScanSourceRead::PinnedFileSet
         | SqlScanSourceRead::FrozenInputSet
         | SqlScanSourceRead::MvTargetState
         | SqlScanSourceRead::MvTargetLocator
@@ -444,6 +445,7 @@ fn scan_binding_for_source<'a>(
 fn scan_source_kind(source: &SqlScanSourceRead) -> &'static str {
     match source {
         SqlScanSourceRead::ConnectorRead => "SqlConnectorRead",
+        SqlScanSourceRead::PinnedFileSet => "SqlPinnedFileSet",
         SqlScanSourceRead::Data => "SqlData",
         SqlScanSourceRead::FrozenInputSet => "SqlFrozenInputSet",
         SqlScanSourceRead::Metadata => "SqlMetadata",

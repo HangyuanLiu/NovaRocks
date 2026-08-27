@@ -1882,6 +1882,7 @@ mod tests {
             name_mapping_json: None,
             table_location: "/tmp/iceberg/orders".to_owned(),
             storage_properties: Default::default(),
+            pinned_data_files: None,
         })
         .expect("table handle")
     }

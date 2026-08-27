@@ -192,6 +192,7 @@ mod tests {
                             unenforced_predicate: Some(all_domain()),
                             enforced_predicate: Some(all_domain()),
                             limit: None,
+                            pinned_data_files: None,
                             projected_columns: Vec::new(),
                             name_mapping_json: None,
                             table_location: "s3://bucket/table".to_owned(),

@@ -62,6 +62,7 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
+    ConnectorPinnedFileSet,
 };
 
 use crate::file_pruning::file_may_satisfy_physical_predicates;
@@ -87,13 +88,14 @@ use crate::typed_read::{
     FilesTableSplitSourceParams, HiveTransactionHandle, ICEBERG_CHANGE_OP_COLUMN,
     IcebergChangeSplit, IcebergChangeWindowEndpoints, IcebergChangeWindowHandle,
     IcebergChangeWindowHandleParams, IcebergChangeWindowSplitSource, IcebergColumnHandle,
-    IcebergDeleteFileFacts, IcebergFileFormat, IcebergMetadataColumn, IcebergPlannedDataFile,
-    IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions, IcebergSystemTableExecution,
-    IcebergSystemTableReference, IcebergTableHandle, IcebergTableHandleParams,
-    ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile, bounds_row_type, change_op_column_handle,
-    decode_tuple_domain as decode_iceberg_tuple_domain, derived_row_type_json,
-    encode_tuple_domain as encode_iceberg_tuple_domain, files_relation_schema_json,
-    partition_row_type, plan_change_window_splits, system_relation_columns,
+    IcebergDeleteFileFacts, IcebergFileFormat, IcebergMetadataColumn, IcebergPinnedDataFileSet,
+    IcebergPlannedDataFile, IcebergSplit, IcebergSplitSource, IcebergSplitSourceOptions,
+    IcebergSystemTableExecution, IcebergSystemTableReference, IcebergTableHandle,
+    IcebergTableHandleParams, ROW_LINEAGE_METADATA_COLUMNS, TrinoManifestFile, bounds_row_type,
+    change_op_column_handle, decode_tuple_domain as decode_iceberg_tuple_domain,
+    derived_row_type_json, encode_tuple_domain as encode_iceberg_tuple_domain,
+    files_relation_schema_json, partition_row_type, plan_change_window_splits,
+    system_relation_columns,
 };
 
 /// The Iceberg table property carrying the default name mapping.
@@ -377,15 +379,25 @@ impl IcebergTypedBoundary {
         constraint: &WireConstraint,
     ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
         let schema = handle.parse_table_schema()?;
-        let static_predicate = handle
-            .effective_predicate()?
-            .intersect(&wire_domain_to_iceberg(constraint.summary())?)?;
-        if static_predicate.is_none() {
-            // Planning already proved the scan reads nothing, so no manifest
-            // needs to be opened at all.
-            return Ok(Vec::new());
-        }
-        let predicates = physical_predicates(&static_predicate, &schema);
+        let pinned = handle.pinned_data_files();
+        // A pinned read is defined by its file set, so nothing here may narrow
+        // it. The offered constraint is deliberately not consulted: unlike an
+        // ordinary scan, whose pruning only changes which rows a query sees,
+        // dropping a file from a rewrite makes its commit replace a file the
+        // reader never produced rows for.
+        let predicates = if pinned.is_some() {
+            Vec::new()
+        } else {
+            let static_predicate = handle
+                .effective_predicate()?
+                .intersect(&wire_domain_to_iceberg(constraint.summary())?)?;
+            if static_predicate.is_none() {
+                // Planning already proved the scan reads nothing, so no
+                // manifest needs to be opened at all.
+                return Ok(Vec::new());
+            }
+            physical_predicates(&static_predicate, &schema)
+        };
 
         let physical = self.load_pinned_relation(handle.schema_table_name())?;
         let table = physical.table.clone();
@@ -398,8 +410,14 @@ impl IcebergTypedBoundary {
             .map_err(unavailable)?;
 
         let mut planned = Vec::with_capacity(read_snapshot.files.len());
+        let mut pinned_seen = 0_usize;
         for read_file in read_snapshot.files {
-            if !predicates.is_empty()
+            if let Some(pinned) = pinned {
+                if !pinned.contains(&read_file.path) {
+                    continue;
+                }
+                pinned_seen += 1;
+            } else if !predicates.is_empty()
                 && !file_may_satisfy_physical_predicates(
                     &pruning_view(handle, &schema, &read_file)?,
                     &predicates,
@@ -408,6 +426,20 @@ impl IcebergTypedBoundary {
                 continue;
             }
             planned.push(planned_data_file(read_file, &facts)?);
+        }
+        // A pinned file the snapshot no longer holds is not an empty read: the
+        // cohort was frozen against a relation state that has since changed,
+        // and reading the rest would commit a replacement for rows nobody
+        // produced. It fails here, before a single split is scheduled.
+        if let Some(pinned) = pinned
+            && pinned_seen != pinned.len()
+        {
+            return Err(corrupt(format!(
+                "iceberg pinned read of {}.{} names {} data files but snapshot {snapshot_id} holds only {pinned_seen} of them",
+                handle.schema_table_name().schema_name(),
+                handle.schema_table_name().table_name(),
+                pinned.len(),
+            )));
         }
         Ok(planned)
     }
@@ -698,6 +730,48 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
             .map(Some)
     }
 
+    fn get_pinned_file_set_handle(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+        pinned: &ConnectorPinnedFileSet,
+    ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+        if system_relation_of(name.table_name()).is_some() {
+            // A `<table>$<suffix>` relation is a view of one metadata file. It
+            // has no data files at all, so a pinned data-file set cannot name
+            // anything in it.
+            return Ok(None);
+        }
+        let Some(physical) = self.load_relation(name)? else {
+            return Ok(None);
+        };
+        let metadata = physical.table.metadata();
+        let snapshot_id = pinned.version_ordinal();
+        // The version the cohort was frozen at must still be a snapshot of
+        // this relation. Pinning against a snapshot the metadata no longer
+        // holds would name files with nothing to check them against.
+        if metadata.snapshot_by_id(snapshot_id).is_none() {
+            return Err(corrupt(format!(
+                "iceberg relation {}.{} no longer holds snapshot {snapshot_id}, which a pinned read was frozen at",
+                name.schema_name(),
+                name.table_name()
+            )));
+        }
+        let files = IcebergPinnedDataFileSet::try_new(pinned.files())?;
+        if files.len() != pinned.files().len() {
+            return Err(invalid(
+                "iceberg pinned read was offered the same data file more than once",
+            ));
+        }
+        self.wrap_table(pinned_table_handle_with_files(
+            name,
+            metadata,
+            Some(snapshot_id),
+            Some(files),
+        )?)
+        .map(Some)
+    }
+
     fn get_column_bindings(
         &self,
         _session: &ConnectorSession,
@@ -758,6 +832,13 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
         let Some(handle) = self.pushdown_table_handle(table)? else {
             return Ok(None);
         };
+        if !handle.accepts_pushdown() {
+            // A pinned read is defined by its file set. A domain accepted here
+            // would become an `enforced_predicate` the split source prunes by,
+            // and a rewrite that reads fewer files than its commit replaces
+            // corrupts the relation. The engine keeps the whole predicate.
+            return Ok(None);
+        }
         let applied = handle.apply_filter(&wire_constraint_to_iceberg(constraint)?)?;
         if applied.handle() == &handle {
             // The connector accepted nothing, so the engine keeps the whole
@@ -809,6 +890,11 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
         let Some(handle) = self.pushdown_table_handle(table)? else {
             return Ok(None);
         };
+        if !handle.accepts_pushdown() {
+            // A zero limit accepted on a pinned read would mark its split
+            // source exhausted and rewrite the cohort's files to nothing.
+            return Ok(None);
+        }
         let applied = handle.apply_limit(limit)?;
         if applied.handle() == &handle {
             return Ok(None);
@@ -1168,6 +1254,15 @@ fn pinned_table_handle(
     metadata: &TableMetadata,
     snapshot_id: Option<i64>,
 ) -> Result<IcebergTableHandle, ConnectorError> {
+    pinned_table_handle_with_files(name, metadata, snapshot_id, None)
+}
+
+fn pinned_table_handle_with_files(
+    name: &SchemaTableName,
+    metadata: &TableMetadata,
+    snapshot_id: Option<i64>,
+    pinned_data_files: Option<IcebergPinnedDataFileSet>,
+) -> Result<IcebergTableHandle, ConnectorError> {
     let schema = pinned_schema(metadata, snapshot_id)?;
     let mut partition_spec_jsons = BTreeMap::new();
     for spec in metadata.partition_specs_iter() {
@@ -1204,6 +1299,7 @@ fn pinned_table_handle(
         name_mapping_json: metadata.properties().get(NAME_MAPPING_PROPERTY).cloned(),
         table_location: metadata.location().to_string(),
         storage_properties: reader_visible_storage_properties(metadata.properties()),
+        pinned_data_files,
     })
 }
 
@@ -2462,6 +2558,99 @@ mod tests {
                 "{table}"
             );
         }
+    }
+
+    /// A pinned read is the file set and nothing else, so neither pushdown may
+    /// narrow it. Both are declined outright rather than accepted-and-ignored:
+    /// an accepted domain becomes an `enforced_predicate` the split source
+    /// prunes by, and an accepted zero limit marks it exhausted.
+    #[test]
+    fn a_pinned_read_declines_every_pushdown_that_could_narrow_it() {
+        let fixture = fixture();
+        let metadata = metadata_with_history();
+        let pinned = IcebergPinnedDataFileSet::try_new(["file:///t/data/a.parquet"])
+            .expect("pinned file set");
+        let handle = pinned_table_handle_with_files(
+            &name("db", "t"),
+            &metadata,
+            Some(12),
+            Some(pinned.clone()),
+        )
+        .expect("pinned handle");
+        let wrapped = fixture.boundary.wrap_table(handle).expect("wrap");
+
+        let schema = table_schema();
+        let region = IcebergColumnHandle::base_column_of(&schema, 2).expect("region");
+        let summary = TupleDomain::with_column_domains(BTreeMap::from([(
+            iceberg_column_to_wire(&region).expect("wire region"),
+            string_domain("emea"),
+        )]))
+        .expect("summary");
+        assert!(
+            fixture
+                .boundary
+                .apply_filter(&session(), &wrapped, &Constraint::of_summary(summary))
+                .expect("apply filter")
+                .is_none()
+        );
+        assert!(
+            fixture
+                .boundary
+                .apply_limit(&session(), &wrapped, 0)
+                .expect("apply limit")
+                .is_none()
+        );
+        // A projection is not a narrowing of the file set, so it still applies
+        // and carries the pin forward untouched.
+        let projected = fixture
+            .boundary
+            .apply_projection(&session(), &wrapped, &[])
+            .expect("apply projection");
+        assert!(projected.is_none());
+        assert_eq!(
+            fixture
+                .boundary
+                .data_table_handle(&wrapped)
+                .expect("data handle")
+                .pinned_data_files(),
+            Some(&pinned)
+        );
+    }
+
+    /// A pinned set names files of one snapshot. If the relation no longer
+    /// holds that snapshot, the cohort was frozen against a state that has
+    /// since changed, and reading whatever is there now would commit a
+    /// replacement for rows nobody produced.
+    #[test]
+    fn a_pinned_read_of_a_vanished_snapshot_is_refused_before_any_split() {
+        let fixture = fixture();
+        fixture.create_table("db", "t", StdHashMap::new());
+        let pinned = ConnectorPinnedFileSet::try_new("db", "t", 4321, ["file:///t/data/a.parquet"])
+            .expect("pinned file set");
+
+        let error = fixture
+            .boundary
+            .get_pinned_file_set_handle(&session(), &name("db", "t"), &pinned)
+            .expect_err("a vanished snapshot must be refused");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        assert!(error.to_string().contains("4321"));
+
+        // A relation this connector does not hold is absence, not an error.
+        assert!(
+            fixture
+                .boundary
+                .get_pinned_file_set_handle(&session(), &name("db", "absent"), &pinned)
+                .expect("absent relation")
+                .is_none()
+        );
+        // A system relation has no data files for a pinned set to name.
+        assert!(
+            fixture
+                .boundary
+                .get_pinned_file_set_handle(&session(), &name("db", "t$files"), &pinned)
+                .expect("system relation")
+                .is_none()
+        );
     }
 
     #[test]

@@ -7,10 +7,10 @@
 
 use std::sync::Arc;
 
-use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
     ConnectorExpression, ConnectorSession, SchemaTableName, SystemTableDistribution,
 };
+use novarocks_spi::connector::{ConnectorError, ConnectorPinnedFileSet};
 
 use super::execution::WireConstraint;
 use super::handle::CatalogTableHandle;
@@ -199,6 +199,22 @@ pub trait TypedConnectorMetadata: Send + Sync {
         name: &SchemaTableName,
         version: TypedRelationVersion,
         reference: Option<&str>,
+    ) -> Result<Option<CatalogTableHandle>, ConnectorError>;
+
+    /// Freeze one relation restricted to exactly the files a provider-frozen
+    /// cohort reads.
+    ///
+    /// The set is the whole definition of the read: the cohort's commit
+    /// replaces precisely those files, so a connector that cannot honor the
+    /// set exactly must fail rather than widen it to the snapshot or narrow it
+    /// by any rule of its own. `None` means this connector does not read
+    /// relations by pinned file set at all, which is different from a set it
+    /// cannot serve: that is an error.
+    fn get_pinned_file_set_handle(
+        &self,
+        session: &ConnectorSession,
+        name: &SchemaTableName,
+        pinned: &ConnectorPinnedFileSet,
     ) -> Result<Option<CatalogTableHandle>, ConnectorError>;
 
     /// The relation's columns in connector schema order.

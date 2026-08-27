@@ -27,8 +27,8 @@ use sha2::{Digest, Sha256};
 use super::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata, ConnectorRequestContext,
-    ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteActivation,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata, ConnectorPinnedFileSet,
+    ConnectorRequestContext, ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteActivation,
     ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteControl,
     ConnectorWriteExecutionId, ConnectorWriteIntent, ConnectorWriteLease,
     ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWriteReceipt,
@@ -203,6 +203,11 @@ pub struct ConnectorDistributedRewriteCohortPlan {
     /// Opaque frozen source used only to plan the rewrite scan.  It is not a
     /// write target and must not be substituted for `preparation.table()`.
     source: ConnectorTableHandle,
+    /// Exactly the data files this cohort rewrites, when its read is a scan of
+    /// table rows. A cohort whose read is not a data scan -- rewriting
+    /// position deletes reads delete artifacts, not rows -- pins no data file
+    /// set and is planned through `source` alone.
+    pinned_source: Option<ConnectorPinnedFileSet>,
     /// Schema of the frozen scan output.  SQL needs this to build the
     /// read-side physical carrier, but it is deliberately not the writer
     /// contract: the Provider-signed preparation below owns input shape.
@@ -217,6 +222,7 @@ impl ConnectorDistributedRewriteCohortPlan {
     pub fn try_new(
         cohort_id: ConnectorWriteCohortId,
         source: ConnectorTableHandle,
+        pinned_source: Option<ConnectorPinnedFileSet>,
         scan_schema: SchemaRef,
         scan_schema_digest: [u8; 32],
         preparation: ConnectorWritePreparation,
@@ -231,6 +237,7 @@ impl ConnectorDistributedRewriteCohortPlan {
         Ok(Self {
             cohort_id,
             source,
+            pinned_source,
             scan_schema,
             scan_schema_digest,
             preparation,
@@ -242,6 +249,10 @@ impl ConnectorDistributedRewriteCohortPlan {
     }
     pub fn source(&self) -> &ConnectorTableHandle {
         &self.source
+    }
+    /// The exact data files this cohort rewrites, when it reads table rows.
+    pub const fn pinned_source(&self) -> Option<&ConnectorPinnedFileSet> {
+        self.pinned_source.as_ref()
     }
     pub fn scan_schema(&self) -> &SchemaRef {
         &self.scan_schema
@@ -264,6 +275,21 @@ impl ConnectorDistributedRewriteCohortPlan {
         hash.update(self.scan_schema_digest);
         digest_bytes(hash, self.source.owner().as_str().as_bytes());
         digest_bytes(hash, self.source.payload());
+        // Which files a cohort rewrites is part of what it is, so two cohorts
+        // that differ only in their pinned set never share a digest.
+        match &self.pinned_source {
+            None => hash.update([0]),
+            Some(pinned) => {
+                hash.update([1]);
+                digest_bytes(hash, pinned.namespace().as_bytes());
+                digest_bytes(hash, pinned.table().as_bytes());
+                hash.update(pinned.version_ordinal().to_be_bytes());
+                hash.update((pinned.files().len() as u64).to_be_bytes());
+                for file in pinned.files() {
+                    digest_bytes(hash, file.as_bytes());
+                }
+            }
+        }
         hash.update(self.preparation.digest());
     }
 }
@@ -1024,6 +1050,7 @@ mod tests {
             ConnectorDistributedRewriteCohortPlan::try_new(
                 cohort_id,
                 request.operation().table().clone(),
+                None,
                 Arc::clone(&schema),
                 schema_digest,
                 preparation(
@@ -1072,6 +1099,7 @@ mod tests {
             ConnectorDistributedRewriteCohortPlan::try_new(
                 cohort_id,
                 request.operation().table().clone(),
+                None,
                 Arc::clone(&schema),
                 [3; 32],
                 preparation,

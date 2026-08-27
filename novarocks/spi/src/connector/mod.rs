@@ -112,7 +112,8 @@ pub use execution_declaration::{
     ConnectorExecutionDeclarationProvider, ConnectorExecutionProviderKind,
 };
 pub use handle::{
-    ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    ConnectorPinnedFileSet, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_PINNED_FILES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};

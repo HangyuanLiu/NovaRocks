@@ -45,6 +45,7 @@ pub mod mv_assembly;
 pub mod mv_native_write;
 pub mod native_fragment;
 pub(crate) mod outcome;
+pub(crate) mod pinned_connector_read;
 pub mod planning;
 pub use crate::runtime::statement_result::StatementResult;
 pub use completion::{

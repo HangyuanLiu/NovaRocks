@@ -935,6 +935,7 @@ pub(crate) mod test_support {
             limit: None,
             projected_columns: vec![iceberg_column_handle(1)],
             name_mapping_json: None,
+            pinned_data_files: None,
             table_location: "s3://bucket/warehouse/db/t".to_owned(),
             storage_properties: BTreeMap::new(),
         }

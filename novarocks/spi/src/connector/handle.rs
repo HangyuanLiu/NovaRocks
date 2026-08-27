@@ -123,3 +123,98 @@ fn validate_payload(payload: &Bytes) -> Result<(), ConnectorError> {
     }
     Ok(())
 }
+
+/// The hard bound on how many files one pinned read may name.
+pub const MAX_CONNECTOR_PINNED_FILES: usize = 4096;
+
+/// Exactly the files one provider-frozen cohort reads, at the relation version
+/// they were frozen at.
+///
+/// This is a set the connector mints while preparing its own mutation or
+/// rewrite; the engine only carries it back to that connector. It is named
+/// rather than described because the cohort's commit replaces precisely these
+/// files: a read narrowed by a predicate, a size threshold, or a re-derived
+/// selection would let the read and the commit disagree, which corrupts the
+/// relation instead of returning a wrong answer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorPinnedFileSet {
+    namespace: Arc<str>,
+    table: Arc<str>,
+    version_ordinal: i64,
+    files: Vec<Arc<str>>,
+}
+
+impl ConnectorPinnedFileSet {
+    /// The relation is named here, and not recovered from whatever synthetic
+    /// name the engine planned the cohort under: only the connector knows
+    /// which relation its own frozen files belong to.
+    ///
+    /// `version_ordinal` is the provider's own version identity, exactly as
+    /// `ConnectorWritePreparation::base_version_ordinal` reports it.
+    ///
+    /// An empty set is legal and reads no rows. The files are sorted and
+    /// deduplicated here so one pinned read has one spelling everywhere.
+    pub fn try_new<F: AsRef<str>>(
+        namespace: impl AsRef<str>,
+        table: impl AsRef<str>,
+        version_ordinal: i64,
+        files: impl IntoIterator<Item = F>,
+    ) -> Result<Self, ConnectorError> {
+        let namespace = namespace.as_ref();
+        let table = table.as_ref();
+        if namespace.is_empty() || table.is_empty() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector pinned file set requires a complete relation name",
+            ));
+        }
+        let mut sorted = Vec::new();
+        for file in files {
+            let file = file.as_ref();
+            if file.is_empty() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector pinned file identity must not be empty",
+                ));
+            }
+            sorted.push(Arc::<str>::from(file));
+        }
+        sorted.sort();
+        let named = sorted.len();
+        sorted.dedup();
+        if sorted.len() != named {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector pinned file set names the same file more than once",
+            ));
+        }
+        if sorted.len() > MAX_CONNECTOR_PINNED_FILES {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "connector pinned file count exceeds the hard limit",
+            ));
+        }
+        Ok(Self {
+            namespace: Arc::from(namespace),
+            table: Arc::from(table),
+            version_ordinal,
+            files: sorted,
+        })
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    pub const fn version_ordinal(&self) -> i64 {
+        self.version_ordinal
+    }
+
+    pub fn files(&self) -> &[Arc<str>] {
+        &self.files
+    }
+}

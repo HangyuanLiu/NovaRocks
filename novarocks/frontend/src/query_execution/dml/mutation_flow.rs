@@ -1189,10 +1189,8 @@ pub(crate) fn stage_prepared_update_mutation(
             let write = build_cow_update_distributed_write(
                 &target,
                 planning_lease,
-                &connector_context,
                 provider_plan,
                 cow_preparations.lease,
-                &execution,
             )?;
             let execution_handle = build_cow_update_distributed_execution(
                 state,
@@ -1872,10 +1870,16 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
         crate::catalog_application::resolver::invalidate_iceberg_caches(&self.state, &self.target)
     }
 }
+/// The pinned cohort read one COW rewrite statement scans.
+///
+/// It carries no planned scan: the connector froze which files this cohort
+/// rewrites, and preparation asks the same connector generation to freeze that
+/// exact relation. Planning the read here instead would need an opaque handle
+/// the typed scan stack cannot admit.
 struct CowFrozenRead {
     identity: FrozenConnectorScanIdentity,
     schema: arrow::datatypes::SchemaRef,
-    read: crate::query_execution::preparation::scan::PlannedConnectorRead,
+    read: crate::query_execution::preparation::scan::QueryPinnedFileSetRead,
 }
 
 struct CowCohortWritePlan {
@@ -1895,10 +1899,8 @@ struct CowUpdateDistributedWrite {
 fn build_cow_update_distributed_write(
     target: &crate::catalog_application::resolver::TargetBackend,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     provider_plan: novarocks_spi::connector::ConnectorRowMutationExecutionPlan,
     write_lease: novarocks_spi::connector::ConnectorWriteLease,
-    execution: &QueryExecutionContext,
 ) -> Result<CowUpdateDistributedWrite, String> {
     let (selection, _, recipes) = provider_plan
         .copy_on_write()
@@ -1921,6 +1923,7 @@ fn build_cow_update_distributed_write(
             ),
             novarocks_spi::connector::ConnectorRowMutationCohortRecipeBody::Rewrite {
                 source,
+                pinned_source,
                 base_version_digest,
                 scan_schema,
                 scan_bindings,
@@ -1938,16 +1941,11 @@ fn build_cow_update_distributed_write(
                     target.namespace.clone(),
                     format!("__nr_cow_{}", uuid::Uuid::new_v4().simple()),
                 );
-                let read =
-                    crate::query_execution::frozen_connector_read::plan_frozen_connector_read(
-                        planning_lease.clone(),
-                        execution.topology(),
-                        source,
-                        scan_schema,
-                        Vec::new(),
-                        connector_context.clone(),
-                    )
-                    .map_err(|error| format!("plan provider-frozen COW source: {error}"))?;
+                let read = crate::query_execution::preparation::scan::QueryPinnedFileSetRead {
+                    pinned: pinned_source.clone(),
+                    source: source.clone(),
+                    planning_lease: planning_lease.clone(),
+                };
                 let query = build_cow_rewrite_query(
                     selection,
                     recipe,
@@ -2446,18 +2444,18 @@ fn run_one_cow_cohort(
     let assembly = match plan.frozen_read {
         Some(frozen) => {
             let binding =
-                crate::query_execution::frozen_connector_read::admit_frozen_connector_scan_binding(
+                crate::query_execution::pinned_connector_read::admit_pinned_file_set_scan_binding(
                     table_bindings.as_ref(),
                     &frozen.identity,
                     &frozen.schema,
                 )?;
             let overlay =
-                crate::query_execution::frozen_connector_read::frozen_connector_query_local_overlay(
+                crate::query_execution::pinned_connector_read::pinned_file_set_query_local_overlay(
                     &frozen.identity,
                     &frozen.schema,
                 );
             let resolver =
-                crate::query_execution::frozen_connector_read::FrozenConnectorReadResolver::new(
+                crate::query_execution::pinned_connector_read::PinnedFileSetReadResolver::new(
                     binding,
                     frozen.identity,
                     frozen.read,
@@ -3490,10 +3488,8 @@ pub(crate) fn stage_prepared_merge_mutation(
     let write = build_cow_update_distributed_write(
         &target,
         planning_lease,
-        &connector_context,
         provider_plan,
         cow_preparations.lease,
-        &execution,
     )?;
     let execution_handle = build_cow_update_distributed_execution(
         state,
@@ -4823,6 +4819,13 @@ mod tests {
                 .collect(),
             ConnectorTableHandle::try_new(instance_id, bytes::Bytes::from_static(b"frozen-source"))
                 .expect("frozen source"),
+            novarocks_spi::connector::ConnectorPinnedFileSet::try_new(
+                "db",
+                "t",
+                11,
+                ["s3://bucket/db/t/data/a.parquet"],
+            )
+            .expect("pinned source"),
             base.digest(),
             scan_schema.clone(),
             scan_bindings.clone(),

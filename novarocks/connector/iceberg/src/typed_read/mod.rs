@@ -116,6 +116,6 @@ pub use table_execute::{
     REWRITE_POSITION_DELETE_OUTPUT_COLUMNS,
 };
 pub use table_handle::{
-    HiveTransactionHandle, IcebergTableHandle, IcebergTableHandleParams,
+    HiveTransactionHandle, IcebergPinnedDataFileSet, IcebergTableHandle, IcebergTableHandleParams,
     identity_partition_source_field_ids,
 };

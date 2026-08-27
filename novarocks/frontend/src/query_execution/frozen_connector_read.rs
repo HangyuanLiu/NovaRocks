@@ -37,7 +37,6 @@ use novarocks_spi::connector::{
 use crate::catalog_application::query_bindings::{
     QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
 };
-use crate::catalog_application::query_materializer::QueryLocalTableOverlay;
 use crate::common::backend_topology::BackendTopologySnapshot;
 use crate::query_execution::preparation::scan::PlannedConnectorRead;
 use novarocks_sql::binding::SqlTableBindingId;
@@ -184,25 +183,6 @@ pub(crate) fn admit_frozen_connector_scan_binding(
     bindings.resolve_or_insert_with_id(frozen_connector_binding_key(identity), |binding| {
         frozen_connector_query_table_binding(identity.clone(), input_schema.clone(), binding)
     })
-}
-
-/// Build the request-local catalog overlay used by SQL-shaped frozen reads.
-/// The overlay and resolver must be created from the same identity and binding
-/// store; neither is published to shared catalog state.
-pub(crate) fn frozen_connector_query_local_overlay(
-    identity: &FrozenConnectorScanIdentity,
-    input_schema: &SchemaRef,
-) -> QueryLocalTableOverlay {
-    let identity = identity.clone();
-    let schema = input_schema.clone();
-    QueryLocalTableOverlay::new(
-        identity.namespace().to_string(),
-        identity.table().to_string(),
-        frozen_connector_binding_key(&identity),
-        move |binding| {
-            frozen_connector_query_table_binding(identity.clone(), schema.clone(), binding)
-        },
-    )
 }
 
 fn frozen_connector_binding_key(identity: &FrozenConnectorScanIdentity) -> QueryTableBindingKey {

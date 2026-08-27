@@ -38,14 +38,14 @@ use novarocks_spi::connector::{
     ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
     ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary, ConnectorError,
     ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorRequestContext,
-    ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorTableHandle,
-    ConnectorWriteActivation, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
-    ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
-    ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
-    ConnectorWritePreparation, ConnectorWriteReceipt, ConnectorWriteTargetRef,
-    ConnectorWriterIdentity, ConnectorWriterTerminalState, REWRITE_DATA_FILES_KIND,
-    REWRITE_POSITION_DELETES_KIND,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorPinnedFileSet,
+    ConnectorRequestContext, ConnectorStagedReport, ConnectorStagedReportSummary,
+    ConnectorTableHandle, ConnectorWriteActivation, ConnectorWriteAttemptCompletion,
+    ConnectorWriteBaseVersion, ConnectorWriteCohortId, ConnectorWriteControl,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
+    ConnectorWriteIntent, ConnectorWritePreparation, ConnectorWriteReceipt,
+    ConnectorWriteTargetRef, ConnectorWriterIdentity, ConnectorWriterTerminalState,
+    REWRITE_DATA_FILES_KIND, REWRITE_POSITION_DELETES_KIND,
 };
 
 use crate::commit::write_control::{
@@ -234,7 +234,7 @@ impl IcebergDistributedRewriteControl {
             request,
             manifest_digest,
             &artifact_location,
-            &artifact.groups,
+            &artifact,
             scan_schema,
             row_lineage,
             metadata,
@@ -976,7 +976,7 @@ fn cohort_plans_from_artifact(
     request: &ConnectorDistributedRewritePlanningRequest,
     artifact_digest: [u8; 32],
     artifact_location: &str,
-    groups: &[IcebergFrozenRewriteGroupV1],
+    artifact: &IcebergFrozenRewriteArtifactV1,
     scan_schema: SchemaRef,
     row_lineage: bool,
     metadata: &crate::iceberg::spec::TableMetadata,
@@ -989,7 +989,8 @@ fn cohort_plans_from_artifact(
             ConnectorWriteIntent::RowDelta
         }
     };
-    groups
+    artifact
+        .groups
         .iter()
         .map(|group| {
             let group_digest = decode_digest(&group.group_digest_hex)?;
@@ -1016,9 +1017,28 @@ fn cohort_plans_from_artifact(
                 row_lineage,
                 metadata,
             )?;
+            // A data-file rewrite reads table rows, and its commit replaces
+            // exactly the group's files, so the read is pinned to that same
+            // set. Rewriting position deletes reads delete artifacts rather
+            // than rows, so it pins no data file set at all.
+            let pinned_source = match request.operation() {
+                ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
+                    let base_snapshot_id = artifact.base_snapshot_id.ok_or_else(|| {
+                        invalid("Iceberg rewrite group has no base snapshot to pin its files to")
+                    })?;
+                    Some(ConnectorPinnedFileSet::try_new(
+                        &artifact.namespace,
+                        &artifact.table,
+                        base_snapshot_id,
+                        group.data_files.iter().map(|file| file.path.as_str()),
+                    )?)
+                }
+                ConnectorDistributedRewriteOperation::RewritePositionDeletes { .. } => None,
+            };
             ConnectorDistributedRewriteCohortPlan::try_new(
                 cohort_id,
                 source,
+                pinned_source,
                 scan_schema.clone(),
                 arrow_schema_digest(&scan_schema),
                 preparation,

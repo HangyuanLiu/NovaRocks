@@ -46,7 +46,7 @@ use crate::query_execution::contract::{
     ConnectorWritePlanningTemplate,
 };
 use crate::query_execution::outcome::ConnectorWriteCompletion;
-use crate::query_execution::preparation::scan::PlannedConnectorRead;
+use crate::query_execution::preparation::scan::{PlannedConnectorRead, QueryPinnedFileSetRead};
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use novarocks_sql::binding::SqlTableBindingId;
@@ -147,6 +147,43 @@ pub(crate) fn frozen_rewrite_read_resolver(
     read: PlannedConnectorRead,
 ) -> FrozenRewriteReadResolver {
     FrozenRewriteReadResolver::new(binding, frozen_rewrite_identity(), read)
+}
+
+/// Admit the synthetic source used by one pinned rewrite cohort read.
+pub(crate) fn admit_pinned_rewrite_scan_binding(
+    bindings: &QueryTableBindingStore,
+    input_schema: &arrow::datatypes::SchemaRef,
+) -> Result<SqlTableBindingId, String> {
+    crate::query_execution::pinned_connector_read::admit_pinned_file_set_scan_binding(
+        bindings,
+        &frozen_rewrite_identity(),
+        input_schema,
+    )
+}
+
+/// Build the minimal physical source for one pinned rewrite cohort read.
+/// Preparation freezes the relation restricted to exactly the files the
+/// provider pinned for this cohort; no normal table lookup may run.
+pub(crate) fn pinned_rewrite_scan_physical_plan(
+    input_schema: &arrow::datatypes::SchemaRef,
+    binding: SqlTableBindingId,
+) -> FrozenConnectorScanPlan {
+    crate::query_execution::pinned_connector_read::pinned_file_set_scan_physical_plan(
+        &frozen_rewrite_identity(),
+        input_schema,
+        binding,
+    )
+}
+
+pub(crate) fn pinned_rewrite_read_resolver(
+    binding: SqlTableBindingId,
+    read: QueryPinnedFileSetRead,
+) -> crate::query_execution::pinned_connector_read::PinnedFileSetReadResolver {
+    crate::query_execution::pinned_connector_read::PinnedFileSetReadResolver::new(
+        binding,
+        frozen_rewrite_identity(),
+        read,
+    )
 }
 
 fn frozen_rewrite_identity() -> FrozenConnectorScanIdentity {
@@ -768,6 +805,7 @@ mod tests {
                 ConnectorDistributedRewriteCohortPlan::try_new(
                     ConnectorWriteCohortId::derive(operation_id, b"test", digest).unwrap(),
                     table.clone(),
+                    None,
                     schema.clone(),
                     [3; 32],
                     preparation(key.clone(), table.clone(), &schema),

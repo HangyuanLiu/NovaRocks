@@ -38,6 +38,7 @@ use novarocks_proto::connector_read::{
     WireConstraint, encode_connector_expression, encode_tuple_domain, encode_value_type,
 };
 use novarocks_proto_models::connector_read as dto;
+use novarocks_spi::connector::ConnectorPinnedFileSet;
 use novarocks_spi::connector::read_stack::{
     ConnectorSession, ConnectorValueType, SchemaTableName, SystemTableDistribution, TupleDomain,
 };
@@ -75,6 +76,14 @@ pub(crate) enum TypedRelationFreeze<'a> {
         version: TypedRelationVersion,
         reference: Option<&'a str>,
     },
+    /// One relation restricted to exactly the files a provider froze for one
+    /// mutation or rewrite cohort.
+    ///
+    /// The set is the whole definition of the read. It is a freeze of its own
+    /// rather than a `Table` with a pushdown, because a pushdown may be
+    /// declined and a declined file set would silently widen the read to the
+    /// whole snapshot -- which a cohort's commit then contradicts.
+    PinnedFileSet(&'a ConnectorPinnedFileSet),
     /// The set difference between the rows visible at two snapshots.
     ///
     /// Both endpoints are pinned by the frozen handle. A row written and
@@ -95,7 +104,7 @@ impl TypedRelationFreeze<'_> {
     /// The relation family this freeze must produce.
     pub(crate) const fn relation_kind(self) -> ConnectorRelationKind {
         match self {
-            Self::Table { .. } => ConnectorRelationKind::Table,
+            Self::Table { .. } | Self::PinnedFileSet(_) => ConnectorRelationKind::Table,
             Self::ChangeWindow(_) => ConnectorRelationKind::ChangeWindow,
             Self::SystemTable => ConnectorRelationKind::SystemTable,
         }
@@ -204,6 +213,23 @@ pub(crate) fn prepare_typed_scan(
                 .ok_or_else(|| {
                     format!(
                         "typed scan relation {relation_name} is no longer resolvable after admission pinned it"
+                    )
+                })?;
+            (handle, dto::ScanWorkSource::RuntimeSplits)
+        }
+        TypedRelationFreeze::PinnedFileSet(pinned) => {
+            let handle = metadata
+                .get_pinned_file_set_handle(session, relation, pinned)
+                .map_err(|error| {
+                    format!(
+                        "typed scan cannot freeze relation {relation_name} restricted to the {} data files pinned at version {}: {error}",
+                        pinned.files().len(),
+                        pinned.version_ordinal()
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!(
+                        "typed scan relation {relation_name} does not expose a pinned file set read"
                     )
                 })?;
             (handle, dto::ScanWorkSource::RuntimeSplits)
@@ -561,6 +587,8 @@ mod tests {
         system_table: Option<SystemTableDistribution>,
         /// Every relation name the stub was asked for a system table plan.
         system_tables_requested: Mutex<Vec<String>>,
+        /// Every pinned file set the stub was asked to freeze.
+        pinned_file_sets_requested: Mutex<Vec<ConnectorPinnedFileSet>>,
     }
 
     impl StubControl {
@@ -578,6 +606,7 @@ mod tests {
                 change_windows_requested: Mutex::new(Vec::new()),
                 system_table: Some(SystemTableDistribution::SingleCoordinator),
                 system_tables_requested: Mutex::new(Vec::new()),
+                pinned_file_sets_requested: Mutex::new(Vec::new()),
             }
         }
     }
@@ -590,6 +619,19 @@ mod tests {
             _version: TypedRelationVersion,
             _reference: Option<&str>,
         ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+            Ok(self.handle.clone())
+        }
+
+        fn get_pinned_file_set_handle(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+            pinned: &ConnectorPinnedFileSet,
+        ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+            self.pinned_file_sets_requested
+                .lock()
+                .expect("pinned file set lock")
+                .push(pinned.clone());
             Ok(self.handle.clone())
         }
 
@@ -734,6 +776,7 @@ mod tests {
                                 enforced_predicate: Some(all_domain()),
                                 limit: None,
                                 projected_columns: Vec::new(),
+                                pinned_data_files: None,
                                 name_mapping_json: None,
                                 table_location: "s3://bucket/table".to_owned(),
                                 storage_properties: BTreeMap::new(),

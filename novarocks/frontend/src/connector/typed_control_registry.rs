@@ -203,6 +203,15 @@ mod tests {
             Ok(None)
         }
 
+        fn get_pinned_file_set_handle(
+            &self,
+            _session: &ConnectorSession,
+            _name: &SchemaTableName,
+            _pinned: &novarocks_spi::connector::ConnectorPinnedFileSet,
+        ) -> Result<Option<CatalogTableHandle>, ConnectorError> {
+            Ok(None)
+        }
+
         fn get_column_bindings(
             &self,
             _session: &ConnectorSession,

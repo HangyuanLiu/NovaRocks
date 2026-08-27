@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_spi::connector::{
     ConnectorBatchBudget, ConnectorControlPlanningLease, ConnectorExecutionDeclaration,
-    ConnectorPredicateDisposition, ConnectorScan, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorStaticPredicate,
+    ConnectorPinnedFileSet, ConnectorPredicateDisposition, ConnectorScan, ConnectorSplit,
+    ConnectorSplitPlanningMetrics, ConnectorStaticPredicate, ConnectorTableHandle,
 };
 
 use crate::catalog_application::query_bindings::QueryScanMaterialization;
@@ -74,6 +74,38 @@ pub(crate) enum ResolvedScanExecution {
     /// two endpoints come from the SQL scan itself, and the connector freezes
     /// one change-window relation pinned to both of them.
     AdmittedChangeWindow(QueryScanMaterialization),
+    /// One provider-frozen cohort read of a pinned file set.
+    AdmittedPinnedFileSet(QueryPinnedFileSetRead),
+}
+
+/// The exact facts one provider-frozen cohort read is planned from.
+///
+/// The file set was minted by the connector's own mutation or rewrite
+/// preparation and is only carried here: the engine neither derives it nor may
+/// narrow it, because the cohort's commit replaces precisely those files.
+#[derive(Clone)]
+pub(crate) struct QueryPinnedFileSetRead {
+    /// The relation, the version, and exactly the files this cohort reads.
+    /// All three are the connector's own; the SQL name that carries the read
+    /// through planning is query-local and synthetic, so it names nothing the
+    /// connector could resolve.
+    pub(crate) pinned: ConnectorPinnedFileSet,
+    /// The provider-frozen source handle. It is the exact-owner witness for
+    /// this read; the relation itself is frozen from the pinned set above.
+    pub(crate) source: ConnectorTableHandle,
+    pub(crate) planning_lease: ConnectorControlPlanningLease,
+}
+
+impl std::fmt::Debug for QueryPinnedFileSetRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PinnedFileSetRead")
+            .field("namespace", &self.pinned.namespace())
+            .field("table", &self.pinned.table())
+            .field("version_ordinal", &self.pinned.version_ordinal())
+            .field("files", &self.pinned.files().len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

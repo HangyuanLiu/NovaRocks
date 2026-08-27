@@ -2916,6 +2916,7 @@ mod tests {
             .chain(table.bytes())
             .chain([match &kind {
                 SqlScanKind::ConnectorRead => 1,
+                SqlScanKind::PinnedFileSet => 8,
                 SqlScanKind::Data { .. } => 2,
                 SqlScanKind::FrozenInputSet { .. } => 3,
                 SqlScanKind::Metadata { .. } => 4,
