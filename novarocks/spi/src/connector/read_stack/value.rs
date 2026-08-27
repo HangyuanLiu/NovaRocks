@@ -45,7 +45,10 @@ pub enum ConnectorValueType {
     BigInt,
     Real,
     Double,
-    Decimal { precision: u8, scale: i8 },
+    Decimal {
+        precision: u8,
+        scale: i8,
+    },
     Date,
     TimeMicros,
     TimestampMicros,
@@ -55,7 +58,9 @@ pub enum ConnectorValueType {
     Varchar,
     Varbinary,
     Uuid,
-    Fixed { length: u32 },
+    Fixed {
+        length: u32,
+    },
     /// A column whose engine type has no comparable counterpart: ROW, ARRAY,
     /// MAP, and the binary-carried variant types.
     ///

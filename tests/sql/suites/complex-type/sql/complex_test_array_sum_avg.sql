@@ -132,4 +132,9 @@ FROM test_array_functions;
 
 -- query 6
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_sum_avg FORCE;
+-- A catalog that cannot hold views cannot answer view enumeration, so
+-- DROP DATABASE ... FORCE is refused here rather than silently assuming
+-- the namespace holds none. Drop the tables explicitly instead.
+USE sql_tests_complex_test_array_sum_avg;
+DROP TABLE IF EXISTS test_array_functions;
+DROP DATABASE IF EXISTS sql_tests_complex_test_array_sum_avg;

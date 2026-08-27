@@ -38,7 +38,7 @@ use novarocks_spi::connector::{
 use super::staged_create::{
     ctas_staging_location, decode_unanchored_ctas_provenance, unanchored_ctas_provenance_location,
 };
-use crate::control_runtime::IcebergControlRuntime;
+use crate::metadata_context::IcebergMetadataContext;
 
 const CTAS_STAGING_NAMESPACE: &str = "_novarocks/ctas-staging/v1";
 const CTAS_UNANCHORED_PROVENANCE_FILE: &str = "_novarocks.ctas.provenance.v1.json";
@@ -47,14 +47,22 @@ const CTAS_UNANCHORED_PROVENANCE_FILE: &str = "_novarocks.ctas.provenance.v1.jso
 pub(crate) struct IcebergUnanchoredCtasCleanupAdapter {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
-    runtime: Arc<IcebergControlRuntime>,
+    runtime: Arc<IcebergMetadataContext>,
 }
 
 impl IcebergUnanchoredCtasCleanupAdapter {
+    /// Attach a sweeper for this generation's unanchored CTAS staging root.
+    ///
+    /// This deliberately does not ask whether the catalog can run a CTAS. A
+    /// catalog that cannot has never staged anything unanchored, so the sweep
+    /// finds nothing and deletes nothing -- and gating here would replace the
+    /// catalog's own explanation of why CTAS is impossible with a generic
+    /// "no cleanup capability" from the lease derivation. The refusal belongs
+    /// where the reason is known.
     pub(crate) fn try_new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ConnectorInstanceIncarnation,
-        runtime: Arc<IcebergControlRuntime>,
+        runtime: Arc<IcebergMetadataContext>,
     ) -> Result<Self, ConnectorError> {
         let warehouse = runtime.control_state().configuration().warehouse_uri.trim();
         if warehouse.is_empty() {
@@ -176,8 +184,11 @@ impl IcebergUnanchoredCtasCleanupAdapter {
         &self,
         publication: novarocks_spi::connector::LakePublicationId,
     ) -> Result<String, ConnectorError> {
+        // `try_new` already proved this generation has an explicit warehouse,
+        // so the only arm this can take is unreachable here. Report it as the
+        // refusal it is rather than as a transient failure a caller might retry.
         let table = ctas_staging_location(self.warehouse_root(), publication)
-            .map_err(|_| unavailable("derive unanchored CTAS staging location"))?;
+            .map_err(|_| unsupported("derive unanchored CTAS staging location"))?;
         table
             .strip_suffix("/table")
             .map(ToOwned::to_owned)
@@ -188,8 +199,10 @@ impl IcebergUnanchoredCtasCleanupAdapter {
         &self,
         publication: novarocks_spi::connector::LakePublicationId,
     ) -> Result<String, ConnectorError> {
+        // See `root_for`: unreachable, and a refusal rather than a retryable
+        // failure if it ever became reachable.
         let table = ctas_staging_location(self.warehouse_root(), publication)
-            .map_err(|_| unavailable("derive unanchored CTAS staging location"))?;
+            .map_err(|_| unsupported("derive unanchored CTAS staging location"))?;
         unanchored_ctas_provenance_location(&table)
     }
 

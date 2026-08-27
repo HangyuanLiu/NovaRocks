@@ -44,11 +44,11 @@ use novarocks_spi::connector::{
 };
 
 use crate::commit::write_shared::write_target_schema;
-use crate::control_provider::IcebergTablePayload;
-use crate::control_runtime::IcebergControlRuntime;
 use crate::file_reader::execution_payload::decode_payload;
 use crate::iceberg::spec::TableMetadata;
 use crate::manifest::{DataFileWithStats, data_file_with_stats_to_iceberg_data_file_info};
+use crate::metadata::IcebergTablePayload;
+use crate::metadata_context::IcebergMetadataContext;
 use crate::row_lineage_synth::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
 use crate::row_mutation_payload::encode_cow_recipe;
 
@@ -59,7 +59,7 @@ use crate::row_mutation_payload::encode_cow_recipe;
 pub(crate) fn activate_row_mutation(
     request: ConnectorRowMutationActivationRequest,
     owner: &ConnectorExecutionBindingKey,
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
 ) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError> {
     request.validate(owner)?;
     if request.context().cancellation().is_cancelled() {
@@ -196,7 +196,7 @@ fn activate_iceberg_cow_row_mutation(
     preparation: &ConnectorRowMutationPreparation,
     selection: &ConnectorRowMutationSelection,
     context: &novarocks_spi::connector::ConnectorRequestContext,
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
 ) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError> {
     if preparation.strategy() != ConnectorRowMutationStrategy::CopyOnWrite {
         return Err(invalid_iceberg_row_mutation_activation(
@@ -901,7 +901,7 @@ fn iceberg_cow_selection_groups(
 fn freeze_iceberg_cow_base(
     preparation: &ConnectorRowMutationPreparation,
     touched_files: &BTreeSet<String>,
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
 ) -> Result<IcebergFrozenCowBase, ConnectorError> {
     let table_payload: IcebergTablePayload =
         decode_payload(preparation.table().payload(), "admitted Iceberg COW table")?;
@@ -1123,7 +1123,7 @@ fn freeze_iceberg_cow_source(
     // this very handle, so it is resolved through that one composition instead
     // of being rebuilt here: a frozen read refuses a scan whose output schema
     // differs by so much as one field annotation.
-    let scan_schema = crate::control_provider::projected_schema(&source_payload, &[])?;
+    let scan_schema = crate::metadata::projected_schema(&source_payload, &[])?;
     let encoded = serde_json::to_vec(&source_payload).map_err(|error| {
         ConnectorError::new(
             ConnectorErrorKind::Internal,
@@ -1256,11 +1256,11 @@ mod tests {
         ConnectorWriteTargetRef, ExternalMutationOutcome,
     };
 
-    use crate::control_provider::IcebergTablePayload;
     use crate::iceberg::spec::{
         FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
         SnapshotReference, SnapshotRetention, SortOrder, Summary, TableMetadataBuilder, Type,
     };
+    use crate::metadata::IcebergTablePayload;
     use crate::row_mutation_payload::decode_cow_recipe;
     use crate::scan_model::IcebergTableInfo;
 

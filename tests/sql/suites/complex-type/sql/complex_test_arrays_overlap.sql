@@ -642,4 +642,10 @@ select k1, a1, a2, arrays_overlap(ifnull(a1, ['a', null]), ifnull(a1, ['a', 'b',
 
 -- query 137
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_arrays_overlap FORCE;
+-- A catalog that cannot hold views cannot answer view enumeration, so
+-- DROP DATABASE ... FORCE is refused here rather than silently assuming
+-- the namespace holds none. Drop the tables explicitly instead.
+USE sql_tests_complex_test_arrays_overlap;
+DROP TABLE IF EXISTS array_test;
+DROP TABLE IF EXISTS t1;
+DROP DATABASE IF EXISTS sql_tests_complex_test_arrays_overlap;

@@ -177,8 +177,8 @@ fn bigint_type_desc() -> proto_common::TypeDesc {
                 precision: None,
                 scale: None,
                 time_unit: None,
-            time_zone: None,
-        },
+                time_zone: None,
+            },
         )),
     }
 }

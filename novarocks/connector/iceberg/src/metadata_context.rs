@@ -30,28 +30,39 @@ use novarocks_types::naming::normalize_identifier;
 use crate::catalog_control::IcebergCatalogControlState;
 use crate::iceberg::{NamespaceIdent, TableIdent};
 use crate::loaded_table::IcebergPhysicalTable;
-use crate::resources::IcebergControlResources;
+use crate::resources::IcebergMetadataResources;
 
-#[allow(dead_code)] // Assembled into the concrete provider factory during R3C.
+/// Everything one Iceberg control generation owns.
+///
+/// The generation holds exactly one catalog, and every operation family reaches
+/// it through [`IcebergMetadataContext::novarocks_catalog`]. There is no second
+/// handle and no concrete-kind slot: a generation that held two clients would
+/// have two pieces of in-memory state that disagree about the same lake.
+///
+/// Callers that need the vendored client -- the commit machinery, which submits
+/// through `Catalog::update_table` -- derive it from the owner rather than from
+/// a field of their own.
 #[derive(Clone)]
-pub struct IcebergControlRuntime {
+pub struct IcebergMetadataContext {
     control_state: IcebergCatalogControlState,
-    resources: IcebergControlResources,
-    catalog: Arc<dyn crate::iceberg::Catalog>,
-    hadoop_catalog: Option<Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>>,
-    rest_catalog: Option<Arc<crate::iceberg_catalog_rest::RestCatalog>>,
+    resources: IcebergMetadataResources,
+    /// The one semantic owner of catalog behavior for this generation.
+    novarocks_catalog: Arc<dyn crate::catalog::NovaRocksCatalog>,
+    /// Proven-committed drops awaiting collection. Generation-local and
+    /// bounded; retired with the generation.
+    drop_cleanup: Arc<crate::catalog_control::drop_cleanup::DropCleanupQueue>,
     write_activations: Arc<crate::write_activation::IcebergWriteActivationReservations>,
 }
 
 #[allow(dead_code)]
-impl IcebergControlRuntime {
+impl IcebergMetadataContext {
     /// Construct one fully local provider generation.  REST and HMS client
     /// initialization is polled only through the runtime injected by server
     /// composition, so factory construction remains deterministic in every
     /// frontend role.
     pub fn try_new(
         control_state: IcebergCatalogControlState,
-        resources: IcebergControlResources,
+        resources: IcebergMetadataResources,
     ) -> Result<Self, String> {
         let configuration = control_state.configuration().clone();
         let catalog = resources
@@ -60,13 +71,19 @@ impl IcebergControlRuntime {
                 async move { crate::catalog_runtime::build_catalog_client(&configuration).await },
             )?
             .map_err(|error| format!("build Iceberg control-generation catalog: {error}"))?;
-        let rest_catalog = catalog.rest().cloned();
+        // Every handle below is derived from this one client. Building a second
+        // one for the owner would give the generation two clients with separate
+        // in-memory state, and they would disagree about the same lake -- a
+        // table dropped through one still resolving through the other.
+        let novarocks_catalog = crate::catalog::factory::NovaRocksCatalogFactory::adopt(
+            control_state.configuration(),
+            &catalog,
+        )?;
         Ok(Self {
             control_state,
             resources,
-            catalog: Arc::clone(catalog.generic()),
-            hadoop_catalog: catalog.hadoop().cloned(),
-            rest_catalog,
+            novarocks_catalog,
+            drop_cleanup: Arc::new(crate::catalog_control::drop_cleanup::DropCleanupQueue::new()),
             write_activations: Arc::new(
                 crate::write_activation::IcebergWriteActivationReservations::default(),
             ),
@@ -77,21 +94,19 @@ impl IcebergControlRuntime {
         &self.control_state
     }
 
-    pub(crate) fn catalog(&self) -> &Arc<dyn crate::iceberg::Catalog> {
-        &self.catalog
+    /// The generation's single catalog owner.
+    pub(crate) fn novarocks_catalog(&self) -> &Arc<dyn crate::catalog::NovaRocksCatalog> {
+        &self.novarocks_catalog
     }
 
-    pub(crate) fn rest_catalog(&self) -> Option<&Arc<crate::iceberg_catalog_rest::RestCatalog>> {
-        self.rest_catalog.as_ref()
-    }
-
-    pub(crate) fn hadoop_catalog(
+    /// Proven-committed drops awaiting their collection pass.
+    pub(crate) fn drop_cleanup(
         &self,
-    ) -> Option<&Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>> {
-        self.hadoop_catalog.as_ref()
+    ) -> &Arc<crate::catalog_control::drop_cleanup::DropCleanupQueue> {
+        &self.drop_cleanup
     }
 
-    pub(crate) fn resources(&self) -> &IcebergControlResources {
+    pub(crate) fn resources(&self) -> &IcebergMetadataResources {
         &self.resources
     }
 
@@ -128,15 +143,17 @@ impl IcebergControlRuntime {
         }
         let ident = TableIdent::from_strs([namespace.as_str(), table.as_str()])
             .map_err(|error| invalid_request(format!("build Iceberg table identity: {error}")))?;
-        let catalog = Arc::clone(&self.catalog);
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target =
+            crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
         let loaded = self
             .resources
             .catalog_runtime()
-            .block_on(async move { catalog.load_table(&ident).await })
+            .block_on(async move { owner.load_table(target).await })
             .map_err(unavailable)?
             .map_err(|error| {
                 (
-                    catalog_error_kind(&error),
+                    error.kind(),
                     format!("load Iceberg table {namespace}.{table}: {error}"),
                 )
             })?;
@@ -150,51 +167,33 @@ impl IcebergControlRuntime {
     }
 
     pub(crate) fn list_namespaces(&self) -> Result<Vec<String>, String> {
-        let catalog = Arc::clone(&self.catalog);
-        let mut namespaces = self
-            .resources
+        let owner = Arc::clone(self.novarocks_catalog());
+        self.resources
             .catalog_runtime()
-            .block_on(async move { catalog.list_namespaces(None).await })?
-            .map_err(|error| format!("list Iceberg namespaces: {error}"))?
-            .into_iter()
-            .flat_map(|namespace| {
-                namespace
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|namespace| !namespace.starts_with('.'))
-            .collect::<Vec<_>>();
-        namespaces.sort();
-        namespaces.dedup();
-        Ok(namespaces)
+            .block_on(async move { owner.list_namespaces().await })?
+            .map_err(|error| format!("list Iceberg namespaces: {error}"))
     }
 
     pub(crate) fn namespace_exists(&self, namespace: &str) -> Result<bool, String> {
         let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
         let namespace_label = namespace.to_string();
-        let catalog = Arc::clone(&self.catalog);
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
         self.resources
             .catalog_runtime()
-            .block_on(async move { catalog.namespace_exists(&namespace).await })?
+            .block_on(async move { owner.namespace_exists(target).await })?
             .map_err(|error| format!("check Iceberg namespace {namespace_label}: {error}"))
     }
 
     pub(crate) fn list_tables(&self, namespace: &str) -> Result<Vec<String>, String> {
         let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
         let namespace_label = namespace.to_string();
-        let catalog = Arc::clone(&self.catalog);
-        let mut tables = self
-            .resources
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
+        self.resources
             .catalog_runtime()
-            .block_on(async move { catalog.list_tables(&namespace).await })?
-            .map_err(|error| format!("list Iceberg tables in {namespace_label}: {error}"))?
-            .into_iter()
-            .map(|table| table.name)
-            .collect::<Vec<_>>();
-        tables.sort();
-        tables.dedup();
-        Ok(tables)
+            .block_on(async move { owner.list_tables(target).await })?
+            .map_err(|error| format!("list Iceberg tables in {namespace_label}: {error}"))
     }
 
     pub(crate) fn table_exists(&self, namespace: &str, table: &str) -> Result<bool, String> {
@@ -203,10 +202,12 @@ impl IcebergControlRuntime {
             normalize_identifier(table)?,
         );
         let ident_label = ident.to_string();
-        let catalog = Arc::clone(&self.catalog);
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target =
+            crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
         self.resources
             .catalog_runtime()
-            .block_on(async move { catalog.table_exists(&ident).await })?
+            .block_on(async move { owner.table_exists(target).await })?
             .map_err(|error| format!("check Iceberg table {ident_label}: {error}"))
     }
 
@@ -227,39 +228,13 @@ fn unavailable(message: String) -> (ConnectorErrorKind, String) {
     (ConnectorErrorKind::Unavailable, message)
 }
 
-/// Project a catalog client error onto the neutral connector classification.
-/// Only absence is special: everything else stays a retryable control-plane
-/// failure, exactly as the string-returning path reports it.
-fn catalog_error_kind(error: &crate::iceberg::Error) -> ConnectorErrorKind {
-    if matches!(
-        error.kind(),
-        crate::iceberg::ErrorKind::TableNotFound | crate::iceberg::ErrorKind::NamespaceNotFound
-    ) {
-        return ConnectorErrorKind::NotFound;
-    }
-    // Catalog backends disagree about how to tag a missing table — the REST
-    // client reports `Unexpected` — so absence is also recognized from the
-    // wording each backend normalizes to.
-    let message = error.to_string().to_ascii_lowercase();
-    if message.contains("not found")
-        || message.contains("does not exist")
-        || message.contains("unknown table")
-        || message.contains("no metadata files")
-    {
-        return ConnectorErrorKind::NotFound;
-    }
-    ConnectorErrorKind::Unavailable
-}
-
-impl std::fmt::Debug for IcebergControlRuntime {
+impl std::fmt::Debug for IcebergMetadataContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("IcebergControlRuntime")
+            .debug_struct("IcebergMetadataContext")
             .field("control_state", &"<provider catalog state>")
             .field("resources", &self.resources)
             .field("catalog", &"<provider catalog client>")
-            .field("hadoop_catalog", &self.hadoop_catalog.is_some())
-            .field("rest_catalog", &self.rest_catalog.is_some())
             .finish()
     }
 }
@@ -290,13 +265,27 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let control = IcebergControlResources::new(binding, runtime.handle().clone());
-        let generation =
-            IcebergControlRuntime::try_new(IcebergCatalogControlState::new(configuration), control)
-                .expect("generation runtime");
+        let control = IcebergMetadataResources::new(binding, runtime.handle().clone());
+        let generation = IcebergMetadataContext::try_new(
+            IcebergCatalogControlState::new(configuration),
+            control,
+        )
+        .expect("generation runtime");
 
         assert_eq!(generation.control_state().properties().len(), 2);
-        assert!(Arc::strong_count(generation.catalog()) >= 1);
         assert!(Arc::strong_count(generation.write_activation_reservations()) >= 1);
+
+        // Every vendored handle the generation hands out is the same
+        // allocation. Two clients built from one configuration would have
+        // separate in-memory state and disagree about the same lake -- a table
+        // dropped through one would still resolve through the other. That held
+        // once during development and cost a passing test to find, which is why
+        // the context now has no second handle to get wrong.
+        let first = generation.novarocks_catalog().vendored_client();
+        let second = generation.novarocks_catalog().vendored_client();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a generation must hold exactly one catalog client"
+        );
     }
 }

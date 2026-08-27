@@ -828,13 +828,13 @@ impl RestCatalog {
             }
             StatusCode::NOT_FOUND => {
                 return Err(Error::new(
-                    ErrorKind::Unexpected,
+                    ErrorKind::NamespaceNotFound,
                     "Tried to create a table under a namespace that does not exist",
                 ));
             }
             StatusCode::CONFLICT => {
                 return Err(Error::new(
-                    ErrorKind::Unexpected,
+                    ErrorKind::TableAlreadyExists,
                     "The table already exists",
                 ));
             }
@@ -1186,7 +1186,7 @@ impl Catalog for RestCatalog {
             }
             StatusCode::NOT_FOUND => {
                 return Err(Error::new(
-                    ErrorKind::Unexpected,
+                    ErrorKind::TableNotFound,
                     "Tried to load a table that does not exist",
                 ));
             }

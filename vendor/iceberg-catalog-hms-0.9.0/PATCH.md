@@ -24,3 +24,18 @@
 Its `iceberg` dependency (`version = "0.9.0"`) is redirected to
 `vendor/iceberg-0.9.0` by the root `[patch.crates-io]` block, the same way
 `iceberg-catalog-rest` is.
+
+
+- `src/catalog.rs` `load_table` / `get_namespace`: gave a missing table or
+  database the error kind the metastore's own answer proves. Upstream funnels
+  every thrift exception -- `NoSuchObjectException` included -- through
+  `from_thrift_exception` into the generic `Unexpected`, so a caller cannot tell
+  "the metastore says it is not there" from "the metastore could not be
+  reached". `table_exists` and `namespace_exists` in the same file already match
+  the typed `O2(NoSuchObjectException)` / `O1(NoSuchObjectException)` variants,
+  which makes this an internal inconsistency rather than an upstream choice.
+  `load_table` now returns `TableNotFound` and `get_namespace` returns
+  `NamespaceNotFound`; real thrift failures keep `Unexpected`. NovaRocks
+  classifies absence from the error kind alone (there is no message-sniffing
+  fallback), so without this a Hive catalog would report an absent table as an
+  unavailable control plane.

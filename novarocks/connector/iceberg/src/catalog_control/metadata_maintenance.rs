@@ -45,8 +45,8 @@ use crate::commit::snapshot_lifecycle_helpers::expire_snapshots::{
     ExpireParams, run_expire_snapshots_once_with_marker,
 };
 use crate::commit::snapshot_lifecycle_helpers::rewrite_manifests::run_rewrite_manifests_once_with_marker;
-use crate::control_provider::IcebergTablePayload;
-use crate::control_runtime::IcebergControlRuntime;
+use crate::metadata::IcebergTablePayload;
+use crate::metadata_context::IcebergMetadataContext;
 
 const PAYLOAD_VERSION: u16 = 1;
 const MARKER_VERSION: u16 = 1;
@@ -125,7 +125,7 @@ struct TerminalRecord {
 pub(crate) struct IcebergMetadataMaintenanceAdapter {
     key: ConnectorExecutionBindingKey,
     descriptor: ConnectorInstanceDescriptor,
-    runtime: Arc<IcebergControlRuntime>,
+    runtime: Arc<IcebergMetadataContext>,
     plans: Mutex<HashMap<ConnectorMutationOperationId, CachedPlan>>,
     terminal: Mutex<HashMap<ConnectorMutationOperationId, TerminalRecord>>,
 }
@@ -133,7 +133,7 @@ pub(crate) struct IcebergMetadataMaintenanceAdapter {
 impl IcebergMetadataMaintenanceAdapter {
     pub(crate) fn new(
         key: ConnectorExecutionBindingKey,
-        runtime: Arc<IcebergControlRuntime>,
+        runtime: Arc<IcebergMetadataContext>,
     ) -> Result<Self, ConnectorError> {
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")?,
@@ -383,7 +383,7 @@ impl IcebergMetadataMaintenanceAdapter {
         self.runtime
             .control_state()
             .invalidate_table_cache(&payload.namespace, &payload.table);
-        let catalog = Arc::clone(self.runtime.catalog());
+        let catalog = self.runtime.novarocks_catalog().vendored_client();
         let loaded = self
             .runtime
             .load_table(&payload.namespace, &payload.table)
@@ -915,7 +915,7 @@ mod tests {
 
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
-    use crate::resources::IcebergControlResources;
+    use crate::resources::IcebergMetadataResources;
 
     struct NeverCancelled;
 
@@ -962,9 +962,9 @@ mod tests {
             )),
         );
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
-                IcebergControlResources::new(binding, executor.handle().clone()),
+                IcebergMetadataResources::new(binding, executor.handle().clone()),
             )
             .expect("control runtime"),
         );

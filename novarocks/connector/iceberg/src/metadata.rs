@@ -51,7 +51,6 @@ use novarocks_spi::connector::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::control_runtime::IcebergControlRuntime;
 use crate::file_reader::distributed_rewrite_reader::{
     ICEBERG_REWRITE_POSITION_SPLIT_V1, IcebergRewritePositionSplitPayloadV1,
 };
@@ -66,6 +65,7 @@ use crate::manifest::{
 use crate::metadata_batch_reader::{
     MetadataTableType, metadata_output_schema, metadata_table_output_columns,
 };
+use crate::metadata_context::IcebergMetadataContext;
 use crate::planning_facts::{IcebergTablePlanningFactsInput, table_planning_facts};
 use crate::scan_model::{
     IcebergDataFileInfo, IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain,
@@ -80,18 +80,18 @@ use novarocks_spi::connector::{
 };
 
 #[derive(Clone)]
-pub struct IcebergControlProvider {
+pub struct IcebergMetadata {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
     binding_key: ConnectorExecutionBindingKey,
-    runtime: Arc<IcebergControlRuntime>,
+    runtime: Arc<IcebergMetadataContext>,
 }
 
-impl IcebergControlProvider {
+impl IcebergMetadata {
     pub(crate) fn new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ConnectorInstanceIncarnation,
-        runtime: Arc<IcebergControlRuntime>,
+        runtime: Arc<IcebergMetadataContext>,
     ) -> Self {
         let binding_key = ConnectorExecutionBindingKey {
             instance_id: descriptor.instance_id.clone(),
@@ -113,7 +113,7 @@ impl IcebergControlProvider {
         self.incarnation
     }
 
-    pub(crate) fn runtime(&self) -> &Arc<IcebergControlRuntime> {
+    pub(crate) fn runtime(&self) -> &Arc<IcebergMetadataContext> {
         &self.runtime
     }
 
@@ -263,7 +263,7 @@ impl IcebergControlProvider {
     }
 }
 
-impl ConnectorMetadata for IcebergControlProvider {
+impl ConnectorMetadata for IcebergMetadata {
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.descriptor.instance_id
     }
@@ -565,7 +565,7 @@ impl ConnectorMetadata for IcebergControlProvider {
     }
 }
 
-impl ConnectorScanPlanning for IcebergControlProvider {
+impl ConnectorScanPlanning for IcebergMetadata {
     fn instance_id(&self) -> &ConnectorInstanceId {
         &self.descriptor.instance_id
     }
@@ -933,7 +933,7 @@ impl ConnectorScanPlanning for IcebergControlProvider {
     }
 }
 
-impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
+impl ConnectorStagedPublicationRecovery for IcebergMetadata {
     fn binding_key(&self) -> &ConnectorExecutionBindingKey {
         &self.binding_key
     }
@@ -975,7 +975,7 @@ impl ConnectorStagedPublicationRecovery for IcebergControlProvider {
     }
 }
 
-impl IcebergControlProvider {
+impl IcebergMetadata {
     fn plan_change_window_splits(
         &self,
         scan: &IcebergScanPayload,
@@ -1749,7 +1749,7 @@ fn split_name_mapping(table: &IcebergTablePayload) -> Result<Option<String>, Con
 
 #[allow(clippy::too_many_arguments)]
 fn push_data_split(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     scan: &IcebergScanPayload,
     name_mapping: &Option<String>,
     splits: &mut Vec<ConnectorSplit>,
@@ -2178,7 +2178,7 @@ mod staged_publication_recovery_tests {
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
     use crate::iceberg::{NamespaceIdent, TableCreation};
-    use crate::resources::IcebergControlResources;
+    use crate::resources::IcebergMetadataResources;
 
     struct NeverCancelled;
 
@@ -2201,7 +2201,7 @@ mod staged_publication_recovery_tests {
     fn provider_with_empty_table() -> (
         tokio::runtime::Runtime,
         tempfile::TempDir,
-        IcebergControlProvider,
+        IcebergMetadata,
         crate::iceberg::table::Table,
     ) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
@@ -2220,9 +2220,9 @@ mod staged_publication_recovery_tests {
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
         );
-        let resources = IcebergControlResources::new(binding, executor.handle().clone());
+        let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
                 resources,
             )
@@ -2232,12 +2232,12 @@ mod staged_publication_recovery_tests {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
             instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
         };
-        let provider = IcebergControlProvider::new(
+        let provider = IcebergMetadata::new(
             descriptor,
             ConnectorInstanceIncarnation::from_bytes([7; 16]),
             Arc::clone(&runtime),
         );
-        let catalog = Arc::clone(runtime.catalog());
+        let catalog = runtime.novarocks_catalog().vendored_client();
         let table = executor.block_on(async move {
             let namespace = NamespaceIdent::new("db".to_string());
             catalog
@@ -2285,7 +2285,7 @@ mod staged_publication_recovery_tests {
     }
 
     fn recovery_descriptor(
-        provider: &IcebergControlProvider,
+        provider: &IcebergMetadata,
         instance_id: ConnectorInstanceId,
     ) -> ConnectorStagedPublicationDescriptor {
         ConnectorStagedPublicationDescriptor::try_new(
@@ -2340,7 +2340,7 @@ mod plan_splits_pruning_tests {
     use super::*;
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
-    use crate::resources::IcebergControlResources;
+    use crate::resources::IcebergMetadataResources;
     use crate::scan_model::{
         IcebergColumnStats, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
         IcebergPhysicalPredicateValue,
@@ -2364,11 +2364,7 @@ mod plan_splits_pruning_tests {
         .expect("request context")
     }
 
-    fn provider() -> (
-        tokio::runtime::Runtime,
-        tempfile::TempDir,
-        IcebergControlProvider,
-    ) {
+    fn provider() -> (tokio::runtime::Runtime, tempfile::TempDir, IcebergMetadata) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let configuration = crate::catalog_config::parse_catalog_configuration(
@@ -2385,15 +2381,15 @@ mod plan_splits_pruning_tests {
             Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
         );
-        let resources = IcebergControlResources::new(binding, executor.handle().clone());
+        let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
                 resources,
             )
             .expect("control runtime"),
         );
-        let provider = IcebergControlProvider::new(
+        let provider = IcebergMetadata::new(
             ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
                 instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
@@ -2435,7 +2431,7 @@ mod plan_splits_pruning_tests {
     }
 
     fn plan(
-        provider: &IcebergControlProvider,
+        provider: &IcebergMetadata,
         files: Vec<IcebergDataFileInfo>,
         predicates: Vec<IcebergPhysicalPredicate>,
     ) -> ConnectorSplitPlanningMetrics {

@@ -29,9 +29,9 @@ use crate::state_store_config::{
 use crate::state_store_limits::resolve_state_store_limits;
 use novarocks_backend::{BackendServerConfig, QueryLifecycleRegistryConfig};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-use novarocks_connector_iceberg::control_factory::IcebergControlFactory;
+use novarocks_connector_iceberg::connector_factory::IcebergConnectorFactory;
 use novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller;
-use novarocks_connector_iceberg::resources::{IcebergControlResources, IcebergExecutionResources};
+use novarocks_connector_iceberg::resources::{IcebergExecutionResources, IcebergMetadataResources};
 use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStorageLakePublication,
     IcebergStorageLakeTargetSnapshotObservation, IcebergStoragePartitionTransform,
@@ -680,7 +680,7 @@ pub fn compose_frontend_control_factories(
     // The observer runs while the control generation is being created, so the
     // typed entry and the SPI binding become visible together.
     let sink = std::sync::Arc::clone(&typed_control);
-    let factory = IcebergControlFactory::new(IcebergControlResources::new(
+    let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
         IcebergReadBinding::from_resources(planning_resources),
         runtime,
     ))

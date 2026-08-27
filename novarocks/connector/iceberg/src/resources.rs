@@ -59,12 +59,12 @@ impl std::fmt::Debug for IcebergCatalogRuntime {
 }
 
 #[derive(Clone)]
-pub struct IcebergControlResources {
+pub struct IcebergMetadataResources {
     planning_binding: IcebergReadBinding,
     catalog_runtime: IcebergCatalogRuntime,
 }
 
-impl IcebergControlResources {
+impl IcebergMetadataResources {
     pub fn new(
         planning_binding: IcebergReadBinding,
         catalog_runtime: tokio::runtime::Handle,
@@ -84,10 +84,10 @@ impl IcebergControlResources {
     }
 }
 
-impl std::fmt::Debug for IcebergControlResources {
+impl std::fmt::Debug for IcebergMetadataResources {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("IcebergControlResources")
+            .debug_struct("IcebergMetadataResources")
             .field("planning_binding", &self.planning_binding)
             .field("catalog_runtime", &self.catalog_runtime)
             .finish()
@@ -167,7 +167,7 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let control = IcebergControlResources::new(binding.clone(), runtime.handle().clone());
+        let control = IcebergMetadataResources::new(binding.clone(), runtime.handle().clone());
         let execution = IcebergExecutionResources::new(binding.clone(), runtime.handle().clone());
 
         assert_eq!(

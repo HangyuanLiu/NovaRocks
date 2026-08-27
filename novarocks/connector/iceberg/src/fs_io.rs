@@ -76,12 +76,12 @@ impl IcebergFsAccess {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct IcebergFsStorageFactory {
+pub struct IcebergFileSystemFactory {
     #[serde(skip, default)]
     object_store_config: Option<ObjectStoreConfig>,
 }
 
-impl IcebergFsStorageFactory {
+impl IcebergFileSystemFactory {
     pub fn new(object_store_config: Option<ObjectStoreConfig>) -> Self {
         Self {
             object_store_config,
@@ -90,7 +90,7 @@ impl IcebergFsStorageFactory {
 }
 
 #[typetag::serde]
-impl StorageFactory for IcebergFsStorageFactory {
+impl StorageFactory for IcebergFileSystemFactory {
     fn build(&self, _config: &StorageConfig) -> Result<Arc<dyn Storage>> {
         Ok(Arc::new(IcebergFsStorage::new(
             self.object_store_config.clone(),
@@ -372,7 +372,7 @@ pub fn build_file_io_for_location(
     // only when actual IO starts, so this helper stores credentials here and
     // leaves location validation to the per-operation FsAccessResolver call.
     let _ = location;
-    FileIOBuilder::new(Arc::new(IcebergFsStorageFactory::new(
+    FileIOBuilder::new(Arc::new(IcebergFileSystemFactory::new(
         object_store_config.cloned(),
     )))
     .build()
@@ -385,7 +385,7 @@ pub fn build_storage_factory_for_location(
     // StorageFactory construction is lazy for the same reason FileIO is: keep
     // credentials here and resolve concrete operators per IO call.
     let _ = location;
-    Arc::new(IcebergFsStorageFactory::new(object_store_config.cloned()))
+    Arc::new(IcebergFileSystemFactory::new(object_store_config.cloned()))
 }
 
 pub fn resolve_access_for_location(

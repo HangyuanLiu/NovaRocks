@@ -32,9 +32,7 @@ use crate::iceberg::spec::{
     Snapshot, SnapshotReference, SnapshotRetention, Summary,
 };
 use crate::iceberg::table::Table;
-use crate::iceberg::transaction::{
-    ActionCommit, ApplyTransactionAction, Transaction, TransactionAction,
-};
+use crate::iceberg::transaction::{ActionCommit, TransactionAction};
 use crate::iceberg::{TableRequirement, TableUpdate};
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -120,14 +118,27 @@ impl IcebergCommitAction for RewriteDataFilesCommit {
             snapshot_properties: ctx.snapshot_properties.clone(),
         };
 
-        let tx = Transaction::new(ctx.table);
-        let tx = action
-            .apply(tx)
-            .map_err(|e| format!("RewriteDataFiles apply failed: {e}"))?;
-        let table_after = tx
-            .commit(ctx.catalog)
-            .await
-            .map_err(|e| format!("RewriteDataFiles commit failed: {e}"))?;
+        // Every other commit action in this module submits through the
+        // provider's own OCC path, which dispatches once and retries only on a
+        // conflict the catalog definitely rejected. This one went through the
+        // vendored `Transaction::commit`, which retries on `Error::retryable()`
+        // -- a predicate that includes a lost response, so the same rewrite
+        // could be sent twice with no way to tell.
+        let table_after = match crate::commit::helpers::submit_occ_action(
+            ctx.catalog,
+            ctx.table,
+            std::sync::Arc::new(action),
+            "RewriteDataFiles",
+            None,
+        )
+        .await
+        {
+            Ok(crate::commit::helpers::OccSubmit::Committed(table_after)) => table_after,
+            // A rewrite always stages a snapshot, so it never proves itself a
+            // no-op; report the base head rather than inventing an outcome.
+            Ok(crate::commit::helpers::OccSubmit::NoOp) => ctx.table.clone(),
+            Err(error) => return Err(error.into_detail()),
+        };
         let new_snapshot_id = table_after
             .metadata()
             .current_snapshot()

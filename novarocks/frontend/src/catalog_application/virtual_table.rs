@@ -164,9 +164,9 @@ fn rewrite_table_factor(
             // in the registry and scan it against the local InMemoryCatalog.
             //
             // For any other 3-part name with an admitted external connector,
-            // intercept `information_schema.schemata` through its exact control
-            // generation.  This bypasses the provider table-load path, which
-            // cannot represent a catalog namespace scan.
+            // intercept `information_schema.{schemata,tables}` through its exact
+            // control generation.  This bypasses the provider table-load path,
+            // which cannot represent a catalog namespace or table scan.
             //
             // We do NOT match plain 1-part references because the session's current
             // database may legitimately shadow them with a real table.
@@ -177,12 +177,14 @@ fn rewrite_table_factor(
                 }
                 [cat, db, tbl]
                     if db.eq_ignore_ascii_case(INFORMATION_SCHEMA_DB)
-                        && tbl.eq_ignore_ascii_case("schemata") =>
+                        && (tbl.eq_ignore_ascii_case("schemata")
+                            || tbl.eq_ignore_ascii_case("tables")) =>
                 {
-                    // External catalog 3-part name: `<cat>.information_schema.schemata`.
-                    // Unknown catalogs remain untouched so downstream resolution
-                    // preserves its normal error. Every successful admission keeps
-                    // one lease for the complete namespace lookup.
+                    // External catalog 3-part name:
+                    // `<cat>.information_schema.{schemata,tables}`. Unknown
+                    // catalogs remain untouched so downstream resolution
+                    // preserves its normal error. Every successful admission
+                    // keeps one lease for the complete lookup.
                     let context = crate::connector::connector_request_context(
                         None,
                         Arc::new(AtomicBool::new(false)),
@@ -190,6 +192,10 @@ fn rewrite_table_factor(
                     match crate::connector::acquire_metadata_planning_lease(connector_control, cat)
                     {
                         Ok(lease) => {
+                            // Both listings must come from the same admitted
+                            // generation, so the lease is shared rather than
+                            // re-acquired between them.
+                            let listing_lease = lease.clone();
                             let namespaces =
                                 crate::connector::metadata_list_namespaces_with_planning_lease(
                                     lease, context,
@@ -200,16 +206,35 @@ fn rewrite_table_factor(
                                 .collect::<Vec<_>>();
                             databases.sort();
                             databases.dedup();
+                            // Enumerating tables is one catalog read per
+                            // namespace, so only the provider that needs them
+                            // pays for it.
+                            let mut table_names: Vec<(String, String)> = Vec::new();
+                            if tbl.eq_ignore_ascii_case("tables") {
+                                for database in &databases {
+                                    let context = crate::connector::connector_request_context(
+                                        None,
+                                        Arc::new(AtomicBool::new(false)),
+                                    )?;
+                                    let tables =
+                                        crate::connector::metadata_list_tables_with_planning_lease(
+                                            &listing_lease,
+                                            context,
+                                            database,
+                                        )?;
+                                    table_names.extend(
+                                        tables.into_iter().map(|table| (database.clone(), table)),
+                                    );
+                                }
+                            }
                             let inputs =
                                 crate::catalog_application::system_catalog::SystemCatalogInputs {
                                     catalog_name: cat,
                                     schema_names: &databases,
+                                    table_names: &table_names,
                                 };
-                            let Some(data) = system_catalog.resolve(
-                                INFORMATION_SCHEMA_DB,
-                                "schemata",
-                                &inputs,
-                            )?
+                            let Some(data) =
+                                system_catalog.resolve(INFORMATION_SCHEMA_DB, tbl, &inputs)?
                             else {
                                 return Ok(());
                             };
@@ -247,6 +272,10 @@ fn rewrite_table_factor(
             let inputs = crate::catalog_application::system_catalog::SystemCatalogInputs {
                 catalog_name: "default_catalog",
                 schema_names: &schema_names,
+                // The local catalog's table listing is not wired here yet; the
+                // hole this closes is on external catalogs, where DROP DATABASE
+                // FORCE is the only way to remove a non-empty namespace.
+                table_names: &[],
             };
             let Some(data) = system_catalog.resolve(&db, &tbl, &inputs)? else {
                 return Ok(());

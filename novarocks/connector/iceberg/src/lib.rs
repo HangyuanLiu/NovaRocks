@@ -28,15 +28,14 @@
 pub const PROVIDER_ID: &str = "iceberg";
 
 pub mod access_binding;
+pub(crate) mod catalog;
 pub mod catalog_cache;
 pub mod catalog_config;
 pub mod catalog_control;
 pub mod catalog_runtime;
 pub mod change_planning;
 pub mod commit;
-pub mod control_factory;
-pub mod control_provider;
-pub mod control_runtime;
+pub mod connector_factory;
 pub mod default_value;
 pub mod delete_file;
 pub mod delta;
@@ -48,7 +47,10 @@ pub mod fs_io;
 pub mod hadoop_catalog;
 pub mod loaded_table;
 pub mod manifest;
+pub mod metadata;
 pub mod metadata_batch_reader;
+pub mod metadata_context;
+pub mod metadata_factory;
 pub mod metadata_read;
 pub mod planning_facts;
 pub mod position_delete;

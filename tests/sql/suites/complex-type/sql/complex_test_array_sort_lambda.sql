@@ -328,4 +328,9 @@ select array_sort([1,3,2,1,3,6,100,200],(x,y)->-1)[1] <= array_max([1,3,2,1,3,6,
 
 -- query 57
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_sort_lambda FORCE;
+-- A catalog that cannot hold views cannot answer view enumeration, so
+-- DROP DATABASE ... FORCE is refused here rather than silently assuming
+-- the namespace holds none. Drop the tables explicitly instead.
+USE sql_tests_complex_test_array_sort_lambda;
+DROP TABLE IF EXISTS t0;
+DROP DATABASE IF EXISTS sql_tests_complex_test_array_sort_lambda;

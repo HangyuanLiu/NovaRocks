@@ -217,4 +217,9 @@ GROUP BY arrays_zip([1], ['test']);
 
 -- query 35
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_arrays_zip FORCE;
+-- A catalog that cannot hold views cannot answer view enumeration, so
+-- DROP DATABASE ... FORCE is refused here rather than silently assuming
+-- the namespace holds none. Drop the tables explicitly instead.
+USE sql_tests_complex_test_arrays_zip;
+DROP TABLE IF EXISTS arrays_zip_test;
+DROP DATABASE IF EXISTS sql_tests_complex_test_arrays_zip;

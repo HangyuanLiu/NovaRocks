@@ -31,11 +31,11 @@ use crate::catalog_control::metadata_maintenance::IcebergMetadataMaintenanceAdap
 use crate::catalog_control::staged_create::IcebergStagedCreateAdapter;
 use crate::catalog_control::unanchored_ctas_cleanup::IcebergUnanchoredCtasCleanupAdapter;
 use crate::commit::IcebergWriteControl;
-use crate::control_provider::IcebergControlProvider;
-use crate::control_runtime::IcebergControlRuntime;
 use crate::distributed_rewrite::IcebergDistributedRewriteControl;
 use crate::execution_declaration::IcebergInstanceDistribution;
-use crate::resources::IcebergControlResources;
+use crate::metadata::IcebergMetadata;
+use crate::metadata_context::IcebergMetadataContext;
+use crate::resources::IcebergMetadataResources;
 use novarocks_spi::connector::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
     ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
@@ -57,14 +57,14 @@ pub type IcebergTypedBoundaryObserver = Arc<
 >;
 
 #[derive(Clone)]
-pub struct IcebergControlFactory {
-    control_resources: IcebergControlResources,
+pub struct IcebergConnectorFactory {
+    control_resources: IcebergMetadataResources,
     provider_id: ConnectorProviderId,
     typed_boundary_observer: Option<IcebergTypedBoundaryObserver>,
 }
 
-impl IcebergControlFactory {
-    pub fn new(control_resources: IcebergControlResources) -> Self {
+impl IcebergConnectorFactory {
+    pub fn new(control_resources: IcebergMetadataResources) -> Self {
         Self {
             control_resources,
             provider_id: ConnectorProviderId::parse(PROVIDER_ID)
@@ -118,7 +118,7 @@ impl IcebergControlFactory {
         }
         let durable_properties = sanitize_durable_properties(&configuration.properties);
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
                 self.control_resources.clone(),
             )
@@ -131,7 +131,7 @@ impl IcebergControlFactory {
     }
 }
 
-impl ConnectorControlFactory for IcebergControlFactory {
+impl ConnectorControlFactory for IcebergConnectorFactory {
     fn provider_id(&self) -> &ConnectorProviderId {
         self.provider_id()
     }
@@ -146,7 +146,7 @@ impl ConnectorControlFactory for IcebergControlFactory {
             instance_id: request.instance_id().clone(),
         };
         let incarnation = ConnectorInstanceIncarnation::new();
-        let provider = Arc::new(IcebergControlProvider::new(
+        let provider = Arc::new(IcebergMetadata::new(
             descriptor.clone(),
             incarnation,
             Arc::clone(&unpublished.runtime),
@@ -191,31 +191,32 @@ impl ConnectorControlFactory for IcebergControlFactory {
             key.clone(),
             Arc::clone(&unpublished.runtime),
         )?);
-        let staged_create = if unpublished.runtime.rest_catalog().is_some() {
-            Some(Arc::new(IcebergStagedCreateAdapter::try_new(
-                Arc::clone(&provider),
-                Arc::clone(&write_control),
-            )?))
-        } else {
-            None
-        };
-        let unanchored_ctas_cleanup = if unpublished.runtime.rest_catalog().is_some() {
-            match IcebergUnanchoredCtasCleanupAdapter::try_new(
-                descriptor.clone(),
-                incarnation,
-                Arc::clone(&unpublished.runtime),
-            ) {
-                Ok(capability) => Some(Arc::new(capability)),
-                // This is an optional CTAS-only capability. A REST catalog
-                // without a warehouse that can safely enumerate/delete the
-                // unanchored namespace must still attach for reads and normal
-                // table operations; CTAS fails typed Unsupported before its
-                // first source or catalog-write side effect.
-                Err(error) if error.kind() == ConnectorErrorKind::Unsupported => None,
-                Err(error) => return Err(error),
-            }
-        } else {
-            None
+        // Slot presence answers "does this provider implement this operation
+        // family", which is a property of the Iceberg connector, not of the
+        // catalog this generation happens to be pointed at. Gating on
+        // `rest_catalog().is_some()` conflated the two and made an absent slot
+        // stand in for an unsupported request.
+        //
+        // The adapters therefore attach for every generation, and whether a
+        // specific request is supported is decided by the catalog owner at
+        // admission, before the first side effect.
+        let staged_create = Some(Arc::new(IcebergStagedCreateAdapter::try_new(
+            Arc::clone(&provider),
+            Arc::clone(&write_control),
+        )?));
+        let unanchored_ctas_cleanup = match IcebergUnanchoredCtasCleanupAdapter::try_new(
+            descriptor.clone(),
+            incarnation,
+            Arc::clone(&unpublished.runtime),
+        ) {
+            Ok(capability) => Some(Arc::new(capability)),
+            // Sweeping the unanchored namespace needs a warehouse this
+            // generation can enumerate and delete under. A catalog without one
+            // still attaches for reads and ordinary table operations; CTAS is
+            // what cannot run, and it is refused at admission rather than by a
+            // missing slot here.
+            Err(error) if error.kind() == ConnectorErrorKind::Unsupported => None,
+            Err(error) => return Err(error),
         };
         let binding = ConnectorControlBinding::try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
                 descriptor.clone(),
@@ -244,13 +245,13 @@ impl ConnectorControlFactory for IcebergControlFactory {
 #[allow(dead_code)] // Held until the provider has assembled every capability.
 #[derive(Debug)]
 pub struct IcebergUnpublishedControl {
-    runtime: Arc<IcebergControlRuntime>,
+    runtime: Arc<IcebergMetadataContext>,
     durable_properties: Vec<(String, String)>,
 }
 
 #[allow(dead_code)]
 impl IcebergUnpublishedControl {
-    pub(crate) fn runtime(&self) -> &Arc<IcebergControlRuntime> {
+    pub(crate) fn runtime(&self) -> &Arc<IcebergMetadataContext> {
         &self.runtime
     }
 
@@ -338,7 +339,7 @@ mod tests {
     }
 
     fn rest_factory_request(
-        factory: &IcebergControlFactory,
+        factory: &IcebergConnectorFactory,
         uri: String,
         extra: Vec<(String, String)>,
     ) -> ConnectorControlFactoryRequest {
@@ -394,7 +395,7 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
             runtime.handle().clone(),
         ));
@@ -422,7 +423,7 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
             runtime.handle().clone(),
         ));
@@ -448,7 +449,8 @@ mod tests {
                 .iter()
                 .all(|(key, _)| !credential_like_property(key))
         );
-        assert!(Arc::strong_count(unpublished.runtime().catalog()) >= 1);
+        let client = unpublished.runtime().novarocks_catalog().vendored_client();
+        assert!(Arc::strong_count(&client) >= 1);
     }
 
     #[test]
@@ -460,7 +462,7 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
             runtime.handle().clone(),
         ));
@@ -503,7 +505,7 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
             runtime.handle().clone(),
         ));
@@ -561,7 +563,7 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
             runtime.handle().clone(),
         ));
@@ -625,9 +627,21 @@ mod tests {
             cleanup.binding_key().incarnation,
             creation.binding().incarnation()
         );
+        // The slot says the Iceberg connector implements staged creation, not
+        // that this catalog can serve any particular request. A Hadoop
+        // generation installs it and refuses CTAS at admission instead.
         assert!(
-            creation.binding().staged_create().is_none(),
-            "Hadoop generations must not expose REST-only staged create"
+            creation.binding().staged_create().is_some(),
+            "every Iceberg generation installs the staged-create adapter"
+        );
+        // The sweeper attaches too, and deliberately does not ask whether this
+        // catalog can CTAS. One that cannot has never staged anything
+        // unanchored, so the sweep finds nothing; gating it here would replace
+        // the catalog's own explanation of why CTAS is impossible with a
+        // generic "no cleanup capability" from the lease derivation.
+        assert!(
+            creation.binding().unanchored_ctas_cleanup().is_some(),
+            "the sweeper attaches wherever its warehouse is usable"
         );
         let recovery = creation
             .binding()
@@ -655,7 +669,7 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
             runtime.handle().clone(),
         ));
@@ -681,7 +695,7 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
             runtime.handle().clone(),
         ));
@@ -706,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn hive_factory_does_not_expose_rest_staged_create() {
+    fn hive_generation_installs_the_staged_create_adapter_and_refuses_at_admission() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let binding = crate::access_binding::IcebergReadBinding::new(
@@ -715,7 +729,7 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let factory = IcebergControlFactory::new(IcebergControlResources::new(
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
             binding,
             runtime.handle().clone(),
         ));
@@ -737,9 +751,13 @@ mod tests {
         .expect("Hive factory request");
 
         let creation = factory.create_control(request).expect("Hive control");
+        // Slot presence answers "does this provider implement staged creation",
+        // which is a property of the connector. Whether *this* catalog can run
+        // a CTAS is a separate question, and it is answered by the catalog
+        // owner before the statement's source executes.
         assert!(
-            creation.binding().staged_create().is_none(),
-            "Hadoop/Hive catalogs must not expose REST-only staged create"
+            creation.binding().staged_create().is_some(),
+            "every Iceberg generation installs the staged-create adapter"
         );
     }
 }

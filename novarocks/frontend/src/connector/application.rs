@@ -291,6 +291,37 @@ pub fn metadata_list_namespaces_with_planning_lease(
         .map_err(|error| error.to_string())
 }
 
+/// Enumerate a namespace's tables through an admission-frozen connector control
+/// lease.
+///
+/// This is what makes a namespace's contents knowable to SQL. Without it a
+/// caller can only drop children it can already name, which is no help to
+/// anyone who did not create them.
+pub fn metadata_list_tables_with_planning_lease(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+    namespace: &str,
+) -> Result<Vec<String>, String> {
+    let instance_id = binding.binding().descriptor().instance_id.clone();
+    let mut tables = binding
+        .binding()
+        .metadata()
+        .list_tables(novarocks_spi::connector::ConnectorListTablesRequest {
+            namespace: novarocks_spi::connector::ConnectorNamespaceIdentity {
+                instance_id,
+                namespace: Arc::from(namespace),
+            },
+            context,
+        })
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|identity| identity.table.to_string())
+        .collect::<Vec<_>>();
+    tables.sort();
+    tables.dedup();
+    Ok(tables)
+}
+
 /// Read immutable branch/tag/snapshot facts through the same exact lease that
 /// admitted the table.  SQL owns the projection of these neutral facts.
 pub fn metadata_read_reference_facts_with_planning_lease(

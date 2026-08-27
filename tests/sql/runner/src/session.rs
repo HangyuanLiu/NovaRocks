@@ -447,15 +447,56 @@ pub fn execute_suite_hook(
     Ok(())
 }
 
+/// Names of the tables a case database currently holds.
+///
+/// `DROP DATABASE ... FORCE` expands into a listing of the namespace's
+/// children, so a catalog that cannot enumerate one kind of child refuses it.
+/// The harness therefore enumerates and drops explicitly, which works on every
+/// catalog.
+///
+/// The catalog qualifier is required: an unqualified `information_schema` name
+/// resolves against the local catalog, and a case database in an external
+/// catalog would come back empty.
+fn case_table_names(
+    conn: &ConnectionConfig,
+    query_timeout: u64,
+    db_name: &str,
+) -> Result<Vec<String>> {
+    let Some(catalog) = conn.catalog.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let sql = format!(
+        "SELECT table_name FROM `{catalog}`.information_schema.tables \
+         WHERE table_schema = '{db_name}';"
+    );
+    let output = match run_mysql_sql(conn, query_timeout, &sql) {
+        Ok(output) => output,
+        // A database that does not exist has no tables to drop, and the drop
+        // below is idempotent either way.
+        Err(_) => return Ok(Vec::new()),
+    };
+    Ok(output
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 pub fn reset_case_database(
     conn: &ConnectionConfig,
     query_timeout: u64,
     db_name: &str,
     label: &str,
 ) -> Result<()> {
-    let sql = format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;\nCREATE DATABASE `{db_name}`;");
-    run_mysql_sql(conn, query_timeout, &sql)
-        .with_context(|| format!("{} case database reset failed: {}", label, db_name))?;
+    drop_case_database(conn, query_timeout, db_name, label)?;
+    run_mysql_sql(
+        conn,
+        query_timeout,
+        &format!("CREATE DATABASE `{db_name}`;"),
+    )
+    .with_context(|| format!("{} case database reset failed: {}", label, db_name))?;
     Ok(())
 }
 
@@ -465,7 +506,21 @@ pub fn drop_case_database(
     db_name: &str,
     label: &str,
 ) -> Result<()> {
-    let sql = format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;");
+    // Without a catalog there is nothing to enumerate against, so the explicit
+    // path cannot see the children it would need to drop first. Fall back to
+    // FORCE, which is what the local catalog still supports and what this did
+    // everywhere before enumeration existed.
+    if conn.catalog.is_none() {
+        let sql = format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;");
+        run_mysql_sql(conn, query_timeout, &sql)
+            .with_context(|| format!("{} case database cleanup failed: {}", label, db_name))?;
+        return Ok(());
+    }
+    let mut sql = String::new();
+    for table in case_table_names(conn, query_timeout, db_name)? {
+        sql.push_str(&format!("DROP TABLE IF EXISTS `{db_name}`.`{table}`;\n"));
+    }
+    sql.push_str(&format!("DROP DATABASE IF EXISTS `{db_name}`;"));
     run_mysql_sql(conn, query_timeout, &sql)
         .with_context(|| format!("{} case database cleanup failed: {}", label, db_name))?;
     Ok(())

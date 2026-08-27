@@ -38,19 +38,18 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::naming::normalize_identifier;
 
-use crate::catalog_config::IcebergCatalogKind;
 use crate::commit::{RefActionOutcome, execute_ref_action, lower_ref_action};
-use crate::control_provider::IcebergControlProvider;
-use crate::control_runtime::IcebergControlRuntime;
 use crate::iceberg::spec::{
     FormatVersion, NestedField, Operation, PrimitiveType, Schema, Snapshot, SnapshotReference,
     SnapshotRetention, StructType, Summary, Transform, Type, UnboundPartitionField,
     UnboundPartitionSpec, UnboundPartitionSpecBuilder,
 };
-use crate::iceberg::transaction::{ApplyTransactionAction, Transaction};
+use crate::iceberg::transaction::Transaction;
 use crate::iceberg::{
     NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
 };
+use crate::metadata::IcebergMetadata;
+use crate::metadata_context::IcebergMetadataContext;
 use crate::reconcile_payload::{
     ICEBERG_MUTATION_EVIDENCE_VERSION, IcebergMutationEvidenceTarget, IcebergMutationEvidenceV1,
     decode_mutation_evidence, encode_mutation_evidence,
@@ -64,7 +63,7 @@ const COLUMN_AGGREGATION_PROPERTY_PREFIX: &str = "novarocks.column_agg.";
 const BOOTSTRAP_OPERATION_MARKER: &str = "novarocks.bootstrap.empty.operation-id";
 const INITIAL_PARTITION_FIELD_ID: i32 = 1000;
 
-impl ConnectorCatalogMutation for IcebergControlProvider {
+impl ConnectorCatalogMutation for IcebergMetadata {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         self.descriptor()
     }
@@ -80,17 +79,19 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
         if let Err(error) = validate_request(self, &request) {
             return Ok(known_uncommitted(error));
         }
-        if self.runtime().control_state().configuration().kind == IcebergCatalogKind::Hadoop
-            && let ConnectorCatalogMutationOperation::CreateTable {
-                table,
-                columns,
-                key,
-                partitioning,
-                properties,
-                policy,
-            } = &request.operation
+        // Every catalog creates through the create-table transaction. Which
+        // receipt shape comes back is decided by what the publication proof
+        // actually carries, not by asking which kind of catalog this is.
+        if let ConnectorCatalogMutationOperation::CreateTable {
+            table,
+            columns,
+            key,
+            partitioning,
+            properties,
+            policy,
+        } = &request.operation
         {
-            return execute_hadoop_create_table(
+            return execute_create_table(
                 self,
                 &request,
                 table,
@@ -219,7 +220,7 @@ impl ConnectorCatalogMutation for IcebergControlProvider {
 }
 
 fn validate_request(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
 ) -> Result<(), ConnectorError> {
     validate_context(&request.context)?;
@@ -251,11 +252,49 @@ fn validate_context(
     Ok(())
 }
 
+/// Run the operations whose result is an effect and nothing more.
+///
+/// Creating a table is deliberately not one of them, and the arm below says so
+/// rather than offering a weaker second create. A create publishes through a
+/// transaction and reports a three-state outcome carrying a receipt, which this
+/// return type cannot express; `execute_create_table` handles it before this is
+/// ever reached. Keeping a create path here is what let `IF NOT EXISTS` quietly
+/// diverge once, and one create path is the point of the owner.
+/// Translate a namespace mutation's three-state outcome into an effect.
+///
+/// Nothing is lost by returning two states here: the caller reads dispatch
+/// certainty off the error's kind and turns an unknown into `CommitUnknown`,
+/// so `Unavailable` is the unknown rather than a flat failure.
+fn namespace_effect(
+    outcome: crate::catalog::error::CatalogOutcome<crate::catalog::CatalogNamespaceName>,
+) -> Result<ExternalMutationEffect, ConnectorError> {
+    match outcome {
+        crate::catalog::error::CatalogOutcome::KnownCommitted { .. } => {
+            Ok(ExternalMutationEffect::Applied)
+        }
+        crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
+            Err(map_mutation_failure(&failure))
+        }
+        crate::catalog::error::CatalogOutcome::CommitUnknown { failure, .. } => {
+            Err(unavailable(failure.to_string()))
+        }
+        crate::catalog::error::CatalogOutcome::Unsupported(reason) => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            reason.message().to_string(),
+        )),
+    }
+}
+
 fn execute_operation(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation: &ConnectorCatalogMutationOperation,
 ) -> Result<ExternalMutationEffect, ConnectorError> {
     match operation {
+        ConnectorCatalogMutationOperation::CreateTable { .. } => Err(ConnectorError::new(
+            ConnectorErrorKind::Internal,
+            "Iceberg CREATE TABLE is published through the create-table transaction, \
+             so it must not reach the effect-only mutation path",
+        )),
         ConnectorCatalogMutationOperation::CreateNamespace { namespace, policy } => {
             ensure_owner(provider, &namespace.instance_id)?;
             let exists = provider
@@ -269,17 +308,17 @@ fn execute_operation(
                     Err(already_exists("Iceberg namespace already exists"))
                 };
             }
-            let namespace =
-                NamespaceIdent::new(normalize_identifier(&namespace.namespace).map_err(invalid)?);
-            let catalog = provider.runtime().catalog().clone();
-            provider
+            let namespace = crate::catalog::CatalogNamespaceName::new(
+                normalize_identifier(&namespace.namespace).map_err(invalid)?,
+            );
+            let owner = Arc::clone(provider.runtime().novarocks_catalog());
+            let outcome = provider
                 .runtime()
                 .resources()
                 .catalog_runtime()
-                .block_on(async move { catalog.create_namespace(&namespace, HashMap::new()).await })
-                .map_err(unavailable)?
-                .map_err(map_iceberg)?;
-            Ok(ExternalMutationEffect::Applied)
+                .block_on(async move { owner.create_namespace(namespace).await })
+                .map_err(unavailable)?;
+            namespace_effect(outcome)
         }
         ConnectorCatalogMutationOperation::DropNamespace { namespace, policy } => {
             ensure_owner(provider, &namespace.instance_id)?;
@@ -294,34 +333,18 @@ fn execute_operation(
                     Err(not_found("Iceberg namespace does not exist"))
                 };
             }
-            let namespace =
-                NamespaceIdent::new(normalize_identifier(&namespace.namespace).map_err(invalid)?);
-            let catalog = provider.runtime().catalog().clone();
-            provider
+            let namespace = crate::catalog::CatalogNamespaceName::new(
+                normalize_identifier(&namespace.namespace).map_err(invalid)?,
+            );
+            let owner = Arc::clone(provider.runtime().novarocks_catalog());
+            let outcome = provider
                 .runtime()
                 .resources()
                 .catalog_runtime()
-                .block_on(async move { catalog.drop_namespace(&namespace).await })
-                .map_err(unavailable)?
-                .map_err(map_iceberg)?;
-            Ok(ExternalMutationEffect::Applied)
+                .block_on(async move { owner.drop_namespace(namespace).await })
+                .map_err(unavailable)?;
+            namespace_effect(outcome)
         }
-        ConnectorCatalogMutationOperation::CreateTable {
-            table,
-            columns,
-            key,
-            partitioning,
-            properties,
-            policy,
-        } => create_table(
-            provider,
-            table,
-            columns,
-            key.as_ref(),
-            partitioning,
-            properties,
-            *policy,
-        ),
         ConnectorCatalogMutationOperation::DropTable {
             table,
             policy,
@@ -347,8 +370,8 @@ fn execute_operation(
                     "a table with the requested Iceberg view name already exists",
                 ));
             }
-            let exists = super::views::view_exists(provider.runtime(), &view.namespace, &view.view)
-                .map_err(map_view_error)?;
+            let exists =
+                super::views::view_exists(provider.runtime(), &view.namespace, &view.view)?;
             match (*policy, exists) {
                 (CreateOrReplacePolicy::NoOpIfExists, true) => {
                     return Ok(ExternalMutationEffect::NoOp);
@@ -373,8 +396,8 @@ fn execute_operation(
         }
         ConnectorCatalogMutationOperation::DropView { view, policy } => {
             ensure_owner(provider, &view.instance_id)?;
-            let exists = super::views::view_exists(provider.runtime(), &view.namespace, &view.view)
-                .map_err(map_view_error)?;
+            let exists =
+                super::views::view_exists(provider.runtime(), &view.namespace, &view.view)?;
             if !exists {
                 return if *policy == DropPolicy::NoOpIfMissing {
                     Ok(ExternalMutationEffect::NoOp)
@@ -419,7 +442,7 @@ fn execute_operation(
                 &table.table,
                 provider.descriptor().instance_id.as_str(),
             )?;
-            let catalog = provider.runtime().catalog().clone();
+            let catalog = provider.runtime().novarocks_catalog().vendored_client();
             let outcome = provider
                 .runtime()
                 .resources()
@@ -463,60 +486,19 @@ fn view_properties(
     Ok(validated.into_iter().collect())
 }
 
-fn create_table(
-    provider: &IcebergControlProvider,
-    table: &ConnectorTableIdentity,
-    columns: &[ConnectorColumnDefinition],
-    key: Option<&ConnectorTableKey>,
-    partitioning: &[ConnectorPartitionTransform],
-    properties: &[(Arc<str>, Arc<str>)],
-    policy: CreatePolicy,
-) -> Result<ExternalMutationEffect, ConnectorError> {
-    ensure_owner(provider, &table.instance_id)?;
-    if provider
-        .runtime()
-        .table_exists(&table.namespace, &table.table)
-        .map_err(unavailable)?
-    {
-        return if policy == CreatePolicy::NoOpIfExists {
-            Ok(ExternalMutationEffect::NoOp)
-        } else {
-            Err(already_exists("Iceberg table already exists"))
-        };
-    }
-    if !provider
-        .runtime()
-        .namespace_exists(&table.namespace)
-        .map_err(unavailable)?
-    {
-        return Err(not_found("Iceberg table namespace does not exist"));
-    }
-    let (namespace, creation) =
-        prepare_table_creation(provider, table, columns, key, partitioning, properties)?;
-    let catalog = provider.runtime().catalog().clone();
-    provider
-        .runtime()
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { catalog.create_table(&namespace, creation).await })
-        .map_err(unavailable)?
-        .map_err(map_iceberg)?;
-    provider
-        .runtime()
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(ExternalMutationEffect::Applied)
-}
-
+/// Build the neutral request's table definition.
+///
+/// It no longer takes the provider: the one thing it used it for was asking
+/// which catalog kind this is, so it could spell out the format version for
+/// REST. That belongs to the REST implementation, which now adds it itself.
 fn prepare_table_creation(
-    provider: &IcebergControlProvider,
     table: &ConnectorTableIdentity,
     columns: &[ConnectorColumnDefinition],
     key: Option<&ConnectorTableKey>,
     partitioning: &[ConnectorPartitionTransform],
     properties: &[(Arc<str>, Arc<str>)],
 ) -> Result<(NamespaceIdent, TableCreation), ConnectorError> {
-    let (format_version, mut properties) = table_properties(columns, key, properties)?;
+    let (format_version, properties) = table_properties(columns, key, properties)?;
     if format_version != FormatVersion::V3
         && columns.iter().any(|column| {
             column.default.as_ref().is_some_and(|value| {
@@ -537,12 +519,6 @@ fn prepare_table_creation(
                 )));
             }
         }
-    }
-    if provider.runtime().control_state().configuration().kind == IcebergCatalogKind::Rest {
-        properties.insert(
-            "format-version".to_string(),
-            (format_version as u8).to_string(),
-        );
     }
     let schema = Schema::builder()
         .with_fields(super::type_mapping::schema_fields(columns).map_err(invalid)?)
@@ -565,8 +541,8 @@ fn prepare_table_creation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_hadoop_create_table(
-    provider: &IcebergControlProvider,
+fn execute_create_table(
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     columns: &[ConnectorColumnDefinition],
@@ -576,6 +552,34 @@ fn execute_hadoop_create_table(
     policy: CreatePolicy,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
     ensure_owner(provider, &table.instance_id)?;
+    // An existing target is settled here, before anything is dispatched.
+    // `CreatePolicy` is the caller's statement about what an existing table
+    // means -- `IF NOT EXISTS` makes it a no-op, a plain create makes it a
+    // conflict -- and the transaction constructor has no way to know which was
+    // asked for. Answering it first is also what keeps the answer exact: a
+    // catalog that reports an already-existing table as a dispatch failure
+    // would otherwise only be able to say the create did not happen, not why.
+    if provider
+        .runtime()
+        .table_exists(&table.namespace, &table.table)
+        .map_err(unavailable)?
+    {
+        return match policy {
+            CreatePolicy::NoOpIfExists => Ok(ExternalMutationOutcome::KnownCommitted {
+                effect: ExternalMutationEffect::NoOp,
+                receipt: receipt(provider, request.operation_id, request.operation.kind())?,
+                finalization: ExternalMutationFinalization::Complete,
+            }),
+            // Stated directly rather than through a ConnectorError, which has
+            // no already-exists kind and would flatten this to InvalidRequest.
+            _ => Ok(ExternalMutationOutcome::KnownUncommitted {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::AlreadyExists,
+                    "Iceberg table already exists",
+                ),
+            }),
+        };
+    }
     if !provider
         .runtime()
         .namespace_exists(&table.namespace)
@@ -585,40 +589,88 @@ fn execute_hadoop_create_table(
             "Iceberg table namespace does not exist",
         )));
     }
-    let (namespace, creation) =
-        match prepare_table_creation(provider, table, columns, key, partitioning, properties) {
+    let (_namespace, creation) =
+        match prepare_table_creation(table, columns, key, partitioning, properties) {
             Ok(prepared) => prepared,
             Err(error) => return Ok(known_uncommitted(error)),
         };
-    let hadoop = provider
-        .runtime()
-        .hadoop_catalog()
-        .cloned()
-        .ok_or_else(|| internal("Hadoop catalog runtime is missing its typed client"))?;
+    // Admission through the create-table constructor; publication through the
+    // transaction it hands back. Admission is local for this catalog -- it
+    // builds metadata and sends nothing -- which is what lets publication
+    // evidence be frozen before anything is dispatched.
     let operation_id = hex_encode(&request.operation_id.to_bytes());
-    let attempt = match hadoop.prepare_create_attempt(&namespace, creation, operation_id.clone()) {
-        Ok(attempt) => attempt,
-        Err(error) => return Ok(known_uncommitted(map_hadoop_create_failure(&error))),
+    let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
+    let start_request = crate::catalog::transaction::CreateTableTransactionRequest {
+        identity: crate::catalog::transaction::TransactionIdentity::new(
+            "connector-mutation",
+            request.operation_id.to_bytes(),
+        ),
+        target: crate::catalog::CatalogTableName::new(
+            table.namespace.as_ref(),
+            table.table.as_ref(),
+        ),
+        intent: crate::catalog::CatalogCreateIntent::EmptyTable,
+        creation,
+        warehouse: None,
     };
-    let facts = attempt.facts().clone();
-    let evidence = hadoop_create_evidence(provider, request, table, &facts)?;
-    validate_context(&request.context)?;
-    let result = provider
+    let start = provider
         .runtime()
         .resources()
         .catalog_runtime()
-        .block_on(async move { hadoop.publish_create_attempt(attempt).await });
-    let result = match result {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => {
-            if error.kind == crate::hadoop_catalog::HadoopCreateFailureKind::Unknown {
-                return Ok(ExternalMutationOutcome::CommitUnknown {
-                    failure: failure(&map_hadoop_create_failure(&error)),
-                    evidence,
-                });
-            }
-            return Ok(known_uncommitted(map_hadoop_create_failure(&error)));
+        .block_on(async move { owner.new_create_table_transaction(start_request).await })
+        .map_err(unavailable)?;
+    let mut transaction = match start {
+        crate::catalog::CatalogTransactionStart::Ready(transaction) => transaction,
+        crate::catalog::CatalogTransactionStart::Unsupported(reason) => {
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                reason.message().to_string(),
+            )));
         }
+        crate::catalog::CatalogTransactionStart::KnownUncommitted { failure } => {
+            return Ok(known_uncommitted(map_mutation_failure(&failure)));
+        }
+        crate::catalog::CatalogTransactionStart::CommitUnknown { failure, .. } => {
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                failure.to_string(),
+            )));
+        }
+    };
+    // A catalog whose create publishes a metadata file can name it before the
+    // request goes out, which is what makes a later reconciliation exact. One
+    // that publishes through the catalog itself has no such name, and gets the
+    // ordinary mutation evidence instead.
+    let admission = transaction.admission_facts().clone();
+    let exact_admission = match (
+        admission.table_uuid.clone(),
+        admission.metadata_location.clone(),
+        admission.metadata_digest.clone(),
+    ) {
+        (Some(table_uuid), Some(metadata_location), Some(metadata_digest)) => {
+            Some(crate::catalog::ConditionalCreateFacts {
+                operation_id: std::sync::Arc::from(operation_id.as_str()),
+                table_uuid,
+                metadata_location,
+                metadata_digest,
+            })
+        }
+        _ => None,
+    };
+    let evidence = match &exact_admission {
+        Some(facts) => hadoop_create_evidence(provider, request, table, facts)?,
+        None => mutation_evidence(provider, request.operation_id, &request.operation)?,
+    };
+    validate_context(&request.context)?;
+    let committed = provider
+        .runtime()
+        .resources()
+        .catalog_runtime()
+        .block_on(async move { transaction.commit().await });
+    let outcome = match committed {
+        Ok(outcome) => outcome,
+        // The bridge wraps the conditional write, so it cannot prove the write
+        // never happened.
         Err(error) => {
             return Ok(ExternalMutationOutcome::CommitUnknown {
                 failure: failure(&unavailable(error)),
@@ -626,62 +678,94 @@ fn execute_hadoop_create_table(
             });
         }
     };
-    if result.facts.operation_id != operation_id {
-        return Err(internal(
-            "Hadoop create result operation identity changed during publication",
-        ));
-    }
+    let proof = match outcome {
+        crate::catalog::error::CatalogOutcome::KnownCommitted { receipt, .. } => receipt,
+        crate::catalog::error::CatalogOutcome::Unsupported(reason) => {
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                reason.message().to_string(),
+            )));
+        }
+        crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
+            return Ok(known_uncommitted(map_mutation_failure(&failure)));
+        }
+        crate::catalog::error::CatalogOutcome::CommitUnknown {
+            failure: unknown_failure,
+            ..
+        } => {
+            return Ok(ExternalMutationOutcome::CommitUnknown {
+                failure: failure(&ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    unknown_failure.to_string(),
+                )),
+                evidence,
+            });
+        }
+    };
+    // The digest is read back after publication, so a proof that carries one
+    // lets the receipt name exactly what landed. A proof without one still
+    // reports the create; it just cannot be reconciled by metadata identity.
+    let exact_publication = proof.table_uuid.clone().zip(proof.metadata_digest.clone());
+    let build_receipt = |provider: &IcebergMetadata| -> Result<_, ConnectorError> {
+        match &exact_publication {
+            Some((table_uuid, metadata_digest)) => hadoop_create_receipt(
+                provider,
+                request.operation_id,
+                request.operation.kind(),
+                proof.metadata_location.as_deref(),
+                table_uuid,
+                metadata_digest,
+            ),
+            None => receipt(provider, request.operation_id, request.operation.kind()),
+        }
+    };
     provider
         .runtime()
         .control_state()
         .invalidate_table_cache(&table.namespace, &table.table);
-    match result.disposition {
-        crate::hadoop_catalog::HadoopCreateDisposition::Created => {
-            Ok(ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
-                receipt: hadoop_create_receipt(
-                    provider,
-                    request.operation_id,
-                    request.operation.kind(),
-                    result.table.metadata_location(),
-                    &result.authoritative_table_uuid,
-                    &result.authoritative_metadata_digest,
-                )?,
-                finalization: hadoop_finalization(result.finalization_failure),
-            })
-        }
-        crate::hadoop_catalog::HadoopCreateDisposition::Existing
-            if policy == CreatePolicy::NoOpIfExists =>
-        {
+    match proof.effect {
+        ExternalMutationEffect::Applied => Ok(ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            receipt: build_receipt(provider)?,
+            // The transaction reports the commit itself, and a finalization
+            // failure after it never downgrades that.
+            finalization: ExternalMutationFinalization::Complete,
+        }),
+        ExternalMutationEffect::NoOp if policy == CreatePolicy::NoOpIfExists => {
             Ok(ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::NoOp,
-                receipt: hadoop_create_receipt(
-                    provider,
-                    request.operation_id,
-                    request.operation.kind(),
-                    result.table.metadata_location(),
-                    &result.authoritative_table_uuid,
-                    &result.authoritative_metadata_digest,
-                )?,
+                receipt: build_receipt(provider)?,
                 finalization: ExternalMutationFinalization::Complete,
             })
         }
-        crate::hadoop_catalog::HadoopCreateDisposition::Existing => {
-            Ok(ExternalMutationOutcome::KnownUncommitted {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::AlreadyExists,
-                    "Iceberg table already exists",
-                ),
-            })
-        }
+        ExternalMutationEffect::NoOp => Ok(ExternalMutationOutcome::KnownUncommitted {
+            failure: ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::AlreadyExists,
+                "Iceberg table already exists",
+            ),
+        }),
     }
 }
 
+/// Drop a table from the catalog, and hand its objects to collection only if
+/// the drop is proven committed.
+///
+/// The `data_disposition` argument used to be ignored outright, so `Purge` and
+/// `Retain` were indistinguishable and neither reclaimed anything. It is now
+/// what decides whether the dropped table's objects become eligible for
+/// collection at all.
+///
+/// The ordering is the point. Exact object identity is captured before the
+/// catalog request, because it is unreadable afterwards; the drop then returns
+/// a three-state outcome; and only `KnownCommitted` produces the witness that
+/// a cleanup request needs. A drop whose response was lost enqueues nothing and
+/// deletes nothing — those objects leak, and identity-aware collection reclaims
+/// them later by re-proving they are dead.
 fn drop_table(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     table: &ConnectorTableIdentity,
     policy: DropPolicy,
-    _data_disposition: ConnectorDropTableDataDisposition,
+    data_disposition: ConnectorDropTableDataDisposition,
 ) -> Result<ExternalMutationEffect, ConnectorError> {
     ensure_owner(provider, &table.instance_id)?;
     if !provider
@@ -695,20 +779,73 @@ fn drop_table(
             Err(not_found("Iceberg table does not exist"))
         };
     }
-    let ident = table_ident(table).map_err(invalid)?;
-    let catalog = provider.runtime().catalog().clone();
-    provider
-        .runtime()
+    let runtime = provider.runtime();
+    let catalog = std::sync::Arc::clone(runtime.novarocks_catalog());
+    let name =
+        crate::catalog::CatalogTableName::new(table.namespace.as_ref(), table.table.as_ref());
+    let canonical = name.canonical();
+    let outcome = runtime
         .resources()
         .catalog_runtime()
-        .block_on(async move { catalog.drop_table(&ident).await })
-        .map_err(unavailable)?
-        .map_err(map_iceberg)?;
-    provider
-        .runtime()
+        .block_on(async move { catalog.drop_table(name).await })
+        .map_err(unavailable)?;
+
+    // Cache invalidation is post-outcome finalization. It cannot change what
+    // the catalog did, so its result never downgrades a committed drop.
+    runtime
         .control_state()
         .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(ExternalMutationEffect::Applied)
+
+    use crate::catalog::error::CatalogOutcome;
+    match outcome {
+        CatalogOutcome::Unsupported(reason) => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            reason.message().to_string(),
+        )),
+        CatalogOutcome::KnownUncommitted { failure } => Err(map_mutation_failure(&failure)),
+        // Nothing is enqueued and nothing is deleted. The objects leak on
+        // purpose: the drop may have landed, and acting on that guess is how
+        // live data disappears.
+        CatalogOutcome::CommitUnknown { failure, .. } => Err(ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            failure.to_string(),
+        )),
+        committed => {
+            let (receipt, effect, witness) = committed
+                .into_known_committed()
+                .expect("the remaining arm is the committed one");
+            if data_disposition == ConnectorDropTableDataDisposition::Purge
+                && let Some(request) =
+                    crate::catalog_control::drop_cleanup::PostCommitCleanupRequest::
+                        from_committed_drop(canonical, &receipt, &witness)
+            {
+                runtime.drop_cleanup().enqueue(request);
+            }
+            Ok(effect)
+        }
+    }
+}
+
+/// Project a typed catalog mutation failure onto the neutral error vocabulary.
+fn map_mutation_failure(
+    failure: &novarocks_spi::connector::ConnectorMutationFailure,
+) -> ConnectorError {
+    use novarocks_spi::connector::ConnectorMutationFailureKind as Kind;
+    let kind = match failure.kind() {
+        Kind::NotFound => ConnectorErrorKind::NotFound,
+        Kind::AlreadyExists | Kind::Conflict | Kind::InvalidRequest => {
+            ConnectorErrorKind::InvalidRequest
+        }
+        Kind::Unsupported => ConnectorErrorKind::Unsupported,
+        Kind::PermissionDenied | Kind::Unauthenticated => ConnectorErrorKind::PermissionDenied,
+        Kind::Cancelled => ConnectorErrorKind::Cancelled,
+        Kind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
+        Kind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
+        Kind::CorruptData => ConnectorErrorKind::CorruptData,
+        Kind::Unavailable => ConnectorErrorKind::Unavailable,
+        Kind::Internal => ConnectorErrorKind::Internal,
+    };
+    ConnectorError::new(kind, failure.to_string())
 }
 
 pub(crate) fn table_properties(
@@ -820,7 +957,7 @@ pub(crate) fn initial_partition_spec(
 }
 
 fn alter_partition_spec(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table: &ConnectorTableIdentity,
     add: &[ConnectorPartitionTransform],
     drop: &[ConnectorPartitionTransform],
@@ -1012,7 +1149,7 @@ fn validate_partition_transform(
 }
 
 fn alter_properties(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table: &ConnectorTableIdentity,
     changes: &[ConnectorPropertyChange],
     authority: ConnectorPropertyAuthority,
@@ -1138,7 +1275,7 @@ fn is_engine_namespace(key: &str) -> bool {
 
 // Design: ADR-0088 (docs/adr/ADR-0088-domain-owned-sql-error-contracts.md)
 fn alter_schema(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table: &ConnectorTableIdentity,
     changes: &[ConnectorSchemaChange],
 ) -> Result<(), ConnectorError> {
@@ -1568,7 +1705,7 @@ fn widen_type(current: &Type, target: Type) -> Result<Type, ConnectorError> {
 }
 
 fn ensure_owner(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     owner: &novarocks_spi::connector::ConnectorInstanceId,
 ) -> Result<(), ConnectorError> {
     if owner == &provider.descriptor().instance_id {
@@ -1589,11 +1726,11 @@ fn table_ident(table: &ConnectorTableIdentity) -> Result<TableIdent, String> {
 }
 
 fn update_table(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     commit: TableCommit,
     action: &str,
 ) -> Result<crate::iceberg::table::Table, ConnectorError> {
-    let catalog = runtime.catalog().clone();
+    let catalog = runtime.novarocks_catalog().vendored_client();
     runtime
         .resources()
         .catalog_runtime()
@@ -1603,7 +1740,7 @@ fn update_table(
 }
 
 fn execute_bootstrap(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     expected_current_snapshot: Option<i64>,
@@ -1685,7 +1822,7 @@ fn execute_bootstrap(
     )?;
     validate_context(&request.context)?;
     let ident = table_ident(table).map_err(invalid)?;
-    let catalog = provider.runtime().catalog().clone();
+    let catalog = provider.runtime().novarocks_catalog().vendored_client();
     let committed = provider
         .runtime()
         .resources()
@@ -1698,13 +1835,32 @@ fn execute_bootstrap(
                     "empty-table bootstrap target gained a snapshot",
                 ));
             }
-            let tx = Transaction::new(&current);
-            let tx = tx
-                .fast_append()
-                .set_snapshot_properties(snapshot_properties.into_iter().collect())
-                .set_commit_uuid(uuid::Uuid::new_v4())
-                .apply(tx)?;
-            tx.commit(catalog.as_ref()).await
+            // Build the action through the vendored transaction, then stage and
+            // dispatch it here. Constructing a `Transaction` is harmless; what
+            // this avoids is its `commit`, which retries on
+            // `Error::retryable()` -- a predicate that includes a lost response.
+            // The bootstrap snapshot could therefore be sent twice with no way
+            // to tell, and the three-state classification below would be
+            // reasoning about the wrong request.
+            let action = std::sync::Arc::new(
+                Transaction::new(&current)
+                    .fast_append()
+                    .set_snapshot_properties(snapshot_properties.into_iter().collect())
+                    .set_commit_uuid(uuid::Uuid::new_v4()),
+            );
+            let staged =
+                crate::iceberg::transaction::TransactionAction::commit(action, &current).await?;
+            let base = current.clone();
+            crate::commit::helpers::submit_action_commit(
+                catalog.as_ref(),
+                ident.clone(),
+                staged,
+                Vec::new(),
+            )
+            .await
+            // An empty-table bootstrap always stages a snapshot, so a proven
+            // no-op means nothing was sent; report the base the caller loaded.
+            .map(|table| table.unwrap_or(base))
         });
     let committed = match committed {
         Ok(Ok(table)) => table,
@@ -1743,7 +1899,7 @@ fn execute_bootstrap(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_metadata_only_mv_stage(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     expected_table_uuid: &str,
@@ -1834,7 +1990,7 @@ fn execute_metadata_only_mv_stage(
     let snapshot_properties = provenance.to_summary_properties().map_err(invalid)?;
     validate_context(&request.context)?;
     let ident = table_ident(table).map_err(invalid)?;
-    let catalog = provider.runtime().catalog().clone();
+    let catalog = provider.runtime().novarocks_catalog().vendored_client();
     let branch = staging_branch.to_string();
     let committed = provider
         .runtime()
@@ -1985,7 +2141,7 @@ fn execute_metadata_only_mv_stage(
 }
 
 fn execute_guarded_properties(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     changes: &[ConnectorPropertyChange],
@@ -2045,7 +2201,7 @@ fn execute_guarded_properties(
         ])
         .updates(updates)
         .build();
-    let catalog = provider.runtime().catalog().clone();
+    let catalog = provider.runtime().novarocks_catalog().vendored_client();
     let committed = provider
         .runtime()
         .resources()
@@ -2101,7 +2257,7 @@ fn guarded_property_commit_conflict(kind: crate::iceberg::ErrorKind) -> bool {
 
 #[allow(clippy::too_many_arguments)]
 fn execute_guarded_publication(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
     source_branch: &str,
@@ -2192,7 +2348,7 @@ fn execute_guarded_publication(
         marker,
     };
     validate_context(&request.context)?;
-    let catalog = provider.runtime().catalog().clone();
+    let catalog = provider.runtime().novarocks_catalog().vendored_client();
     let result = provider
         .runtime()
         .resources()
@@ -2257,7 +2413,7 @@ fn ensure_mv_publication_staging_ref(
 }
 
 fn mutation_evidence(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation: &ConnectorCatalogMutationOperation,
 ) -> Result<ExternalMutationEvidence, ConnectorError> {
@@ -2354,7 +2510,7 @@ fn mutation_evidence(
 }
 
 fn evidence(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation_kind: &str,
     target: IcebergMutationEvidenceTarget,
@@ -2375,10 +2531,10 @@ fn evidence(
 }
 
 fn hadoop_create_evidence(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
     table: &ConnectorTableIdentity,
-    facts: &crate::hadoop_catalog::HadoopCreateAttemptFacts,
+    facts: &crate::catalog::ConditionalCreateFacts,
 ) -> Result<ExternalMutationEvidence, ConnectorError> {
     let namespace = normalize_identifier(&table.namespace).map_err(invalid)?;
     let table_name = normalize_identifier(&table.table).map_err(invalid)?;
@@ -2389,16 +2545,16 @@ fn hadoop_create_evidence(
         IcebergMutationEvidenceTarget::HadoopCreate {
             namespace,
             table: table_name,
-            expected_uuid: facts.table_uuid.clone(),
-            metadata_location: facts.metadata_location.clone(),
-            metadata_digest: facts.metadata_digest.clone(),
-            operation_id: facts.operation_id.clone(),
+            expected_uuid: facts.table_uuid.to_string(),
+            metadata_location: facts.metadata_location.to_string(),
+            metadata_digest: facts.metadata_digest.to_string(),
+            operation_id: facts.operation_id.to_string(),
         },
     )
 }
 
 fn reconcile_evidence(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     target: IcebergMutationEvidenceTarget,
     evidence: ExternalMutationEvidence,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
@@ -2484,33 +2640,23 @@ fn reconcile_evidence(
                     "Hadoop create evidence operation identity does not match its envelope",
                 ));
             }
-            let hadoop = provider
-                .runtime()
-                .hadoop_catalog()
-                .cloned()
-                .ok_or_else(|| invalid("Hadoop create evidence requires a Hadoop catalog"))?;
-            let reconcile_namespace = namespace.clone();
-            let reconcile_table = table.clone();
-            let reconcile_uuid = expected_uuid.clone();
-            let reconcile_location = metadata_location.clone();
-            let reconcile_digest = metadata_digest.clone();
+            // Read-only adjudication through the catalog owner. Absence stays
+            // ambiguous rather than becoming proof, and nothing here writes.
+            let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
+            let adjudication = crate::catalog::ConditionalCreateEvidence {
+                namespace: std::sync::Arc::from(namespace.as_str()),
+                table: std::sync::Arc::from(table.as_str()),
+                expected_table_uuid: std::sync::Arc::from(expected_uuid.as_str()),
+                metadata_location: std::sync::Arc::from(metadata_location.as_str()),
+                metadata_digest: std::sync::Arc::from(metadata_digest.as_str()),
+            };
             let result = provider
                 .runtime()
                 .resources()
                 .catalog_runtime()
-                .block_on(async move {
-                    hadoop
-                        .reconcile_create_attempt(
-                            &reconcile_namespace,
-                            &reconcile_table,
-                            &reconcile_uuid,
-                            &reconcile_location,
-                            &reconcile_digest,
-                        )
-                        .await
-                });
+                .block_on(async move { owner.adjudicate_conditional_create(adjudication).await });
             match result {
-                Ok(Ok(crate::hadoop_catalog::HadoopCreateReconciliation::Committed {
+                Ok(Ok(crate::catalog::ConditionalCreateVerdict::Committed {
                     finalization_failure,
                 })) => Ok(ExternalMutationOutcome::KnownCommitted {
                     effect: ExternalMutationEffect::Applied,
@@ -2522,15 +2668,18 @@ fn reconcile_evidence(
                         &expected_uuid,
                         &metadata_digest,
                     )?,
-                    finalization: hadoop_finalization(finalization_failure),
+                    finalization: hadoop_finalization(finalization_failure.map(|f| f.to_string())),
                 }),
-                Ok(Ok(crate::hadoop_catalog::HadoopCreateReconciliation::Absent)) => {
+                Ok(Ok(crate::catalog::ConditionalCreateVerdict::Absent)) => {
                     uncommitted("Hadoop create fence is absent")
                 }
-                Ok(Ok(crate::hadoop_catalog::HadoopCreateReconciliation::Foreign)) => {
+                Ok(Ok(crate::catalog::ConditionalCreateVerdict::Foreign)) => {
                     ambiguous("Hadoop create fence belongs to another table incarnation")
                 }
-                Ok(Err(message)) | Err(message) => ambiguous(&format!(
+                Ok(Err(error)) => {
+                    ambiguous(&format!("read authoritative Hadoop create fence: {error}"))
+                }
+                Err(message) => ambiguous(&format!(
                     "read authoritative Hadoop create fence: {message}"
                 )),
             }
@@ -2540,8 +2689,7 @@ fn reconcile_evidence(
             view,
             should_exist,
         } => {
-            let exists = super::views::view_exists(provider.runtime(), &namespace, &view)
-                .map_err(map_view_error)?;
+            let exists = super::views::view_exists(provider.runtime(), &namespace, &view)?;
             if exists == should_exist {
                 ambiguous("Iceberg view postcondition matches but cannot be attributed")
             } else {
@@ -2647,7 +2795,7 @@ fn metadata_only_base_uuid(
 }
 
 fn reconcile_ref(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     evidence: &ExternalMutationEvidence,
     namespace: &str,
     table: &str,
@@ -2699,7 +2847,7 @@ fn reconcile_ref(
 }
 
 fn load_optional_table(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table: &ConnectorTableIdentity,
 ) -> Result<Option<crate::loaded_table::IcebergPhysicalTable>, ConnectorError> {
     if !runtime
@@ -2715,7 +2863,7 @@ fn load_optional_table(
 }
 
 fn receipt(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation_kind: &str,
 ) -> Result<ConnectorCatalogMutationReceipt, ConnectorError> {
@@ -2729,7 +2877,7 @@ fn receipt(
 }
 
 fn receipt_with_version(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation_kind: &str,
     metadata_location: Option<&str>,
@@ -2744,7 +2892,7 @@ fn receipt_with_version(
 }
 
 fn guarded_publication_receipt(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation_kind: &str,
     metadata_location: Option<&str>,
@@ -2772,7 +2920,7 @@ struct HadoopCreateProviderVersion<'a> {
 }
 
 fn hadoop_create_receipt(
-    provider: &IcebergControlProvider,
+    provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation_kind: &str,
     metadata_location: Option<&str>,
@@ -2804,28 +2952,6 @@ fn hadoop_finalization(failure: Option<String>) -> ExternalMutationFinalization 
         )),
         None => ExternalMutationFinalization::Complete,
     }
-}
-
-fn map_hadoop_create_failure(
-    failure: &crate::hadoop_catalog::HadoopCreateFailure,
-) -> ConnectorError {
-    let kind = match failure.kind {
-        crate::hadoop_catalog::HadoopCreateFailureKind::Invalid => {
-            ConnectorErrorKind::InvalidRequest
-        }
-        crate::hadoop_catalog::HadoopCreateFailureKind::Unsupported => {
-            ConnectorErrorKind::Unsupported
-        }
-        crate::hadoop_catalog::HadoopCreateFailureKind::Uncommitted => {
-            ConnectorErrorKind::Unavailable
-        }
-        crate::hadoop_catalog::HadoopCreateFailureKind::Unknown => ConnectorErrorKind::Unavailable,
-    };
-    let message = match failure.facts.as_ref() {
-        Some(facts) => format!("{} [operation_id={}]", failure.message, facts.operation_id),
-        None => failure.message.clone(),
-    };
-    ConnectorError::new(kind, message)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -2960,7 +3086,7 @@ mod tests {
 
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
-    use crate::resources::IcebergControlResources;
+    use crate::resources::IcebergMetadataResources;
 
     struct NeverCancelled;
 
@@ -2980,11 +3106,7 @@ mod tests {
         .expect("context")
     }
 
-    fn provider() -> (
-        tokio::runtime::Runtime,
-        tempfile::TempDir,
-        IcebergControlProvider,
-    ) {
+    fn provider() -> (tokio::runtime::Runtime, tempfile::TempDir, IcebergMetadata) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let configuration = crate::catalog_config::parse_catalog_configuration(
@@ -3006,13 +3128,13 @@ mod tests {
             )),
         );
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
-                IcebergControlResources::new(binding, executor.handle().clone()),
+                IcebergMetadataResources::new(binding, executor.handle().clone()),
             )
             .expect("control runtime"),
         );
-        let provider = IcebergControlProvider::new(
+        let provider = IcebergMetadata::new(
             ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
                 instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
@@ -3041,9 +3163,9 @@ mod tests {
             .expect("schema")
     }
 
-    fn guarded_table(provider: &IcebergControlProvider) -> ConnectorTableIdentity {
+    fn guarded_table(provider: &IcebergMetadata) -> ConnectorTableIdentity {
         let namespace = NamespaceIdent::new("guarded".to_string());
-        let catalog = provider.runtime().catalog().clone();
+        let catalog = provider.runtime().novarocks_catalog().vendored_client();
         provider
             .runtime()
             .resources()
@@ -3056,7 +3178,7 @@ mod tests {
             namespace: "guarded".into(),
             table: "orders".into(),
         };
-        create_table(
+        create_table_fixture(
             provider,
             &table,
             &[ConnectorColumnDefinition {
@@ -3101,9 +3223,9 @@ mod tests {
         }
     }
 
-    fn create_namespace(provider: &IcebergControlProvider, name: &str) {
+    fn create_namespace(provider: &IcebergMetadata, name: &str) {
         let namespace = NamespaceIdent::new(name.to_string());
-        let catalog = provider.runtime().catalog().clone();
+        let catalog = provider.runtime().novarocks_catalog().vendored_client();
         provider
             .runtime()
             .resources()
@@ -3113,8 +3235,59 @@ mod tests {
             .expect("create namespace");
     }
 
+    /// Create a table for a fixture through the production create path.
+    ///
+    /// It deliberately does not reimplement the create. A second create path
+    /// existing at all is what let `CREATE TABLE IF NOT EXISTS` lose its no-op
+    /// once, so fixtures go through the same transaction production does.
+    fn create_table_fixture(
+        provider: &IcebergMetadata,
+        table: &ConnectorTableIdentity,
+        columns: &[ConnectorColumnDefinition],
+        key: Option<&ConnectorTableKey>,
+        partitioning: &[ConnectorPartitionTransform],
+        properties: &[(Arc<str>, Arc<str>)],
+        policy: CreatePolicy,
+    ) -> Result<ExternalMutationEffect, ConnectorError> {
+        let request = ConnectorCatalogMutationRequest {
+            operation_id: ConnectorMutationOperationId::new(),
+            target: ConnectorExecutionBindingKey {
+                instance_id: provider.descriptor().instance_id.clone(),
+                incarnation: provider.incarnation(),
+            },
+            operation: ConnectorCatalogMutationOperation::CreateTable {
+                table: table.clone(),
+                columns: columns.to_vec(),
+                key: key.cloned(),
+                partitioning: partitioning.to_vec(),
+                properties: properties.to_vec(),
+                policy,
+            },
+            context: context(),
+        };
+        match execute_create_table(
+            provider,
+            &request,
+            table,
+            columns,
+            key,
+            partitioning,
+            properties,
+            policy,
+        )? {
+            ExternalMutationOutcome::KnownCommitted { effect, .. } => Ok(effect),
+            ExternalMutationOutcome::KnownUncommitted { failure } => {
+                Err(map_mutation_failure(&failure))
+            }
+            ExternalMutationOutcome::CommitUnknown { failure, .. } => Err(ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                failure.to_string(),
+            )),
+        }
+    }
+
     fn create_request(
-        provider: &IcebergControlProvider,
+        provider: &IcebergMetadata,
         operation_id: ConnectorMutationOperationId,
         policy: CreatePolicy,
     ) -> ConnectorCatalogMutationRequest {
@@ -3214,32 +3387,38 @@ mod tests {
         else {
             panic!("create request");
         };
-        let (namespace, creation) = prepare_table_creation(
-            &provider,
-            table,
-            columns,
-            key.as_ref(),
-            partitioning,
-            properties,
-        )
-        .expect("prepare table creation");
-        let hadoop = provider
-            .runtime()
-            .hadoop_catalog()
-            .cloned()
-            .expect("Hadoop catalog");
-        let attempt = hadoop
-            .prepare_create_attempt(&namespace, creation, hex_encode(&operation_id.to_bytes()))
-            .expect("prepare attempt");
-        let evidence = hadoop_create_evidence(&provider, &request, table, attempt.facts())
-            .expect("create evidence");
-        provider
+        let (namespace, creation) =
+            prepare_table_creation(table, columns, key.as_ref(), partitioning, properties)
+                .expect("prepare table creation");
+        // Through the catalog owner, like production: no concrete client here.
+        let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
+        let prepare = crate::catalog::ConditionalCreateRequest {
+            namespace: crate::catalog::CatalogNamespaceName::new(namespace.to_url_string()),
+            creation,
+            operation_id: std::sync::Arc::from(hex_encode(&operation_id.to_bytes()).as_str()),
+        };
+        let prepared = provider
             .runtime()
             .resources()
             .catalog_runtime()
-            .block_on(async move { hadoop.publish_create_attempt(attempt).await })
-            .expect("catalog runtime")
-            .expect("publish v1");
+            .block_on(async move { owner.prepare_conditional_create(prepare).await })
+            .expect("catalog runtime");
+        let (attempt, _effect, _witness) = prepared
+            .into_known_committed()
+            .expect("prepare is local and cannot fail here");
+        let evidence = hadoop_create_evidence(&provider, &request, table, &attempt.facts)
+            .expect("create evidence");
+        let owner = std::sync::Arc::clone(provider.runtime().novarocks_catalog());
+        let published = provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { owner.publish_conditional_create(attempt).await })
+            .expect("catalog runtime");
+        assert!(matches!(
+            published,
+            crate::catalog::error::CatalogOutcome::KnownCommitted { .. }
+        ));
 
         let reconciled = provider
             .reconcile(ConnectorCatalogMutationReconcileRequest {
@@ -3387,7 +3566,7 @@ mod tests {
             ConnectorDropTableDataDisposition::Purge,
         )
         .expect("drop captured Iceberg table");
-        create_table(
+        create_table_fixture(
             &provider,
             &table,
             &[ConnectorColumnDefinition {

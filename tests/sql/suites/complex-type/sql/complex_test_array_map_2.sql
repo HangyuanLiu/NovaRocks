@@ -223,4 +223,11 @@ select cast(if (1 > rand(), "[]", "") as array<string>) l , array_map((x)-> (con
 
 -- query 44
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_map_2 FORCE;
+-- A catalog that cannot hold views cannot answer view enumeration, so
+-- DROP DATABASE ... FORCE is refused here rather than silently assuming
+-- the namespace holds none. Drop the tables explicitly instead.
+USE sql_tests_complex_test_array_map_2;
+DROP TABLE IF EXISTS array_map_test;
+DROP TABLE IF EXISTS t;
+DROP TABLE IF EXISTS array_map_x;
+DROP DATABASE IF EXISTS sql_tests_complex_test_array_map_2;

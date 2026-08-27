@@ -67,10 +67,16 @@ pub(crate) enum HadoopCreateDisposition {
 #[derive(Debug)]
 pub(crate) struct HadoopCreateResult {
     pub(crate) disposition: HadoopCreateDisposition,
+    /// Kept for the fault tests, which assert the published attempt's identity
+    /// straight off the client result rather than through the catalog owner.
+    #[allow(dead_code)]
     pub(crate) facts: HadoopCreateAttemptFacts,
     pub(crate) authoritative_table_uuid: String,
     pub(crate) authoritative_metadata_digest: String,
     pub(crate) table: Table,
+    /// Read by the fault tests only. A finalization failure never downgrades a
+    /// commit the client already proved, so no production caller consults it.
+    #[allow(dead_code)]
     pub(crate) finalization_failure: Option<String>,
 }
 
@@ -807,27 +813,42 @@ impl Catalog for HadoopFileSystemCatalog {
         self.build_table(table.clone(), metadata, metadata_location)
     }
 
+    /// Drop the table from the catalog.
+    ///
+    /// For a filesystem catalog the catalog entry *is* storage: existence
+    /// resolves through `version-hint.text` and, failing that, the canonical
+    /// `v1.metadata.json`. Removing those two is therefore the catalog
+    /// operation, mirroring ADR-0077, where writing `v1.metadata.json` is what
+    /// makes a table exist. Data files and superseded metadata are objects, and
+    /// they are not touched here.
+    ///
+    /// This used to prefix-delete the whole table directory, which was wrong in
+    /// four ways at once: it ignored the caller's data disposition, so a drop
+    /// asking to retain data destroyed it anyway; it gave concurrent readers no
+    /// window, so a reader that had just resolved this table lost its files
+    /// mid-scan; it matched a lexical prefix rather than the table's exact
+    /// object identity; and it swallowed its own failures, so a partial delete
+    /// still reported success. Object deletion now belongs to the post-commit
+    /// cleanup handoff, which runs only after the drop is proven committed,
+    /// only against exact identity, and only once the age window has passed.
+    /// See ADR-0118.
+    ///
+    /// The order matters. The hint goes first, so a failure between the two
+    /// steps leaves the table resolvable through `v1.metadata.json` and the
+    /// hint self-repairs on the next read: the drop simply did not commit, and
+    /// retrying is safe. Removing `v1.metadata.json` is the commit point.
     async fn drop_table(&self, table: &TableIdent) -> Result<()> {
         let key = Self::table_key(table);
         self.tables.lock().await.remove(&key);
 
-        // Physically delete the table's warehouse directory (metadata/ and data/
-        // sub-directories) so that files are not left orphaned after DROP.
-        // The table location follows the Hadoop catalog convention:
-        //   <warehouse>/<namespace>/<table>
         let table_location = self.table_location(table);
-        // Object-store prefix deletion is lexical: deleting `.../dim` would
-        // also delete the sibling table `.../dim2`. Keep the separator in the
-        // prefix so DROP TABLE only removes this table's directory.
-        let table_prefix = format!("{}/", table_location.trim_end_matches('/'));
-        if let Err(e) = self.file_io.delete_prefix(&table_prefix).await {
-            // Log but do not propagate — the in-memory and SQLite state has
-            // already been removed, so the drop must be considered successful
-            // even if the filesystem cleanup fails (e.g. table files were never
-            // written because creation failed mid-way).
-            tracing::warn!(
-                "drop_table: failed to delete warehouse files for {table_location}: {e}"
-            );
+        let hint = Self::version_hint_path(&table_location);
+        if self.file_io.exists(&hint).await? {
+            self.file_io.delete(&hint).await?;
+        }
+        let canonical = Self::metadata_path(&table_location, 1);
+        if self.file_io.exists(&canonical).await? {
+            self.file_io.delete(&canonical).await?;
         }
         Ok(())
     }
@@ -1097,6 +1118,60 @@ mod tests {
         assert_eq!(
             left.table.metadata_location(),
             right.table.metadata_location()
+        );
+    }
+
+    /// A drop removes the catalog entry and nothing else.
+    ///
+    /// Data files outlive it deliberately: they are objects, and objects are
+    /// reclaimed by the age-gated, identity-checked cleanup handoff, never by
+    /// the catalog deleting a path prefix out from under a live reader.
+    #[tokio::test]
+    async fn drop_removes_the_catalog_pointer_and_leaves_objects_for_collection() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("analytics".to_string());
+        let ident = TableIdent::new(namespace.clone(), "events".to_string());
+        let catalog = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location.clone(),
+        );
+        catalog
+            .create_table_fenced(
+                &namespace,
+                test_creation("events"),
+                "operation-create".to_string(),
+            )
+            .await
+            .expect("create table");
+
+        let table_location = catalog.table_location(&ident);
+        // Stand in for a data file the table owns.
+        let data_file = format!("{table_location}/data/part-0.parquet");
+        catalog
+            .file_io
+            .new_output(&data_file)
+            .expect("output")
+            .write(bytes::Bytes::from_static(b"rows"))
+            .await
+            .expect("write data file");
+
+        catalog.drop_table(&ident).await.expect("drop table");
+
+        assert!(
+            !catalog.table_exists(&ident).await.expect("existence"),
+            "the catalog entry is gone"
+        );
+        // A fresh client must agree: the pointer, not just the cache, was removed.
+        let restored = HadoopFileSystemCatalog::new(
+            crate::fs_io::build_file_io_for_location(&location, None),
+            location.clone(),
+        );
+        assert!(!restored.table_exists(&ident).await.expect("existence"));
+
+        assert!(
+            catalog.file_io.exists(&data_file).await.expect("stat"),
+            "objects survive the drop and are left to identity-aware collection"
         );
     }
 

@@ -264,7 +264,7 @@ mod tests {
             kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
                 r#type: primitive as i32,
                 ..Default::default()
-        })),
+            })),
         }
     }
 
@@ -345,7 +345,7 @@ mod tests {
                                     precision: Some(18),
                                     scale: Some(4),
                                     ..Default::default()
-        })),
+                                })),
                             }),
                         },
                         common::StructField {

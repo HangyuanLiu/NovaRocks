@@ -48,9 +48,9 @@ use crate::commit::{
     RecoveryEvidence, RunInput, run_iceberg_commit,
 };
 use crate::commit::{CommitOpKind, CommitOutcome, WrittenFile};
-use crate::control_provider::IcebergControlProvider;
-use crate::control_runtime::IcebergControlRuntime;
 use crate::fs_io;
+use crate::metadata::IcebergMetadata;
+use crate::metadata_context::IcebergMetadataContext;
 
 const PLAN_PAYLOAD_VERSION: u16 = 1;
 const RECEIPT_PAYLOAD_VERSION: u16 = 1;
@@ -197,12 +197,12 @@ enum MarkerLookup {
 }
 
 struct RegisteredIcebergDataMutationBackend {
-    provider: Arc<IcebergControlProvider>,
-    runtime: Arc<IcebergControlRuntime>,
+    provider: Arc<IcebergMetadata>,
+    runtime: Arc<IcebergMetadataContext>,
 }
 
 impl RegisteredIcebergDataMutationBackend {
-    fn new(provider: Arc<IcebergControlProvider>) -> Self {
+    fn new(provider: Arc<IcebergMetadata>) -> Self {
         Self {
             runtime: Arc::clone(provider.runtime()),
             provider,
@@ -440,9 +440,8 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 );
             }
         }
-        let catalog = Arc::clone(self.runtime.catalog());
-        ensure_hadoop_registration(&self.runtime, &table)
-            .map_err(connector_error_as_pre_dispatch)?;
+        let catalog = self.runtime.novarocks_catalog().vendored_client();
+        anchor_committed_write(&self.runtime, &table).map_err(connector_error_as_pre_dispatch)?;
         let marker_value = canonical_json(marker, "Iceberg data mutation marker")
             .map_err(connector_error_as_pre_dispatch)?;
         let snapshot_properties = BTreeMap::from([(
@@ -570,7 +569,7 @@ pub struct IcebergDataMutationAdapter {
 }
 
 impl IcebergDataMutationAdapter {
-    pub(crate) fn try_new(provider: Arc<IcebergControlProvider>) -> Result<Self, ConnectorError> {
+    pub(crate) fn try_new(provider: Arc<IcebergMetadata>) -> Result<Self, ConnectorError> {
         let key = ConnectorExecutionBindingKey {
             instance_id: provider.descriptor().instance_id.clone(),
             incarnation: provider.incarnation(),
@@ -1074,7 +1073,7 @@ fn data_file_to_written_file(
 }
 
 fn validate_no_duplicate_data_files(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
     manifest: &AddFilesManifest,
 ) -> Result<(), ConnectorError> {
@@ -1102,7 +1101,7 @@ fn validate_no_duplicate_data_files(
 }
 
 fn build_abort_cleanup(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
 ) -> Result<(crate::opendal::Operator, Option<CleanupPathMapper>), ConnectorError> {
     let state = runtime.control_state();
     let warehouse_uri = &state.configuration().warehouse_uri;
@@ -1136,30 +1135,52 @@ fn build_abort_cleanup(
     Ok((fs, Some(mapper)))
 }
 
-fn ensure_hadoop_registration(
-    runtime: &IcebergControlRuntime,
+/// Make a committed write reachable through this generation's catalog.
+///
+/// This used to be `ensure_hadoop_registration`, and it decided what to do by
+/// comparing catalog kinds in the DML publication path -- a branch living
+/// outside the factory. The catalog answers now: one that owns its metadata
+/// pointer no-ops, and a filesystem catalog anchors.
+///
+/// It also created the namespace with `let _ =`, so a namespace that failed to
+/// appear surfaced later as a confusing registration failure rather than as the
+/// thing that actually went wrong. That error is no longer swallowed.
+fn anchor_committed_write(
+    runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
 ) -> Result<(), ConnectorError> {
-    if runtime.control_state().uses_remote_catalog() {
-        return Ok(());
-    }
-    let namespace = table.identifier().namespace().clone();
-    let ident = table.identifier().clone();
     let metadata_location = table
         .metadata_location()
         .ok_or_else(|| corrupt("Iceberg table has no metadata location"))?
         .to_string();
-    let catalog = Arc::clone(runtime.catalog());
-    runtime
+    let ident = table.identifier();
+    let name = crate::catalog::CatalogTableName::new(
+        ident.namespace().to_url_string(),
+        ident.name().to_string(),
+    );
+    let catalog = Arc::clone(runtime.novarocks_catalog());
+    let outcome = runtime
         .resources()
         .catalog_runtime()
         .block_on(async move {
-            let _ = catalog.create_namespace(&namespace, HashMap::new()).await;
-            catalog.register_table(&ident, metadata_location).await
+            catalog
+                .anchor_written_metadata(name, Arc::from(metadata_location))
+                .await
         })
-        .map_err(|error| internal(format!("Iceberg registration runtime: {error}")))?
-        .map(|_| ())
-        .map_err(|error| map_provider_error(error.to_string()))
+        .map_err(|error| internal(format!("Iceberg catalog runtime bridge: {error}")))?;
+    match outcome {
+        crate::catalog::error::CatalogOutcome::KnownCommitted { .. } => Ok(()),
+        crate::catalog::error::CatalogOutcome::Unsupported(reason) => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            reason.message().to_string(),
+        )),
+        crate::catalog::error::CatalogOutcome::KnownUncommitted { failure } => {
+            Err(map_provider_error(failure.to_string()))
+        }
+        crate::catalog::error::CatalogOutcome::CommitUnknown { failure, .. } => Err(
+            ConnectorError::new(ConnectorErrorKind::Unavailable, failure.to_string()),
+        ),
+    }
 }
 
 fn target_snapshot_id(
@@ -1333,7 +1354,7 @@ mod tests {
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
     use crate::iceberg::{NamespaceIdent, TableCreation};
-    use crate::resources::IcebergControlResources;
+    use crate::resources::IcebergMetadataResources;
 
     struct NeverCancelled;
 
@@ -1446,7 +1467,7 @@ mod tests {
     fn exact_provider_with_empty_table() -> (
         tokio::runtime::Runtime,
         tempfile::TempDir,
-        Arc<IcebergControlProvider>,
+        Arc<IcebergMetadata>,
     ) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
@@ -1468,15 +1489,15 @@ mod tests {
                 executor.handle().clone(),
             )),
         );
-        let resources = IcebergControlResources::new(binding, executor.handle().clone());
+        let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
                 resources,
             )
             .expect("control runtime"),
         );
-        let catalog = Arc::clone(runtime.catalog());
+        let catalog = runtime.novarocks_catalog().vendored_client();
         executor.block_on(async move {
             let namespace = NamespaceIdent::new("db".to_string());
             catalog
@@ -1505,7 +1526,7 @@ mod tests {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
             instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
         };
-        let provider = Arc::new(IcebergControlProvider::new(
+        let provider = Arc::new(IcebergMetadata::new(
             descriptor,
             ConnectorInstanceIncarnation::from_bytes([8; 16]),
             runtime,

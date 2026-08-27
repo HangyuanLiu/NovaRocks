@@ -37,7 +37,7 @@
 //!   missing manifest fact is an error, and a split that fails wire validation
 //!   is an error rather than a silently dropped unit of work.
 //!
-//! It is additive: the existing [`crate::control_provider`] control path is
+//! It is additive: the existing [`crate::metadata`] control path is
 //! untouched and keeps its own resolution rules.
 // Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
 
@@ -64,7 +64,6 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
 };
 
-use crate::control_runtime::IcebergControlRuntime;
 use crate::file_pruning::file_may_satisfy_physical_predicates;
 use crate::iceberg::spec::{
     DataContentType, DataFileFormat, Datum, FormatVersion, Literal, ManifestFile, ManifestStatus,
@@ -73,6 +72,7 @@ use crate::iceberg::spec::{
 };
 use crate::iceberg::table::Table;
 use crate::loaded_table::IcebergPhysicalTable;
+use crate::metadata_context::IcebergMetadataContext;
 use crate::read_model::{IcebergReadFile, IcebergReadSnapshot};
 use crate::ref_snapshot::resolve_branch_head_snapshot_id;
 use crate::scan_model::{
@@ -196,7 +196,7 @@ pub struct IcebergTypedBoundary {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
     transaction: HiveTransactionHandle,
-    runtime: Arc<IcebergControlRuntime>,
+    runtime: Arc<IcebergMetadataContext>,
     split_source_options: IcebergSplitSourceOptions,
 }
 
@@ -204,13 +204,13 @@ impl IcebergTypedBoundary {
     /// The composition-root entry point.
     ///
     /// `runtime` is the same control generation the existing
-    /// [`crate::control_provider::IcebergControlProvider`] holds, so both paths
+    /// [`crate::metadata::IcebergMetadata`] holds, so both paths
     /// observe one catalog client and one physical-table cache.
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ConnectorInstanceIncarnation,
         transaction: HiveTransactionHandle,
-        runtime: Arc<IcebergControlRuntime>,
+        runtime: Arc<IcebergMetadataContext>,
     ) -> Self {
         Self {
             descriptor,
@@ -1949,7 +1949,7 @@ mod tests {
         SnapshotRetention, SortOrder, Summary, TableMetadataBuilder, Transform,
     };
     use crate::iceberg::{NamespaceIdent, TableCreation};
-    use crate::resources::IcebergControlResources;
+    use crate::resources::IcebergMetadataResources;
 
     use super::*;
 
@@ -1958,7 +1958,7 @@ mod tests {
         _warehouse: tempfile::TempDir,
         executor: tokio::runtime::Runtime,
         boundary: IcebergTypedBoundary,
-        runtime: Arc<IcebergControlRuntime>,
+        runtime: Arc<IcebergMetadataContext>,
     }
 
     fn fixture() -> Fixture {
@@ -1978,9 +1978,9 @@ mod tests {
             StdArc::new(TokioFileIoRuntime::new(executor.handle().clone())),
             StdArc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
         );
-        let resources = IcebergControlResources::new(binding, executor.handle().clone());
+        let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
         let runtime = Arc::new(
-            IcebergControlRuntime::try_new(
+            IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
                 resources,
             )
@@ -2043,7 +2043,9 @@ mod tests {
             format_version: FormatVersion,
             properties: StdHashMap<String, String>,
         ) {
-            let catalog = Arc::clone(self.runtime.catalog());
+            // The generic accessor is gone: catalog reads go through the owner,
+            // and `vendored_client` is the seam that hands out its client.
+            let catalog = self.runtime.novarocks_catalog().vendored_client();
             let namespace_name = namespace.to_string();
             let table_name = table.to_string();
             self.executor.block_on(async move {

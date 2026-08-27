@@ -121,6 +121,7 @@ code-anchors:
 - ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0112 — MV 运行态为何只属于当前进程、StateStore为何只保留 lake-source Accelerator（active）
 - ADR-0114 — Connector read 为何改用 Trino 对齐的 typed handle/split/page-source 与运行时 split 投递（active）
+- ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 
 #### 历史
 
@@ -195,6 +196,7 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 
 
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
+- ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 
 #### 历史
 

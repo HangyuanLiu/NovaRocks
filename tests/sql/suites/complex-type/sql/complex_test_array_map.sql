@@ -176,4 +176,12 @@ where  array_contains(fields,'bbb');
 
 -- query 15
 -- @skip_result_check=true
-DROP DATABASE IF EXISTS sql_tests_complex_test_array_map FORCE;
+-- A catalog that cannot hold views cannot answer view enumeration, so
+-- DROP DATABASE ... FORCE is refused here rather than silently assuming
+-- the namespace holds none. Drop the tables explicitly instead.
+USE sql_tests_complex_test_array_map;
+DROP TABLE IF EXISTS t1;
+DROP TABLE IF EXISTS t2;
+DROP TABLE IF EXISTS table1;
+DROP TABLE IF EXISTS table2;
+DROP DATABASE IF EXISTS sql_tests_complex_test_array_map;

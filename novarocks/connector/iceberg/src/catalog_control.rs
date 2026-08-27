@@ -37,6 +37,7 @@ mod cleanup_candidates;
 pub mod cleanup_maintenance;
 #[path = "catalog_control/data_mutation.rs"]
 pub mod data_mutation;
+pub mod drop_cleanup;
 #[path = "catalog_control/metadata_maintenance.rs"]
 pub(crate) mod metadata_maintenance;
 #[path = "catalog_control/owned_ref_cleanup.rs"]
@@ -153,14 +154,6 @@ impl IcebergCatalogControlState {
         self.configuration.object_store_config.is_some()
     }
 
-    pub fn uses_remote_catalog(&self) -> bool {
-        matches!(
-            self.configuration.kind,
-            crate::catalog_config::IcebergCatalogKind::Rest
-                | crate::catalog_config::IcebergCatalogKind::Hive
-        )
-    }
-
     pub fn object_store_config(&self) -> Option<&novarocks_fs::ObjectStoreConfig> {
         self.configuration.object_store_config.as_ref()
     }
@@ -244,7 +237,6 @@ mod tests {
         });
 
         assert!(!state.is_s3());
-        assert!(!state.uses_remote_catalog());
         assert_eq!(state.properties().len(), 3);
         assert_eq!(
             state.cloud_properties_map().get("aws.s3.endpoint"),

@@ -102,7 +102,16 @@ impl IcebergCommitAction for OverwritePartitionsCommit {
         match crate::commit::classify_iceberg_write_mode(ctx.table) {
             IcebergWriteMode::RowLineageV3 => {}
             IcebergWriteMode::LegacyPositionDeletes => {
-                return Err("OverwritePartitionsCommit requires v3 row-lineage table".to_string());
+                // A local read of the table's own metadata, before anything is
+                // staged or sent. Without the marker this fell through the
+                // substring classifier, matched none of its signals, and was
+                // reported as an unknown publication -- so a statement that
+                // provably did nothing told the caller it could not tell, and
+                // left its staged files behind for review.
+                return Err(format!(
+                    "{} OverwritePartitionsCommit requires v3 row-lineage table",
+                    crate::commit::service::PROVEN_UNCOMMITTED_MARKER
+                ));
             }
         }
 

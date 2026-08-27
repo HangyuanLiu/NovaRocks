@@ -51,7 +51,7 @@ use std::sync::Arc;
 /// `Ok(None)` means the staged action produced no updates at all: it is a
 /// proven no-op against the base state it observed, so there is nothing to
 /// submit and no external effect to linearize.
-pub(super) async fn submit_action_commit(
+pub(crate) async fn submit_action_commit(
     catalog: &dyn Catalog,
     ident: TableIdent,
     mut staged: ActionCommit,
@@ -81,16 +81,25 @@ pub(super) enum OccSubmit {
 /// Why an optimistic-concurrency write submission did not commit.
 pub(super) enum OccSubmitError {
     /// Ordinary optimistic-concurrency conflict on the data ref that survived
-    /// every retry.
+    /// every retry. A conflict is a definite rejection.
     Conflict { detail: String },
-    /// Anything else, including outcomes we cannot classify.
+    /// Proven not published: the failure happened before anything was sent, or
+    /// the catalog definitively refused the request.
     Failed { detail: String },
+    /// The request may have been applied and its outcome is not observable.
+    /// Deliberately carries no marker, so it classifies as unknown.
+    Unknown { detail: String },
 }
 
 impl OccSubmitError {
     pub(super) fn into_detail(self) -> String {
         match self {
-            Self::Conflict { detail } | Self::Failed { detail } => detail,
+            // Stamp the verdict this path can prove, so the orchestrator does
+            // not have to recognise the wording to get it right.
+            Self::Conflict { detail } | Self::Failed { detail } => {
+                format!("{} {detail}", super::service::PROVEN_UNCOMMITTED_MARKER)
+            }
+            Self::Unknown { detail } => detail,
         }
     }
 }
@@ -151,8 +160,18 @@ where
             Ok(None) => return Ok(OccSubmit::NoOp),
             Err(error) => {
                 if !is_retryable_commit_conflict(&error) {
-                    return Err(OccSubmitError::Failed {
-                        detail: format!("{label} commit failed: {error}"),
+                    // The request went out. Whether it landed is answered by
+                    // what the error proves, not by whether it reads as
+                    // transient: a lost response is exactly the case where the
+                    // honest answer is that we cannot tell.
+                    return Err(if crate::catalog::error::proves_uncommitted(&error) {
+                        OccSubmitError::Failed {
+                            detail: format!("{label} commit failed: {error}"),
+                        }
+                    } else {
+                        OccSubmitError::Unknown {
+                            detail: format!("{label} commit outcome is unknown: {error}"),
+                        }
                     });
                 }
                 // A precondition failure can mean either "someone fenced us"

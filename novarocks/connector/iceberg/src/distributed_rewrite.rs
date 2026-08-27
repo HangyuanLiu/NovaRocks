@@ -52,9 +52,9 @@ use crate::commit::write_control::{
     IcebergDistributedRewriteActivation, IcebergDistributedRewriteCohortActivation,
     IcebergDistributedRewriteKind, IcebergWriteControl,
 };
-use crate::control_provider::IcebergControlProvider;
-use crate::control_runtime::IcebergControlRuntime;
 use crate::manifest::{DataFileWithStats, data_file_with_stats_to_iceberg_data_file_info};
+use crate::metadata::IcebergMetadata;
+use crate::metadata_context::IcebergMetadataContext;
 use crate::row_lineage_synth::{ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL};
 use crate::scan_model::{IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat};
 
@@ -91,8 +91,8 @@ struct PlannedRewrite {
 pub struct IcebergDistributedRewriteControl {
     key: ConnectorExecutionBindingKey,
     descriptor: ConnectorInstanceDescriptor,
-    runtime: Arc<IcebergControlRuntime>,
-    provider: Arc<IcebergControlProvider>,
+    runtime: Arc<IcebergMetadataContext>,
+    provider: Arc<IcebergMetadata>,
     write: Arc<IcebergWriteControl>,
     plans: Mutex<HashMap<novarocks_spi::connector::ConnectorWriteOperationId, PlannedRewrite>>,
 }
@@ -101,8 +101,8 @@ impl IcebergDistributedRewriteControl {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ConnectorInstanceIncarnation,
-        runtime: Arc<IcebergControlRuntime>,
-        provider: Arc<IcebergControlProvider>,
+        runtime: Arc<IcebergMetadataContext>,
+        provider: Arc<IcebergMetadata>,
         write: Arc<IcebergWriteControl>,
     ) -> Result<Self, ConnectorError> {
         let key = ConnectorExecutionBindingKey {
@@ -650,7 +650,7 @@ pub(crate) fn decode_group_payload(
 }
 
 pub(crate) fn load_frozen_rewrite_group(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     file_io: &crate::iceberg::io::FileIO,
     payload: &IcebergRewriteGroupPayloadV1,
 ) -> Result<IcebergFrozenRewriteGroupV1, ConnectorError> {
@@ -722,7 +722,7 @@ pub(crate) fn load_frozen_rewrite_group(
 }
 
 fn write_frozen_artifact(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     file_io: crate::iceberg::io::FileIO,
     artifact: &IcebergFrozenRewriteArtifactV1,
     logical_digest: [u8; 32],
@@ -1321,7 +1321,7 @@ fn group_payload(
 }
 
 fn live_delete_file_paths(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
 ) -> Result<BTreeSet<String>, ConnectorError> {
     let Some(snapshot) = table.metadata().current_snapshot().cloned() else {
@@ -1745,7 +1745,7 @@ fn validate_frozen_rewrite_table(
 }
 
 fn write_artifact_file(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     file_io: &crate::iceberg::io::FileIO,
     location: &str,
     bytes: Bytes,
@@ -1762,7 +1762,7 @@ fn write_artifact_file(
 }
 
 fn read_artifact_file(
-    runtime: &IcebergControlRuntime,
+    runtime: &IcebergMetadataContext,
     file_io: &crate::iceberg::io::FileIO,
     location: &str,
     max_bytes: usize,

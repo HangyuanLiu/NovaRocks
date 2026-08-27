@@ -1152,9 +1152,11 @@ pub(crate) mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        assert!(error
-            .to_string()
-            .contains("duplicate connector control factory"));
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate connector control factory")
+        );
     }
 
     #[test]
@@ -1200,9 +1202,10 @@ pub(crate) mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-        assert!(host
-            .observe_current_binding(&ConnectorInstanceId::parse("catalog.analytics").unwrap())
-            .is_err());
+        assert!(
+            host.observe_current_binding(&ConnectorInstanceId::parse("catalog.analytics").unwrap())
+                .is_err()
+        );
     }
 
     #[test]

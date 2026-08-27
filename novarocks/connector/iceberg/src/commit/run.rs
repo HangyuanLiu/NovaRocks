@@ -241,7 +241,17 @@ async fn handle_commit_error(
     fs: &Operator,
     cleanup_path_mapper: Option<&CleanupPathMapper>,
 ) -> CommitServiceError {
-    match classify_commit_error(&commit_err) {
+    // The marker is an internal signal between the code that knows the verdict
+    // and the classifier. It has no business in a message a user reads.
+    let kind = classify_commit_error(&commit_err);
+    let commit_err = commit_err
+        .replacen(
+            &format!("{} ", crate::commit::service::PROVEN_UNCOMMITTED_MARKER),
+            "",
+            1,
+        )
+        .replacen(crate::commit::service::PROVEN_UNCOMMITTED_MARKER, "", 1);
+    match kind {
         CommitFailureKind::Unknown => {
             let evidence = RecoveryEvidence::from_collector(collector);
             tracing::warn!(
