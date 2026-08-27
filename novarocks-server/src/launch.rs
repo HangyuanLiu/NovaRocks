@@ -24,7 +24,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use novarocks_types::ClusterRole;
 
-use crate::app_config::NovaRocksConfig;
+use crate::{
+    app_config::NovaRocksConfig,
+    native_trust::{
+        NativeTrustSnapshot, build_role_native_trust_snapshot, ensure_all_in_one_trust_homogeneous,
+    },
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServerLaunchMode {
@@ -159,6 +164,7 @@ pub struct RoleConfig {
     pub role: ClusterRole,
     pub path: PathBuf,
     pub config: NovaRocksConfig,
+    pub native_trust: NativeTrustSnapshot,
     endpoints: Vec<BindEndpoint>,
     process: ProcessCompatibilityProjection,
 }
@@ -198,6 +204,7 @@ pub fn resolve_server_launch(args: StandaloneLaunchArgs) -> Result<ResolvedServe
                     be.path.display()
                 );
             }
+            ensure_all_in_one_trust_homogeneous(&fe.config, &be.config)?;
             Ok(ResolvedServerLaunch::AllInOne { fe, be })
         }
     }
@@ -217,11 +224,14 @@ fn load_role_config(mode: ServerLaunchMode, path: PathBuf) -> Result<RoleConfig>
     }
     let endpoints = role_bind_endpoints(expected, &config, &path)?;
     ensure_no_endpoint_overlap(&endpoints, &[])?;
+    let native_trust = build_role_native_trust_snapshot(expected, &config)
+        .with_context(|| format!("construct {mode:?} native trust {}", path.display()))?;
     Ok(RoleConfig {
         role: expected,
         path,
         process: ProcessCompatibilityProjection::from_config(&config),
         config,
+        native_trust,
         endpoints,
     })
 }
@@ -406,7 +416,10 @@ mod tests {
         let mysql = mysql
             .map(|port| format!("\n[standalone_server]\nmysql_port = {port}\n"))
             .unwrap_or_default();
-        std::fs::write(path, format!("{extra}\n[server]\nhost = \"{host}\"\ngrpc_port = {grpc}\nhttp_port = {http}\n\n[cluster]\nrole = \"{role}\"\n{mysql}")).expect("write config");
+        let frontend_endpoint = (role == "be")
+            .then_some("frontend_endpoint = \"127.0.0.1:19080\"\n")
+            .unwrap_or_default();
+        std::fs::write(path, format!("{extra}\n[native_trust]\ndeployment_id = \"test-deployment\"\nshared_secret = \"0123456789abcdef0123456789abcdef\"\n\n[server]\nhost = \"{host}\"\ngrpc_port = {grpc}\nhttp_port = {http}\n\n[cluster]\nrole = \"{role}\"\n{frontend_endpoint}{mysql}")).expect("write config");
     }
 
     fn args(values: &[&str]) -> Vec<String> {

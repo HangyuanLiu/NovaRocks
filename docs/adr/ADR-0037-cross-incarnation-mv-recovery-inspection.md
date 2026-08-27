@@ -4,7 +4,7 @@ title: "Cross-incarnation MV recovery uses lake inspection"
 domain: [frontend-mv]
 status: superseded
 supersedes: []
-superseded-by: ADR-0104
+superseded-by: ADR-0110
 date: 2026-08-02
 provenance:
   - "discussion: 2026-08-02 historical materialized-view recovery"

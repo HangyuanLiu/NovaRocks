@@ -1349,35 +1349,15 @@ fn validate_backend(
     raw: &novarocks::ParticipantBackendIdentity,
     path: FieldPath,
 ) -> Result<(), ProtocolError> {
-    let endpoint = raw.endpoint.as_ref().ok_or_else(|| {
-        error(
-            path.field("endpoint"),
-            ProtocolErrorKind::MissingField,
-            "query control endpoint is required",
-        )
-    })?;
-    if endpoint.host.trim().is_empty() {
-        return Err(error(
-            path.field("endpoint").field("host"),
-            ProtocolErrorKind::InvalidValue,
-            "query control endpoint host must not be empty",
-        ));
-    }
-    if endpoint.port == 0 || endpoint.port > u16::MAX as u32 {
-        return Err(error(
-            path.field("endpoint").field("port"),
-            ProtocolErrorKind::OutOfRange,
-            "query control endpoint port must be a nonzero u16",
-        ));
-    }
-    if raw.start_epoch == 0 {
-        return Err(error(
-            path.field("start_epoch"),
-            ProtocolErrorKind::InvalidValue,
-            "backend start epoch must be nonzero",
-        ));
-    }
-    Ok(())
+    ParticipantBackendIdentity::parse(raw.clone())
+        .map(|_| ())
+        .map_err(|error| {
+            ProtocolError::new(
+                path.append_segments(error.path().segments().iter().skip(1).cloned()),
+                error.kind(),
+                error.detail(),
+            )
+        })
 }
 
 fn required_backend(
@@ -1579,12 +1559,16 @@ mod tests {
 
     fn backend() -> novarocks::ParticipantBackendIdentity {
         novarocks::ParticipantBackendIdentity {
-            backend_id: 1,
             endpoint: Some(novarocks::QueryControlEndpoint {
                 host: "127.0.0.1".into(),
                 port: 9030,
             }),
-            start_epoch: 1,
+            process_id: Some(novarocks::BackendProcessId {
+                value: vec![
+                    0x01, 0x9c, 0x98, 0xa9, 0x33, 0x90, 0x75, 0x76, 0x97, 0x7b, 0x33, 0xd1, 0x88,
+                    0xad, 0x1f, 0x06,
+                ],
+            }),
         }
     }
 
@@ -1728,7 +1712,7 @@ mod tests {
         };
         let proof = TerminalizationProof::parse(raw).expect("P0 proof");
         assert_eq!(snapshot.execution_id().query_id().high(), 1);
-        assert_eq!(snapshot.backend().backend_id(), 1);
+        assert!(snapshot.backend().process_id().is_ok());
         assert_eq!(snapshot.init_digest().as_bytes(), &[7; 32]);
         assert_eq!(snapshot.fragments()[0].fragment_instance_id().lo, 1);
         assert_eq!(snapshot.fragments()[0].backend_num(), 0);
@@ -1824,7 +1808,7 @@ mod tests {
         })
         .expect("negative attestation");
         assert_eq!(attestation.execution_id().query_id().low(), 2);
-        assert_eq!(attestation.backend().start_epoch(), 1);
+        assert!(attestation.backend().process_id().is_ok());
         assert_eq!(attestation.init_digest().as_bytes(), &[7; 32]);
         assert_eq!(
             attestation.reason(),

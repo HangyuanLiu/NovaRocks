@@ -17,7 +17,7 @@
 
 //! The REST catalog implementation.
 //!
-//! Design: ADR-0110 (docs/adr/ADR-0110-iceberg-provider-private-catalog-owner.md)
+//! Design: ADR-0114 (docs/adr/ADR-0114-iceberg-provider-private-catalog-owner.md)
 
 use std::sync::Arc;
 

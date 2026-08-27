@@ -17,6 +17,77 @@
 
 use std::fmt;
 
+use uuid::Uuid;
+
+/// Process-lifetime identity for one backend process.
+///
+/// A backend generates this identifier once during process startup. It is not
+/// a durable membership id and is never reused after a restart.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct BackendProcessId(Uuid);
+
+/// Transport-neutral validation failure for a backend process identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendProcessIdentityError {
+    Nil,
+    NotUuidV7,
+}
+
+impl fmt::Display for BackendProcessIdentityError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Nil => "backend process id must not be nil",
+            Self::NotUuidV7 => "backend process id must be UUIDv7",
+        })
+    }
+}
+
+impl std::error::Error for BackendProcessIdentityError {}
+
+impl BackendProcessId {
+    /// Allocates a fresh process-lifetime UUIDv7 identity.
+    pub fn new_v7() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    pub fn try_from_uuid(value: Uuid) -> Result<Self, BackendProcessIdentityError> {
+        if value.is_nil() {
+            return Err(BackendProcessIdentityError::Nil);
+        }
+        if value.get_version_num() != 7 {
+            return Err(BackendProcessIdentityError::NotUuidV7);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn try_from_bytes(value: [u8; 16]) -> Result<Self, BackendProcessIdentityError> {
+        Self::try_from_uuid(Uuid::from_bytes(value))
+    }
+
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0.into_bytes()
+    }
+
+    pub const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for BackendProcessId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for BackendProcessId {
+    type Err = BackendProcessIdentityError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = Uuid::parse_str(value).map_err(|_| BackendProcessIdentityError::NotUuidV7)?;
+        Self::try_from_uuid(value)
+    }
+}
+
 /// Bit-exact identifier used for protocol, fragment, and execution identities.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct UniqueId {
@@ -292,9 +363,26 @@ mod tests {
     use std::collections::{BTreeSet, HashSet};
 
     use super::{
-        AttemptId, ExecutionIdentityError, LocalQuerySequence, QueryExecutionId, QueryId,
-        QueryIdAttribution, QueryProcessNamespace, UniqueId, format_uuid,
+        AttemptId, BackendProcessId, BackendProcessIdentityError, ExecutionIdentityError,
+        LocalQuerySequence, QueryExecutionId, QueryId, QueryIdAttribution, QueryProcessNamespace,
+        UniqueId, format_uuid,
     };
+    use uuid::Uuid;
+
+    #[test]
+    fn backend_process_id_is_exact_uuid_v7_and_non_nil() {
+        let id = BackendProcessId::new_v7();
+        assert_eq!(BackendProcessId::try_from_bytes(id.to_bytes()), Ok(id));
+        assert_eq!(id.as_uuid().get_version_num(), 7);
+        assert_eq!(
+            BackendProcessId::try_from_uuid(Uuid::nil()),
+            Err(BackendProcessIdentityError::Nil)
+        );
+        assert_eq!(
+            BackendProcessId::try_from_uuid(Uuid::new_v4()),
+            Err(BackendProcessIdentityError::NotUuidV7)
+        );
+    }
 
     #[test]
     fn identities_preserve_the_java_uuid_bit_layout() {

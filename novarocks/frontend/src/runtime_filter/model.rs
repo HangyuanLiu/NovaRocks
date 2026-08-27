@@ -13,9 +13,6 @@ use novarocks_proto_models::{common, filter};
 
 use super::deployment::RuntimeFilterWaitGraph;
 
-pub(crate) const CONTRIBUTION_DIGEST_DOMAIN: &[u8] =
-    b"novarocks.query-lifecycle.runtime-filter-contribution.v1\0";
-
 const BLOOM_BITS_PER_KEY: u64 = 8;
 const BLOOM_HASH_COUNT: u32 = 5;
 const BLOOM_SEED: u64 = 17;

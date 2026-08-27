@@ -17,7 +17,7 @@
 
 //! Construction of one exact-generation `IcebergMetadata`.
 //!
-//! Design: ADR-0110 (docs/adr/ADR-0110-iceberg-provider-private-catalog-owner.md)
+//! Design: ADR-0114 (docs/adr/ADR-0114-iceberg-provider-private-catalog-owner.md)
 //!
 //! A control generation freezes its descriptor, its one catalog, its filesystem
 //! authority, and its caches together. Splitting construction out from the

@@ -104,7 +104,7 @@ impl AbortCleanupFailure {
         detail: impl Into<String>,
     ) -> Self {
         Self {
-            target: participant.target,
+            target: participant.target.clone(),
             digest: participant.digest,
             kind,
             detail: detail.into(),
@@ -982,8 +982,8 @@ impl AttemptControl {
                 query_id_high = self.execution_id.query_id().high(),
                 query_id_low = self.execution_id.query_id().low(),
                 attempt_id = self.execution_id.attempt_id().get(),
-                backend_id = failure.target.backend_idx(),
-                backend_start_epoch = failure.target.start_epoch(),
+                backend_idx = failure.target.backend_idx(),
+                backend_process_id = %failure.target.process_id(),
                 participant_digest = %hex::encode(failure.digest.as_bytes()),
                 error_kind = ?failure.kind,
                 error = %failure.detail,
@@ -1026,8 +1026,8 @@ impl AttemptControl {
                             query_id_high = self.execution_id.query_id().high(),
                             query_id_low = self.execution_id.query_id().low(),
                             attempt_id = self.execution_id.attempt_id().get(),
-                            backend_id = participant.target.backend_idx(),
-                            backend_start_epoch = participant.target.start_epoch(),
+                            backend_idx = participant.target.backend_idx(),
+                            backend_process_id = %participant.target.process_id(),
                             participant_digest = %hex::encode(participant.digest.as_bytes()),
                             accepted_reason = ?accepted_reason,
                             "frontend query lifecycle stream abort accepted"
@@ -1059,7 +1059,11 @@ impl AttemptControl {
             })?;
         let ack = self
             .transport
-            .abort_query(participant.target, request, self.config.attach_timeout())
+            .abort_query(
+                participant.target.clone(),
+                request,
+                self.config.attach_timeout(),
+            )
             .map_err(|error| {
                 AbortCleanupFailure::new(
                     participant,
@@ -1091,8 +1095,8 @@ impl AttemptControl {
             query_id_high = self.execution_id.query_id().high(),
             query_id_low = self.execution_id.query_id().low(),
             attempt_id = self.execution_id.attempt_id().get(),
-            backend_id = participant.target.backend_idx(),
-            backend_start_epoch = participant.target.start_epoch(),
+            backend_idx = participant.target.backend_idx(),
+            backend_process_id = %participant.target.process_id(),
             participant_digest = %hex::encode(participant.digest.as_bytes()),
             accepted_reason = ?ack.accepted_reason().map_err(|error| AbortCleanupFailure::new(
                 participant,
@@ -1251,8 +1255,8 @@ impl AttemptControl {
             .filter(|(backend_idx, _)| !terminal.outcomes.contains_key(backend_idx))
             .map(|(backend_idx, participant)| {
                 format!(
-                    "backend={backend_idx} start_epoch={} digest={}",
-                    participant.target.start_epoch(),
+                    "backend={backend_idx} process_id={} digest={}",
+                    participant.target.process_id(),
                     hex::encode(participant.digest.as_bytes())
                 )
             })
@@ -1634,13 +1638,12 @@ impl AttemptControl {
                 if let Some(scope) = claim_terminal_snapshot_conflict(session, &outcome)? {
                     let conflict = conflicting_terminal_outcome(&outcome)?;
                     eprintln!(
-                        "NOVAROCKS_QUERY_TERMINAL_SNAPSHOT_CONFLICT_INJECTED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+                        "NOVAROCKS_QUERY_TERMINAL_SNAPSHOT_CONFLICT_INJECTED execution_id={}:{}:{} backend_index={} process_id={} token={}",
                         outcome.execution_id().query_id().high(),
                         outcome.execution_id().query_id().low(),
                         outcome.execution_id().attempt_id().get(),
                         scope.backend_index,
-                        scope.backend_id,
-                        scope.start_epoch,
+                        scope.process_id,
                         scope.token,
                     );
                     return self
@@ -1742,28 +1745,25 @@ fn claim_terminal_ack_drop(
         return Ok(false);
     };
     let backend_index = session.target.backend_idx();
-    let backend_id = u64::try_from(backend_index)
-        .map_err(|_| "backend index does not fit terminal ACK fault identity".to_string())?;
+    let process_id = session.target.process_id();
     let Some(scope) = claim_matching_fault(
         &root,
         QueryLifecycleFaultKind::TerminalAckDrop,
         protocol_execution_id(outcome.execution_id())?,
         backend_index,
-        backend_id,
-        session.target.start_epoch(),
+        process_id,
     )
     .map_err(|error| format!("claim terminal ACK drop fault: {error}"))?
     else {
         return Ok(false);
     };
     eprintln!(
-        "NOVAROCKS_QUERY_TERMINAL_ACK_DROPPED execution_id={}:{}:{} backend_index={} backend_id={} start_epoch={} token={}",
+        "NOVAROCKS_QUERY_TERMINAL_ACK_DROPPED execution_id={}:{}:{} backend_index={} process_id={} token={}",
         outcome.execution_id().query_id().high(),
         outcome.execution_id().query_id().low(),
         outcome.execution_id().attempt_id().get(),
         backend_index,
-        backend_id,
-        session.target.start_epoch(),
+        scope.process_id,
         scope.token,
     );
     Ok(true)
@@ -1780,15 +1780,13 @@ fn claim_terminal_snapshot_conflict(
         return Ok(None);
     };
     let backend_index = session.target.backend_idx();
-    let backend_id = u64::try_from(backend_index)
-        .map_err(|_| "backend index does not fit terminal conflict fault identity".to_string())?;
+    let process_id = session.target.process_id();
     claim_matching_fault(
         &root,
         QueryLifecycleFaultKind::TerminalSnapshotConflict,
         protocol_execution_id(outcome.execution_id())?,
         backend_index,
-        backend_id,
-        session.target.start_epoch(),
+        process_id,
     )
     .map_err(|error| format!("claim terminal snapshot conflict fault: {error}"))
 }

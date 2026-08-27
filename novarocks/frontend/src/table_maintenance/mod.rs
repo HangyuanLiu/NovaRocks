@@ -21,17 +21,18 @@
 //! survives a frontend restart. The sole durable exception is the separately
 //! named GC first-observation accelerator; it never owns a catalog mutation.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use novarocks_spi::connector::{
     ConnectorCleanupCandidate, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
+    ConnectorWriteOperationId, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use novarocks_spi::state_store::StateStore;
 use tokio::runtime::Handle;
 
+use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
@@ -66,7 +67,7 @@ enum WorkerLifecycle {
     Stopped(Result<(), String>),
 }
 
-// Design: ADR-0109 (docs/adr/ADR-0109-frontend-process-runtime-jobs-and-gc-observation-accelerator.md)
+// Design: ADR-0111 (docs/adr/ADR-0111-frontend-process-runtime-jobs-and-gc-observation-accelerator.md)
 pub struct FrontendTableMaintenanceService {
     optimize_runtime: Arc<OptimizeProcessRuntime>,
     activity: TableMaintenanceActivity,
@@ -135,6 +136,31 @@ impl FrontendTableMaintenanceService {
         let outcome = match action {
             ParsedMaintenanceAction::RemoveOrphanFiles { older_than_ms } => {
                 self.execute_cleanup(engine, target, older_than_ms)?
+            }
+            ParsedMaintenanceAction::RewriteDataFiles { .. } => {
+                let _permit = self
+                    .activity
+                    .acquire(&target, MaintenanceActivityFamily::Metadata)
+                    .map_err(|error| error.to_string())?;
+                execute_distributed_rewrite(
+                    engine,
+                    &target,
+                    DistributedRewriteIntent::DataFiles { rewrite_all: true },
+                )?
+            }
+            ParsedMaintenanceAction::RewritePositionDeleteFiles {
+                options,
+                where_clause,
+            } => {
+                let _permit = self
+                    .activity
+                    .acquire(&target, MaintenanceActivityFamily::Metadata)
+                    .map_err(|error| error.to_string())?;
+                execute_distributed_rewrite(
+                    engine,
+                    &target,
+                    rewrite_position_delete_intent(&options, where_clause.as_deref())?,
+                )?
             }
             action => {
                 let _permit = self
@@ -379,15 +405,167 @@ impl OptimizeJobExecutor for DirectOptimizeExecutor {
         engine: &dyn TableMaintenanceEngine,
         job: &model::OptimizeJob,
     ) -> Result<MaintenanceActionOutcome, String> {
-        engine.execute_action(MaintenanceActionRequest::RewriteDataFiles {
-            target: job.target.clone(),
-            base_snapshot_id: job.base_snapshot_id,
-            job_id: Some(job.job_id),
-            options: BTreeMap::new(),
-            branch: None,
-            where_clause: None,
-        })
+        execute_distributed_rewrite(
+            engine,
+            &job.target,
+            DistributedRewriteIntent::DataFiles { rewrite_all: true },
+        )
     }
+}
+
+/// Execute one current-process OPTIMIZE job through the frontend-owned native
+/// distributed rewrite path. The process runtime deliberately retains no
+/// recovery record, but a single attempt must still finish or abort its exact
+/// frozen connector session before the worker reports a terminal job state.
+fn execute_distributed_rewrite(
+    engine: &dyn TableMaintenanceEngine,
+    target: &MaintenanceTarget,
+    intent: DistributedRewriteIntent,
+) -> Result<MaintenanceActionOutcome, String> {
+    let session =
+        engine.plan_distributed_rewrite(target, ConnectorWriteOperationId::new(), intent)?;
+    let plan = session.plan();
+    if session.is_noop() {
+        return rewrite_outcome(intent, None, plan.summary());
+    }
+
+    for cohort in plan.cohorts() {
+        let completion = engine
+            .prepare_distributed_rewrite_cohort(&session, cohort.cohort_id())
+            .and_then(|prepared| {
+                crate::native::fragment_encoder::encode_native_fragment_bundle(
+                    prepared.encoding().encoding_view(),
+                )
+                .map_err(|error| format!("encode distributed rewrite fragments: {error}"))
+                .and_then(|bundle| prepared.finish(bundle))
+            });
+        let completion = match completion {
+            Ok(completion) => completion,
+            Err(error) => return abort_distributed_rewrite(engine, &session, error),
+        };
+        if let Err(error) = engine.checkpoint_distributed_rewrite_attempt(&session, &completion) {
+            return abort_distributed_rewrite(engine, &session, error);
+        }
+    }
+
+    match engine.commit_distributed_rewrite(&session)? {
+        ExternalMutationOutcome::KnownCommitted {
+            receipt,
+            finalization,
+            ..
+        } => {
+            let receipt = engine.finalize_distributed_rewrite(&session, &receipt)?;
+            if let ExternalMutationFinalization::Failed(error) = finalization {
+                return Err(format!(
+                    "distributed optimize committed but finalization failed: {error}"
+                ));
+            }
+            let summary = receipt.summary();
+            rewrite_outcome(intent, Some(summary), plan.summary())
+        }
+        ExternalMutationOutcome::KnownUncommitted { failure } => abort_distributed_rewrite(
+            engine,
+            &session,
+            format!("distributed rewrite commit was not applied: {failure}"),
+        ),
+        ExternalMutationOutcome::CommitUnknown { failure, .. } => Err(format!(
+            "distributed rewrite commit outcome is unknown: {failure}; do not retry automatically"
+        )),
+    }
+}
+
+fn rewrite_outcome(
+    intent: DistributedRewriteIntent,
+    receipt: Option<novarocks_spi::connector::ConnectorDistributedRewriteReceiptSummary>,
+    plan: novarocks_spi::connector::ConnectorDistributedRewritePlanSummary,
+) -> Result<MaintenanceActionOutcome, String> {
+    let receipt = receipt.unwrap_or_default();
+    match intent {
+        DistributedRewriteIntent::DataFiles { .. } => {
+            Ok(MaintenanceActionOutcome::RewriteDataFiles {
+                target_snapshot_id: receipt.target_version,
+                rewritten_data_files_count: i32::try_from(receipt.input_data_files)
+                    .map_err(|_| "distributed rewrite input data file count exceeds i32")?,
+                added_data_files_count: i32::try_from(receipt.output_data_files)
+                    .map_err(|_| "distributed rewrite output data file count exceeds i32")?,
+                rewritten_bytes_count: i64::try_from(plan.input_bytes)
+                    .map_err(|_| "distributed rewrite input byte count exceeds i64")?,
+                failed_data_files_count: 0,
+                removed_delete_files_count: i32::try_from(receipt.input_delete_files)
+                    .map_err(|_| "distributed rewrite input delete file count exceeds i32")?,
+                output_record_count: i64::try_from(receipt.output_rows)
+                    .map_err(|_| "distributed rewrite output row count exceeds i64")?,
+            })
+        }
+        DistributedRewriteIntent::PositionDeletes { .. } => {
+            Ok(MaintenanceActionOutcome::RewritePositionDeleteFiles {
+                rewritten_delete_files_count: i32::try_from(receipt.input_delete_files)
+                    .map_err(|_| "distributed rewrite input delete file count exceeds i32")?,
+                added_delete_files_count: i32::try_from(receipt.output_delete_files)
+                    .map_err(|_| "distributed rewrite output delete file count exceeds i32")?,
+                rewritten_bytes_count: i64::try_from(plan.input_bytes)
+                    .map_err(|_| "distributed rewrite input byte count exceeds i64")?,
+                added_bytes_count: 0,
+            })
+        }
+    }
+}
+
+fn abort_distributed_rewrite(
+    engine: &dyn TableMaintenanceEngine,
+    session: &crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession,
+    error: String,
+) -> Result<MaintenanceActionOutcome, String> {
+    match engine.abort_distributed_rewrite(session) {
+        Ok(_) => Err(error),
+        Err(abort) => Err(format!(
+            "{error}; distributed rewrite abort failed: {abort}"
+        )),
+    }
+}
+
+fn rewrite_position_delete_intent(
+    options: &std::collections::BTreeMap<String, String>,
+    where_clause: Option<&str>,
+) -> Result<DistributedRewriteIntent, String> {
+    if where_clause.is_some() {
+        return Err(
+            "rewrite_position_delete_files where is not supported in NovaRocks yet".to_string(),
+        );
+    }
+    let mut rewrite_all = false;
+    let mut min_input_files = None;
+    for (key, value) in options {
+        match key.as_str() {
+            "rewrite-all" if value.eq_ignore_ascii_case("true") => rewrite_all = true,
+            "rewrite-all" => {
+                return Err(
+                    "rewrite_position_delete_files option `rewrite-all` must be `true`".to_string(),
+                );
+            }
+            "min-input-files" => {
+                min_input_files = Some(value.parse::<u32>().map_err(|_| {
+                    "rewrite_position_delete_files option `min-input-files` must be a positive integer"
+                        .to_string()
+                })?);
+                if min_input_files == Some(0) {
+                    return Err(
+                        "rewrite_position_delete_files option `min-input-files` must be a positive integer"
+                            .to_string(),
+                    );
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unsupported rewrite_position_delete_files option `{other}`"
+                ));
+            }
+        }
+    }
+    Ok(DistributedRewriteIntent::PositionDeletes {
+        rewrite_all,
+        min_input_files,
+    })
 }
 
 impl TableMaintenanceService for FrontendTableMaintenanceService {
@@ -454,16 +632,34 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String> {
         match request {
+            MaintenanceActionRequest::RewriteDataFiles { target, .. } => {
+                execute_distributed_rewrite(
+                    engine,
+                    &target,
+                    DistributedRewriteIntent::DataFiles { rewrite_all: true },
+                )
+            }
+            MaintenanceActionRequest::RewritePositionDeleteFiles {
+                target,
+                options,
+                where_clause,
+            } => execute_distributed_rewrite(
+                engine,
+                &target,
+                rewrite_position_delete_intent(&options, where_clause.as_deref())?,
+            ),
             MaintenanceActionRequest::RemoveOrphanFiles {
                 target,
                 older_than_ms,
             } => self.execute_cleanup(engine, target, older_than_ms),
             request => {
                 let target = match &request {
-                    MaintenanceActionRequest::RewriteDataFiles { target, .. }
-                    | MaintenanceActionRequest::RewriteManifests { target, .. }
-                    | MaintenanceActionRequest::ExpireSnapshots { target, .. }
-                    | MaintenanceActionRequest::RewritePositionDeleteFiles { target, .. } => target,
+                    MaintenanceActionRequest::RewriteManifests { target, .. }
+                    | MaintenanceActionRequest::ExpireSnapshots { target, .. } => target,
+                    MaintenanceActionRequest::RewriteDataFiles { .. }
+                    | MaintenanceActionRequest::RewritePositionDeleteFiles { .. } => {
+                        unreachable!("handled by the frontend distributed rewrite owner")
+                    }
                     MaintenanceActionRequest::RemoveOrphanFiles { .. } => {
                         unreachable!("handled above")
                     }

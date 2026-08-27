@@ -19,7 +19,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::app_config::NovaRocksConfig;
-use crate::network;
+use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
 #[cfg(feature = "mysql-state-store-provider")]
 use crate::state_store_config::MySqlTlsMode;
 use crate::state_store_config::{
@@ -267,9 +267,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                     .collect();
                 MvLakePublicationObservation::Published(MvPublishedRefreshObservation::try_new(
                     facts.target_snapshot_id,
-                    facts.refresh_id,
-                    facts.mv_id,
-                    facts.token,
+                    facts.publication_id,
                     technique,
                     bases,
                     facts.definition_fingerprint,
@@ -282,6 +280,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
         };
         MvLakePackageObservation::try_new(
             metadata.identity.clone(),
+            observed.target_object_id,
             descriptor,
             current_target_snapshot,
             publication,
@@ -332,9 +331,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
                     (
                         snapshot_id,
                         MvObservedRefreshMarker {
-                            refresh_id: marker.refresh_id,
-                            mv_id: marker.mv_id,
-                            token: marker.token,
+                            publication_id: marker.publication_id,
                         },
                     )
                 })
@@ -411,21 +408,36 @@ pub fn compose_backend_execution_installers(
 /// Frontend, StateStore, or connector wire sections.
 pub fn compose_backend_server_config(
     config: &NovaRocksConfig,
+    native_trust: &NativeTrustSnapshot,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<BackendServerConfig> {
     let runtime_config = &config.runtime;
-    let advertise_endpoint = network::standalone_advertise_endpoint(
-        &config.server.host,
-        &config.server.priority_networks,
-        &config.cluster.advertise_host,
-        config.server.grpc_port,
-    )
-    .map_err(|error| anyhow::anyhow!("resolve backend advertise endpoint: {error}"))?;
+    let advertise_endpoint = novarocks_types::AdvertiseEndpoint {
+        host: native_trust.advertised_endpoint().host().to_string(),
+        port: native_trust.advertised_endpoint().port(),
+    };
+    let frontend_endpoint = config
+        .cluster
+        .frontend_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("role=be requires [cluster].frontend_endpoint"))?
+        .parse::<novarocks_types::NativeEndpoint>()
+        .map_err(|error| anyhow::anyhow!("parse [cluster].frontend_endpoint: {error}"))?;
     Ok(BackendServerConfig {
         bind_host: config.server.host.clone(),
         grpc_port: config.server.grpc_port,
         metrics_http_port: config.server.http_port,
         advertise_endpoint,
+        native_trust: std::sync::Arc::clone(native_trust.trust()),
+        native_transport: backend_native_transport(native_trust.transport()),
+        frontend_endpoint,
+        announce_interval: Duration::from_millis(config.cluster.backend_announce_interval_ms()),
+        announce_initial_backoff: Duration::from_millis(
+            config.cluster.backend_announce_initial_backoff_ms(),
+        ),
+        announce_max_backoff: Duration::from_millis(
+            config.cluster.backend_announce_max_backoff_ms(),
+        ),
         query_lifecycle_sweep_interval: Duration::from_millis(
             runtime_config.query_control_heartbeat_interval_ms,
         ),
@@ -466,17 +478,11 @@ pub fn compose_backend_server_config(
 /// Resolve every Frontend startup input from the application wire configuration.
 pub fn compose_frontend_server_config(
     config: &NovaRocksConfig,
+    native_trust: &NativeTrustSnapshot,
     port_override: Option<u16>,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<FrontendServerConfig> {
     let runtime_config = &config.runtime;
-    let advertised = network::standalone_advertise_endpoint(
-        &config.server.host,
-        &config.server.priority_networks,
-        &config.cluster.advertise_host,
-        config.server.grpc_port,
-    )
-    .map_err(|error| anyhow::anyhow!("resolve frontend advertise endpoint: {error}"))?;
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
     let failure_backoff_ms = config
@@ -484,8 +490,8 @@ pub fn compose_frontend_server_config(
         .as_ref()
         .map(|standalone| standalone.mv_refresh_scheduler_failure_backoff_ms.max(1));
     let mut execution = FrontendExecutionConfig::new(
-        advertised.host,
-        advertised.port,
+        native_trust.advertised_endpoint().host().to_string(),
+        native_trust.advertised_endpoint().port(),
         runtime_filter_worker_count,
     )
     .with_lake_publication_runtime_policy(
@@ -540,22 +546,11 @@ pub fn compose_frontend_server_config(
             ),
         );
     }
-    let backend_seeds = config
-        .cluster
-        .backends
-        .iter()
-        .map(|endpoint| {
-            endpoint.parse().map_err(|error| {
-                anyhow::anyhow!("parse configured backend endpoint '{endpoint}' failed: {error}")
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let backend_open = ClusterBackendOpenConfig::new(
         config.cluster.role,
-        backend_seeds,
-        Duration::from_millis(config.cluster.heartbeat_interval_ms),
-        config.cluster.heartbeat_timeout_retries,
-        Duration::from_secs(config.cluster.decommission_timeout_secs),
+        Duration::from_millis(config.cluster.heartbeat_interval_ms()),
+        config.cluster.heartbeat_timeout_retries(),
+        Duration::from_millis(config.cluster.backend_announce_lease_ttl_ms()),
     )
     .map_err(|error| anyhow::anyhow!("open frontend backend cluster configuration: {error}"))?;
     let mysql_listener = novarocks_frontend::resolve_mysql_listener_settings(
@@ -583,7 +578,37 @@ pub fn compose_frontend_server_config(
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
         state_store_input,
         state_store_provider_registry,
+        native_trust: std::sync::Arc::clone(native_trust.trust()),
+        native_transport: frontend_native_transport(native_trust.transport()),
     })
+}
+
+fn backend_native_transport(
+    transport: &NativeTrustTransport,
+) -> novarocks_backend::BackendNativeTransport {
+    match transport {
+        NativeTrustTransport::Plaintext => novarocks_backend::BackendNativeTransport::Plaintext,
+        NativeTrustTransport::Automatic(material) => {
+            novarocks_backend::BackendNativeTransport::Automatic(material.clone())
+        }
+        NativeTrustTransport::Pem(material) => {
+            novarocks_backend::BackendNativeTransport::Pem(material.clone())
+        }
+    }
+}
+
+fn frontend_native_transport(
+    transport: &NativeTrustTransport,
+) -> novarocks_frontend::FrontendNativeTransport {
+    match transport {
+        NativeTrustTransport::Plaintext => novarocks_frontend::FrontendNativeTransport::plaintext(),
+        NativeTrustTransport::Automatic(material) => {
+            novarocks_frontend::FrontendNativeTransport::automatic(material.clone())
+        }
+        NativeTrustTransport::Pem(material) => {
+            novarocks_frontend::FrontendNativeTransport::pem(material.clone())
+        }
+    }
 }
 
 fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntimeConfig {

@@ -364,15 +364,18 @@ fn runtime_filter_profile_tree(
 ) -> Result<RuntimeProfileTree, DistributedQueryError> {
     let execution_id = snapshot.execution_id();
     let backend = snapshot.backend();
+    let process_id = backend.process_id().map_err(|error| {
+        DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            error.to_string(),
+        )
+    })?;
     let participant = RuntimeProfile::new(format!(
-        "RuntimeFilterParticipant (backend_id={}, start_epoch={})",
-        backend.backend_id(),
-        backend.start_epoch()
+        "RuntimeFilterParticipant (process_id={process_id})"
     ));
     participant.add_info_string("QueryId", execution_id.query_id().to_string());
     participant.add_info_string("AttemptId", execution_id.attempt_id().get().to_string());
-    participant.add_info_string("BackendId", backend.backend_id().to_string());
-    participant.add_info_string("BackendStartEpoch", backend.start_epoch().to_string());
+    participant.add_info_string("BackendProcessId", process_id.to_string());
 
     let common = participant.child(COMMON_METRICS);
     if totals.has_row_evaluation {
@@ -1102,8 +1105,17 @@ mod tests {
     use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
     use novarocks_proto_models::{common, novarocks};
 
+    fn test_backend_process_id(participant_seed: u64) -> novarocks::BackendProcessId {
+        let mut value = vec![
+            0x01, 0x9c, 0x98, 0xa9, 0x33, 0x90, 0x75, 0x76, 0x97, 0x7b, 0x33, 0xd1, 0x88, 0xad,
+            0x1f, 0x00,
+        ];
+        value[15] = participant_seed as u8;
+        novarocks::BackendProcessId { value }
+    }
+
     fn runtime_filter_snapshot(
-        backend_id: u64,
+        participant_seed: u64,
         channel_binding_id: u32,
         input_rows: u64,
         output_rows: u64,
@@ -1115,16 +1127,15 @@ mod tests {
             version: 1,
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(execution_id)),
             backend: Some(novarocks::ParticipantBackendIdentity {
-                backend_id,
                 endpoint: Some(novarocks::QueryControlEndpoint {
                     host: "127.0.0.1".to_string(),
                     port: 19_000_u16
-                        .checked_add(backend_id as u16)
+                        .checked_add(participant_seed as u16)
                         .expect("test port") as u32,
                 }),
-                start_epoch: 1,
+                process_id: Some(test_backend_process_id(participant_seed)),
             }),
-            init_digest: vec![backend_id as u8; 32],
+            init_digest: vec![participant_seed as u8; 32],
             fragments: Vec::new(),
             profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
@@ -1133,7 +1144,7 @@ mod tests {
                             version: 1,
                             channels: vec![novarocks::QueryTerminalRuntimeFilterChannelV1 {
                                 channel_binding_id,
-                                channel_id: backend_id as u32,
+                                channel_id: participant_seed as u32,
                                 install_state: novarocks::QueryTerminalRuntimeFilterChannelInstallStateV1::Installed as i32,
                                 terminal_state: novarocks::QueryTerminalRuntimeFilterChannelTerminalStateV1::Completed as i32,
                                 latest_published_logical_version: Some(1),
@@ -1146,10 +1157,10 @@ mod tests {
                             transport_routes: Vec::new(),
                             consumers: vec![novarocks::QueryTerminalRuntimeFilterConsumerV1 {
                                 channel_binding_id,
-                                channel_id: backend_id as u32,
+                                channel_id: participant_seed as u32,
                                 consumer_binding_id: channel_binding_id + 100,
                                 fragment_instance_id: Some(common::UniqueId {
-                                    hi: backend_id as i64,
+                                    hi: participant_seed as i64,
                                     lo: channel_binding_id as i64,
                                 }),
                                 latest_delivered_logical_version: Some(1),
@@ -1187,13 +1198,17 @@ mod tests {
 
         let profiles = builder.finish().into_profiles();
         assert_eq!(profiles.len(), 2);
-        assert_eq!(
-            profiles[0].root.name,
-            "RuntimeFilterParticipant (backend_id=1, start_epoch=1)"
+        assert!(
+            profiles[0]
+                .root
+                .name
+                .starts_with("RuntimeFilterParticipant (process_id=")
         );
-        assert_eq!(
-            profiles[1].root.name,
-            "RuntimeFilterParticipant (backend_id=2, start_epoch=1)"
+        assert!(
+            profiles[1]
+                .root
+                .name
+                .starts_with("RuntimeFilterParticipant (process_id=")
         );
         assert!(profiles[0].root.children.iter().any(|node| {
             node.name == "RuntimeFilterChannel (channel_binding_id=11, channel_id=1)"
@@ -1238,12 +1253,11 @@ mod tests {
                     .expect("execution id"),
             )),
             backend: Some(novarocks::ParticipantBackendIdentity {
-                backend_id: 1,
                 endpoint: Some(novarocks::QueryControlEndpoint {
                     host: "127.0.0.1".to_string(),
                     port: 19_001,
                 }),
-                start_epoch: 1,
+                process_id: Some(test_backend_process_id(1)),
             }),
             init_digest: vec![1; 32],
             profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {

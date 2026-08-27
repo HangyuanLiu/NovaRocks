@@ -70,7 +70,7 @@ pub(crate) fn launch_server(
                 startup_timeout: startup_timeout(),
                 child_environment: Default::default(),
                 config_overlay: Default::default(),
-                initial_backend_seeds: None,
+                native_trust_fixture: Default::default(),
             },
         )?)),
     }

@@ -55,7 +55,7 @@ impl IcebergMvBackend {
 
     pub fn list_mvs(&self, req: ListMvsRequest) -> Result<Vec<MvListRow>, String> {
         crate::mv::domain::analysis_adapter::list_mv_rows_with_ports(
-            self.ports.repository().as_ref(),
+            self.ports.readiness().as_ref(),
             req.current_catalog.as_deref(),
             &req.stmt,
             Some(MvStorageEngine::Iceberg),

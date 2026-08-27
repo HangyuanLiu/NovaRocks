@@ -2,9 +2,9 @@
 id: ADR-0109
 title: "MV lake descriptor is the rebuild authority for desired semantics"
 domain: [frontend-mv, provider-spi]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0112
 date: 2026-08-26
 provenance:
   - "discussion: 2026-08-25 MV lake descriptor fidelity and wipe-start equivalence"
@@ -31,7 +31,7 @@ Iceberg target table 的 application-owned descriptor properties 可以和 targe
 Connector generation读取；current snapshot及其 provenance提供已经发布的 target snapshot、base waterline、
 object identity、rows和refresh time。Provider只投影这些中立事实，Frontend保留 MV descriptor、SQL与
 repository 的语义解释，遵循 ADR-0086。Catalog commit 仍是外部写入的唯一 frontier，响应不明保持
-crash-only outcome，遵循 ADR-0104。
+crash-only outcome，遵循 ADR-0110。
 
 StateStore definition、target/dependency indexes、partition state和scheduler metadata服务于当前 Frontend
 运行；numeric `mv_id`、refresh attempt、lease/fence、in-progress flag、scheduler error和next-run物理时间

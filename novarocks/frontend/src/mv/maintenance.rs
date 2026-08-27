@@ -458,7 +458,7 @@ impl MaintenanceCoordinator {
             // Target loss/recovery is re-discovered by the next inventory
             // scan; definition/corruption/invariant errors must not spin.
             MvBackgroundEngineErrorKind::TargetGone
-            | MvBackgroundEngineErrorKind::RecoveryRequired
+            | MvBackgroundEngineErrorKind::TerminalFailure
             | MvBackgroundEngineErrorKind::InvalidDefinition
             | MvBackgroundEngineErrorKind::Corruption
             | MvBackgroundEngineErrorKind::InvariantViolation => {

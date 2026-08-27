@@ -1,0 +1,49 @@
+{
+  "type": "record",
+  "name": "StoredMvAcceleratorProjectionV1",
+  "namespace": "org.apache.novarocks.mv.accelerator",
+  "fields": [
+    { "name": "mv_id", "type": "long" },
+    { "name": "query_definition", "type": {
+      "type": "record", "name": "PersistedQueryDefinitionV1", "fields": [
+        { "name": "format_version", "type": "int" },
+        { "name": "raw_query_source", "type": "string" },
+        { "name": "dialect", "type": "string" },
+        { "name": "resolution", "type": {
+          "type": "record", "name": "FrozenQueryResolutionContextV1", "fields": [
+            { "name": "default_catalog", "type": "string" },
+            { "name": "default_database", "type": "string" }
+          ]
+        } }
+      ]
+    } },
+    { "name": "base_table_refs", "type": { "type": "array", "items": "string" } },
+    { "name": "primary_key_columns", "type": { "type": "array", "items": "string" } },
+    { "name": "storage_engine", "type": "string" },
+    { "name": "target_catalog", "type": ["null", "string"] },
+    { "name": "target_namespace", "type": ["null", "string"] },
+    { "name": "target_table", "type": ["null", "string"] },
+    { "name": "schema_contract", "type": ["null", "string"] },
+    { "name": "partition_spec", "type": ["null", "string"] },
+    { "name": "last_refresh_ms", "type": ["null", "long"] },
+    { "name": "last_refresh_rows", "type": ["null", "long"] },
+    { "name": "last_refresh_snapshots", "type": { "type": "map", "values": "long" } },
+    { "name": "last_refresh_table_object_ids", "type": { "type": "map", "values": "bytes" } },
+    { "name": "last_refreshed_iceberg_snapshot_id", "type": ["null", "long"] },
+    { "name": "refresh_policy", "type": {
+      "type": "enum", "name": "MvDesiredRefreshPolicyV1",
+      "symbols": ["MANUAL", "ASYNC_ON_CHANGE", "ASYNC_INTERVAL"]
+    } },
+    { "name": "refresh_paused", "type": "boolean" },
+    { "name": "refresh_interval_ms", "type": ["null", "long"] },
+    { "name": "max_staleness_ms", "type": ["null", "long"] },
+    { "name": "created_at_ms", "type": "long" },
+    { "name": "source_revision", "type": {
+      "type": "record", "name": "MvAcceleratorSourceRevisionV1", "fields": [
+        { "name": "target_object_id", "type": "bytes" },
+        { "name": "descriptor_content_hash", "type": "string" },
+        { "name": "current_target_snapshot_id", "type": ["null", "long"] }
+      ]
+    } }
+  ]
+}

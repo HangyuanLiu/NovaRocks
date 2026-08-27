@@ -29,10 +29,6 @@ pub trait Visit {
         walk_show_backends(self, statement);
     }
 
-    fn visit_backend_statement(&mut self, statement: &BackendStatement) {
-        walk_backend_statement(self, statement);
-    }
-
     fn visit_statistics_statement(&mut self, statement: &StatisticsStatement) {
         walk_statistics_statement(self, statement);
     }
@@ -124,7 +120,7 @@ pub trait Visit {
 
 pub fn walk_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Statement) {
     match statement {
-        Statement::Backend(statement) => visitor.visit_backend_statement(statement),
+        Statement::ShowBackends(statement) => visitor.visit_show_backends(statement),
         Statement::Statistics(statement) => visitor.visit_statistics_statement(statement),
         Statement::Catalog(statement) => visitor.visit_catalog_statement(statement),
         Statement::Iceberg(statement) => visitor.visit_iceberg_statement(statement),
@@ -142,10 +138,6 @@ pub fn walk_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &Statement)
 }
 
 pub fn walk_show_backends<V: Visit + ?Sized>(_: &mut V, _: &ShowBackends) {}
-
-pub fn walk_backend_statement<V: Visit + ?Sized>(visitor: &mut V, statement: &BackendStatement) {
-    super::backend::walk(visitor, statement);
-}
 
 pub fn walk_statistics_statement<V: Visit + ?Sized>(
     visitor: &mut V,
@@ -646,10 +638,6 @@ pub trait Fold {
         fold_show_backends(self, statement)
     }
 
-    fn fold_backend_statement(&mut self, statement: BackendStatement) -> BackendStatement {
-        fold_backend_statement(self, statement)
-    }
-
     fn fold_statistics_statement(&mut self, statement: StatisticsStatement) -> StatisticsStatement {
         fold_statistics_statement(self, statement)
     }
@@ -747,8 +735,8 @@ pub trait Fold {
 
 pub fn fold_statement<F: Fold + ?Sized>(folder: &mut F, statement: Statement) -> Statement {
     match statement {
-        Statement::Backend(statement) => {
-            Statement::Backend(folder.fold_backend_statement(statement))
+        Statement::ShowBackends(statement) => {
+            Statement::ShowBackends(folder.fold_show_backends(statement))
         }
         Statement::Statistics(statement) => {
             Statement::Statistics(folder.fold_statistics_statement(statement))
@@ -778,13 +766,6 @@ pub fn fold_statement<F: Fold + ?Sized>(folder: &mut F, statement: Statement) ->
 
 pub fn fold_show_backends<F: Fold + ?Sized>(_: &mut F, statement: ShowBackends) -> ShowBackends {
     statement
-}
-
-pub fn fold_backend_statement<F: Fold + ?Sized>(
-    folder: &mut F,
-    statement: BackendStatement,
-) -> BackendStatement {
-    super::backend::fold(folder, statement)
 }
 
 pub fn fold_statistics_statement<F: Fold + ?Sized>(

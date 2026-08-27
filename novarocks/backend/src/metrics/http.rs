@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, TcpListener};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
@@ -47,6 +47,8 @@ impl BackendMetricsRegistry {
             Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINATIONS).clone()),
             Box::new(Lazy::force(&BACKEND_QUERY_LIFECYCLE_TERMINAL).clone()),
             Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone()),
+            Box::new(Lazy::force(&BACKEND_NATIVE_AUTHENTICATION_FAILURES).clone()),
+            Box::new(Lazy::force(&BACKEND_NATIVE_TLS_FAILURES).clone()),
         ] {
             registry
                 .register(collector)
@@ -222,6 +224,64 @@ static BACKEND_QUERY_EXECUTION_RESOURCES: Lazy<IntGaugeVec> = Lazy::new(|| {
     )
     .expect("construct novarocks_backend_query_execution_resources")
 });
+
+static BACKEND_NATIVE_AUTHENTICATION_FAILURES: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    prometheus::IntCounterVec::new(
+        Opts::new(
+            "novarocks_native_authentication_failures_total",
+            "Cumulative rejected Native caller authentication attempts.",
+        ),
+        &["reason"],
+    )
+    .expect("construct novarocks_native_authentication_failures_total")
+});
+
+static BACKEND_NATIVE_TLS_FAILURES: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    prometheus::IntCounterVec::new(
+        Opts::new(
+            "novarocks_native_tls_failures_total",
+            "Cumulative Native TLS handshake failures.",
+        ),
+        &["phase", "reason"],
+    )
+    .expect("construct novarocks_native_tls_failures_total")
+});
+
+static BACKEND_NATIVE_AUTH_FAILURE_LOG_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static BACKEND_NATIVE_TLS_FAILURE_LOG_SAMPLE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_backend_native_authentication_failure() {
+    BACKEND_NATIVE_AUTHENTICATION_FAILURES
+        .with_label_values(&["authentication"])
+        .inc();
+    if BACKEND_NATIVE_AUTH_FAILURE_LOG_SAMPLE
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(64)
+    {
+        tracing::warn!(
+            role = "be",
+            reason = "authentication",
+            "rejected native caller authentication"
+        );
+    }
+}
+
+pub(crate) fn record_backend_native_tls_handshake_failure() {
+    BACKEND_NATIVE_TLS_FAILURES
+        .with_label_values(&["handshake", "transport_configuration"])
+        .inc();
+    if BACKEND_NATIVE_TLS_FAILURE_LOG_SAMPLE
+        .fetch_add(1, Ordering::Relaxed)
+        .is_multiple_of(64)
+    {
+        tracing::warn!(
+            role = "be",
+            phase = "handshake",
+            reason = "transport_configuration",
+            "rejected native TLS handshake"
+        );
+    }
+}
 
 fn parse_metrics_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
     let bare = if host.starts_with('[') && host.ends_with(']') {

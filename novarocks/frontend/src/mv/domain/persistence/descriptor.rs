@@ -319,7 +319,7 @@ mod tests {
                 vec!["id".to_string()],
                 sample_schema_contract(),
                 MvRefreshDesiredConfiguration::new(
-                    crate::mv::domain::persistence::definition::StoredMvRefreshPolicy::AsyncInterval,
+                    crate::mv::domain::persistence::definition::MvDesiredRefreshPolicy::AsyncInterval,
                     true,
                     Some(60_000),
                     Some(300_000),

@@ -20,9 +20,9 @@
 //! Test-only transparent Iceberg REST proxy for publication acceptance tests.
 //!
 //! The proxy owns no catalog state and exposes no catalog extension.  It only
-//! recognizes standard REST `stage-create` and table-commit requests in order
-//! to consume one runner-owned fault token.  The real REST Catalog remains the
-//! only authority for every create, commit, ref, and object outcome.
+//! recognizes standard REST publication and discovery requests in order to
+//! consume one runner-owned fault token. The real REST Catalog remains the
+//! only authority for every create, commit, ref, object, and package outcome.
 
 use anyhow::{Context, Result};
 use axum::body::{Body, Bytes};
@@ -88,6 +88,8 @@ struct NextFaultState {
 pub(crate) enum PublicationAction {
     StageCreate,
     TableCommit,
+    NamespaceList,
+    TableLoad,
 }
 
 impl PublicationAction {
@@ -95,6 +97,8 @@ impl PublicationAction {
         match self {
             Self::StageCreate => "stage-create",
             Self::TableCommit => "table-commit",
+            Self::NamespaceList => "namespace-list",
+            Self::TableLoad => "table-load",
         }
     }
 }
@@ -105,6 +109,8 @@ pub(crate) enum PublicationFault {
     BeforeDispatch,
     AfterCommitBeforeResponse,
     AfterCommitHoldForFrontendKill,
+    IncompleteDiscovery,
+    CorruptPackage,
 }
 
 impl PublicationFault {
@@ -113,6 +119,8 @@ impl PublicationFault {
             Self::BeforeDispatch => "before-dispatch",
             Self::AfterCommitBeforeResponse => "after-commit-before-response",
             Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
+            Self::IncompleteDiscovery => "incomplete-discovery",
+            Self::CorruptPackage => "corrupt-package",
         }
     }
 }
@@ -272,6 +280,8 @@ fn parse_action(value: &str) -> Result<PublicationAction> {
     match value {
         "stage-create" => Ok(PublicationAction::StageCreate),
         "table-commit" => Ok(PublicationAction::TableCommit),
+        "namespace-list" => Ok(PublicationAction::NamespaceList),
+        "table-load" => Ok(PublicationAction::TableLoad),
         other => anyhow::bail!("unknown publication catalog action `{other}`"),
     }
 }
@@ -283,6 +293,8 @@ fn parse_fault(value: &str) -> Result<PublicationFault> {
         "after-commit-hold-for-frontend-kill" => {
             Ok(PublicationFault::AfterCommitHoldForFrontendKill)
         }
+        "incomplete-discovery" => Ok(PublicationFault::IncompleteDiscovery),
+        "corrupt-package" => Ok(PublicationFault::CorruptPackage),
         other => anyhow::bail!("unknown publication catalog fault `{other}`"),
     }
 }
@@ -430,7 +442,7 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
         Ok(bytes) => bytes,
         Err(error) => return temporary_failure(error.to_string()),
     };
-    let action = standard_publication_action(&parts.method, parts.uri.path(), &bytes);
+    let action = standard_catalog_action(&parts.method, parts.uri.path(), &bytes);
     let fault = action.and_then(|action| take_matching_fault(&state, action));
     if let Some(armed) = fault.as_ref()
         && armed.fault == PublicationFault::BeforeDispatch
@@ -455,18 +467,40 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
                     "publication REST response released after frontend kill",
                 );
             }
+            PublicationFault::IncompleteDiscovery => {
+                // A valid empty list means discovery completed with no
+                // namespaces. The MV contract needs an actual standard REST
+                // read failure so SPI classifies this catalog as Incomplete.
+                return temporary_failure("catalog discovery read failed");
+            }
+            PublicationFault::CorruptPackage => {
+                return response_with_headers(
+                    StatusCode::OK,
+                    HeaderMap::new(),
+                    Bytes::from_static(b"{corrupt-package"),
+                );
+            }
             PublicationFault::BeforeDispatch => unreachable!("returned before dispatch"),
         }
     }
     response
 }
 
-fn standard_publication_action(
+fn standard_catalog_action(
     method: &Method,
     path: &str,
     body: &[u8],
 ) -> Option<PublicationAction> {
-    if method != Method::POST || !path.contains("/v1/") {
+    if !path.contains("/v1/") {
+        return None;
+    }
+    if method == Method::GET && path.ends_with("/v1/namespaces") {
+        return Some(PublicationAction::NamespaceList);
+    }
+    if method == Method::GET && path.contains("/tables/") {
+        return Some(PublicationAction::TableLoad);
+    }
+    if method != Method::POST {
         return None;
     }
     let value: Value = serde_json::from_slice(body).ok()?;
@@ -584,7 +618,7 @@ mod tests {
     #[test]
     fn recognizes_only_standard_stage_create_and_table_commit_requests() {
         assert_eq!(
-            standard_publication_action(
+            standard_catalog_action(
                 &Method::POST,
                 "/v1/namespaces/ns/tables",
                 br#"{"stage-create":true}"#,
@@ -592,7 +626,7 @@ mod tests {
             Some(PublicationAction::StageCreate)
         );
         assert_eq!(
-            standard_publication_action(
+            standard_catalog_action(
                 &Method::POST,
                 "/v1/namespaces/ns/tables/t",
                 br#"{"requirements":[],"updates":[]}"#,
@@ -600,12 +634,20 @@ mod tests {
             Some(PublicationAction::TableCommit)
         );
         assert_eq!(
-            standard_publication_action(
+            standard_catalog_action(
                 &Method::POST,
                 "/extensions/private-action/publish",
                 br#"{}"#,
             ),
             None
+        );
+        assert_eq!(
+            standard_catalog_action(&Method::GET, "/v1/namespaces", br#""#),
+            Some(PublicationAction::NamespaceList)
+        );
+        assert_eq!(
+            standard_catalog_action(&Method::GET, "/v1/namespaces/ns/tables/t", br#""#),
+            Some(PublicationAction::TableLoad)
         );
     }
 

@@ -32,7 +32,7 @@ MySQL client
   |
   v
 NovaRocks role=fe
-  |  StateStore durable membership + cluster.backends additive seeds
+  |  Native self-registration + FE-pull exact heartbeat verification
   v
 NovaRocks role=be  +  NovaRocks role=be  +  ...
 ```
@@ -49,9 +49,11 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 - FE 节点和所有 BE 节点使用同一版本的 NovaRocks。
 - FE 节点可以访问每个 BE 的 `grpc_port`。
 - BE 节点可以访问 FE 的 `grpc_port`，用于向 coordinator 上报执行状态。
+- 所有 FE/BE 配置必须有完全相同的 `[native_trust].deployment_id`、shared
+  secret 与 transport mode；Native JWT 是 mandatory，TLS 只是在其上增加的可选层。
 - 所有 BE 节点都能访问相同的数据源、对象存储和 catalog。
 - 如果使用对象存储，所有节点的凭据、endpoint 和 path-style 设置应保持一致。
-- `role=fe` 必须配置一个可用的 `[state_store]`。它是 backend membership 的唯一 durable authority；SQLite 只适用于恰好一个 active FE。
+- `role=fe` 必须配置一个可用的 `[state_store]`，供 catalog、MV 等其余 FE durable owner 使用；它不是 backend membership source。backend desired lifecycle 属于外部 orchestrator，FE 的 observed registry 会由 BE announce 和 FE-pull heartbeat 在重启后重建。SQLite 只适用于恰好一个 active FE。
 
 ## 编译 NovaRocks
 
@@ -88,6 +90,10 @@ log_level = "info"
 host = "0.0.0.0"
 grpc_port = 9080
 http_port = 8040
+
+[native_trust]
+deployment_id = "analytics-prod"
+shared_secret = "${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
 
 [cluster]
 role = "be"
@@ -127,11 +133,10 @@ affected process. Credentials never enter native fragments or FE-to-BE transport
 
 ## 配置 FE 节点
 
-FE 节点启动 `server.grpc_port` 接收 BE coordinator report，并启动独立
-`server.http_port` 暴露 FE-scoped metrics 和现有 gated lifecycle debug。Native
-listener 不承载 management HTTP。FE 必须配置 `[state_store]`，以持久化 backend
-membership；`[cluster].backends` 则是可选的 additive seeds，endpoint 应指向 BE 的
-`grpc_port`。
+FE 节点启动 `server.grpc_port` 接收 BE coordinator report 和 authenticated backend
+announce，并启动独立 `server.http_port` 暴露 FE-scoped metrics 和现有 gated lifecycle
+debug。Native listener 不承载 management HTTP。FE 必须配置 `[state_store]`，但它不持久化
+backend membership：BE 由外部 orchestrator 创建，并向 FE self-register。
 
 示例 `fe.toml`：
 
@@ -149,6 +154,10 @@ host = "0.0.0.0"
 grpc_port = 9080
 http_port = 8040
 
+[native_trust]
+deployment_id = "analytics-prod"
+shared_secret = "${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
+
 [standalone_server]
 mysql_port = 9030
 user = "root"
@@ -161,13 +170,12 @@ enable_path_style_access = true
 
 [cluster]
 role = "fe"
-backends = [
-  "10.0.0.11:9080",
-  "10.0.0.12:9080",
-]
+heartbeat_interval_ms = 1000
+heartbeat_timeout_retries = 3
+backend_announce_lease_ttl_ms = 5000
 ```
 
-`[state_store]` 是 FE durable control-plane state 的唯一持久化入口，其中的 membership 会在 FE 重启后恢复；不得添加第二套 metadata store 或内存 registry 作为 fallback。持久用户表属于 external Iceberg catalog；`[connector.object_store]` 只提供 connector execution 的进程本地凭据。`[cluster].backends` 只会补充尚不存在的 endpoint：它不会删除 StateStore 中已有的 backend，也不会重新激活正在 decommissioning 的 backend。
+`[state_store]` 是 FE durable control-plane state 的唯一持久化入口，但 membership 只是可重建的内存投影：FE 重启后由仍在运行的 BE renew announce 重建。不得添加第二套 metadata store、seed 或内存 fallback。持久用户表属于 external Iceberg catalog；`[connector.object_store]` 只提供 connector execution 的进程本地凭据。
 
 启动 FE：
 
@@ -183,6 +191,22 @@ NOVAROCKS_READY mysql_port=9030 pid=<pid>
 ```
 
 当前 MySQL 入口绑定在 `127.0.0.1`。如果需要远程访问，请在 FE 节点上使用 SSH tunnel、反向代理或本机客户端连接。
+
+## Native trust 与传输选择
+
+每个 deployable FE/BE role 都必须配置相同的 `[native_trust]`。它要求
+`deployment_id` 和至少 32 bytes 的 shared secret；secret 推荐以
+`openssl rand -base64 32` 生成，并通过每台主机受保护的
+`NOVAROCKS_NATIVE_SHARED_SECRET` 环境变量供 Server 在启动时解析。不要将 production
+secret 提交到 TOML、shell history 或日志。
+
+未写 `[native_trust.transport]` 时是 **authenticated h2c**：每个 Native RPC 都必须有
+短期 HS256 deployment JWT，但 protobuf body 仍是 plaintext。它只适用于明确可信、没有
+被动监听和主动中间人的内部网络。需要保密性、transport integrity 或 server endpoint
+cryptographic identity 时，所有 role 必须一起切换到 `automatic` 或 `pem` TLS 1.3。精确
+TLS profile、证书要求、DNS/IP identity、轮换和故障 runbook 见
+[Native trust、JWT 与可选 TLS](native-trust.md)。MySQL 与 management HTTP 不受
+`[native_trust]` 保护。
 
 ## 验证集群
 
@@ -208,51 +232,47 @@ SELECT 1;
 
 如果集群连接了 external Iceberg catalog，再执行一条真实表查询，确认 FE 调度、BE 执行和外部存储访问均可用。
 
-## 管理 BE
+## 配置与管理 BE
 
-FE 角色支持通过 SQL 动态管理后端：
+每个 BE 使用自己的 deployable config，并指向同一个 FE Native endpoint：
 
-```sql
-ADD BACKEND '10.0.0.13:9080';
-SHOW BACKENDS;
-DROP BACKEND '10.0.0.13:9080';
+```toml
+[cluster]
+role = "be"
+frontend_endpoint = "fe.native.example:9080"
+backend_announce_interval_ms = 1000
+backend_announce_initial_backoff_ms = 100
+backend_announce_max_backoff_ms = 2000
 ```
 
-如果需要立即移除后端，可以使用：
-
-```sql
-DROP BACKEND '10.0.0.13:9080' FORCE;
-```
-
-普通 `DROP BACKEND` 会让后端停止接收新查询，并等待在途 fragment 结束后移除；`FORCE` 会立即移除，可能导致在途查询失败。
-
-ADD/DROP 的最终 desired membership 先写入 FE 的 StateStore，因此 clean FE restart 后仍会保留动态 ADD 的 backend，并保持已删除 backend 不被 seeds 静默恢复。要恢复一个已删除 endpoint，需要再次显式执行 `ADD BACKEND`。
+BE 启动后创建新的 process identity，立即通过同一受 NWT-3 保护的 Native listener announce；FE 随后反向 heartbeat 该 endpoint，二者 descriptor 精确一致才调度新查询。`SHOW BACKENDS` 只读展示 `ProcessId`、lease、identity verification、reported state、compatibility 和 derived `Eligible`。`ADD BACKEND`、`DROP BACKEND`、`[cluster].backends` 均不是产品接口。
 
 ## 启停顺序
 
 推荐启动顺序：
 
 1. 启动对象存储、catalog、HDFS 等外部依赖。
-2. 启动所有 BE 节点，等待 `NOVAROCKS_READY role=be`。
-3. 启动 FE 节点，等待 `NOVAROCKS_READY mysql_port=...`。
+2. 启动 FE 节点，等待 `NOVAROCKS_READY mysql_port=...`。
+3. 启动所有 BE 节点，等待 `NOVAROCKS_READY role=be` 及 `SHOW BACKENDS` 中 `Eligible=true`。
 4. 连接 FE 并执行 `SHOW BACKENDS`。
 5. 执行最小查询和一条真实数据查询。
 
 推荐停止顺序：
 
 1. 停止新查询入口或断开客户端。
-2. 在 FE 上 `DROP BACKEND` 或等待查询结束。
+2. 对 BE 发送 `SIGTERM`，使其先 announce `Draining`、拒绝新的 Init，并等待已接纳 lifecycle 完成。
 3. 停止 FE 进程。
-4. 停止 BE 进程。
 
 ## 常见问题
 
 | 现象 | 处理方式 |
 | --- | --- |
-| `SHOW BACKENDS` 为空 | 检查 StateStore 中的 durable membership、`[cluster].backends` seeds，或使用 `ADD BACKEND 'host:port'` 注册后端。 |
-| BE 一直不 Alive | 确认 FE 节点能访问 BE 的 `grpc_port`，并检查 BE 的 `advertise_host`。 |
+| `SHOW BACKENDS` 为空 | 确认 BE 已启动、`frontend_endpoint` 指向 FE Native listener，且所有 role 的 Native trust 配置一致。 |
+| BE 一直不 Eligible | 确认 FE 能访问 BE 的 advertised endpoint，并检查 announce、heartbeat、process identity 和 build diagnostics。 |
+| `Unauthenticated` 或 native trust startup failure | 检查每个 FE/BE 的 `deployment_id`、environment-resolved secret 与 transport mode 完全一致；不要为恢复连接而删除 `[native_trust]`。 |
+| TLS handshake / certificate failure | 所有 role 必须使用同一 TLS mode；检查 advertised IP/DNS reference 与 certificate SAN，PEM mode 还要检查显式 trust roots。 |
 | 查询报 `role=fe: no live backend available` | 当前 FE 没有可调度的 live BE；先恢复或注册 BE。 |
 | FE 启动时提示缺少 StateStore | 为 `role=fe` 配置 `[state_store]`；不要使用 core metadata 或内存 registry 作为 membership fallback。 |
-| BE 启动时配置校验失败 | `role=be` 不能配置 `[cluster].backends`。 |
+| BE 启动时配置校验失败 | `role=be` 必须配置 `[cluster].frontend_endpoint`，且不能配置 FE heartbeat 或 lease 设置。 |
 | Native 或 management endpoint 冲突 | 让 FE MySQL、FE Native gRPC、FE management HTTP、BE Native gRPC、BE management HTTP 使用不重叠的 bind endpoint；同时检查 wildcard bind。 |
 | `/metrics` 在 gRPC port 不可用 | 改访问对应 role 的 `[server].http_port`；metrics 使用 role-local registry，不会跨 FE/BE 混合。 |

@@ -859,6 +859,7 @@ mod tests {
     use crate::query_execution::contract::QueryId;
     use novarocks_proto::lifecycle::{AttemptId, QueryTerminalSnapshot};
     use novarocks_proto_models::{common, plan};
+    use novarocks_types::BackendProcessId;
     use prost::Message;
 
     fn query_id() -> UniqueId {
@@ -972,12 +973,13 @@ mod tests {
                 execution_id(),
             )),
             backend: Some(novarocks::ParticipantBackendIdentity {
-                backend_id: 31,
                 endpoint: Some(novarocks::QueryControlEndpoint {
                     host: "127.0.0.1".to_string(),
                     port: 9030,
                 }),
-                start_epoch: 1,
+                process_id: Some(novarocks::BackendProcessId {
+                    value: BackendProcessId::new_v7().to_bytes().to_vec(),
+                }),
             }),
             init_digest: vec![9; 32],
             fragments: vec![writer_terminal_fragment()],

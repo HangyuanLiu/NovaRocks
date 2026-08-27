@@ -332,12 +332,7 @@ fn sealed_topology(
 ) -> Result<BTreeMap<usize, String>, DistributedQueryError> {
     let mut topology = BTreeMap::new();
     for entry in view.clone().frozen_live_backends() {
-        if entry.start_epoch() == 0 {
-            return Err(compilation_error(format!(
-                "runtime filter backend {} has zero start epoch",
-                entry.backend_idx()
-            )));
-        }
+        let _process_id = entry.process_id();
         if topology
             .insert(entry.backend_idx(), entry.endpoint().to_string())
             .is_some()

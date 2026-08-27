@@ -24,6 +24,71 @@
 use crate::runtime::query_result::build_string_query_result;
 use crate::runtime::statement_result::StatementResult;
 
+/// Frontend-owned factory for a replacement *whole* distributed round.  It
+/// receives a fresh topology snapshot and must return newly planned request
+/// artifacts and their matching completion formatter; no existing fragment,
+/// split, writer, RF, schedule, manifest, or profile artifact may be reused.
+pub(crate) trait PreReadyRetryBoundary {
+    fn permit_pre_ready_retry(
+        &self,
+    ) -> Result<(), crate::query_execution::contract::DistributedQueryError>;
+
+    fn close_after_control_ready(&self) {}
+
+    fn close_after_stage_or_start(&self) {}
+}
+
+pub(crate) trait PreparedDistributedRoundFactory: Send + PreReadyRetryBoundary {
+    fn replan(
+        &mut self,
+        topology: crate::common::backend_topology::BackendTopologySnapshot,
+    ) -> Result<PreparedDistributedQuery, crate::query_execution::contract::DistributedQueryError>;
+}
+
+/// Frontend-owned factory for a replacement whole distributed round whose
+/// caller retains the raw outcome (for example, a DML transaction runner
+/// still needs its exact commit/abort handles). It has the same no-reuse and
+/// one-way effect boundary as [`PreparedDistributedRoundFactory`], but it
+/// intentionally has no statement-result formatter.
+pub(crate) trait PreparedDistributedRequestFactory: Send + PreReadyRetryBoundary {
+    fn replan(
+        &mut self,
+        topology: crate::common::backend_topology::BackendTopologySnapshot,
+    ) -> Result<
+        crate::query_execution::contract::DistributedQueryRequest,
+        crate::query_execution::contract::DistributedQueryError,
+    >;
+}
+
+/// One raw-outcome distributed operation plus the sole owner capable of
+/// generating its replacement round. The request remains move-only; the
+/// factory can only return a wholly new request from stable semantics.
+pub struct PreparedRetriableDistributedRequest {
+    request: crate::query_execution::contract::DistributedQueryRequest,
+    round_factory: Box<dyn PreparedDistributedRequestFactory>,
+}
+
+impl PreparedRetriableDistributedRequest {
+    pub(crate) fn new(
+        request: crate::query_execution::contract::DistributedQueryRequest,
+        round_factory: Box<dyn PreparedDistributedRequestFactory>,
+    ) -> Self {
+        Self {
+            request,
+            round_factory,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::query_execution::contract::DistributedQueryRequest,
+        Box<dyn PreparedDistributedRequestFactory>,
+    ) {
+        (self.request, self.round_factory)
+    }
+}
+
 #[expect(
     clippy::large_enum_variant,
     reason = "Prepared query operations preserve their direct immediate and distributed boundary payloads."
@@ -65,6 +130,7 @@ impl PreparedImmediateQuery {
 pub struct PreparedDistributedQuery {
     request: crate::query_execution::contract::DistributedQueryRequest,
     completion: PreparedQueryCompletion,
+    round_factory: Option<Box<dyn PreparedDistributedRoundFactory>>,
 }
 
 impl PreparedDistributedQuery {
@@ -78,16 +144,26 @@ impl PreparedDistributedQuery {
         Self {
             request,
             completion,
+            round_factory: None,
         }
     }
 
-    pub fn into_parts(
+    pub(crate) fn with_round_factory(
+        mut self,
+        round_factory: Box<dyn PreparedDistributedRoundFactory>,
+    ) -> Self {
+        self.round_factory = Some(round_factory);
+        self
+    }
+
+    pub(crate) fn into_parts(
         self,
     ) -> (
         crate::query_execution::contract::DistributedQueryRequest,
         PreparedQueryCompletion,
+        Option<Box<dyn PreparedDistributedRoundFactory>>,
     ) {
-        (self.request, self.completion)
+        (self.request, self.completion, self.round_factory)
     }
 }
 

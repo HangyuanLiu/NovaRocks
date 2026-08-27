@@ -17,36 +17,27 @@ pub use novarocks::QueryTerminationReason;
 /// The generated enum is the sole terminal-report outcome representation.
 pub use novarocks::ReportQueryTerminalOutcome as QueryTerminalReportOutcome;
 
-/// A validated `InitQueryRequest`, including its descriptor-derived manifest
-/// digest fence.
+/// A validated `InitQueryRequest`.
+///
+/// The request carries the participant manifest alone. Its descriptor-derived
+/// identity is not carried here: each role derives it from the manifest at its
+/// own admission boundary and retains it with role-local state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueryInitRequest {
     raw: novarocks::InitQueryRequest,
 }
 
 impl QueryInitRequest {
-    /// Frames one validated generated manifest with its canonical digest.
+    /// Frames one validated generated manifest.
     pub fn from_manifest(manifest: ParticipantManifest) -> Self {
-        let digest = manifest
-            .digest()
-            .expect("validated participant manifest has a canonical digest");
         Self::parse(novarocks::InitQueryRequest {
             manifest: Some(manifest.as_proto().clone()),
-            init_digest: digest.as_bytes().to_vec(),
         })
         .expect("validated participant manifest forms a valid InitQuery request")
     }
 
     pub fn parse(raw: novarocks::InitQueryRequest) -> Result<Self, ProtocolError> {
-        let manifest = required_manifest(&raw.manifest)?;
-        let digest = manifest_digest(&raw.init_digest)?;
-        if manifest.digest()? != digest {
-            return Err(ProtocolError::new(
-                FieldPath::root("init_query_request").field("init_digest"),
-                ProtocolErrorKind::InvalidValue,
-                "participant manifest digest does not match canonical projection",
-            ));
-        }
+        required_manifest(&raw.manifest)?;
         Ok(Self { raw })
     }
 
@@ -56,10 +47,6 @@ impl QueryInitRequest {
 
     pub fn manifest(&self) -> Result<ParticipantManifest, ProtocolError> {
         required_manifest(&self.raw.manifest)
-    }
-
-    pub fn digest(&self) -> Result<ParticipantManifestDigest, ProtocolError> {
-        manifest_digest(&self.raw.init_digest)
     }
 }
 
@@ -548,7 +535,9 @@ fn parse_init_outcome(raw: i32) -> Result<QueryInitOutcome, ProtocolError> {
             | QueryInitOutcome::QueryInitRejectedStaleBackend
             | QueryInitOutcome::QueryInitRejectedCapacity
             | QueryInitOutcome::QueryInitRejectedInvalidManifest
-            | QueryInitOutcome::QueryInitRejectedTerminated),
+            | QueryInitOutcome::QueryInitRejectedTerminated
+            | QueryInitOutcome::QueryInitRejectedBackendDraining
+            | QueryInitOutcome::QueryInitRejectedBackendProcessMismatch),
         ) => Ok(outcome),
         Ok(QueryInitOutcome::Unspecified) | Err(_) => Err(ProtocolError::new(
             FieldPath::root("init_query_response").field("outcome"),
@@ -630,9 +619,13 @@ mod tests {
         novarocks::ParticipantManifest {
             execution_id: Some(execution_id()),
             backend: Some(novarocks::ParticipantBackendIdentity {
-                backend_id: 3,
                 endpoint: Some(endpoint(9030)),
-                start_epoch: 11,
+                process_id: Some(novarocks::BackendProcessId {
+                    value: vec![
+                        0x01, 0x9c, 0x98, 0xa9, 0x33, 0x90, 0x75, 0x76, 0x97, 0x7b, 0x33, 0xd1,
+                        0x88, 0xad, 0x1f, 0x06,
+                    ],
+                }),
             }),
             participant_roles: vec![1],
             expected_fragment_instance_ids: vec![id(11, 12)],
@@ -661,25 +654,27 @@ mod tests {
     }
 
     #[test]
-    fn init_request_rechecks_the_descriptor_manifest_digest() {
+    fn init_request_carries_the_manifest_and_requires_it() {
         let raw = novarocks::InitQueryRequest {
             manifest: Some(manifest()),
-            init_digest: manifest_digest(),
         };
         let parsed = QueryInitRequest::parse(raw.clone()).expect("valid request");
         assert_eq!(parsed.as_proto(), &raw);
-
-        let mut mismatch = raw;
-        mismatch
-            .manifest
-            .as_mut()
-            .expect("manifest")
-            .query_deadline_unix_ms += 1;
-        let error = QueryInitRequest::parse(mismatch).expect_err("digest must fence all fields");
         assert_eq!(
-            error.detail(),
-            "participant manifest digest does not match canonical projection"
+            parsed
+                .manifest()
+                .expect("manifest")
+                .digest()
+                .expect("digest")
+                .as_bytes()
+                .to_vec(),
+            manifest_digest(),
+            "the receiver derives the same identity the sender retains"
         );
+
+        let error = QueryInitRequest::parse(novarocks::InitQueryRequest { manifest: None })
+            .expect_err("the manifest is required");
+        assert_eq!(error.detail(), "participant manifest is required");
     }
 
     #[test]

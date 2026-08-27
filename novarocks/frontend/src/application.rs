@@ -23,6 +23,7 @@ use tokio::runtime::Handle;
 
 use crate::query_execution::service::QueryExecutionService;
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
+use novarocks_native_trust::NativeTrust;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
 
@@ -32,9 +33,7 @@ use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogControll
 use crate::common::admitted_query_context::LakePublicationRuntimePolicy;
 use crate::connector::ConnectorControlHost;
 use crate::coordination::FrontendCoordinationRuntime;
-use crate::coordinator::{
-    BackendQueryActivity, FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader,
-};
+use crate::coordinator::{FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader};
 use crate::dml::DmlService;
 use crate::mv::maintenance::MaintenanceCoordinatorConfig;
 use crate::mv::scheduler::FrontendMvSchedulerConfig;
@@ -42,6 +41,7 @@ use crate::mv::{
     FrontendMvRefreshProviderActivationPort, FrontendMvService, repository::StateStoreMvRepository,
 };
 use crate::native::data_runtime::FrontendDataRuntime;
+use crate::native::transport::FrontendNativeTransport;
 use crate::query_control::FrontendQueryControl;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::statistics::FrontendStatisticsService;
@@ -54,6 +54,23 @@ use crate::view::FrontendViewService;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+fn test_native_trust() -> Arc<NativeTrust> {
+    use novarocks_native_trust::{
+        DeploymentId, NativeCallerSubject, NativeTransportMode, ValidatedSharedSecret,
+    };
+
+    Arc::new(NativeTrust::new(
+        DeploymentId::parse("frontend-application-test").expect("fixed test deployment id"),
+        ValidatedSharedSecret::new(novarocks_secret::SecretValue::new(
+            "0123456789abcdef0123456789abcdef",
+        ))
+        .expect("fixed test shared secret"),
+        NativeCallerSubject::parse("fe@127.0.0.1:19040").expect("fixed test caller subject"),
+        NativeTransportMode::Disabled,
+    ))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrontendApplicationErrorKind {
@@ -275,8 +292,19 @@ impl FrontendApplicationHost {
         execution: FrontendExecutionConfig,
         backend: ClusterBackendOpenConfig,
         data_runtime: Handle,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
-        Self::open_with_factories(state_store, execution, backend, Vec::new(), data_runtime).await
+        Self::open_with_factories(
+            state_store,
+            execution,
+            backend,
+            Vec::new(),
+            data_runtime,
+            native_trust,
+            native_transport,
+        )
+        .await
     }
 
     pub async fn open_with_factories(
@@ -285,6 +313,8 @@ impl FrontendApplicationHost {
         backend: ClusterBackendOpenConfig,
         connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
         data_runtime: Handle,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
         let registry = StateStoreProviderRegistry::new();
         Self::open_with_factories_and_state_store_registry(
@@ -294,10 +324,16 @@ impl FrontendApplicationHost {
             backend,
             connector_factories,
             data_runtime,
+            native_trust,
+            native_transport,
         )
         .await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Server composition deliberately supplies StateStore, role execution, and immutable Native trust capabilities independently."
+    )]
     pub async fn open_with_factories_and_state_store_registry(
         state_store: Option<StateStoreHostInput>,
         state_store_registry: &StateStoreProviderRegistry,
@@ -305,8 +341,14 @@ impl FrontendApplicationHost {
         backend: ClusterBackendOpenConfig,
         connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
         data_runtime: Handle,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
-        let data_runtime = FrontendDataRuntime::new(data_runtime);
+        let data_runtime = FrontendDataRuntime::new_with_native_trust(
+            data_runtime,
+            native_trust,
+            native_transport,
+        );
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
@@ -425,13 +467,8 @@ impl FrontendApplicationHost {
             }
             host.catalog_controller = Some(controller);
         }
-        match ClusterBackendService::open(
-            backend,
-            host.state_store(),
-            tokio::runtime::Handle::current(),
-            data_runtime,
-        )
-        .await
+        match ClusterBackendService::open(backend, tokio::runtime::Handle::current(), data_runtime)
+            .await
         {
             Ok(topology) => host.topology = Some(topology),
             Err(error) => {
@@ -486,51 +523,7 @@ impl FrontendApplicationHost {
         }
         match host.state_store() {
             Some(store) => {
-                // The MV repository must observe the exact attachment version an
-                // admitted catalog was resolved from, so a durable MV definition
-                // can never outlive the attachment it references.
-                let attachment_observations = host.catalog_application_port.as_ref().map(|port| {
-                    Arc::clone(port)
-                        as Arc<dyn crate::mv::repository::CatalogAttachmentObservationSource>
-                });
-                // Cluster-wide refresh ownership. The refresh path registers with
-                // this registry before creating durable state, so installing it as
-                // the repository's fence source below makes every durable refresh
-                // transition prove ownership inside its own transaction.
-                let ownership = match crate::mv::coordination::MvRefreshOwnershipContext::open(
-                    Arc::clone(&store),
-                )
-                .await
-                {
-                    Ok(ownership) => Some(ownership),
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            "frontend MV refresh ownership coordination unavailable; \
-                             refreshes remain single-owner"
-                        );
-                        None
-                    }
-                };
-                // Installing the registry as the repository's fence source is what
-                // makes ownership binding: every durable refresh transition then
-                // proves ownership inside its own transaction, so a superseded
-                // owner's write fails at commit rather than racing.
-                //
-                // This must land together with the refresh path's acquisition, and
-                // it does -- the registry is fail-closed for unregistered targets,
-                // so installing it without acquisition refuses every refresh in the
-                // cluster. `installing_a_fence_source_without_registration_stops_\
-                // every_refresh` guards that combination.
-                let refresh_fence = ownership.as_ref().map(|context| context.registry());
-                match StateStoreMvRepository::open_with_observations_and_refresh_fence(
-                    store,
-                    tokio::runtime::Handle::current(),
-                    attachment_observations,
-                    refresh_fence,
-                )
-                .await
-                {
+                match StateStoreMvRepository::open(store, tokio::runtime::Handle::current()).await {
                     Ok(repository) => {
                         let repository: Arc<dyn crate::mv::domain::repository::MvRepository> =
                             repository;
@@ -539,30 +532,28 @@ impl FrontendApplicationHost {
                         let service = Arc::new(FrontendMvService::with_refresh_dependencies(
                             Arc::clone(&repository),
                             host.query_execution_service(),
-                            host.connector_control_registry(),
+                            Arc::clone(&host.connector_control)
+                                as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
                             Arc::clone(&provider_activation),
                             host.execution_role,
                             host.backend_topology_port(),
                             execution.mv_scheduler.clone(),
                             execution.mv_maintenance.clone(),
                             host.table_maintenance_service(),
-                            execution.optimizer_query_mem_limit_bytes(),
-                            execution
-                                .lake_publication_runtime_policy()
-                                .max_attempt_duration(),
-                            ownership,
+                            host.optimizer_query_mem_limit_bytes,
+                            Duration::from_secs(30 * 60),
                         ));
-                        host.mv_background_engine_sink = Some(
-                            FrontendMvService::background_engine_sink(Arc::clone(&service)),
-                        );
                         let application_service: Arc<
                             dyn crate::mv::domain::application::MvApplicationService,
                         > = Arc::clone(&service)
                             as Arc<dyn crate::mv::domain::application::MvApplicationService>;
+                        host.mv_background_engine_sink = Some(
+                            FrontendMvService::background_engine_sink(Arc::clone(&service)),
+                        );
+                        host.mv_refresh_provider_activation = Some(provider_activation);
                         host.mv_application_service = Some(application_service);
                         host.mv_service = Some(service);
                         host.mv_repository = Some(repository);
-                        host.mv_refresh_provider_activation = Some(provider_activation);
                     }
                     Err(error) => {
                         return Err(host
@@ -575,16 +566,12 @@ impl FrontendApplicationHost {
                 }
             }
             None => {
-                let repository: Arc<dyn crate::mv::domain::repository::MvRepository> =
-                    Arc::new(crate::mv::domain::repository::UnavailableMvRepository);
-                let service = Arc::new(FrontendMvService::new(Arc::clone(&repository)));
-                let application_service: Arc<
-                    dyn crate::mv::domain::application::MvApplicationService,
-                > = Arc::clone(&service)
-                    as Arc<dyn crate::mv::domain::application::MvApplicationService>;
-                host.mv_repository = Some(repository);
-                host.mv_application_service = Some(application_service);
-                host.mv_service = Some(service);
+                return Err(host
+                    .cleanup_open_error(FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::MvServiceOpen,
+                        "frontend MV Accelerator requires StateStore",
+                    ))
+                    .await);
             }
         }
         if let Err(error) = host.topology().start_heartbeat_manager().map_err(|error| {
@@ -779,15 +766,24 @@ impl FrontendApplicationHost {
         )
     }
 
+    pub(crate) fn backend_membership_ingress(&self) -> Arc<ClusterBackendService> {
+        Arc::clone(self.topology())
+    }
+
     pub fn start_report_server(
         &self,
         bind_addr: std::net::SocketAddr,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
     ) -> Result<crate::native::report_server::FrontendReportServerHandle, FrontendApplicationError>
     {
         crate::native::report_server::FrontendReportServerHandle::start(
             bind_addr,
             self.terminal_ingress(),
+            self.backend_membership_ingress(),
             self.lifecycle_convergence_reader(),
+            native_trust,
+            native_transport,
         )
         .map_err(FrontendApplicationError::server)
     }
@@ -796,13 +792,18 @@ impl FrontendApplicationHost {
         &self,
         host: &str,
         port: u16,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
     ) -> Result<crate::native::report_server::FrontendReportServerHandle, FrontendApplicationError>
     {
         crate::native::report_server::FrontendReportServerHandle::start_from_host(
             host,
             port,
             self.terminal_ingress(),
+            self.backend_membership_ingress(),
             self.lifecycle_convergence_reader(),
+            native_trust,
+            native_transport,
         )
         .map_err(FrontendApplicationError::server)
     }
@@ -833,19 +834,6 @@ impl FrontendApplicationHost {
                 .as_ref(),
             request,
         )
-    }
-
-    pub fn backend_query_activity(&self) -> BackendQueryActivity {
-        self.coordinator
-            .as_ref()
-            .expect("frontend coordinator is installed before host open returns")
-            .backend_query_activity()
-    }
-
-    pub fn backend_query_event_sink(
-        &self,
-    ) -> Arc<dyn crate::common::backend_topology::BackendQueryEventSink> {
-        Arc::new(self.backend_query_activity())
     }
 
     pub fn coordinator_report_endpoint_sink(
@@ -903,8 +891,6 @@ impl FrontendApplicationHost {
             )
             .map_err(FrontendApplicationError::server)?,
         );
-        self.topology()
-            .attach_query_events(Arc::new(coordinator.backend_query_activity()));
         self.query_execution = Some(QueryExecutionService::new(coordinator.clone()));
         self.coordinator = Some(coordinator);
         Ok(())
@@ -952,9 +938,6 @@ impl FrontendApplicationHost {
             .as_ref()
             .map(|topology| topology.stop_heartbeat_manager())
             .transpose();
-        if let Some(topology) = self.topology.as_ref() {
-            topology.detach_query_events();
-        }
         self.topology.take();
         primary_error = heartbeat_result.err();
         if let Some(statistics_worker_error) = statistics_worker_error {
@@ -1042,7 +1025,7 @@ mod tests {
 
     use super::{
         FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-        FrontendExecutionConfig,
+        FrontendExecutionConfig, FrontendNativeTransport, test_native_trust,
     };
 
     const DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
@@ -1113,7 +1096,6 @@ mod tests {
         let registry = test_state_store_registry();
         let backend = crate::topology::ClusterBackendOpenConfig::new(
             novarocks_types::ClusterRole::Fe,
-            Vec::new(),
             Duration::from_secs(1),
             1,
             Duration::from_secs(1),
@@ -1130,6 +1112,8 @@ mod tests {
             backend,
             Vec::new(),
             tokio::runtime::Handle::current(),
+            test_native_trust(),
+            FrontendNativeTransport::plaintext(),
         )
         .await
         .expect("host opens with the catalog controller");

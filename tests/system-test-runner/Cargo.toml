@@ -27,7 +27,14 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+bytes = "1"
+h2 = "0.4"
+http = "1"
 mysql = "25.0.1"
 novarocks-cluster-harness = { path = "../cluster-harness" }
 novarocks-connector-iceberg = { path = "../../novarocks/connector/iceberg" }
+novarocks-native-trust = { path = "../../novarocks/native-trust" }
+novarocks-secret = { path = "../../novarocks/secret" }
+novarocks-types = { path = "../../novarocks/types" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+tonic = { version = "0.12", features = ["transport"] }

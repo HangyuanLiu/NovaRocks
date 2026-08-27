@@ -15,33 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Provider-neutral MV repository used only by core integration tests.
+//! Provider-neutral in-memory MV Accelerator used by domain tests.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, MutexGuard};
 
+use bytes::Bytes;
+use novarocks_spi::state_store::VersionToken;
 use uuid::Uuid;
 
 use super::dependency::model::MvDependencyObjectRef;
-use super::persistence::definition::{
-    CreateMvDefinitionRequest, StoredMvDefinition, UpdateMvRefreshMetadataRequest,
-};
+use super::persistence::definition::StoredMvDefinition;
 use super::persistence::dependency::StoredMvDependency;
-use super::persistence::partition::{
-    MvPartitionRefreshStatus, RecordFailedMvPartitionStatesRequest,
-    ReplaceMvPartitionStatesRequest, StoredMvPartitionState, UpdateMvPartitionContractRequest,
-};
-use super::persistence::refresh::{
-    BeginIcebergMvRefreshRequest, MvRefreshFinalizeRequest, MvRefreshLifecycleOwner,
-    MvRefreshState, RecordPublishCommitRequest, RecordStagingCommitRequest, RefreshCommitMarker,
-    RefreshExternalOutcome, StoredMvRefresh, UpdateStarRocksMvRefreshSummaryRequest,
-};
 use super::repository::{
-    CreateMvDependencyRequest, CreateMvRepositoryRequest, CreateMvRepositoryWithIdRequest,
-    FinalizeMvRefreshWithPartitionsRequest, MvRepository, MvRepositoryAvailability,
-    MvRepositoryError, MvRepositoryErrorKind, MvTarget, RebuildMvRepositoryRequest,
-    RebuiltMvPublicationProjection, RecordExternalCommitAndFinalizeRequest,
+    DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionRequest, MvProjectionVersion,
+    MvPublishedProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTarget,
+    ReplaceMvProjectionRequest,
 };
 
 #[derive(Default)]
@@ -49,93 +38,37 @@ pub struct InMemoryMvRepository {
     state: Mutex<State>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TestMvRepositoryFailurePoint {
-    Create,
-    CreateWithId,
-    DropById,
-    FinalizeRefresh,
-    UpdateStarRocksRefreshSummary,
-}
-
-thread_local! {
-    static NEXT_FAILURE: RefCell<Option<TestMvRepositoryFailurePoint>> = const { RefCell::new(None) };
-    static AFTER_CREATE: RefCell<Option<Arc<dyn Fn() + Send + Sync>>> = const { RefCell::new(None) };
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) struct TestMvRepositoryFailureGuard;
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn fail_next_mv_repository_command(
-    point: TestMvRepositoryFailurePoint,
-) -> TestMvRepositoryFailureGuard {
-    NEXT_FAILURE.with(|slot| *slot.borrow_mut() = Some(point));
-    TestMvRepositoryFailureGuard
-}
-
-impl Drop for TestMvRepositoryFailureGuard {
-    fn drop(&mut self) {
-        NEXT_FAILURE.with(|slot| *slot.borrow_mut() = None);
-    }
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) struct TestMvRepositoryAfterCreateGuard;
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn after_next_mv_repository_create(
-    callback: Arc<dyn Fn() + Send + Sync>,
-) -> TestMvRepositoryAfterCreateGuard {
-    AFTER_CREATE.with(|slot| *slot.borrow_mut() = Some(callback));
-    TestMvRepositoryAfterCreateGuard
-}
-
-impl Drop for TestMvRepositoryAfterCreateGuard {
-    fn drop(&mut self) {
-        AFTER_CREATE.with(|slot| *slot.borrow_mut() = None);
-    }
-}
-
-fn fail_if_requested(point: TestMvRepositoryFailurePoint) -> Result<(), MvRepositoryError> {
-    let requested = NEXT_FAILURE.with(|slot| slot.borrow_mut().take());
-    if requested == Some(point) {
-        return Err(MvRepositoryError::new(
-            MvRepositoryErrorKind::InvalidRequest,
-            format!("test-only injected MV repository failure at {point:?}"),
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Default)]
 struct State {
     next_id: i64,
-    definitions: BTreeMap<i64, StoredMvDefinition>,
-    refreshes: BTreeMap<i64, StoredMvRefresh>,
-    partitions: BTreeMap<(i64, String), StoredMvPartitionState>,
+    next_version: u64,
+    projections: BTreeMap<i64, StoredMvDefinition>,
+    versions: BTreeMap<i64, MvProjectionVersion>,
     dependencies: BTreeMap<i64, Vec<StoredMvDependency>>,
 }
 
 impl InMemoryMvRepository {
-    fn state(&self) -> Result<std::sync::MutexGuard<'_, State>, MvRepositoryError> {
+    fn state(&self) -> Result<MutexGuard<'_, State>, MvRepositoryError> {
         self.state.lock().map_err(|_| {
             MvRepositoryError::new(
                 MvRepositoryErrorKind::Corruption,
-                "in-memory MV repository lock poisoned",
+                "in-memory MV Accelerator lock poisoned",
             )
+        })
+    }
+
+    fn next_version(state: &mut State) -> MvProjectionVersion {
+        state.next_version += 1;
+        let bytes = Bytes::copy_from_slice(&state.next_version.to_be_bytes());
+        MvProjectionVersion::from_store(
+            VersionToken::try_from(bytes).expect("non-empty test version token"),
+        )
+    }
+
+    fn loaded(state: &State, mv_id: i64) -> Option<LoadedMvProjection> {
+        Some(LoadedMvProjection {
+            definition: state.projections.get(&mv_id)?.clone(),
+            version: state.versions.get(&mv_id)?.clone(),
         })
     }
 
@@ -147,741 +80,214 @@ impl InMemoryMvRepository {
         })
     }
 
-    fn allocate(state: &mut State) -> i64 {
-        state.next_id += 1;
-        state.next_id
+    fn definition(mv_id: i64, request: &MvProjectionRequest) -> StoredMvDefinition {
+        let (
+            last_refresh_ms,
+            last_refresh_rows,
+            last_refresh_snapshots,
+            last_refresh_table_object_ids,
+            last_refreshed_iceberg_snapshot_id,
+        ) = match &request.publication {
+            MvPublishedProjection::NeverPublished => {
+                (None, None, BTreeMap::new(), BTreeMap::new(), None)
+            }
+            MvPublishedProjection::Published(waterline) => (
+                Some(waterline.last_refresh_ms),
+                Some(waterline.last_refresh_rows),
+                waterline.base_snapshots.clone(),
+                waterline.base_table_object_ids.clone(),
+                Some(waterline.last_refreshed_iceberg_snapshot_id),
+            ),
+        };
+        StoredMvDefinition {
+            mv_id,
+            query_definition: request.definition.query_definition.clone(),
+            base_table_refs: request.definition.base_table_refs.clone(),
+            primary_key_columns: request.definition.primary_key_columns.clone(),
+            storage_engine: request.definition.storage_engine.clone(),
+            target_catalog: request.definition.target_catalog.clone(),
+            target_namespace: request.definition.target_namespace.clone(),
+            target_table: request.definition.target_table.clone(),
+            schema_contract: request.definition.schema_contract.clone(),
+            partition_spec: request.definition.partition_spec.clone(),
+            last_refresh_ms,
+            last_refresh_rows,
+            last_refresh_snapshots,
+            last_refresh_table_object_ids,
+            last_refreshed_iceberg_snapshot_id,
+            refresh_policy: request.refresh.policy.clone(),
+            refresh_paused: request.refresh.paused,
+            refresh_interval_ms: request.refresh.interval_ms,
+            max_staleness_ms: request.refresh.max_staleness_ms,
+            created_at_ms: request.definition.created_at_ms,
+            source_revision: request.source_revision.clone(),
+        }
     }
 
-    fn create_locked(
-        state: &mut State,
-        mv_id: i64,
-        request: CreateMvRepositoryRequest,
-    ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        if state.definitions.contains_key(&mv_id) {
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Conflict,
-                format!("MV definition {mv_id} already exists"),
-            ));
-        }
-        let definition = definition_from_request(mv_id, request.definition, request.refresh);
-        if let Some(target) = Self::target(&definition)
-            && state
-                .definitions
-                .values()
-                .any(|candidate| Self::target(candidate).as_ref() == Some(&target))
-        {
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Conflict,
-                format!("MV target {} already exists", target.display_name()),
-            ));
-        }
-        let dependencies = request
+    fn stored_dependencies(mv_id: i64, request: &MvProjectionRequest) -> Vec<StoredMvDependency> {
+        request
             .dependencies
-            .into_iter()
+            .iter()
             .map(|dependency| StoredMvDependency {
                 downstream_mv_id: mv_id,
-                upstream: dependency.upstream,
+                upstream: dependency.upstream.clone(),
                 created_at_ms: dependency.created_at_ms,
             })
-            .collect();
-        state.next_id = state.next_id.max(mv_id);
-        state.dependencies.insert(mv_id, dependencies);
-        state.definitions.insert(mv_id, definition.clone());
-        Ok(definition)
+            .collect()
     }
-
-    fn refresh_mut(
-        state: &mut State,
-        refresh_id: i64,
-    ) -> Result<&mut StoredMvRefresh, MvRepositoryError> {
-        state.refreshes.get_mut(&refresh_id).ok_or_else(|| {
-            MvRepositoryError::new(
-                MvRepositoryErrorKind::NotFound,
-                format!("MV refresh {refresh_id} does not exist"),
-            )
-        })
-    }
-
-    fn expect_refresh_state(
-        refresh: &StoredMvRefresh,
-        expected: MvRefreshState,
-    ) -> Result<(), MvRepositoryError> {
-        if refresh.state == expected {
-            return Ok(());
-        }
-        Err(MvRepositoryError::new(
-            MvRepositoryErrorKind::Conflict,
-            format!(
-                "mv refresh {} is {}, expected {}",
-                refresh.refresh_id,
-                refresh.state.as_str(),
-                expected.as_str()
-            ),
-        ))
-    }
-
-    fn persisted_publish_target_snapshot(refresh: &StoredMvRefresh) -> Option<i64> {
-        refresh.published_snapshot_id.or_else(|| {
-            refresh
-                .external_outcome
-                .as_ref()
-                .and_then(|outcome| outcome.target_snapshot_id)
-        })
-    }
-
-    fn finish_locked(
-        state: &mut State,
-        request: MvRefreshFinalizeRequest,
-    ) -> Result<(), MvRepositoryError> {
-        let refresh = Self::refresh_mut(state, request.refresh_id)?.clone();
-        let definition = state.definitions.get_mut(&refresh.mv_id).ok_or_else(|| {
-            MvRepositoryError::new(
-                MvRepositoryErrorKind::NotFound,
-                format!("MV definition {} does not exist", refresh.mv_id),
-            )
-        })?;
-        definition.last_refresh_ms = Some(request.last_refresh_ms);
-        definition.last_refresh_rows = Some(request.rows);
-        definition.last_refresh_snapshots = request.base_snapshots;
-        definition.last_refresh_table_object_ids = request.base_table_object_ids;
-        definition.last_refreshed_iceberg_snapshot_id =
-            request.target_snapshot_id.or(refresh.published_snapshot_id);
-        definition.refresh_in_progress = false;
-        definition.active_refresh_id = None;
-        definition.refresh_target_snapshots.clear();
-        Self::refresh_mut(state, request.refresh_id)?.state = MvRefreshState::Finalized;
-        Ok(())
-    }
-}
-
-fn definition_from_request(
-    mv_id: i64,
-    request: CreateMvDefinitionRequest,
-    refresh: super::repository::InitialMvRefreshConfiguration,
-) -> StoredMvDefinition {
-    StoredMvDefinition {
-        mv_id,
-        query_definition: request.query_definition,
-        base_table_refs: request.base_table_refs,
-        primary_key_columns: request.primary_key_columns,
-        storage_engine: request.storage_engine,
-        target_catalog: request.target_catalog,
-        target_namespace: request.target_namespace,
-        target_table: request.target_table,
-        schema_contract: request.schema_contract,
-        partition_spec: request.partition_spec,
-        partition_state_complete: false,
-        last_refresh_ms: None,
-        last_refresh_rows: None,
-        last_refresh_snapshots: BTreeMap::new(),
-        last_refresh_table_object_ids: BTreeMap::new(),
-        last_refreshed_iceberg_snapshot_id: None,
-        refresh_in_progress: false,
-        active_refresh_id: None,
-        refresh_target_snapshots: BTreeMap::new(),
-        refresh_policy: refresh.policy,
-        refresh_paused: refresh.paused,
-        refresh_interval_ms: refresh.interval_ms,
-        max_staleness_ms: refresh.max_staleness_ms,
-        last_scheduler_error: None,
-        next_refresh_after_ms: refresh.next_refresh_after_ms,
-        created_at_ms: request.created_at_ms,
-    }
-}
-
-fn apply_rebuilt_publication(
-    definition: &mut StoredMvDefinition,
-    publication: &RebuiltMvPublicationProjection,
-) -> Result<(), MvRepositoryError> {
-    match publication {
-        RebuiltMvPublicationProjection::NeverPublished => {
-            definition.last_refresh_ms = None;
-            definition.last_refresh_rows = None;
-            definition.last_refresh_snapshots.clear();
-            definition.last_refresh_table_object_ids.clear();
-            definition.last_refreshed_iceberg_snapshot_id = None;
-        }
-        RebuiltMvPublicationProjection::Published(waterline) => {
-            if waterline.last_refreshed_iceberg_snapshot_id < 0 || waterline.last_refresh_ms < 0 {
-                return Err(MvRepositoryError::new(
-                    MvRepositoryErrorKind::InvalidRequest,
-                    "rebuilt MV published waterline contains a negative target snapshot value",
-                ));
-            }
-            definition.last_refresh_ms = Some(waterline.last_refresh_ms);
-            definition.last_refresh_rows = Some(waterline.last_refresh_rows);
-            definition.last_refresh_snapshots = waterline.base_snapshots.clone();
-            definition.last_refresh_table_object_ids = waterline.base_table_object_ids.clone();
-            definition.last_refreshed_iceberg_snapshot_id =
-                Some(waterline.last_refreshed_iceberg_snapshot_id);
-        }
-    }
-    Ok(())
-}
-
-fn validate_rebuilt_publication(
-    publication: &RebuiltMvPublicationProjection,
-) -> Result<(), MvRepositoryError> {
-    if let RebuiltMvPublicationProjection::Published(waterline) = publication
-        && (waterline.last_refreshed_iceberg_snapshot_id < 0 || waterline.last_refresh_ms < 0)
-    {
-        return Err(MvRepositoryError::new(
-            MvRepositoryErrorKind::InvalidRequest,
-            "rebuilt MV published waterline contains a negative target snapshot value",
-        ));
-    }
-    Ok(())
 }
 
 impl MvRepository for InMemoryMvRepository {
-    fn availability(&self) -> MvRepositoryAvailability {
-        MvRepositoryAvailability::Available
-    }
-    fn create(
+    fn create_projection(
         &self,
-        _: Uuid,
-        request: CreateMvRepositoryRequest,
-    ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        fail_if_requested(TestMvRepositoryFailurePoint::Create)?;
-        let definition = {
-            let mut state = self.state()?;
-            let id = Self::allocate(&mut state);
-            Self::create_locked(&mut state, id, request)?
-        };
-        if let Some(callback) = AFTER_CREATE.with(|slot| slot.borrow_mut().take()) {
-            callback();
-        }
-        Ok(definition)
-    }
-    fn create_with_id(
-        &self,
-        _: Uuid,
-        request: CreateMvRepositoryWithIdRequest,
-    ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        fail_if_requested(TestMvRepositoryFailurePoint::CreateWithId)?;
+        _operation_id: Uuid,
+        projection: MvProjectionRequest,
+    ) -> Result<LoadedMvProjection, MvRepositoryError> {
         let mut state = self.state()?;
-        Self::create_locked(&mut state, request.mv_id, request.create)
-    }
-    fn rebuild(
-        &self,
-        _: Uuid,
-        request: RebuildMvRepositoryRequest,
-    ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        fail_if_requested(TestMvRepositoryFailurePoint::Create)?;
-        validate_rebuilt_publication(&request.publication)?;
-        let mut state = self.state()?;
-        let id = Self::allocate(&mut state);
-        let mut definition = Self::create_locked(&mut state, id, request.create)?;
-        apply_rebuilt_publication(&mut definition, &request.publication)?;
-        state.definitions.insert(id, definition.clone());
-        Ok(definition)
-    }
-    fn reserve_definition_id(&self, mv_id: i64) -> Result<(), MvRepositoryError> {
-        let mut state = self.state()?;
-        if state.definitions.contains_key(&mv_id) {
+        let candidate = Self::definition(state.next_id + 1, &projection);
+        let target = Self::target(&candidate).ok_or_else(|| {
+            MvRepositoryError::new(
+                MvRepositoryErrorKind::InvalidRequest,
+                "MV Accelerator projection target is incomplete",
+            )
+        })?;
+        if state
+            .projections
+            .values()
+            .any(|definition| Self::target(definition).as_ref() == Some(&target))
+        {
             return Err(MvRepositoryError::new(
                 MvRepositoryErrorKind::Conflict,
-                format!("MV definition {mv_id} already exists"),
+                "MV Accelerator target already exists",
             ));
         }
-        state.next_id = state.next_id.max(mv_id);
-        Ok(())
+        state.next_id += 1;
+        let mv_id = state.next_id;
+        let version = Self::next_version(&mut state);
+        state.projections.insert(mv_id, candidate.clone());
+        state.versions.insert(mv_id, version.clone());
+        state
+            .dependencies
+            .insert(mv_id, Self::stored_dependencies(mv_id, &projection));
+        Ok(LoadedMvProjection {
+            definition: candidate,
+            version,
+        })
     }
-    fn load_by_id(&self, mv_id: i64) -> Result<Option<StoredMvDefinition>, MvRepositoryError> {
-        Ok(self.state()?.definitions.get(&mv_id).cloned())
+
+    fn replace_projection(
+        &self,
+        _operation_id: Uuid,
+        request: ReplaceMvProjectionRequest,
+    ) -> Result<LoadedMvProjection, MvRepositoryError> {
+        let mut state = self.state()?;
+        if state.versions.get(&request.mv_id) != Some(&request.expected_version) {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                "MV projection changed before CAS",
+            ));
+        }
+        let next = Self::definition(request.mv_id, &request.projection);
+        let next_target = Self::target(&next).ok_or_else(|| {
+            MvRepositoryError::new(
+                MvRepositoryErrorKind::InvalidRequest,
+                "MV Accelerator projection target is incomplete",
+            )
+        })?;
+        if state.projections.iter().any(|(mv_id, definition)| {
+            *mv_id != request.mv_id && Self::target(definition).as_ref() == Some(&next_target)
+        }) {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                "replacement MV Accelerator target already exists",
+            ));
+        }
+        let version = Self::next_version(&mut state);
+        state.projections.insert(request.mv_id, next.clone());
+        state.versions.insert(request.mv_id, version.clone());
+        state.dependencies.insert(
+            request.mv_id,
+            Self::stored_dependencies(request.mv_id, &request.projection),
+        );
+        Ok(LoadedMvProjection {
+            definition: next,
+            version,
+        })
     }
+
+    fn load_by_id(&self, mv_id: i64) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+        let state = self.state()?;
+        Ok(Self::loaded(&state, mv_id))
+    }
+
     fn find_by_target(
         &self,
         target: &MvTarget,
-    ) -> Result<Option<StoredMvDefinition>, MvRepositoryError> {
-        Ok(self
-            .state()?
-            .definitions
-            .values()
-            .find(|definition| InMemoryMvRepository::target(definition).as_ref() == Some(target))
-            .cloned())
+    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+        let state = self.state()?;
+        Ok(state
+            .projections
+            .iter()
+            .find(|(_, definition)| Self::target(definition).as_ref() == Some(target))
+            .and_then(|(mv_id, _)| Self::loaded(&state, *mv_id)))
     }
-    fn list_definitions(&self) -> Result<Vec<StoredMvDefinition>, MvRepositoryError> {
-        Ok(self.state()?.definitions.values().cloned().collect())
+
+    fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
+        let state = self.state()?;
+        Ok(state
+            .projections
+            .keys()
+            .filter_map(|mv_id| Self::loaded(&state, *mv_id))
+            .collect())
     }
-    fn drop_by_id(&self, mv_id: i64) -> Result<bool, MvRepositoryError> {
-        fail_if_requested(TestMvRepositoryFailurePoint::DropById)?;
-        let mut state = self.state()?;
-        let existed = state.definitions.remove(&mv_id).is_some();
-        if existed {
-            state.dependencies.remove(&mv_id);
-            state.partitions.retain(|(id, _), _| *id != mv_id);
-        }
-        Ok(existed)
-    }
-    fn drop_by_target(&self, target: &MvTarget) -> Result<bool, MvRepositoryError> {
-        let id = self
-            .find_by_target(target)?
-            .map(|definition| definition.mv_id);
-        id.map_or(Ok(false), |mv_id| self.drop_by_id(mv_id))
-    }
-    fn wipe_rebuildable_projection_by_target(
+
+    fn delete_projection(
         &self,
+        _operation_id: Uuid,
+        request: DeleteMvProjectionRequest,
+    ) -> Result<bool, MvRepositoryError> {
+        let mut state = self.state()?;
+        let Some(current) = state.projections.get(&request.mv_id) else {
+            return Ok(false);
+        };
+        if state.versions.get(&request.mv_id) != Some(&request.expected_version)
+            || current.source_revision != request.expected_source_revision
+        {
+            return Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                "MV projection source or version changed before delete",
+            ));
+        }
+        state.projections.remove(&request.mv_id);
+        state.versions.remove(&request.mv_id);
+        state.dependencies.remove(&request.mv_id);
+        Ok(true)
+    }
+
+    fn wipe_projection_by_target(
+        &self,
+        operation_id: Uuid,
         target: &MvTarget,
     ) -> Result<bool, MvRepositoryError> {
-        let mut state = self.state()?;
-        let Some(mv_id) = state
-            .definitions
-            .values()
-            .find(|definition| Self::target(definition).as_ref() == Some(target))
-            .map(|definition| definition.mv_id)
-        else {
+        let Some(loaded) = self.find_by_target(target)? else {
             return Ok(false);
         };
-        let definition = state.definitions.get(&mv_id).expect("selected definition");
-        if definition.refresh_in_progress || definition.active_refresh_id.is_some() {
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Conflict,
-                "mv definition has refresh in progress",
-            ));
-        }
-        state.definitions.remove(&mv_id);
-        state.dependencies.remove(&mv_id);
-        state.partitions.retain(|(id, _), _| *id != mv_id);
-        Ok(true)
+        self.delete_projection(
+            operation_id,
+            DeleteMvProjectionRequest {
+                mv_id: loaded.definition.mv_id,
+                expected_version: loaded.version,
+                expected_source_revision: loaded.definition.source_revision,
+            },
+        )
     }
-    fn update_refresh_metadata(
-        &self,
-        request: UpdateMvRefreshMetadataRequest,
-    ) -> Result<StoredMvDefinition, MvRepositoryError> {
+
+    fn wipe_accelerator(&self, _operation_id: Uuid) -> Result<(), MvRepositoryError> {
         let mut state = self.state()?;
-        let definition = state.definitions.get_mut(&request.mv_id).ok_or_else(|| {
-            MvRepositoryError::new(
-                MvRepositoryErrorKind::NotFound,
-                format!("MV definition {} does not exist", request.mv_id),
-            )
-        })?;
-        definition.refresh_policy = request.refresh_policy;
-        definition.refresh_paused = request.refresh_paused;
-        definition.refresh_interval_ms = request.refresh_interval_ms;
-        definition.max_staleness_ms = request.max_staleness_ms;
-        definition.last_scheduler_error = request.last_scheduler_error;
-        definition.next_refresh_after_ms = request.next_refresh_after_ms;
-        Ok(definition.clone())
-    }
-    fn update_partition_contract(
-        &self,
-        request: UpdateMvPartitionContractRequest,
-    ) -> Result<StoredMvDefinition, MvRepositoryError> {
-        let mut state = self.state()?;
-        let updated = {
-            let definition = state.definitions.get_mut(&request.mv_id).ok_or_else(|| {
-                MvRepositoryError::new(
-                    MvRepositoryErrorKind::NotFound,
-                    format!("MV definition {} does not exist", request.mv_id),
-                )
-            })?;
-            let schema = definition.schema_contract.as_mut().ok_or_else(|| {
-                MvRepositoryError::new(
-                    MvRepositoryErrorKind::Corruption,
-                    "MV definition has no schema contract",
-                )
-            })?;
-            schema.target.partition = Some(request.partition_spec.clone());
-            definition.partition_spec = Some(request.partition_spec);
-            definition.partition_state_complete = false;
-            definition.clone()
-        };
-        state.partitions.retain(|(id, _), _| *id != request.mv_id);
-        Ok(updated)
-    }
-    fn begin_refresh_intent(
-        &self,
-        mv_id: i64,
-        target_snapshots: BTreeMap<String, i64>,
-    ) -> Result<StoredMvRefresh, MvRepositoryError> {
-        let mut state = self.state()?;
-        let refresh_id = Self::allocate(&mut state);
-        let definition = state.definitions.get_mut(&mv_id).ok_or_else(|| {
-            MvRepositoryError::new(
-                MvRepositoryErrorKind::NotFound,
-                format!("MV definition {mv_id} does not exist"),
-            )
-        })?;
-        if definition.refresh_in_progress {
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Conflict,
-                "MV refresh is already in progress",
-            ));
-        }
-        definition.refresh_in_progress = true;
-        definition.active_refresh_id = Some(refresh_id);
-        definition.refresh_target_snapshots = target_snapshots.clone();
-        let refresh = StoredMvRefresh {
-            refresh_id,
-            mv_id,
-            operation_id: None,
-            state: MvRefreshState::IntentCreated,
-            target_catalog: None,
-            target_namespace: None,
-            target_table: None,
-            staging_branch: None,
-            expected_main_snapshot_id: None,
-            staging_snapshot_id: None,
-            published_snapshot_id: None,
-            target_snapshots,
-            base_table_object_ids: BTreeMap::new(),
-            rows: None,
-            marker: None,
-            external_outcome: None,
-            lifecycle_owner: MvRefreshLifecycleOwner::LegacyCore,
-            frontend_ledger: None,
-            frontend_recovery: None,
-        };
-        state.refreshes.insert(refresh_id, refresh.clone());
-        Ok(refresh)
-    }
-    fn begin_iceberg_refresh_intent(
-        &self,
-        request: BeginIcebergMvRefreshRequest,
-    ) -> Result<StoredMvRefresh, MvRepositoryError> {
-        let mut state = self.state()?;
-        let refresh_id = Self::allocate(&mut state);
-        let definition = state.definitions.get_mut(&request.mv_id).ok_or_else(|| {
-            MvRepositoryError::new(
-                MvRepositoryErrorKind::NotFound,
-                format!("MV definition {} does not exist", request.mv_id),
-            )
-        })?;
-        if definition.refresh_in_progress {
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Conflict,
-                "MV refresh is already in progress",
-            ));
-        }
-        definition.refresh_in_progress = true;
-        definition.active_refresh_id = Some(refresh_id);
-        definition.refresh_target_snapshots = request.base_snapshots.clone();
-        let refresh = StoredMvRefresh {
-            refresh_id,
-            mv_id: request.mv_id,
-            operation_id: request.operation_id,
-            state: MvRefreshState::IntentCreated,
-            target_catalog: (!request.target_catalog.is_empty()).then_some(request.target_catalog),
-            target_namespace: (!request.target_namespace.is_empty())
-                .then_some(request.target_namespace),
-            target_table: (!request.target_table.is_empty()).then_some(request.target_table),
-            staging_branch: (!request.staging_branch.is_empty()).then_some(request.staging_branch),
-            expected_main_snapshot_id: request.expected_main_snapshot_id,
-            staging_snapshot_id: None,
-            published_snapshot_id: None,
-            target_snapshots: request.base_snapshots,
-            base_table_object_ids: BTreeMap::new(),
-            rows: None,
-            marker: Some(RefreshCommitMarker {
-                refresh_id,
-                mv_id: request.mv_id,
-                token: request.marker_token,
-            }),
-            external_outcome: None,
-            lifecycle_owner: MvRefreshLifecycleOwner::LegacyCore,
-            frontend_ledger: None,
-            frontend_recovery: None,
-        };
-        state.refreshes.insert(refresh_id, refresh.clone());
-        Ok(refresh)
-    }
-    fn record_staging_commit(
-        &self,
-        request: RecordStagingCommitRequest,
-    ) -> Result<(), MvRepositoryError> {
-        let mut state = self.state()?;
-        let refresh = Self::refresh_mut(&mut state, request.refresh_id)?;
-        if refresh.state == MvRefreshState::StagingCommitted {
-            if refresh.staging_snapshot_id == Some(request.staging_snapshot_id)
-                && refresh.rows == Some(request.rows)
-                && refresh.base_table_object_ids == request.base_table_object_ids
-            {
-                return Ok(());
-            }
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Conflict,
-                format!(
-                    "mv refresh {} staging commit differs from recorded value",
-                    request.refresh_id
-                ),
-            ));
-        }
-        Self::expect_refresh_state(refresh, MvRefreshState::IntentCreated)?;
-        refresh.state = MvRefreshState::StagingCommitted;
-        refresh.staging_snapshot_id = Some(request.staging_snapshot_id);
-        refresh.rows = Some(request.rows);
-        refresh.base_table_object_ids = request.base_table_object_ids;
+        *state = State::default();
         Ok(())
     }
-    fn record_publish_commit(
-        &self,
-        request: RecordPublishCommitRequest,
-    ) -> Result<(), MvRepositoryError> {
-        let mut state = self.state()?;
-        let refresh = Self::refresh_mut(&mut state, request.refresh_id)?;
-        if refresh.state == MvRefreshState::PublishCommitted {
-            if refresh.published_snapshot_id == Some(request.published_snapshot_id)
-                && Self::persisted_publish_target_snapshot(refresh)
-                    == Some(request.published_snapshot_id)
-            {
-                return Ok(());
-            }
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Conflict,
-                format!(
-                    "mv refresh {} publish commit differs from recorded value",
-                    request.refresh_id
-                ),
-            ));
-        }
-        Self::expect_refresh_state(refresh, MvRefreshState::StagingCommitted)?;
-        refresh.state = MvRefreshState::PublishCommitted;
-        refresh.published_snapshot_id = Some(request.published_snapshot_id);
-        refresh.external_outcome = Some(RefreshExternalOutcome {
-            target_snapshot_id: Some(request.published_snapshot_id),
-            commit_id: format!("iceberg-snapshot-{}", request.published_snapshot_id),
-        });
-        Ok(())
-    }
-    fn mark_refresh_commit_unknown(&self, refresh_id: i64) -> Result<(), MvRepositoryError> {
-        let mut state = self.state()?;
-        let refresh = Self::refresh_mut(&mut state, refresh_id)?;
-        if !matches!(
-            refresh.state,
-            MvRefreshState::Finalized | MvRefreshState::Aborted
-        ) {
-            refresh.state = MvRefreshState::CommitUnknown;
-        }
-        Ok(())
-    }
-    fn record_external_commit_outcome(
-        &self,
-        refresh_id: i64,
-        outcome: RefreshExternalOutcome,
-    ) -> Result<(), MvRepositoryError> {
-        let mut state = self.state()?;
-        let refresh = Self::refresh_mut(&mut state, refresh_id)?;
-        Self::expect_refresh_state(refresh, MvRefreshState::IntentCreated)?;
-        refresh.state = MvRefreshState::PublishCommitted;
-        refresh.published_snapshot_id = outcome.target_snapshot_id;
-        refresh.external_outcome = Some(outcome);
-        Ok(())
-    }
-    fn finalize_refresh(&self, request: MvRefreshFinalizeRequest) -> Result<(), MvRepositoryError> {
-        fail_if_requested(TestMvRepositoryFailurePoint::FinalizeRefresh)?;
-        let mut state = self.state()?;
-        InMemoryMvRepository::finish_locked(&mut state, request)
-    }
-    fn finalize_refresh_with_partitions(
-        &self,
-        request: FinalizeMvRefreshWithPartitionsRequest,
-    ) -> Result<(), MvRepositoryError> {
-        let mut state = self.state()?;
-        if let Some(partitions) = request.partitions {
-            replace_partitions(&mut state, partitions)?;
-        }
-        InMemoryMvRepository::finish_locked(&mut state, request.refresh)
-    }
-    fn record_external_commit_and_finalize(
-        &self,
-        request: RecordExternalCommitAndFinalizeRequest,
-    ) -> Result<(), MvRepositoryError> {
-        let mut state = self.state()?;
-        Self::refresh_mut(&mut state, request.refresh_id)?.external_outcome =
-            Some(request.external_outcome);
-        InMemoryMvRepository::finish_locked(&mut state, request.finalize)
-    }
-    fn clear_refresh_progress(&self, mv_id: i64) -> Result<bool, MvRepositoryError> {
-        let mut state = self.state()?;
-        let Some(active_refresh_id) = state
-            .definitions
-            .get(&mv_id)
-            .map(|definition| definition.active_refresh_id)
-        else {
-            return Ok(false);
-        };
-        if let Some(refresh_id) = active_refresh_id {
-            let refresh = Self::refresh_mut(&mut state, refresh_id)?;
-            if refresh.state == MvRefreshState::CommitUnknown {
-                return Err(MvRepositoryError::new(
-                    MvRepositoryErrorKind::Conflict,
-                    format!("mv definition {mv_id} active refresh {refresh_id} is commit-unknown"),
-                ));
-            }
-            if !matches!(
-                refresh.state,
-                MvRefreshState::Finalized | MvRefreshState::Aborted
-            ) {
-                refresh.state = MvRefreshState::Aborted;
-            }
-        }
-        let definition = state
-            .definitions
-            .get_mut(&mv_id)
-            .expect("definition checked above");
-        definition.refresh_in_progress = false;
-        definition.active_refresh_id = None;
-        definition.refresh_target_snapshots.clear();
-        Ok(true)
-    }
-    fn load_refresh(&self, refresh_id: i64) -> Result<Option<StoredMvRefresh>, MvRepositoryError> {
-        Ok(self.state()?.refreshes.get(&refresh_id).cloned())
-    }
-    fn list_refreshes(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
-        Ok(self.state()?.refreshes.values().cloned().collect())
-    }
-    fn list_unfinished_refreshes(&self) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
-        Ok(self
-            .state()?
-            .refreshes
-            .values()
-            .filter(|refresh| {
-                !matches!(
-                    refresh.state,
-                    MvRefreshState::Finalized | MvRefreshState::Aborted
-                )
-            })
-            .cloned()
-            .collect())
-    }
-    fn list_unfinished_branch_staged_iceberg_refreshes(
-        &self,
-    ) -> Result<Vec<StoredMvRefresh>, MvRepositoryError> {
-        Ok(self
-            .list_unfinished_refreshes()?
-            .into_iter()
-            .filter(|refresh| {
-                refresh.lifecycle_owner == MvRefreshLifecycleOwner::LegacyCore
-                    && refresh.staging_branch.is_some()
-            })
-            .collect())
-    }
-    fn update_starrocks_refresh_summary_if_present(
-        &self,
-        request: UpdateStarRocksMvRefreshSummaryRequest,
-    ) -> Result<bool, MvRepositoryError> {
-        fail_if_requested(TestMvRepositoryFailurePoint::UpdateStarRocksRefreshSummary)?;
-        let mut state = self.state()?;
-        let Some(definition) = state.definitions.get_mut(&request.mv_id) else {
-            return Ok(false);
-        };
-        definition.last_refresh_ms = Some(request.last_refresh_ms);
-        definition.last_refresh_rows = Some(request.last_refresh_rows);
-        definition.last_refresh_snapshots = request.base_snapshots;
-        definition.last_refresh_table_object_ids = request.base_table_object_ids;
-        Ok(true)
-    }
-    fn replace_partition_states(
-        &self,
-        request: ReplaceMvPartitionStatesRequest,
-    ) -> Result<(), MvRepositoryError> {
-        let mut state = self.state()?;
-        replace_partitions(&mut state, request)
-    }
-    fn record_failed_partition_states(
-        &self,
-        request: RecordFailedMvPartitionStatesRequest,
-    ) -> Result<(), MvRepositoryError> {
-        let mut state = self.state()?;
-        for key in request.partition_keys.into_iter().take(request.max_entries) {
-            state.partitions.insert(
-                (request.mv_id, key.clone()),
-                StoredMvPartitionState {
-                    mv_id: request.mv_id,
-                    partition_key: key,
-                    status: MvPartitionRefreshStatus::Failed,
-                    last_refresh_ms: Some(request.last_refresh_ms),
-                    base_snapshots: request.base_snapshots.clone(),
-                    target_snapshot_id: request.target_snapshot_id,
-                    last_refresh_id: Some(request.last_refresh_id),
-                    failure_message: Some(request.failure_message.clone()),
-                },
-            );
-        }
-        Ok(())
-    }
-    fn clear_partition_states(&self, mv_id: i64) -> Result<bool, MvRepositoryError> {
-        let mut state = self.state()?;
-        let before = state.partitions.len();
-        state.partitions.retain(|(id, _), _| *id != mv_id);
-        Ok(before != state.partitions.len())
-    }
-    fn list_partition_states(
-        &self,
-        mv_id: i64,
-    ) -> Result<Vec<StoredMvPartitionState>, MvRepositoryError> {
-        Ok(self
-            .state()?
-            .partitions
-            .range((mv_id, String::new())..)
-            .take_while(|((id, _), _)| *id == mv_id)
-            .map(|(_, value)| value.clone())
-            .collect())
-    }
-    fn adopt_target_compaction_snapshot(
-        &self,
-        target: &MvTarget,
-        expected_snapshot_id: i64,
-        adopted_snapshot_id: i64,
-    ) -> Result<bool, MvRepositoryError> {
-        let mut state = self.state()?;
-        let Some(definition) = state
-            .definitions
-            .values_mut()
-            .find(|definition| InMemoryMvRepository::target(definition).as_ref() == Some(target))
-        else {
-            return Ok(false);
-        };
-        if definition.last_refreshed_iceberg_snapshot_id != Some(expected_snapshot_id) {
-            return Ok(false);
-        };
-        definition.last_refreshed_iceberg_snapshot_id = Some(adopted_snapshot_id);
-        Ok(true)
-    }
-    fn replace_dependencies_for_mv(
-        &self,
-        mv_id: i64,
-        dependencies: Vec<CreateMvDependencyRequest>,
-    ) -> Result<(), MvRepositoryError> {
-        let mut state = self.state()?;
-        if !state.definitions.contains_key(&mv_id) {
-            return Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::NotFound,
-                format!("MV definition {mv_id} does not exist"),
-            ));
-        }
-        state.dependencies.insert(
-            mv_id,
-            dependencies
-                .into_iter()
-                .map(|dependency| StoredMvDependency {
-                    downstream_mv_id: mv_id,
-                    upstream: dependency.upstream,
-                    created_at_ms: dependency.created_at_ms,
-                })
-                .collect(),
-        );
-        Ok(())
-    }
-    fn delete_dependencies_for_mv(&self, mv_id: i64) -> Result<(), MvRepositoryError> {
-        self.state()?.dependencies.remove(&mv_id);
-        Ok(())
-    }
-    fn ensure_no_downstream_dependencies(
-        &self,
-        upstream: &MvDependencyObjectRef,
-    ) -> Result<(), MvRepositoryError> {
-        let dependents = self.list_downstream_dependencies(upstream)?;
-        if dependents.is_empty() {
-            Ok(())
-        } else {
-            Err(MvRepositoryError::new(
-                MvRepositoryErrorKind::Conflict,
-                "MV dependency prevents drop",
-            ))
-        }
-    }
+
     fn list_dependencies_by_downstream(
         &self,
         mv_id: i64,
@@ -893,6 +299,7 @@ impl MvRepository for InMemoryMvRepository {
             .cloned()
             .unwrap_or_default())
     }
+
     fn list_downstream_dependencies(
         &self,
         upstream: &MvDependencyObjectRef,
@@ -906,36 +313,21 @@ impl MvRepository for InMemoryMvRepository {
             .cloned()
             .collect())
     }
-}
 
-fn replace_partitions(
-    state: &mut State,
-    request: ReplaceMvPartitionStatesRequest,
-) -> Result<(), MvRepositoryError> {
-    if !state.definitions.contains_key(&request.mv_id) {
-        return Err(MvRepositoryError::new(
-            MvRepositoryErrorKind::NotFound,
-            format!("MV definition {} does not exist", request.mv_id),
-        ));
+    fn ensure_no_downstream_dependencies(
+        &self,
+        upstream: &MvDependencyObjectRef,
+    ) -> Result<(), MvRepositoryError> {
+        if self.list_downstream_dependencies(upstream)?.is_empty() {
+            Ok(())
+        } else {
+            Err(MvRepositoryError::new(
+                MvRepositoryErrorKind::Conflict,
+                format!(
+                    "{} has downstream materialized views",
+                    upstream.display_name()
+                ),
+            ))
+        }
     }
-    state.partitions.retain(|(id, _), _| *id != request.mv_id);
-    for key in request.partition_keys.into_iter().take(request.max_entries) {
-        state.partitions.insert(
-            (request.mv_id, key.clone()),
-            StoredMvPartitionState {
-                mv_id: request.mv_id,
-                partition_key: key,
-                status: MvPartitionRefreshStatus::Fresh,
-                last_refresh_ms: Some(request.last_refresh_ms),
-                base_snapshots: request.base_snapshots.clone(),
-                target_snapshot_id: request.target_snapshot_id,
-                last_refresh_id: Some(request.last_refresh_id),
-                failure_message: None,
-            },
-        );
-    }
-    if let Some(definition) = state.definitions.get_mut(&request.mv_id) {
-        definition.partition_state_complete = true;
-    }
-    Ok(())
 }

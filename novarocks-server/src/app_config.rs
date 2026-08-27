@@ -24,8 +24,9 @@ use crate::state_store_config::{
     StateStoreConfig, StateStoreProviderConfig,
 };
 use crate::state_store_limits::StateStoreLimitOverrides;
+use novarocks_native_trust::NativeTransportMode;
 use novarocks_secret::SecretValue;
-use novarocks_types::ClusterRole;
+use novarocks_types::{ClusterRole, NativeEndpoint};
 use uuid::Uuid;
 
 pub use crate::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
@@ -232,42 +233,59 @@ fn deserialize_foundationdb_client<'de, D: Deserializer<'de>>(
 
 /// Configuration for the `[cluster]` TOML section.
 #[derive(Clone, Debug, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClusterConfig {
     pub role: ClusterRole,
-    pub backends: Vec<String>,
+    /// Exact logical FE native endpoint used by a BE to announce itself.
+    /// FE membership is self-registration only; no role accepts a BE seed list.
+    pub frontend_endpoint: Option<String>,
     pub advertise_host: String,
     pub advertise_port: u16,
-    #[serde(default = "default_heartbeat_interval_ms")]
-    pub heartbeat_interval_ms: u64,
-    #[serde(default = "default_heartbeat_timeout_retries")]
-    pub heartbeat_timeout_retries: u32,
-    #[serde(default = "default_decommission_timeout_secs")]
-    pub decommission_timeout_secs: u64,
+    pub heartbeat_interval_ms: Option<u64>,
+    pub heartbeat_timeout_retries: Option<u32>,
+    pub backend_announce_lease_ttl_ms: Option<u64>,
+    pub backend_announce_interval_ms: Option<u64>,
+    pub backend_announce_initial_backoff_ms: Option<u64>,
+    pub backend_announce_max_backoff_ms: Option<u64>,
 }
 
 fn default_heartbeat_interval_ms() -> u64 {
-    5000
+    1000
 }
 
 fn default_heartbeat_timeout_retries() -> u32 {
     3
 }
 
-fn default_decommission_timeout_secs() -> u64 {
-    300
+fn default_backend_announce_lease_ttl_ms() -> u64 {
+    5000
+}
+
+fn default_backend_announce_interval_ms() -> u64 {
+    1000
+}
+
+fn default_backend_announce_initial_backoff_ms() -> u64 {
+    100
+}
+
+fn default_backend_announce_max_backoff_ms() -> u64 {
+    2000
 }
 
 impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             role: ClusterRole::Fe,
-            backends: Vec::new(),
+            frontend_endpoint: None,
             advertise_host: String::new(),
             advertise_port: 0,
-            heartbeat_interval_ms: default_heartbeat_interval_ms(),
-            heartbeat_timeout_retries: default_heartbeat_timeout_retries(),
-            decommission_timeout_secs: default_decommission_timeout_secs(),
+            heartbeat_interval_ms: None,
+            heartbeat_timeout_retries: None,
+            backend_announce_lease_ttl_ms: None,
+            backend_announce_interval_ms: None,
+            backend_announce_initial_backoff_ms: None,
+            backend_announce_max_backoff_ms: None,
         }
     }
 }
@@ -276,28 +294,96 @@ impl ClusterConfig {
     /// Validate cluster config consistency. Called at startup after parsing.
     pub fn validate(&self) -> Result<(), String> {
         match self.role {
+            ClusterRole::Fe if self.frontend_endpoint.is_some() => {
+                return Err("role=fe must not configure [cluster].frontend_endpoint".to_string());
+            }
             ClusterRole::Fe => {
-                let mut seen = std::collections::HashSet::new();
-                for b in &self.backends {
-                    let canonical = b
-                        .parse::<std::net::SocketAddr>()
-                        .map_err(|e| format!("invalid backend addr '{}': {}", b, e))?
-                        .to_string();
-                    if !seen.insert(canonical) {
-                        return Err(format!("duplicate backend in [cluster].backends: {}", b));
-                    }
+                if self.backend_announce_interval_ms.is_some()
+                    || self.backend_announce_initial_backoff_ms.is_some()
+                    || self.backend_announce_max_backoff_ms.is_some()
+                {
+                    return Err(
+                        "role=fe must not configure BE announce cadence or backoff".to_string()
+                    );
+                }
+                if self.heartbeat_interval_ms() == 0
+                    || self.heartbeat_timeout_retries() == 0
+                    || self.backend_announce_lease_ttl_ms() == 0
+                {
+                    return Err(
+                        "FE heartbeat and announce lease settings must be nonzero".to_string()
+                    );
                 }
             }
             ClusterRole::Be => {
-                if !self.backends.is_empty() {
-                    return Err(format!(
-                        "role=be must not configure [cluster].backends (got {} entries)",
-                        self.backends.len()
-                    ));
+                self.frontend_endpoint
+                    .as_deref()
+                    .ok_or_else(|| {
+                        "role=be requires [cluster].frontend_endpoint for authenticated self-registration"
+                            .to_string()
+                    })?
+                    .parse::<NativeEndpoint>()
+                    .map_err(|error| {
+                        format!("invalid [cluster].frontend_endpoint: {error}")
+                    })?;
+                if self.heartbeat_interval_ms.is_some()
+                    || self.heartbeat_timeout_retries.is_some()
+                    || self.backend_announce_lease_ttl_ms.is_some()
+                {
+                    return Err(
+                        "role=be must not configure FE heartbeat or announce lease settings"
+                            .to_string(),
+                    );
+                }
+                if self.backend_announce_initial_backoff_ms()
+                    > self.backend_announce_max_backoff_ms()
+                {
+                    return Err(
+                        "[cluster].backend_announce_max_backoff_ms must be at least backend_announce_initial_backoff_ms"
+                            .to_string(),
+                    );
+                }
+                if self.backend_announce_interval_ms() == 0
+                    || self.backend_announce_initial_backoff_ms() == 0
+                    || self.backend_announce_max_backoff_ms() == 0
+                {
+                    return Err(
+                        "BE announce cadence and backoff settings must be nonzero".to_string()
+                    );
                 }
             }
         }
         Ok(())
+    }
+
+    pub fn heartbeat_interval_ms(&self) -> u64 {
+        self.heartbeat_interval_ms
+            .unwrap_or_else(default_heartbeat_interval_ms)
+    }
+
+    pub fn heartbeat_timeout_retries(&self) -> u32 {
+        self.heartbeat_timeout_retries
+            .unwrap_or_else(default_heartbeat_timeout_retries)
+    }
+
+    pub fn backend_announce_lease_ttl_ms(&self) -> u64 {
+        self.backend_announce_lease_ttl_ms
+            .unwrap_or_else(default_backend_announce_lease_ttl_ms)
+    }
+
+    pub fn backend_announce_interval_ms(&self) -> u64 {
+        self.backend_announce_interval_ms
+            .unwrap_or_else(default_backend_announce_interval_ms)
+    }
+
+    pub fn backend_announce_initial_backoff_ms(&self) -> u64 {
+        self.backend_announce_initial_backoff_ms
+            .unwrap_or_else(default_backend_announce_initial_backoff_ms)
+    }
+
+    pub fn backend_announce_max_backoff_ms(&self) -> u64 {
+        self.backend_announce_max_backoff_ms
+            .unwrap_or_else(default_backend_announce_max_backoff_ms)
     }
 }
 
@@ -308,23 +394,25 @@ mod cluster_hb_tests {
     #[test]
     fn cluster_config_heartbeat_defaults() {
         let c = ClusterConfig::default();
-        assert_eq!(c.heartbeat_interval_ms, 5000);
-        assert_eq!(c.heartbeat_timeout_retries, 3);
-        assert_eq!(c.decommission_timeout_secs, 300);
+        assert_eq!(c.heartbeat_interval_ms(), 1000);
+        assert_eq!(c.heartbeat_timeout_retries(), 3);
+        assert_eq!(c.backend_announce_lease_ttl_ms(), 5000);
+        assert_eq!(c.backend_announce_interval_ms(), 1000);
+        assert_eq!(c.backend_announce_initial_backoff_ms(), 100);
+        assert_eq!(c.backend_announce_max_backoff_ms(), 2000);
     }
 
     #[test]
     fn cluster_config_parses_heartbeat_overrides() {
         let toml = r#"
             role = "fe"
-            backends = ["127.0.0.1:9070"]
             heartbeat_interval_ms = 2000
             heartbeat_timeout_retries = 5
         "#;
         let c: ClusterConfig = toml::from_str(toml).unwrap();
-        assert_eq!(c.heartbeat_interval_ms, 2000);
-        assert_eq!(c.heartbeat_timeout_retries, 5);
-        assert_eq!(c.decommission_timeout_secs, 300);
+        assert_eq!(c.heartbeat_interval_ms(), 2000);
+        assert_eq!(c.heartbeat_timeout_retries(), 5);
+        assert_eq!(c.backend_announce_lease_ttl_ms(), 5000);
     }
 }
 
@@ -443,6 +531,9 @@ pub struct NovaRocksConfig {
 
     #[serde(default)]
     pub cluster: ClusterConfig,
+
+    #[serde(default, deserialize_with = "deserialize_native_trust_config")]
+    pub native_trust: Option<NativeTrustConfig>,
 }
 
 impl NovaRocksConfig {
@@ -483,8 +574,99 @@ impl NovaRocksConfig {
             .validate()
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("validate [cluster]: {}", path.display()))?;
+        if cfg.native_trust.is_none() {
+            bail!(
+                "config {}: missing required [native_trust] table",
+                path.display()
+            );
+        }
         Ok(cfg)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeTrustConfig {
+    pub deployment_id: String,
+    pub shared_secret: SecretValue,
+    pub transport: NativeTrustTransportConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeTrustTransportConfig {
+    pub mode: NativeTransportMode,
+    pub certificate_chain_path: Option<PathBuf>,
+    pub private_key_path: Option<PathBuf>,
+    pub trust_roots_path: Option<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeTrustConfigWire {
+    deployment_id: String,
+    shared_secret: String,
+    #[serde(default)]
+    transport: NativeTrustTransportConfigWire,
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct NativeTrustTransportConfigWire {
+    mode: Option<String>,
+    certificate_chain_path: Option<PathBuf>,
+    private_key_path: Option<PathBuf>,
+    trust_roots_path: Option<PathBuf>,
+}
+
+impl Default for NativeTrustTransportConfigWire {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            certificate_chain_path: None,
+            private_key_path: None,
+            trust_roots_path: None,
+        }
+    }
+}
+
+fn deserialize_native_trust_config<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<NativeTrustConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let wire = Option::<NativeTrustConfigWire>::deserialize(deserializer)?;
+    wire.map(|wire| {
+        let mode = match wire.transport.mode.as_deref().unwrap_or("disabled") {
+            "disabled" => NativeTransportMode::Disabled,
+            "automatic" => NativeTransportMode::Automatic,
+            "pem" => NativeTransportMode::Pem,
+            _ => return Err(serde::de::Error::custom("native_trust.transport.mode must be disabled, automatic, or pem")),
+        };
+        let transport = NativeTrustTransportConfig {
+            mode,
+            certificate_chain_path: wire.transport.certificate_chain_path,
+            private_key_path: wire.transport.private_key_path,
+            trust_roots_path: wire.transport.trust_roots_path,
+        };
+        let has_pem_paths = transport.certificate_chain_path.is_some()
+            || transport.private_key_path.is_some()
+            || transport.trust_roots_path.is_some();
+        if mode == NativeTransportMode::Pem {
+            if transport.certificate_chain_path.is_none()
+                || transport.private_key_path.is_none()
+                || transport.trust_roots_path.is_none()
+            {
+                return Err(serde::de::Error::custom("native_trust.transport.mode=pem requires certificate_chain_path, private_key_path, and trust_roots_path"));
+            }
+        } else if has_pem_paths {
+            return Err(serde::de::Error::custom("native_trust PEM paths are only valid when transport.mode=pem"));
+        }
+        Ok(NativeTrustConfig {
+            deployment_id: wire.deployment_id,
+            shared_secret: SecretValue::new(wire.shared_secret),
+            transport,
+        })
+    }).transpose()
 }
 
 fn load_resolved_config_value(path: &Path) -> Result<toml::Value> {
@@ -550,6 +732,7 @@ impl Default for NovaRocksConfig {
             connector: ConnectorConfig::default(),
             spill: SpillStorageConfig::default(),
             cluster: ClusterConfig::default(),
+            native_trust: None,
         }
     }
 }
@@ -2402,90 +2585,84 @@ host = "127.0.0.1"
 "#;
         let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse default");
         assert_eq!(cfg.cluster.role, super::ClusterRole::Fe);
-        assert!(cfg.cluster.backends.is_empty());
+        assert!(cfg.cluster.frontend_endpoint.is_none());
     }
 
     #[test]
-    fn test_cluster_role_fe_with_single_backend() {
+    fn test_cluster_role_fe_rejects_legacy_backend_seeds() {
         let toml = r#"
 [cluster]
 role = "fe"
 backends = ["127.0.0.1:9070"]
 "#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse fe");
-        assert_eq!(cfg.cluster.role, super::ClusterRole::Fe);
-        assert_eq!(cfg.cluster.backends, vec!["127.0.0.1:9070".to_string()]);
+        assert!(toml::from_str::<NovaRocksConfig>(toml).is_err());
     }
 
     #[test]
-    fn test_cluster_role_be_rejects_backends() {
+    fn test_cluster_role_be_requires_frontend_endpoint() {
         let toml = r#"
 [cluster]
 role = "be"
-backends = ["127.0.0.1:9070"]
 "#;
-        let parsed: NovaRocksConfig = toml::from_str(toml).expect("parse be with backends");
-        let err = parsed
-            .cluster
-            .validate()
-            .expect_err("be with backends should fail");
-        assert!(err.contains("backends"));
+        let parsed: NovaRocksConfig = toml::from_str(toml).expect("parse be");
+        assert!(parsed.cluster.validate().is_err());
     }
 
     #[test]
-    fn test_cluster_role_fe_with_three_backends_passes() {
+    fn test_cluster_role_be_accepts_dns_frontend_endpoint() {
         let toml = r#"
 [cluster]
-role = "fe"
-backends = ["10.0.0.1:9070", "10.0.0.2:9070", "10.0.0.3:9070"]
+role = "be"
+frontend_endpoint = "fe.native.example:9070"
 "#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse fe with 3 backends");
+        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse be");
         cfg.cluster
             .validate()
-            .expect("3 backends should pass D2 validate");
+            .expect("dns frontend endpoint should pass validation");
     }
 
     #[test]
-    fn test_cluster_role_fe_rejects_duplicate_backends() {
+    fn test_cluster_role_fe_rejects_frontend_endpoint() {
         let toml = r#"
 [cluster]
 role = "fe"
-backends = ["10.0.0.1:9070", "10.0.0.1:9070"]
+frontend_endpoint = "fe.native.example:9070"
 "#;
         let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
-        let err = cfg
-            .cluster
-            .validate()
-            .expect_err("duplicate backends should fail");
-        assert!(err.contains("duplicate") || err.contains("10.0.0.1:9070"));
+        assert!(cfg.cluster.validate().is_err());
     }
 
     #[test]
-    fn test_cluster_role_fe_rejects_malformed_backend() {
+    fn test_cluster_role_fe_rejects_be_announce_settings() {
         let toml = r#"
 [cluster]
 role = "fe"
-backends = ["not-a-socket-addr"]
+backend_announce_interval_ms = 1000
 "#;
         let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
-        let err = cfg
-            .cluster
-            .validate()
-            .expect_err("malformed addr should fail");
-        assert!(err.contains("not-a-socket-addr") || err.contains("invalid"));
+        assert!(cfg.cluster.validate().is_err());
     }
 
     #[test]
-    fn test_cluster_role_fe_empty_backends_allowed() {
-        let toml = r#"
+    fn test_cluster_role_be_rejects_frontend_lease_settings_and_invalid_backoff() {
+        let lease_toml = r#"
 [cluster]
-role = "fe"
-backends = []
+role = "be"
+frontend_endpoint = "fe.native.example:9070"
+backend_announce_lease_ttl_ms = 5000
 "#;
-        let cfg: NovaRocksConfig = toml::from_str(toml).expect("parse");
-        cfg.cluster
-            .validate()
-            .expect("role=fe may start with no configured backends");
+        let cfg: NovaRocksConfig = toml::from_str(lease_toml).expect("parse");
+        assert!(cfg.cluster.validate().is_err());
+
+        let backoff_toml = r#"
+[cluster]
+role = "be"
+frontend_endpoint = "fe.native.example:9070"
+backend_announce_initial_backoff_ms = 2000
+backend_announce_max_backoff_ms = 100
+"#;
+        let cfg: NovaRocksConfig = toml::from_str(backoff_toml).expect("parse");
+        assert!(cfg.cluster.validate().is_err());
     }
 
     #[test]

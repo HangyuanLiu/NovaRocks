@@ -72,7 +72,7 @@ impl Printer {
 
     fn write_statement(&mut self, statement: &Statement) {
         match statement {
-            Statement::Backend(statement) => {
+            Statement::ShowBackends(statement) => {
                 crate::ast::backend::write_sql(statement, &mut self.output)
             }
             Statement::Statistics(statement) => {
@@ -1718,7 +1718,7 @@ mod tests {
     }
 
     #[test]
-    fn parenthesizes_binary_expressions_and_keeps_legacy_statements() {
+    fn parenthesizes_binary_expressions_and_prints_show_backends() {
         let expression = binary(
             identifier("a"),
             BinaryOperator::Multiply,
@@ -1726,9 +1726,7 @@ mod tests {
         );
         assert_eq!(print_expr(&expression), "a * (b + c)");
 
-        let show = Statement::Backend(BackendStatement::ShowBackends(ShowBackends {
-            span: span(),
-        }));
+        let show = Statement::ShowBackends(ShowBackends { span: span() });
         assert_eq!(print_statement(&show), "SHOW BACKENDS");
         assert_eq!(
             print_statements(&[show.clone(), show]),

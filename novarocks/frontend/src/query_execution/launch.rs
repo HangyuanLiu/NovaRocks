@@ -71,8 +71,8 @@ impl StageParticipantBinding {
         })
     }
 
-    pub const fn target(&self) -> QueryLifecycleTarget {
-        self.target
+    pub const fn target(&self) -> &QueryLifecycleTarget {
+        &self.target
     }
 
     pub const fn init_digest(&self) -> ParticipantManifestDigest {
@@ -98,6 +98,10 @@ impl StageParticipantBinding {
 pub struct StageBatch {
     binding: StageParticipantBinding,
     request: QueryStageRequest,
+    /// Derived once when the batch is frozen. The request no longer carries the
+    /// stage identity, so the Start fence and acknowledgement comparison read
+    /// this retained value instead of re-deriving it per attempt.
+    digest: StageDigest,
 }
 
 impl StageBatch {
@@ -137,10 +141,13 @@ impl StageBatch {
             execution_id,
             binding.init_digest(),
             StageDigestVersion::V1,
-            digest,
             fragments,
         )?;
-        Ok(Self { binding, request })
+        Ok(Self {
+            binding,
+            request,
+            digest,
+        })
     }
 
     pub const fn binding(&self) -> &StageParticipantBinding {
@@ -151,11 +158,15 @@ impl StageBatch {
         &self.request
     }
 
+    pub const fn digest(&self) -> StageDigest {
+        self.digest
+    }
+
     pub fn start_request(&self) -> QueryStartRequest {
         QueryStartRequest::new(
             self.request.execution_id(),
             self.request.digest_version(),
-            self.request.digest(),
+            self.digest,
         )
         .expect("validated Stage request contains a valid Start fence")
     }
@@ -171,12 +182,11 @@ pub trait QueryLaunchBarrier: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
+    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_proto::lifecycle::AttemptId;
     use novarocks_proto_models::common;
     use novarocks_proto_models::{novarocks, plan};
-    use novarocks_types::QueryId;
+    use novarocks_types::{BackendProcessId, QueryId};
 
     use super::*;
 
@@ -192,8 +202,8 @@ mod tests {
         StageParticipantBinding::new(
             QueryLifecycleTarget::new(
                 4,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 19040),
-                9,
+                RuntimeEndpoint::parse("127.0.0.1:19040").expect("test endpoint"),
+                BackendProcessId::new_v7(),
             ),
             ParticipantManifestDigest::new([3; 32]),
             [ParticipantRole::FragmentExecutor],

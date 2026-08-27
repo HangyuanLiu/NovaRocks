@@ -17,7 +17,7 @@
 
 //! The only place a concrete Iceberg catalog kind is chosen.
 //!
-//! Design: ADR-0110 (docs/adr/ADR-0110-iceberg-provider-private-catalog-owner.md)
+//! Design: ADR-0114 (docs/adr/ADR-0114-iceberg-provider-private-catalog-owner.md)
 //!
 //! `IcebergCatalogKind` is a validated configuration value, and this is the one
 //! function allowed to match on it. Past this point the rest of the provider

@@ -4,7 +4,7 @@ title: "Frontend CTAS uses provider-owned staged publication"
 domain: [frontend-dml, provider-spi]
 status: superseded
 supersedes: []
-superseded-by: ADR-0104
+superseded-by: ADR-0110
 date: 2026-08-02
 provenance:
   - "discussion: 2026-08-02 CTAS staged publication and destructive compensation"

@@ -19,16 +19,11 @@ pub(crate) mod activity;
 pub(crate) mod background;
 pub(crate) mod background_engine;
 pub mod command;
-pub mod domain;
-// The acquisition surface here is consumed when the three refresh entry points
-// are switched onto it. The repository-side fence it feeds is already live, so
-// it lands first and is wired next rather than being held back.
-#[allow(dead_code)]
-pub mod coordination;
 mod create;
+pub mod domain;
 pub(crate) mod maintenance;
 pub(crate) mod maintenance_worker;
-mod recovery;
+pub(crate) mod process_runtime;
 // Installed by the composition root so the frontend owns startup ordering.
 mod refresh;
 pub mod repository;
@@ -37,6 +32,5 @@ mod service;
 #[allow(dead_code)]
 pub(crate) mod startup_restore;
 
-pub use recovery::FrontendMvRecoverySummary;
 pub(crate) use refresh::FrontendMvRefreshProviderActivationPort;
 pub use service::FrontendMvService;

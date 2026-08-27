@@ -4,7 +4,7 @@ title: "Frontend StateStore owns durable backend membership"
 domain: [cluster-membership]
 status: superseded
 supersedes: []
-superseded-by: ADR-0108
+superseded-by: ADR-0111
 date: 2026-07-29
 provenance:
   - "discussion: 2026-07-29 frontend backend membership authority"

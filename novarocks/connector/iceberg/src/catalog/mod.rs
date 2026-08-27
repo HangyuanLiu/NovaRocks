@@ -17,7 +17,7 @@
 
 //! The provider-private Iceberg catalog owner.
 //!
-//! Design: ADR-0110 (docs/adr/ADR-0110-iceberg-provider-private-catalog-owner.md)
+//! Design: ADR-0114 (docs/adr/ADR-0114-iceberg-provider-private-catalog-owner.md)
 //!
 //! [`NovaRocksCatalog`] is the only place Iceberg catalog semantics are
 //! decided. Everything above it — metadata, DDL, CTAS, write, maintenance,
@@ -188,7 +188,7 @@ impl CatalogTransactionStart {
 ///
 /// The identity is captured ahead of the catalog request precisely because it
 /// is unreadable afterwards, and post-commit cleanup may only ever act on
-/// exact identity. See ADR-0110 on the catalog/filesystem split.
+/// exact identity. See ADR-0114 on the catalog/filesystem split.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CatalogDropTableReceipt {
     pub(crate) table_uuid: Option<Arc<str>>,
@@ -420,7 +420,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// Drop a table from the catalog.
     ///
     /// This removes catalog visibility only. Object deletion is the filesystem
-    /// owner's job and may only proceed on `KnownCommitted`; see ADR-0110.
+    /// owner's job and may only proceed on `KnownCommitted`; see ADR-0114.
     async fn drop_table(&self, table: CatalogTableName) -> CatalogOutcome<CatalogDropTableReceipt>;
 
     /// Make a write's freshly published metadata reachable through this

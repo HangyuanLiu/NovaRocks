@@ -1,53 +1,70 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 mod mv_repository_definition;
 
-use novarocks_frontend::mv::domain::dependency::model::{
-    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
-};
-use novarocks_frontend::mv::domain::persistence::dependency::CreateMvDependencyRequest;
-use novarocks_frontend::mv::domain::repository::MvRepository;
+use novarocks_frontend::mv::domain::repository::{MvRepository, ReplaceMvProjectionRequest};
 
 #[test]
-fn dependency_replace_delete_guard_and_ordering_are_provider_backed() {
+fn dependency_indexes_are_replaced_only_with_the_root_projection_cas() {
     let (_temp, _runtime, _host, repository) = mv_repository_definition::repository();
-    let definition = repository
-        .create(
+    let created = repository
+        .create_projection(
             uuid::Uuid::now_v7(),
-            mv_repository_definition::create_request("dependency"),
+            mv_repository_definition::projection_request(
+                "dependency",
+                b"dependency-object",
+                51,
+                "orders",
+            ),
         )
-        .expect("create definition");
-    let upstream = MvDependencyObjectRef {
-        catalog: Some("ice".to_string()),
-        database_or_namespace: "sales".to_string(),
-        name: "customers".to_string(),
-        object_type: MvDependencyObjectType::Table,
-        storage_engine: MvDependencyStorageEngine::Iceberg,
-    };
-    repository
-        .replace_dependencies_for_mv(
-            definition.mv_id,
-            vec![CreateMvDependencyRequest {
-                upstream: upstream.clone(),
-                created_at_ms: 2,
-            }],
-        )
-        .expect("replace dependencies");
+        .unwrap();
+    let upstream = created.definition.base_table_refs[0].clone();
     assert_eq!(
         repository
-            .list_downstream_dependencies(&upstream)
-            .expect("upstream index"),
-        repository
-            .list_dependencies_by_downstream(definition.mv_id)
-            .expect("downstream index")
+            .list_dependencies_by_downstream(created.definition.mv_id)
+            .unwrap()
+            .len(),
+        1
     );
-    assert!(
-        repository
-            .ensure_no_downstream_dependencies(&upstream)
-            .is_err()
+
+    let replacement = mv_repository_definition::projection_request(
+        "dependency",
+        b"dependency-object",
+        52,
+        "customers",
     );
+    let replaced = repository
+        .replace_projection(
+            uuid::Uuid::now_v7(),
+            ReplaceMvProjectionRequest {
+                mv_id: created.definition.mv_id,
+                expected_version: created.version,
+                projection: replacement,
+            },
+        )
+        .unwrap();
+    let dependencies = repository
+        .list_dependencies_by_downstream(replaced.definition.mv_id)
+        .unwrap();
+    assert_eq!(dependencies.len(), 1);
+    assert_eq!(dependencies[0].upstream.name, "customers");
+    assert_ne!(replaced.definition.base_table_refs[0], upstream);
     repository
-        .delete_dependencies_for_mv(definition.mv_id)
-        .expect("delete dependencies");
-    repository
-        .ensure_no_downstream_dependencies(&upstream)
-        .expect("guard clears after delete");
+        .ensure_no_downstream_dependencies(&dependencies[0].upstream)
+        .expect_err("upstream guard must observe the symmetric index");
 }

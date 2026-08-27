@@ -1778,9 +1778,10 @@ mod tests {
                 table: Arc::from("t"),
             },
             owner,
-            publication_id: novarocks_spi::connector::LakePublicationId::from_bytes(
+            publication_id: novarocks_spi::connector::LakePublicationId::try_from_bytes(
                 operation_id.to_bytes(),
-            ),
+            )
+            .expect("publication id from operation id"),
             operation_id,
             columns: Vec::new(),
             partitioning: Vec::new(),

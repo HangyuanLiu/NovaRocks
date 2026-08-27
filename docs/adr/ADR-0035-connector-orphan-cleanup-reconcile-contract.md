@@ -4,7 +4,7 @@ title: "Connector orphan cleanup uses immutable receipts and reconcile-only unkn
 domain: [provider-spi, table-maintenance]
 status: superseded
 supersedes: []
-superseded-by: ADR-0104
+superseded-by: ADR-0110
 date: 2026-08-03
 provenance:
   - "discussion: 2026-08-03 connector orphan cleanup recovery semantics"

@@ -10,6 +10,7 @@ doctest = false
 [dependencies]
 novarocks-execution = { path = "../execution" }
 novarocks-failpoint = { path = "../failpoint" }
+novarocks-native-trust = { path = "../native-trust" }
 novarocks-proto = { path = "../proto" }
 novarocks-proto-models = { path = "../proto-models" }
 novarocks-spi = { path = "../spi" }
@@ -20,6 +21,8 @@ async-trait = "0.1"
 axum = "0.7"
 once_cell = "1.19"
 hex = "0.4"
+hyper = { version = "1", features = ["http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 novarocks-types = { path = "../types" }
 novarocks-version = { path = "../version" }
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }
@@ -30,8 +33,12 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.12", features = ["transport"] }
+tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 
 [build-dependencies]
 protoc-bin-vendored = "3"
 tonic-build = "0.12"
+
+[dev-dependencies]
+novarocks-secret = { path = "../secret" }

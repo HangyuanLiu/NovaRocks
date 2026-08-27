@@ -4,7 +4,7 @@ title: "Frontend-owned MV refresh lifecycle"
 domain: [frontend-mv, provider-spi]
 status: superseded
 supersedes: []
-superseded-by: ADR-0104
+superseded-by: ADR-0110
 date: 2026-08-01
 provenance:
   - "discussion: MVX-2 frontend refresh lifecycle"

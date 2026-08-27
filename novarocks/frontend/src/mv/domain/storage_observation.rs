@@ -30,6 +30,7 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
     ConnectorTableObjectId, ConnectorTableRequest, ConnectorTableResolution,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MvCreatedTargetObservation as SpiCreatedTargetObservation,
+    MvLakeCatalogIncompleteReason, MvLakePackageFailure,
     MvLakePackageObservation as SpiLakePackageObservation,
     MvLakePublicationObservation as SpiLakePublicationObservation,
     MvMaintenanceMetadataObservation as SpiMaintenanceMetadataObservation,
@@ -400,6 +401,7 @@ pub(crate) enum MvSchemaValidationPartitionTransform {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvLakePackageObservation {
     pub table: ConnectorTableIdentity,
+    pub target_object_id: ConnectorTableObjectId,
     pub descriptor: MvDescriptorV3,
     pub current_target_snapshot: Option<MvLakeTargetSnapshot>,
     pub publication: MvLakePublication,
@@ -418,6 +420,7 @@ pub(crate) struct MvLakeTargetSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvLakeSourceRevision {
     pub table: ConnectorTableIdentity,
+    pub target_object_id: ConnectorTableObjectId,
     pub descriptor_content_hash: String,
     pub current_target_snapshot_id: Option<i64>,
 }
@@ -439,6 +442,7 @@ pub enum MvLakePublishedProjection {
 impl MvLakePackageObservation {
     pub fn try_new(
         table: ConnectorTableIdentity,
+        target_object_id: ConnectorTableObjectId,
         descriptor: MvDescriptorV3,
         current_target_snapshot: Option<MvLakeTargetSnapshot>,
         publication: MvLakePublication,
@@ -467,6 +471,7 @@ impl MvLakePackageObservation {
         }
         Ok(Self {
             table,
+            target_object_id,
             descriptor,
             current_target_snapshot,
             publication,
@@ -476,6 +481,7 @@ impl MvLakePackageObservation {
     pub fn source_revision(&self) -> Result<MvLakeSourceRevision, ConnectorError> {
         Ok(MvLakeSourceRevision {
             table: self.table.clone(),
+            target_object_id: self.target_object_id.clone(),
             descriptor_content_hash: self.descriptor.content_hash().map_err(|error| {
                 ConnectorError::new(
                     ConnectorErrorKind::CorruptData,
@@ -534,9 +540,7 @@ pub(crate) enum MvLakePublication {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvPublishedLakeFacts {
     pub target_snapshot_id: i64,
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    pub token: String,
+    pub publication_id: novarocks_spi::connector::LakePublicationId,
     pub technique: MvPublishedRefreshTechnique,
     pub bases: Vec<MvPublishedBaseFact>,
     pub definition_fingerprint: String,
@@ -552,9 +556,7 @@ impl MvPublishedLakeFacts {
     )]
     pub fn try_new(
         target_snapshot_id: i64,
-        refresh_id: i64,
-        mv_id: i64,
-        token: String,
+        publication_id: novarocks_spi::connector::LakePublicationId,
         technique: MvPublishedRefreshTechnique,
         bases: Vec<MvPublishedBaseFact>,
         definition_fingerprint: String,
@@ -564,9 +566,7 @@ impl MvPublishedLakeFacts {
     ) -> Result<Self, ConnectorError> {
         let facts = Self {
             target_snapshot_id,
-            refresh_id,
-            mv_id,
-            token,
+            publication_id,
             technique,
             bases,
             definition_fingerprint,
@@ -582,13 +582,6 @@ impl MvPublishedLakeFacts {
         if self.target_snapshot_id < 0 {
             return corrupt("published MV lake facts have a negative target snapshot ID");
         }
-        if self.refresh_id < 0 {
-            return corrupt("published MV lake facts have a negative refresh ID");
-        }
-        if self.mv_id < 0 {
-            return corrupt("published MV lake facts have a negative MV ID");
-        }
-        require_non_empty(&self.token, "published MV refresh token")?;
         require_non_empty(
             &self.definition_fingerprint,
             "published MV definition fingerprint",
@@ -723,9 +716,7 @@ pub(crate) struct MvRefreshTargetObservation {
 /// compares it against the identity in its own refresh ledger.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvObservedRefreshMarker {
-    pub refresh_id: i64,
-    pub mv_id: i64,
-    pub token: String,
+    pub publication_id: novarocks_spi::connector::LakePublicationId,
 }
 
 impl MvRefreshTargetObservation {
@@ -782,7 +773,6 @@ impl MvRefreshTargetObservation {
             if *snapshot_id < 0 {
                 return corrupt("MV refresh target marker has a negative snapshot ID");
             }
-            require_non_empty(&marker.token, "MV refresh target marker token")?;
         }
 
         Ok(Self {
@@ -1113,7 +1103,7 @@ fn schema_validation_from_spi(
     )
 }
 
-fn lake_package_from_spi(
+pub(crate) fn lake_package_from_spi(
     observation: SpiLakePackageObservation,
 ) -> Result<MvLakePackageObservation, ConnectorError> {
     let descriptor_projection = observation.descriptor();
@@ -1164,9 +1154,7 @@ fn lake_package_from_spi(
             };
             MvLakePublication::Published(MvPublishedLakeFacts::try_new(
                 facts.target_snapshot_id,
-                facts.refresh_id,
-                facts.mv_id,
-                facts.token.clone(),
+                facts.publication_id,
                 technique,
                 facts
                     .bases
@@ -1187,6 +1175,7 @@ fn lake_package_from_spi(
     };
     MvLakePackageObservation::try_new(
         observation.table().clone(),
+        observation.target_object_id().clone(),
         descriptor,
         current_target_snapshot,
         publication,
@@ -1226,9 +1215,7 @@ fn refresh_target_from_spi(
                 (
                     *snapshot_id,
                     MvObservedRefreshMarker {
-                        refresh_id: marker.refresh_id,
-                        mv_id: marker.mv_id,
-                        token: marker.token.clone(),
+                        publication_id: marker.publication_id,
                     },
                 )
             })
@@ -1379,26 +1366,40 @@ pub(crate) fn discover_mv_lake_packages(
     instance_ids: impl IntoIterator<Item = ConnectorInstanceId>,
     observer: &dyn MvStorageObservationPort,
     context: ConnectorRequestContext,
-) -> Result<Vec<MvLakePackageObservation>, ConnectorError> {
+) -> Result<MvLakeCatalogDiscovery, ConnectorError> {
     validate_request_context(&context)?;
     let mut instance_ids = instance_ids.into_iter().collect::<Vec<_>>();
     instance_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     instance_ids.dedup();
     let mut budget = 0_usize;
-    let mut packages = Vec::new();
+    let mut outcomes = Vec::new();
 
     for instance_id in instance_ids {
         validate_request_context(&context)?;
         reserve_payload(&context, &mut budget, instance_id.as_str())?;
-        let exact_lease = controls.acquire_current(&instance_id)?;
+        let exact_lease = match controls.acquire_current(&instance_id) {
+            Ok(lease) => lease,
+            Err(error) => {
+                return Ok(MvLakeCatalogDiscovery::Incomplete(
+                    MvLakeCatalogIncompleteReason::EnumerationFailed(error),
+                ));
+            }
+        };
         if exact_lease.binding().descriptor().instance_id != instance_id {
             return corrupt("connector lease does not match MV discovery attachment identity");
         }
         let metadata = exact_lease.binding().metadata();
-        let mut namespaces = metadata.list_namespaces(ConnectorListNamespacesRequest {
+        let mut namespaces = match metadata.list_namespaces(ConnectorListNamespacesRequest {
             instance_id: instance_id.clone(),
             context: context.clone(),
-        })?;
+        }) {
+            Ok(namespaces) => namespaces,
+            Err(error) => {
+                return Ok(MvLakeCatalogDiscovery::Incomplete(
+                    MvLakeCatalogIncompleteReason::EnumerationFailed(error),
+                ));
+            }
+        };
         namespaces.sort_by(|left, right| left.namespace.cmp(&right.namespace));
         namespaces.dedup_by(|left, right| left.namespace == right.namespace);
 
@@ -1406,20 +1407,26 @@ pub(crate) fn discover_mv_lake_packages(
             if namespace.instance_id != instance_id || namespace.namespace.trim().is_empty() {
                 return corrupt("connector returned an invalid namespace during MV discovery");
             }
-            if let Err(error) = normalize_identifier(namespace.namespace.as_ref()) {
-                tracing::warn!(
-                    instance = %instance_id.as_str(),
-                    namespace = %namespace.namespace,
-                    error,
-                    "skip connector namespace outside the Native identifier contract during MV lake discovery"
-                );
-                continue;
-            }
+            normalize_identifier(namespace.namespace.as_ref()).map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    format!(
+                        "connector namespace outside the Native identifier contract during MV lake discovery: {error}"
+                    ),
+                )
+            })?;
             reserve_payload(&context, &mut budget, namespace.namespace.as_ref())?;
-            let mut tables = metadata.list_tables(ConnectorListTablesRequest {
+            let mut tables = match metadata.list_tables(ConnectorListTablesRequest {
                 namespace: namespace.clone(),
                 context: context.clone(),
-            })?;
+            }) {
+                Ok(tables) => tables,
+                Err(error) => {
+                    return Ok(MvLakeCatalogDiscovery::Incomplete(
+                        MvLakeCatalogIncompleteReason::EnumerationFailed(error),
+                    ));
+                }
+            };
             tables.sort_by(|left, right| left.table.cmp(&right.table));
             tables.dedup_by(|left, right| left.table == right.table);
 
@@ -1439,13 +1446,9 @@ pub(crate) fn discover_mv_lake_packages(
                 }) {
                     Ok(loaded) => loaded,
                     Err(error) => {
-                        tracing::warn!(
-                            instance = %instance_id.as_str(),
-                            namespace = %table.namespace,
-                            table = %table.table,
-                            error = %error,
-                            "skip unreadable connector table during MV lake discovery"
-                        );
+                        outcomes.push(MvLakePackageOutcome::Failed(MvLakePackageFailure::try_new(
+                            table, None, error,
+                        )?));
                         continue;
                     }
                 };
@@ -1454,9 +1457,17 @@ pub(crate) fn discover_mv_lake_packages(
                         "connector loaded metadata for a different table during MV discovery",
                     );
                 }
-                if let Some(package) =
-                    observe_lake_package(observer, &exact_lease, &loaded, context.clone())?
-                {
+                let package =
+                    match observe_lake_package(observer, &exact_lease, &loaded, context.clone()) {
+                        Ok(package) => package,
+                        Err(error) => {
+                            outcomes.push(MvLakePackageOutcome::Failed(
+                                MvLakePackageFailure::try_new(table, None, error)?,
+                            ));
+                            continue;
+                        }
+                    };
+                if let Some(package) = package {
                     if package.table != table {
                         return corrupt(format!(
                             "MV lake observer returned package metadata for `{}`.`{}`.`{}` while discovering `{}`.`{}`.`{}`",
@@ -1478,20 +1489,43 @@ pub(crate) fn discover_mv_lake_packages(
                             package.descriptor.package_id,
                         ));
                     }
-                    packages.push(package);
+                    outcomes.push(MvLakePackageOutcome::Observed(package));
                 }
             }
         }
     }
-    packages.sort_by(|left, right| {
-        left.table
-            .instance_id
+    outcomes.sort_by(|left, right| {
+        let left = match left {
+            MvLakePackageOutcome::Observed(package) => &package.table,
+            MvLakePackageOutcome::Failed(failure) => failure.table(),
+        };
+        let right = match right {
+            MvLakePackageOutcome::Observed(package) => &package.table,
+            MvLakePackageOutcome::Failed(failure) => failure.table(),
+        };
+        left.instance_id
             .as_str()
-            .cmp(right.table.instance_id.as_str())
-            .then(left.table.namespace.cmp(&right.table.namespace))
-            .then(left.table.table.cmp(&right.table.table))
+            .cmp(right.instance_id.as_str())
+            .then(left.namespace.cmp(&right.namespace))
+            .then(left.table.cmp(&right.table))
     });
-    Ok(packages)
+    Ok(MvLakeCatalogDiscovery::Complete(outcomes))
+}
+
+/// Frontend discovery retains its validated descriptor projection while using
+/// the SPI's explicit incomplete and package-failure vocabulary. The SPI
+/// package carrier is not leaked here because this module owns conversion into
+/// Frontend's lake descriptor contract.
+#[derive(Clone, Debug)]
+pub(crate) enum MvLakeCatalogDiscovery {
+    Complete(Vec<MvLakePackageOutcome>),
+    Incomplete(MvLakeCatalogIncompleteReason),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum MvLakePackageOutcome {
+    Observed(MvLakePackageObservation),
+    Failed(MvLakePackageFailure),
 }
 
 fn validate_request_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
@@ -1748,7 +1782,7 @@ mod tests {
         MvSchemaValidationObservation, MvTargetCreationObservation,
     };
     use crate::mv::domain::persistence::{
-        definition::StoredMvRefreshPolicy,
+        definition::MvDesiredRefreshPolicy,
         descriptor::{DescriptorDependency, MvDescriptorV3},
         schema::{
             BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
@@ -1841,7 +1875,7 @@ mod tests {
                     },
                 },
                 MvRefreshDesiredConfiguration::new(
-                    StoredMvRefreshPolicy::Manual,
+                    MvDesiredRefreshPolicy::Manual,
                     false,
                     None,
                     None,
@@ -1883,9 +1917,7 @@ mod tests {
     fn published_facts() -> MvPublishedLakeFacts {
         MvPublishedLakeFacts::try_new(
             10,
-            11,
-            12,
-            "refresh-token".to_string(),
+            novarocks_spi::connector::LakePublicationId::new_v7(),
             MvPublishedRefreshTechnique::Incremental,
             vec![MvPublishedBaseFact {
                 table_fqn: "iceberg.db.base".to_string(),
@@ -2009,9 +2041,7 @@ mod tests {
     fn published_facts_reject_duplicate_bases_negative_rows_and_missing_hashes() {
         let duplicate_base = MvPublishedLakeFacts::try_new(
             10,
-            11,
-            12,
-            "refresh-token".to_string(),
+            novarocks_spi::connector::LakePublicationId::new_v7(),
             MvPublishedRefreshTechnique::Full,
             vec![
                 MvPublishedBaseFact {
@@ -2040,9 +2070,7 @@ mod tests {
 
         let negative_rows = MvPublishedLakeFacts::try_new(
             10,
-            11,
-            12,
-            "refresh-token".to_string(),
+            novarocks_spi::connector::LakePublicationId::new_v7(),
             MvPublishedRefreshTechnique::MetadataOnly,
             vec![],
             "definition-fingerprint".to_string(),
@@ -2058,9 +2086,7 @@ mod tests {
 
         let missing_hash = MvPublishedLakeFacts::try_new(
             10,
-            11,
-            12,
-            "refresh-token".to_string(),
+            novarocks_spi::connector::LakePublicationId::new_v7(),
             MvPublishedRefreshTechnique::MetadataOnly,
             vec![],
             "definition-fingerprint".to_string(),
@@ -2079,6 +2105,7 @@ mod tests {
     fn lake_package_accepts_never_published_and_validates_the_descriptor() {
         let observed = MvLakePackageObservation::try_new(
             table(),
+            object_id(b"mv-target-object"),
             descriptor(),
             None,
             MvLakePublication::NeverPublished,
@@ -2088,6 +2115,7 @@ mod tests {
 
         let observed = MvLakePackageObservation::try_new(
             table(),
+            object_id(b"mv-target-object"),
             descriptor(),
             Some(MvLakeTargetSnapshot {
                 snapshot_id: 10,
@@ -2120,6 +2148,7 @@ mod tests {
 
         let missing_current = MvLakePackageObservation::try_new(
             table(),
+            object_id(b"mv-target-object"),
             descriptor(),
             None,
             MvLakePublication::Published(published_facts()),
@@ -2133,6 +2162,7 @@ mod tests {
 
         let mismatched_current = MvLakePackageObservation::try_new(
             table(),
+            object_id(b"mv-target-object"),
             descriptor(),
             Some(MvLakeTargetSnapshot {
                 snapshot_id: 9,
@@ -2151,6 +2181,7 @@ mod tests {
         invalid.package_id.clear();
         let err = MvLakePackageObservation::try_new(
             table(),
+            object_id(b"mv-target-object"),
             invalid,
             None,
             MvLakePublication::NeverPublished,
@@ -2188,6 +2219,7 @@ mod tests {
         .unwrap();
         let observed = SpiLakePackageObservation::try_new(
             table(),
+            object_id(b"target-object"),
             projection,
             Some(
                 SpiLakeTargetSnapshotObservation::try_new(10, 1_700_000_010_000)

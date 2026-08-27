@@ -214,4 +214,30 @@ if [ "$(ci_native_cross_process_suite_cluster_size join)" != "3" ]; then
   exit 1
 fi
 
+launcher_capture="$tmpdir/sql-runner-launcher.args"
+(
+  REPO_ROOT="$tmpdir/current-worktree"
+  CI_RUN_DIR="$tmpdir/sql-runner-launcher"
+  NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml"
+  RUN_MODE="explicit"
+  mkdir -p "$CI_RUN_DIR/sql"
+
+  resolve_suites() {
+    SUITES=(filter)
+  }
+  ci_run_logged() {
+    printf '%s\n' "$@" >"$launcher_capture"
+    return 0
+  }
+  ci_record_sql_suite() { :; }
+  ci_render_summary() { :; }
+
+  run_sql_suites
+)
+
+if ! grep -Fx "NOVAROCKS_WORKSPACE_ROOT=$tmpdir/current-worktree" "$launcher_capture" >/dev/null; then
+  echo "SQL runner must receive the current CI worktree root" >&2
+  exit 1
+fi
+
 echo "local-full-ci-classification-test: PASS"

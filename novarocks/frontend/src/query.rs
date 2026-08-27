@@ -23,8 +23,11 @@ use std::time::{Duration, Instant};
 
 use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
+#[cfg(test)]
+use crate::common::admitted_query_context::RequestAdmission;
 use crate::common::admitted_query_context::{
-    LakePublicationRuntimePolicy, RequestAdmission, RequestContext, SessionOptimizerSettings,
+    LakePublicationRuntimePolicy, RequestContext, SessionOptimizerSettings,
+    StatementAdmissionContext,
 };
 use crate::common::backend_topology::BackendTopologyService;
 use crate::common::engine_error::EngineError;
@@ -135,7 +138,7 @@ impl CoreCommandRoute for TypedCommandRoute {
         query_options: QueryOptions,
     ) -> Result<StatementResult, String> {
         match statement {
-            ParsedStatement::Backend(statement) => {
+            ParsedStatement::ShowBackends(statement) => {
                 self.backend.execute(statement, context.execution().role())
             }
             ParsedStatement::Statistics(statement) => self.statistics.execute(
@@ -464,9 +467,7 @@ fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
                 | ast::StatisticsStatement::DropHistogram(_)
                 | ast::StatisticsStatement::DropMultipleColumnsStats(_)
         ),
-        ParsedStatement::Backend(statement) => {
-            !matches!(statement, ast::BackendStatement::ShowBackends(_))
-        }
+        ParsedStatement::ShowBackends(_) => false,
         ParsedStatement::Session(_)
         | ParsedStatement::Query(_)
         | ParsedStatement::ExplainQuery(_) => false,
@@ -997,6 +998,38 @@ impl FrontendQuerySession {
                 ));
             }
         };
+        let topology = if topology.targets().is_empty()
+            && matches!(
+                parsed_statement,
+                ParsedStatement::Query(_)
+                    | ParsedStatement::ExplainQuery(_)
+                    | ParsedStatement::Dml(_)
+            ) {
+            let wait_deadline =
+                deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
+            let wait_after_revision = topology.revision();
+            let topology_service = Arc::clone(&self.service.topology);
+            match task::spawn_blocking(move || {
+                topology_service.wait_for_eligible_after(wait_after_revision, wait_deadline)
+            })
+            .await
+            {
+                Ok(Ok(snapshot)) => snapshot,
+                Ok(Err(error)) => {
+                    let _ = active.finish();
+                    return Err(QueryServiceError::new(
+                        QueryServiceErrorKind::Internal,
+                        error.to_string(),
+                    ));
+                }
+                Err(error) => {
+                    let _ = active.finish();
+                    return Err(internal_error(error.to_string()));
+                }
+            }
+        } else {
+            topology
+        };
         let mut optimizer_settings = state.optimizer_settings;
         // A session `SET` wins; otherwise admission freezes the process budget so
         // SQL costing never consults a process-global configuration.
@@ -1004,15 +1037,15 @@ impl FrontendQuerySession {
             optimizer_settings.optimizer_query_mem_limit_bytes =
                 Some(self.service.optimizer_query_mem_limit_bytes as f64);
         }
-        let context = RequestContext::admit(RequestAdmission::new(
+        let statement_context = StatementAdmissionContext::new(
             state.current_catalog,
             state.current_database,
             self.service.role,
-            topology,
             deadline,
             cancellation.clone(),
             optimizer_settings,
-        ));
+        );
+        let context = statement_context.for_topology(topology);
         let compiler = self.service.query_compiler.clone();
         let command_executor = Arc::clone(&self.service.command_executor);
         let query_execution = self.service.query_execution.clone();
@@ -1127,8 +1160,7 @@ impl FrontendQuerySession {
             match tokio::time::timeout(timeout_duration, &mut worker).await {
                 Ok(result) => result.map_err(|error| internal_error(error.to_string()))?,
                 Err(_) => {
-                    let timeout_ms =
-                        u64::try_from(timeout_duration.as_millis()).unwrap_or(u64::MAX);
+                    let timeout_ms = timeout_message_millis(timeout_duration);
                     self.cancel_current(QueryCancellationReason::DeadlineExceeded { timeout_ms });
                     // A timeout is not complete until the worker releases the
                     // statement lease. Waiting here also fences Backend abort
@@ -1342,13 +1374,9 @@ fn execute_prepared_query(
 ) -> Result<StatementResult, String> {
     match operation {
         PreparedQueryOperation::Immediate(operation) => Ok(operation.into_result()),
-        PreparedQueryOperation::Distributed(operation) => {
-            let (request, completion) = operation.into_parts();
-            let outcome = query_execution
-                .execute(request)
-                .map_err(|error| error.to_string())?;
-            completion.complete(outcome)
-        }
+        PreparedQueryOperation::Distributed(operation) => query_execution
+            .execute_prepared(operation)
+            .map_err(|error| error.to_string()),
     }
 }
 
@@ -1907,6 +1935,14 @@ fn poisoned_state<T>(_error: std::sync::PoisonError<T>) -> QueryServiceError {
 
 fn internal_error(message: impl Into<String>) -> QueryServiceError {
     QueryServiceError::new(QueryServiceErrorKind::Internal, message)
+}
+
+/// Keep a user-visible timeout at its admitted millisecond precision. The
+/// remaining duration is sampled after deadline admission, so truncating it
+/// can turn a one-second timeout into a misleading `999 ms` message.
+fn timeout_message_millis(timeout: Duration) -> u64 {
+    let millis = timeout.as_nanos().saturating_add(999_999) / 1_000_000;
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 fn cancellation_error(reason: QueryCancellationReason) -> QueryServiceError {
@@ -2665,6 +2701,15 @@ mod tests {
             .kind(),
             QueryServiceErrorKind::Interrupted
         );
+    }
+
+    #[test]
+    fn timeout_message_rounds_a_sampled_deadline_up_to_milliseconds() {
+        assert_eq!(
+            timeout_message_millis(Duration::from_nanos(999_999_999)),
+            1_000
+        );
+        assert_eq!(timeout_message_millis(Duration::from_millis(1_000)), 1_000);
     }
 
     #[test]

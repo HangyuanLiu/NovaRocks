@@ -77,12 +77,13 @@ pub(crate) struct AtomicPartitionReplacement {
 
 impl AtomicPartitionReplacement {
     pub(super) fn try_new(updates: Vec<TableUpdate>) -> Result<Self, String> {
-        if updates.len() != 2
+        if updates.len() != 3
             || !matches!(updates[0], TableUpdate::AddSpec { .. })
             || !matches!(updates[1], TableUpdate::SetDefaultSpec { .. })
+            || !matches!(updates[2], TableUpdate::SetProperties { .. })
         {
             return Err(
-                "atomic Iceberg partition replacement requires AddSpec then SetDefaultSpec"
+                "atomic Iceberg partition replacement requires AddSpec, SetDefaultSpec, then SetProperties"
                     .to_string(),
             );
         }

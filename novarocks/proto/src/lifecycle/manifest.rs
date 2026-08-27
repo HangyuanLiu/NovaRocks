@@ -10,8 +10,10 @@ use std::time::Duration;
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
 use super::query_options::QueryOptions;
 use crate::canonical;
+use crate::membership::BackendProcessId;
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, novarocks};
+use novarocks_types::BackendProcessId as DomainBackendProcessId;
 
 const PARTICIPANT_MANIFEST_V1_DOMAIN: &[u8] =
     b"novarocks.query-lifecycle.participant-manifest.v1\0";
@@ -84,14 +86,12 @@ impl ParticipantBackendIdentity {
     /// Constructs a validated generated backend identity without a Core
     /// mirror value.
     pub fn new(
-        backend_id: u64,
+        process_id: DomainBackendProcessId,
         endpoint: QueryControlEndpoint,
-        start_epoch: u64,
     ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::ParticipantBackendIdentity {
-            backend_id,
             endpoint: Some(endpoint.as_proto().clone()),
-            start_epoch,
+            process_id: Some(BackendProcessId::from_domain(process_id).as_proto().clone()),
         })
     }
 
@@ -108,12 +108,18 @@ impl ParticipantBackendIdentity {
                 error,
             )
         })?;
-        if raw.start_epoch == 0 {
-            return Err(invalid(
-                FieldPath::root("participant_backend_identity").field("start_epoch"),
-                "backend start epoch must be nonzero",
-            ));
-        }
+        let process_id = raw.process_id.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("participant_backend_identity").field("process_id"),
+                "backend process id is required",
+            )
+        })?;
+        BackendProcessId::parse(process_id).map_err(|error| {
+            prefix_path(
+                FieldPath::root("participant_backend_identity").field("process_id"),
+                error,
+            )
+        })?;
         Ok(Self { raw })
     }
 
@@ -121,8 +127,14 @@ impl ParticipantBackendIdentity {
         &self.raw
     }
 
-    pub const fn backend_id(&self) -> u64 {
-        self.raw.backend_id
+    pub fn process_id(&self) -> Result<DomainBackendProcessId, ProtocolError> {
+        let raw = self.raw.process_id.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("participant_backend_identity").field("process_id"),
+                "backend process id is required",
+            )
+        })?;
+        BackendProcessId::parse(raw)?.domain()
     }
 
     pub fn endpoint(&self) -> Result<QueryControlEndpoint, ProtocolError> {
@@ -130,10 +142,6 @@ impl ParticipantBackendIdentity {
             &self.raw.endpoint,
             "participant backend endpoint is required",
         )
-    }
-
-    pub const fn start_epoch(&self) -> u64 {
-        self.raw.start_epoch
     }
 }
 
@@ -241,12 +249,6 @@ impl RuntimeFilterContribution {
                 "runtime filter participant id must be nonzero",
             ));
         }
-        if raw.contribution_digest.len() != 32 {
-            return Err(invalid(
-                FieldPath::root("runtime_filter_contribution").field("contribution_digest"),
-                "runtime filter contribution digest must be 32 bytes",
-            ));
-        }
         Ok(Self { raw })
     }
 
@@ -256,10 +258,6 @@ impl RuntimeFilterContribution {
 
     pub const fn participant_id(&self) -> u32 {
         self.raw.participant_id
-    }
-
-    pub fn digest(&self) -> &[u8] {
-        &self.raw.contribution_digest
     }
 }
 
@@ -689,9 +687,13 @@ mod tests {
 
     fn backend() -> novarocks::ParticipantBackendIdentity {
         novarocks::ParticipantBackendIdentity {
-            backend_id: 3,
             endpoint: Some(endpoint(9030)),
-            start_epoch: 11,
+            process_id: Some(novarocks::BackendProcessId {
+                value: vec![
+                    0x01, 0x9c, 0x98, 0xa9, 0x33, 0x90, 0x75, 0x76, 0x97, 0x7b, 0x33, 0xd1, 0x88,
+                    0xad, 0x1f, 0x06,
+                ],
+            }),
         }
     }
 
@@ -715,7 +717,6 @@ mod tests {
     fn contribution() -> novarocks::RuntimeFilterContribution {
         novarocks::RuntimeFilterContribution {
             participant_id: 7,
-            contribution_digest: vec![3; 32],
             ..Default::default()
         }
     }
@@ -750,7 +751,7 @@ mod tests {
             parsed.execution_id().expect("execution id").query_id(),
             QueryId::new(5, 6)
         );
-        assert_eq!(parsed.backend().expect("backend").backend_id(), 3);
+        assert!(parsed.backend().expect("backend").process_id().is_ok());
         assert_eq!(
             parsed.roles().expect("roles"),
             vec![ParticipantRole::FragmentExecutor]
@@ -815,13 +816,13 @@ mod tests {
         );
 
         let filter_error = RuntimeFilterContribution::parse(novarocks::RuntimeFilterContribution {
-            contribution_digest: vec![0; 31],
+            participant_id: 0,
             ..contribution()
         })
-        .expect_err("short runtime-filter digest");
+        .expect_err("unaddressed runtime-filter contribution");
         assert_eq!(
             filter_error.detail(),
-            "runtime filter contribution digest must be 32 bytes"
+            "runtime filter participant id must be nonzero"
         );
     }
 
@@ -929,17 +930,42 @@ mod tests {
             .as_mut()
             .expect("lifecycle")
             .delivery_expire_ms = 2;
-        let changed_again = ParticipantManifest::parse(changed_again_raw).expect("valid manifest");
+        let changed_again =
+            ParticipantManifest::parse(changed_again_raw.clone()).expect("valid manifest");
+        let mut changed_install_raw = changed_again_raw;
+        changed_install_raw
+            .runtime_filter
+            .as_mut()
+            .expect("filter")
+            .install = Some(
+            novarocks_proto_models::filter::RuntimeFilterParticipantInstall {
+                core_channels: vec![
+                    novarocks_proto_models::filter::RuntimeFilterChannelDeployment {
+                        channel_id: 9,
+                        ..Default::default()
+                    },
+                ],
+                routing_channels: Vec::new(),
+            },
+        );
+        let changed_install =
+            ParticipantManifest::parse(changed_install_raw).expect("valid manifest");
 
         assert_ne!(
             first.digest().expect("digest"),
             changed.digest().expect("digest")
         );
-        // The old projection digested only contribution_digest, not this
-        // generated lifecycle field. Descriptor traversal covers it directly.
+        // A hand-written projection had to enumerate every nested generated
+        // field such as these. Descriptor traversal covers the contribution's
+        // lifecycle and install subtrees directly, so the contribution needs no
+        // self-attestation of its own.
         assert_ne!(
             changed.digest().expect("digest"),
             changed_again.digest().expect("digest")
+        );
+        assert_ne!(
+            changed_again.digest().expect("digest"),
+            changed_install.digest().expect("digest")
         );
     }
 

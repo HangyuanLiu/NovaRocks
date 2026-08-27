@@ -26,19 +26,64 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 
+use novarocks_native_trust::{
+    AutomaticTlsMaterial, NativeEndpointConnector, NativeIncomingAdapter, NativeTlsMaterial,
+    NativeTrust,
+};
+use novarocks_types::NativeEndpoint;
 use tokio::runtime::Handle;
 use tonic::transport::Channel;
+
+/// Server-resolved transport material for the Backend-owned Native listener
+/// and outbound connections. The backend receives this capability only; it
+/// never reads configuration files, credentials, or PEM paths.
+#[derive(Clone, Debug)]
+pub enum BackendNativeTransport {
+    Plaintext,
+    Automatic(AutomaticTlsMaterial),
+    Pem(NativeTlsMaterial),
+}
+
+impl BackendNativeTransport {
+    pub(crate) fn connector_for(
+        &self,
+        endpoint: NativeEndpoint,
+    ) -> Result<NativeEndpointConnector, String> {
+        match self {
+            Self::Plaintext => Ok(NativeEndpointConnector::plaintext(endpoint)),
+            Self::Automatic(material) => NativeEndpointConnector::automatic(endpoint, material)
+                .map_err(|error| format!("construct automatic native connector: {error}")),
+            Self::Pem(material) => Ok(NativeEndpointConnector::pem(endpoint, material)),
+        }
+    }
+
+    pub(crate) fn incoming_adapter(&self) -> NativeIncomingAdapter {
+        match self {
+            Self::Plaintext => NativeIncomingAdapter::plaintext(),
+            Self::Automatic(material) => NativeIncomingAdapter::automatic(material),
+            Self::Pem(material) => NativeIncomingAdapter::pem(material),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct BackendDataRuntime {
     handle: Handle,
-    channels: Arc<Mutex<HashMap<String, Channel>>>,
+    native_trust: Arc<NativeTrust>,
+    native_transport: BackendNativeTransport,
+    channels: Arc<Mutex<HashMap<NativeEndpoint, Channel>>>,
 }
 
 impl BackendDataRuntime {
-    pub fn new(handle: Handle) -> Self {
+    pub fn new(
+        handle: Handle,
+        native_trust: Arc<NativeTrust>,
+        native_transport: BackendNativeTransport,
+    ) -> Self {
         Self {
             handle,
+            native_trust,
+            native_transport,
             channels: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -59,7 +104,15 @@ impl BackendDataRuntime {
         &self.handle
     }
 
-    pub(crate) fn channels(&self) -> &Arc<Mutex<HashMap<String, Channel>>> {
+    pub(crate) fn native_trust(&self) -> &Arc<NativeTrust> {
+        &self.native_trust
+    }
+
+    pub(crate) fn native_transport(&self) -> &BackendNativeTransport {
+        &self.native_transport
+    }
+
+    pub(crate) fn channels(&self) -> &Arc<Mutex<HashMap<NativeEndpoint, Channel>>> {
         &self.channels
     }
 }
@@ -73,15 +126,35 @@ pub(crate) fn test_backend_data_runtime() -> BackendDataRuntime {
                 .worker_threads(1)
                 .build()
                 .expect("build Backend test data runtime");
-            let adapter = BackendDataRuntime::new(runtime.handle().clone());
+            let adapter = BackendDataRuntime::new(
+                runtime.handle().clone(),
+                test_backend_native_trust(),
+                BackendNativeTransport::Plaintext,
+            );
             (runtime, adapter)
         });
     TEST_RUNTIME.1.clone()
 }
 
 #[cfg(test)]
+pub(crate) fn test_backend_native_trust() -> Arc<NativeTrust> {
+    use novarocks_native_trust::{
+        DeploymentId, NativeCallerSubject, NativeTransportMode, ValidatedSharedSecret,
+    };
+    use novarocks_secret::SecretValue;
+
+    Arc::new(NativeTrust::new(
+        DeploymentId::parse("backend-test").expect("valid deployment"),
+        ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))
+            .expect("valid secret"),
+        NativeCallerSubject::parse("be@127.0.0.1:9070").expect("valid subject"),
+        NativeTransportMode::Disabled,
+    ))
+}
+
+#[cfg(test)]
 mod tests {
-    use super::BackendDataRuntime;
+    use super::{BackendDataRuntime, BackendNativeTransport, test_backend_native_trust};
 
     #[test]
     fn cloned_adapter_shares_one_role_cache_and_distinct_adapters_do_not() {
@@ -90,9 +163,17 @@ mod tests {
             .worker_threads(1)
             .build()
             .expect("build adapter test runtime");
-        let first = BackendDataRuntime::new(runtime.handle().clone());
+        let first = BackendDataRuntime::new(
+            runtime.handle().clone(),
+            test_backend_native_trust(),
+            BackendNativeTransport::Plaintext,
+        );
         let clone = first.clone();
-        let second = BackendDataRuntime::new(runtime.handle().clone());
+        let second = BackendDataRuntime::new(
+            runtime.handle().clone(),
+            test_backend_native_trust(),
+            BackendNativeTransport::Plaintext,
+        );
 
         assert!(std::sync::Arc::ptr_eq(first.channels(), clone.channels()));
         assert!(!std::sync::Arc::ptr_eq(first.channels(), second.channels()));
@@ -105,7 +186,11 @@ mod tests {
             .worker_threads(1)
             .build()
             .expect("build adapter test runtime");
-        let adapter = BackendDataRuntime::new(runtime.handle().clone());
+        let adapter = BackendDataRuntime::new(
+            runtime.handle().clone(),
+            test_backend_native_trust(),
+            BackendNativeTransport::Plaintext,
+        );
 
         assert_eq!(adapter.block_on(async { 7_u8 }), 7);
         let active_adapter = adapter.clone();

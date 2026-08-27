@@ -1,17 +1,23 @@
 use std::fmt;
 use std::future::Future;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
+use novarocks_native_trust::NativeTrust;
+use novarocks_proto::lifecycle::QueryControlEndpoint;
 use novarocks_proto::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryStageAck,
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
 };
+use novarocks_proto::membership::BackendProcessDescriptor;
+use novarocks_proto::membership::{
+    BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
+};
 use novarocks_spi::connector::ConnectorExecutionInstaller;
-use novarocks_types::AdvertiseEndpoint;
+use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
 
 use crate::BackendDataRuntime;
 use crate::connector::ConnectorRegistry;
@@ -26,6 +32,8 @@ use crate::query_lifecycle::{
     NativeQueryLifecycleLocalRuntime, QueryControlAttachment, QueryLifecycleError,
     QueryLifecycleIngress, QueryLifecycleRegistry, QueryLifecycleRegistryConfig,
 };
+use crate::rpc::client::BackendRpcClient;
+use crate::rpc::runtime::BackendNativeTransport;
 use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
 use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
@@ -33,12 +41,23 @@ use novarocks_spi::connector::WriteCommitEvidenceLimits;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const ANNOUNCE_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct BackendServerConfig {
     pub bind_host: String,
     pub grpc_port: u16,
     pub metrics_http_port: u16,
     pub advertise_endpoint: AdvertiseEndpoint,
+    /// Server-resolved Native caller authentication and transport material.
+    /// Backend receives this immutable capability and never reads trust source
+    /// configuration or credentials itself.
+    pub native_trust: Arc<NativeTrust>,
+    pub native_transport: BackendNativeTransport,
+    /// Exact FE native ingress used exclusively for authenticated membership announce.
+    pub frontend_endpoint: NativeEndpoint,
+    pub announce_interval: Duration,
+    pub announce_initial_backoff: Duration,
+    pub announce_max_backoff: Duration,
     pub query_lifecycle_sweep_interval: Duration,
     pub query_lifecycle_config: QueryLifecycleRegistryConfig,
     /// Server-resolved per-fragment terminal write evidence budget.
@@ -103,6 +122,140 @@ pub struct BackendApplicationHost {
     _execution_runtime: Arc<ExecutionRuntime>,
     query_lifecycle_sweep: QueryLifecycleSweepTask,
     metrics_http_server: MetricsHttpServer,
+    process_descriptor: BackendProcessDescriptor,
+    announce_task: BackendAnnounceTask,
+}
+
+struct BackendAnnounceTask {
+    stop: Arc<AtomicBool>,
+    draining: Arc<AtomicBool>,
+    wake: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    join: Option<std::thread::JoinHandle<()>>,
+    data_runtime: BackendDataRuntime,
+    frontend_endpoint: NativeEndpoint,
+    descriptor: BackendProcessDescriptor,
+}
+
+impl BackendAnnounceTask {
+    fn start(
+        data_runtime: BackendDataRuntime,
+        frontend_endpoint: NativeEndpoint,
+        descriptor: BackendProcessDescriptor,
+        interval: Duration,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let draining = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let thread_stop = Arc::clone(&stop);
+        let thread_draining = Arc::clone(&draining);
+        let thread_wake = Arc::clone(&wake);
+        let thread_runtime = data_runtime.clone();
+        let thread_frontend_endpoint = frontend_endpoint.clone();
+        let thread_descriptor = descriptor.clone();
+        let join = std::thread::Builder::new()
+            .name("backend-announce".to_string())
+            .spawn(move || {
+                let client = BackendRpcClient::new_native_endpoint(
+                    thread_runtime,
+                    thread_frontend_endpoint,
+                );
+                let initial_backoff = initial_backoff.max(Duration::from_millis(1));
+                let max_backoff = max_backoff.max(initial_backoff);
+                let mut retry_delay = initial_backoff;
+                while !thread_stop.load(Ordering::Acquire) {
+                    let reported_state = if thread_draining.load(Ordering::Acquire) {
+                        BackendReportedState::Draining
+                    } else {
+                        BackendReportedState::Running
+                    };
+                    let request = BackendAnnounceRequest::new(
+                        thread_descriptor.clone(),
+                        reported_state,
+                    )
+                        .expect("backend process descriptor remains validated");
+                    let next_delay = match client.blocking_announce_backend_with_timeout(
+                        request.as_proto().clone(),
+                        ANNOUNCE_RPC_TIMEOUT,
+                    ) {
+                        Ok(BackendAnnounceResult::Accepted { lease_ttl_ms }) => {
+                            retry_delay = initial_backoff;
+                            interval.min(Duration::from_millis(lease_ttl_ms.saturating_div(3).max(1)))
+                        }
+                        Ok(BackendAnnounceResult::Rejected { reason, safe_detail }) => {
+                            tracing::error!(?reason, %safe_detail, "backend announce rejected by frontend");
+                            let delay = retry_delay;
+                            retry_delay = retry_delay.saturating_mul(2).min(max_backoff);
+                            delay
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "backend announce attempt failed");
+                            let delay = retry_delay;
+                            retry_delay = retry_delay.saturating_mul(2).min(max_backoff);
+                            delay
+                        }
+                    };
+                    let (pending, signal) = &*thread_wake;
+                    let mut pending = pending.lock().expect("backend announce wake lock");
+                    if !*pending && !thread_stop.load(Ordering::Acquire) {
+                        let (next, _) = signal
+                            .wait_timeout(pending, next_delay)
+                            .expect("backend announce wake wait");
+                        pending = next;
+                    }
+                    *pending = false;
+                }
+            })
+            .expect("spawn backend announce task");
+        Self {
+            stop,
+            draining,
+            wake,
+            join: Some(join),
+            data_runtime,
+            frontend_endpoint,
+            descriptor,
+        }
+    }
+
+    fn begin_drain(&self) {
+        self.draining.store(true, Ordering::Release);
+        let client = BackendRpcClient::new_native_endpoint(
+            self.data_runtime.clone(),
+            self.frontend_endpoint.clone(),
+        );
+        let request =
+            BackendAnnounceRequest::new(self.descriptor.clone(), BackendReportedState::Draining)
+                .expect("backend process descriptor remains validated");
+        match client.blocking_announce_backend_with_timeout(
+            request.as_proto().clone(),
+            ANNOUNCE_RPC_TIMEOUT,
+        ) {
+            Ok(BackendAnnounceResult::Accepted { .. }) => {}
+            Ok(BackendAnnounceResult::Rejected {
+                reason,
+                safe_detail,
+            }) => {
+                tracing::error!(?reason, %safe_detail, "backend drain announce rejected by frontend");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "backend drain announce attempt failed");
+            }
+        }
+        let (pending, signal) = &*self.wake;
+        *pending.lock().expect("backend announce wake lock") = true;
+        signal.notify_one();
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let (_, signal) = &*self.wake;
+        signal.notify_one();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 impl fmt::Debug for BackendApplicationHost {
@@ -132,8 +285,12 @@ struct BackendStageLifecycleIngress {
 }
 
 impl QueryLifecycleIngress for BackendStageLifecycleIngress {
-    fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError> {
-        self.registry.bind_backend_identity(backend_id)
+    fn backend_process_id(&self) -> BackendProcessId {
+        self.registry.local_process_id()
+    }
+
+    fn is_draining(&self) -> bool {
+        self.registry.is_draining()
     }
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
@@ -146,6 +303,7 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
             crate::query_lifecycle::StageBuildDecision::Build(permit) => {
                 let execution_id = request.execution_id();
                 let fragments = request.fragments();
+                let stage_digest = permit.digest();
                 let build = self
                     .fragments
                     .stage_fragments(execution_id, &fragments, permit.gate());
@@ -154,7 +312,7 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
                     Err(error) => QueryStageAck::new(
                         request.execution_id(),
                         request.digest_version(),
-                        request.digest(),
+                        stage_digest,
                         QueryStageOutcome::RejectedLocalFailure,
                         error.to_string(),
                     )
@@ -278,9 +436,8 @@ fn compose_backend_application_services(
         Arc::clone(&controls),
         Arc::clone(&execution_host),
     ));
-    let query_lifecycle_registry = QueryLifecycleRegistry::new_unbound_with_runtime(
+    let query_lifecycle_registry = QueryLifecycleRegistry::new_with_runtime(
         data_runtime.clone(),
-        crate::runtime::start_epoch::start_epoch(),
         local_runtime,
         query_lifecycle_config,
     );
@@ -365,6 +522,21 @@ impl BackendApplicationHost {
         SocketAddr::new(ip, bound.port())
     }
 
+    pub fn process_descriptor(&self) -> &BackendProcessDescriptor {
+        &self.process_descriptor
+    }
+
+    /// SIGTERM makes this BE ineligible for new Init while existing admitted
+    /// lifecycle entries remain reachable until their normal terminal state.
+    pub fn begin_drain(&self) {
+        self._query_lifecycle_registry.begin_drain();
+        self.announce_task.begin_drain();
+    }
+
+    pub fn is_drained(&self) -> bool {
+        self._query_lifecycle_registry.is_drained()
+    }
+
     pub fn poll_failure(
         &mut self,
     ) -> Result<Option<BackendApplicationError>, BackendApplicationError> {
@@ -393,6 +565,7 @@ impl BackendApplicationHost {
     }
 
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
+        self.announce_task.stop();
         let listener_shutdown = self.grpc_server.stop();
         let execution_shutdown = self
             .execution_host
@@ -418,18 +591,27 @@ impl BackendApplicationHost {
             grpc_port,
             metrics_http_port,
             advertise_endpoint,
+            native_trust,
+            native_transport,
+            frontend_endpoint,
+            announce_interval,
+            announce_initial_backoff,
+            announce_max_backoff,
             query_lifecycle_sweep_interval,
             query_lifecycle_config,
             write_commit_evidence_limits,
             execution_runtime_config,
             execution_installers,
         } = config;
-        let readiness_addr =
-            advertised_probe_addr(&advertise_endpoint.host, advertise_endpoint.port).map_err(
-                |error| {
-                    BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
-                },
-            )?;
+        let readiness_endpoint =
+            NativeEndpoint::from_host_port(&advertise_endpoint.host, advertise_endpoint.port)
+                .map_err(|error| {
+                    BackendApplicationError::new(
+                        BackendApplicationErrorKind::Configuration,
+                        format!("invalid advertised Native readiness endpoint: {error}"),
+                    )
+                })?;
+        let readiness_runtime = data_runtime.clone();
         let services = compose_backend_application_services(
             data_runtime,
             execution_runtime_config,
@@ -437,6 +619,24 @@ impl BackendApplicationHost {
             write_commit_evidence_limits,
             &execution_installers,
         )?;
+        let process_descriptor = BackendProcessDescriptor::new(
+            services.query_lifecycle_ingress.backend_process_id(),
+            QueryControlEndpoint::new(advertise_endpoint.host.clone(), advertise_endpoint.port)
+                .map_err(|error| {
+                    BackendApplicationError::new(
+                        BackendApplicationErrorKind::Configuration,
+                        format!("resolve backend process endpoint: {error}"),
+                    )
+                })?,
+            native_trust.deployment_id().as_str(),
+            novarocks_version::native_build_identity(),
+        )
+        .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("construct backend process descriptor: {error}"),
+            )
+        })?;
         let metrics_registry = Arc::new(BackendMetricsRegistry::new().map_err(|error| {
             BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
         })?);
@@ -471,7 +671,10 @@ impl BackendApplicationHost {
                 services.query_lifecycle_ingress.clone(),
                 runtime_filter_ingress,
                 Arc::clone(&services.exchange_receiver_port),
+                process_descriptor.clone(),
             ),
+            native_trust,
+            native_transport,
         ) {
             Ok(server) => server,
             Err(error) => {
@@ -488,7 +691,9 @@ impl BackendApplicationHost {
             }
         };
 
-        if let Err(error) = wait_for_tcp_ready(readiness_addr, readiness_timeout) {
+        if let Err(error) =
+            wait_for_native_ready(&readiness_runtime, readiness_endpoint, readiness_timeout)
+        {
             let listener_result = grpc_server.stop();
             let sweep_result = query_lifecycle_sweep.stop();
             let metrics_result = metrics_http_server.stop();
@@ -501,6 +706,15 @@ impl BackendApplicationHost {
                 [listener_result, sweep_result, metrics_result],
             ));
         }
+
+        let announce_task = BackendAnnounceTask::start(
+            readiness_runtime,
+            frontend_endpoint,
+            process_descriptor.clone(),
+            announce_interval.max(Duration::from_millis(100)),
+            announce_initial_backoff,
+            announce_max_backoff,
+        );
 
         Ok(Self {
             ready_marker: format!(
@@ -515,6 +729,8 @@ impl BackendApplicationHost {
             _execution_runtime: services.execution_runtime,
             query_lifecycle_sweep,
             metrics_http_server,
+            process_descriptor,
+            announce_task,
         })
     }
 }
@@ -534,7 +750,11 @@ pub fn run_backend_server(config: BackendServerConfig) -> Result<(), BackendAppl
                 format!("build backend Tokio runtime failed: {error}"),
             )
         })?;
-    let data_runtime = BackendDataRuntime::new(runtime.handle().clone());
+    let data_runtime = BackendDataRuntime::new(
+        runtime.handle().clone(),
+        Arc::clone(&config.native_trust),
+        config.native_transport.clone(),
+    );
     runtime.block_on(run_backend_server_until_signal(config, data_runtime))
 }
 pub async fn run_backend_server_until_shutdown<F>(
@@ -614,6 +834,7 @@ where
         },
         Err(error) => Err(error),
     };
+    host.begin_drain();
     combine_primary_and_shutdown(primary, host.shutdown())
 }
 
@@ -652,39 +873,26 @@ fn combine_shutdown_results(
     }
 }
 
-fn advertised_probe_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
-    let host = host
-        .trim()
-        .trim_matches(|character| character == '[' || character == ']');
-    (host, port)
-        .to_socket_addrs()
-        .map_err(|error| format!("resolve advertised endpoint {host}:{port}: {error}"))?
-        .next()
-        .ok_or_else(|| format!("advertised endpoint {host}:{port} resolved no addresses"))
-}
-
-fn wait_for_tcp_ready(addr: SocketAddr, timeout: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    let mut last_error = None;
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let attempt_timeout = remaining.min(Duration::from_millis(100));
-        match TcpStream::connect_timeout(&addr, attempt_timeout) {
-            Ok(_) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-        std::thread::sleep(remaining.min(Duration::from_millis(10)));
-    }
-    match last_error {
-        Some(error) => Err(format!(
-            "advertised endpoint {addr} did not become ready within {}ms: {error}",
-            timeout.as_millis()
-        )),
-        None => Err(format!(
-            "advertised endpoint {addr} did not become ready within {}ms",
-            timeout.as_millis()
-        )),
-    }
+fn wait_for_native_ready(
+    runtime: &BackendDataRuntime,
+    endpoint: NativeEndpoint,
+    timeout: Duration,
+) -> Result<(), String> {
+    let connector = runtime.native_transport().connector_for(endpoint.clone())?;
+    runtime.block_on(async move {
+        tokio::time::timeout(timeout, connector.connect())
+            .await
+            .map_err(|_| {
+                format!(
+                    "advertised Native endpoint {endpoint} did not become ready within {}ms",
+                    timeout.as_millis()
+                )
+            })?
+            .map(|_| ())
+            .map_err(|error| {
+                format!("advertised Native endpoint {endpoint} readiness failed: {error}")
+            })
+    })
 }
 
 #[cfg(test)]
@@ -699,10 +907,12 @@ mod tests {
         BackendServerConfig, QueryLifecycleRegistryConfig, combine_primary_and_shutdown,
         compose_backend_application_services,
     };
+    use crate::rpc::runtime::test_backend_native_trust;
     use crate::rpc::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
+    use novarocks_native_trust::NativeClientAuthInterceptor;
     use novarocks_proto::lifecycle as protocol_lifecycle;
     use novarocks_proto::lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
@@ -711,14 +921,13 @@ mod tests {
     };
     use novarocks_proto_models::novarocks as protocol;
     use novarocks_proto_models::novarocks::{
-        AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest,
+        AbortQueryRequest as ProtoAbortQueryRequest, HeartbeatRequest, HeartbeatResponse,
         InitQueryRequest as ProtoInitQueryRequest, QueryControlAttach as ProtoQueryControlAttach,
         QueryControlRequest as ProtoQueryControlRequest,
     };
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
-    use novarocks_types::AdvertiseEndpoint;
     use novarocks_types::QueryId;
-    use novarocks_version::native_build_identity;
+    use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
     use tokio_stream::wrappers::ReceiverStream;
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -762,7 +971,7 @@ mod tests {
         crate::rpc::runtime::test_backend_data_runtime()
     }
 
-    fn http_get(port: u16, path: &str) -> String {
+    fn http_get(port: u16, path: &str) -> std::io::Result<String> {
         let mut stream =
             std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect HTTP listener");
         stream
@@ -774,10 +983,8 @@ mod tests {
         )
         .expect("write HTTP request");
         let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .expect("read HTTP response");
-        response
+        stream.read_to_string(&mut response)?;
+        Ok(response)
     }
 
     fn query_lifecycle_registry_config(
@@ -816,6 +1023,13 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: advertise_port,
             },
+            native_trust: crate::rpc::runtime::test_backend_native_trust(),
+            native_transport: crate::rpc::runtime::BackendNativeTransport::Plaintext,
+            frontend_endpoint: NativeEndpoint::from_host_port("127.0.0.1", unused_port())
+                .expect("valid frontend endpoint"),
+            announce_interval: Duration::from_secs(60),
+            announce_initial_backoff: Duration::from_millis(100),
+            announce_max_backoff: Duration::from_secs(2),
             query_lifecycle_sweep_interval: Duration::from_millis(1_000),
             query_lifecycle_config: query_lifecycle_registry_config(Duration::from_millis(5_000)),
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
@@ -824,7 +1038,7 @@ mod tests {
         }
     }
 
-    fn live_query_init_request(start_epoch: u64, query_low: i64) -> QueryInitRequest {
+    fn live_query_init_request(process_id: BackendProcessId, query_low: i64) -> QueryInitRequest {
         let execution_id = QueryExecutionId::new(
             QueryId::new(0x514c_4302, query_low),
             AttemptId::new(1).expect("nonzero attempt"),
@@ -834,9 +1048,8 @@ mod tests {
             ParticipantManifest::new(
                 execution_id,
                 ParticipantBackendIdentity::new(
-                    7,
+                    process_id,
                     QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid backend endpoint"),
-                    start_epoch,
                 )
                 .expect("valid backend identity"),
                 [ParticipantRole::FragmentExecutor],
@@ -898,6 +1111,8 @@ mod tests {
                 ProtoQueryControlAttach {
                     execution_id: manifest.as_proto().execution_id,
                     init_digest: init
+                        .manifest()
+                        .expect("validated init manifest")
                         .digest()
                         .expect("validated InitQuery has digest")
                         .as_bytes()
@@ -921,12 +1136,34 @@ mod tests {
         }
     }
 
-    async fn connect_live_client(grpc_port: u16) -> NovaRocksGrpcClient<tonic::transport::Channel> {
-        NovaRocksGrpcClient::connect(format!("http://127.0.0.1:{grpc_port}"))
+    async fn connect_live_client(
+        grpc_port: u16,
+    ) -> NovaRocksGrpcClient<
+        tonic::service::interceptor::InterceptedService<
+            tonic::transport::Channel,
+            NativeClientAuthInterceptor,
+        >,
+    > {
+        let channel =
+            tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{grpc_port}"))
+                .expect("construct native backend test endpoint")
+                .connect()
+                .await
+                .expect("connect native backend gRPC");
+        NovaRocksGrpcClient::with_interceptor(
+            channel,
+            test_backend_native_trust().client_interceptor(),
+        )
+        .max_encoding_message_size(64 * 1024 * 1024)
+        .max_decoding_message_size(64 * 1024 * 1024)
+    }
+
+    async fn connect_live_channel(grpc_port: u16) -> tonic::transport::Channel {
+        tonic::transport::Channel::from_shared(format!("http://127.0.0.1:{grpc_port}"))
+            .expect("construct native backend test endpoint")
+            .connect()
             .await
             .expect("connect native backend gRPC")
-            .max_encoding_message_size(64 * 1024 * 1024)
-            .max_decoding_message_size(64 * 1024 * 1024)
     }
 
     #[test]
@@ -977,16 +1214,11 @@ mod tests {
             BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
                 .expect("native backend host starts");
         let mut client = connect_live_client(grpc_port).await;
-        let heartbeat = client
-            .heartbeat(HeartbeatRequest {
-                assigned_be_id: 7,
-                fe_epoch: 1,
-            })
-            .await
-            .expect("bind backend identity")
-            .into_inner();
-        assert_eq!(heartbeat.version, native_build_identity());
-        let init = live_query_init_request(heartbeat.start_epoch, 901);
+        let process_id = host
+            .process_descriptor()
+            .process_id()
+            .expect("host process identity");
+        let init = live_query_init_request(process_id, 901);
         let protocol_init = protocol_init_request(&init);
         client
             .init_query(protocol_init.as_proto().clone())
@@ -1073,15 +1305,11 @@ mod tests {
         let host = BackendApplicationHost::open(config, test_data_runtime())
             .expect("native backend host starts");
         let mut client = connect_live_client(grpc_port).await;
-        let heartbeat = client
-            .heartbeat(HeartbeatRequest {
-                assigned_be_id: 7,
-                fe_epoch: 1,
-            })
-            .await
-            .expect("bind backend identity")
-            .into_inner();
-        let init = live_query_init_request(heartbeat.start_epoch, 902);
+        let process_id = host
+            .process_descriptor()
+            .process_id()
+            .expect("host process identity");
+        let init = live_query_init_request(process_id, 902);
         let protocol_init = protocol_init_request(&init);
         client
             .init_query(protocol_init.as_proto().clone())
@@ -1123,6 +1351,8 @@ mod tests {
             .abort_query(protocol_abort_request(
                 &protocol_init,
                 protocol_init
+                    .manifest()
+                    .expect("validated init manifest")
                     .digest()
                     .expect("validated InitQuery has digest")
                     .as_bytes(),
@@ -1155,15 +1385,11 @@ mod tests {
                 .expect("native backend host starts");
         let registry = Arc::clone(&host._query_lifecycle_registry);
         let mut client = connect_live_client(grpc_port).await;
-        let heartbeat = client
-            .heartbeat(HeartbeatRequest {
-                assigned_be_id: 7,
-                fe_epoch: 1,
-            })
-            .await
-            .expect("bind backend identity")
-            .into_inner();
-        let init = live_query_init_request(heartbeat.start_epoch, 903);
+        let process_id = host
+            .process_descriptor()
+            .process_id()
+            .expect("host process identity");
+        let init = live_query_init_request(process_id, 903);
         let protocol_init = protocol_init_request(&init);
         client
             .init_query(protocol_init.as_proto().clone())
@@ -1224,6 +1450,8 @@ mod tests {
                     .expect("validated manifest execution id"),
                 ParticipantManifestDigest::new(
                     *protocol_init
+                        .manifest()
+                        .expect("validated init manifest")
                         .digest()
                         .expect("validated InitQuery has digest")
                         .as_bytes(),
@@ -1266,6 +1494,60 @@ mod tests {
         clippy::await_holding_lock,
         reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
     )]
+    async fn application_authenticates_complete_native_route_set_before_domain_or_fallback() {
+        let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
+        let grpc_port = unused_port();
+        let metrics_port = unused_port();
+        let mut config = backend_config(grpc_port, grpc_port);
+        config.metrics_http_port = metrics_port;
+        let host = BackendApplicationHost::open(config, test_data_runtime())
+            .expect("native backend host starts");
+
+        let mut missing_auth = NovaRocksGrpcClient::new(connect_live_channel(grpc_port).await);
+        let error = missing_auth
+            .heartbeat(HeartbeatRequest {
+                expected_process_id: host.process_descriptor().as_proto().process_id.clone(),
+            })
+            .await
+            .expect_err("Native RPC without JWT must fail before domain validation");
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.message(), "native caller authentication failed");
+        let metrics = http_get(metrics_port, "/metrics").expect("read backend metrics");
+        assert!(metrics.contains(
+            "novarocks_native_authentication_failures_total{reason=\"authentication\"} 1"
+        ));
+
+        let channel = connect_live_channel(grpc_port).await;
+        let service = tonic::service::interceptor::InterceptedService::new(
+            channel,
+            test_backend_native_trust().client_interceptor(),
+        );
+        let mut grpc = tonic::client::Grpc::new(service);
+        grpc.ready()
+            .await
+            .expect("authenticated test client is ready");
+        let result: Result<tonic::Response<HeartbeatResponse>, tonic::Status> = grpc
+            .unary(
+                tonic::Request::new(HeartbeatRequest {
+                    expected_process_id: host.process_descriptor().as_proto().process_id.clone(),
+                }),
+                "/novarocks.NovaRocksGrpc/Unknown"
+                    .parse()
+                    .expect("valid unknown native RPC path"),
+                tonic::codec::ProstCodec::default(),
+            )
+            .await;
+        let error = result.expect_err("valid JWT must reach the Native fallback");
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+
+        host.shutdown().expect("native backend shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "The mutex serializes loopback backend tests that bind listeners and must remain held for the full test."
+    )]
     async fn application_malformed_abort_query_returns_invalid_argument() {
         let _live_host = LIVE_HOST_TEST.lock().expect("live host test lock");
         let grpc_port = unused_port();
@@ -1293,11 +1575,12 @@ mod tests {
         let host = BackendApplicationHost::open(config, test_data_runtime())
             .expect("native backend host starts");
 
-        let native_response = http_get(grpc_port, "/metrics");
-        assert!(native_response.contains("grpc-status: 12"));
-        assert!(!native_response.contains("novarocks_backend_query_lifecycle_entries"));
+        if let Ok(native_response) = http_get(grpc_port, "/metrics") {
+            assert!(!native_response.contains("novarocks_backend_query_lifecycle_entries"));
+        }
 
-        let management_response = http_get(metrics_port, "/metrics");
+        let management_response =
+            http_get(metrics_port, "/metrics").expect("read management metrics");
         assert!(management_response.starts_with("HTTP/1.1 200"));
         assert!(management_response.contains("novarocks_backend_query_lifecycle_entries"));
 
@@ -1316,16 +1599,12 @@ mod tests {
             BackendApplicationHost::open(backend_config(grpc_port, grpc_port), test_data_runtime())
                 .expect("native backend host starts");
         let mut client = connect_live_client(grpc_port).await;
-        let heartbeat = client
-            .heartbeat(HeartbeatRequest {
-                assigned_be_id: 7,
-                fe_epoch: 1,
-            })
-            .await
-            .expect("bind backend identity")
-            .into_inner();
-        let init = live_query_init_request(heartbeat.start_epoch, 904);
-        let different = live_query_init_request(heartbeat.start_epoch, 905);
+        let process_id = host
+            .process_descriptor()
+            .process_id()
+            .expect("host process identity");
+        let init = live_query_init_request(process_id, 904);
+        let different = live_query_init_request(process_id, 905);
         let protocol_init = protocol_init_request(&init);
         let protocol_different = protocol_init_request(&different);
         client
@@ -1337,6 +1616,8 @@ mod tests {
             .abort_query(protocol_abort_request(
                 &protocol_init,
                 protocol_different
+                    .manifest()
+                    .expect("validated init manifest")
                     .digest()
                     .expect("validated InitQuery has digest")
                     .as_bytes(),

@@ -22,7 +22,6 @@
 //! scan and requires all installs to ACK before native submissions exist.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
@@ -34,6 +33,7 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::lifecycle::QueryExecutionId;
 use novarocks_proto::provider::{
     EnsureConnectorExecutionBindingRejection, RetireConnectorExecutionBindingOutcome,
@@ -99,7 +99,7 @@ impl std::error::Error for ConnectorBindingRetirementError {}
 /// control-plane DTO: no scan handle, split, credential, or client is present.
 pub struct ConnectorBindingBackendInstallPlan {
     backend_idx: usize,
-    endpoint: SocketAddr,
+    endpoint: RuntimeEndpoint,
     declarations: Vec<ConnectorExecutionDeclaration>,
 }
 
@@ -108,8 +108,8 @@ impl ConnectorBindingBackendInstallPlan {
         self.backend_idx
     }
 
-    pub const fn endpoint(&self) -> SocketAddr {
-        self.endpoint
+    pub fn endpoint(&self) -> &RuntimeEndpoint {
+        &self.endpoint
     }
 
     pub fn declarations(&self) -> &[ConnectorExecutionDeclaration] {
@@ -147,7 +147,7 @@ pub trait ConnectorBindingDispatcher: Send + Sync + 'static {
         &self,
         execution_id: QueryExecutionId,
         backend_idx: usize,
-        endpoint: SocketAddr,
+        endpoint: RuntimeEndpoint,
         declaration: &ConnectorExecutionDeclaration,
     ) -> Result<(), ConnectorBindingDispatchError>;
 
@@ -155,7 +155,7 @@ pub trait ConnectorBindingDispatcher: Send + Sync + 'static {
     /// solely owned by the established query terminal lifecycle.
     fn retire(
         &self,
-        endpoint: SocketAddr,
+        endpoint: RuntimeEndpoint,
         key: &ConnectorExecutionBindingKey,
     ) -> Result<(), ConnectorBindingRetirementError>;
 }
@@ -166,7 +166,7 @@ pub trait ConnectorBindingDispatcher: Send + Sync + 'static {
 pub trait ConnectorBindingInstallObserver: Send + Sync + 'static {
     fn installed(
         &self,
-        endpoint: SocketAddr,
+        endpoint: RuntimeEndpoint,
         declaration: &ConnectorExecutionDeclaration,
     ) -> Result<(), String>;
 }
@@ -175,7 +175,11 @@ pub trait ConnectorBindingInstallObserver: Send + Sync + 'static {
 pub struct NoopConnectorBindingInstallObserver;
 
 impl ConnectorBindingInstallObserver for NoopConnectorBindingInstallObserver {
-    fn installed(&self, _: SocketAddr, _: &ConnectorExecutionDeclaration) -> Result<(), String> {
+    fn installed(
+        &self,
+        _: RuntimeEndpoint,
+        _: &ConnectorExecutionDeclaration,
+    ) -> Result<(), String> {
         Ok(())
     }
 }
@@ -219,17 +223,17 @@ pub(crate) fn compile_install_plan(
     let mut by_backend: BTreeMap<
         usize,
         (
-            SocketAddr,
+            RuntimeEndpoint,
             BTreeMap<ConnectorInstanceId, ConnectorExecutionDeclaration>,
         ),
     > = BTreeMap::new();
 
     for (&fragment_id, placements) in &schedule.by_fragment {
         for placement in placements {
-            let endpoint = placement_socket_addr(&placement.endpoint)?;
+            let endpoint = placement.endpoint.clone();
             let entry = by_backend
                 .entry(placement.backend_idx)
-                .or_insert_with(|| (endpoint, BTreeMap::new()));
+                .or_insert_with(|| (endpoint.clone(), BTreeMap::new()));
             if entry.0 != endpoint {
                 return Err(contract_error(format!(
                     "connector binding schedule assigns backend {} to conflicting endpoints {} and {}",
@@ -288,10 +292,10 @@ pub(crate) fn compile_install_plan(
                         writer.backend_num()
                     ))
                 })?;
-            let endpoint = placement_socket_addr(&placement.endpoint)?;
+            let endpoint = placement.endpoint.clone();
             let entry = by_backend
                 .entry(placement.backend_idx)
-                .or_insert_with(|| (endpoint, BTreeMap::new()));
+                .or_insert_with(|| (endpoint.clone(), BTreeMap::new()));
             if entry.0 != endpoint {
                 return Err(contract_error(format!(
                     "connector binding writer schedule assigns backend {} to conflicting endpoints {} and {}",
@@ -335,25 +339,6 @@ fn connector_writer_fragment_instance_bytes(value: novarocks_types::UniqueId) ->
     bytes
 }
 
-fn placement_socket_addr(
-    endpoint: &novarocks_execution::runtime::endpoint::RuntimeEndpoint,
-) -> Result<SocketAddr, DistributedQueryError> {
-    let ip = endpoint.host().parse::<IpAddr>().map_err(|_| {
-        contract_error(format!(
-            "connector binding requires an IP-native scheduled endpoint, got '{}'",
-            endpoint.host()
-        ))
-    })?;
-    let port = u16::try_from(endpoint.port()).map_err(|_| {
-        contract_error(format!(
-            "connector binding scheduled endpoint '{}' has invalid port {}",
-            endpoint.host(),
-            endpoint.port()
-        ))
-    })?;
-    Ok(SocketAddr::new(ip, port))
-}
-
 /// Serial barrier implementation shared by production and focused tests.
 /// Installation is idempotent at the BE host, so a retry after a transport
 /// ambiguity is safe and does not manufacture a second registry entry.
@@ -393,7 +378,7 @@ impl ConnectorBindingInstallBarrier for DispatchingConnectorBindingBarrier {
                     .install(
                         execution_id,
                         backend.backend_idx(),
-                        backend.endpoint(),
+                        backend.endpoint().clone(),
                         declaration,
                     )
                     .map_err(|error| match error {
@@ -416,7 +401,7 @@ impl ConnectorBindingInstallBarrier for DispatchingConnectorBindingBarrier {
                         )),
                     })?;
                 self.observer
-                    .installed(backend.endpoint(), declaration)
+                    .installed(backend.endpoint().clone(), declaration)
                     .map_err(|error| {
                         failed(format!(
                             "connector instance '{}' installation acknowledgement could not be recorded for BE[{}] ({}): {error}",
@@ -445,7 +430,7 @@ mod tests {
     }
 
     struct RecordingDispatcher {
-        installs: Mutex<Vec<(usize, SocketAddr, String)>>,
+        installs: Mutex<Vec<(usize, RuntimeEndpoint, String)>>,
         fail_on: Option<usize>,
     }
 
@@ -458,7 +443,7 @@ mod tests {
             &self,
             _execution_id: QueryExecutionId,
             backend_idx: usize,
-            endpoint: SocketAddr,
+            endpoint: RuntimeEndpoint,
             declaration: &ConnectorExecutionDeclaration,
         ) -> Result<(), ConnectorBindingDispatchError> {
             let mut installs = self.installs.lock().unwrap();
@@ -477,7 +462,7 @@ mod tests {
 
         fn retire(
             &self,
-            _endpoint: SocketAddr,
+            _endpoint: RuntimeEndpoint,
             _key: &ConnectorExecutionBindingKey,
         ) -> Result<(), ConnectorBindingRetirementError> {
             Ok(())
@@ -489,7 +474,7 @@ mod tests {
             &self,
             _execution_id: QueryExecutionId,
             _backend_idx: usize,
-            _endpoint: SocketAddr,
+            _endpoint: RuntimeEndpoint,
             _declaration: &ConnectorExecutionDeclaration,
         ) -> Result<(), ConnectorBindingDispatchError> {
             Err(ConnectorBindingDispatchError::Rejected(
@@ -499,7 +484,7 @@ mod tests {
 
         fn retire(
             &self,
-            _endpoint: SocketAddr,
+            _endpoint: RuntimeEndpoint,
             _key: &ConnectorExecutionBindingKey,
         ) -> Result<(), ConnectorBindingRetirementError> {
             Ok(())

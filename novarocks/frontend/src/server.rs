@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_native_trust::NativeTrust;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,7 @@ use std::task::Poll;
 use tokio::runtime::Handle;
 
 use crate::capabilities as core_capabilities;
+use crate::native::transport::FrontendNativeTransport;
 use crate::state_store::{StateStoreHostInput, StateStoreProviderRegistry};
 use crate::{
     ClientConnectionControlPort, MysqlClientConnectionRegistry, QuerySessionFactory,
@@ -76,6 +78,12 @@ pub struct FrontendServerConfig {
     pub state_store_input: Option<StateStoreHostInput>,
     /// Concrete provider registrations supplied only by Server composition.
     pub state_store_provider_registry: StateStoreProviderRegistry,
+    /// Server-owned deployment trust capability. It is mandatory for every
+    /// production FE Native channel and report listener.
+    pub native_trust: Arc<NativeTrust>,
+    /// Server-materialized plaintext/TLS transport capability paired with the
+    /// deployment trust above.
+    pub native_transport: FrontendNativeTransport,
 }
 
 /// Opens the frontend services once for an externally composed server.
@@ -90,6 +98,8 @@ pub async fn open_frontend_application_for_server(
         config.backend_open.clone(),
         config.connector_control_factories.clone(),
         data_runtime,
+        Arc::clone(&config.native_trust),
+        config.native_transport.clone(),
     )
     .await
 }
@@ -117,6 +127,7 @@ pub fn build_frontend_query_session_factory(
     let mv_repository = host.mv_repository();
     let mv_application = host.mv_application_service();
     let mv_service = host.mv_service();
+    let mv_readiness = mv_service.readiness_port();
     let view_service = host.view_service();
     let statistics_application = host.statistics_application_port();
     let maintenance_service = host.table_maintenance_service();
@@ -140,6 +151,7 @@ pub fn build_frontend_query_session_factory(
                 topology.clone(),
                 exchange_port,
                 Arc::clone(&mv_repository),
+                Arc::clone(&mv_readiness),
                 Arc::clone(&mv_storage_observation),
             ),
         )
@@ -151,15 +163,7 @@ pub fn build_frontend_query_session_factory(
         Arc::clone(&catalog_projection),
         Arc::clone(&catalog_application),
         Arc::clone(&mv_storage_observation),
-        Arc::clone(&mv_repository),
-        {
-            let service = Arc::clone(&mv_service);
-            Box::new(move || {
-                service
-                    .recover_startup_mv_refreshes()
-                    .map_err(|error| format!("frontend MV startup recovery failed: {error}"))
-            })
-        },
+        mv_service.readiness_port(),
     );
     crate::mv::domain::startup_restore::run_mv_startup_restore(&startup_restore)
         .map_err(FrontendApplicationError::server)?;
@@ -222,6 +226,7 @@ pub fn build_frontend_query_session_factory(
                 Some(Arc::clone(&catalog_application)),
                 Arc::clone(&connector_control),
                 Arc::clone(&mv_repository),
+                Arc::clone(&mv_readiness),
                 Arc::clone(&mv_storage_observation),
             ),
             Arc::clone(&maintenance_engine),
@@ -249,7 +254,7 @@ pub fn build_frontend_query_session_factory(
             exchange_port,
             view_service.clone(),
             system_catalog,
-            Arc::clone(&mv_repository),
+            Arc::clone(&mv_readiness),
             Arc::clone(&mv_storage_observation),
         ));
     let session_catalog_resolver =
@@ -263,7 +268,7 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
-            Arc::clone(&mv_repository),
+            Arc::clone(&mv_readiness),
             Arc::clone(&mv_storage_observation),
             view_service,
         ));
@@ -402,8 +407,12 @@ where
 {
     let metrics_registry =
         crate::metrics::FrontendMetricsRegistry::new().map_err(FrontendApplicationError::server)?;
-    let mut report_server =
-        host.start_report_server_from_host(&config.report_bind_host, config.report_grpc_port)?;
+    let mut report_server = host.start_report_server_from_host(
+        &config.report_bind_host,
+        config.report_grpc_port,
+        Arc::clone(&config.native_trust),
+        config.native_transport.clone(),
+    )?;
     let mut metrics_http_server = match crate::metrics::MetricsHttpServer::start(
         &config.report_bind_host,
         config.metrics_http_port,
@@ -709,6 +718,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use novarocks_native_trust::{
+        DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
+    };
+    use novarocks_secret::SecretValue;
     use novarocks_spi::connector::UnavailableMvStorageObservationPort;
 
     use super::{
@@ -717,6 +730,7 @@ mod tests {
         run_frontend_server_with_signal_and_ports,
     };
     use crate::catalog_application::CatalogAdmission;
+    use crate::native::transport::FrontendNativeTransport;
     use crate::state_store::{
         StateStoreProviderRegistry,
         testing::{input as test_state_store_input, registry as test_state_store_registry},
@@ -726,6 +740,16 @@ mod tests {
         FrontendApplicationHost, FrontendExecutionConfig, MysqlClientConnectionRegistry,
     };
     use crate::{QueryServiceErrorKind, QuerySessionOpenRequest, ResolvedMysqlListenerSettings};
+
+    fn test_native_trust() -> Arc<NativeTrust> {
+        Arc::new(NativeTrust::new(
+            DeploymentId::parse("frontend-server-test").expect("deployment"),
+            ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))
+                .expect("secret"),
+            NativeCallerSubject::parse("fe@127.0.0.1:19040").expect("subject"),
+            NativeTransportMode::Disabled,
+        ))
+    }
 
     #[derive(Debug)]
     struct RecordingHostPort;
@@ -764,13 +788,14 @@ mod tests {
             mv_storage_observation: Arc::new(UnavailableMvStorageObservationPort),
             state_store_input: None,
             state_store_provider_registry: StateStoreProviderRegistry::new(),
+            native_trust: test_native_trust(),
+            native_transport: FrontendNativeTransport::plaintext(),
         }
     }
 
     fn frontend_backend_open_config() -> ClusterBackendOpenConfig {
         ClusterBackendOpenConfig::new(
             novarocks_types::ClusterRole::Fe,
-            Vec::new(),
             Duration::from_secs(1),
             3,
             Duration::from_secs(1),
@@ -829,6 +854,8 @@ mod tests {
             frontend_backend_open_config(),
             vec![Arc::new(EchoingControlFactory)],
             tokio::runtime::Handle::current(),
+            test_native_trust(),
+            FrontendNativeTransport::plaintext(),
         )
         .await
         .expect("open frontend application host");
@@ -921,13 +948,19 @@ mod tests {
             frontend_backend_open_config(),
             Vec::new(),
             tokio::runtime::Handle::current(),
+            test_native_trust(),
+            FrontendNativeTransport::plaintext(),
         )
         .await
         .expect("open frontend application host");
         let report_endpoint = host.coordinator_report_endpoint_sink();
         for bind_addr in ["127.0.0.1:0".parse().unwrap(), "[::1]:0".parse().unwrap()] {
             let mut report_server = host
-                .start_report_server(bind_addr)
+                .start_report_server(
+                    bind_addr,
+                    test_native_trust(),
+                    FrontendNativeTransport::plaintext(),
+                )
                 .expect("start frontend-owned report endpoint");
             let bound_addr = report_server.bound_addr();
             report_endpoint.set_bound_port(bound_addr.port());
@@ -964,6 +997,8 @@ mod tests {
             frontend_backend_open_config(),
             Vec::new(),
             tokio::runtime::Handle::current(),
+            test_native_trust(),
+            FrontendNativeTransport::plaintext(),
         )
         .await
         .expect("open frontend application host");

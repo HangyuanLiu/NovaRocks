@@ -62,13 +62,14 @@ code-anchors:
 - ADR-0027 — Runtime Filter 规划为何由 SQL 私有拥有、角色之间只交换封存 wire facts（active）
 - ADR-0043 — Runtime Filter row/scan evaluator 为何统一由 Execution 拥有、Backend 只提供 artifact query（active）
 - ADR-0044 — Runtime Filter participant 物理生命周期为何由 Backend 拥有、Execution 保留语义值与 evaluator（active）
-- ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（active）
+- ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（active）
 
 #### 历史
 
 - ADR-0041 — Runtime Filter scan-domain 评估为何由 Execution 拥有、Core 只提供中立 artifact capability（superseded → ADR-0043）
 - ADR-0076 — Runtime Filter terminal observation 为何由 Backend participant 有界聚合、并仅经 typed QLC contribution 出域（superseded → ADR-0078）
 - ADR-0078 — Runtime Filter terminal observation 为何只作观测，且以 P0/P1/P2 查询终止契约交付（superseded → ADR-0106）
+- ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
 
 ### join-execution
 
@@ -99,7 +100,7 @@ code-anchors:
 - ADR-0029 — distributed rewrite 为何以 frozen groups、C1 cohorts 与 FE aggregate commit 实现单 snapshot（active）
 - ADR-0034 — cluster composite split 与 Backend local scan unit 为何采用冻结、认证、再调度的两级生命周期（active）
 - ADR-0039 — scan unit为何以immutable、bounded的physical domain facts服务后续执行侧（active）
-- ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（active）
+- ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（active）
 - ADR-0104 — Connector execution binding 为何使用 SPI domain declaration、sealed Host 与可重放失败状态机（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0051 — distributed write 为何在 preparation 与 planning 之间强制 exact-generation Provider activation（active）
@@ -107,18 +108,18 @@ code-anchors:
 - ADR-0053 — MV snapshot change window 为何复用 exact-generation scan planning 并返回 sealed neutral admission（active）
 - ADR-0055 — row-DML 调用方为何只读 Provider 签发的 strategy，而 SQL 谓词合法性为何留在 Core（active）
 - ADR-0056 — 摘除 Core 对 provider 的测试依赖时，无法用冻结 SPI facts 表达的断言为何归位到实现旁而非复刻或删除（active）
-- ADR-0061 — MV repartition 为何由 Provider 在单次原子 write commit 中同时切换 partition spec 与 snapshot（active）
 - ADR-0063 — Copy-on-Write row mutation 的match与rewrite读源为何由Provider按exact base签发（active）
 - ADR-0077 — Hadoop catalog 创建表为何以 storage 条件创建 v1 metadata 作为线性化点（active）
 - ADR-0085 — durable caller 为何通过既有 exact metadata lease capture/rebind 物理表对象，而不依赖统计能力或新增平行 authority（active）
 - ADR-0080 — 统计证据为何拆成 collection 级覆盖度与 per-metric 基准版本/来源/数值性质/集合关系四个独立维度（active）
 - ADR-0081 — 统计为何是带版本、允许陈旧、由读侧逐 metric 决定可用性的估计事实（active）
 - ADR-0082 — 同一快照上的统计发布为何以覆盖度排序、且冲突重试必须重新判定（active）
-- ADR-0109 — Frontend maintenance/statistics job 为何是 ProcessRuntime，而 GC first-observation 是 Accelerator（active）
+- ADR-0111 — Frontend maintenance/statistics job 为何是 ProcessRuntime，而 GC first-observation 是 Accelerator（active）
 - ADR-0097 — durable MV 与维护基表 identity 为何保持 opaque、只在 provider-local 边界解释（active）
 - ADR-0089 — Predicate-driven Parquet page pruning 为何只在 FS reader-open 按实际 physical leaf 计算（active）
-- ADR-0104 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
-- ADR-0110 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
+- ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
+- ADR-0112 — MV 运行态为何只属于当前进程、StateStore为何只保留 lake-source Accelerator（active）
+- ADR-0114 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 
 #### 历史
 
@@ -127,9 +128,11 @@ code-anchors:
 - ADR-0060 — MV refresh base pin 为何必须从同一 exact metadata 投影 UUID 与 current snapshot（superseded → ADR-0086）
 - ADR-0047 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（superseded → ADR-0103）
 - ADR-0103 — 中央 Provider wire authority 与同构 Native build admission 为何统一由 Protocol 和 Frontend topology 拥有（superseded → ADR-0105）
-- ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（superseded → ADR-0104）
-- ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（superseded → ADR-0104）
-- ADR-0084 — durable statistics job target binding（superseded → ADR-0109）
+- ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（superseded → ADR-0110）
+- ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（superseded → ADR-0110）
+- ADR-0084 — durable statistics job target binding（superseded → ADR-0111）
+- ADR-0061 — MV repartition 为何由 Provider 在单次原子 write commit 中同时切换 partition spec 与 snapshot（superseded → ADR-0112）
+- ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
 ### distributed-query-lifecycle
 
 领域哲学：FE coordinator 拥有全局编排，BE query lifecycle 拥有本地执行与资源；两者是独立进程、故障域与状态机，
@@ -142,7 +145,7 @@ code-anchors:
 - ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
 - ADR-0012 — Query session admission 与 router 为何由 frontend 拥有、core 只保留 wire/compiler kernel（active）
 - ADR-0102 — MySQL KILL 为何经 exact generation token 与 protocol-owned connection lifecycle 实现（active）
-- ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（active）
+- ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（active）
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
 
 #### 历史
@@ -155,6 +158,7 @@ code-anchors:
 - ADR-0079 — IDL/proto 为何是 FE/BE 中立 query lifecycle 契约的规范形式、Protocol 如何同时拥有 schema 与已验证值（superseded → ADR-0106）
 - ADR-0098 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（superseded → ADR-0106）
 - ADR-0105 — Provider wire authority 为何与 SPI domain carrier 分离、但仍保持单一 Protocol digest（superseded → ADR-0106）
+- ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
 
 ### sql-compiler
 
@@ -188,12 +192,22 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 永久只支持 shared-data。
 
 
-- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
-- ADR-0110 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
+- ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
+- ADR-0114 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 
 #### 历史
 
 - ADR-0026 — 为何退役 StarRocks-compatible backend runtime role，并把 StarRocks 限定为外部 Connector（superseded → ADR-0108）
+- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one（superseded → ADR-0112）
+
+### native-transport-security
+
+领域哲学：Native transport 先证明 caller 属于 deployment，再由 TLS 选择性提供 channel confidentiality、
+integrity 与 server identity。transport proof 不取代 topology、lifecycle、Protocol 或 SQL authorization；
+plaintext 的残余风险必须可见，TLS profile 与证书/endpoint identity 必须是 closed contract，不能以 fallback、
+system default 或 role-local source 偷偷扩张。
+
+- ADR-0110 — Native caller authentication 为何采用 mandatory JWT、authenticated plaintext 默认与 optional TLS（active）
 
 ### backend-architecture
 
@@ -205,19 +219,20 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 
 ### cluster-membership
 
-领域哲学：backend membership 的 durable desired state 与 heartbeat/live/generation 等运行期 observation 必须分离。
-frontend 的 `ClusterBackendService` 通过 StateStore 成为唯一 membership authority；core 只消费稳定的
-`BackendTopologyPort`，不保留 metadata bridge、global registry 或内存 durable fallback。配置的 backend 是 additive
-seeds，动态 ADD/DROP 的结果跨 FE 重启恢复；单 FE writer 与未来多 FE fencing/takeover 分阶段裁决。
+领域哲学：外部 orchestrator 是 backend desired lifecycle 的唯一权威；Frontend 只保存可丢失的
+announce/heartbeat/compatibility observation，并从中派生可调度 topology。core 只消费稳定的
+`BackendTopologyPort`，不保留 metadata bridge、global registry、seed 或 durable membership fallback；多 FE
+fencing/takeover 仍须单独裁决。
 
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（active）
-- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
+- ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
+- ADR-0111 — Backend 为何以自注册、精确 heartbeat 与 pre-ready 完整重规划取代 durable membership（active）
 
 #### 历史
 
+ - ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（superseded → ADR-0111）
 - ADR-0103 — 中央 Provider wire authority 与同构 Native build admission 为何统一由 Protocol 和 Frontend topology 拥有（superseded → ADR-0105）
 - ADR-0105 — Provider wire authority 为何与 SPI domain carrier 分离、但仍保持单一 Protocol digest（superseded → ADR-0106）
-- ADR-0013 — backend membership 为何由 frontend StateStore 单独持久化（superseded → ADR-0108）
 
 ### catalog-attachment
 
@@ -248,7 +263,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 - ADR-0020 — DELETE/equality-delete application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（active）
 - ADR-0021 — native frontend INSERT 为何只支持 Iceberg，并与 external StarRocks connector 隔离（active）
-- ADR-0104 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
+- ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0033 — UPDATE/MERGE 为何由 frontend 拥有 application lifecycle、core 保留 opaque mutation reverse port（active）
 - ADR-0063 — Copy-on-Write row mutation 的match与rewrite读源为何由Provider按exact base签发（active）
 
@@ -256,29 +271,30 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 - ADR-0045 — change-stream 为何由 SQL 绑定 layout、Iceberg Connector 拥有 provider binding，DML/MV 只共享该 binding（superseded → ADR-0049）
 - ADR-0062 — Copy-on-Write row mutation 的读源为何由 Provider 按 cohort 冻结并以中立 recipe 签发（superseded → ADR-0063）
-- ADR-0032 — Frontend CTAS 为何使用 provider-owned staged publication，而不对可见表做破坏性补偿（superseded → ADR-0104）
-- ADR-0046 — ADD FILES 为何以 provider canonical source scope 保护 frontend durable ownership（superseded → ADR-0104）
-- ADR-0054 — Frontend DML 为何使用 operation-scoped StateStore authority、且不把它宣称为 external commit fencing（superseded → ADR-0104）
-- ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（superseded → ADR-0104）
-- ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（superseded → ADR-0104）
+- ADR-0032 — Frontend CTAS 为何使用 provider-owned staged publication，而不对可见表做破坏性补偿（superseded → ADR-0110）
+- ADR-0046 — ADD FILES 为何以 provider canonical source scope 保护 frontend durable ownership（superseded → ADR-0110）
+- ADR-0054 — Frontend DML 为何使用 operation-scoped StateStore authority、且不把它宣称为 external commit fencing（superseded → ADR-0110）
+- ADR-0068 — 分布式 DML 的 external write fence 为何做成 catalog 原子条件更新里的线性化点（superseded → ADR-0110）
+- ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（superseded → ADR-0110）
 
 ### frontend-mv
 
 领域哲学：Frontend 拥有当前 MV refresh attempt 的 application state、durable ledger、query orchestration 与用户结果；SQL、provider 和 Backend 各自只承担其真实职责。commit truth使用typed provider evidence，不从错误文本猜测，不通过双journal或aggregate facade掩盖owner。
 
-- ADR-0104 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
-- ADR-0038 — Frontend 为何拥有 MV background worker lifecycle 与 per-target activity gate（active）
-- ADR-0096 — MV refresh 所有权为何按 target 上锁、且必须在每个事务内校验（active）
-- ADR-0075 — ledger 丢失后 MV attempt 为何以 lake-first 有界发现 + 保守分类收敛，而非按时间/ID 猜 winner（active）
+- ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0086 — MV storage observation 为何以中立 SPI facts 连接 provider 与 Frontend durable contracts（active）
-- ADR-0109 — MV lake descriptor 为何是 desired semantics 的重建 authority，StateStore definition 仅为可重建 projection（active）
+- ADR-0112 — MV 运行态为何只属于当前进程、StateStore为何只保留 lake-source Accelerator（active）
 
 #### 历史
 
 - ADR-0019 — INSERT application flow 为何由 frontend 拥有、core 只保留过渡性 typed engine port（superseded by ADR-0021）
-- ADR-0036 — MV refresh 为什么由Frontend拥有 lifecycle，并以 provider-neutral committed version 保持receipt隔离（superseded → ADR-0104）
-- ADR-0037 — 历史 MV refresh 为什么只能跨 incarnation 做 lake inspection 与 guarded cleanup（superseded → ADR-0104）
-- ADR-0064 — MV publication 为何需要 lake 上专用的 fence ref，并在推进 main 的同一 commit 中做四方 exact 比较（superseded → ADR-0104）
+- ADR-0036 — MV refresh 为什么由Frontend拥有 lifecycle，并以 provider-neutral committed version 保持receipt隔离（superseded → ADR-0110）
+- ADR-0037 — 历史 MV refresh 为什么只能跨 incarnation 做 lake inspection 与 guarded cleanup（superseded → ADR-0110）
+- ADR-0064 — MV publication 为何需要 lake 上专用的 fence ref，并在推进 main 的同一 commit 中做四方 exact 比较（superseded → ADR-0110）
+- ADR-0038 — Frontend 为何拥有 MV background worker lifecycle 与 per-target activity gate（superseded → ADR-0112）
+- ADR-0096 — MV refresh 所有权为何按 target 上锁、且必须在每个事务内校验（superseded → ADR-0112）
+- ADR-0075 — ledger 丢失后 MV attempt 为何以 lake-first 有界发现 + 保守分类收敛，而非按时间/ID 猜 winner（superseded → ADR-0112）
+- ADR-0109 — MV lake descriptor 为何是 desired semantics 的重建 authority，StateStore definition 仅为可重建 projection（superseded → ADR-0112）
 
 ### table-maintenance
 
@@ -288,16 +304,16 @@ durable truth；单 FE 恢复与未来多 FE lease/fence/takeover 分阶段决�
 fallback 模糊 owner 和故障语义。
 
 - ADR-0083 — 表维护 execution port 为何必须随 query assembly 归 Frontend，不能以 Core cohort bridge 留存（active）
-- ADR-0104 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
-- ADR-0109 — Frontend maintenance/statistics job 为何是 ProcessRuntime，而 GC first-observation 是 Accelerator（active）
+- ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
+- ADR-0111 — Frontend maintenance/statistics job 为何是 ProcessRuntime，而 GC first-observation 是 Accelerator（active）
 - ADR-0057 — MV 维护事实为何按「是否需要 provider runtime IO」切成观测口投影与 SPI capability 两条通道（active）
 
 #### 历史
 
 - ADR-0009 — 表维护为何由 frontend 拥有 application/lifecycle，并通过 core domain port 调用 connector truth（superseded → ADR-0083）
-- ADR-0035 — Connector orphan cleanup 为何使用 immutable manifest、逐 batch receipt 与 reconcile-only unknown（superseded → ADR-0104）
-- ADR-0065 — 同一张表的维护为何以单个 per-table lease attempt 为唯一派发权威、并在同事务内校验 fence（superseded → ADR-0109）
-- ADR-0067 — 收敛已死 generation 的维护为何是独立 provider capability，而不是放宽 exact-generation reconcile（superseded → ADR-0109）
+- ADR-0035 — Connector orphan cleanup 为何使用 immutable manifest、逐 batch receipt 与 reconcile-only unknown（superseded → ADR-0110）
+- ADR-0065 — 同一张表的维护为何以单个 per-table lease attempt 为唯一派发权威、并在同事务内校验 fence（superseded → ADR-0111）
+- ADR-0067 — 收敛已死 generation 的维护为何是独立 provider capability，而不是放宽 exact-generation reconcile（superseded → ADR-0111）
 
 ### crate-boundary
 
@@ -310,15 +326,16 @@ fallback 模糊 owner 和故障语义。
 - ADR-0058 — 架构隔离为何由 crate 边界强制，而不用硬编码的 source-shape guard（active）
 - ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active）
 - ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active）
-- ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（active）
+- ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（active）
 - ADR-0093 — StateStore provider 为何作为 leaf crate、Frontend 直接拥有 consumer runtime（active）
 - ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
-- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
+- ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 
 #### 历史
 
 - ADR-0098 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（superseded → ADR-0106）
 - ADR-0099 — 聚合 Core 退场后为何按真实 owner 物理切断依赖（superseded → ADR-0108）
+- ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
 
 ### configuration
 
@@ -328,7 +345,7 @@ debug/test 开关归启动进程环境。跨域 wire section 不因名字相似�
 
 - ADR-0087 — 进程 data runtime 为何由 Server 创建并经 role-local adapter 注入 FE/BE（active）
 - ADR-0107 — 静态 startup secret 为何由 Server exact resolve，并向 provider 投影 direct credential（active）
-- ADR-0108 — native FE/BE role launch、management surface 与双配置 all-in-one 为何保持同一启动路径（active）
+- ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 
 #### 历史
 

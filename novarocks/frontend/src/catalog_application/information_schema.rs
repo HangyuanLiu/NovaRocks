@@ -22,7 +22,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_parser::{ast, printer};
 
-use crate::mv::domain::repository::MvRepository;
+use crate::mv::domain::readiness::MvReadinessPort;
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::runtime::statement_result::StatementResult;
 
@@ -74,12 +74,10 @@ impl InfoColumn {
     }
 }
 
-/// The materialized-views virtual table needs only the durable MV repository.
-///
-/// Taking that leaf port directly keeps this read-only projection independent
-/// of whichever capability value composed the query.
+/// The materialized-views virtual table consumes only ready Accelerator
+/// projections, never a retained row from a quarantined lake package.
 pub fn try_query_materialized_views(
-    mv_repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
     query: &ast::Query,
 ) -> Result<Option<StatementResult>, String> {
     let ast::SetExpr::Select(select) = query.body.as_ref() else {
@@ -93,7 +91,7 @@ pub fn try_query_materialized_views(
     }
 
     let projection = projection_columns(select)?;
-    let mut rows = materialized_view_rows(mv_repository)?;
+    let mut rows = materialized_view_rows(readiness)?;
     if let Some(selection) = select.selection.as_ref() {
         let mut filtered = Vec::with_capacity(rows.len());
         for row in rows {
@@ -110,13 +108,14 @@ pub fn try_query_materialized_views(
 }
 
 fn materialized_view_rows(
-    mv_repository: &dyn MvRepository,
+    readiness: &MvReadinessPort,
 ) -> Result<Vec<MaterializedViewInfoRow>, String> {
-    let definitions = mv_repository
-        .list_definitions()
+    let projections = readiness
+        .list_ready_projections()
         .map_err(|e| format!("load materialized view metadata failed: {e}"))?;
     let mut rows = Vec::new();
-    for mv in &definitions {
+    for projection in &projections {
+        let mv = &projection.definition;
         if mv.storage_engine.eq_ignore_ascii_case("iceberg") {
             let (Some(table_schema), Some(target_table)) =
                 (mv.target_namespace.clone(), mv.target_table.clone())

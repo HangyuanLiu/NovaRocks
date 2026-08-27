@@ -137,8 +137,8 @@ Deployable role configuration is explicit. Use the two templates as a pair:
   connector execution binding.
 
 Both files must contain `[cluster].role`; the command line asserts that role
-and never changes it. A frontend role uses `[state_store]` for durable backend
-membership. A minimal FE outline is:
+and never changes it. A frontend role uses `[state_store]` for durable control-plane
+state, never backend membership. A minimal FE outline is:
 
 ```toml
 [state_store]
@@ -147,13 +147,16 @@ path = "meta/frontend-state.sqlite"
 cluster_id = "local-cluster"
 deployment_owner = "fe-1"
 
+[native_trust]
+deployment_id = "analytics-prod"
+shared_secret = "${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
+
 [server]
 grpc_port = 9080
 http_port = 8040
 
 [cluster]
 role = "fe"
-backends = ["127.0.0.1:9081"]
 
 [standalone_server]
 mysql_port = 9030
@@ -166,13 +169,26 @@ access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
 enable_path_style_access = true
 ```
 
-`[state_store]` is the frontend-owned durable control-plane store. Persistent
+`[state_store]` is the frontend-owned durable control-plane store, not a backend
+membership registry. Every BE self-registers to the FE native endpoint and is
+eligible only after its authenticated announce and FE-pull heartbeat agree on its
+process identity. Persistent
 user tables belong to explicitly created external Iceberg catalogs;
 `[connector.object_store]` supplies process-local object-store credentials for
 connector execution and does not create a native internal table store.
 Secret-bearing scalars may be literal for local development or an exact
 `${ENV:VAR}` reference. References are resolved once by Server startup; missing,
 empty, malformed, and non-UTF-8 values fail startup without exposing the value.
+
+`[native_trust]` is mandatory in every deployable FE/BE configuration. Its
+shared secret authenticates every Native RPC in all three directions (FE→BE,
+BE→BE, BE→FE); it is not SQL authorization, backend membership, or a message
+MAC. Omitting `[native_trust.transport]` deliberately selects authenticated
+plaintext h2c for a trusted network. Select `automatic` or `pem` to add the
+fixed TLS 1.3/h2 layer; JWT authentication remains mandatory in either TLS
+mode. See the [Native trust deployment guide](docs/guides/deployment/native-trust.md)
+for exact TLS configuration, rotation, and threat boundaries. MySQL and
+management HTTP are outside this NWT-3 configuration surface.
 
 ## Run
 

@@ -33,6 +33,7 @@ use novarocks_proto::lifecycle::QueryOptions;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
 use crate::catalog_application::query_materializer::build_catalog_service_provider;
+#[cfg(test)]
 use crate::mv::domain::repository::MvRepository;
 pub use novarocks_sql::planning::catalog::TableLookupMode;
 use novarocks_types::naming::normalize_identifier;
@@ -76,11 +77,11 @@ pub fn query_catalog_service_snapshot(
 /// candidates; it never gains connector-control access directly.
 pub fn freeze_query_mv_rewrite_definition_index(
     query_kernel: &domain::QueryPreparationKernel,
-    repository: &dyn MvRepository,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
 ) -> Result<novarocks_sql::compiler::MvRewriteDefinitionIndex, String> {
     crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-        repository,
+        readiness,
         query_kernel.connector_control().as_ref(),
         storage_observation,
     )
@@ -1064,7 +1065,7 @@ impl TestQueryCompiler {
                     current_catalog,
                     current_database,
                     &self.query,
-                    self.mv_repository.as_ref(),
+                    self.system_tables.mv_readiness().as_ref(),
                     self.mv_storage_observation.as_ref(),
                     &connector_context,
                     request_context.execution(),
@@ -1087,7 +1088,7 @@ impl TestQueryCompiler {
             novarocks_parser::ast::Statement::Query(query) => {
                 if let Some(result) =
                     crate::catalog_application::information_schema::try_query_materialized_views(
-                        self.system_tables.mv_repository().as_ref(),
+                        self.system_tables.mv_readiness().as_ref(),
                         &query,
                     )?
                 {
@@ -1136,7 +1137,7 @@ impl TestQueryCompiler {
                     current_catalog,
                     current_database,
                     &self.query,
-                    self.mv_repository.as_ref(),
+                    self.system_tables.mv_readiness().as_ref(),
                     self.mv_storage_observation.as_ref(),
                     &connector_context,
                     query_opts,
@@ -1189,7 +1190,7 @@ impl TestQueryCompiler {
                 current_catalog,
                 current_database,
                 &self.query,
-                self.mv_repository.as_ref(),
+                self.system_tables.mv_readiness().as_ref(),
                 self.mv_storage_observation.as_ref(),
                 connector_context,
                 Some(query_options_for_explain_analyze(query_opts)),
@@ -1243,6 +1244,9 @@ fn test_request_context_with_role(
     };
     use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
     use crate::common::query_cancellation::QueryCancellationSource;
+    use novarocks_proto::lifecycle::QueryControlEndpoint;
+    use novarocks_proto::membership::BackendProcessDescriptor;
+    use novarocks_types::BackendProcessId;
 
     let cancellation = QueryCancellationSource::new();
     RequestContext::new(
@@ -1260,8 +1264,14 @@ fn test_request_context_with_role(
                 0,
                 vec![LiveBackendTarget::new(
                     0,
-                    "127.0.0.1:9030".parse().expect("loopback test backend"),
-                    1,
+                    BackendProcessDescriptor::new(
+                        BackendProcessId::new_v7(),
+                        QueryControlEndpoint::new("127.0.0.1", 9030)
+                            .expect("valid loopback endpoint"),
+                        "test-deployment",
+                        "test-build",
+                    )
+                    .expect("valid test descriptor"),
                 )],
             )
             .expect("non-empty test topology"),
@@ -1644,24 +1654,43 @@ impl PreparedDmlWriteAssembly {
         &self.encoding
     }
 
-    pub(crate) fn finish(
+    /// Consume this one-shot assembly into its exact distributed write
+    /// request. The caller may submit it directly or hand it to the
+    /// statement-owned raw retry controller; in either case the native bundle
+    /// must match this round's encoding provenance.
+    pub(crate) fn into_request(
         self,
         native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    ) -> Result<
+        (
+            crate::query_execution::service::QueryExecutionService,
+            crate::query_execution::contract::DistributedQueryRequest,
+        ),
+        String,
+    > {
         if !self.encoding.matches_native_attachment(&native_bundle) {
             return Err(
                 "native fragment bundle does not match the sealed DML encoding input".into(),
             );
         }
         let (_, prepared) = self.encoding.into_parts();
-        execute_distributed_write_with_execution(
+        let request = build_distributed_write_request(
             &self.query_execution,
             prepared,
             native_bundle,
             self.query_options,
             &self.execution,
             self.connector_write,
-        )
+        )?;
+        Ok((self.query_execution, request))
+    }
+
+    pub(crate) fn finish(
+        self,
+        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
+    ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+        let (query_execution, request) = self.into_request(native_bundle)?;
+        execute_distributed_write_request(&query_execution, request)
     }
 }
 
@@ -2154,7 +2183,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     current_catalog: Option<&str>,
     current_database: &str,
     query_kernel: &domain::QueryPreparationKernel,
-    mv_repository: &dyn crate::mv::domain::repository::MvRepository,
+    mv_readiness: &crate::mv::domain::readiness::MvReadinessPort,
     mv_storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     query_opts: Option<QueryOptions>,
@@ -2178,18 +2207,17 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     // MV rewrite is an optional SQL optimization. An application composition
     // without an MV repository supplies no snapshot; a repository that is
     // available but fails to freeze remains a planning error.
-    let mv_definitions =
-        if allow_mv_rewrite_candidates && mv_repository.availability().is_available() {
-            Some(
-                crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-                    mv_repository,
-                    query_kernel.connector_control().as_ref(),
-                    mv_storage_observation,
-                )?,
-            )
-        } else {
-            None
-        };
+    let mv_definitions = if allow_mv_rewrite_candidates {
+        Some(
+            crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
+                mv_readiness,
+                query_kernel.connector_control().as_ref(),
+                mv_storage_observation,
+            )?,
+        )
+    } else {
+        None
+    };
     let distributed_intent = match &intent {
         novarocks_sql::compiler::SqlCompileIntent::Explain { analyze: true, .. } => {
             crate::query_execution::contract::DistributedQueryIntent::Profile
@@ -2268,7 +2296,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     current_catalog: Option<&str>,
     current_database: &str,
     query_kernel: &domain::QueryPreparationKernel,
-    mv_repository: &dyn crate::mv::domain::repository::MvRepository,
+    mv_readiness: &crate::mv::domain::readiness::MvReadinessPort,
     mv_storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
@@ -2283,7 +2311,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
     let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     let mv_definitions =
         crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-            mv_repository,
+            mv_readiness,
             query_kernel.connector_control().as_ref(),
             mv_storage_observation,
         )?;
@@ -2382,6 +2410,25 @@ fn execute_distributed_write_with_execution(
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     connector_write: Option<DistributedConnectorWrite>,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
+    let request = build_distributed_write_request(
+        query_execution,
+        prepared,
+        native_bundle,
+        query_options,
+        execution,
+        connector_write,
+    )?;
+    execute_distributed_write_request(query_execution, request)
+}
+
+fn build_distributed_write_request(
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
+    query_options: Option<QueryOptions>,
+    execution: &crate::common::admitted_query_context::QueryExecutionContext,
+    connector_write: Option<DistributedConnectorWrite>,
+) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
         native_bundle,
@@ -2416,6 +2463,13 @@ fn execute_distributed_write_with_execution(
         }
         None => request,
     };
+    Ok(request)
+}
+
+fn execute_distributed_write_request(
+    query_execution: &crate::query_execution::service::QueryExecutionService,
+    request: crate::query_execution::contract::DistributedQueryRequest,
+) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     let (query_result, write_commit, write_abort, connector_completion) = query_execution
         .execute(request)
         .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)

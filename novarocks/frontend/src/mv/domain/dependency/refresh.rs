@@ -22,7 +22,7 @@ use crate::mv::domain::dependency::model::{
 use crate::mv::domain::model::{MvStorageEngine, MvTarget};
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::persistence::dependency::stored_definition_dependency_ref;
-use crate::mv::domain::repository::MvRepository;
+use crate::mv::domain::readiness::MvReadinessPort;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvRefreshDependencyStep {
@@ -79,21 +79,22 @@ pub(crate) fn refresh_step_for_dependency_object(
     })
 }
 
-/// Resolves the required upstream MV refresh order from persisted dependency
+/// Resolves the required upstream MV refresh order from accelerator dependency
 /// edges. The caller owns refresh admission; Core returns only domain steps.
-pub fn build_upstream_refresh_steps_with_repository(
-    repository: &dyn MvRepository,
+pub(crate) fn build_upstream_refresh_steps_with_readiness(
+    readiness: &MvReadinessPort,
     requested: &MvDependencyObjectRef,
 ) -> Result<Vec<MvRefreshDependencyStep>, String> {
-    let definitions = repository
-        .list_definitions()
-        .map_err(|e| format!("load MV definitions for refresh graph failed: {e}"))?;
+    let projections = readiness
+        .list_ready_projections()
+        .map_err(|e| format!("load MV projections for refresh graph failed: {e}"))?;
 
     let mut edges = Vec::new();
-    for definition in definitions {
+    for projection in projections {
+        let definition = projection.definition.clone();
         let target = stored_definition_dependency_ref_for_iceberg(&definition)?;
-        let upstream_mvs = repository
-            .list_dependencies_by_downstream(definition.mv_id)
+        let upstream_mvs = readiness
+            .list_ready_dependencies_by_downstream(&projection)
             .map_err(|e| format!("load MV dependencies for refresh graph failed: {e}"))?
             .into_iter()
             .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)

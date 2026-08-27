@@ -24,8 +24,8 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use once_cell::sync::Lazy;
 use prometheus::{
-    Encoder, Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry,
-    TextEncoder,
+    Encoder, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry, TextEncoder,
 };
 
 pub(crate) mod dml_publication;
@@ -51,23 +51,137 @@ static HEARTBEAT_RTT_SECONDS: Lazy<Histogram> = Lazy::new(|| {
     .expect("register novarocks_heartbeat_rtt_seconds")
 });
 
-static LIVE_BACKENDS: Lazy<IntGauge> = Lazy::new(|| {
+static BACKEND_REGISTRY_ENTRIES: Lazy<IntGauge> = Lazy::new(|| {
     IntGauge::with_opts(Opts::new(
-        "novarocks_live_backends",
-        "Number of live backends in the FE registry.",
+        "novarocks_backend_registry_entries",
+        "Number of BE process descriptors retained by the FE runtime registry.",
     ))
-    .expect("register novarocks_live_backends")
+    .expect("register novarocks_backend_registry_entries")
 });
 
-static BACKENDS_BY_STATE: Lazy<IntGaugeVec> = Lazy::new(|| {
+static BACKEND_ANNOUNCE_LEASE_VALID: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(Opts::new(
+        "novarocks_backend_announce_lease_valid",
+        "Number of BE entries with a valid self-registration lease.",
+    ))
+    .expect("register novarocks_backend_announce_lease_valid")
+});
+
+static BACKEND_IDENTITY_VERIFIED: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(Opts::new(
+        "novarocks_backend_identity_verified",
+        "Number of BE entries whose exact descriptor was verified by FE pull heartbeat.",
+    ))
+    .expect("register novarocks_backend_identity_verified")
+});
+
+static BACKEND_REPORTED_STATE: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new(
-            "novarocks_backends",
-            "Number of backends by registry state.",
+            "novarocks_backend_reported_state",
+            "Number of BE entries by self-reported process state.",
         ),
         &["state"],
     )
-    .expect("register novarocks_backends")
+    .expect("register novarocks_backend_reported_state")
+});
+
+static BACKEND_COMPATIBILITY: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_backend_compatibility",
+            "Number of BE entries by FE compatibility result.",
+        ),
+        &["state"],
+    )
+    .expect("register novarocks_backend_compatibility")
+});
+
+static BACKEND_ENDPOINT_OWNERSHIP: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_backend_endpoint_ownership",
+            "Number of BE entries by verified endpoint ownership.",
+        ),
+        &["state"],
+    )
+    .expect("register novarocks_backend_endpoint_ownership")
+});
+
+static BACKEND_ELIGIBLE: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(Opts::new(
+        "novarocks_backend_eligible",
+        "Number of BE entries eligible for new query admission.",
+    ))
+    .expect("register novarocks_backend_eligible")
+});
+
+static BACKEND_TOPOLOGY_REVISION: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(Opts::new(
+        "novarocks_backend_topology_revision",
+        "Latest FE topology revision for the eligible BE set.",
+    ))
+    .expect("register novarocks_backend_topology_revision")
+});
+
+static BACKEND_ANNOUNCE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_announce_total",
+            "Total BE self-registration announce outcomes observed by FE.",
+        ),
+        &["outcome"],
+    )
+    .expect("register novarocks_backend_announce_total")
+});
+
+static BACKEND_HEARTBEAT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_heartbeat_total",
+            "Total FE-pull BE heartbeat outcomes.",
+        ),
+        &["outcome"],
+    )
+    .expect("register novarocks_backend_heartbeat_total")
+});
+
+static PRE_READY_REPLAN_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "novarocks_pre_ready_replan_total",
+            "Total pre-ControlReady whole-round replans by typed topology reason.",
+        ),
+        &["reason"],
+    )
+    .expect("register novarocks_pre_ready_replan_total")
+});
+
+static PRE_READY_EFFECT_GATE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "novarocks_pre_ready_effect_gate_total",
+            "Total pre-ControlReady effect-gate decisions.",
+        ),
+        &["outcome"],
+    )
+    .expect("register novarocks_pre_ready_effect_gate_total")
+});
+
+static WAITING_FOR_BACKEND_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    Histogram::with_opts(HistogramOpts::new(
+        "novarocks_waiting_for_backend_seconds",
+        "Time spent waiting for a newer eligible backend topology revision.",
+    ))
+    .expect("register novarocks_waiting_for_backend_seconds")
+});
+
+static PRE_READY_REPLAN_SECONDS: Lazy<Histogram> = Lazy::new(|| {
+    Histogram::with_opts(HistogramOpts::new(
+        "novarocks_pre_ready_replan_seconds",
+        "Time spent rebuilding one replacement distributed round.",
+    ))
+    .expect("register novarocks_pre_ready_replan_seconds")
 });
 static FRONTEND_QUERY_LIFECYCLE_ATTEMPTS: Lazy<IntGauge> = Lazy::new(|| {
     IntGauge::with_opts(Opts::new(
@@ -110,6 +224,19 @@ static FRONTEND_QUERY_LIFECYCLE_LATENCY: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("register novarocks_frontend_query_lifecycle_latency_micros")
 });
 
+/// Bounded, role-local Native transport rejections. The label names the FE
+/// listener family and never contains a caller, endpoint, token, or error.
+static NATIVE_TRUST_TRANSPORT_REJECTIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "novarocks_native_trust_transport_rejections_total",
+            "Native listener connections rejected before Frontend RPC dispatch.",
+        ),
+        &["listener"],
+    )
+    .expect("register novarocks_native_trust_transport_rejections_total")
+});
+
 /// Explicit collector registry owned by one Frontend management host.
 ///
 /// This keeps FE's metrics surface role-local even when a process supervises
@@ -125,12 +252,25 @@ impl FrontendMetricsRegistry {
         for collector in [
             Box::new(FRAGMENT_SCHEDULED_TOTAL.clone()) as Box<dyn prometheus::core::Collector>,
             Box::new(HEARTBEAT_RTT_SECONDS.clone()),
-            Box::new(LIVE_BACKENDS.clone()),
-            Box::new(BACKENDS_BY_STATE.clone()),
+            Box::new(BACKEND_REGISTRY_ENTRIES.clone()),
+            Box::new(BACKEND_ANNOUNCE_LEASE_VALID.clone()),
+            Box::new(BACKEND_IDENTITY_VERIFIED.clone()),
+            Box::new(BACKEND_REPORTED_STATE.clone()),
+            Box::new(BACKEND_COMPATIBILITY.clone()),
+            Box::new(BACKEND_ENDPOINT_OWNERSHIP.clone()),
+            Box::new(BACKEND_ELIGIBLE.clone()),
+            Box::new(BACKEND_TOPOLOGY_REVISION.clone()),
+            Box::new(BACKEND_ANNOUNCE_TOTAL.clone()),
+            Box::new(BACKEND_HEARTBEAT_TOTAL.clone()),
+            Box::new(PRE_READY_REPLAN_TOTAL.clone()),
+            Box::new(PRE_READY_EFFECT_GATE_TOTAL.clone()),
+            Box::new(WAITING_FOR_BACKEND_SECONDS.clone()),
+            Box::new(PRE_READY_REPLAN_SECONDS.clone()),
             Box::new(FRONTEND_QUERY_LIFECYCLE_ATTEMPTS.clone()),
             Box::new(FRONTEND_QUERY_LIFECYCLE_INIT.clone()),
             Box::new(FRONTEND_QUERY_LIFECYCLE_CONTROL.clone()),
             Box::new(FRONTEND_QUERY_LIFECYCLE_LATENCY.clone()),
+            Box::new(NATIVE_TRUST_TRANSPORT_REJECTIONS.clone()),
         ] {
             registry
                 .register(collector)
@@ -155,30 +295,91 @@ pub(crate) fn observe_fragments_scheduled(count: usize) {
 pub fn observe_backend_heartbeat_rtt(duration: Duration) {
     Lazy::force(&HEARTBEAT_RTT_SECONDS).observe(duration.as_secs_f64());
 }
-/// Publishes already-counted backend registry states as neutral scalars.
+
+pub(crate) fn observe_native_trust_transport_rejection(listener: &'static str) {
+    NATIVE_TRUST_TRANSPORT_REJECTIONS
+        .with_label_values(&[listener])
+        .inc();
+}
+
+pub(crate) fn record_backend_announce(outcome: &'static str) {
+    BACKEND_ANNOUNCE_TOTAL.with_label_values(&[outcome]).inc();
+}
+
+pub(crate) fn record_backend_heartbeat(outcome: &'static str) {
+    BACKEND_HEARTBEAT_TOTAL.with_label_values(&[outcome]).inc();
+}
+
+pub(crate) fn record_pre_ready_replan(reason: &'static str) {
+    PRE_READY_REPLAN_TOTAL.with_label_values(&[reason]).inc();
+}
+
+pub(crate) fn record_pre_ready_effect_gate(outcome: &'static str) {
+    PRE_READY_EFFECT_GATE_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+pub(crate) fn observe_waiting_for_backend(duration: Duration) {
+    WAITING_FOR_BACKEND_SECONDS.observe(duration.as_secs_f64());
+}
+
+pub(crate) fn observe_pre_ready_replan(duration: Duration) {
+    PRE_READY_REPLAN_SECONDS.observe(duration.as_secs_f64());
+}
+/// Publishes already-counted backend registry facts as neutral scalars.
 ///
-/// Backend membership authority is owned outside this module (`ADR-0013`), so
-/// the metrics surface deliberately names no membership type: it accepts the
-/// counts and owns only the `novarocks_backends` label set they map onto. That
-/// keeps the membership owner and this listener independently relocatable.
+/// The runtime registry remains the membership owner. This module owns only
+/// the stable metric names and label sets, so observability does not become a
+/// second membership authority.
 pub(crate) fn publish_backend_topology_metrics(
-    registering: usize,
-    live: usize,
-    incompatible: usize,
-    lost: usize,
-    decommissioning: usize,
+    entries: usize,
+    announce_lease_valid: usize,
+    identity_verified: usize,
+    reported_running: usize,
+    reported_draining: usize,
+    compatibility_compatible: usize,
+    compatibility_incompatible: usize,
+    compatibility_unknown: usize,
+    endpoint_owned: usize,
+    endpoint_unowned: usize,
+    eligible: usize,
+    revision: u64,
 ) {
-    Lazy::force(&LIVE_BACKENDS).set(live as i64);
-    for (state_name, count) in [
-        ("registering", registering),
-        ("live", live),
-        ("incompatible", incompatible),
-        ("lost", lost),
-        ("decommissioning", decommissioning),
+    Lazy::force(&BACKEND_REGISTRY_ENTRIES).set(entries as i64);
+    Lazy::force(&BACKEND_ANNOUNCE_LEASE_VALID).set(announce_lease_valid as i64);
+    Lazy::force(&BACKEND_IDENTITY_VERIFIED).set(identity_verified as i64);
+    Lazy::force(&BACKEND_ELIGIBLE).set(eligible as i64);
+    Lazy::force(&BACKEND_TOPOLOGY_REVISION).set(revision as i64);
+    for (metric, states) in [
+        (
+            &*BACKEND_REPORTED_STATE,
+            [
+                ("running", reported_running),
+                ("draining", reported_draining),
+                ("unspecified", 0),
+            ],
+        ),
+        (
+            &*BACKEND_COMPATIBILITY,
+            [
+                ("compatible", compatibility_compatible),
+                ("incompatible", compatibility_incompatible),
+                ("unknown", compatibility_unknown),
+            ],
+        ),
+        (
+            &*BACKEND_ENDPOINT_OWNERSHIP,
+            [
+                ("owned", endpoint_owned),
+                ("unowned", endpoint_unowned),
+                ("unknown", 0),
+            ],
+        ),
     ] {
-        BACKENDS_BY_STATE
-            .with_label_values(&[state_name])
-            .set(count as i64);
+        for (state_name, count) in states {
+            metric.with_label_values(&[state_name]).set(count as i64);
+        }
     }
 }
 pub fn publish_frontend_query_lifecycle_metrics(snapshot: FrontendQueryLifecycleMetricsSnapshot) {
@@ -341,8 +542,20 @@ pub(crate) fn render_metrics_json(registry: &FrontendMetricsRegistry) -> Result<
 fn refresh_frontend_gauges() {
     Lazy::force(&FRAGMENT_SCHEDULED_TOTAL);
     Lazy::force(&HEARTBEAT_RTT_SECONDS);
-    Lazy::force(&LIVE_BACKENDS);
-    Lazy::force(&BACKENDS_BY_STATE);
+    Lazy::force(&BACKEND_REGISTRY_ENTRIES);
+    Lazy::force(&BACKEND_ANNOUNCE_LEASE_VALID);
+    Lazy::force(&BACKEND_IDENTITY_VERIFIED);
+    Lazy::force(&BACKEND_REPORTED_STATE);
+    Lazy::force(&BACKEND_COMPATIBILITY);
+    Lazy::force(&BACKEND_ENDPOINT_OWNERSHIP);
+    Lazy::force(&BACKEND_ELIGIBLE);
+    Lazy::force(&BACKEND_TOPOLOGY_REVISION);
+    Lazy::force(&BACKEND_ANNOUNCE_TOTAL);
+    Lazy::force(&BACKEND_HEARTBEAT_TOTAL);
+    Lazy::force(&PRE_READY_REPLAN_TOTAL);
+    Lazy::force(&PRE_READY_EFFECT_GATE_TOTAL);
+    Lazy::force(&WAITING_FOR_BACKEND_SECONDS);
+    Lazy::force(&PRE_READY_REPLAN_SECONDS);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_ATTEMPTS);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_INIT);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_CONTROL);
@@ -354,8 +567,30 @@ fn refresh_frontend_gauges() {
 /// Make the documented FE metric families observable before their first event
 /// without resetting values already published by their application owner.
 fn ensure_frontend_metric_label_families() {
-    for state in ["registering", "live", "lost", "decommissioning"] {
-        let _ = BACKENDS_BY_STATE.get_metric_with_label_values(&[state]);
+    for state in ["running", "draining", "unspecified"] {
+        let _ = BACKEND_REPORTED_STATE.get_metric_with_label_values(&[state]);
+    }
+    for state in ["compatible", "incompatible", "unknown"] {
+        let _ = BACKEND_COMPATIBILITY.get_metric_with_label_values(&[state]);
+    }
+    for state in ["owned", "unowned", "unknown"] {
+        let _ = BACKEND_ENDPOINT_OWNERSHIP.get_metric_with_label_values(&[state]);
+    }
+    for outcome in ["accepted", "rejected"] {
+        let _ = BACKEND_ANNOUNCE_TOTAL.get_metric_with_label_values(&[outcome]);
+    }
+    for outcome in ["verified", "identity_mismatch", "unknown_process", "failed"] {
+        let _ = BACKEND_HEARTBEAT_TOTAL.get_metric_with_label_values(&[outcome]);
+    }
+    for reason in [
+        "backend_draining",
+        "backend_process_mismatch",
+        "backend_not_eligible",
+    ] {
+        let _ = PRE_READY_REPLAN_TOTAL.get_metric_with_label_values(&[reason]);
+    }
+    for outcome in ["permitted", "rejected"] {
+        let _ = PRE_READY_EFFECT_GATE_TOTAL.get_metric_with_label_values(&[outcome]);
     }
     for outcome in [
         "applied",
@@ -408,8 +643,14 @@ mod tests {
         let body = render_metrics(registry.as_ref()).expect("render metrics");
         assert!(body.contains("novarocks_fragment_scheduled_total"));
         assert!(body.contains("novarocks_heartbeat_rtt_seconds"));
-        assert!(body.contains("novarocks_live_backends"));
-        assert!(body.contains("novarocks_backends"));
+        assert!(body.contains("novarocks_backend_registry_entries"));
+        assert!(body.contains("novarocks_backend_eligible"));
+        assert!(body.contains("novarocks_backend_announce_total"));
+        assert!(body.contains("novarocks_backend_heartbeat_total"));
+        assert!(body.contains("novarocks_pre_ready_replan_total"));
+        assert!(body.contains("novarocks_pre_ready_effect_gate_total"));
+        assert!(body.contains("novarocks_waiting_for_backend_seconds"));
+        assert!(body.contains("novarocks_pre_ready_replan_seconds"));
     }
 
     #[test]
@@ -448,32 +689,40 @@ mod tests {
 
     #[test]
     fn backend_topology_gauges_preserve_the_last_nonzero_frontend_snapshot() {
-        publish_backend_topology_metrics(1, 2, 3, 4, 5);
+        publish_backend_topology_metrics(11, 7, 6, 5, 4, 3, 2, 1, 9, 2, 5, 42);
 
         let registry = frontend_registry();
         let first = render_metrics(registry.as_ref()).expect("render first metrics snapshot");
         let second = render_metrics(registry.as_ref()).expect("render second metrics snapshot");
 
         for body in [&first, &second] {
-            assert!(body.contains("novarocks_live_backends 2"), "{body}");
             assert!(
-                body.contains("novarocks_backends{state=\"registering\"} 1"),
+                body.contains("novarocks_backend_registry_entries 11"),
                 "{body}"
             );
             assert!(
-                body.contains("novarocks_backends{state=\"live\"} 2"),
+                body.contains("novarocks_backend_announce_lease_valid 7"),
                 "{body}"
             );
             assert!(
-                body.contains("novarocks_backends{state=\"incompatible\"} 3"),
+                body.contains("novarocks_backend_identity_verified 6"),
                 "{body}"
             );
             assert!(
-                body.contains("novarocks_backends{state=\"lost\"} 4"),
+                body.contains("novarocks_backend_reported_state{state=\"running\"} 5"),
                 "{body}"
             );
             assert!(
-                body.contains("novarocks_backends{state=\"decommissioning\"} 5"),
+                body.contains("novarocks_backend_compatibility{state=\"compatible\"} 3"),
+                "{body}"
+            );
+            assert!(
+                body.contains("novarocks_backend_endpoint_ownership{state=\"owned\"} 9"),
+                "{body}"
+            );
+            assert!(body.contains("novarocks_backend_eligible 5"), "{body}");
+            assert!(
+                body.contains("novarocks_backend_topology_revision 42"),
                 "{body}"
             );
         }

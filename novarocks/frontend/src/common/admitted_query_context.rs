@@ -26,7 +26,7 @@ pub use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::ClusterRole;
 
 /// Startup-frozen temporal boundary shared by every lake publication attempt.
-// Design: ADR-0104 (docs/adr/ADR-0104-lake-publication-crash-only-contract.md)
+// Design: ADR-0110 (docs/adr/ADR-0110-lake-publication-crash-only-contract.md)
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LakePublicationRuntimePolicy {
     max_attempt_duration: Duration,
@@ -157,6 +157,76 @@ pub struct RequestSessionContext {
     optimizer_settings: SessionOptimizerSettings,
 }
 
+/// Statement-stable inputs retained while a distributed statement may need a
+/// new topology round.  It deliberately owns no backend snapshot: every
+/// round derives a fresh [`QueryExecutionContext`] from this immutable
+/// admission boundary.
+///
+/// The existing [`RequestContext`] remains the narrow projection consumed by
+/// compiler and coordinator code.  It is therefore impossible for a caller
+/// to manufacture a later round by modifying an already prepared request.
+#[derive(Clone)]
+pub struct StatementAdmissionContext {
+    session: RequestSessionContext,
+    role: ClusterRole,
+    deadline: Option<Instant>,
+    cancellation: QueryCancellationView,
+}
+
+impl StatementAdmissionContext {
+    pub fn new(
+        current_catalog: Option<String>,
+        current_database: String,
+        role: ClusterRole,
+        deadline: Option<Instant>,
+        cancellation: QueryCancellationView,
+        optimizer_settings: SessionOptimizerSettings,
+    ) -> Self {
+        Self {
+            session: RequestSessionContext::new(
+                current_catalog,
+                current_database,
+                optimizer_settings,
+            ),
+            role,
+            deadline,
+            cancellation,
+        }
+    }
+
+    /// Derive the compiler/coordinator projection for exactly one frozen
+    /// topology round.  Semantic session state, deadline, and cancellation
+    /// identity remain those admitted for the original statement.
+    pub fn for_topology(&self, topology: BackendTopologySnapshot) -> RequestContext {
+        RequestContext::new(
+            self.session.clone(),
+            QueryExecutionContext::new(
+                self.role,
+                topology,
+                self.deadline,
+                self.cancellation.clone(),
+                self.session.optimizer_settings().clone(),
+            ),
+        )
+    }
+
+    pub fn session(&self) -> &RequestSessionContext {
+        &self.session
+    }
+
+    pub const fn role(&self) -> ClusterRole {
+        self.role
+    }
+
+    pub const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    pub fn cancellation(&self) -> &QueryCancellationView {
+        &self.cancellation
+    }
+}
+
 impl RequestSessionContext {
     pub fn new(
         current_catalog: Option<String>,
@@ -264,21 +334,15 @@ impl RequestContext {
     /// A settings value of `None` means "no budget", which leaves optimizer
     /// costing on its profile default.
     pub fn admit(admission: RequestAdmission) -> Self {
-        let settings = admission.optimizer_settings;
-        Self::new(
-            RequestSessionContext::new(
-                admission.current_catalog,
-                admission.current_database,
-                settings.clone(),
-            ),
-            QueryExecutionContext::new(
-                admission.role,
-                admission.topology,
-                admission.deadline,
-                admission.cancellation,
-                settings,
-            ),
-        )
+        let statement = StatementAdmissionContext::new(
+            admission.current_catalog,
+            admission.current_database,
+            admission.role,
+            admission.deadline,
+            admission.cancellation,
+            admission.optimizer_settings,
+        );
+        statement.for_topology(admission.topology)
     }
 
     pub fn session(&self) -> &RequestSessionContext {
@@ -315,7 +379,9 @@ impl<'a> QueryPreparationContext<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use novarocks_proto::lifecycle::QueryControlEndpoint;
+    use novarocks_proto::membership::BackendProcessDescriptor;
+    use novarocks_types::BackendProcessId;
 
     use super::*;
     use crate::common::backend_topology::LiveBackendTarget;
@@ -361,8 +427,13 @@ mod tests {
             9,
             vec![LiveBackendTarget::new(
                 7,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9030),
-                2,
+                BackendProcessDescriptor::new(
+                    BackendProcessId::new_v7(),
+                    QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid loopback endpoint"),
+                    "test-deployment",
+                    "test-build",
+                )
+                .expect("valid test descriptor"),
             )],
         )
         .expect("valid snapshot");

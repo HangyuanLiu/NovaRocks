@@ -22,20 +22,14 @@
 //! candidate; it remains live until an operator can inspect it.
 
 use sha2::{Digest, Sha256};
+use std::str::FromStr;
 
-use crate::commit::mv_publication_fence::{
-    MV_PUBLICATION_FENCE_REF, observe_legacy_mv_publication_fence,
-};
 use crate::commit::write_fence::{WRITE_FENCE_REF_PREFIX, observe_fence};
 use crate::iceberg::spec::TableMetadata;
+use novarocks_spi::connector::LakePublicationId;
 
-pub(crate) const MV_STAGING_REF_PREFIX: &str = "__novarocks_mv_refresh_";
-const MV_REFRESH_ID_PROP: &str = "novarocks.mv.refresh_id";
-const MV_ID_PROP: &str = "novarocks.mv.id";
-const MV_REFRESH_TOKEN_PROP: &str = "novarocks.mv.refresh_token";
-const CURRENT_MV_PROVENANCE_VERSION: u16 = 1;
+const CURRENT_MV_PROVENANCE_VERSION: u16 = 2;
 const LEGACY_WRITE_FENCE_PROVENANCE_VERSION: u16 = 1;
-const LEGACY_MV_PUBLICATION_FENCE_PROVENANCE_VERSION: u16 = 1;
 const OWNED_REF_PROVENANCE_DOMAIN: &[u8] = b"novarocks.iceberg.owned-ref-gc.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,59 +65,27 @@ pub(crate) fn collect_owned_ref_candidates(
         if created_at_ms <= 0 || created_at_ms >= older_than_ms {
             continue;
         }
-        let provenance = if let Some(raw_refresh_id) = name.strip_prefix(MV_STAGING_REF_PREFIX) {
-            let Ok(refresh_id) = raw_refresh_id.parse::<i64>() else {
+        let provenance = if let Some(raw_publication_id) =
+            name.strip_prefix(crate::commit::MV_PUBLICATION_STAGING_REF_PREFIX)
+        {
+            let Ok(publication_id) = LakePublicationId::from_str(raw_publication_id) else {
                 continue;
             };
-            let props = &snapshot.summary().additional_properties;
-            let refresh_id_marker = props
-                .get(MV_REFRESH_ID_PROP)
-                .and_then(|value| value.parse::<i64>().ok())
-                .filter(|value| *value == refresh_id && *value > 0);
-            let mv_id = props
-                .get(MV_ID_PROP)
-                .and_then(|value| value.parse::<i64>().ok())
-                .filter(|value| *value > 0);
-            let token = props
-                .get(MV_REFRESH_TOKEN_PROP)
-                .filter(|value| valid_owned_identity(value));
-            match (refresh_id_marker, mv_id, token) {
-                (Some(refresh_id), Some(mv_id), Some(token)) => Some((
-                    CURRENT_MV_PROVENANCE_VERSION,
-                    vec![
-                        "mv".to_string(),
-                        refresh_id.to_string(),
-                        mv_id.to_string(),
-                        token.clone(),
-                    ],
-                )),
-                _ => None,
-            }
-        } else if name == MV_PUBLICATION_FENCE_REF {
-            observe_legacy_mv_publication_fence(metadata)
+            crate::commit::MvPublicationProvenanceV2::from_snapshot_summary(snapshot)
                 .ok()
                 .flatten()
-                .filter(|observed| {
-                    observed.snapshot_id == reference.snapshot_id
-                        && uuid::Uuid::parse_str(&observed.marker.target_table_uuid)
-                            .is_ok_and(|target_table_uuid| target_table_uuid == metadata.uuid())
-                })
-                .map(|observed| {
-                    let marker = observed.marker;
-                    (
-                        LEGACY_MV_PUBLICATION_FENCE_PROVENANCE_VERSION,
-                        vec![
-                            "mv-publication-fence".to_string(),
-                            marker.fence_version.to_string(),
-                            marker.resource_digest,
-                            marker.target_table_uuid,
-                            marker.cluster_digest,
-                            marker.control_plane_incarnation.to_string(),
-                            marker.resource_epoch.to_string(),
-                            marker.token_digest,
-                            marker.operation_id,
-                        ],
-                    )
+                .filter(|provenance| provenance.publication_id == publication_id)
+                .and_then(|provenance| {
+                    provenance.content_hash().ok().map(|provenance_hash| {
+                        (
+                            CURRENT_MV_PROVENANCE_VERSION,
+                            vec![
+                                "mv".to_string(),
+                                publication_id.to_string(),
+                                provenance_hash,
+                            ],
+                        )
+                    })
                 })
         } else if let Some(operation_id) = name.strip_prefix(WRITE_FENCE_REF_PREFIX) {
             observe_fence(metadata, name)
@@ -312,36 +274,46 @@ mod tests {
         .metadata
     }
 
-    fn mv_marker(refresh_id: i64, mv_id: i64, token: &str) -> HashMap<String, String> {
-        HashMap::from([
-            (MV_REFRESH_ID_PROP.to_string(), refresh_id.to_string()),
-            (MV_ID_PROP.to_string(), mv_id.to_string()),
-            (MV_REFRESH_TOKEN_PROP.to_string(), token.to_string()),
-        ])
+    fn publication_id(suffix: u16) -> LakePublicationId {
+        LakePublicationId::from_str(&format!("01890f3c-4e70-7cc0-8000-{suffix:012x}"))
+            .expect("publication ID")
     }
 
-    fn legacy_mv_publication_fence_marker(
-        target_table_uuid: uuid::Uuid,
-    ) -> HashMap<String, String> {
-        HashMap::from([(
-            crate::commit::mv_publication_fence::MV_PUBLICATION_FENCE_MARKER_PROP.to_string(),
-            format!(
-                r#"{{"fence_version":1,"resource_digest":"{:064x}","target_table_uuid":"{}","cluster_digest":"{:064x}","control_plane_incarnation":7,"resource_epoch":11,"token_digest":"{:064x}","operation_id":"{:032x}"}}"#,
-                0xaaaau64, target_table_uuid, 0xbbbbu64, 0xccccu64, 0xddddu64,
-            ),
-        )])
+    fn mv_marker(publication_id: LakePublicationId, fingerprint: &str) -> HashMap<String, String> {
+        crate::commit::MvPublicationProvenanceV2 {
+            provenance_version: crate::commit::MV_PUBLICATION_PROVENANCE_VERSION,
+            publication_id,
+            technique: crate::commit::RefreshTechnique::Full,
+            bases: vec![crate::commit::ProvenanceBase {
+                table_fqn: "ice.db.base".to_string(),
+                uuid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+                from_snapshot: None,
+                to_snapshot: 1,
+            }],
+            definition_fingerprint: fingerprint.to_string(),
+            descriptor_properties_digest_base64: Some("descriptor-digest".to_string()),
+            rows: 1,
+        }
+        .to_summary_properties()
+        .expect("MV publication properties")
+        .into_iter()
+        .collect()
     }
 
     #[test]
     fn only_known_prefixes_are_owned() {
-        assert!(MV_STAGING_REF_PREFIX.starts_with("__novarocks_"));
+        assert!(crate::commit::MV_PUBLICATION_STAGING_REF_PREFIX.starts_with("__novarocks_"));
         assert!(WRITE_FENCE_REF_PREFIX.starts_with("novarocks-"));
     }
 
     #[test]
     fn mv_owned_ref_requires_strict_marker_and_freezes_full_provenance() {
-        let name = format!("{MV_STAGING_REF_PREFIX}41");
-        let metadata = metadata_with_branch(&name, 100, mv_marker(41, 9, "token-a"));
+        let publication_id = publication_id(0x41);
+        let name = format!(
+            "{}{publication_id}",
+            crate::commit::MV_PUBLICATION_STAGING_REF_PREFIX
+        );
+        let metadata = metadata_with_branch(&name, 100, mv_marker(publication_id, "definition-a"));
         let candidates = collect_owned_ref_candidates(&metadata, "db", "target", 101);
         assert_eq!(candidates.len(), 1);
         let expected = candidates.into_iter().next().expect("candidate");
@@ -357,32 +329,47 @@ mod tests {
                 CURRENT_MV_PROVENANCE_VERSION,
                 &[
                     "mv".to_string(),
-                    "41".to_string(),
-                    "9".to_string(),
-                    "token-b".to_string(),
+                    publication_id.to_string(),
+                    "different-provenance-hash".to_string(),
                 ],
             ),
             "the frozen proof must bind the full marker identity"
         );
 
-        let drifted = metadata_with_branch(&name, 100, mv_marker(41, 9, "token-b"));
+        let drifted = metadata_with_branch(&name, 100, mv_marker(publication_id, "definition-b"));
         assert!(
             !matches_owned_ref_candidate(&drifted, "db", "target", &expected),
             "a marker change must invalidate the frozen owned-ref proof"
         );
 
-        let malformed = metadata_with_branch(&name, 100, mv_marker(40, 9, "token-a"));
+        let malformed = metadata_with_branch(
+            &format!(
+                "{}not-a-v7-id",
+                crate::commit::MV_PUBLICATION_STAGING_REF_PREFIX
+            ),
+            100,
+            mv_marker(publication_id, "definition-a"),
+        );
         assert!(collect_owned_ref_candidates(&malformed, "db", "target", 101).is_empty());
-        let young = metadata_with_branch(&name, 101, mv_marker(41, 9, "token-a"));
+        let young = metadata_with_branch(&name, 101, mv_marker(publication_id, "definition-a"));
         assert!(collect_owned_ref_candidates(&young, "db", "target", 101).is_empty());
     }
 
     #[test]
     fn similar_prefix_without_a_complete_marker_is_never_owned() {
-        let name = format!("{MV_STAGING_REF_PREFIX}41");
-        let mut marker = mv_marker(41, 9, "");
-        marker.insert(MV_REFRESH_TOKEN_PROP.to_string(), "\u{7}".to_string());
-        let metadata = metadata_with_branch(&name, 100, marker);
+        let publication_id = publication_id(0x41);
+        let name = format!(
+            "{}{publication_id}",
+            crate::commit::MV_PUBLICATION_STAGING_REF_PREFIX
+        );
+        let metadata = metadata_with_branch(
+            &name,
+            100,
+            HashMap::from([(
+                crate::commit::MV_PUBLICATION_ID_PROP.to_string(),
+                publication_id.to_string(),
+            )]),
+        );
         assert!(collect_owned_ref_candidates(&metadata, "db", "target", 101).is_empty());
     }
 
@@ -445,51 +432,5 @@ mod tests {
         );
         let metadata = metadata_with_branch(&name, 100, unknown_version);
         assert!(collect_owned_ref_candidates(&metadata, "db", "target", 101).is_empty());
-    }
-
-    #[test]
-    fn legacy_mv_publication_fence_requires_the_exact_ref_head_and_target_table() {
-        let target_table_uuid = uuid::Uuid::from_u128(0x5eed);
-        let metadata = metadata_with_branch(
-            MV_PUBLICATION_FENCE_REF,
-            100,
-            legacy_mv_publication_fence_marker(target_table_uuid),
-        );
-        let candidates = collect_owned_ref_candidates(&metadata, "db", "target", 101);
-        assert_eq!(candidates.len(), 1);
-        let expected = candidates.into_iter().next().expect("candidate");
-        assert_eq!(expected.name, MV_PUBLICATION_FENCE_REF);
-        assert!(matches_owned_ref_candidate(
-            &metadata, "db", "target", &expected
-        ));
-
-        let mut drifted_marker = legacy_mv_publication_fence_marker(target_table_uuid);
-        let raw = drifted_marker
-            .get_mut(crate::commit::mv_publication_fence::MV_PUBLICATION_FENCE_MARKER_PROP)
-            .expect("marker");
-        *raw = raw.replacen(
-            &format!("{:032x}", 0xddddu64),
-            &format!("{:032x}", 0xeeeeu64),
-            1,
-        );
-        let drifted = metadata_with_branch(MV_PUBLICATION_FENCE_REF, 100, drifted_marker);
-        assert!(
-            !matches_owned_ref_candidate(&drifted, "db", "target", &expected),
-            "the marker identity, including token digest, must be frozen"
-        );
-
-        let wrong_table = metadata_with_branch(
-            MV_PUBLICATION_FENCE_REF,
-            100,
-            legacy_mv_publication_fence_marker(uuid::Uuid::from_u128(0xbeef)),
-        );
-        assert!(collect_owned_ref_candidates(&wrong_table, "db", "target", 101).is_empty());
-
-        let similarly_named = metadata_with_branch(
-            "__novarocks_mv_publication_fence_v1_other",
-            100,
-            legacy_mv_publication_fence_marker(target_table_uuid),
-        );
-        assert!(collect_owned_ref_candidates(&similarly_named, "db", "target", 101).is_empty());
     }
 }

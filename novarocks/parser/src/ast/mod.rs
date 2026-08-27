@@ -36,7 +36,7 @@ pub(crate) mod view;
 mod visit;
 mod window;
 
-pub use backend::{AddBackend, BackendStatement, DropBackend, ShowBackends};
+pub use backend::ShowBackends;
 pub use catalog::{
     CatalogProperty, CatalogStatement, CreateCatalog, CreateDatabase, DropCatalog, DropDatabase,
     DropTable, ShowCreateTable, TruncateTable,
@@ -118,7 +118,7 @@ use crate::Span;
 /// A top-level SQL statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
-    Backend(BackendStatement),
+    ShowBackends(ShowBackends),
     Statistics(StatisticsStatement),
     Catalog(CatalogStatement),
     Iceberg(IcebergStatement),
@@ -135,7 +135,7 @@ pub enum Statement {
 impl Statement {
     pub const fn span(&self) -> Span {
         match self {
-            Self::Backend(statement) => statement.span(),
+            Self::ShowBackends(statement) => statement.span,
             Self::Statistics(statement) => statement.span(),
             Self::Catalog(statement) => statement.span(),
             Self::Iceberg(statement) => statement.span(),
@@ -242,9 +242,7 @@ mod tests {
             span: span(8, 10),
         };
         let expression = Expr::Literal(literal.clone());
-        let statement = Statement::Backend(BackendStatement::ShowBackends(ShowBackends {
-            span: span(11, 24),
-        }));
+        let statement = Statement::ShowBackends(ShowBackends { span: span(11, 24) });
 
         assert_eq!(name.span, span(0, 7));
         assert_eq!(type_name.span, span(0, 7));

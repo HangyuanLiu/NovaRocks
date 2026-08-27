@@ -1717,7 +1717,7 @@ mod tests {
     fn ref_retirement_manifest_never_carries_object_sweep_candidates() {
         let ref_pass = selected_owned_ref_manifest_records(
             vec![OwnedRefCandidate {
-                name: "__novarocks_mv_refresh_41".to_string(),
+                name: "__novarocks_mv_publication_01890f3c-4e70-7cc0-8000-000000000041".to_string(),
                 head_snapshot_id: 7,
                 provenance_version: 1,
                 provenance_digest: [9; 32],
@@ -1764,14 +1764,14 @@ mod tests {
     fn selected_owned_ref_plan_is_exact_and_never_promotes_to_object_sweep() {
         let current = vec![
             OwnedRefCandidate {
-                name: "__novarocks_mv_refresh_a".to_string(),
+                name: "__novarocks_mv_publication_01890f3c-4e70-7cc0-8000-00000000000a".to_string(),
                 head_snapshot_id: 7,
                 provenance_version: 1,
                 provenance_digest: [1; 32],
                 created_at_ms: 100,
             },
             OwnedRefCandidate {
-                name: "__novarocks_mv_refresh_b".to_string(),
+                name: "__novarocks_mv_publication_01890f3c-4e70-7cc0-8000-00000000000b".to_string(),
                 head_snapshot_id: 8,
                 provenance_version: 1,
                 provenance_digest: [2; 32],
@@ -1780,7 +1780,7 @@ mod tests {
         ];
         let exact = ConnectorCleanupOwnedRefSelection::try_new(vec![
             ConnectorCleanupOwnedRefIdentity::try_new(
-                Arc::from("__novarocks_mv_refresh_a"),
+                Arc::from("__novarocks_mv_publication_01890f3c-4e70-7cc0-8000-00000000000a"),
                 7,
                 1,
                 [1; 32],
@@ -1792,12 +1792,14 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert!(matches!(
             &selected[0].candidate,
-            ManifestCandidate::OwnedRef { name, .. } if name == "__novarocks_mv_refresh_a"
+            ManifestCandidate::OwnedRef { name, .. }
+                if name
+                    == "__novarocks_mv_publication_01890f3c-4e70-7cc0-8000-00000000000a"
         ));
 
         let stale = ConnectorCleanupOwnedRefSelection::try_new(vec![
             ConnectorCleanupOwnedRefIdentity::try_new(
-                Arc::from("__novarocks_mv_refresh_a"),
+                Arc::from("__novarocks_mv_publication_01890f3c-4e70-7cc0-8000-00000000000a"),
                 7,
                 1,
                 [3; 32],

@@ -18,6 +18,7 @@
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -25,23 +26,28 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::common::backend_topology::LiveBackendTarget;
+use crate::common::backend_topology::{
+    BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, LiveBackendTarget,
+};
 use crate::native::fragment_transport::{FetchOutcome, FragmentDispatcher};
 use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::artifact::{
     ConnectorBindingDispatcher, ConnectorBindingInstallObserver,
     DispatchingConnectorBindingBarrier, RunningNativeExecutionParts,
 };
+use crate::query_execution::completion::PreReadyRetryBoundary;
 use crate::query_execution::contract::{
     ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
     DistributedQueryErrorKind, DistributedQueryIntent, DistributedQueryOutcome,
-    DistributedQueryRequest, ProfileTerminalBuilder,
+    DistributedQueryRequest, PreReadyTopologyOutcome, ProfileTerminalBuilder,
 };
 #[cfg(test)]
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use crate::query_execution::lifecycle_plan::{QueryInitOptions, QueryLifecycleLease};
 use crate::query_execution::write::WriteTerminalBuilder;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
+use crate::runtime::statement_result::StatementResult;
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto::lifecycle::QueryOptions as ProtocolQueryOptions;
 use novarocks_spi::connector::ConnectorWriteLease;
 use novarocks_types::{
@@ -49,7 +55,6 @@ use novarocks_types::{
     QueryProcessNamespace,
 };
 
-use super::backend_events::BackendQueryActivity;
 use super::query_lifecycle::{
     FrontendQueryLifecycleBarrier, FrontendQueryLifecycleConfig, QueryLifecycleTransport,
 };
@@ -62,6 +67,10 @@ use super::report::FrontendCoordinatorTerminalIngress;
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use crate::connector::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
+};
+use crate::metrics::{
+    observe_pre_ready_replan, observe_waiting_for_backend, record_pre_ready_effect_gate,
+    record_pre_ready_replan,
 };
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
@@ -78,7 +87,7 @@ use novarocks_proto::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
     QueryInitOutcome, QueryInitRequest, QueryStageAck, QueryStageOutcome, QueryStageRequest,
     QueryStartAck, QueryStartOutcome, QueryStartRequest, QueryTerminationAck,
-    QueryTerminationReason,
+    QueryTerminationReason, StageDigest,
 };
 #[cfg(test)]
 use novarocks_proto_models::novarocks as protocol;
@@ -172,7 +181,7 @@ impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
         &self,
         _execution_id: QueryExecutionId,
         _backend_idx: usize,
-        _endpoint: SocketAddr,
+        _endpoint: RuntimeEndpoint,
         _declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
     ) -> Result<(), crate::query_execution::connector_binding::ConnectorBindingDispatchError> {
         Ok(())
@@ -180,7 +189,7 @@ impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
 
     fn retire(
         &self,
-        _endpoint: SocketAddr,
+        _endpoint: RuntimeEndpoint,
         _key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
     ) -> Result<(), crate::query_execution::connector_binding::ConnectorBindingRetirementError>
     {
@@ -202,7 +211,7 @@ impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
             .installed_backends
             .iter()
             .enumerate()
-            .filter_map(|(index, endpoint)| match endpoint.parse::<SocketAddr>() {
+            .filter_map(|(index, endpoint)| match RuntimeEndpoint::parse(endpoint) {
                 Ok(endpoint) => Some((index, endpoint)),
                 Err(error) => {
                     tracing::warn!(
@@ -230,7 +239,7 @@ impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
                 }
             };
         for (_, endpoint) in endpoints {
-            if let Err(error) = dispatcher.retire(endpoint, &retirement.key) {
+            if let Err(error) = dispatcher.retire(endpoint.clone(), &retirement.key) {
                 tracing::warn!(
                     instance_id = %retirement.key.instance_id.as_str(),
                     incarnation = ?retirement.key.incarnation,
@@ -246,13 +255,13 @@ impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
 impl ConnectorBindingInstallObserver for FrontendConnectorBindingInstallObserver {
     fn installed(
         &self,
-        endpoint: std::net::SocketAddr,
+        endpoint: RuntimeEndpoint,
         declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
     ) -> Result<(), String> {
         self.control
             .record_installed_backend(
                 &novarocks_spi::connector::ConnectorExecutionBindingKey::from(declaration),
-                endpoint.to_string(),
+                endpoint.as_host_port(),
             )
             .map_err(|error| error.to_string())
     }
@@ -485,11 +494,9 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         request: QueryInitRequest,
         _timeout: Duration,
     ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
-        let execution_id = request
-            .manifest()
-            .and_then(|manifest| manifest.execution_id())
-            .map_err(protocol_contract_error)?;
-        let digest = request.digest().map_err(protocol_contract_error)?;
+        let manifest = request.manifest().map_err(protocol_contract_error)?;
+        let execution_id = manifest.execution_id().map_err(protocol_contract_error)?;
+        let digest = manifest.digest().map_err(protocol_contract_error)?;
         QueryInitAck::parse(protocol::InitQueryResponse {
             execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
                 execution_id,
@@ -527,7 +534,12 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         QueryStageAck::new(
             request.execution_id(),
             request.digest_version(),
-            request.digest(),
+            StageDigest::compute_v1(
+                request.execution_id(),
+                request.init_digest(),
+                &request.fragments(),
+            )
+            .map_err(protocol_contract_error)?,
             QueryStageOutcome::Applied,
             "test participant staged",
         )
@@ -623,8 +635,13 @@ fn production_backend_services(
 ) -> Result<QueryBackendServices, DistributedQueryError> {
     let entries = topology
         .iter()
-        .map(|target| (target.backend_idx(), target.endpoint()))
-        .collect::<Vec<_>>();
+        .map(|target| {
+            target
+                .endpoint()
+                .map(|endpoint| (target.backend_idx(), endpoint))
+                .map_err(|error| failed(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let snapshot = FrontendBackendSnapshot::from_live_targets(topology.to_vec())?;
     Ok(QueryBackendServices {
         scheduler: FrontendFragmentScheduler::new(snapshot),
@@ -814,14 +831,41 @@ impl FrontendDistributedQueryCoordinator {
             .iter()
             .flat_map(|scheduler| scheduler.live_targets())
             .collect::<Vec<_>>();
+        let topology =
+            crate::topology::ClusterBackendService::from_captured_targets_for_test(&targets);
+        Self::new_for_test_with_backend_sequence_and_topology(
+            query_id,
+            report_endpoint,
+            schedulers,
+            dispatcher,
+            runtime_filter_worker_count,
+            _test_fixture,
+            lifecycle_transport,
+            Arc::new(topology),
+        )
+    }
+
+    #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The retry fixture must inject independently evolving topology and scheduler sequences."
+    )]
+    pub(crate) fn new_for_test_with_backend_sequence_and_topology(
+        query_id: QueryId,
+        report_endpoint: SocketAddr,
+        schedulers: Vec<FrontendFragmentScheduler>,
+        dispatcher: Arc<dyn FragmentDispatcher>,
+        runtime_filter_worker_count: NonZeroUsize,
+        _test_fixture: Arc<dyn std::any::Any + Send + Sync>,
+        lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
+        backend_topology: crate::common::backend_topology::BackendTopologyService,
+    ) -> Self {
         let test_timeouts = crate::application::FrontendQueryControlTimeouts::default();
         Self {
             report_endpoint: Arc::new(FrontendReportEndpointBinding::from_socket_addr(
                 report_endpoint,
             )),
-            backend_topology: Arc::new(
-                crate::topology::ClusterBackendService::from_captured_targets_for_test(&targets),
-            ),
+            backend_topology,
             backend_services: Some(BackendServicesSource::Sequence {
                 schedulers: Mutex::new(schedulers.into()),
                 dispatcher,
@@ -849,10 +893,6 @@ impl FrontendDistributedQueryCoordinator {
         Arc::clone(&self.registry) as Arc<dyn QueryLifecycleConvergenceReader>
     }
 
-    pub fn backend_query_activity(&self) -> BackendQueryActivity {
-        BackendQueryActivity::new(Arc::clone(&self.registry))
-    }
-
     pub fn report_endpoint_sink(
         &self,
     ) -> Arc<dyn crate::common::backend_topology::CoordinatorReportEndpointSink> {
@@ -876,7 +916,7 @@ impl FrontendDistributedQueryCoordinator {
         };
         for retirement in ready {
             for endpoint in retirement.installed_backends {
-                let endpoint = match endpoint.parse::<SocketAddr>() {
+                let endpoint = match RuntimeEndpoint::parse(&endpoint) {
                     Ok(endpoint) => endpoint,
                     Err(error) => {
                         tracing::warn!(
@@ -889,7 +929,7 @@ impl FrontendDistributedQueryCoordinator {
                         continue;
                     }
                 };
-                if let Err(error) = dispatcher.retire(endpoint, &retirement.key) {
+                if let Err(error) = dispatcher.retire(endpoint.clone(), &retirement.key) {
                     tracing::warn!(
                         instance_id = %retirement.key.instance_id.as_str(),
                         incarnation = ?retirement.key.incarnation,
@@ -906,17 +946,27 @@ impl FrontendDistributedQueryCoordinator {
         &self,
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        let statement_deadline = statement_deadline_for_request(&request)?;
+        let intent = request.intent();
         let query_id = self.query_ids.next_query_id()?;
-        let execution_id = QueryExecutionId::new(
-            query_id,
-            AttemptId::new(1).expect("the initial query attempt is nonzero"),
-        )
-        .map_err(|error| {
-            DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                error.to_string(),
-            )
-        })?;
+        let execution_id = execution_id_for_round(query_id, 1)?;
+        self.execute_round(query_id, execution_id, statement_deadline, request, None)
+            .map_err(|error| fail_closed_one_shot_topology_retry(intent, error))
+    }
+
+    /// Execute exactly one move-only distributed round. A future statement
+    /// controller retains the logical `query_id`, advances only the attempt
+    /// id, and supplies a newly planned request here after the old pre-ready
+    /// attempt has been aborted. This method never patches or reuses an old
+    /// round's artifacts.
+    fn execute_round(
+        &self,
+        query_id: QueryId,
+        execution_id: QueryExecutionId,
+        statement_deadline: Instant,
+        request: DistributedQueryRequest,
+        retry_boundary: Option<&dyn PreReadyRetryBoundary>,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         let parts = request.into_parts();
         let connector_write_session = parts
             .connector_write
@@ -933,7 +983,7 @@ impl FrontendDistributedQueryCoordinator {
         }
         self.backend_topology
             .validate_snapshot(&parts.topology)
-            .map_err(|error| failed(error.to_string()))?;
+            .map_err(pre_ready_topology_validation_error)?;
         #[cfg(test)]
         let backend_services = match &self.backend_services {
             Some(services) => services.resolve(parts.topology.targets())?,
@@ -959,7 +1009,7 @@ impl FrontendDistributedQueryCoordinator {
             .scheduled_backend_ownership(&schedule.backend_ids())?;
         self.backend_topology
             .validate_snapshot(&parts.topology)
-            .map_err(|error| failed(error.to_string()))?;
+            .map_err(pre_ready_topology_validation_error)?;
         self.registry
             .set_scheduled_backend_ownership(query_id, &scheduled_backend_ownership)?;
         let binding_attachment =
@@ -1002,7 +1052,7 @@ impl FrontendDistributedQueryCoordinator {
             None => scheduled,
         };
         let deployment = compile_scheduled_runtime_filter_deployment(
-            scheduled.runtime_filter_scheduled_view(),
+            scheduled.runtime_filter_scheduled_view()?,
             FrontendRuntimeFilterDeploymentCompilerConfig::from_query_lifecycle(
                 parts.options.runtime_filter_lifecycle(),
                 self.runtime_filter_worker_count.get(),
@@ -1024,11 +1074,17 @@ impl FrontendDistributedQueryCoordinator {
                     .min(i64::MAX as u128) as i64
             })
             .unwrap_or_else(|| parts.options.timeout_ms().max(0));
+        let remaining_budget = statement_deadline.saturating_duration_since(Instant::now());
+        if remaining_budget.is_zero() {
+            return Err(failed(
+                "query deadline elapsed before native lifecycle initialization",
+            ));
+        }
         let query_deadline_unix_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| failed(format!("system clock precedes Unix epoch: {error}")))?
             .as_millis()
-            .saturating_add(u128::from(timeout_ms.max(1) as u64))
+            .saturating_add(remaining_budget.as_millis())
             .try_into()
             .map_err(|_| failed("query deadline exceeds u64 milliseconds"))?;
         let lifecycle_barrier = FrontendQueryLifecycleBarrier::new(
@@ -1060,13 +1116,31 @@ impl FrontendDistributedQueryCoordinator {
             }),
         );
         let connector_binding_ready = runtime_filter_ready
-            .initialize_query(init_options, &lifecycle_barrier)?
+            .initialize_query(init_options, &lifecycle_barrier)
+            .map_err(|error| {
+                reclassify_pre_ready_lifecycle_failure(
+                    self.backend_topology.as_ref(),
+                    &parts.topology,
+                    error,
+                    statement_deadline.min(
+                        Instant::now()
+                            .checked_add(self.lifecycle_config.init_rpc_timeout())
+                            .unwrap_or(statement_deadline),
+                    ),
+                )
+            })?
             .prepare_connector_bindings(&connector_bindings)?;
+        if let Some(retry_boundary) = retry_boundary {
+            retry_boundary.close_after_control_ready();
+        }
         let submission_view = connector_binding_ready.native_submission_view()?;
         let submission_attachment = encode_native_submission(&submission_view).map_err(failed)?;
         let stage_prepared = connector_binding_ready.finish_stage(submission_attachment)?;
         self.dispatch_ready_connector_retires(connector_binding_dispatcher.as_ref());
         let staged = stage_prepared.stage(&lifecycle_barrier)?;
+        if let Some(retry_boundary) = retry_boundary {
+            retry_boundary.close_after_stage_or_start();
+        }
         for batch in staged.batches() {
             self.backend_topology.record_successful_stage(
                 batch.binding().target().backend_idx(),
@@ -1091,7 +1165,7 @@ impl FrontendDistributedQueryCoordinator {
             return Err(failed(message));
         }
 
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        let deadline = statement_deadline;
         let mut batches = Vec::new();
         if root_fetch.uses_result_buffer() {
             loop {
@@ -1326,10 +1400,339 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.execute_request(request)
     }
+
+    fn execute_prepared(
+        &self,
+        operation: crate::query_execution::completion::PreparedDistributedQuery,
+    ) -> Result<StatementResult, DistributedQueryError> {
+        let query_id = self.query_ids.next_query_id()?;
+        let (first_request, first_completion, mut round_factory) = operation.into_parts();
+        let first_revision = first_request.topology().revision();
+        let retry_deadline = statement_deadline_for_request(&first_request)?;
+        let first_execution_id = execution_id_for_round(query_id, 1)?;
+        let first_retry_boundary = round_factory
+            .as_deref()
+            .map(|factory| factory as &dyn PreReadyRetryBoundary);
+        match self.execute_round(
+            query_id,
+            first_execution_id,
+            retry_deadline,
+            first_request,
+            first_retry_boundary,
+        ) {
+            Ok(outcome) => first_completion.complete(outcome).map_err(failed),
+            Err(first_error) => {
+                // Never classify ordinary failure text as a topology retry.
+                // The lifecycle barrier and pre-Init validation are the sole
+                // typed evidence sources.
+                if first_error.pre_ready_topology_outcome().is_none() {
+                    return Err(first_error);
+                }
+                let Some(factory) = round_factory.as_deref_mut() else {
+                    return Err(first_error);
+                };
+                let reason = pre_ready_topology_reason(
+                    first_error
+                        .pre_ready_topology_outcome()
+                        .expect("pre-ready topology outcome checked above"),
+                );
+                if let Err(error) = factory.permit_pre_ready_retry() {
+                    record_pre_ready_effect_gate("rejected");
+                    return Err(error);
+                }
+                record_pre_ready_effect_gate("permitted");
+                record_pre_ready_replan(reason);
+                let waiting_started_at = Instant::now();
+                let fresh_topology = self
+                    .backend_topology
+                    .wait_for_eligible_after(first_revision, retry_deadline)
+                    .map_err(|error| {
+                        observe_waiting_for_backend(waiting_started_at.elapsed());
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::Failed,
+                            error.to_string(),
+                        )
+                    })?;
+                observe_waiting_for_backend(waiting_started_at.elapsed());
+                let replan_started_at = Instant::now();
+                let replacement = factory.replan(fresh_topology);
+                observe_pre_ready_replan(replan_started_at.elapsed());
+                let replacement = replacement?;
+                let (replacement_request, replacement_completion, replacement_factory) =
+                    replacement.into_parts();
+                if replacement_factory.is_some() {
+                    return Err(DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "replacement distributed round must not retain another automatic retry factory",
+                    ));
+                }
+                let replacement_execution_id = execution_id_for_round(query_id, 2)?;
+                self.execute_round(
+                    query_id,
+                    replacement_execution_id,
+                    retry_deadline,
+                    replacement_request,
+                    None,
+                )
+                .and_then(|outcome| replacement_completion.complete(outcome).map_err(failed))
+            }
+        }
+    }
+
+    fn execute_prepared_raw(
+        &self,
+        operation: crate::query_execution::completion::PreparedRetriableDistributedRequest,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        let query_id = self.query_ids.next_query_id()?;
+        let (first_request, mut round_factory) = operation.into_parts();
+        let first_revision = first_request.topology().revision();
+        let retry_deadline = statement_deadline_for_request(&first_request)?;
+        let first_execution_id = execution_id_for_round(query_id, 1)?;
+        match self.execute_round(
+            query_id,
+            first_execution_id,
+            retry_deadline,
+            first_request,
+            Some(round_factory.as_ref() as &dyn PreReadyRetryBoundary),
+        ) {
+            Ok(outcome) => Ok(outcome),
+            Err(first_error) => {
+                if first_error.pre_ready_topology_outcome().is_none() {
+                    return Err(first_error);
+                }
+                let reason = pre_ready_topology_reason(
+                    first_error
+                        .pre_ready_topology_outcome()
+                        .expect("pre-ready topology outcome checked above"),
+                );
+                if let Err(error) = round_factory.permit_pre_ready_retry() {
+                    record_pre_ready_effect_gate("rejected");
+                    return Err(error);
+                }
+                record_pre_ready_effect_gate("permitted");
+                record_pre_ready_replan(reason);
+                let waiting_started_at = Instant::now();
+                let fresh_topology = self
+                    .backend_topology
+                    .wait_for_eligible_after(first_revision, retry_deadline)
+                    .map_err(|error| {
+                        observe_waiting_for_backend(waiting_started_at.elapsed());
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::Failed,
+                            error.to_string(),
+                        )
+                    })?;
+                observe_waiting_for_backend(waiting_started_at.elapsed());
+                let replan_started_at = Instant::now();
+                let replacement = round_factory.replan(fresh_topology);
+                observe_pre_ready_replan(replan_started_at.elapsed());
+                let replacement = replacement?;
+                let replacement_execution_id = execution_id_for_round(query_id, 2)?;
+                self.execute_round(
+                    query_id,
+                    replacement_execution_id,
+                    retry_deadline,
+                    replacement,
+                    None,
+                )
+            }
+        }
+    }
+}
+
+fn pre_ready_topology_reason(outcome: PreReadyTopologyOutcome) -> &'static str {
+    match outcome {
+        PreReadyTopologyOutcome::BackendDraining { .. } => "backend_draining",
+        PreReadyTopologyOutcome::BackendProcessMismatch { .. } => "backend_process_mismatch",
+        PreReadyTopologyOutcome::BackendNotEligible { .. } => "backend_not_eligible",
+    }
+}
+
+fn fail_closed_one_shot_topology_retry(
+    intent: DistributedQueryIntent,
+    error: DistributedQueryError,
+) -> DistributedQueryError {
+    if intent == DistributedQueryIntent::Write
+        && let Some(outcome) = error.pre_ready_topology_outcome()
+    {
+        // A write request is one-shot. Until its DML owner can preserve the
+        // exact target/base/publication binding and rebuild the complete write
+        // layout under a positive zero-effect permit, it must not reuse this
+        // request or silently enter the read-query replan controller.
+        return DistributedQueryError::topology_retry_unsupported(
+            outcome,
+            format!(
+                "distributed write cannot retry pre-ready topology change without a whole-round semantic binding and effect-free permit: {}",
+                error.message()
+            ),
+        );
+    }
+    error
+}
+
+/// Establish one absolute execution deadline before the first distributed
+/// round.  Every retry consumes this same monotonic budget; it must never
+/// inherit a fresh `query_timeout` window merely because the layout changed.
+fn statement_deadline_for_request(
+    request: &DistributedQueryRequest,
+) -> Result<Instant, DistributedQueryError> {
+    if let Some(deadline) = request.deadline() {
+        return Ok(deadline);
+    }
+    let timeout_ms = u64::try_from(request.options().timeout_ms().max(1)).map_err(|_| {
+        DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "resolved query timeout does not fit an unsigned duration",
+        )
+    })?;
+    Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .ok_or_else(|| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::Failed,
+                "query deadline exceeds monotonic clock range",
+            )
+        })
 }
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
+}
+
+fn execution_id_for_round(
+    query_id: QueryId,
+    attempt: u32,
+) -> Result<QueryExecutionId, DistributedQueryError> {
+    QueryExecutionId::new(
+        query_id,
+        AttemptId::new(u64::from(attempt)).map_err(|error| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                error.to_string(),
+            )
+        })?,
+    )
+    .map_err(|error| {
+        DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            error.to_string(),
+        )
+    })
+}
+
+/// Snapshot validation runs before the Init + ControlReady boundary.  Only a
+/// concrete missing/replaced captured process becomes typed topology evidence;
+/// revision-only and availability errors are not guessed into retryability.
+fn pre_ready_topology_validation_error(
+    error: BackendTopologyValidationError,
+) -> DistributedQueryError {
+    match error {
+        BackendTopologyValidationError::GenerationChanged {
+            backend_idx,
+            captured_generation,
+            ..
+        }
+        | BackendTopologyValidationError::TargetMissing {
+            backend_idx,
+            captured_generation,
+            ..
+        } => DistributedQueryError::pre_ready_topology(
+            PreReadyTopologyOutcome::BackendNotEligible {
+                backend_idx,
+                process_id: captured_generation,
+            },
+            error.to_string(),
+        ),
+        other => failed(other.to_string()),
+    }
+}
+
+/// A lifecycle transport failure remains terminal unless the FE-owned
+/// membership authority can independently prove that a captured participant
+/// process was replaced or is no longer eligible. This runs before
+/// `ControlReady`, after the guarded old round has been aborted, and never
+/// derives retryability from transport text.
+fn reclassify_pre_ready_lifecycle_failure(
+    topology: &dyn BackendTopologyPort,
+    captured: &BackendTopologySnapshot,
+    original: DistributedQueryError,
+    observation_deadline: Instant,
+) -> DistributedQueryError {
+    if original.pre_ready_topology_outcome().is_some() {
+        return original;
+    }
+    if !original.requires_pre_ready_topology_observation() {
+        return original;
+    }
+
+    // The failed Init RPC itself is not retry evidence.  It can, however,
+    // race the registered replacement's announce/heartbeat publication. Wait
+    // for at most the already-budgeted Init RPC window, and only elevate the
+    // failure if the membership owner independently proves one of the
+    // captured processes became unavailable.
+    let mut observed_revision = captured.revision();
+    loop {
+        let current = match topology.snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(_) => return original,
+        };
+        observed_revision = observed_revision.max(current.revision());
+        // A transport loss has no BE-provided draining disposition.  Do not
+        // reinterpret the transient N-1 snapshot as an intentional scale-down
+        // and replan onto it. Explicit `BackendDraining` evidence takes the
+        // separate typed path above; this observer waits only for a replacement
+        // that restores the captured participation capacity.
+        if current.targets().len() < captured.targets().len() {
+            if Instant::now() >= observation_deadline {
+                return original;
+            }
+            let snapshot =
+                match topology.wait_for_eligible_after(observed_revision, observation_deadline) {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => return original,
+                };
+            observed_revision = snapshot.revision();
+            continue;
+        }
+        match topology.validate_snapshot(captured) {
+            Err(
+                error @ (BackendTopologyValidationError::GenerationChanged { .. }
+                | BackendTopologyValidationError::TargetMissing { .. }),
+            ) => {
+                let observed = pre_ready_topology_validation_error(error);
+                let outcome = observed
+                    .pre_ready_topology_outcome()
+                    .expect("exact topology replacement is typed pre-ready evidence");
+                tracing::info!(
+                    original_error = %original,
+                    observed_topology = %observed,
+                    ?outcome,
+                    "frontend reclassified a pre-ready lifecycle failure from exact backend topology evidence"
+                );
+                return DistributedQueryError::pre_ready_topology(
+                    outcome,
+                    format!(
+                        "{original}; observed captured backend topology invalid before ControlReady: {observed}"
+                    ),
+                );
+            }
+            Err(BackendTopologyValidationError::ContentChangedWithoutRevision { .. })
+            | Err(BackendTopologyValidationError::Unavailable(_)) => return original,
+            Err(BackendTopologyValidationError::RevisionChanged {
+                current_revision, ..
+            }) => observed_revision = current_revision,
+            Ok(()) => {}
+        }
+        if Instant::now() >= observation_deadline {
+            return original;
+        }
+        let snapshot =
+            match topology.wait_for_eligible_after(observed_revision, observation_deadline) {
+                Ok(snapshot) => snapshot,
+                Err(_) => return original,
+            };
+        observed_revision = snapshot.revision();
+    }
 }
 
 fn abort_query_lifecycle(
@@ -1344,10 +1747,94 @@ fn abort_query_lifecycle(
 
 #[cfg(test)]
 mod tests {
-    use super::{FrontendReportEndpointBinding, QueryIdSource, UniqueQueryIdSource};
+    use std::collections::BTreeSet;
+    use std::net::SocketAddr;
+    use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
+        FrontendReportEndpointBinding, QueryAbortRequest, QueryControlAttach, QueryControlSession,
+        QueryIdSource, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryLifecycleTarget,
+        QueryLifecycleTransport, QueryLifecycleTransportError, QueryStageAck, QueryStageRequest,
+        QueryStartAck, QueryStartRequest, QueryTerminationAck, ReadyLifecycleTransportForTest,
+        UniqueQueryIdSource, fail_closed_one_shot_topology_retry,
+        pre_ready_topology_validation_error,
+    };
     use crate::common::backend_topology::CoordinatorReportEndpointSink;
-    use crate::query_execution::contract::DistributedQueryErrorKind;
-    use novarocks_types::QueryProcessNamespace;
+    use crate::common::backend_topology::{
+        BackendTopologyPort, BackendTopologyValidationError, LiveBackendTarget,
+    };
+    use crate::common::query_cancellation::QueryCancellationSource;
+    use crate::connector::{
+        FixtureConnectorRegistry, FixtureControlResolver, test_request_context,
+    };
+    use crate::native::fragment_transport::{
+        ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher,
+    };
+    use crate::query_execution::completion::{
+        PreReadyRetryBoundary, PreparedDistributedQuery, PreparedDistributedRequestFactory,
+        PreparedDistributedRoundFactory, PreparedQueryCompletion,
+        PreparedRetriableDistributedRequest,
+    };
+    use crate::query_execution::contract::{
+        DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
+        DistributedQueryIntent, DistributedQueryRequest, PreReadyTopologyOutcome,
+        build_distributed_query_request_with_execution,
+    };
+    use crate::query_execution::preparation::{ScanPreparationOptions, prepare_fragments};
+    use crate::topology::ClusterBackendService;
+    use novarocks_proto::lifecycle::{QueryControlEndpoint, QueryExecutionId};
+    use novarocks_proto::membership::{BackendProcessDescriptor, BackendReportedState};
+    use novarocks_proto_models::novarocks as protocol;
+    use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
+    use novarocks_types::{
+        BackendProcessId, ClusterRole, QueryId, QueryProcessNamespace, UniqueId,
+    };
+    use novarocks_version::native_build_identity;
+
+    #[test]
+    fn missing_captured_process_is_typed_pre_ready_not_eligible() {
+        let process_id = BackendProcessId::new_v7();
+        let error =
+            pre_ready_topology_validation_error(BackendTopologyValidationError::TargetMissing {
+                backend_idx: 2,
+                captured_generation: process_id,
+                captured_revision: 7,
+                current_revision: 8,
+            });
+        assert_eq!(
+            error.pre_ready_topology_outcome(),
+            Some(PreReadyTopologyOutcome::BackendNotEligible {
+                backend_idx: 2,
+                process_id,
+            })
+        );
+    }
+
+    #[test]
+    fn one_shot_write_rejects_pre_ready_topology_without_a_replan_owner() {
+        let process_id = BackendProcessId::new_v7();
+        let original = DistributedQueryError::pre_ready_topology(
+            PreReadyTopologyOutcome::BackendDraining {
+                backend_idx: 1,
+                process_id,
+            },
+            "backend is draining",
+        );
+        let outcome = original
+            .pre_ready_topology_outcome()
+            .expect("typed outcome is retained");
+        let error = fail_closed_one_shot_topology_retry(DistributedQueryIntent::Write, original);
+
+        assert_eq!(
+            error.kind(),
+            DistributedQueryErrorKind::TopologyRetryUnsupported
+        );
+        assert_eq!(error.pre_ready_topology_outcome(), Some(outcome));
+    }
 
     #[test]
     fn unique_query_id_source_uses_one_namespace_with_continuous_positive_sequences() {
@@ -1441,5 +1928,511 @@ mod tests {
         binding
             .resolve()
             .expect("bound port publication makes the DNS endpoint available");
+    }
+
+    struct FailingAfterStartDispatcher;
+
+    impl FragmentDispatcher for FailingAfterStartDispatcher {
+        fn fetch_result(
+            &self,
+            _backend_idx: usize,
+            _finst_id: UniqueId,
+            _max_wait_ms: i64,
+            _expected_output_schema: Option<ExpectedOutputSchemaView<'_>>,
+        ) -> Result<FetchOutcome, String> {
+            Err("test fetch failure after retry stage/start".to_string())
+        }
+
+        fn backend_count(&self) -> usize {
+            1
+        }
+    }
+
+    #[derive(Default)]
+    struct RetryTransportState {
+        first_init: bool,
+        init_attempts: Vec<u64>,
+        abort_attempts: Vec<u64>,
+        stage_attempts: Vec<u64>,
+        start_attempts: Vec<u64>,
+    }
+
+    struct DrainingThenReadyTransport {
+        state: Arc<Mutex<RetryTransportState>>,
+        topology: Arc<ClusterBackendService>,
+        replacement: BackendProcessDescriptor,
+    }
+
+    impl DrainingThenReadyTransport {
+        fn execution_id(
+            request: &QueryInitRequest,
+        ) -> Result<QueryExecutionId, QueryLifecycleTransportError> {
+            request
+                .manifest()
+                .and_then(|manifest| manifest.execution_id())
+                .map_err(super::protocol_contract_error)
+        }
+
+        fn init_ack(
+            request: &QueryInitRequest,
+            outcome: QueryInitOutcome,
+        ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
+            let execution_id = Self::execution_id(request)?;
+            let digest = request
+                .manifest()
+                .and_then(|manifest| manifest.digest())
+                .map_err(super::protocol_contract_error)?;
+            QueryInitAck::parse(protocol::InitQueryResponse {
+                execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+                    execution_id,
+                )),
+                init_digest: digest.as_bytes().to_vec(),
+                outcome: outcome as i32,
+            })
+            .map_err(super::protocol_contract_error)
+        }
+    }
+
+    impl QueryLifecycleTransport for DrainingThenReadyTransport {
+        fn init_query(
+            &self,
+            _target: QueryLifecycleTarget,
+            request: QueryInitRequest,
+            _timeout: Duration,
+        ) -> Result<QueryInitAck, QueryLifecycleTransportError> {
+            let execution_id = Self::execution_id(&request)?;
+            let first = {
+                let mut state = self.state.lock().expect("retry transport state");
+                state.init_attempts.push(execution_id.attempt_id().get());
+                if state.first_init {
+                    false
+                } else {
+                    state.first_init = true;
+                    true
+                }
+            };
+            if first {
+                self.topology
+                    .record_announce(self.replacement.clone(), BackendReportedState::Running)
+                    .expect("replacement announce");
+                self.topology.record_heartbeat_success(
+                    self.replacement
+                        .process_id()
+                        .expect("replacement process id"),
+                    self.replacement.clone(),
+                    BackendReportedState::Running,
+                    2,
+                    2,
+                );
+                Self::init_ack(&request, QueryInitOutcome::QueryInitRejectedBackendDraining)
+            } else {
+                Self::init_ack(&request, QueryInitOutcome::QueryInitApplied)
+            }
+        }
+
+        fn attach_control(
+            &self,
+            target: QueryLifecycleTarget,
+            attach: QueryControlAttach,
+            timeout: Duration,
+        ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
+            ReadyLifecycleTransportForTest.attach_control(target, attach, timeout)
+        }
+
+        fn stage_fragments(
+            &self,
+            target: QueryLifecycleTarget,
+            request: &QueryStageRequest,
+            timeout: Duration,
+        ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
+            self.state
+                .lock()
+                .expect("retry transport state")
+                .stage_attempts
+                .push(request.execution_id().attempt_id().get());
+            ReadyLifecycleTransportForTest.stage_fragments(target, request, timeout)
+        }
+
+        fn start_prepared_query(
+            &self,
+            target: QueryLifecycleTarget,
+            request: &QueryStartRequest,
+            timeout: Duration,
+        ) -> Result<QueryStartAck, QueryLifecycleTransportError> {
+            self.state
+                .lock()
+                .expect("retry transport state")
+                .start_attempts
+                .push(request.execution_id().attempt_id().get());
+            ReadyLifecycleTransportForTest.start_prepared_query(target, request, timeout)
+        }
+
+        fn abort_query(
+            &self,
+            target: QueryLifecycleTarget,
+            request: QueryAbortRequest,
+            timeout: Duration,
+        ) -> Result<QueryTerminationAck, QueryLifecycleTransportError> {
+            self.state
+                .lock()
+                .expect("retry transport state")
+                .abort_attempts
+                .push(
+                    request
+                        .execution_id()
+                        .map_err(super::protocol_contract_error)?
+                        .attempt_id()
+                        .get(),
+                );
+            ReadyLifecycleTransportForTest.abort_query(target, request, timeout)
+        }
+    }
+
+    struct RecordingRetryFactory {
+        permits: Arc<AtomicUsize>,
+        control_ready_closures: Arc<AtomicUsize>,
+        stage_or_start_closures: Arc<AtomicUsize>,
+        replanned_topologies:
+            Arc<Mutex<Vec<crate::common::backend_topology::BackendTopologySnapshot>>>,
+    }
+
+    impl PreparedDistributedRoundFactory for RecordingRetryFactory {
+        fn replan(
+            &mut self,
+            topology: crate::common::backend_topology::BackendTopologySnapshot,
+        ) -> Result<PreparedDistributedQuery, DistributedQueryError> {
+            self.replanned_topologies
+                .lock()
+                .expect("replanned topologies")
+                .push(topology.clone());
+            Ok(PreparedDistributedQuery::new(
+                fresh_result_request(topology)?,
+                PreparedQueryCompletion::result(),
+            ))
+        }
+    }
+
+    impl PreparedDistributedRequestFactory for RecordingRetryFactory {
+        fn replan(
+            &mut self,
+            topology: crate::common::backend_topology::BackendTopologySnapshot,
+        ) -> Result<DistributedQueryRequest, DistributedQueryError> {
+            self.replanned_topologies
+                .lock()
+                .expect("replanned topologies")
+                .push(topology.clone());
+            fresh_result_request(topology)
+        }
+    }
+
+    impl PreReadyRetryBoundary for RecordingRetryFactory {
+        fn permit_pre_ready_retry(&self) -> Result<(), DistributedQueryError> {
+            self.permits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn close_after_control_ready(&self) {
+            self.control_ready_closures.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn close_after_stage_or_start(&self) {
+            self.stage_or_start_closures.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn descriptor(process_id: BackendProcessId, endpoint: SocketAddr) -> BackendProcessDescriptor {
+        BackendProcessDescriptor::new(
+            process_id,
+            QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port())
+                .expect("test endpoint"),
+            "test-deployment",
+            native_build_identity(),
+        )
+        .expect("test descriptor")
+    }
+
+    fn verify(
+        topology: &ClusterBackendService,
+        descriptor: &BackendProcessDescriptor,
+        now_ms: i64,
+    ) {
+        topology.record_heartbeat_success(
+            descriptor.process_id().expect("descriptor process id"),
+            descriptor.clone(),
+            BackendReportedState::Running,
+            2,
+            now_ms,
+        );
+    }
+
+    fn fresh_result_request(
+        topology: crate::common::backend_topology::BackendTopologySnapshot,
+    ) -> Result<DistributedQueryRequest, DistributedQueryError> {
+        let plan = native_preparation_plan(NativePreparationFixture::ResultOutput)
+            .expect("sealed result fixture");
+        let registry = FixtureConnectorRegistry::new();
+        let controls = FixtureControlResolver::new(registry.clone());
+        let prepared = prepare_fragments(
+            &plan,
+            &controls,
+            &test_request_context(),
+            None,
+            None,
+            ScanPreparationOptions::single_backend_fixture(),
+        )
+        .expect("prepared result fixture");
+        let native = crate::query_execution::native_fragment::native_fragment_attachment_for_test(
+            [novarocks_proto_models::plan::PlanFragment {
+                fragment_id: 7,
+                ..Default::default()
+            }],
+            &BTreeSet::from([7]),
+            None,
+        )
+        .expect("native fragment fixture");
+        let cancellation = QueryCancellationSource::new();
+        let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
+            ClusterRole::Fe,
+            topology,
+            Some(Instant::now() + Duration::from_secs(5)),
+            cancellation.view(),
+            novarocks_sql::compiler::SessionOptimizerSettings::default(),
+        );
+        build_distributed_query_request_with_execution(
+            prepared,
+            native,
+            None,
+            DistributedQueryIntent::Result,
+            &execution,
+        )
+    }
+
+    #[test]
+    fn pre_ready_draining_aborts_first_round_and_replans_on_verified_replacement() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = runtime.enter();
+        let endpoint: SocketAddr = "127.0.0.1:19041".parse().expect("test endpoint");
+        let old = descriptor(BackendProcessId::new_v7(), endpoint);
+        let replacement = descriptor(BackendProcessId::new_v7(), endpoint);
+        let topology = Arc::new(ClusterBackendService::new_transient_for_test(1));
+        topology
+            .record_announce(old.clone(), BackendReportedState::Running)
+            .expect("initial announce");
+        verify(topology.as_ref(), &old, 1);
+        let first_snapshot = topology.snapshot().expect("initial topology");
+        let old_scheduler = FrontendFragmentScheduler::new(
+            FrontendBackendSnapshot::from_live_targets(first_snapshot.targets().to_vec())
+                .expect("old scheduler"),
+        );
+
+        let replacement_for_scheduler = replacement.clone();
+        let replacement_scheduler = FrontendFragmentScheduler::new(
+            FrontendBackendSnapshot::from_live_targets(vec![LiveBackendTarget::new(
+                0,
+                replacement_for_scheduler,
+            )])
+            .expect("replacement scheduler"),
+        );
+        let state = Arc::new(Mutex::new(RetryTransportState::default()));
+        let transport = Arc::new(DrainingThenReadyTransport {
+            state: Arc::clone(&state),
+            topology: Arc::clone(&topology),
+            replacement: replacement.clone(),
+        });
+        let coordinator =
+            FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence_and_topology(
+                QueryId::new(7, 11),
+                "127.0.0.1:19070".parse().expect("report endpoint"),
+                vec![old_scheduler, replacement_scheduler],
+                Arc::new(FailingAfterStartDispatcher),
+                NonZeroUsize::new(1).expect("nonzero workers"),
+                Arc::new(()),
+                transport,
+                Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
+            );
+        let permits = Arc::new(AtomicUsize::new(0));
+        let control_ready_closures = Arc::new(AtomicUsize::new(0));
+        let stage_or_start_closures = Arc::new(AtomicUsize::new(0));
+        let replanned_topologies = Arc::new(Mutex::new(Vec::new()));
+        let operation = PreparedDistributedQuery::new(
+            fresh_result_request(first_snapshot.clone()).expect("first request"),
+            PreparedQueryCompletion::result(),
+        )
+        .with_round_factory(Box::new(RecordingRetryFactory {
+            permits: Arc::clone(&permits),
+            control_ready_closures: Arc::clone(&control_ready_closures),
+            stage_or_start_closures: Arc::clone(&stage_or_start_closures),
+            replanned_topologies: Arc::clone(&replanned_topologies),
+        }));
+
+        let error = coordinator
+            .execute_prepared(operation)
+            .expect_err("second round reaches the scripted post-start fetch failure");
+        assert!(
+            error
+                .message()
+                .contains("test fetch failure after retry stage/start")
+        );
+        assert_eq!(permits.load(Ordering::SeqCst), 1);
+        assert_eq!(control_ready_closures.load(Ordering::SeqCst), 0);
+        assert_eq!(stage_or_start_closures.load(Ordering::SeqCst), 0);
+        let replanned = replanned_topologies.lock().expect("replanned topologies");
+        assert_eq!(replanned.len(), 1);
+        assert!(replanned[0].revision() > first_snapshot.revision());
+        assert_eq!(
+            replanned[0].targets()[0]
+                .process_id()
+                .expect("replacement process id"),
+            replacement.process_id().expect("replacement process id"),
+        );
+        let state = state.lock().expect("retry transport state");
+        assert_eq!(state.init_attempts, vec![1, 2]);
+        // The first pre-ready attempt has no attached control stream, so its
+        // cleanup must use the unary Abort RPC. The second attempt reaches
+        // Start and is cancelled through its attached control stream instead.
+        assert_eq!(state.abort_attempts, vec![1]);
+        assert_eq!(state.stage_attempts, vec![2]);
+        assert_eq!(state.start_attempts, vec![2]);
+    }
+
+    #[test]
+    fn raw_pre_ready_draining_replans_without_losing_the_write_outcome_boundary() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = runtime.enter();
+        let endpoint: SocketAddr = "127.0.0.1:19043".parse().expect("test endpoint");
+        let old = descriptor(BackendProcessId::new_v7(), endpoint);
+        let replacement = descriptor(BackendProcessId::new_v7(), endpoint);
+        let topology = Arc::new(ClusterBackendService::new_transient_for_test(1));
+        topology
+            .record_announce(old.clone(), BackendReportedState::Running)
+            .expect("initial announce");
+        verify(topology.as_ref(), &old, 1);
+        let first_snapshot = topology.snapshot().expect("initial topology");
+        let old_scheduler = FrontendFragmentScheduler::new(
+            FrontendBackendSnapshot::from_live_targets(first_snapshot.targets().to_vec())
+                .expect("old scheduler"),
+        );
+        let replacement_scheduler = FrontendFragmentScheduler::new(
+            FrontendBackendSnapshot::from_live_targets(vec![LiveBackendTarget::new(
+                0,
+                replacement.clone(),
+            )])
+            .expect("replacement scheduler"),
+        );
+        let state = Arc::new(Mutex::new(RetryTransportState::default()));
+        let transport = Arc::new(DrainingThenReadyTransport {
+            state: Arc::clone(&state),
+            topology: Arc::clone(&topology),
+            replacement: replacement.clone(),
+        });
+        let coordinator =
+            FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence_and_topology(
+                QueryId::new(7, 13),
+                "127.0.0.1:19070".parse().expect("report endpoint"),
+                vec![old_scheduler, replacement_scheduler],
+                Arc::new(FailingAfterStartDispatcher),
+                NonZeroUsize::new(1).expect("nonzero workers"),
+                Arc::new(()),
+                transport,
+                Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
+            );
+        let permits = Arc::new(AtomicUsize::new(0));
+        let control_ready_closures = Arc::new(AtomicUsize::new(0));
+        let stage_or_start_closures = Arc::new(AtomicUsize::new(0));
+        let replanned_topologies = Arc::new(Mutex::new(Vec::new()));
+        let operation = PreparedRetriableDistributedRequest::new(
+            fresh_result_request(first_snapshot.clone()).expect("first request"),
+            Box::new(RecordingRetryFactory {
+                permits: Arc::clone(&permits),
+                control_ready_closures,
+                stage_or_start_closures,
+                replanned_topologies: Arc::clone(&replanned_topologies),
+            }),
+        );
+
+        let error = match coordinator.execute_prepared_raw(operation) {
+            Ok(_) => panic!("second raw round reaches the scripted post-start fetch failure"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .message()
+                .contains("test fetch failure after retry stage/start")
+        );
+        assert_eq!(permits.load(Ordering::SeqCst), 1);
+        let replanned = replanned_topologies.lock().expect("replanned topologies");
+        assert_eq!(replanned.len(), 1);
+        assert!(replanned[0].revision() > first_snapshot.revision());
+        assert_eq!(
+            replanned[0].targets()[0]
+                .process_id()
+                .expect("replacement process id"),
+            replacement.process_id().expect("replacement process id"),
+        );
+        let state = state.lock().expect("retry transport state");
+        assert_eq!(state.init_attempts, vec![1, 2]);
+        assert_eq!(state.abort_attempts, vec![1]);
+        assert_eq!(state.stage_attempts, vec![2]);
+        assert_eq!(state.start_attempts, vec![2]);
+    }
+
+    #[test]
+    fn control_ready_and_stage_close_the_round_retry_boundary() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = runtime.enter();
+        let endpoint: SocketAddr = "127.0.0.1:19042".parse().expect("test endpoint");
+        let descriptor = descriptor(BackendProcessId::new_v7(), endpoint);
+        let topology = Arc::new(ClusterBackendService::new_transient_for_test(1));
+        topology
+            .record_announce(descriptor.clone(), BackendReportedState::Running)
+            .expect("initial announce");
+        verify(topology.as_ref(), &descriptor, 1);
+        let snapshot = topology.snapshot().expect("eligible topology");
+        let scheduler = FrontendFragmentScheduler::new(
+            FrontendBackendSnapshot::from_live_targets(snapshot.targets().to_vec())
+                .expect("scheduler"),
+        );
+        let coordinator = FrontendDistributedQueryCoordinator::new_for_test_with_topology(
+            QueryId::new(7, 12),
+            "127.0.0.1:19070".parse().expect("report endpoint"),
+            scheduler,
+            Arc::new(FailingAfterStartDispatcher),
+            NonZeroUsize::new(1).expect("nonzero workers"),
+            Arc::new(()),
+            Arc::new(ReadyLifecycleTransportForTest),
+            Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
+        );
+        let control_ready_closures = Arc::new(AtomicUsize::new(0));
+        let stage_or_start_closures = Arc::new(AtomicUsize::new(0));
+        let operation = PreparedDistributedQuery::new(
+            fresh_result_request(snapshot).expect("first request"),
+            PreparedQueryCompletion::result(),
+        )
+        .with_round_factory(Box::new(RecordingRetryFactory {
+            permits: Arc::new(AtomicUsize::new(0)),
+            control_ready_closures: Arc::clone(&control_ready_closures),
+            stage_or_start_closures: Arc::clone(&stage_or_start_closures),
+            replanned_topologies: Arc::new(Mutex::new(Vec::new())),
+        }));
+
+        let error = coordinator
+            .execute_prepared(operation)
+            .expect_err("scripted fetch failure occurs after Start");
+        assert!(
+            error
+                .message()
+                .contains("test fetch failure after retry stage/start")
+        );
+        assert_eq!(control_ready_closures.load(Ordering::SeqCst), 1);
+        assert_eq!(stage_or_start_closures.load(Ordering::SeqCst), 1);
     }
 }

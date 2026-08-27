@@ -24,8 +24,6 @@ use novarocks_execution::runtime::fragment::{FragmentOutcome, FragmentTerminalFa
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_failpoint::QueryLifecycleFaultKind;
-#[cfg(debug_assertions)]
-use novarocks_failpoint::{claim_matching_fault, configured_root};
 use novarocks_proto::lifecycle::terminal::p0_max_encoded_len;
 use novarocks_proto::lifecycle::{
     FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifestDigest, ParticipantRole,
@@ -36,7 +34,9 @@ use novarocks_proto::lifecycle::{
     QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationAck,
     QueryTerminationReason, StageDigest, StageDigestVersion, TerminalOutcomeContentId,
 };
-use novarocks_types::{LocalQuerySequence, QueryIdAttribution, QueryProcessNamespace, UniqueId};
+use novarocks_types::{
+    BackendProcessId, LocalQuerySequence, QueryIdAttribution, QueryProcessNamespace, UniqueId,
+};
 use prost::Message;
 use tracing::{info, warn};
 
@@ -170,13 +170,15 @@ fn protocol_backend(
     backend: novarocks_proto::lifecycle::ParticipantBackendIdentity,
 ) -> novarocks_proto_models::novarocks::ParticipantBackendIdentity {
     let endpoint = validated(backend.endpoint());
+    let process_id = validated(backend.process_id());
     novarocks_proto_models::novarocks::ParticipantBackendIdentity {
-        backend_id: backend.backend_id(),
         endpoint: Some(novarocks_proto_models::novarocks::QueryControlEndpoint {
             host: endpoint.host().to_owned(),
             port: u32::from(endpoint.port()),
         }),
-        start_epoch: backend.start_epoch(),
+        process_id: Some(novarocks_proto_models::novarocks::BackendProcessId {
+            value: process_id.to_bytes().to_vec(),
+        }),
     }
 }
 
@@ -861,8 +863,7 @@ pub(crate) struct QueryLifecycleRegistry {
     local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
     runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
     config: QueryLifecycleRegistryConfig,
-    local_backend_id: Mutex<Option<u64>>,
-    local_start_epoch: u64,
+    local_process_id: BackendProcessId,
     clock: Arc<dyn MonotonicClock>,
     metrics: Arc<dyn QueryLifecycleMetricsSink>,
     stage_resources: Arc<Mutex<StageResourceLedger>>,
@@ -925,6 +926,7 @@ impl QueryTerminalFallbackTransport for GrpcQueryTerminalFallbackTransport {
 
 #[derive(Default)]
 struct QueryLifecycleRegistryState {
+    draining: bool,
     entries: BTreeMap<QueryExecutionId, Arc<QueryLifecycleEntry>>,
     fragment_executions: BTreeMap<UniqueId, QueryExecutionId>,
     tombstones: VecDeque<QueryExecutionId>,
@@ -950,19 +952,6 @@ struct PreInitTombstone {
     digest: ParticipantManifestDigest,
     reason: QueryTerminationReason,
     terminated_at: Instant,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct QueryLifecycleRestorationStatus {
-    pub(crate) control_ready: usize,
-    pub(crate) active_lifecycle: usize,
-    pub(crate) fragment_admissions: usize,
-    pub(crate) fragment_acceptances: usize,
-    pub(crate) lifecycle_entries: usize,
-    pub(crate) lifecycle_tombstones: usize,
-    pub(crate) pre_init_tombstones: usize,
-    pub(crate) tombstone_index: usize,
-    pub(crate) restored: bool,
 }
 
 struct InitWorkspace {
@@ -1068,14 +1057,12 @@ impl QueryLifecycleRegistry {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn new(
-        local_backend_id: u64,
-        local_start_epoch: u64,
+        local_process_id: BackendProcessId,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
     ) -> Arc<Self> {
         Self::new_with_clock(
-            local_backend_id,
-            local_start_epoch,
+            local_process_id,
             local_runtime,
             config,
             Arc::new(SystemMonotonicClock),
@@ -1084,15 +1071,13 @@ impl QueryLifecycleRegistry {
 
     #[cfg(test)]
     pub(crate) fn new_with_clock(
-        local_backend_id: u64,
-        local_start_epoch: u64,
+        local_process_id: BackendProcessId,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
         clock: Arc<dyn MonotonicClock>,
     ) -> Arc<Self> {
         Self::new_with_clock_and_metrics(
-            local_backend_id,
-            local_start_epoch,
+            local_process_id,
             local_runtime,
             config,
             clock,
@@ -1102,16 +1087,14 @@ impl QueryLifecycleRegistry {
 
     #[cfg(test)]
     pub(crate) fn new_with_clock_and_metrics(
-        local_backend_id: u64,
-        local_start_epoch: u64,
+        local_process_id: BackendProcessId,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
         clock: Arc<dyn MonotonicClock>,
         metrics: Arc<dyn QueryLifecycleMetricsSink>,
     ) -> Arc<Self> {
         Self::new_with_clock_metrics_and_terminal_fallback(
-            local_backend_id,
-            local_start_epoch,
+            local_process_id,
             local_runtime,
             config,
             clock,
@@ -1124,8 +1107,7 @@ impl QueryLifecycleRegistry {
 
     #[cfg(test)]
     pub(crate) fn new_with_clock_metrics_and_terminal_fallback(
-        local_backend_id: u64,
-        local_start_epoch: u64,
+        local_process_id: BackendProcessId,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
         clock: Arc<dyn MonotonicClock>,
@@ -1134,8 +1116,7 @@ impl QueryLifecycleRegistry {
     ) -> Arc<Self> {
         Self::new_with_backend_identity(
             crate::rpc::runtime::test_backend_data_runtime(),
-            Some(local_backend_id),
-            local_start_epoch,
+            local_process_id,
             local_runtime,
             config,
             clock,
@@ -1150,8 +1131,7 @@ impl QueryLifecycleRegistry {
         reason = "The test constructor injects every lifecycle dependency to exercise failure paths deterministically."
     )]
     pub(crate) fn new_with_clock_metrics_terminal_fallback_and_runtime_filter_factory(
-        local_backend_id: u64,
-        local_start_epoch: u64,
+        local_process_id: BackendProcessId,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
         clock: Arc<dyn MonotonicClock>,
@@ -1160,8 +1140,7 @@ impl QueryLifecycleRegistry {
         runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
     ) -> Arc<Self> {
         Self::new_with_backend_identity_and_runtime_filter_factory(
-            Some(local_backend_id),
-            local_start_epoch,
+            local_process_id,
             local_runtime,
             config,
             clock,
@@ -1172,29 +1151,31 @@ impl QueryLifecycleRegistry {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_unbound(
-        local_start_epoch: u64,
+    pub(crate) fn new_with_process_id(
+        local_process_id: BackendProcessId,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
     ) -> Arc<Self> {
-        Self::new_unbound_with_runtime(
-            crate::rpc::runtime::test_backend_data_runtime(),
-            local_start_epoch,
+        let runtime = crate::rpc::runtime::test_backend_data_runtime();
+        Self::new_with_backend_identity(
+            runtime.clone(),
+            local_process_id,
             local_runtime,
             config,
+            Arc::new(SystemMonotonicClock),
+            Arc::new(PrometheusQueryLifecycleMetricsSink),
+            Arc::new(GrpcQueryTerminalFallbackTransport { runtime }),
         )
     }
 
-    pub(crate) fn new_unbound_with_runtime(
+    pub(crate) fn new_with_runtime(
         runtime: BackendDataRuntime,
-        local_start_epoch: u64,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
     ) -> Arc<Self> {
         Self::new_with_backend_identity(
             runtime.clone(),
-            None,
-            local_start_epoch,
+            BackendProcessId::new_v7(),
             local_runtime,
             config,
             Arc::new(SystemMonotonicClock),
@@ -1209,8 +1190,7 @@ impl QueryLifecycleRegistry {
     )]
     fn new_with_backend_identity(
         runtime: BackendDataRuntime,
-        local_backend_id: Option<u64>,
-        local_start_epoch: u64,
+        local_process_id: BackendProcessId,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
         clock: Arc<dyn MonotonicClock>,
@@ -1218,8 +1198,7 @@ impl QueryLifecycleRegistry {
         terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
     ) -> Arc<Self> {
         Self::new_with_backend_identity_and_runtime_filter_factory(
-            local_backend_id,
-            local_start_epoch,
+            local_process_id,
             local_runtime,
             config,
             clock,
@@ -1234,8 +1213,7 @@ impl QueryLifecycleRegistry {
         reason = "This constructor accepts the complete production lifecycle dependency set and explicit runtime-filter factory."
     )]
     fn new_with_backend_identity_and_runtime_filter_factory(
-        local_backend_id: Option<u64>,
-        local_start_epoch: u64,
+        local_process_id: BackendProcessId,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
         clock: Arc<dyn MonotonicClock>,
@@ -1269,8 +1247,7 @@ impl QueryLifecycleRegistry {
             local_runtime,
             runtime_filter_factory,
             config,
-            local_backend_id: Mutex::new(local_backend_id),
-            local_start_epoch,
+            local_process_id,
             clock,
             metrics,
             stage_resources: Arc::new(Mutex::new(StageResourceLedger::default())),
@@ -1283,95 +1260,37 @@ impl QueryLifecycleRegistry {
         registry
     }
 
-    fn local_backend_id(&self) -> Option<u64> {
-        *self
-            .local_backend_id
-            .lock()
-            .expect("query lifecycle backend identity lock")
+    pub(crate) const fn local_process_id(&self) -> BackendProcessId {
+        self.local_process_id
     }
 
-    pub(crate) fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError> {
-        let mut local_backend_id = self
-            .local_backend_id
+    /// Reject new attempts after SIGTERM drain has begun. Existing attempts
+    /// retain their normal lifecycle; drain never reassigns this process.
+    pub(crate) fn begin_drain(&self) {
+        self.state
             .lock()
-            .expect("query lifecycle backend identity lock");
-        match *local_backend_id {
-            None => {
-                *local_backend_id = Some(backend_id);
-                drop(local_backend_id);
-                let status = self.restoration_status();
-                if query_lifecycle_test_markers_enabled() {
-                    eprintln!(
-                        "NOVAROCKS_QUERY_LIFECYCLE_RESTORE_STATUS backend_id={} start_epoch={} control_ready={} active_lifecycle={} fragment_admissions={} fragment_acceptances={} lifecycle_entries={} lifecycle_tombstones={} pre_init_tombstones={} tombstone_index={} restored={}",
-                        backend_id,
-                        self.local_start_epoch,
-                        status.control_ready,
-                        status.active_lifecycle,
-                        status.fragment_admissions,
-                        status.fragment_acceptances,
-                        status.lifecycle_entries,
-                        status.lifecycle_tombstones,
-                        status.pre_init_tombstones,
-                        status.tombstone_index,
-                        status.restored
-                    );
-                }
-                Ok(())
-            }
-            Some(current) if current == backend_id => Ok(()),
-            Some(current) => Err(QueryLifecycleError::new(
-                QueryLifecycleErrorCode::Conflict,
-                format!(
-                    "backend identity is already bound to {current}; refusing reassignment to {backend_id}"
-                ),
-            )),
-        }
+            .expect("query lifecycle registry lock")
+            .draining = true;
     }
 
-    pub(crate) fn restoration_status(&self) -> QueryLifecycleRestorationStatus {
+    pub(crate) fn is_draining(&self) -> bool {
+        self.state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .draining
+    }
+
+    pub(crate) fn is_drained(&self) -> bool {
         let state = self.state.lock().expect("query lifecycle registry lock");
-        let mut control_ready = 0;
-        let mut fragment_admissions = 0;
-        let mut fragment_acceptances = 0;
-        let mut lifecycle_tombstones = 0;
-        for entry in state.entries.values() {
-            let entry_state = entry.state.lock().expect("query lifecycle entry lock");
-            control_ready += usize::from(entry_state.phase == QueryLifecyclePhase::ControlAttached);
-            fragment_admissions += entry_state.in_flight_fragments.len();
-            fragment_acceptances += entry_state.accepted_fragments.len();
-            lifecycle_tombstones +=
-                usize::from(entry_state.phase == QueryLifecyclePhase::Tombstone);
-        }
-        fragment_acceptances = fragment_acceptances.max(state.fragment_executions.len());
-        let active_lifecycle = state.active_entries;
-        let lifecycle_entries = state.entries.len();
-        let pre_init_tombstones = state.pre_init_tombstones.len();
-        let tombstone_index = state.tombstones.len();
-        let restored = control_ready != 0
-            || active_lifecycle != 0
-            || fragment_admissions != 0
-            || fragment_acceptances != 0
-            || lifecycle_entries != 0
-            || lifecycle_tombstones != 0
-            || pre_init_tombstones != 0
-            || tombstone_index != 0;
-        QueryLifecycleRestorationStatus {
-            control_ready,
-            active_lifecycle,
-            fragment_admissions,
-            fragment_acceptances,
-            lifecycle_entries,
-            lifecycle_tombstones,
-            pre_init_tombstones,
-            tombstone_index,
-            restored,
-        }
+        state.draining && state.active_entries == 0
     }
 
     pub(crate) fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         let manifest = validated(request.manifest());
         let execution_id = validated(manifest.execution_id());
-        let digest = validated(request.digest());
+        // The admission boundary derives the manifest identity exactly once and
+        // retains it on the entry; later comparisons read the retained value.
+        let digest = validated(manifest.digest());
         if validated(manifest.roles()).contains(&ParticipantRole::FragmentExecutor)
             && manifest.expected_fragment_instance_ids().is_empty()
         {
@@ -1384,13 +1303,11 @@ impl QueryLifecycleRegistry {
             return ack;
         }
         let manifest_backend = validated(manifest.backend());
-        if self.local_backend_id() != Some(manifest_backend.backend_id())
-            || manifest_backend.start_epoch() != self.local_start_epoch
-        {
+        if validated(manifest_backend.process_id()) != self.local_process_id {
             let ack = QueryInitAck::new(
                 execution_id,
                 digest,
-                QueryInitOutcome::QueryInitRejectedStaleBackend,
+                QueryInitOutcome::QueryInitRejectedBackendProcessMismatch,
             );
             self.log_init(&ack);
             return ack;
@@ -1399,6 +1316,16 @@ impl QueryLifecycleRegistry {
         let entry = {
             let mut state = self.state.lock().expect("query lifecycle registry lock");
             self.clean_tombstones_locked(&mut state, self.clock.now(), 64);
+            if state.draining {
+                let ack = QueryInitAck::new(
+                    execution_id,
+                    digest,
+                    QueryInitOutcome::QueryInitRejectedBackendDraining,
+                );
+                drop(state);
+                self.log_init(&ack);
+                return ack;
+            }
             if let Some(tombstone) = state.pre_init_tombstones.get(&execution_id) {
                 let outcome = if tombstone.digest == digest {
                     QueryInitOutcome::QueryInitRejectedTerminated
@@ -1538,8 +1465,7 @@ impl QueryLifecycleRegistry {
                     query_local_sequence = %diagnostic.local_sequence(),
                     query_attempt_id = diagnostic.attempt_id(),
                     attempt_id = execution_id.attempt_id().get(),
-                    backend_id = ?self.local_backend_id(),
-                    start_epoch = self.local_start_epoch,
+                    process_id = %self.local_process_id,
                     digest = %format_digest(digest),
                     outcome = "terminated",
                     reason = ?reason,
@@ -1718,8 +1644,7 @@ impl QueryLifecycleRegistry {
             query_local_sequence = %diagnostic.local_sequence(),
             query_attempt_id = diagnostic.attempt_id(),
             attempt_id = execution_id.attempt_id().get(),
-            backend_id = ?self.local_backend_id(),
-            start_epoch = self.local_start_epoch,
+            process_id = %self.local_process_id,
             digest = %format_digest(digest),
             outcome = "control_attached",
             reason = "none",
@@ -1727,9 +1652,9 @@ impl QueryLifecycleRegistry {
         );
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
-                "NOVAROCKS_QUERY_CONTROL_READY execution_id={} backend_id={} expected_fragments={} {}",
+                "NOVAROCKS_QUERY_CONTROL_READY execution_id={} process_id={} expected_fragments={} {}",
                 format_execution_id(execution_id),
-                self.local_backend_id().unwrap_or_default(),
+                self.local_process_id,
                 entry.expected_fragment_instance_ids.len(),
                 QueryExecutionDiagnostic::from(execution_id),
             );
@@ -1796,6 +1721,7 @@ impl QueryLifecycleRegistry {
             };
             let backend = validated(entry.manifest.backend());
             let endpoint = validated(backend.endpoint());
+            let process_id = validated(backend.process_id());
             let observation = FragmentLiveObservation::parse(
                 novarocks_proto_models::novarocks::FragmentLiveObservation {
                     execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
@@ -1804,14 +1730,15 @@ impl QueryLifecycleRegistry {
                     init_digest: entry.digest.as_bytes().to_vec(),
                     backend: Some(
                         novarocks_proto_models::novarocks::ParticipantBackendIdentity {
-                            backend_id: backend.backend_id(),
                             endpoint: Some(
                                 novarocks_proto_models::novarocks::QueryControlEndpoint {
                                     host: endpoint.host().to_owned(),
                                     port: u32::from(endpoint.port()),
                                 },
                             ),
-                            start_epoch: backend.start_epoch(),
+                            process_id: Some(novarocks_proto_models::novarocks::BackendProcessId {
+                                value: process_id.to_bytes().to_vec(),
+                            }),
                         },
                     ),
                     fragment_instance_id: Some(protocol_unique_id(fragment_instance_id)),
@@ -1845,8 +1772,14 @@ impl QueryLifecycleRegistry {
     pub(crate) fn begin_stage(&self, request: QueryStageRequest) -> StageBuildDecision {
         let execution_id = request.execution_id();
         let digest_version = request.digest_version();
-        let stage_digest = request.digest();
-        let fragment_count = request.fragments().len();
+        // Derive the stage identity exactly once. Every acknowledgement echoes
+        // it, including the capacity rejection below, so this must precede the
+        // backend-local fragment budget check. Protocol already bounded the
+        // fragment count and encoded size before this carrier was validated.
+        let fragments = request.fragments();
+        let stage_digest = StageDigest::compute_v1(execution_id, request.init_digest(), &fragments)
+            .expect("validated QueryStageRequest always derives a stage digest");
+        let fragment_count = fragments.len();
         if fragment_count > self.config.stage_max_fragments {
             return StageBuildDecision::Complete(
                 QueryStageAck::new(
@@ -2166,8 +2099,7 @@ impl QueryLifecycleRegistry {
             query_local_sequence = %diagnostic.local_sequence(),
             query_attempt_id = diagnostic.attempt_id(),
             attempt_id = execution_id.attempt_id().get(),
-            backend_id = ?self.local_backend_id(),
-            start_epoch = self.local_start_epoch,
+            process_id = %self.local_process_id,
             digest = %format_digest(digest),
             outcome = "attach_rejected",
             reason = detail,
@@ -2409,8 +2341,7 @@ impl QueryLifecycleRegistry {
             query_local_sequence = %diagnostic.local_sequence(),
             query_attempt_id = diagnostic.attempt_id(),
             attempt_id = execution_id.attempt_id().get(),
-            backend_id = ?self.local_backend_id(),
-            start_epoch = self.local_start_epoch,
+            process_id = %self.local_process_id,
             digest = %digest,
             outcome = "admission_rejected",
             reason = detail,
@@ -2639,9 +2570,9 @@ impl QueryLifecycleRegistry {
         );
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
-                "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={} backend_id={} reason={} expected_fragments={} {}",
+                "NOVAROCKS_QUERY_LIFECYCLE_TERMINATED execution_id={} process_id={} reason={} expected_fragments={} {}",
                 format_execution_id(execution_id),
-                self.local_backend_id().unwrap_or_default(),
+                self.local_process_id,
                 termination_reason_name(requested_reason),
                 expected_instances.len(),
                 QueryExecutionDiagnostic::from(execution_id),
@@ -2692,11 +2623,7 @@ impl QueryLifecycleRegistry {
         fragment_instance_id: UniqueId,
         outcome: &FragmentOutcome,
     ) {
-        let snapshot = match fragment_snapshot_from_outcome(
-            fragment_instance_id,
-            self.local_backend_id().unwrap_or_default() as i32,
-            outcome,
-        ) {
+        let snapshot = match fragment_snapshot_from_outcome(fragment_instance_id, 0, outcome) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 warn!(target: "novarocks::query_lifecycle", error = %error, "rejecting terminal fragment fact");
@@ -2904,8 +2831,7 @@ impl QueryLifecycleRegistry {
             {
                 return;
             }
-            let backend_num =
-                i32::try_from(self.local_backend_id().unwrap_or_default()).unwrap_or(i32::MAX);
+            let backend_num = 0;
             for fragment_instance_id in &entry.expected_fragment_instance_ids {
                 if !state.terminal_facts.contains_key(fragment_instance_id) {
                     let detail = format!(
@@ -3359,9 +3285,9 @@ impl QueryLifecycleRegistry {
         if self.terminal_outcome_suppressed(execution_id) {
             if query_lifecycle_test_markers_enabled() {
                 eprintln!(
-                    "NOVAROCKS_QUERY_TERMINAL_OUTCOME_SUPPRESSED execution_id={} backend_id={}",
+                    "NOVAROCKS_QUERY_TERMINAL_OUTCOME_SUPPRESSED execution_id={} process_id={}",
                     format_execution_id(execution_id),
-                    self.local_backend_id().unwrap_or_default(),
+                    self.local_process_id,
                 );
             }
             return;
@@ -3415,47 +3341,22 @@ impl QueryLifecycleRegistry {
                 return Ok(true);
             }
         }
-        let Some(root) = configured_root() else {
+        let Some(root) = novarocks_failpoint::configured_root() else {
             return Ok(false);
         };
-        let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
-            .map_err(|_| {
-                QueryLifecycleError::new(
-                    QueryLifecycleErrorCode::Internal,
-                    "lifecycle terminal fault backend index is unset",
-                )
-            })?
-            .parse::<usize>()
-            .map_err(|error| {
-                QueryLifecycleError::new(
-                    QueryLifecycleErrorCode::Internal,
-                    format!("invalid lifecycle terminal fault backend index: {error}"),
-                )
-            })?;
-        let backend_id = self.local_backend_id().ok_or_else(|| {
-            QueryLifecycleError::new(
-                QueryLifecycleErrorCode::Internal,
-                "backend identity is not bound for lifecycle terminal fault",
-            )
-        })?;
-        let claimed = claim_matching_fault(
+        novarocks_failpoint::claim_matching_fault_for_process(
             &root,
             kind,
             execution_id,
-            backend_index,
-            backend_id,
-            self.local_start_epoch,
+            self.local_process_id,
         )
-        .map_err(|error| QueryLifecycleError::new(QueryLifecycleErrorCode::Internal, error))?;
-        if claimed.is_some() && query_lifecycle_test_markers_enabled() {
-            eprintln!(
-                "NOVAROCKS_QUERY_TERMINAL_FAULT_TRIGGERED kind={} execution_id={} backend_id={}",
-                kind.file_stem(),
-                format_execution_id(execution_id),
-                backend_id,
-            );
-        }
-        Ok(claimed.is_some())
+        .map(|claimed| claimed.is_some())
+        .map_err(|error| {
+            QueryLifecycleError::new(
+                crate::query_lifecycle::QueryLifecycleErrorCode::Internal,
+                error,
+            )
+        })
     }
 
     #[cfg(not(debug_assertions))]
@@ -3576,10 +3477,9 @@ impl QueryLifecycleRegistry {
     ) {
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
-                "NOVAROCKS_QUERY_TERMINAL_RETAINED execution_id={} backend_id={} start_epoch={} digest={:?} bytes={}",
+                "NOVAROCKS_QUERY_TERMINAL_RETAINED execution_id={} process_id={} digest={:?} bytes={}",
                 format_execution_id(snapshot.execution_id()),
-                self.local_backend_id().unwrap_or_default(),
-                self.local_start_epoch,
+                self.local_process_id,
                 content_id.as_bytes(),
                 bytes,
             );
@@ -3648,9 +3548,9 @@ impl QueryLifecycleRegistry {
                             });
                             if query_lifecycle_test_markers_enabled() {
                                 eprintln!(
-                                    "NOVAROCKS_QUERY_TERMINAL_FALLBACK_ACCEPTED execution_id={} backend_id={} attempt={} outcome={:?}",
+                                    "NOVAROCKS_QUERY_TERMINAL_FALLBACK_ACCEPTED execution_id={} process_id={} attempt={} outcome={:?}",
                                     format_execution_id(outcome.execution_id()),
-                                    registry.local_backend_id().unwrap_or_default(),
+                                    registry.local_process_id,
                                     attempt + 1,
                                     ack.outcome().expect("validated terminal fallback acknowledgement"),
                                 );
@@ -3672,9 +3572,9 @@ impl QueryLifecycleRegistry {
                             });
                             if query_lifecycle_test_markers_enabled() {
                                 eprintln!(
-                                    "NOVAROCKS_QUERY_TERMINAL_FALLBACK_RETRY execution_id={} backend_id={} attempt={} outcome={:?} detail={}",
+                                    "NOVAROCKS_QUERY_TERMINAL_FALLBACK_RETRY execution_id={} process_id={} attempt={} outcome={:?} detail={}",
                                     format_execution_id(outcome.execution_id()),
-                                    registry.local_backend_id().unwrap_or_default(),
+                                    registry.local_process_id,
                                     attempt + 1,
                                     ack.outcome(),
                                     ack.detail(),
@@ -3708,9 +3608,9 @@ impl QueryLifecycleRegistry {
                             });
                             if query_lifecycle_test_markers_enabled() {
                                 eprintln!(
-                                    "NOVAROCKS_QUERY_TERMINAL_FALLBACK_RETRY execution_id={} backend_id={} attempt={} transport_error={}",
+                                    "NOVAROCKS_QUERY_TERMINAL_FALLBACK_RETRY execution_id={} process_id={} attempt={} transport_error={}",
                                     format_execution_id(outcome.execution_id()),
-                                    registry.local_backend_id().unwrap_or_default(),
+                                    registry.local_process_id,
                                     attempt + 1,
                                     error,
                                 );
@@ -3776,11 +3676,11 @@ impl QueryLifecycleRegistry {
         if query_lifecycle_test_markers_enabled() {
             let query_id = execution_id.query_id();
             eprintln!(
-                "NOVAROCKS_QUERY_TERMINAL_ACK query_hi={} query_lo={} attempt={} backend_id={} {}",
+                "NOVAROCKS_QUERY_TERMINAL_ACK query_hi={} query_lo={} attempt={} process_id={} {}",
                 query_id.high(),
                 query_id.low(),
                 execution_id.attempt_id().get(),
-                self.local_backend_id().unwrap_or_default(),
+                self.local_process_id,
                 QueryExecutionDiagnostic::from(execution_id),
             );
         }
@@ -3909,8 +3809,7 @@ impl QueryLifecycleRegistry {
             query_local_sequence = %diagnostic.local_sequence(),
             query_attempt_id = diagnostic.attempt_id(),
             attempt_id = execution_id.attempt_id().get(),
-            backend_id = ?self.local_backend_id(),
-            start_epoch = self.local_start_epoch,
+            process_id = %self.local_process_id,
             digest = %format_digest(entry.digest),
             outcome = "terminated",
             reason = ?reason,
@@ -3919,9 +3818,9 @@ impl QueryLifecycleRegistry {
         self.publish_metrics();
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
-                "NOVAROCKS_QUERY_LIFECYCLE_CLEANUP execution_id={} backend_id={} active=false tombstone=true reason={reason:?} {}",
+                "NOVAROCKS_QUERY_LIFECYCLE_CLEANUP execution_id={} process_id={} active=false tombstone=true reason={reason:?} {}",
                 format_execution_id(execution_id),
-                self.local_backend_id().unwrap_or_default(),
+                self.local_process_id,
                 QueryExecutionDiagnostic::from(execution_id),
             );
         }
@@ -4054,8 +3953,7 @@ impl QueryLifecycleRegistry {
                 query_local_sequence = %diagnostic.local_sequence(),
                 query_attempt_id = diagnostic.attempt_id(),
                 attempt_id = execution_id.attempt_id().get(),
-                backend_id = ?self.local_backend_id(),
-                start_epoch = self.local_start_epoch,
+                process_id = %self.local_process_id,
                 digest = %format_digest(entry.digest),
                 outcome = "coordinator_lost",
                 reason = ?reason,
@@ -4207,8 +4105,7 @@ impl QueryLifecycleRegistry {
             query_local_sequence = %diagnostic.local_sequence(),
             query_attempt_id = diagnostic.attempt_id(),
             attempt_id = execution_id.attempt_id().get(),
-            backend_id = ?self.local_backend_id(),
-            start_epoch = self.local_start_epoch,
+            process_id = %self.local_process_id,
             digest = %format_digest(digest),
             outcome = ?outcome,
             reason = "none",
@@ -4234,9 +4131,9 @@ impl QueryLifecycleRegistry {
                 "NOVAROCKS_QUERY_INIT_IDEMPOTENT"
             };
             eprintln!(
-                "{marker} execution_id={} backend_id={} expected_fragments={expected_fragments} {}",
+                "{marker} execution_id={} process_id={} expected_fragments={expected_fragments} {}",
                 format_execution_id(execution_id),
-                self.local_backend_id().unwrap_or_default(),
+                self.local_process_id,
                 QueryExecutionDiagnostic::from(execution_id),
             );
         }
@@ -4346,6 +4243,12 @@ impl InitWorkspace {
 impl StageBuildPermit {
     pub(crate) fn gate(&self) -> Arc<super::stage::StartGate> {
         Arc::clone(&self.gate)
+    }
+
+    /// The stage identity derived once when the build was reserved. Callers
+    /// acknowledge with this value instead of deriving it again.
+    pub(crate) const fn digest(&self) -> StageDigest {
+        self.digest
     }
 
     pub(crate) fn commit(mut self) -> QueryStageAck {
@@ -4492,12 +4395,13 @@ impl FragmentAdmissionPermit {
         self.committed = true;
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
-                "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={} backend_id={} finst_id={} {}",
+                "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={} process_id={} finst_id={} {}",
                 format_execution_id(self.execution_id),
                 self.registry
                     .upgrade()
-                    .and_then(|registry| registry.local_backend_id())
-                    .unwrap_or_default(),
+                    .map(|registry| registry.local_process_id)
+                    .map(|process_id| process_id.to_string())
+                    .unwrap_or_else(|| "unavailable".to_owned()),
                 self.fragment_instance_id,
                 QueryExecutionDiagnostic::from(self.execution_id),
             );
@@ -4565,15 +4469,16 @@ impl BackendQueryControl for RegistryQueryControl {
 
     fn coordinator_lost(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError> {
         if query_lifecycle_test_markers_enabled() {
-            let backend_id = self
+            let process_id = self
                 .registry
                 .upgrade()
-                .and_then(|registry| registry.local_backend_id())
-                .unwrap_or_default();
+                .map(|registry| registry.local_process_id)
+                .map(|process_id| process_id.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned());
             eprintln!(
-                "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST execution_id={} backend_id={} reason={reason:?} {}",
+                "NOVAROCKS_QUERY_CONTROL_COORDINATOR_LOST execution_id={} process_id={} reason={reason:?} {}",
                 format_execution_id(self.execution_id),
-                backend_id,
+                process_id,
                 QueryExecutionDiagnostic::from(self.execution_id),
             );
         }
@@ -4660,8 +4565,8 @@ pub(super) fn query_lifecycle_test_markers_enabled() -> bool {
 }
 
 impl QueryLifecycleIngress for QueryLifecycleRegistry {
-    fn bind_backend_identity(&self, backend_id: u64) -> Result<(), QueryLifecycleError> {
-        QueryLifecycleRegistry::bind_backend_identity(self, backend_id)
+    fn backend_process_id(&self) -> BackendProcessId {
+        self.local_process_id()
     }
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {

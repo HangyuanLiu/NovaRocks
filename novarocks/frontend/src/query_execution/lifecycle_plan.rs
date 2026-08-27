@@ -16,7 +16,6 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
@@ -33,6 +32,7 @@ use novarocks_proto::lifecycle::{
 };
 use novarocks_proto_models::common;
 use novarocks_proto_models::novarocks;
+use novarocks_types::BackendProcessId;
 
 use crate::query_execution::launch::StageParticipantBinding;
 use crate::query_execution::terminal_set::QueryTerminalSet;
@@ -40,32 +40,36 @@ use crate::query_execution::terminal_set::QueryTerminalSet;
 /// Frozen target selected from one live backend snapshot.
 ///
 /// This is coordinator orchestration state, not a native lifecycle message.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct QueryLifecycleTarget {
     backend_idx: usize,
-    endpoint: SocketAddr,
-    start_epoch: u64,
+    endpoint: RuntimeEndpoint,
+    process_id: BackendProcessId,
 }
 
 impl QueryLifecycleTarget {
-    pub const fn new(backend_idx: usize, endpoint: SocketAddr, start_epoch: u64) -> Self {
+    pub fn new(
+        backend_idx: usize,
+        endpoint: RuntimeEndpoint,
+        process_id: BackendProcessId,
+    ) -> Self {
         Self {
             backend_idx,
             endpoint,
-            start_epoch,
+            process_id,
         }
     }
 
-    pub const fn backend_idx(self) -> usize {
+    pub const fn backend_idx(&self) -> usize {
         self.backend_idx
     }
 
-    pub const fn endpoint(self) -> SocketAddr {
-        self.endpoint
+    pub const fn endpoint(&self) -> &RuntimeEndpoint {
+        &self.endpoint
     }
 
-    pub const fn start_epoch(self) -> u64 {
-        self.start_epoch
+    pub const fn process_id(&self) -> BackendProcessId {
+        self.process_id
     }
 }
 
@@ -93,15 +97,17 @@ fn protocol_report_endpoint(
 fn protocol_backend_identity(
     target: LiveBackendTarget,
 ) -> Result<ParticipantBackendIdentity, DistributedQueryError> {
-    let backend_id = u64::try_from(target.backend_idx())
-        .map_err(|_| contract_error("query initialization backend index is outside u64 range"))?;
+    let endpoint = target.endpoint().map_err(protocol_contract_error)?;
+    let process_id = target.process_id().map_err(protocol_contract_error)?;
     ParticipantBackendIdentity::parse(novarocks::ParticipantBackendIdentity {
-        backend_id,
         endpoint: Some(novarocks::QueryControlEndpoint {
-            host: target.endpoint().ip().to_string(),
-            port: u32::from(target.endpoint().port()),
+            host: endpoint.host().to_string(),
+            port: u32::try_from(endpoint.port())
+                .map_err(|_| contract_error("backend endpoint port is outside u32 range"))?,
         }),
-        start_epoch: target.start_epoch(),
+        process_id: Some(novarocks::BackendProcessId {
+            value: process_id.to_bytes().to_vec(),
+        }),
     })
     .map_err(protocol_contract_error)
 }
@@ -182,25 +188,21 @@ impl QueryInitOptions {
                 "query initialization pre-start timeout must be nonzero",
             ));
         }
-        let mut backend_ids = BTreeSet::new();
+        let mut backend_indices = BTreeSet::new();
         let mut endpoints = BTreeSet::new();
         for target in &live_backends {
-            if target.start_epoch() == 0 {
-                return Err(contract_error(format!(
-                    "query initialization live backend {} has zero start epoch",
-                    target.backend_idx()
-                )));
-            }
-            if !backend_ids.insert(target.backend_idx()) {
+            target.process_id().map_err(protocol_contract_error)?;
+            if !backend_indices.insert(target.backend_idx()) {
                 return Err(contract_error(format!(
                     "query initialization live snapshot repeats backend {}",
                     target.backend_idx()
                 )));
             }
-            if !endpoints.insert(target.endpoint()) {
+            let endpoint = target.endpoint().map_err(protocol_contract_error)?;
+            if !endpoints.insert(endpoint.clone()) {
                 return Err(contract_error(format!(
                     "query initialization live snapshot repeats endpoint {}",
-                    target.endpoint()
+                    endpoint
                 )));
             }
         }
@@ -299,17 +301,15 @@ impl QueryInitPlan {
                     .backend()
                     .endpoint()
                     .map_err(protocol_contract_error)?;
-                let endpoint_ip = endpoint.host().parse::<IpAddr>().map_err(|error| {
-                    contract_error(format!(
-                        "query stage backend {} endpoint is not an IP address: {error}",
-                        participant.backend_idx()
-                    ))
-                })?;
                 StageParticipantBinding::new(
                     QueryLifecycleTarget::new(
                         participant.backend_idx(),
-                        SocketAddr::new(endpoint_ip, endpoint.port()),
-                        participant.backend().start_epoch(),
+                        RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port()))
+                            .map_err(|error| contract_error(error.to_string()))?,
+                        participant
+                            .backend()
+                            .process_id()
+                            .map_err(protocol_contract_error)?,
                     ),
                     participant.digest(),
                     participant
@@ -337,6 +337,7 @@ impl QueryInitPlan {
         execution_id: QueryExecutionId,
         manifests: impl IntoIterator<Item = (usize, ParticipantManifest)>,
     ) -> Result<Self, DistributedQueryError> {
+        let mut process_ids = BTreeSet::new();
         let mut participants = manifests
             .into_iter()
             .map(|(backend_idx, manifest)| {
@@ -345,20 +346,17 @@ impl QueryInitPlan {
                         "contract-test participant execution id differs from query init plan",
                     ));
                 }
-                if manifest
-                    .backend()
-                    .map_err(protocol_contract_error)?
-                    .backend_id()
-                    != backend_idx as u64
-                {
+                let backend = manifest.backend().map_err(protocol_contract_error)?;
+                let process_id = backend.process_id().map_err(protocol_contract_error)?;
+                if !process_ids.insert(process_id) {
                     return Err(contract_error(
-                        "contract-test participant backend identity differs from backend index",
+                        "contract-test query init plan repeats a backend process identity",
                     ));
                 }
                 let digest = manifest.digest().map_err(protocol_contract_error)?;
                 Ok(QueryInitParticipant {
                     backend_idx,
-                    backend: manifest.backend().map_err(protocol_contract_error)?,
+                    backend,
                     manifest,
                     digest,
                 })
@@ -511,7 +509,7 @@ pub(crate) fn compile_query_init_plan(
     let live_by_backend = options
         .live_backends
         .iter()
-        .map(|target| (target.backend_idx(), *target))
+        .map(|target| (target.backend_idx(), target.clone()))
         .collect::<BTreeMap<_, _>>();
     if live_by_backend != fragments.frozen_live_backends {
         return Err(contract_error(
@@ -524,11 +522,12 @@ pub(crate) fn compile_query_init_plan(
                 "scheduled backend {backend_idx} is absent from query initialization live snapshot"
             ))
         })?;
-        if RuntimeEndpoint::from_socket_addr(target.endpoint()) != *endpoint {
+        let target_endpoint = target.endpoint().map_err(protocol_contract_error)?;
+        if target_endpoint != *endpoint {
             return Err(contract_error(format!(
                 "scheduled backend {backend_idx} endpoint {} differs from query initialization snapshot endpoint {}",
                 endpoint.as_host_port(),
-                target.endpoint()
+                target_endpoint
             )));
         }
     }
@@ -558,11 +557,14 @@ pub(crate) fn compile_query_init_plan(
         .collect::<BTreeSet<_>>();
     let mut participants = Vec::with_capacity(participant_ids.len());
     for backend_idx in participant_ids {
-        let target = *live_by_backend.get(&backend_idx).ok_or_else(|| {
-            contract_error(format!(
-                "query initialization participant backend {backend_idx} is not live"
-            ))
-        })?;
+        let target = live_by_backend
+            .get(&backend_idx)
+            .ok_or_else(|| {
+                contract_error(format!(
+                    "query initialization participant backend {backend_idx} is not live"
+                ))
+            })?
+            .clone();
         let backend = protocol_backend_identity(target)?;
         let mut roles = BTreeSet::new();
         let expected_instances = fragments
@@ -623,6 +625,7 @@ pub(crate) fn compile_query_init_plan(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::OnceLock;
     use std::time::Duration;
 
     use super::{QueryInitOptions, compile_query_init_plan};
@@ -632,8 +635,9 @@ mod tests {
     use novarocks_proto::lifecycle::{
         AttemptId, ParticipantRole, QueryExecutionId, QueryOptions, RuntimeFilterContribution,
     };
+    use novarocks_proto::membership::BackendProcessDescriptor;
     use novarocks_proto_models::novarocks;
-    use novarocks_types::UniqueId;
+    use novarocks_types::{BackendProcessId, UniqueId};
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
@@ -644,12 +648,27 @@ mod tests {
     }
 
     fn backend(backend_idx: usize) -> LiveBackendTarget {
+        static PROCESS_IDS: OnceLock<[BackendProcessId; 3]> = OnceLock::new();
+        let process_ids = PROCESS_IDS.get_or_init(|| {
+            [
+                BackendProcessId::new_v7(),
+                BackendProcessId::new_v7(),
+                BackendProcessId::new_v7(),
+            ]
+        });
         LiveBackendTarget::new(
             backend_idx,
-            format!("127.0.0.1:{}", 19040 + backend_idx)
-                .parse()
+            BackendProcessDescriptor::new(
+                process_ids[backend_idx],
+                novarocks_proto::lifecycle::QueryControlEndpoint::new(
+                    "127.0.0.1",
+                    u16::try_from(19040 + backend_idx).expect("valid port"),
+                )
                 .expect("valid endpoint"),
-            100 + backend_idx as u64,
+                "test-deployment",
+                "test-build",
+            )
+            .expect("valid descriptor"),
         )
     }
 
@@ -657,7 +676,6 @@ mod tests {
         let participant_id = u32::try_from(backend_idx + 1).expect("participant");
         let contribution = RuntimeFilterContribution::parse(novarocks::RuntimeFilterContribution {
             participant_id,
-            contribution_digest: vec![0; 32],
             ..Default::default()
         })
         .expect("valid opaque contribution");
@@ -678,18 +696,8 @@ mod tests {
                 (1, BTreeSet::from([fragment_one])),
             ]),
             BTreeMap::from([
-                (
-                    0,
-                    novarocks_execution::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
-                        backend(0).endpoint(),
-                    ),
-                ),
-                (
-                    1,
-                    novarocks_execution::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
-                        backend(1).endpoint(),
-                    ),
-                ),
+                (0, backend(0).endpoint().expect("valid endpoint")),
+                (1, backend(1).endpoint().expect("valid endpoint")),
             ]),
             Vec::new(),
         )
@@ -765,19 +773,14 @@ mod tests {
             .expect("runtime filter contribution");
 
         assert_eq!(contribution.participant_id(), 3);
-        assert_eq!(contribution.digest(), &[0; 32]);
+        assert_eq!(contribution.as_proto(), runtime_filter(2).1.as_proto());
     }
 
     #[test]
     fn query_init_plan_rejects_backend_restart_at_the_same_endpoint() {
         let fragments = FragmentLifecycleProjection::new(
             BTreeMap::from([(0, BTreeSet::from([UniqueId::new(10, 1)]))]),
-            BTreeMap::from([(
-                0,
-                novarocks_execution::runtime::endpoint::RuntimeEndpoint::from_socket_addr(
-                    backend(0).endpoint(),
-                ),
-            )]),
+            BTreeMap::from([(0, backend(0).endpoint().expect("valid endpoint"))]),
             Vec::new(),
         )
         .with_frozen_live_backends(vec![backend(0)])
@@ -785,8 +788,14 @@ mod tests {
         let resolved = ResolvedQueryOptions::from_upstream(None);
         let restarted = LiveBackendTarget::new(
             backend(0).backend_idx(),
-            backend(0).endpoint(),
-            backend(0).start_epoch() + 1,
+            BackendProcessDescriptor::new(
+                BackendProcessId::new_v7(),
+                novarocks_proto::lifecycle::QueryControlEndpoint::new("127.0.0.1", 19040)
+                    .expect("valid endpoint"),
+                "test-deployment",
+                "test-build",
+            )
+            .expect("valid descriptor"),
         );
         let options = QueryInitOptions::new(
             execution_id(),

@@ -25,13 +25,17 @@ use novarocks_frontend::view::{
 };
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
-    FrontendApplicationHost, FrontendExecutionConfig,
+    FrontendApplicationHost, FrontendExecutionConfig, FrontendNativeTransport,
+};
+use novarocks_native_trust::{
+    DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
 };
 use novarocks_parser::{
     ast::{Query, Statement as ParsedStatement},
     parse as parse_typed_statement,
     printer::print_query,
 };
+use novarocks_secret::SecretValue;
 use novarocks_spi::state_store::{CommitOutcome, Key, Precondition, TransactionId, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +43,16 @@ mod common;
 use common::state_store_fixture;
 use tempfile::TempDir;
 use uuid::Uuid;
+
+fn test_native_trust() -> Arc<NativeTrust> {
+    Arc::new(NativeTrust::new(
+        DeploymentId::parse("frontend-integration-test").expect("deployment"),
+        ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))
+            .expect("secret"),
+        NativeCallerSubject::parse("fe@127.0.0.1:19040").expect("subject"),
+        NativeTransportMode::Disabled,
+    ))
+}
 
 fn execution_config() -> FrontendExecutionConfig {
     FrontendExecutionConfig::new("127.0.0.1", 19090, std::num::NonZeroUsize::new(1).unwrap())
@@ -55,6 +69,8 @@ async fn open_host(
         backend_config(),
         Vec::new(),
         tokio::runtime::Handle::current(),
+        test_native_trust(),
+        FrontendNativeTransport::plaintext(),
     )
     .await
 }
@@ -62,7 +78,6 @@ async fn open_host(
 fn backend_config() -> ClusterBackendOpenConfig {
     ClusterBackendOpenConfig::new(
         novarocks_types::ClusterRole::Fe,
-        Vec::new(),
         Duration::from_secs(1),
         1,
         Duration::from_secs(1),
@@ -73,7 +88,6 @@ fn backend_config() -> ClusterBackendOpenConfig {
 fn fe_backend_config() -> ClusterBackendOpenConfig {
     ClusterBackendOpenConfig::new(
         novarocks_types::ClusterRole::Fe,
-        Vec::new(),
         Duration::from_secs(1),
         1,
         Duration::from_secs(1),
@@ -234,26 +248,25 @@ async fn sqlite_host_bootstraps_once_and_preserves_reconciling_mode() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fe_without_state_store_fails_before_frontend_services_open() {
+async fn fe_without_state_store_fails_before_durable_services_open() {
     let error = match FrontendApplicationHost::open(
         None,
         execution_config(),
         fe_backend_config(),
         tokio::runtime::Handle::current(),
+        test_native_trust(),
+        FrontendNativeTransport::plaintext(),
     )
     .await
     {
         Ok(host) => {
             host.shutdown().await.expect("shutdown unexpected FE host");
-            panic!("role=fe must not open without StateStore membership authority");
+            panic!("role=fe must not open durable services without StateStore");
         }
         Err(error) => error,
     };
 
-    assert_eq!(
-        error.kind(),
-        FrontendApplicationErrorKind::ClusterBackendOpen
-    );
+    assert_eq!(error.kind(), FrontendApplicationErrorKind::MvServiceOpen);
     assert!(error.to_string().contains("requires StateStore"), "{error}");
 }
 
@@ -289,6 +302,8 @@ async fn unregistered_provider_fails_before_store_open() {
         execution_config(),
         backend_config(),
         tokio::runtime::Handle::current(),
+        test_native_trust(),
+        FrontendNativeTransport::plaintext(),
     )
     .await
     {

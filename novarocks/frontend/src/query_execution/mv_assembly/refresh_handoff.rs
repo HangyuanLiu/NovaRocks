@@ -17,37 +17,37 @@
 
 //! Frontend refresh-lifecycle handoff assembled from Core SQL facts.
 
-use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorWriteOperationId};
+use novarocks_spi::connector::{
+    ConnectorExecutionBindingKey, ConnectorWriteOperationId, LakePublicationId,
+};
 
 use super::refresh_artifact::{
     MvRefreshPublicationIntent, PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite,
 };
 use novarocks_sql::planning::mv::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
 
-/// Frontend-preallocated identities for a single MV refresh lifecycle. These
-/// are application lifecycle values: SQL may validate them but cannot create
-/// a connector operation or persist their durable intent.
+/// Frontend-preallocated identity for one MV refresh publication.
+///
+/// A publication ID is the sole cross-boundary identity. Provider-specific
+/// write IDs and ref names are derived from it at the assembly boundary, so a
+/// refresh cannot accidentally split one publication across unrelated
+/// operation IDs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvRefreshAttemptIdentity {
-    pub refresh_id: i64,
-    pub request_id: [u8; 16],
-    pub staging_branch: String,
-    pub marker_token: String,
-    pub staging_create_operation_id: [u8; 16],
-    pub write_operation_id: ConnectorWriteOperationId,
-    pub publication_operation_id: [u8; 16],
-    pub staging_drop_operation_id: [u8; 16],
+    pub publication_id: LakePublicationId,
 }
 
 impl MvRefreshAttemptIdentity {
     pub fn validate(&self) -> Result<(), String> {
-        if self.refresh_id <= 0 || self.staging_branch.is_empty() || self.marker_token.is_empty() {
-            return Err(
-                "MV refresh preparation requires a positive identity and non-empty staging marker"
-                    .to_string(),
-            );
-        }
         Ok(())
+    }
+
+    pub fn write_operation_id(&self) -> ConnectorWriteOperationId {
+        self.publication_id.into()
+    }
+
+    pub fn staging_branch(&self) -> String {
+        format!("__novarocks_mv_publication_{}", self.publication_id)
     }
 }
 
@@ -161,27 +161,21 @@ mod tests {
 
     fn attempt() -> MvRefreshAttemptIdentity {
         MvRefreshAttemptIdentity {
-            refresh_id: 7,
-            request_id: [1; 16],
-            staging_branch: "__nova_mv_7".to_string(),
-            marker_token: "marker".to_string(),
-            staging_create_operation_id: [2; 16],
-            write_operation_id: ConnectorWriteOperationId::from_bytes([3; 16]),
-            publication_operation_id: [4; 16],
-            staging_drop_operation_id: [5; 16],
+            publication_id: LakePublicationId::new_v7(),
         }
     }
 
     #[test]
     fn refresh_attempt_is_lifecycle_owned() {
         attempt().validate().expect("complete attempt identity");
-        assert!(
-            MvRefreshAttemptIdentity {
-                marker_token: String::new(),
-                ..attempt()
-            }
-            .validate()
-            .is_err()
+        let attempt = attempt();
+        assert_eq!(
+            attempt.write_operation_id().to_bytes(),
+            attempt.publication_id.to_bytes()
+        );
+        assert_eq!(
+            attempt.staging_branch(),
+            format!("__novarocks_mv_publication_{}", attempt.publication_id)
         );
     }
 

@@ -206,7 +206,6 @@ impl QueryStageRequest {
         execution_id: QueryExecutionId,
         init_digest: ParticipantManifestDigest,
         digest_version: StageDigestVersion,
-        digest: StageDigest,
         mut fragments: Vec<StageFragment>,
     ) -> Result<Self, ProtocolError> {
         fragments.sort_by_key(StageFragment::fragment_instance_id);
@@ -215,7 +214,6 @@ impl QueryStageRequest {
             execution_id: Some(encode_query_execution_id(execution_id)),
             init_digest: init_digest.as_bytes().to_vec(),
             stage_digest_version: digest_version.get(),
-            stage_digest: digest.as_bytes().to_vec(),
             fragments: fragments
                 .into_iter()
                 .map(StageFragment::into_proto)
@@ -244,10 +242,9 @@ impl QueryStageRequest {
             ));
         }
 
-        let execution_id = required_execution_id(wire.execution_id.as_ref())?;
-        let init_digest = ParticipantManifestDigest::try_from_slice(&wire.init_digest)?;
-        let _ = StageDigestVersion::try_from_wire(wire.stage_digest_version)?;
-        let digest = StageDigest::try_from_slice(&wire.stage_digest)?;
+        required_execution_id(wire.execution_id.as_ref())?;
+        ParticipantManifestDigest::try_from_slice(&wire.init_digest)?;
+        StageDigestVersion::try_from_wire(wire.stage_digest_version)?;
         let fragments = wire
             .fragments
             .iter()
@@ -255,17 +252,6 @@ impl QueryStageRequest {
             .map(StageFragment::parse)
             .collect::<Result<Vec<_>, _>>()?;
         validate_stage_fragment_ids(&fragments)?;
-
-        // `try_from_wire` above accepts only V1, so this projection remains
-        // versioned without leaving an unchecked fallback for future values.
-        let recomputed = StageDigest::compute_v1(execution_id, init_digest, &fragments)?;
-        if recomputed != digest {
-            return Err(ProtocolError::new(
-                FieldPath::root("stage_fragments_request").field("stage_digest"),
-                ProtocolErrorKind::DigestMismatch,
-                "stage digest does not match decoded stage fragment batch",
-            ));
-        }
         Ok(Self { wire })
     }
 
@@ -290,11 +276,6 @@ impl QueryStageRequest {
     pub fn digest_version(&self) -> StageDigestVersion {
         StageDigestVersion::try_from_wire(self.wire.stage_digest_version)
             .expect("validated QueryStageRequest always has a digest version")
-    }
-
-    pub fn digest(&self) -> StageDigest {
-        StageDigest::try_from_slice(&self.wire.stage_digest)
-            .expect("validated QueryStageRequest always has a stage digest")
     }
 
     pub fn fragments(&self) -> Vec<StageFragment> {
@@ -727,18 +708,11 @@ mod tests {
     fn stage_request_sorts_fragment_ids_and_preserves_valid_wire_round_trip() {
         let first = fragment(9);
         let second = fragment(3);
-        let digest = StageDigest::compute_v1(
-            execution_id(),
-            init_digest(),
-            &[first.clone(), second.clone()],
-        )
-        .expect("digest");
         let request = QueryStageRequest::new(
             execution_id(),
             init_digest(),
             StageDigestVersion::V1,
-            digest,
-            vec![first, second],
+            vec![first.clone(), second.clone()],
         )
         .expect("valid batch");
         assert_eq!(request.fragments()[0].fragment_instance_id().low(), 3);
@@ -747,6 +721,14 @@ mod tests {
         let round_tripped =
             QueryStageRequest::parse(request.as_proto().clone()).expect("valid generated request");
         assert_eq!(round_tripped.as_proto(), request.as_proto());
+
+        // Both roles derive the same identity from the carried content.
+        assert_eq!(
+            StageDigest::compute_v1(execution_id(), init_digest(), &request.fragments())
+                .expect("sender digest"),
+            StageDigest::compute_v1(execution_id(), init_digest(), &[second, first])
+                .expect("receiver digest")
+        );
     }
 
     #[test]
@@ -755,7 +737,6 @@ mod tests {
             execution_id: Some(encode_query_execution_id(execution_id())),
             init_digest: init_digest().as_bytes().to_vec(),
             stage_digest_version: StageDigestVersion::V1.get(),
-            stage_digest: [9; 32].to_vec(),
             fragments: vec![fragment(3).into_proto(), fragment(3).into_proto()],
         };
         let error = QueryStageRequest::parse(raw).expect_err("duplicate ids cannot be staged");

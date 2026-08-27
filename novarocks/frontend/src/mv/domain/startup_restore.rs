@@ -42,18 +42,11 @@ pub trait MvStartupRestore: Send + Sync {
     /// work to rebuild.
     fn rebuild_cache_from_lake(&self) -> Result<(), String>;
 
-    /// Restore each definition's provider-side target state.
+    /// Register each ready projection with its provider-local catalog state.
     ///
-    /// After the rebuild so it sees rebuilt definitions too, and before recovery
-    /// so recovery has target descriptors to inspect against.
+    /// This is pure local registration. It must not mutate or inspect a
+    /// historical refresh attempt.
     fn restore_targets(&self) -> Result<(), String>;
-
-    /// Reconcile unfinished refresh attempts.
-    ///
-    /// Last because it needs both catalog bindings and target descriptors already
-    /// restored in order to acquire a current-generation inspection lease per
-    /// fenced attempt.
-    fn recover_unfinished_refreshes(&self) -> Result<(), String>;
 }
 
 /// Runs the restore steps in the one order that satisfies their preconditions.
@@ -63,8 +56,7 @@ pub trait MvStartupRestore: Send + Sync {
 /// by accident.
 pub fn run_mv_startup_restore(restore: &dyn MvStartupRestore) -> Result<(), String> {
     restore.rebuild_cache_from_lake()?;
-    restore.restore_targets()?;
-    restore.recover_unfinished_refreshes()
+    restore.restore_targets()
 }
 
 #[cfg(test)]
@@ -106,26 +98,20 @@ mod tests {
         fn restore_targets(&self) -> Result<(), String> {
             self.record("targets")
         }
-        fn recover_unfinished_refreshes(&self) -> Result<(), String> {
-            self.record("recover")
-        }
     }
 
     #[test]
-    fn restore_runs_rebuild_then_targets_then_recovery() {
+    fn restore_runs_rebuild_then_targets() {
         let restore = RecordingRestore::default();
         run_mv_startup_restore(&restore).expect("restore succeeds");
 
-        // The order is the contract: recovery needs target descriptors, and
-        // target restore needs definitions the rebuild may have just recreated.
-        assert_eq!(restore.calls(), vec!["rebuild", "targets", "recover"]);
+        // Target registration consumes only the projections rebuilt above.
+        assert_eq!(restore.calls(), vec!["rebuild", "targets"]);
     }
 
     #[test]
     fn a_failed_step_stops_the_sequence() {
-        // Continuing past a failed rebuild would run recovery against a cache
-        // that is still missing definitions, and recovery would then see fewer
-        // attempts than exist.
+        // Continuing past a failed rebuild would register an incomplete cache.
         let restore = RecordingRestore::failing_at("rebuild");
         let error = run_mv_startup_restore(&restore).expect_err("rebuild failure propagates");
         assert!(error.contains("rebuild failed"), "{error}");
@@ -136,7 +122,7 @@ mod tests {
         assert_eq!(
             restore.calls(),
             vec!["rebuild", "targets"],
-            "recovery must not run after target restore failed"
+            "no later startup action may run after target registration fails"
         );
     }
 }

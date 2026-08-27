@@ -416,6 +416,10 @@ run_cargo_gates() {
     tools/ci/check-native-wire-dependency-boundary.py
   run_fail_fast_stage "native wire dependency boundary mutations" "native-wire-dependency-boundary-test.log" \
     tools/ci/tests/native-wire-dependency-boundary-test.sh
+  run_fail_fast_stage "native trust dependency boundary" "native-trust-dependency-boundary.log" \
+    tools/ci/check-native-trust-dependency-boundary.py
+  run_fail_fast_stage "native trust dependency boundary mutations" "native-trust-dependency-boundary-test.log" \
+    tools/ci/tests/native-trust-dependency-boundary-test.sh
   run_fail_fast_stage "legacy branding" "legacy-branding.log" \
     tools/ci/check-legacy-branding.sh
   run_fail_fast_stage "legacy branding tests" "legacy-branding-test.log" \
@@ -895,6 +899,7 @@ run_sql_suites() {
     ci_run_logged "$log_path" \
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \
+      NOVAROCKS_WORKSPACE_ROOT="$REPO_ROOT" \
       cargo run --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \

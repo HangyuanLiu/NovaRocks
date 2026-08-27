@@ -3,6 +3,15 @@
 
 log_level = "info"
 
+# Every deployable FE/BE configuration in one deployment must use the same
+# deployment_id and shared secret. The secret is resolved by Server at startup;
+# do not put a production secret in this file.
+[native_trust]
+deployment_id = "analytics-prod"
+shared_secret = "${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
+# Omitting [native_trust.transport] selects authenticated plaintext h2c.
+# See docs/guides/deployment/native-trust.md for optional TLS 1.3 modes.
+
 [server]
 host = "127.0.0.1"
 # Native fragment/exchange gRPC listener. This listener does not expose

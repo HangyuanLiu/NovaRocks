@@ -2,9 +2,9 @@
 id: ADR-0108
 title: "Native role launch and management surfaces"
 domain: [runtime-role, configuration, cluster-membership, crate-boundary]
-status: active
+status: superseded
 supersedes: [ADR-0013, ADR-0026, ADR-0072, ADR-0099]
-superseded-by: null
+superseded-by: ADR-0112
 date: 2026-08-26
 provenance:
   - "implementation: native FE/BE dual-config launch and role-local management surfaces; PR #971"

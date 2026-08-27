@@ -1770,7 +1770,8 @@ mod tests {
                 table: Arc::from("t"),
             },
             owner,
-            publication_id: LakePublicationId::from_bytes(operation_id.to_bytes()),
+            publication_id: LakePublicationId::try_from_bytes(operation_id.to_bytes())
+                .expect("staged create operation ID must be UUIDv7"),
             operation_id,
             columns: Vec::new(),
             partitioning: Vec::new(),

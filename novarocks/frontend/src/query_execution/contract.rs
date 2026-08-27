@@ -47,6 +47,7 @@ use novarocks_spi::connector::{
     ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlanningRequest,
     ConnectorWritePreparation,
 };
+use novarocks_types::BackendProcessId;
 
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use novarocks_sql::plan_read::FragmentId;
@@ -810,7 +811,30 @@ pub(crate) fn with_connector_write_operation(
 pub enum DistributedQueryErrorKind {
     ContractViolation,
     Rejected,
+    /// The statement observed a pre-ControlReady topology disposition, but
+    /// its owner cannot prove the stable semantic binding and zero-effect
+    /// conditions required to construct a replacement round.
+    TopologyRetryUnsupported,
     Failed,
+}
+
+/// Closed, pre-ControlReady topology outcomes that a statement-level round
+/// controller may consider for one bounded replan.  This is carried as typed
+/// coordinator evidence rather than reconstructed from an error string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreReadyTopologyOutcome {
+    BackendDraining {
+        backend_idx: usize,
+        process_id: BackendProcessId,
+    },
+    BackendProcessMismatch {
+        backend_idx: usize,
+        process_id: BackendProcessId,
+    },
+    BackendNotEligible {
+        backend_idx: usize,
+        process_id: BackendProcessId,
+    },
 }
 
 /// A coordinator failure that core can surface without naming a coordinator
@@ -820,6 +844,8 @@ pub struct DistributedQueryError {
     kind: DistributedQueryErrorKind,
     message: String,
     connector_binding_rejection: Option<EnsureConnectorExecutionBindingRejection>,
+    pre_ready_topology_outcome: Option<PreReadyTopologyOutcome>,
+    pre_ready_topology_observation: bool,
 }
 
 impl DistributedQueryError {
@@ -828,6 +854,8 @@ impl DistributedQueryError {
             kind,
             message: message.into(),
             connector_binding_rejection: None,
+            pre_ready_topology_outcome: None,
+            pre_ready_topology_observation: false,
         }
     }
 
@@ -852,6 +880,55 @@ impl DistributedQueryError {
                 field_path,
             ),
             connector_binding_rejection: Some(rejection),
+            pre_ready_topology_outcome: None,
+            pre_ready_topology_observation: false,
+        }
+    }
+
+    /// Constructed only by the pre-ControlReady coordinator/barrier path.
+    /// Callers must never infer this disposition from transport text or a
+    /// post-ready lifecycle failure.
+    pub(crate) fn pre_ready_topology(
+        outcome: PreReadyTopologyOutcome,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: DistributedQueryErrorKind::Rejected,
+            message: message.into(),
+            connector_binding_rejection: None,
+            pre_ready_topology_outcome: Some(outcome),
+            pre_ready_topology_observation: false,
+        }
+    }
+
+    /// A pre-ControlReady lifecycle transport loss can wait briefly for the
+    /// membership authority to prove an exact captured-process replacement.
+    /// It is not retry evidence by itself and must never be constructed from
+    /// display text or after ControlReady.
+    pub(crate) fn pre_ready_topology_observation(message: impl Into<String>) -> Self {
+        Self {
+            kind: DistributedQueryErrorKind::Failed,
+            message: message.into(),
+            connector_binding_rejection: None,
+            pre_ready_topology_outcome: None,
+            pre_ready_topology_observation: true,
+        }
+    }
+
+    /// Turns typed pre-ready topology evidence into a fail-closed statement
+    /// result when the operation has no whole-round replanning owner. The
+    /// original outcome remains available to observability and callers; it is
+    /// not reduced to transport/display text.
+    pub(crate) fn topology_retry_unsupported(
+        outcome: PreReadyTopologyOutcome,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: DistributedQueryErrorKind::TopologyRetryUnsupported,
+            message: message.into(),
+            connector_binding_rejection: None,
+            pre_ready_topology_outcome: Some(outcome),
+            pre_ready_topology_observation: false,
         }
     }
 
@@ -865,6 +942,14 @@ impl DistributedQueryError {
 
     pub fn connector_binding_rejection(&self) -> Option<&EnsureConnectorExecutionBindingRejection> {
         self.connector_binding_rejection.as_ref()
+    }
+
+    pub(crate) const fn pre_ready_topology_outcome(&self) -> Option<PreReadyTopologyOutcome> {
+        self.pre_ready_topology_outcome
+    }
+
+    pub(crate) const fn requires_pre_ready_topology_observation(&self) -> bool {
+        self.pre_ready_topology_observation
     }
 }
 
@@ -893,6 +978,46 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         &self,
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError>;
+
+    /// Execute a statement operation whose replacement rounds must carry a
+    /// newly derived completion formatter as well as a newly derived request.
+    /// The default retains legacy single-round behavior for narrow test
+    /// coordinators; the production coordinator overrides it with the
+    /// statement-level pre-ready controller.
+    fn execute_prepared(
+        &self,
+        operation: crate::query_execution::completion::PreparedDistributedQuery,
+    ) -> Result<crate::runtime::statement_result::StatementResult, DistributedQueryError> {
+        let (request, completion, round_factory) = operation.into_parts();
+        if round_factory.is_some() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "injected coordinator does not implement statement-level pre-ready replan",
+            ));
+        }
+        let outcome = self.execute(request)?;
+        completion
+            .complete(outcome)
+            .map_err(|error| DistributedQueryError::new(DistributedQueryErrorKind::Failed, error))
+    }
+
+    /// Execute a statement operation whose caller retains its raw outcome.
+    /// This is deliberately separate from `execute_prepared`: a distributed
+    /// write must preserve connector commit/abort handles for the frontend
+    /// transaction runner and cannot be rendered as a `StatementResult`.
+    fn execute_prepared_raw(
+        &self,
+        operation: crate::query_execution::completion::PreparedRetriableDistributedRequest,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        let (request, _round_factory) = operation.into_parts();
+        Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            format!(
+                "injected coordinator does not implement raw pre-ready replan for {:?}",
+                request.intent()
+            ),
+        ))
+    }
 }
 
 #[cfg(test)]

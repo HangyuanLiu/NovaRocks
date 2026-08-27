@@ -17,7 +17,7 @@
 
 //! Post-commit cleanup handoff for `DROP TABLE ... PURGE`.
 //!
-//! Design: ADR-0110 (docs/adr/ADR-0110-iceberg-provider-private-catalog-owner.md)
+//! Design: ADR-0114 (docs/adr/ADR-0114-iceberg-provider-private-catalog-owner.md)
 //!
 //! Catalog visibility and object deletion are separate authorities, and this
 //! module is the seam between them. It is deliberately weak:

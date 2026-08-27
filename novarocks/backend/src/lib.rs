@@ -20,4 +20,4 @@ pub use connector::{
 };
 pub use fragment::NativeFragmentService;
 pub use query_lifecycle::QueryLifecycleRegistryConfig;
-pub use rpc::runtime::BackendDataRuntime;
+pub use rpc::runtime::{BackendDataRuntime, BackendNativeTransport};

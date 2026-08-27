@@ -2,9 +2,9 @@
 id: ADR-0075
 title: "Lake-first MV attempt discovery classifies conservatively or not at all"
 domain: [frontend-mv, provider-spi]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0112
 date: 2026-08-13
 provenance:
   - "discussion: 2026-08-10 MV refresh active-active recalibration"

@@ -831,7 +831,7 @@ impl Catalog for HadoopFileSystemCatalog {
     /// still reported success. Object deletion now belongs to the post-commit
     /// cleanup handoff, which runs only after the drop is proven committed,
     /// only against exact identity, and only once the age window has passed.
-    /// See ADR-0110.
+    /// See ADR-0114.
     ///
     /// The order matters. The hint goes first, so a failure between the two
     /// steps leaves the table resolvable through `v1.metadata.json` and the

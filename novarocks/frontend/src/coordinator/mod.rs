@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod backend_events;
 mod execution;
 // Task 5 deliberately lands the lifecycle client seam before Task 6 wires the
 // production transport and Task 7 cuts over coordinator submission.
@@ -24,7 +23,6 @@ mod query_registry;
 mod report;
 mod scheduler;
 
-pub use backend_events::BackendQueryActivity;
 pub use execution::FrontendDistributedQueryCoordinator;
 pub(crate) use query_registry::{
     QueryLifecycleConvergenceErrorSource, QueryLifecycleConvergenceReader,

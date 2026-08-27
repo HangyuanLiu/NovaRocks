@@ -66,18 +66,13 @@ mod write_shared;
 pub use abort::{AbortLog, CleanupError};
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};
 pub use mv_provenance::{
-    MV_PROVENANCE_V1_PROP, MV_PROVENANCE_VERSION, MV_REFRESH_ROW_COUNT_PROP, MvProvenanceV1,
-    ProvenanceBase, RefreshTechnique, waterline_hash_for,
-};
-pub use mv_publication_fence::{
-    LegacyMvPublicationFenceObservation, MV_PUBLICATION_FENCE_MARKER_PROP,
-    MV_PUBLICATION_FENCE_REF, MV_PUBLICATION_FENCE_VERSION, MvPublicationFenceMarker,
-    is_legacy_mv_publication_fence_ref, observe_legacy_mv_publication_fence,
+    MV_PUBLICATION_PROVENANCE_PROP, MV_PUBLICATION_PROVENANCE_VERSION, MV_REFRESH_ROW_COUNT_PROP,
+    MvPublicationProvenanceV2, ProvenanceBase, RefreshTechnique, waterline_hash_for,
 };
 pub use mv_refresh_ref::{
-    MV_ID_PROP, MV_REFRESH_ID_PROP, MV_REFRESH_TOKEN_PROP, MvRefreshPublishOutcome,
-    MvRefreshPublishPlan, MvRefreshSnapshotMarker, publish_staging_branch_to_main,
-    snapshot_matches_refresh_marker,
+    MV_PUBLICATION_ID_PROP, MV_PUBLICATION_STAGING_REF_PREFIX, MvPublicationSnapshotMarker,
+    MvRefreshPublishOutcome, MvRefreshPublishPlan, publish_staging_branch_to_main,
+    snapshot_matches_publication_marker,
 };
 pub use position_delete_writer::{PositionDeleteGroup, write_position_delete_files};
 pub use puffin_dv::{

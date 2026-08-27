@@ -4,7 +4,7 @@ title: "Recovering a dead generation's maintenance is a separate provider capabi
 domain: [table-maintenance]
 status: superseded
 supersedes: []
-superseded-by: ADR-0109
+superseded-by: ADR-0111
 date: 2026-08-13
 provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/888"

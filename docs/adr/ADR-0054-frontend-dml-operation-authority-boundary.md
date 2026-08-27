@@ -4,7 +4,7 @@ title: "Frontend DML uses operation-scoped StateStore authority without claiming
 domain: [frontend-dml]
 status: superseded
 supersedes: []
-superseded-by: ADR-0104
+superseded-by: ADR-0110
 date: 2026-08-10
 provenance:
   - "discussion: 2026-08-10 frontend DML operation authority and recovery scope"

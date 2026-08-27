@@ -27,8 +27,9 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{
     ConnectorCommittedPartitioning, ConnectorCommittedVersion, ConnectorExecutionBindingKey,
-    ConnectorManagedPartitionSpecReplacement, ConnectorTableHandle, ConnectorTableObjectId,
-    ConnectorWriteCohortId, ConnectorWriteOperationId, ConnectorWriteReceipt,
+    ConnectorManagedDescriptorProperties, ConnectorManagedPartitionSpecReplacement,
+    ConnectorTableHandle, ConnectorTableObjectId, ConnectorWriteCohortId,
+    ConnectorWriteOperationId, ConnectorWriteReceipt, LakePublicationId,
 };
 
 use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
@@ -111,42 +112,41 @@ impl MvRefreshPublicationBase {
 /// fabricated by SQL preparation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvRefreshPublicationIntent {
-    refresh_id: i64,
-    mv_id: i64,
-    marker_token: String,
+    publication_id: LakePublicationId,
+    target_object_id: ConnectorTableObjectId,
+    expected_target_snapshot_id: Option<i64>,
+    descriptor_properties: ConnectorManagedDescriptorProperties,
     technique: MvRefreshPublicationTechnique,
     bases: Vec<MvRefreshPublicationBase>,
     definition_fingerprint: String,
     target_catalog: String,
     target_namespace: String,
     target_name: String,
-    staging_branch: String,
     partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
+    expected_committed_partitioning: Option<ConnectorCommittedPartitioning>,
 }
 
 impl MvRefreshPublicationIntent {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
-        refresh_id: i64,
-        mv_id: i64,
-        marker_token: String,
+        publication_id: LakePublicationId,
+        target_object_id: ConnectorTableObjectId,
+        expected_target_snapshot_id: Option<i64>,
+        descriptor_properties: ConnectorManagedDescriptorProperties,
         technique: MvRefreshPublicationTechnique,
         bases: Vec<MvRefreshPublicationBase>,
         definition_fingerprint: String,
         target_catalog: String,
         target_namespace: String,
         target_name: String,
-        staging_branch: String,
     ) -> Result<Self, String> {
-        if refresh_id <= 0
-            || mv_id <= 0
-            || marker_token.is_empty()
+        if expected_target_snapshot_id.is_some_and(|snapshot| snapshot < 0)
+            || descriptor_properties.entries().is_empty()
             || bases.is_empty()
             || definition_fingerprint.is_empty()
             || target_catalog.is_empty()
             || target_namespace.is_empty()
             || target_name.is_empty()
-            || staging_branch.is_empty()
         {
             return Err("invalid MV refresh publication intent".to_string());
         }
@@ -159,28 +159,32 @@ impl MvRefreshPublicationIntent {
             return Err("MV refresh publication intent has duplicate base identity".to_string());
         }
         Ok(Self {
-            refresh_id,
-            mv_id,
-            marker_token,
+            publication_id,
+            target_object_id,
+            expected_target_snapshot_id,
+            descriptor_properties,
             technique,
             bases,
             definition_fingerprint,
             target_catalog,
             target_namespace,
             target_name,
-            staging_branch,
             partition_spec_replacement: None,
+            expected_committed_partitioning: None,
         })
     }
 
-    pub(crate) const fn refresh_id(&self) -> i64 {
-        self.refresh_id
+    pub(crate) const fn publication_id(&self) -> LakePublicationId {
+        self.publication_id
     }
-    pub(crate) const fn mv_id(&self) -> i64 {
-        self.mv_id
+    pub(crate) fn target_object_id(&self) -> &ConnectorTableObjectId {
+        &self.target_object_id
     }
-    pub(crate) fn marker_token(&self) -> &str {
-        &self.marker_token
+    pub(crate) const fn expected_target_snapshot_id(&self) -> Option<i64> {
+        self.expected_target_snapshot_id
+    }
+    pub(crate) fn descriptor_properties(&self) -> &ConnectorManagedDescriptorProperties {
+        &self.descriptor_properties
     }
     pub(crate) const fn technique(&self) -> MvRefreshPublicationTechnique {
         self.technique
@@ -200,20 +204,30 @@ impl MvRefreshPublicationIntent {
     pub(crate) fn target_name(&self) -> &str {
         &self.target_name
     }
-    pub(crate) fn staging_branch(&self) -> &str {
-        &self.staging_branch
+    pub(crate) fn staging_branch(&self) -> String {
+        // The ref is provider-internal and must remain a pure function of the
+        // single publication identity.
+        format!("__novarocks_mv_publication_{}", self.publication_id)
     }
 
     pub(crate) fn with_partition_spec_replacement(
         mut self,
         replacement: ConnectorManagedPartitionSpecReplacement,
+        expected_committed_partitioning: ConnectorCommittedPartitioning,
+        descriptor_properties: ConnectorManagedDescriptorProperties,
     ) -> Self {
         self.partition_spec_replacement = Some(replacement);
+        self.expected_committed_partitioning = Some(expected_committed_partitioning);
+        self.descriptor_properties = descriptor_properties;
         self
     }
 
     pub fn partition_spec_replacement(&self) -> Option<&ConnectorManagedPartitionSpecReplacement> {
         self.partition_spec_replacement.as_ref()
+    }
+
+    pub fn expected_committed_partitioning(&self) -> Option<&ConnectorCommittedPartitioning> {
+        self.expected_committed_partitioning.as_ref()
     }
 }
 
@@ -244,6 +258,12 @@ impl MvRefreshCommittedFacts {
         if intent.partition_spec_replacement().is_some() != committed_partitioning.is_some() {
             return Err(
                 "MV refresh committed partitioning does not match the requested transition"
+                    .to_string(),
+            );
+        }
+        if committed_partitioning.as_ref() != intent.expected_committed_partitioning() {
+            return Err(
+                "MV refresh committed partitioning does not match its exact prepared preview"
                     .to_string(),
             );
         }
@@ -790,16 +810,21 @@ mod incremental_tests {
         )
         .expect("base");
         let error = MvRefreshPublicationIntent::try_new(
-            1,
-            2,
-            "token".to_string(),
+            LakePublicationId::new_v7(),
+            ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"mv-target-object"))
+                .expect("valid target object ID"),
+            Some(7),
+            ConnectorManagedDescriptorProperties::try_new(vec![(
+                std::sync::Arc::from("novarocks.mv.descriptor.hash"),
+                std::sync::Arc::from("descriptor-hash"),
+            )])
+            .expect("descriptor properties"),
             MvRefreshPublicationTechnique::Full,
             vec![base.clone(), base],
             "fingerprint".to_string(),
             "ice".to_string(),
             "db".to_string(),
             "mv".to_string(),
-            "__nova_mv_1".to_string(),
         )
         .expect_err("duplicate base must fail");
         assert_eq!(
