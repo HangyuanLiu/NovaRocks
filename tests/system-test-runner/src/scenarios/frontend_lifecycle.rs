@@ -37,7 +37,7 @@ impl Scenario for StaticFileDisposableCarrier {
             format!(
                 "format_version = 1\n\
                  [[catalogs]]\n\
-                 instance_id = \"catalog.lnp8_static\"\n\
+                 instance_id = \"lnp8_static\"\n\
                  provider_id = \"iceberg\"\n\
                  display_name = \"lnp8_static\"\n\
                  config_format_version = 1\n\
@@ -63,6 +63,34 @@ impl Scenario for StaticFileDisposableCarrier {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
+        let mut connection = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect StaticFile client")?,
+        )?;
+        connection
+            .query_drop("SET CATALOG lnp8_static")
+            .context("select StaticFile catalog")?;
+        let namespace = format!("lnp8ns_{}", context.mysql_port());
+        connection
+            .query_drop(format!("CREATE DATABASE {namespace}"))
+            .context("create StaticFile catalog namespace")?;
+        connection
+            .query_drop(format!(
+                "CREATE TABLE {namespace}.orders (id INT, amount INT)"
+            ))
+            .context("create StaticFile catalog table")?;
+        connection
+            .query_drop(format!(
+                "INSERT INTO {namespace}.orders VALUES (1, 10), (2, 20)"
+            ))
+            .context("write StaticFile catalog rows")?;
+        let rows: Vec<(i32, i32)> = connection
+            .query(format!(
+                "SELECT id, amount FROM {namespace}.orders ORDER BY id"
+            ))
+            .context("query StaticFile catalog before FE disposal")?;
+        ensure!(rows == vec![(1, 10), (2, 20)]);
         let state_before = context
             .handle()
             .frontend_management_get("/v1/frontend/state", Duration::from_secs(2))?;
@@ -77,6 +105,7 @@ impl Scenario for StaticFileDisposableCarrier {
         );
         context.action("captured the bootstrapped StaticFile catalog snapshot identity");
 
+        drop(connection);
         let deadline = context.deadline();
         context
             .handle()
@@ -88,6 +117,23 @@ impl Scenario for StaticFileDisposableCarrier {
         ensure!(
             static_snapshot_digest(&state_after.body)? == digest_before,
             "StaticFile snapshot digest changed after FE disposal"
+        );
+        let mut connection = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("reconnect after StaticFile disposal")?,
+        )?;
+        connection
+            .query_drop("SET CATALOG lnp8_static")
+            .context("reselect StaticFile catalog")?;
+        let rebuilt: Vec<(i32, i32)> = connection
+            .query(format!(
+                "SELECT id, amount FROM {namespace}.orders ORDER BY id"
+            ))
+            .context("query StaticFile catalog after FE disposal")?;
+        ensure!(
+            rebuilt == rows,
+            "StaticFile rows changed after FE disposal: {rebuilt:?}"
         );
         context.action("proved an empty FE SQLite store rebuilt the same StaticFile catalog state");
         Ok(())

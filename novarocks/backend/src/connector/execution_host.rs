@@ -323,6 +323,36 @@ impl ConnectorExecutionHost {
                 if let Err(rejection) = ensure_admissible(&state, query, &key) {
                     return rejected(rejection);
                 }
+                // A frontend restart remints the process-local connector
+                // incarnation while a live backend keeps its prior binding.
+                // Replacement is safe only when no admitted query still
+                // leases the older generation; there is no FE takeover fence
+                // and no attempt migration hidden in this path.
+                let superseded = state
+                    .bindings
+                    .keys()
+                    .filter(|candidate| {
+                        candidate.instance_id() == key.instance_id() && *candidate != &key
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !superseded.is_empty() {
+                    let old_generation_is_leased = state.query_leases.values().any(|leases| {
+                        superseded
+                            .iter()
+                            .any(|candidate| leases.contains(candidate))
+                    });
+                    if old_generation_is_leased {
+                        return rejected(host_unavailable(
+                            "connector instance has an active prior incarnation",
+                        ));
+                    }
+                    for old_key in superseded {
+                        state.bindings.remove(&old_key);
+                        state.retiring.remove(&old_key);
+                        state.typed_registry.retire(&old_key);
+                    }
+                }
                 let Some(installer) = state.installers.get(&declaration.provider_kind()).cloned()
                 else {
                     return rejected(host_unavailable(
@@ -1023,5 +1053,32 @@ mod tests {
             rejection(ready_host.ensure(query(4), &admitted(declaration))).reason(),
             EnsureConnectorExecutionBindingRejectionReason::Retiring
         );
+    }
+
+    #[test]
+    fn idle_incarnation_is_replaced_after_frontend_restart() {
+        let host = host(Arc::new(AtomicUsize::new(0)), None);
+        let old = declaration(1, "default");
+        let old_key = ConnectorExecutionBindingKey::from(&old);
+        let old_query = query(1);
+        assert!(matches!(
+            host.ensure(old_query, &admitted(old)).outcome(),
+            EnsureConnectorExecutionBindingOutcome::Ensured
+        ));
+        host.release_query(old_query)
+            .expect("release completed old query lease");
+
+        let replacement = declaration(2, "default");
+        let replacement_key = ConnectorExecutionBindingKey::from(&replacement);
+        assert!(matches!(
+            host.ensure(query(2), &admitted(replacement)).outcome(),
+            EnsureConnectorExecutionBindingOutcome::Ensured
+        ));
+        assert!(
+            host.resolver_for(query(2))
+                .resolve(&replacement_key)
+                .is_ok()
+        );
+        assert!(host.resolver_for(query(2)).resolve(&old_key).is_err());
     }
 }
