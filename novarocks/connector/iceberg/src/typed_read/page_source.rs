@@ -852,7 +852,8 @@ fn try_partition_only_page_source(
             IcebergColumnSource::Physical { .. }
             | IcebergColumnSource::InitialDefault
             | IcebergColumnSource::TypedNull
-            | IcebergColumnSource::Metadata(_) => return Ok(None),
+            | IcebergColumnSource::Metadata(_)
+            | IcebergColumnSource::StoredRowLineage(_) => return Ok(None),
         }
     }
     let total_rows = u64::try_from(split.file_record_count()).map_err(|_| {
@@ -1728,6 +1729,7 @@ mod tests {
     use crate::iceberg::spec::{
         NestedField, PrimitiveType, Schema as IcebergSchema, Transform, Type,
     };
+    use crate::typed_read::schema_binding::IcebergMetadataColumn;
     use crate::typed_read::split::{
         IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileParams, IcebergSplitParams,
     };
@@ -1823,6 +1825,75 @@ mod tests {
             writer.write(&batch).expect("write data batch");
             writer.flush().expect("close row group");
         }
+        writer.close().expect("close parquet writer");
+        fs::metadata(path).expect("stat data file").len()
+    }
+
+    /// The Arrow schema of a data file that materializes its row lineage.
+    ///
+    /// This is the shape a rewrite produces: the two reserved field IDs are
+    /// real Parquet columns alongside the table's own. Both are nullable here
+    /// because Iceberg declares them optional and a null row means "inherit",
+    /// which is the half of the rule a required column could never exercise.
+    fn arrow_row_lineage_file_schema() -> Arc<ArrowSchema> {
+        fn with_field_id(field: Field, field_id: i32) -> Field {
+            field.with_metadata(
+                [(PARQUET_FIELD_ID_META_KEY.to_owned(), field_id.to_string())]
+                    .into_iter()
+                    .collect(),
+            )
+        }
+        Arc::new(ArrowSchema::new(vec![
+            with_field_id(Field::new("id", DataType::Int64, false), 1),
+            with_field_id(Field::new("region", DataType::Utf8, true), 2),
+            with_field_id(
+                Field::new(
+                    crate::row_lineage_synth::ICEBERG_ROW_ID_COL,
+                    DataType::Int64,
+                    true,
+                ),
+                crate::row_lineage_synth::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+            ),
+            with_field_id(
+                Field::new(
+                    crate::row_lineage_synth::ICEBERG_LAST_UPDATED_SEQ_COL,
+                    DataType::Int64,
+                    true,
+                ),
+                crate::row_lineage_synth::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+            ),
+        ]))
+    }
+
+    /// Write one row group whose rows carry the lineage a rewrite preserved.
+    ///
+    /// The four rows deliberately cover every corner of the rule: both stored,
+    /// only `_row_id` stored, only `_last_updated_sequence_number` stored, and
+    /// neither.
+    fn write_row_lineage_data_file(path: &Path) -> u64 {
+        let schema = arrow_row_lineage_file_schema();
+        let file = fs::File::create(path).expect("create data file");
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(ROWS_PER_GROUP))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties))
+            .expect("create parquet writer");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![0_i64, 1, 2, 3])),
+                Arc::new(StringArray::from(vec!["r0", "r1", "r2", "r3"])),
+                Arc::new(Int64Array::from(vec![
+                    Some(70_i64),
+                    Some(71),
+                    Some(72),
+                    None,
+                ])),
+                Arc::new(Int64Array::from(vec![Some(1_i64), None, Some(2), None])),
+            ],
+        )
+        .expect("build data batch");
+        writer.write(&batch).expect("write data batch");
         writer.close().expect("close parquet writer");
         fs::metadata(path).expect("stat data file").len()
     }
@@ -1949,10 +2020,15 @@ mod tests {
     }
 
     fn harness(groups: usize) -> Harness {
+        harness_of(|path| write_data_file(path, groups))
+    }
+
+    /// A harness over a data file this test wrote itself.
+    fn harness_of(write: impl FnOnce(&Path) -> u64) -> Harness {
         let runtime = tokio_runtime();
         let directory = tempfile::tempdir().expect("temporary directory");
         let data_path = directory.path().join("data.parquet");
-        let file_size = write_data_file(&data_path, groups);
+        let file_size = write(&data_path);
         let offsets = row_group_offsets(&data_path);
         let context = read_context(&runtime);
         let access_binding = read_binding(&runtime);
@@ -2027,6 +2103,38 @@ mod tests {
             ids.extend(values.values().iter().copied());
         }
         ids
+    }
+
+    /// Drain every page and return the first `count` output columns as i64.
+    fn drain_i64_columns(source: &mut Box<dyn ConnectorPageSource>, count: usize) -> Vec<Vec<i64>> {
+        let mut out = vec![Vec::new(); count];
+        while !source.is_finished() {
+            let Some(page) = source.next_source_page().expect("page") else {
+                continue;
+            };
+            let (rows, columns) = page.into_columns().expect("materialize");
+            for (ordinal, values) in out.iter_mut().enumerate() {
+                let column = columns[ordinal]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("int64 column");
+                assert_eq!(column.len(), rows);
+                assert_eq!(column.null_count(), 0, "column {ordinal} reports no nulls");
+                values.extend(column.values().iter().copied());
+            }
+        }
+        out
+    }
+
+    /// The handle a scan names a hidden metadata column with. It mirrors what
+    /// the boundary publishes: optional, and typed by the column itself.
+    fn metadata_handle(metadata: IcebergMetadataColumn) -> IcebergColumnHandle {
+        IcebergColumnHandle::base_column(&NestedField::optional(
+            metadata.field_id(),
+            metadata.column_name(),
+            Type::Primitive(metadata.declared_type()),
+        ))
+        .expect("metadata column handle")
     }
 
     fn id_column(schema: &IcebergSchema) -> Vec<IcebergColumnHandle> {
@@ -2524,6 +2632,50 @@ mod tests {
             ids,
             (1_000 + 2 * ROWS_PER_GROUP as i64..1_000 + 3 * ROWS_PER_GROUP as i64)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// A rewrite preserves row history only if the reader reads it back.
+    ///
+    /// The data file materializes both reserved row-lineage columns, which is
+    /// what a rewritten v3 file looks like. Synthesizing over them would report
+    /// `first_row_id + position` and the rewriting snapshot's own sequence
+    /// number for every row -- silently claiming that rows the rewrite merely
+    /// copied had changed. Each column falls back on its own, so a row may
+    /// inherit one and keep the other.
+    #[test]
+    fn a_stored_row_lineage_column_is_read_rather_than_synthesized() {
+        let harness = harness_of(write_row_lineage_data_file);
+        let schema = iceberg_schema();
+        let handle = table_handle(&schema, false);
+        let split = build_split(
+            &harness.file_name,
+            SplitOptions {
+                first_row_id: Some(1_000),
+                ..SplitOptions::whole_file(harness.file_size, ROWS_PER_GROUP as i64)
+            },
+        );
+        let mut source = harness
+            .page_source(
+                &split,
+                &handle,
+                &[
+                    metadata_handle(IcebergMetadataColumn::RowId),
+                    metadata_handle(IcebergMetadataColumn::LastUpdatedSequenceNumber),
+                ],
+            )
+            .expect("page source");
+        let columns = drain_i64_columns(&mut source, 2);
+
+        // Rows 0..3 store a `_row_id`; row 3 stores none and inherits
+        // `first_row_id + position` = 1000 + 3.
+        assert_eq!(columns[0], vec![70, 71, 72, 1_003], "_row_id");
+        // Rows 0 and 2 store a sequence number; rows 1 and 3 inherit the data
+        // file's own, which `build_split` freezes at 3.
+        assert_eq!(
+            columns[1],
+            vec![1, 3, 2, 3],
+            "_last_updated_sequence_number"
         );
     }
 

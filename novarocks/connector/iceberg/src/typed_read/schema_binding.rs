@@ -58,7 +58,8 @@ use crate::iceberg::spec::{
 use crate::row_lineage_synth::{
     ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL,
     ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-    ICEBERG_ROW_ID_COL, ICEBERG_ROW_POS_COL,
+    ICEBERG_ROW_ID_COL, ICEBERG_ROW_POS_COL, IcebergRowLineageColumn, StoredRowLineageIndices,
+    stored_row_lineage_indices, synthesize_last_updated_sequence_number, synthesize_row_id,
 };
 use crate::schema_mapping::{
     apply_name_mapping_to_schema, field_id_for_arrow_field, is_variant_struct_data_type,
@@ -162,6 +163,21 @@ impl IcebergMetadataColumn {
         }
     }
 
+    /// The row-lineage column this one is, when it is one at all.
+    ///
+    /// Only these two may be materialized in a data file under a reserved
+    /// field ID; `_file`, `_pos` and `_deleted` have no physical carrier and
+    /// can only ever be synthesized.
+    pub const fn row_lineage_column(self) -> Option<IcebergRowLineageColumn> {
+        match self {
+            Self::RowId => Some(IcebergRowLineageColumn::RowId),
+            Self::LastUpdatedSequenceNumber => {
+                Some(IcebergRowLineageColumn::LastUpdatedSequenceNumber)
+            }
+            Self::Path | Self::RowPosition | Self::IsDeleted => None,
+        }
+    }
+
     pub const fn from_field_id(field_id: i32) -> Option<Self> {
         // Written as a chain rather than a `match` because the arms are
         // associated constants, which patterns cannot name.
@@ -226,6 +242,17 @@ pub enum IcebergColumnSource {
     TypedNull,
     /// A column that is not a field of the table schema.
     Metadata(IcebergMetadataColumn),
+    /// A row-lineage column this data file materializes under its reserved
+    /// Iceberg field ID.
+    ///
+    /// Whether a file stores `_row_id` or `_last_updated_sequence_number` is a
+    /// per-file fact -- a freshly written file inherits both, a rewritten one
+    /// carries forward the lineage its rows already had -- so this is decided
+    /// against the footer, once per split. The variant exists to make the
+    /// reader project the reserved column: the values themselves are resolved
+    /// by the same inherit-vs-stored rule as [`Self::Metadata`], which simply
+    /// finds nothing stored when the file materialized nothing.
+    StoredRowLineage(IcebergRowLineageColumn),
 }
 
 /// One output column and the decision that produces it.
@@ -305,13 +332,17 @@ impl IcebergSchemaBinding {
     }
 
     /// Whether any bound column needs file-level absolute row positions.
+    ///
+    /// A stored `_row_id` still needs them: any row the file left null falls
+    /// back to `first_row_id + position`, and which rows those are is not
+    /// known until the batch is read.
     pub fn requires_row_positions(&self) -> bool {
         self.columns.iter().any(|column| {
             matches!(
                 column.source,
                 IcebergColumnSource::Metadata(
                     IcebergMetadataColumn::RowId | IcebergMetadataColumn::RowPosition
-                )
+                ) | IcebergColumnSource::StoredRowLineage(IcebergRowLineageColumn::RowId)
             )
         })
     }
@@ -385,7 +416,18 @@ impl IcebergSchemaBinding {
                 IcebergColumnSource::Metadata(metadata) => metadata_column(
                     *metadata,
                     bound.target.as_ref(),
-                    row_count,
+                    batch,
+                    absolute_positions,
+                    facts,
+                )?,
+                // A stored row-lineage column is resolved by the same rule as
+                // a synthesized one. The binding already made the only choice
+                // that differs -- projecting the reserved column out of the
+                // file -- so the rule simply finds the stored values here.
+                IcebergColumnSource::StoredRowLineage(column) => row_lineage_column(
+                    *column,
+                    bound.target.as_ref(),
+                    batch,
                     absolute_positions,
                     facts,
                 )?,
@@ -435,6 +477,10 @@ pub fn bind_scan_columns(
         request.partition_values,
         request.table_schema,
     )?;
+    // Which row-lineage columns this one file materializes. A name-mapped
+    // legacy file identifies nothing, and a file that predates row lineage
+    // materializes nothing, so both correctly answer "neither".
+    let stored_row_lineage = stored_row_lineage_indices(request.file_schema);
 
     let mut columns = Vec::with_capacity(request.columns.len());
     let mut physical_base_field_ids = Vec::new();
@@ -445,11 +491,20 @@ pub fn bind_scan_columns(
             &physical,
             mapped_physical.as_ref(),
             &identity_partitions,
+            stored_row_lineage,
         )?;
-        if let IcebergColumnSource::Physical { base_field_id, .. } = &bound.source
-            && !physical_base_field_ids.contains(base_field_id)
+        let projected = match &bound.source {
+            IcebergColumnSource::Physical { base_field_id, .. } => Some(*base_field_id),
+            IcebergColumnSource::StoredRowLineage(column) => Some(column.field_id()),
+            IcebergColumnSource::IdentityPartitionConstant(_)
+            | IcebergColumnSource::InitialDefault
+            | IcebergColumnSource::TypedNull
+            | IcebergColumnSource::Metadata(_) => None,
+        };
+        if let Some(field_id) = projected
+            && !physical_base_field_ids.contains(&field_id)
         {
-            physical_base_field_ids.push(*base_field_id);
+            physical_base_field_ids.push(field_id);
         }
         columns.push(bound);
     }
@@ -658,11 +713,12 @@ fn bind_one_column(
     physical: &PhysicalIndex,
     mapped_physical: Option<&PhysicalIndex>,
     identity_partitions: &HashMap<i32, Option<Literal>>,
+    stored_row_lineage: StoredRowLineageIndices,
 ) -> Result<IcebergBoundColumn, ConnectorError> {
     let base_field_id = handle.base_field_id();
 
     if let Some(metadata) = IcebergMetadataColumn::from_field_id(base_field_id) {
-        return bind_metadata_column(handle, metadata);
+        return bind_metadata_column(handle, metadata, stored_row_lineage);
     }
 
     let base_target = read_schema
@@ -751,6 +807,7 @@ fn bind_one_column(
 fn bind_metadata_column(
     handle: &IcebergColumnHandle,
     metadata: IcebergMetadataColumn,
+    stored_row_lineage: StoredRowLineageIndices,
 ) -> Result<IcebergBoundColumn, ConnectorError> {
     if handle.base_column_identity().name() != metadata.column_name() {
         return Err(corrupt(format!(
@@ -791,11 +848,21 @@ fn bind_metadata_column(
             .collect(),
         ),
     );
+    // A rewritten v3 file materializes the row-lineage columns it carries
+    // forward. Reading them is what keeps a row's history from being rewritten
+    // into the rewriting snapshot's own sequence; only a file that stores
+    // nothing is fully synthesized.
+    let source = match metadata.row_lineage_column() {
+        Some(column) if stored_row_lineage.contains(column) => {
+            IcebergColumnSource::StoredRowLineage(column)
+        }
+        Some(_) | None => IcebergColumnSource::Metadata(metadata),
+    };
     Ok(IcebergBoundColumn {
         handle: handle.clone(),
         target: Arc::clone(&field),
         base_target: field,
-        source: IcebergColumnSource::Metadata(metadata),
+        source,
     })
 }
 
@@ -1094,79 +1161,145 @@ fn partition_constant(
     }
 }
 
-fn metadata_column(
-    metadata: IcebergMetadataColumn,
+/// Widen the reader's absolute row positions into the signed domain every
+/// position-derived column works in.
+fn absolute_positions_as_i64(positions: &UInt64Array) -> Result<Vec<i64>, ConnectorError> {
+    positions
+        .iter()
+        .map(|value| {
+            value
+                .ok_or_else(|| corrupt("iceberg absolute row position is null"))
+                .and_then(|value| {
+                    i64::try_from(value)
+                        .map_err(|_| corrupt("iceberg absolute row position exceeds int64"))
+                })
+        })
+        .collect()
+}
+
+/// Resolve one row-lineage column for a batch, stored values included.
+///
+/// This is the single place the inherit-vs-stored rule is applied. A column
+/// the file materialized was projected by the binding and is found in `batch`;
+/// one it did not materialize is absent there, and every row inherits. The
+/// rule itself lives in [`crate::row_lineage_synth`].
+fn row_lineage_column(
+    column: IcebergRowLineageColumn,
     target: &Field,
-    row_count: usize,
+    batch: &RecordBatch,
     absolute_positions: Option<&UInt64Array>,
     facts: &IcebergSplitFacts<'_>,
 ) -> Result<ArrayRef, ConnectorError> {
-    let require_positions = || -> Result<&UInt64Array, ConnectorError> {
-        absolute_positions.ok_or_else(|| {
-            corrupt(format!(
-                "iceberg metadata column {} needs file-level absolute row positions that {} did not produce",
-                metadata.column_name(),
-                facts.path
-            ))
-        })
-    };
+    let schema = batch.schema();
+    let row_count = batch.num_rows();
+    let values = match column {
+        IcebergRowLineageColumn::RowId => {
+            let positions = require_absolute_positions(
+                absolute_positions,
+                IcebergMetadataColumn::RowId,
+                facts,
+            )?;
+            let positions = absolute_positions_as_i64(positions)?;
+            synthesize_row_id(
+                &schema,
+                batch.columns(),
+                row_count,
+                facts.file_first_row_id,
+                &positions,
+            )
+        }
+        IcebergRowLineageColumn::LastUpdatedSequenceNumber => {
+            synthesize_last_updated_sequence_number(
+                &schema,
+                batch.columns(),
+                row_count,
+                facts.data_sequence_number,
+            )
+        }
+    }
+    .map_err(|error| {
+        corrupt(format!(
+            "iceberg data file {} cannot resolve {}: {error}",
+            facts.path,
+            column.column_name()
+        ))
+    })?;
+    cast_to_target(
+        Arc::new(arrow::array::Int64Array::from(values)),
+        column.column_name(),
+        target,
+    )
+}
+
+/// Bring a synthesized metadata array onto the carrier the scan declared.
+fn cast_to_target(
+    array: ArrayRef,
+    column_name: &str,
+    target: &Field,
+) -> Result<ArrayRef, ConnectorError> {
+    if array.data_type() == target.data_type() {
+        return Ok(array);
+    }
+    cast(array.as_ref(), target.data_type()).map_err(|error| {
+        corrupt(format!(
+            "iceberg metadata column {column_name} cannot be converted to {:?}: {error}",
+            target.data_type()
+        ))
+    })
+}
+
+fn require_absolute_positions<'a>(
+    absolute_positions: Option<&'a UInt64Array>,
+    metadata: IcebergMetadataColumn,
+    facts: &IcebergSplitFacts<'_>,
+) -> Result<&'a UInt64Array, ConnectorError> {
+    absolute_positions.ok_or_else(|| {
+        corrupt(format!(
+            "iceberg metadata column {} needs file-level absolute row positions that {} did not produce",
+            metadata.column_name(),
+            facts.path
+        ))
+    })
+}
+
+fn metadata_column(
+    metadata: IcebergMetadataColumn,
+    target: &Field,
+    batch: &RecordBatch,
+    absolute_positions: Option<&UInt64Array>,
+    facts: &IcebergSplitFacts<'_>,
+) -> Result<ArrayRef, ConnectorError> {
+    let row_count = batch.num_rows();
     let array: ArrayRef = match metadata {
         IcebergMetadataColumn::Path => {
             Arc::new(arrow::array::StringArray::from(vec![facts.path; row_count]))
         }
         IcebergMetadataColumn::RowPosition => {
-            let positions = require_positions()?;
-            Arc::new(arrow::array::Int64Array::from(
-                positions
-                    .iter()
-                    .map(|value| {
-                        value
-                            .ok_or_else(|| corrupt("iceberg absolute row position is null"))
-                            .and_then(|value| {
-                                i64::try_from(value).map_err(|_| {
-                                    corrupt("iceberg absolute row position exceeds int64")
-                                })
-                            })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
+            let positions = require_absolute_positions(absolute_positions, metadata, facts)?;
+            Arc::new(arrow::array::Int64Array::from(absolute_positions_as_i64(
+                positions,
+            )?))
         }
+        // A row-lineage column goes through the same rule whether or not the
+        // file stores it: the rule finds nothing stored here and every row
+        // inherits, which is exactly what an unmaterialized column means.
         IcebergMetadataColumn::RowId => {
-            // Row lineage is `first_row_id + row_position`. Both halves are
-            // facts; neither is defaulted, and the sum never wraps.
-            let first_row_id = facts.file_first_row_id.ok_or_else(|| {
-                corrupt(format!(
-                    "iceberg data file {} carries no first row id, so _row_id cannot be built",
-                    facts.path
-                ))
-            })?;
-            let positions = require_positions()?;
-            Arc::new(arrow::array::Int64Array::from(
-                positions
-                    .iter()
-                    .map(|value| {
-                        let position = value
-                            .ok_or_else(|| corrupt("iceberg absolute row position is null"))?;
-                        let position = i64::try_from(position)
-                            .map_err(|_| corrupt("iceberg absolute row position exceeds int64"))?;
-                        first_row_id.checked_add(position).ok_or_else(|| {
-                            corrupt(format!(
-                                "iceberg _row_id overflows int64 for data file {}",
-                                facts.path
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
+            return row_lineage_column(
+                IcebergRowLineageColumn::RowId,
+                target,
+                batch,
+                absolute_positions,
+                facts,
+            );
         }
         IcebergMetadataColumn::LastUpdatedSequenceNumber => {
-            let sequence = facts.data_sequence_number.ok_or_else(|| {
-                corrupt(format!(
-                    "iceberg data file {} carries no data sequence number, so _last_updated_sequence_number cannot be built",
-                    facts.path
-                ))
-            })?;
-            Arc::new(arrow::array::Int64Array::from(vec![sequence; row_count]))
+            return row_lineage_column(
+                IcebergRowLineageColumn::LastUpdatedSequenceNumber,
+                target,
+                batch,
+                absolute_positions,
+                facts,
+            );
         }
         IcebergMetadataColumn::IsDeleted => {
             return Err(unsupported(format!(
@@ -1175,16 +1308,7 @@ fn metadata_column(
             )));
         }
     };
-    if array.data_type() == target.data_type() {
-        return Ok(array);
-    }
-    cast(array.as_ref(), target.data_type()).map_err(|error| {
-        corrupt(format!(
-            "iceberg metadata column {} cannot be converted to {:?}: {error}",
-            metadata.column_name(),
-            target.data_type()
-        ))
-    })
+    cast_to_target(array, metadata.column_name(), target)
 }
 
 #[cfg(test)]
@@ -1635,6 +1759,17 @@ mod tests {
         );
     }
 
+    /// A physical batch of `rows` rows that materializes no column at all, so
+    /// every row-lineage column it is asked for must be inherited.
+    fn rows_without_stored_lineage(rows: usize) -> RecordBatch {
+        RecordBatch::try_new_with_options(
+            Arc::new(ArrowSchema::empty()),
+            Vec::new(),
+            &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+        .expect("empty physical batch")
+    }
+
     #[test]
     fn row_id_overflow_fails_closed_instead_of_wrapping() {
         let target = Field::new("_row_id", DataType::Int64, false);
@@ -1647,7 +1782,7 @@ mod tests {
         let error = metadata_column(
             IcebergMetadataColumn::RowId,
             &target,
-            1,
+            &rows_without_stored_lineage(1),
             Some(&positions),
             &facts,
         )
@@ -1670,12 +1805,85 @@ mod tests {
             metadata_column(
                 IcebergMetadataColumn::LastUpdatedSequenceNumber,
                 &target,
-                1,
+                &rows_without_stored_lineage(1),
                 None,
                 &facts,
             )
             .is_err()
         );
+    }
+
+    fn metadata_handle(metadata: IcebergMetadataColumn) -> IcebergColumnHandle {
+        IcebergColumnHandle::base_column(&NestedField::optional(
+            metadata.field_id(),
+            metadata.column_name(),
+            Type::Primitive(metadata.declared_type()),
+        ))
+        .expect("metadata column handle")
+    }
+
+    /// Whether a row-lineage column is stored is a fact of one file, and each
+    /// column answers for itself. This file materializes `_row_id` and leaves
+    /// `_last_updated_sequence_number` to inheritance, so only the first joins
+    /// the projection the reader opens.
+    #[test]
+    fn only_a_row_lineage_column_the_file_stores_joins_the_projection() {
+        let schema = table_schema();
+        let file_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(field_id_metadata(1)),
+            Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, true)
+                .with_metadata(field_id_metadata(ICEBERG_RESERVED_FIELD_ID_ROW_ID)),
+        ]));
+        let columns = vec![
+            handle(&schema, 1),
+            metadata_handle(IcebergMetadataColumn::RowId),
+            metadata_handle(IcebergMetadataColumn::LastUpdatedSequenceNumber),
+        ];
+        let binding = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
+            .expect("binds");
+
+        assert!(matches!(
+            binding.columns()[1].source(),
+            IcebergColumnSource::StoredRowLineage(IcebergRowLineageColumn::RowId)
+        ));
+        assert!(matches!(
+            binding.columns()[2].source(),
+            IcebergColumnSource::Metadata(IcebergMetadataColumn::LastUpdatedSequenceNumber)
+        ));
+        assert_eq!(
+            binding.physical_base_field_ids(),
+            &[1, ICEBERG_RESERVED_FIELD_ID_ROW_ID]
+        );
+        // A stored `_row_id` may still be null per row, so the reader must
+        // keep producing absolute positions for the rows that inherit.
+        assert!(binding.requires_row_positions());
+    }
+
+    /// The same scan against a file that stores nothing keeps both columns
+    /// synthesized and asks the reader for no extra Parquet column.
+    #[test]
+    fn a_file_without_stored_row_lineage_synthesizes_both_columns() {
+        let schema = table_schema();
+        let file_schema: SchemaRef = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(field_id_metadata(1)),
+        ]));
+        let columns = vec![
+            handle(&schema, 1),
+            metadata_handle(IcebergMetadataColumn::RowId),
+            metadata_handle(IcebergMetadataColumn::LastUpdatedSequenceNumber),
+        ];
+        let binding = bind_scan_columns(empty_binding_request(&schema, &file_schema, &columns))
+            .expect("binds");
+
+        assert!(matches!(
+            binding.columns()[1].source(),
+            IcebergColumnSource::Metadata(IcebergMetadataColumn::RowId)
+        ));
+        assert!(matches!(
+            binding.columns()[2].source(),
+            IcebergColumnSource::Metadata(IcebergMetadataColumn::LastUpdatedSequenceNumber)
+        ));
+        assert_eq!(binding.physical_base_field_ids(), &[1]);
     }
 
     #[test]
@@ -1724,8 +1932,12 @@ mod tests {
             comment: None,
         })
         .expect("handle");
-        let error = bind_metadata_column(&handle, IcebergMetadataColumn::IsDeleted)
-            .expect_err("_deleted never binds");
+        let error = bind_metadata_column(
+            &handle,
+            IcebergMetadataColumn::IsDeleted,
+            StoredRowLineageIndices::default(),
+        )
+        .expect_err("_deleted never binds");
         assert_eq!(
             error.kind(),
             novarocks_spi::connector::ConnectorErrorKind::Unsupported
@@ -1749,8 +1961,12 @@ mod tests {
             comment: None,
         })
         .expect("handle");
-        let error = bind_metadata_column(&handle, IcebergMetadataColumn::Path)
-            .expect_err("a reserved id must carry its reserved name");
+        let error = bind_metadata_column(
+            &handle,
+            IcebergMetadataColumn::Path,
+            StoredRowLineageIndices::default(),
+        )
+        .expect_err("a reserved id must carry its reserved name");
         assert_eq!(
             error.kind(),
             novarocks_spi::connector::ConnectorErrorKind::CorruptData

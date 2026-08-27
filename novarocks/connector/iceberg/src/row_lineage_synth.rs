@@ -20,6 +20,26 @@
 //! The reserved field IDs and fallback rules are Iceberg physical-format
 //! facts. They remain provider-private: consumers receive ordinary Arrow
 //! batches after the provider reader has applied this transformation.
+//!
+//! # The inherit-vs-stored rule
+//!
+//! A row-lineage column is either *inherited* from a file-level fact or
+//! *stored* as a real column in the data file. Which one applies is decided
+//! per column and per row, and the two columns never decide for each other:
+//!
+//! * A data file that materializes the reserved column carries the lineage its
+//!   rows already had, which is exactly how a rewrite preserves history. That
+//!   stored value wins.
+//! * A null in a materialized column, and a file that materializes no column
+//!   at all, both mean "inherit": `_row_id` becomes
+//!   `first_row_id + absolute row position` and
+//!   `_last_updated_sequence_number` becomes the file's own data sequence
+//!   number.
+//!
+//! A file may materialize one column and not the other, so each column asks
+//! the question separately. The inherited fact is demanded only by the rows
+//! that actually need it: a file whose stored column covers every row is read
+//! without it rather than rejected for lacking it.
 
 use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::Schema;
@@ -45,17 +65,64 @@ pub fn is_iceberg_last_updated_sequence_number(name: &str) -> bool {
     name.eq_ignore_ascii_case(ICEBERG_LAST_UPDATED_SEQ_COL)
 }
 
+/// The two Iceberg v3 row-lineage columns, as a closed set.
+///
+/// They are the only columns a data file may materialize under a reserved
+/// field ID, so naming them as their own type keeps a caller from asking
+/// whether `_file` or `_pos` was "stored" -- a question with no meaning.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum IcebergRowLineageColumn {
+    RowId,
+    LastUpdatedSequenceNumber,
+}
+
+impl IcebergRowLineageColumn {
+    pub const fn field_id(self) -> i32 {
+        match self {
+            Self::RowId => ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+            Self::LastUpdatedSequenceNumber => {
+                ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
+            }
+        }
+    }
+
+    pub const fn column_name(self) -> &'static str {
+        match self {
+            Self::RowId => ICEBERG_ROW_ID_COL,
+            Self::LastUpdatedSequenceNumber => ICEBERG_LAST_UPDATED_SEQ_COL,
+        }
+    }
+}
+
 /// Indices of stored row-lineage columns (`_row_id`, `_last_updated_seq`) in a
 /// batch schema, if present.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct StoredRowLineageIndices {
     pub(crate) row_id: Option<usize>,
     pub(crate) last_updated_seq: Option<usize>,
 }
 
+impl StoredRowLineageIndices {
+    /// Where one row-lineage column sits, when the schema materializes it.
+    pub(crate) const fn index_of(self, column: IcebergRowLineageColumn) -> Option<usize> {
+        match column {
+            IcebergRowLineageColumn::RowId => self.row_id,
+            IcebergRowLineageColumn::LastUpdatedSequenceNumber => self.last_updated_seq,
+        }
+    }
+
+    /// Whether the schema materializes this column at all. The two columns are
+    /// independent, so this is asked once per column.
+    pub(crate) const fn contains(self, column: IcebergRowLineageColumn) -> bool {
+        self.index_of(column).is_some()
+    }
+}
+
 /// Locate stored row-lineage columns by their reserved Iceberg field IDs.
-#[cfg_attr(not(test), allow(dead_code))]
+///
+/// Field ID, never name: a table may legitimately own a user column called
+/// `_row_id`, and a rewritten file's reserved column is identified by the
+/// spec's reserved ID alone.
 pub(crate) fn stored_row_lineage_indices(schema: &Schema) -> StoredRowLineageIndices {
     let mut out = StoredRowLineageIndices::default();
     for (idx, field) in schema.fields().iter().enumerate() {
@@ -76,41 +143,55 @@ pub(crate) fn stored_row_lineage_indices(schema: &Schema) -> StoredRowLineageInd
     out
 }
 
-/// Synthesize `_row_id` values for rows in `columns`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Locate one stored row-lineage column's values in a batch.
+fn stored_values<'a>(
+    schema: &Schema,
+    columns: &'a [ArrayRef],
+    column: IcebergRowLineageColumn,
+) -> Result<Option<&'a Int64Array>, String> {
+    let name = column.column_name();
+    let Some(index) = stored_row_lineage_indices(schema).index_of(column) else {
+        return Ok(None);
+    };
+    let array = columns.get(index).ok_or_else(|| {
+        format!(
+            "row-lineage stored {name} column index {index} out of bounds (columns.len={})",
+            columns.len()
+        )
+    })?;
+    array
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            format!(
+                "stored {name} column must be Int64, got {:?}",
+                array.data_type()
+            )
+        })
+        .map(Some)
+}
+
+/// Resolve `_row_id` for every row of a batch.
+///
+/// A stored non-null value wins; every other row inherits
+/// `first_row_id + positions[row]`. `first_row_id` is a manifest fact, so it
+/// is passed as the option it is and demanded only by a row that inherits: a
+/// file whose stored column covers every row needs no such fact.
+///
+/// `positions` are the rows' file-level absolute zero-based positions. They
+/// are required rather than optional because a batch-relative index is not a
+/// file position for any batch after the first, and a wrong `_row_id` is
+/// indistinguishable from a right one.
 pub(crate) fn synthesize_row_id(
     schema: &Schema,
     columns: &[ArrayRef],
     num_rows: usize,
-    first_row_id: i64,
-    positions: Option<&[i64]>,
+    first_row_id: Option<i64>,
+    positions: &[i64],
 ) -> Result<Vec<i64>, String> {
-    let idx = stored_row_lineage_indices(schema);
-    let stored: Option<&Int64Array> = idx
-        .row_id
-        .map(|i| {
-            columns
-                .get(i)
-                .ok_or_else(|| {
-                    format!(
-                        "row-lineage stored _row_id column index {i} out of bounds (columns.len={})",
-                        columns.len()
-                    )
-                })
-                .and_then(|col| {
-                    col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                        format!(
-                            "stored _row_id column must be Int64, got {:?}",
-                            col.data_type()
-                        )
-                    })
-                })
-        })
-        .transpose()?;
+    let stored = stored_values(schema, columns, IcebergRowLineageColumn::RowId)?;
 
-    if let Some(positions) = positions
-        && positions.len() != num_rows
-    {
+    if positions.len() != num_rows {
         return Err(format!(
             "synthesize_row_id positions.len()={} does not match num_rows={num_rows}",
             positions.len()
@@ -118,14 +199,18 @@ pub(crate) fn synthesize_row_id(
     }
 
     let mut out = Vec::with_capacity(num_rows);
-    for i in 0..num_rows {
+    for (row, position) in positions.iter().copied().enumerate().take(num_rows) {
         if let Some(stored) = stored
-            && !stored.is_null(i)
+            && !stored.is_null(row)
         {
-            out.push(stored.value(i));
+            out.push(stored.value(row));
             continue;
         }
-        let position = positions.map_or(i as i64, |positions| positions[i]);
+        let first_row_id = first_row_id.ok_or_else(|| {
+            format!(
+                "row {row} inherits its {ICEBERG_ROW_ID_COL} but the data file carries no first row id"
+            )
+        })?;
         let computed = first_row_id.checked_add(position).ok_or_else(|| {
             format!(
                 "Row ID overflow when computing fallback _row_id: first_row_id={first_row_id}, position={position}"
@@ -136,45 +221,36 @@ pub(crate) fn synthesize_row_id(
     Ok(out)
 }
 
-/// Synthesize `_last_updated_sequence_number` values for rows in `columns`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Resolve `_last_updated_sequence_number` for every row of a batch.
+///
+/// A stored non-null value wins; every other row inherits the data file's own
+/// sequence number. That fact is demanded only by a row that inherits, for the
+/// same reason `first_row_id` is.
 pub(crate) fn synthesize_last_updated_sequence_number(
     schema: &Schema,
     columns: &[ArrayRef],
     num_rows: usize,
-    data_sequence_number: i64,
+    data_sequence_number: Option<i64>,
 ) -> Result<Vec<i64>, String> {
-    let idx = stored_row_lineage_indices(schema);
-    let stored: Option<&Int64Array> = idx
-        .last_updated_seq
-        .map(|i| {
-            columns
-                .get(i)
-                .ok_or_else(|| {
-                    format!(
-                        "row-lineage stored _last_updated_sequence_number index {i} out of bounds"
-                    )
-                })
-                .and_then(|col| {
-                    col.as_any().downcast_ref::<Int64Array>().ok_or_else(|| {
-                        format!(
-                            "stored _last_updated_sequence_number column must be Int64, got {:?}",
-                            col.data_type()
-                        )
-                    })
-                })
-        })
-        .transpose()?;
+    let stored = stored_values(
+        schema,
+        columns,
+        IcebergRowLineageColumn::LastUpdatedSequenceNumber,
+    )?;
 
     let mut out = Vec::with_capacity(num_rows);
-    for i in 0..num_rows {
+    for row in 0..num_rows {
         if let Some(stored) = stored
-            && !stored.is_null(i)
+            && !stored.is_null(row)
         {
-            out.push(stored.value(i));
-        } else {
-            out.push(data_sequence_number);
+            out.push(stored.value(row));
+            continue;
         }
+        out.push(data_sequence_number.ok_or_else(|| {
+            format!(
+                "row {row} inherits its {ICEBERG_LAST_UPDATED_SEQ_COL} but the data file carries no data sequence number"
+            )
+        })?);
     }
     Ok(out)
 }
@@ -228,7 +304,8 @@ mod tests {
         ];
 
         assert_eq!(
-            synthesize_row_id(&schema, &columns, 3, 1000, None).expect("synthesis succeeds"),
+            synthesize_row_id(&schema, &columns, 3, Some(1000), &[0, 1, 2])
+                .expect("synthesis succeeds"),
             vec![42, 1001, 7]
         );
     }
@@ -239,10 +316,43 @@ mod tests {
         let columns = vec![Arc::new(Int64Array::from(vec![100_i64, 200])) as ArrayRef];
 
         assert_eq!(
-            synthesize_row_id(&schema, &columns, 2, 500, Some(&[3, 9]))
+            synthesize_row_id(&schema, &columns, 2, Some(500), &[3, 9])
                 .expect("synthesis succeeds"),
             vec![503, 509]
         );
+    }
+
+    /// A file whose stored column covers every row is complete on its own, so
+    /// the manifest's `first_row_id` is never consulted.
+    #[test]
+    fn a_fully_stored_row_id_column_needs_no_first_row_id() {
+        let schema = schema_with_stored_row_id();
+        let columns = vec![
+            Arc::new(Int64Array::from(vec![100_i64, 200])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(42_i64), Some(7)])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![None, None])) as ArrayRef,
+        ];
+
+        assert_eq!(
+            synthesize_row_id(&schema, &columns, 2, None, &[0, 1]).expect("synthesis succeeds"),
+            vec![42, 7]
+        );
+    }
+
+    /// The inherited fact is not optional for a row that actually inherits.
+    #[test]
+    fn an_inheriting_row_without_first_row_id_fails_closed() {
+        let schema = schema_with_stored_row_id();
+        let columns = vec![
+            Arc::new(Int64Array::from(vec![100_i64, 200])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(42_i64), None])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![None, None])) as ArrayRef,
+        ];
+
+        let error = synthesize_row_id(&schema, &columns, 2, None, &[0, 1])
+            .expect_err("an inheriting row needs the file's first row id");
+        assert!(error.contains("row 1"), "{error}");
+        assert!(error.contains("first row id"), "{error}");
     }
 
     #[test]
@@ -255,9 +365,45 @@ mod tests {
         ];
 
         assert_eq!(
-            synthesize_last_updated_sequence_number(&schema, &columns, 2, 99)
+            synthesize_last_updated_sequence_number(&schema, &columns, 2, Some(99))
                 .expect("synthesis succeeds"),
             vec![11, 99]
+        );
+    }
+
+    /// The two columns decide independently: a file may materialize one and
+    /// leave the other to inheritance, and neither answer may leak into the
+    /// other.
+    #[test]
+    fn each_row_lineage_column_falls_back_on_its_own() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            field_with_id(
+                "_last_updated_sequence_number",
+                ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
+                DataType::Int64,
+                true,
+            ),
+        ]);
+        let columns = vec![
+            Arc::new(Int64Array::from(vec![100_i64, 200])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(11_i64), Some(12)])) as ArrayRef,
+        ];
+        let indices = stored_row_lineage_indices(&schema);
+        assert!(!indices.contains(IcebergRowLineageColumn::RowId));
+        assert!(indices.contains(IcebergRowLineageColumn::LastUpdatedSequenceNumber));
+
+        // `_row_id` is absent, so every row inherits it ...
+        assert_eq!(
+            synthesize_row_id(&schema, &columns, 2, Some(500), &[3, 9])
+                .expect("synthesis succeeds"),
+            vec![503, 509]
+        );
+        // ... while the stored `_last_updated_sequence_number` is preserved.
+        assert_eq!(
+            synthesize_last_updated_sequence_number(&schema, &columns, 2, Some(99))
+                .expect("synthesis succeeds"),
+            vec![11, 12]
         );
     }
 }
