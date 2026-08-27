@@ -90,7 +90,7 @@ pub struct StatisticsAttemptRequest {
 pub struct StatisticsAttemptBinding {
     pub table: novarocks_spi::connector::ConnectorTableHandle,
     pub data_version: StatisticsDataVersion,
-    pub sql_columns: Vec<String>,
+    pub sql_columns: Vec<arrow::datatypes::FieldRef>,
 }
 
 /// The frontend captures a logical ANALYZE target before job creation.
@@ -220,7 +220,7 @@ impl StatisticsTargetResolver for ConnectorStatisticsTargetResolver {
             namespace: target.namespace.clone(),
             table: target.table.clone(),
             object_id: captured.object_id.as_bytes().to_vec(),
-            sql_columns: sql_visible_columns(&captured.metadata.schema),
+            sql_columns: sql_visible_column_names(&captured.metadata.schema),
         })
     }
 }
@@ -266,7 +266,12 @@ pub(crate) fn rebind_table_object(
     })
 }
 
-fn sql_visible_columns(schema: &arrow::datatypes::SchemaRef) -> Vec<String> {
+/// The SQL-visible fields, carrying their types.
+///
+/// A caller that only validates names takes them off the field. A caller that
+/// builds a statistics metric request needs the type: which metrics a column
+/// can answer depends on it.
+fn sql_visible_columns(schema: &arrow::datatypes::SchemaRef) -> Vec<arrow::datatypes::FieldRef> {
     schema
         .fields()
         .iter()
@@ -276,7 +281,14 @@ fn sql_visible_columns(schema: &arrow::datatypes::SchemaRef) -> Vec<String> {
                 .get(CONNECTOR_FIELD_HIDDEN_FROM_SQL)
                 .is_none_or(|value| !value.eq_ignore_ascii_case("true"))
         })
-        .map(|field| field.name().to_string())
+        .map(Arc::clone)
+        .collect()
+}
+
+fn sql_visible_column_names(schema: &arrow::datatypes::SchemaRef) -> Vec<String> {
+    sql_visible_columns(schema)
+        .iter()
+        .map(|field| field.name().clone())
         .collect()
 }
 
@@ -320,7 +332,7 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
         let mut metrics = Vec::with_capacity(requested_metric_count);
         metrics.push(StatisticsMetric::RowCount);
         for column in sql_columns {
-            let name: Arc<str> = Arc::from(column);
+            let name: Arc<str> = Arc::from(column.name().as_str());
             metrics.extend([
                 StatisticsMetric::NullCount {
                     column: Arc::clone(&name),

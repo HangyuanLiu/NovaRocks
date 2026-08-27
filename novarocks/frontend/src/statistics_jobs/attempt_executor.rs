@@ -22,6 +22,7 @@
 //! it encodes the sealed prepared view before returning the resulting request
 //! to the carrier-neutral query-execution service.
 
+use arrow::datatypes::FieldRef;
 use std::any::Any;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,7 +38,7 @@ use novarocks_spi::connector::{
     ConnectorStatisticsLease, ConnectorTableHandle, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    StatisticsCollectionRequest, StatisticsMetric, StatisticsMetricRequest,
+    StatisticsCollectionRequest, StatisticsMetricRequest,
     StatisticsPublishPreparationRequest, StatisticsPublishRequest,
 };
 
@@ -109,8 +110,8 @@ impl FrontendStatisticsAttemptExecutor {
 
     fn resolve_columns(
         request: &StatisticsAttemptRequest,
-        bound_columns: &[String],
-    ) -> Result<Vec<String>, StatisticsApplicationError> {
+        bound_columns: &[FieldRef],
+    ) -> Result<Vec<FieldRef>, StatisticsApplicationError> {
         match &request.columns {
             StatisticsColumnIntent::AllColumns => Ok(bound_columns.to_vec()),
             StatisticsColumnIntent::Explicit(requested_columns) => {
@@ -118,7 +119,7 @@ impl FrontendStatisticsAttemptExecutor {
                 for requested in requested_columns {
                     let mut matches = bound_columns
                         .iter()
-                        .filter(|bound| bound.eq_ignore_ascii_case(requested));
+                        .filter(|bound| bound.name().eq_ignore_ascii_case(requested));
                     let Some(column) = matches.next() else {
                         return Err(StatisticsApplicationError::new(format!(
                             "ANALYZE requested column '{requested}' does not exist on the rebound table"
@@ -129,10 +130,9 @@ impl FrontendStatisticsAttemptExecutor {
                             "ANALYZE requested column '{requested}' matches multiple rebound table columns"
                         )));
                     }
-                    if resolved
-                        .iter()
-                        .any(|existing: &String| existing.eq_ignore_ascii_case(column))
-                    {
+                    if resolved.iter().any(|existing: &FieldRef| {
+                        existing.name().eq_ignore_ascii_case(column.name())
+                    }) {
                         return Err(StatisticsApplicationError::new(format!(
                             "ANALYZE requested column '{requested}' is duplicated"
                         )));
@@ -144,7 +144,9 @@ impl FrontendStatisticsAttemptExecutor {
         }
     }
 
-    fn metrics(columns: &[String]) -> Result<StatisticsMetricRequest, StatisticsApplicationError> {
+    fn metrics(
+        columns: &[FieldRef],
+    ) -> Result<StatisticsMetricRequest, StatisticsApplicationError> {
         let requested_metric_count = columns
             .len()
             .checked_mul(5)
@@ -159,27 +161,12 @@ impl FrontendStatisticsAttemptExecutor {
                 "ANALYZE requires {requested_metric_count} metrics, exceeding the connector statistics limit of {MAX_CONNECTOR_STATISTICS_METRICS}",
             )));
         }
-        let mut metrics = vec![StatisticsMetric::RowCount];
-        for column in columns {
-            let column: Arc<str> = Arc::from(column.as_str());
-            metrics.extend([
-                StatisticsMetric::NullCount {
-                    column: Arc::clone(&column),
-                },
-                StatisticsMetric::Minimum {
-                    column: Arc::clone(&column),
-                },
-                StatisticsMetric::Maximum {
-                    column: Arc::clone(&column),
-                },
-                StatisticsMetric::AverageSize {
-                    column: Arc::clone(&column),
-                },
-                StatisticsMetric::ThetaNdv { column },
-            ]);
-        }
-        StatisticsMetricRequest::try_new(metrics)
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))
+        crate::query_execution::planning::statistics::visible_row_metric_request(
+            columns
+                .iter()
+                .map(|field| (field.name().as_str(), field.data_type())),
+        )
+        .map_err(|error| StatisticsApplicationError::new(error.to_string()))
     }
 
     fn operation_id(request: &StatisticsAttemptRequest) -> ConnectorMutationOperationId {
