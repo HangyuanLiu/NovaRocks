@@ -37,6 +37,8 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::QueryExecutionId;
 
+use super::typed_registry::{InstalledReadExecution, InstalledReadExecutionRegistry};
+
 const CONNECTOR_BINDING_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(30);
 
 // Design: ADR-0104 (docs/adr/ADR-0104-typed-connector-execution-binding-declaration.md)
@@ -53,11 +55,11 @@ struct ExecutionHostState {
     /// Per-provider worker factories, sealed at startup like the installers.
     /// A generation gets its typed entry the moment its binding is ensured, so
     /// "installed" has exactly one meaning on this backend.
-    typed_factories: BTreeMap<
+    read_bundle_factories: BTreeMap<
         ConnectorExecutionProviderKind,
-        Arc<dyn novarocks_proto_codec::connector_read::TypedConnectorProviderFactory>,
+        Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
     >,
-    typed_registry: Arc<super::TypedConnectorProviderRegistry>,
+    read_executions: Arc<InstalledReadExecutionRegistry>,
     bindings: BTreeMap<ConnectorExecutionBindingKey, Arc<BindingCell>>,
     retiring: BTreeSet<ConnectorExecutionBindingKey>,
     query_leases: BTreeMap<QueryExecutionId, BTreeSet<ConnectorExecutionBindingKey>>,
@@ -226,13 +228,13 @@ impl ConnectorExecutionHost {
     /// ready. There is intentionally no runtime registration operation.
     pub fn try_new(
         installers: impl IntoIterator<Item = Arc<dyn ConnectorExecutionInstaller>>,
-        typed_factories: impl IntoIterator<
+        read_bundle_factories: impl IntoIterator<
             Item = (
                 ConnectorExecutionProviderKind,
-                Arc<dyn novarocks_proto_codec::connector_read::TypedConnectorProviderFactory>,
+                Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
             ),
         >,
-        typed_registry: Arc<super::TypedConnectorProviderRegistry>,
+        read_executions: Arc<InstalledReadExecutionRegistry>,
     ) -> Result<Self, ConnectorError> {
         let mut sealed_installers = BTreeMap::new();
         for installer in installers {
@@ -252,9 +254,9 @@ impl ConnectorExecutionHost {
                 ));
             }
         }
-        let mut sealed_typed_factories = BTreeMap::new();
-        for (kind, factory) in typed_factories {
-            if sealed_typed_factories.insert(kind, factory).is_some() {
+        let mut sealed_read_bundle_factories = BTreeMap::new();
+        for (kind, factory) in read_bundle_factories {
+            if sealed_read_bundle_factories.insert(kind, factory).is_some() {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
                     format!("startup typed factory set contains duplicate {kind:?} factory"),
@@ -264,8 +266,8 @@ impl ConnectorExecutionHost {
         Ok(Self {
             state: Arc::new(Mutex::new(ExecutionHostState {
                 installers: sealed_installers,
-                typed_factories: sealed_typed_factories,
-                typed_registry,
+                read_bundle_factories: sealed_read_bundle_factories,
+                read_executions,
                 bindings: BTreeMap::new(),
                 retiring: BTreeSet::new(),
                 query_leases: BTreeMap::new(),
@@ -279,8 +281,8 @@ impl ConnectorExecutionHost {
         Self {
             state: Arc::new(Mutex::new(ExecutionHostState {
                 installers: BTreeMap::new(),
-                typed_factories: BTreeMap::new(),
-                typed_registry: Arc::new(super::TypedConnectorProviderRegistry::new()),
+                read_bundle_factories: BTreeMap::new(),
+                read_executions: Arc::new(InstalledReadExecutionRegistry::default()),
                 bindings: BTreeMap::new(),
                 retiring: BTreeSet::new(),
                 query_leases: BTreeMap::new(),
@@ -361,7 +363,7 @@ impl ConnectorExecutionHost {
             }
         };
 
-        let mut state = match self.state.lock() {
+        let state = match self.state.lock() {
             Ok(state) => state,
             Err(_) => return rejected(host_unavailable("connector execution host is unavailable")),
         };
@@ -370,25 +372,40 @@ impl ConnectorExecutionHost {
         }
         match completion {
             Completion::Ready(_) => {
-                // The typed entry appears exactly when the binding does, so the
-                // worker decode path and the host never disagree about which
-                // generation is installed. Ensure is retried on an ambiguous
-                // response, so an existing identical entry is success.
-                if let Some(factory) = state
-                    .typed_factories
+                let bundle_factory = state
+                    .read_bundle_factories
                     .get(&declaration.provider_kind())
-                    .cloned()
-                {
-                    let providers = super::TypedConnectorProviders::new(factory);
-                    if let Err(error) = state.typed_registry.install(&key, providers)
-                        && state.typed_registry.resolve(&key).is_err()
-                    {
-                        drop(state);
-                        return rejected(internal_failure(&ConnectorError::new(
-                            ConnectorErrorKind::Internal,
-                            error.to_string(),
-                        )));
+                    .cloned();
+                let executions = Arc::clone(&state.read_executions);
+                drop(state);
+                // The bundle is built only after Host admission. It gives the
+                // role matching factory and codec for one exact generation;
+                // it does not grant discovery or lifecycle authority.
+                if executions.resolve(&key).is_none() {
+                    let Some(bundle_factory) = bundle_factory else {
+                        return rejected(host_unavailable(
+                            "connector read execution bundle factory is not installed",
+                        ));
+                    };
+                    let bundle = match bundle_factory.build(&key) {
+                        Ok(bundle) => bundle,
+                        Err(error) => return rejected(internal_failure(&error)),
+                    };
+                    executions.install_or_resolve(
+                        key.clone(),
+                        InstalledReadExecution::new(bundle.provider_factory(), bundle.codec()),
+                    );
+                }
+                let mut state = match self.state.lock() {
+                    Ok(state) => state,
+                    Err(_) => {
+                        return rejected(host_unavailable(
+                            "connector execution host is unavailable",
+                        ));
                     }
+                };
+                if let Err(rejection) = ensure_admissible(&state, query, &key) {
+                    return rejected(rejection);
                 }
                 state.query_leases.entry(query).or_default().insert(key);
                 drop(state);
@@ -457,20 +474,20 @@ impl ConnectorExecutionHost {
         // Retiring the typed entry alongside the binding is what makes a stale
         // generation unresolvable: a fragment decoded after this point can no
         // longer reach a provider whose credentials and clients are going away.
-        state.typed_registry.retire(key);
+        state.read_executions.retire(key);
         RetireConnectorExecutionBindingResult::new(RetireConnectorExecutionBindingOutcome::Accepted)
     }
 
-    /// The typed provider registry this host writes on ensure and clears on
-    /// retire. The fragment runtime reads it at decode, so both roles agree on
-    /// which generation is installed instead of keeping two answers.
-    pub fn typed_providers(&self) -> Arc<super::TypedConnectorProviderRegistry> {
+    /// The passive exact-key read bundle mirror. Host admission and retirement
+    /// remain authoritative; scan decoding only resolves this already-admitted
+    /// factory/codec pair.
+    pub fn read_executions(&self) -> Arc<InstalledReadExecutionRegistry> {
         match self.state.lock() {
-            Ok(state) => Arc::clone(&state.typed_registry),
+            Ok(state) => Arc::clone(&state.read_executions),
             // A poisoned host cannot resolve any generation; an empty registry
             // makes every typed scan fail closed rather than silently reach a
             // provider whose host state is unknown.
-            Err(_) => Arc::new(super::TypedConnectorProviderRegistry::new()),
+            Err(_) => Arc::new(InstalledReadExecutionRegistry::default()),
         }
     }
 
@@ -876,7 +893,7 @@ mod tests {
         ConnectorExecutionHost::try_new(
             installers,
             std::iter::empty(),
-            Arc::new(super::super::TypedConnectorProviderRegistry::new()),
+            Arc::new(InstalledReadExecutionRegistry::default()),
         )
     }
 

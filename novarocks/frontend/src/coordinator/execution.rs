@@ -2493,8 +2493,8 @@ fn prepare_round_split_assignment(
             .split_manager
             .get_splits(
                 &session,
-                table_scan.table().handle(),
-                table_scan.source().assignments(),
+                table_scan.table().relation().table(),
+                table_scan.assignments(),
                 &table_scan.dynamic_filter_columns(),
                 &scan.prepared.constraint,
             )
@@ -2506,6 +2506,7 @@ fn prepare_round_split_assignment(
         sources.push(RoundSplitSource {
             plan_node_id,
             source,
+            codec: Arc::clone(&scan.prepared.codec),
         });
     }
     let targets = assignment_targets(schedule, &scan_nodes);

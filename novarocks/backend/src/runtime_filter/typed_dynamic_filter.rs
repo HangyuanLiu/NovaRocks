@@ -40,12 +40,12 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterSubscriptionRequest,
 };
 use novarocks_proto_codec::connector_read::{
-    ConnectorTableScanSource, ValidatedColumnHandle, WireDynamicFilter,
+    ConnectorTableScanSource, DecodedConnectorReadScan, ValidatedColumnHandle, WireDynamicFilter,
 };
 use novarocks_spi::connector::ConnectorScalarValue;
 use novarocks_spi::connector::read_stack::{
-    BoundsMatch, ColumnValueBounds, CompleteAllDynamicFilter, ConnectorValue, DynamicFilter,
-    TupleDomain,
+    BoundsMatch, ColumnValueBounds, CompleteAllDynamicFilter, ConnectorReadColumnHandle,
+    ConnectorReadDynamicFilter, ConnectorValue, DynamicFilter, TupleDomain,
 };
 
 /// The dynamic-filter columns a typed scan really has.
@@ -129,6 +129,76 @@ pub(crate) fn scan_dynamic_filter(
         columns_covered,
         subscriptions,
     }))
+}
+
+/// Adapts the existing runtime-filter artifact oracle to SPI column handles.
+/// The bidirectional assignment correspondence is validated from the frozen
+/// scan carrier once; page sources subsequently receive only SPI handles.
+pub(crate) fn scan_dynamic_filter_spi(
+    wire_scan: &ConnectorTableScanSource,
+    scan: &DecodedConnectorReadScan,
+    session: Option<&RuntimeFilterSessionRef>,
+    contracts: &BTreeMap<u32, RuntimeFilterConsumerContract>,
+) -> Result<Arc<ConnectorReadDynamicFilter>, RuntimeFilterContractViolation> {
+    let inner = scan_dynamic_filter(wire_scan, session, contracts)?;
+    let dynamic_columns = scan_dynamic_filter_columns(wire_scan);
+    let raw_by_variable: BTreeMap<&str, &ValidatedColumnHandle> = wire_scan
+        .assignments()
+        .iter()
+        .map(|assignment| (assignment.variable(), assignment.column()))
+        .collect();
+    let mut columns = BTreeSet::new();
+    let mut raw_by_spi = BTreeMap::new();
+    for assignment in scan.assignments() {
+        let Some(raw) = raw_by_variable.get(assignment.variable()) else {
+            continue;
+        };
+        if !dynamic_columns.contains(*raw) {
+            continue;
+        }
+        columns.insert(assignment.column().clone());
+        raw_by_spi.insert(assignment.column().clone(), (*raw).clone());
+    }
+    Ok(Arc::new(SpiScanDynamicFilter {
+        columns,
+        raw_by_spi,
+        inner,
+    }))
+}
+
+struct SpiScanDynamicFilter {
+    columns: BTreeSet<ConnectorReadColumnHandle>,
+    raw_by_spi: BTreeMap<ConnectorReadColumnHandle, ValidatedColumnHandle>,
+    inner: Arc<WireDynamicFilter>,
+}
+
+impl DynamicFilter<ConnectorReadColumnHandle> for SpiScanDynamicFilter {
+    fn columns_covered(&self) -> &BTreeSet<ConnectorReadColumnHandle> {
+        &self.columns
+    }
+    fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+    fn is_awaitable(&self) -> bool {
+        self.inner.is_awaitable()
+    }
+    fn is_blocked(&self) -> bool {
+        self.inner.is_blocked()
+    }
+    fn current_predicate(&self) -> TupleDomain<ConnectorReadColumnHandle> {
+        TupleDomain::all()
+    }
+    fn bounds_may_match(
+        &self,
+        column: &ConnectorReadColumnHandle,
+        bounds: &ColumnValueBounds,
+    ) -> BoundsMatch {
+        self.raw_by_spi
+            .get(column)
+            .map_or(BoundsMatch::Unknown, |raw| {
+                self.inner.bounds_may_match(raw, bounds)
+            })
+    }
 }
 
 /// One covered column and the live subscription that can constrain it.

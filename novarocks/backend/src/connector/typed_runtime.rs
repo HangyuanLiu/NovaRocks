@@ -48,9 +48,10 @@ use std::time::{Duration, Instant};
 
 use crate::connector::runtime::ConnectorBatchTransform;
 use crate::fragment::decode::plan::context::RuntimeFilterSessionResolver;
-use crate::runtime_filter::typed_dynamic_filter::scan_dynamic_filter;
+use crate::runtime_filter::typed_dynamic_filter::scan_dynamic_filter_spi;
 use novarocks_execution::connector::{
-    ConnectorPageAdapter, PageConversion, SplitPoll, SplitQueue, TaskAttemptSplitQueues,
+    ConnectorPageAdapter, PageConversion, ScheduledSplitFacts, SplitPoll, SplitQueue,
+    TaskAttemptSplitQueues,
 };
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
 use novarocks_execution::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
@@ -61,12 +62,11 @@ use novarocks_execution::exec::node::scan::{
 use novarocks_execution::exec::node::{BoxedExecIter, ExecResult};
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_execution::runtime_filter::RuntimeFilterConsumerContract;
-use novarocks_proto_codec::connector_read::{
-    ConnectorTableScanSource, ScheduledSplit, TypedConnectorPageSourceProvider,
-    TypedConnectorSystemTableProvider, ValidatedColumnHandle, WireDynamicFilter,
-};
 use novarocks_spi::connector::ConnectorRequestContext;
-use novarocks_spi::connector::read_stack::{CompleteAllDynamicFilter, ConnectorSession};
+use novarocks_spi::connector::read_stack::{
+    CompleteAllDynamicFilter, ConnectorReadColumnHandle, ConnectorReadDynamicFilter,
+    ConnectorReadPageSourceProvider, ConnectorReadSystemTableProvider, ConnectorSession,
+};
 use novarocks_types::SlotId;
 
 /// How long a driver parks on an empty, non-terminal split queue before it
@@ -89,22 +89,13 @@ const BLOCKED_PAGE_SOURCE_BACKOFF: Duration = Duration::from_millis(1);
 /// It covers exactly the columns the scan's dynamic-filter bindings name, and
 /// reports an unconstrained, complete, non-awaitable predicate. A blocked or
 /// awaitable filter here would fabricate feedback that no one produces.
-pub fn complete_all_scan_dynamic_filter(scan: &ConnectorTableScanSource) -> Arc<WireDynamicFilter> {
-    // A binding always names a variable this scan assigns: the protocol carrier
-    // rejects one that does not, so this lookup is total for a validated scan.
-    let assigned: BTreeMap<&str, &ValidatedColumnHandle> = scan
+pub fn complete_all_scan_dynamic_filter(
+    scan: &novarocks_proto_codec::connector_read::DecodedConnectorReadScan,
+) -> Arc<ConnectorReadDynamicFilter> {
+    let covered: BTreeSet<ConnectorReadColumnHandle> = scan
         .assignments()
         .iter()
-        .map(|assignment| (assignment.variable(), assignment.column()))
-        .collect();
-    let covered: BTreeSet<ValidatedColumnHandle> = scan
-        .dynamic_filters()
-        .iter()
-        .filter_map(|binding| {
-            assigned
-                .get(binding.variable())
-                .map(|column| (*column).clone())
-        })
+        .map(|assignment| assignment.column().clone())
         .collect();
     Arc::new(CompleteAllDynamicFilter::new(covered))
 }
@@ -112,8 +103,12 @@ pub fn complete_all_scan_dynamic_filter(scan: &ConnectorTableScanSource) -> Arc<
 /// Everything one typed scan needs, shared by the source, the op, and every
 /// iterator the op hands out.
 struct TypedConnectorScanShared {
-    scan: ConnectorTableScanSource,
-    provider: Arc<dyn TypedConnectorPageSourceProvider>,
+    /// Retained only for the live runtime-filter bridge.  It is the frozen
+    /// carrier that names runtime-filter bindings; the actual relation,
+    /// columns, and splits below remain SPI values.
+    wire_scan: novarocks_proto_codec::connector_read::ConnectorTableScanSource,
+    scan: novarocks_proto_codec::connector_read::DecodedConnectorReadScan,
+    provider: Arc<dyn ConnectorReadPageSourceProvider>,
     session: ConnectorSession,
     /// Resolves the attempt's runtime-filter session at the moment it is
     /// needed. Held as a resolver rather than a session because a fragment
@@ -131,7 +126,7 @@ struct TypedConnectorScanShared {
     /// the columns the connector itself produces, which is not necessarily the
     /// node's whole output.
     slot_ids: Vec<SlotId>,
-    dynamic_filter: Arc<WireDynamicFilter>,
+    dynamic_filter: Arc<ConnectorReadDynamicFilter>,
     /// Builds the columns the connector does not read, and the output schema
     /// the result must have.
     ///
@@ -206,16 +201,17 @@ fn emit_page_source_marker(marker: &str, plan_node_id: i32, sequence_id: Option<
 /// per-plan-node queue, so binding it never waits for enumeration.
 pub struct TypedConnectorScanSource {
     shared: Arc<TypedConnectorScanShared>,
-    queues: Arc<TaskAttemptSplitQueues>,
+    queues: Arc<TaskAttemptSplitQueues<crate::fragment::ingress::ReceivedReadSplit>>,
 }
 
 impl TypedConnectorScanSource {
-    pub fn new(
-        scan: ConnectorTableScanSource,
-        provider: Arc<dyn TypedConnectorPageSourceProvider>,
+    pub(crate) fn new(
+        wire_scan: novarocks_proto_codec::connector_read::ConnectorTableScanSource,
+        scan: novarocks_proto_codec::connector_read::DecodedConnectorReadScan,
+        provider: Arc<dyn ConnectorReadPageSourceProvider>,
         session: ConnectorSession,
         request: ConnectorRequestContext,
-        queues: Arc<TaskAttemptSplitQueues>,
+        queues: Arc<TaskAttemptSplitQueues<crate::fragment::ingress::ReceivedReadSplit>>,
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         runtime_filter: RuntimeFilterSessionResolver,
@@ -223,6 +219,7 @@ impl TypedConnectorScanSource {
         let dynamic_filter = complete_all_scan_dynamic_filter(&scan);
         Self {
             shared: Arc::new(TypedConnectorScanShared {
+                wire_scan,
                 scan,
                 provider,
                 session,
@@ -263,7 +260,10 @@ impl TypedConnectorScanSource {
     /// runtime-filter owner, not to this scan: when that owner can hand over a
     /// filter, it is substituted here and nothing else in this file changes. No
     /// other code path may synthesize a filter.
-    pub fn with_backend_dynamic_filter(mut self, dynamic_filter: Arc<WireDynamicFilter>) -> Self {
+    pub fn with_backend_dynamic_filter(
+        mut self,
+        dynamic_filter: Arc<ConnectorReadDynamicFilter>,
+    ) -> Self {
         let shared = Arc::get_mut(&mut self.shared)
             .expect("typed connector scan source is not shared before it is bound");
         shared.dynamic_filter = dynamic_filter;
@@ -294,25 +294,25 @@ impl TypedConnectorScanSource {
     /// Absent session or absent contract both mean this scan receives no
     /// feedback, and it keeps the truthful unconstrained filter rather than
     /// claiming one that could never narrow.
-    fn live_dynamic_filter(&self) -> Result<Option<Arc<WireDynamicFilter>>, String> {
+    fn live_dynamic_filter(&self) -> Result<Option<Arc<ConnectorReadDynamicFilter>>, String> {
         if self.shared.runtime_filter_contracts.is_empty() {
             return Ok(None);
         }
-        let Some(session) = (self.shared.runtime_filter)() else {
-            return Ok(None);
-        };
-        scan_dynamic_filter(
+        let session = (self.shared.runtime_filter)()?;
+        scan_dynamic_filter_spi(
+            &self.shared.wire_scan,
             &self.shared.scan,
-            Some(&session),
+            session.as_ref(),
             &self.shared.runtime_filter_contracts,
         )
         .map(Some)
-        .map_err(|error| error.to_string())
+        .map_err(|error| format!("create typed scan live runtime filter: {error}"))
     }
 
-    fn with_substituted_filter(&self, dynamic_filter: Arc<WireDynamicFilter>) -> Self {
+    fn with_substituted_filter(&self, dynamic_filter: Arc<ConnectorReadDynamicFilter>) -> Self {
         Self {
             shared: Arc::new(TypedConnectorScanShared {
+                wire_scan: self.shared.wire_scan.clone(),
                 scan: self.shared.scan.clone(),
                 provider: Arc::clone(&self.shared.provider),
                 session: self.shared.session.clone(),
@@ -410,7 +410,7 @@ impl ScanSource for TypedConnectorScanSource {
 /// One bound typed connector scan.
 pub struct TypedConnectorScanOp {
     shared: Arc<TypedConnectorScanShared>,
-    queue: Arc<SplitQueue>,
+    queue: Arc<SplitQueue<crate::fragment::ingress::ReceivedReadSplit>>,
     waiter: Arc<SplitWaiter>,
     sources: Arc<TypedPageSourceGroup>,
 }
@@ -514,7 +514,7 @@ impl ScanOp for TypedConnectorScanOp {
 /// The chunk stream of one driver over this scan's split queue.
 struct TypedConnectorSplitIter {
     shared: Arc<TypedConnectorScanShared>,
-    queue: Arc<SplitQueue>,
+    queue: Arc<SplitQueue<crate::fragment::ingress::ReceivedReadSplit>>,
     waiter: Arc<SplitWaiter>,
     sources: Arc<TypedPageSourceGroup>,
     /// The split currently being read. `None` between two splits.
@@ -524,14 +524,17 @@ struct TypedConnectorSplitIter {
 }
 
 impl TypedConnectorSplitIter {
-    fn open_page_source(&mut self, split: &ScheduledSplit) -> Result<(), String> {
+    fn open_page_source(
+        &mut self,
+        split: &crate::fragment::ingress::ReceivedReadSplit,
+    ) -> Result<(), String> {
         self.shared.check_liveness("page source open")?;
         let page_source = self
             .shared
             .provider
             .create_page_source(
                 &self.shared.session,
-                self.shared.scan.table(),
+                self.shared.scan.relation().table(),
                 split.split(),
                 split.sequence_id(),
                 self.shared.scan.assignments(),
@@ -1140,7 +1143,9 @@ mod tests {
     use novarocks_execution::connector::{SplitQueueConfig, SplitQueueRegistry, TaskAttemptKey};
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_codec::connector_read::{
-        CatalogTableHandle, ScanAssignment, ValidatedConnectorSplit,
+        CatalogTableHandle, ConnectorTableScanSource, ScanAssignment, ScheduledSplit,
+        TypedConnectorPageSourceProvider, TypedConnectorSystemTableProvider,
+        ValidatedConnectorSplit, WireDynamicFilter,
     };
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::read_stack::{
@@ -1303,15 +1308,18 @@ mod tests {
         SourcePage::try_new(positions, vec![column]).expect("valid page")
     }
 
-    fn scheduled_split(sequence_id: u64) -> ScheduledSplit {
-        ScheduledSplit::parse(
-            test_support::split_proto(NODE, sequence_id),
-            FieldPath::root("scheduled_split"),
+    fn scheduled_split(sequence_id: u64) -> crate::fragment::ingress::ReceivedReadSplit {
+        crate::fragment::ingress::ReceivedReadSplit::from_scheduled(
+            ScheduledSplit::parse(
+                test_support::split_proto(NODE, sequence_id),
+                FieldPath::root("scheduled_split"),
+            )
+            .expect("valid scheduled split"),
         )
-        .expect("valid scheduled split")
     }
 
-    fn attempt_queues() -> Arc<TaskAttemptSplitQueues> {
+    fn attempt_queues() -> Arc<TaskAttemptSplitQueues<crate::fragment::ingress::ReceivedReadSplit>>
+    {
         let registry = SplitQueueRegistry::new();
         registry.open_attempt(
             TaskAttemptKey::new(
@@ -1340,7 +1348,7 @@ mod tests {
 
     fn source_with(
         provider: Arc<ScriptedProvider>,
-        queues: Arc<TaskAttemptSplitQueues>,
+        queues: Arc<TaskAttemptSplitQueues<crate::fragment::ingress::ReceivedReadSplit>>,
         cancellation: Arc<dyn ConnectorCancellation>,
     ) -> TypedConnectorScanSource {
         TypedConnectorScanSource::new(
@@ -1817,8 +1825,8 @@ pub struct TypedConnectorSystemTableScanSource {
 }
 
 struct TypedSystemTableScanShared {
-    scan: ConnectorTableScanSource,
-    provider: Arc<dyn TypedConnectorSystemTableProvider>,
+    scan: novarocks_proto_codec::connector_read::DecodedConnectorReadScan,
+    provider: Arc<dyn ConnectorReadSystemTableProvider>,
     session: ConnectorSession,
     request: ConnectorRequestContext,
     plan_node_id: i32,
@@ -1852,8 +1860,8 @@ impl TypedSystemTableScanShared {
 
 impl TypedConnectorSystemTableScanSource {
     pub fn new(
-        scan: ConnectorTableScanSource,
-        provider: Arc<dyn TypedConnectorSystemTableProvider>,
+        scan: novarocks_proto_codec::connector_read::DecodedConnectorReadScan,
+        provider: Arc<dyn ConnectorReadSystemTableProvider>,
         session: ConnectorSession,
         request: ConnectorRequestContext,
         plan_node_id: i32,
@@ -1990,7 +1998,7 @@ impl TypedSystemTableIter {
             .provider
             .create_system_page_source(
                 &self.shared.session,
-                self.shared.scan.table(),
+                self.shared.scan.relation().table(),
                 self.shared.scan.assignments(),
             )
             .map_err(|error| format!("create typed system relation page source: {error}"))?;

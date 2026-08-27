@@ -19,8 +19,8 @@
 
 use std::sync::Arc;
 
-use novarocks_proto_codec::connector_read::{
-    CatalogTableHandle, ConnectorRelationKind, ValidatedConnectorSplit,
+use novarocks_spi::connector::read_stack::{
+    ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadSplit,
 };
 
 /// The catalog a relation or split belongs to.
@@ -55,26 +55,26 @@ impl CatalogHandle {
 #[derive(Clone, Debug)]
 pub(crate) struct TableHandle {
     catalog: CatalogHandle,
-    handle: CatalogTableHandle,
+    relation: ConnectorReadRelation,
 }
 
 impl TableHandle {
-    pub(crate) fn new(catalog: CatalogHandle, handle: CatalogTableHandle) -> Self {
-        Self { catalog, handle }
+    pub(crate) fn new(catalog: CatalogHandle, relation: ConnectorReadRelation) -> Self {
+        Self { catalog, relation }
     }
 
     pub(crate) const fn catalog(&self) -> &CatalogHandle {
         &self.catalog
     }
 
-    pub(crate) const fn handle(&self) -> &CatalogTableHandle {
-        &self.handle
+    pub(crate) const fn relation(&self) -> &ConnectorReadRelation {
+        &self.relation
     }
 
     /// Which relation family this handle names. The engine branches on this to
     /// choose a distribution; it never reads inside the provider variant.
-    pub(crate) fn relation_kind(&self) -> ConnectorRelationKind {
-        self.handle.relation().kind()
+    pub(crate) fn relation_kind(&self) -> ConnectorReadRelationKind {
+        self.relation.kind()
     }
 }
 
@@ -87,34 +87,34 @@ impl TableHandle {
 /// provider from that node's own frozen table handle. Repeating it here would
 /// create a second authority that could disagree with the first.
 pub(crate) struct Split {
-    split: ValidatedConnectorSplit,
+    split: ConnectorReadSplit,
 }
 
 impl Split {
-    pub(crate) fn new(split: ValidatedConnectorSplit) -> Self {
+    pub(crate) fn new(split: ConnectorReadSplit) -> Self {
         Self { split }
     }
 
-    pub(crate) const fn split(&self) -> &ValidatedConnectorSplit {
+    pub(crate) const fn split(&self) -> &ConnectorReadSplit {
         &self.split
     }
 
     /// Relative scheduling cost. Weight only influences placement; it never
     /// changes what the split reads.
     pub(crate) fn weight_raw(&self) -> u64 {
-        self.split.split_weight().raw_value()
+        self.split.facts().split_weight().raw_value()
     }
 
     pub(crate) fn retained_size_in_bytes(&self) -> u64 {
-        self.split.retained_size_in_bytes()
+        self.split.facts().retained_size_in_bytes()
     }
 
     pub(crate) fn is_remotely_accessible(&self) -> bool {
-        self.split.is_remotely_accessible()
+        self.split.facts().remotely_accessible()
     }
 
     pub(crate) fn affinity_key(&self) -> Option<&str> {
-        self.split.affinity_key()
+        self.split.facts().affinity_key()
     }
 }
 

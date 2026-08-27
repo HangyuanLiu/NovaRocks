@@ -21,7 +21,11 @@
 //! mutable collections.  They expose only the frozen facts that an encoder may
 //! map into a native carrier.
 
-use novarocks_proto_codec::connector_read::ConnectorTableScanSource;
+use novarocks_proto_codec::FieldPath;
+use novarocks_proto_codec::connector_read::{
+    ConnectorTableScanSource, encode_connector_expression,
+};
+use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::ConnectorExecutionDeclaration;
 use novarocks_sql::plan_read::{ColumnId, FragmentId, OutputColumn, TypedExpr};
 use novarocks_types::schema::ColumnDef;
@@ -226,9 +230,75 @@ impl<'a> NativeConnectorReadView<'a> {
         &self.scan.declaration
     }
 
-    /// The validated typed scan carrier, exactly as preparation froze it.
-    pub fn table_scan_source(self) -> &'a ConnectorTableScanSource {
-        self.scan.prepared.table_scan.source()
+    /// Encode the frozen SPI scan only at native fragment egress.  The codec
+    /// belongs to the exact installed binding that minted every opaque handle.
+    pub fn table_scan_source(self) -> Result<ConnectorTableScanSource, String> {
+        let node = &self.scan.prepared.table_scan;
+        let codec = self.scan.prepared.codec.as_ref();
+        let source = node.source();
+        let assignments = source
+            .assignments()
+            .iter()
+            .enumerate()
+            .map(|(index, assignment)| {
+                codec.encode_assignment(
+                    assignment,
+                    FieldPath::root("connector_table_scan_source")
+                        .field("assignments")
+                        .index(index),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let work_source = match source.work_source() {
+            novarocks_spi::connector::read_stack::ConnectorReadWorkSource::RuntimeSplits => {
+                dto::ScanWorkSource::RuntimeSplits as i32
+            }
+            novarocks_spi::connector::read_stack::ConnectorReadWorkSource::WholeRelation => {
+                dto::ScanWorkSource::WholeRelation as i32
+            }
+        };
+        let raw = dto::ConnectorTableScanSource {
+            table: Some(
+                codec
+                    .encode_relation(node.table().relation())
+                    .map_err(|error| error.to_string())?,
+            ),
+            assignments,
+            enforced_predicate: Some(
+                codec
+                    .encode_tuple_domain(
+                        source.enforced_predicate(),
+                        FieldPath::root("connector_table_scan_source").field("enforced_predicate"),
+                    )
+                    .map_err(|error| error.to_string())?,
+            ),
+            unenforced_predicate: Some(
+                codec
+                    .encode_tuple_domain(
+                        source.unenforced_predicate(),
+                        FieldPath::root("connector_table_scan_source")
+                            .field("unenforced_predicate"),
+                    )
+                    .map_err(|error| error.to_string())?,
+            ),
+            remaining_expression: source
+                .remaining_expression()
+                .map(encode_connector_expression),
+            dynamic_filters: source
+                .dynamic_filters()
+                .iter()
+                .map(|binding| dto::DynamicFilterBinding {
+                    filter_id: binding.filter_id(),
+                    variable: binding.variable().to_owned(),
+                })
+                .collect(),
+            max_batch_rows: source.max_batch_rows(),
+            max_batch_bytes: source.max_batch_bytes(),
+            work_source,
+        };
+        ConnectorTableScanSource::parse(raw, FieldPath::root("connector_table_scan_source"))
+            .map_err(|error| error.to_string())
     }
 
     pub fn residual_predicates(self) -> &'a [TypedExpr] {

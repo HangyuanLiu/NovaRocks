@@ -49,8 +49,12 @@ use crate::fragment::decode::plan::layout::Layout;
 /// not keep growing one parameter at a time.
 #[derive(Clone)]
 pub(crate) struct TypedScanRuntime {
-    providers: Arc<crate::connector::TypedConnectorProviderRegistry>,
-    queues: Arc<novarocks_execution::connector::TaskAttemptSplitQueues>,
+    read_executions: Arc<crate::connector::typed_registry::InstalledReadExecutionRegistry>,
+    queues: Arc<
+        novarocks_execution::connector::TaskAttemptSplitQueues<
+            crate::fragment::ingress::ReceivedReadSplit,
+        >,
+    >,
     session: novarocks_spi::connector::read_stack::ConnectorSession,
     /// Resolves this attempt's runtime-filter session, or `None` when it
     /// installed none — in which case a typed scan uses the truthful
@@ -61,33 +65,50 @@ pub(crate) struct TypedScanRuntime {
     /// admission permit while its plan is decoded, and the lifecycle refuses a
     /// session without one, so resolving here would always answer `None`.
     runtime_filter: RuntimeFilterSessionResolver,
+    read_context: Arc<crate::fragment::ingress::TypedReadAttemptContext>,
 }
 
 /// Looks up the attempt's runtime-filter session at the moment it is needed.
 pub(crate) type RuntimeFilterSessionResolver = Arc<
-    dyn Fn() -> Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef> + Send + Sync,
+    dyn Fn() -> Result<Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>, String>
+        + Send
+        + Sync,
 >;
 
 impl TypedScanRuntime {
     pub(crate) fn new(
-        providers: Arc<crate::connector::TypedConnectorProviderRegistry>,
-        queues: Arc<novarocks_execution::connector::TaskAttemptSplitQueues>,
+        read_executions: Arc<crate::connector::typed_registry::InstalledReadExecutionRegistry>,
+        queues: Arc<
+            novarocks_execution::connector::TaskAttemptSplitQueues<
+                crate::fragment::ingress::ReceivedReadSplit,
+            >,
+        >,
         session: novarocks_spi::connector::read_stack::ConnectorSession,
         runtime_filter: RuntimeFilterSessionResolver,
+        read_context: Arc<crate::fragment::ingress::TypedReadAttemptContext>,
     ) -> Self {
         Self {
-            providers,
+            read_executions,
             queues,
             session,
             runtime_filter,
+            read_context,
         }
     }
 
-    pub(crate) fn providers(&self) -> Arc<crate::connector::TypedConnectorProviderRegistry> {
-        Arc::clone(&self.providers)
+    pub(crate) fn read_executions(
+        &self,
+    ) -> Arc<crate::connector::typed_registry::InstalledReadExecutionRegistry> {
+        Arc::clone(&self.read_executions)
     }
 
-    pub(crate) fn queues(&self) -> Arc<novarocks_execution::connector::TaskAttemptSplitQueues> {
+    pub(crate) fn queues(
+        &self,
+    ) -> Arc<
+        novarocks_execution::connector::TaskAttemptSplitQueues<
+            crate::fragment::ingress::ReceivedReadSplit,
+        >,
+    > {
         Arc::clone(&self.queues)
     }
 
@@ -97,6 +118,18 @@ impl TypedScanRuntime {
 
     pub(crate) fn runtime_filter(&self) -> RuntimeFilterSessionResolver {
         Arc::clone(&self.runtime_filter)
+    }
+
+    pub(crate) fn register_read_execution(
+        &self,
+        plan_node_id: i32,
+        execution: crate::connector::typed_registry::InstalledReadExecution,
+    ) -> Result<(), String> {
+        self.read_context.register(plan_node_id, execution)
+    }
+
+    pub(crate) fn read_context(&self) -> Arc<crate::fragment::ingress::TypedReadAttemptContext> {
+        Arc::clone(&self.read_context)
     }
 }
 

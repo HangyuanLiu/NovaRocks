@@ -23,11 +23,9 @@
 
 use std::fmt;
 
-use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_proto_models::connector_read as dto;
-use novarocks_types::UniqueId;
-
 use super::driver::AssignmentTarget;
+use crate::query_execution::connector_domain::TaskUpdateRequest;
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
 
 /// What one backend reported for one plan node after an update.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,7 +80,6 @@ pub(crate) trait TaskUpdateTransport: Send + Sync {
         &self,
         execution_id: QueryExecutionId,
         target: &AssignmentTarget,
-        fragment_instance_id: UniqueId,
-        assignments: Vec<dto::SplitAssignment>,
+        request: TaskUpdateRequest,
     ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError>;
 }

@@ -210,7 +210,7 @@ impl Drop for SplitAssignmentRoundGuard {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_types::{AttemptId, QueryId, UniqueId};
+    use novarocks_types::{AttemptId, QueryId};
 
     use super::*;
 
@@ -227,8 +227,7 @@ mod tests {
                 &self,
                 _execution_id: QueryExecutionId,
                 _target: &AssignmentTarget,
-                _fragment_instance_id: UniqueId,
-                _assignments: Vec<novarocks_proto_models::connector_read::SplitAssignment>,
+                _request: crate::query_execution::connector_domain::TaskUpdateRequest,
             ) -> Result<
                 crate::query_execution::split_assignment::TaskUpdateOutcome,
                 crate::query_execution::split_assignment::TaskUpdateTransportError,

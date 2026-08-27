@@ -33,12 +33,14 @@
 
 pub mod change_window;
 pub mod change_window_page_source;
+pub mod codec;
 pub mod column_handle;
 pub mod delete_manager;
 pub mod merge;
 pub mod page_source;
 pub mod page_source_provider;
 pub mod rewrite_position_page_source;
+pub mod runtime;
 pub mod schema_binding;
 pub mod split;
 pub mod split_source;
@@ -60,6 +62,7 @@ pub use change_window_page_source::{
     IcebergChangeWindowPageSource, IcebergChangeWindowPageSourceRequest,
     create_iceberg_change_window_page_source,
 };
+pub use codec::IcebergConnectorReadCodec;
 pub use column_handle::{
     ColumnIdentity, ColumnIdentityCategory, IcebergColumnHandle, IcebergColumnHandleParams,
     decode_tuple_domain, encode_tuple_domain,
@@ -84,6 +87,7 @@ pub use rewrite_position_page_source::{
     IcebergRewritePositionDeleteFilesPageSourceRequest,
     create_iceberg_rewrite_position_delete_files_page_source,
 };
+pub use runtime::{IcebergExecutionReadRuntime, IcebergReadSplit, IcebergRuntimeRelation};
 pub use schema_binding::{
     ALWAYS_BOUND_METADATA_COLUMNS, FileFieldIdCoverage, ICEBERG_METADATA_FIELD_ID_IS_DELETED,
     ICEBERG_METADATA_FIELD_ID_PATH, ICEBERG_METADATA_FIELD_ID_ROW_POSITION, IcebergBoundColumn,

@@ -24,8 +24,10 @@
 //! and the service traits below.
 
 use std::any::Any;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Formatter};
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::connector::read_stack::{
@@ -145,13 +147,27 @@ impl Debug for ConnectorReadSplit {
     }
 }
 
-/// A column's equality and ordering are provider-defined, but the semantic key
-/// is deliberately supplied at construction rather than exposing the payload.
+/// A column's equality and ordering delegate to its provider's concrete
+/// `ColumnHandle`, without exposing that payload outside the adapter.
 #[derive(Clone)]
 pub struct ConnectorReadColumnHandle {
     binding: ConnectorReadBinding,
-    identity: Arc<[u8]>,
     payload: OpaquePayload,
+    comparison: Arc<dyn ErasedColumnComparison>,
+}
+
+/// Private provider-erased ordering for an opaque column payload. It is never
+/// derived from wire bytes, pointer identity, or a role-visible token.
+trait ErasedColumnComparison: Send + Sync {
+    fn compare(&self, left: &OpaquePayload, right: &OpaquePayload) -> Option<Ordering>;
+}
+
+struct TypedColumnComparison<C>(PhantomData<fn() -> C>);
+
+impl<C: ColumnHandle> ErasedColumnComparison for TypedColumnComparison<C> {
+    fn compare(&self, left: &OpaquePayload, right: &OpaquePayload) -> Option<Ordering> {
+        Some(left.downcast_ref::<C>()?.cmp(right.downcast_ref::<C>()?))
+    }
 }
 
 impl ConnectorReadColumnHandle {
@@ -171,32 +187,39 @@ impl Debug for ConnectorReadColumnHandle {
 
 impl PartialEq for ConnectorReadColumnHandle {
     fn eq(&self, other: &Self) -> bool {
-        self.binding == other.binding && self.identity == other.identity
+        self.binding == other.binding
+            && self
+                .comparison
+                .compare(&self.payload, &other.payload)
+                .is_some_and(Ordering::is_eq)
     }
 }
 
 impl Eq for ConnectorReadColumnHandle {}
 
 impl PartialOrd for ConnectorReadColumnHandle {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl Ord for ConnectorReadColumnHandle {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         (
             self.binding.descriptor.provider_id.as_str(),
             self.binding.descriptor.instance_id.as_str(),
             self.binding.incarnation.to_bytes(),
-            self.identity.as_ref(),
         )
             .cmp(&(
                 other.binding.descriptor.provider_id.as_str(),
                 other.binding.descriptor.instance_id.as_str(),
                 other.binding.incarnation.to_bytes(),
-                other.identity.as_ref(),
             ))
+            .then_with(|| {
+                self.comparison
+                    .compare(&self.payload, &other.payload)
+                    .expect("same read binding must carry one concrete column family")
+            })
     }
 }
 
@@ -511,6 +534,15 @@ pub enum ConnectorReadTableExecuteProcedure {
 /// Coordinator-facing read services.  They are transport neutral and never
 /// expose the concrete payload of a returned handle.
 pub trait ConnectorReadMetadata: Send + Sync {
+    /// Freeze an opaque table with the transaction of its exact installed
+    /// provider binding.  Roles can retain the resulting relation but cannot
+    /// inspect or manufacture its transaction payload.
+    fn relation(
+        &self,
+        kind: ConnectorReadRelationKind,
+        table: ConnectorReadTableHandle,
+    ) -> Result<ConnectorReadRelation, ConnectorError>;
+
     fn get_table_handle(
         &self,
         session: &ConnectorSession,
@@ -597,6 +629,17 @@ pub trait ConnectorReadSplitManager: Send + Sync {
     ) -> Result<Box<dyn ConnectorReadSplitSource>, ConnectorError>;
 }
 
+/// A role-local lease that keeps one exact read-control registration alive.
+///
+/// The connector that owns a control generation retains the strong lease with
+/// its generation metadata.  Role registries retain only a weak reference, so
+/// dropping the generation can remove exactly its local slot without turning
+/// registry retirement into a Host or RPC operation.
+///
+/// This is deliberately a marker: it carries no provider payload, wire value,
+/// or role authority.
+pub trait ConnectorReadRegistrationLease: Send + Sync {}
+
 pub trait ConnectorReadPageSourceProvider: Send + Sync {
     fn create_page_source(
         &self,
@@ -653,15 +696,14 @@ pub(crate) fn transaction_handle<T: Send + Sync + 'static>(
     }
 }
 
-pub(crate) fn column_handle<T: Send + Sync + 'static>(
+pub(crate) fn column_handle<T: ColumnHandle>(
     binding: ConnectorReadBinding,
-    identity: impl Into<Arc<[u8]>>,
     value: T,
 ) -> ConnectorReadColumnHandle {
     ConnectorReadColumnHandle {
         binding,
-        identity: identity.into(),
         payload: OpaquePayload::new(value),
+        comparison: Arc::new(TypedColumnComparison::<T>(PhantomData)),
     }
 }
 
@@ -678,6 +720,10 @@ pub(crate) fn split_handle<T: Send + Sync + 'static>(
 }
 
 pub(crate) fn table_value<T: 'static>(handle: &ConnectorReadTableHandle) -> Option<&T> {
+    handle.payload.downcast_ref()
+}
+
+pub(crate) fn transaction_value<T: 'static>(handle: &ConnectorReadTransactionHandle) -> Option<&T> {
     handle.payload.downcast_ref()
 }
 

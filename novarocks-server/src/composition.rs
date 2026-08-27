@@ -470,7 +470,9 @@ pub fn compose_backend_server_config(
         .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
         execution_installers: compose_backend_execution_installers(config, runtime.clone())?,
-        typed_provider_factories: compose_backend_typed_provider_factories(config, runtime)?,
+        read_execution_bundle_factories: compose_backend_read_execution_bundle_factories(
+            config, runtime,
+        )?,
     })
 }
 
@@ -677,28 +679,21 @@ pub fn compose_frontend_control_factories(
     typed_control: std::sync::Arc<novarocks_frontend::TypedConnectorControlRegistry>,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorControlFactory>>> {
     let planning_resources = compose_connector_file_planning_resources(config, runtime.clone())?;
-    // The observer runs while the control generation is being created, so the
-    // typed entry and the SPI binding become visible together.
+    // The installer runs only after the provider has built and validated its
+    // complete control binding.  A registration failure therefore prevents a
+    // binding from escaping without its matching read services and codec.
     let sink = std::sync::Arc::clone(&typed_control);
     let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
         IcebergReadBinding::from_resources(planning_resources),
         runtime,
     ))
-    .with_typed_boundary_observer(std::sync::Arc::new(move |key, boundary| {
-        let boundary = std::sync::Arc::new(boundary);
-        if let Err(error) = sink.install(
-            key.clone(),
-            novarocks_frontend::TypedConnectorControl::new(
-                std::sync::Arc::clone(&boundary) as _,
-                boundary as _,
+    .with_read_control_installer(std::sync::Arc::new(move |key, metadata, splits, codec| {
+        sink.install_read_control(
+            key,
+            novarocks_frontend::connector::typed_control_registry::InstalledReadControl::new(
+                metadata, splits, codec,
             ),
-        ) {
-            tracing::warn!(
-                target: "novarocks::composition",
-                %error,
-                "typed connector control was not installed for this generation"
-            );
-        }
+        )
     }));
     Ok(vec![std::sync::Arc::new(factory)])
 }
@@ -708,13 +703,15 @@ pub fn compose_frontend_control_factories(
 /// StarRocks has no typed read contract yet, so it deliberately contributes no
 /// factory: a typed StarRocks scan must fail to resolve rather than reach a
 /// placeholder that would look like support.
-pub fn compose_backend_typed_provider_factories(
+pub fn compose_backend_read_execution_bundle_factories(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<
     Vec<(
         novarocks_spi::connector::ConnectorExecutionProviderKind,
-        std::sync::Arc<dyn novarocks_proto_codec::connector_read::TypedConnectorProviderFactory>,
+        std::sync::Arc<
+            dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory,
+        >,
     )>,
 > {
     let binding = IcebergReadBinding::from_resources(compose_connector_file_planning_resources(

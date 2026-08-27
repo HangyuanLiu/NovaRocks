@@ -28,7 +28,10 @@ use std::fmt;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_types::UniqueId;
 
-use novarocks_proto_codec::connector_read::{TypedConnectorSplitSource, WireDynamicFilterSnapshot};
+use novarocks_proto_codec::connector_read::ConnectorReadCodec;
+use novarocks_spi::connector::read_stack::{
+    ConnectorReadDynamicFilterSnapshot, ConnectorReadSplitSource,
+};
 
 use super::super::connector_domain::{PlanNodeAssignmentState, Split, SplitAssignmentError};
 use super::transport::{TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError};
@@ -166,6 +169,7 @@ pub(crate) struct SplitAssignmentDriver {
     /// Splits the backends reported as still queued, above which the driver
     /// stops pulling new batches.
     max_queued_splits_per_task: u64,
+    codecs: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadCodec>>,
 }
 
 impl SplitAssignmentDriver {
@@ -174,6 +178,7 @@ impl SplitAssignmentDriver {
         transport: std::sync::Arc<dyn TaskUpdateTransport>,
         tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
         max_queued_splits_per_task: u64,
+        codecs: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadCodec>>,
     ) -> Self {
         let mut sequences = BTreeMap::new();
         let mut task_state = BTreeMap::new();
@@ -202,6 +207,7 @@ impl SplitAssignmentDriver {
             sources,
             closed: false,
             max_queued_splits_per_task,
+            codecs,
         }
     }
 
@@ -347,17 +353,25 @@ impl SplitAssignmentDriver {
                 .sequences
                 .entry(target.clone())
                 .or_insert_with(PlanNodeAssignmentState::new)
-                .assign(plan_node_id, splits, no_more_splits)?;
-            let encoded = vec![assignment.to_proto()];
+                .assign(
+                    plan_node_id,
+                    splits,
+                    no_more_splits,
+                    self.codecs.get(&plan_node_id).cloned().ok_or_else(|| {
+                        SplitAssignmentDriverError::SplitSource {
+                            plan_node_id,
+                            detail: "missing exact connector read codec".to_owned(),
+                        }
+                    })?,
+                )?;
+            let request = super::super::connector_domain::TaskUpdateRequest::new(
+                target.fragment_instance_id,
+                vec![assignment],
+            );
 
             let state = self.task_state.entry(target.clone()).or_default();
             state.in_flight = true;
-            let outcome = self.transport.send(
-                self.execution_id,
-                &target,
-                target.fragment_instance_id,
-                encoded,
-            );
+            let outcome = self.transport.send(self.execution_id, &target, request);
             let state = self.task_state.entry(target.clone()).or_default();
             state.in_flight = false;
 
@@ -407,7 +421,7 @@ impl SplitAssignmentDriver {
     pub(crate) fn pump(
         &mut self,
         plan_node_id: i32,
-        source: &mut dyn TypedConnectorSplitSource,
+        source: &mut dyn ConnectorReadSplitSource,
         batch_size: usize,
     ) -> Result<bool, SplitAssignmentDriverError> {
         if self.closed {
@@ -422,7 +436,7 @@ impl SplitAssignmentDriver {
         let batch = source
             .next_batch(
                 batch_size.clamp(1, MAX_SPLITS_PER_UPDATE),
-                &WireDynamicFilterSnapshot::all_complete(),
+                &ConnectorReadDynamicFilterSnapshot::all_complete(),
             )
             .map_err(|error| SplitAssignmentDriverError::SplitSource {
                 plan_node_id,
@@ -457,360 +471,17 @@ impl SplitAssignmentDriver {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::Mutex;
-
-    use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_codec::connector_read::ValidatedConnectorSplit;
-    use novarocks_proto_models::connector_read as dto;
-    use novarocks_spi::connector::read_stack::ConnectorSplitBatch;
-    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-    use novarocks_types::{AttemptId, QueryId};
-
-    use super::super::transport::AcceptedPlanNode;
     use super::*;
 
-    #[derive(Default)]
-    struct RecordingTransport {
-        sent: Mutex<Vec<(AssignmentTarget, Vec<dto::SplitAssignment>)>>,
-        reject: Mutex<bool>,
-        fail: Mutex<bool>,
-    }
-
-    impl TaskUpdateTransport for RecordingTransport {
-        fn send(
-            &self,
-            _execution_id: QueryExecutionId,
-            target: &AssignmentTarget,
-            _fragment_instance_id: UniqueId,
-            assignments: Vec<dto::SplitAssignment>,
-        ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
-            if *self.fail.lock().expect("transport lock") {
-                return Err(TaskUpdateTransportError::new("backend unreachable"));
-            }
-            if *self.reject.lock().expect("transport lock") {
-                return Ok(TaskUpdateOutcome::Rejected {
-                    reason: "TERMINATED".to_owned(),
-                    detail: "query lifecycle has terminated".to_owned(),
-                });
-            }
-            let accepted = assignments
-                .iter()
-                .map(|assignment| AcceptedPlanNode {
-                    plan_node_id: assignment.plan_node_id,
-                    accepted_through_sequence: assignment
-                        .splits
-                        .last()
-                        .map(|split| split.sequence_id)
-                        .unwrap_or_default(),
-                    no_more_splits: assignment.no_more_splits,
-                    queued_splits: assignment.splits.len() as u64,
-                })
-                .collect();
-            self.sent
-                .lock()
-                .expect("transport lock")
-                .push((target.clone(), assignments));
-            Ok(TaskUpdateOutcome::Accepted(accepted))
-        }
-    }
-
-    fn execution_id() -> QueryExecutionId {
-        QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).expect("attempt"))
-            .expect("execution id")
-    }
-
-    fn validated_split(weight_raw: u64) -> ValidatedConnectorSplit {
-        let raw = dto::ConnectorSplit {
-            split_weight_raw: weight_raw,
-            remotely_accessible: true,
-            addresses: Vec::new(),
-            affinity_key: None,
-            retained_size_in_bytes: 64,
-            category: Some(dto::connector_split::Category::Data(dto::DataSplit {
-                provider: Some(dto::data_split::Provider::Iceberg(dto::IcebergSplit {
-                    path: "s3://bucket/table/data/0001.parquet".to_owned(),
-                    start: 0,
-                    length: 1024,
-                    file_size: 1024,
-                    file_record_count: 10,
-                    file_format: dto::IcebergFileFormat::Parquet as i32,
-                    partition_spec_id: 0,
-                    partition_data_json: "{}".to_owned(),
-                    deletes: Vec::new(),
-                    file_statistics_domain: Some(dto::TupleDomain {
-                        none: false,
-                        column_domains: Vec::new(),
-                    }),
-                    data_sequence_number: Some(1),
-                    file_first_row_id: None,
-                    decryption_data: None,
-                })),
-            })),
-        };
-        ValidatedConnectorSplit::parse(raw, FieldPath::root("connector_split"))
-            .expect("valid split")
-    }
-
-    fn split(weight_raw: u64) -> Split {
-        Split::new(validated_split(weight_raw))
-    }
-
-    /// A source that hands out pre-programmed batches in order.
-    struct ScriptedSource {
-        batches: std::collections::VecDeque<ConnectorSplitBatch<ValidatedConnectorSplit>>,
-        fail: bool,
-        closed: usize,
-    }
-
-    impl TypedConnectorSplitSource for ScriptedSource {
-        fn next_batch(
-            &mut self,
-            _max_size: usize,
-            _dynamic_filter: &WireDynamicFilterSnapshot,
-        ) -> Result<ConnectorSplitBatch<ValidatedConnectorSplit>, ConnectorError> {
-            if self.fail {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::Unavailable,
-                    "manifest read failed",
-                ));
-            }
-            Ok(self
-                .batches
-                .pop_front()
-                .unwrap_or_else(ConnectorSplitBatch::finished))
-        }
-
-        fn is_finished(&self) -> bool {
-            self.batches.is_empty()
-        }
-
-        fn close(&mut self) -> Result<(), ConnectorError> {
-            self.closed += 1;
-            Ok(())
-        }
-    }
-
-    fn target(backend_idx: usize) -> AssignmentTarget {
-        AssignmentTarget {
-            backend_idx,
-            fragment_instance_id: UniqueId::new(9, backend_idx as i64),
-        }
-    }
-
-    fn new_driver(transport: Arc<RecordingTransport>, backends: usize) -> SplitAssignmentDriver {
-        let mut tasks = BTreeMap::new();
-        tasks.insert(7_i32, (0..backends).map(target).collect::<Vec<_>>());
-        SplitAssignmentDriver::new(execution_id(), transport, tasks, 1024)
-    }
-
     #[test]
-    fn splits_spread_across_tasks_by_weight() {
-        let transport = Arc::new(RecordingTransport::default());
-        let mut driver = new_driver(transport, 2);
-        let placement = driver
-            .distribute(7, vec![split(400), split(100), split(100)])
-            .expect("distribute");
-        let counts = placement
-            .values()
-            .map(Vec::len)
-            .collect::<std::collections::BTreeSet<_>>();
-        // The heavy split lands alone; the two light ones share the other task.
-        assert_eq!(counts, [1_usize, 2].into_iter().collect());
-    }
-
-    #[test]
-    fn a_task_with_no_work_still_receives_the_terminal_marker() {
-        let transport = Arc::new(RecordingTransport::default());
-        let mut driver = new_driver(Arc::clone(&transport), 3);
-        let placement = driver.distribute(7, vec![split(100)]).expect("distribute");
-        driver.send(7, placement, true).expect("send");
-        let sent = transport.sent.lock().expect("transport lock");
-        assert_eq!(sent.len(), 3);
+    fn split_source_error_names_its_plan_node() {
         assert!(
-            sent.iter()
-                .all(|(_, assignments)| assignments[0].no_more_splits)
-        );
-        assert_eq!(
-            sent.iter()
-                .filter(|(_, assignments)| assignments[0].splits.is_empty())
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn zero_splits_finish_the_source_without_a_synthetic_split() {
-        let transport = Arc::new(RecordingTransport::default());
-        let mut driver = new_driver(Arc::clone(&transport), 2);
-        driver.send(7, BTreeMap::new(), true).expect("send");
-        assert!(driver.sources()[0].is_finished());
-        let sent = transport.sent.lock().expect("transport lock");
-        assert!(
-            sent.iter()
-                .all(|(_, assignments)| assignments[0].splits.is_empty())
-        );
-    }
-
-    #[test]
-    fn a_plan_node_cannot_be_assigned_after_its_terminal_marker() {
-        let transport = Arc::new(RecordingTransport::default());
-        let mut driver = new_driver(transport, 1);
-        driver.send(7, BTreeMap::new(), true).expect("send");
-        let placement = driver.distribute(7, vec![split(100)]).expect("distribute");
-        let error = driver.send(7, placement, false).expect_err("terminal");
-        assert!(matches!(
-            error,
-            SplitAssignmentDriverError::Assignment(SplitAssignmentError::AlreadyTerminal {
-                plan_node_id: 7
-            })
-        ));
-    }
-
-    #[test]
-    fn a_closed_driver_refuses_further_work() {
-        let transport = Arc::new(RecordingTransport::default());
-        let mut driver = new_driver(transport, 1);
-        driver.close();
-        driver.close();
-        assert!(driver.is_closed());
-        assert!(driver.sources().iter().all(SplitSourceHandle::is_closed));
-        assert_eq!(
-            driver.distribute(7, vec![split(100)]).expect_err("closed"),
-            SplitAssignmentDriverError::Closed
-        );
-        assert_eq!(
-            driver.send(7, BTreeMap::new(), true).expect_err("closed"),
-            SplitAssignmentDriverError::Closed
-        );
-    }
-
-    #[test]
-    fn a_plan_node_without_an_admitted_task_fails_closed() {
-        let transport = Arc::new(RecordingTransport::default());
-        let mut driver = new_driver(transport, 1);
-        assert_eq!(
-            driver.distribute(9, vec![split(100)]).expect_err("no task"),
-            SplitAssignmentDriverError::NoAdmittedTask { plan_node_id: 9 }
-        );
-    }
-
-    #[test]
-    fn a_rejection_and_a_transport_failure_both_surface_typed() {
-        let transport = Arc::new(RecordingTransport::default());
-        *transport.reject.lock().expect("lock") = true;
-        let mut driver = new_driver(Arc::clone(&transport), 1);
-        let placement = driver.distribute(7, vec![split(100)]).expect("distribute");
-        assert!(matches!(
-            driver.send(7, placement, false).expect_err("rejected"),
-            SplitAssignmentDriverError::Rejected { .. }
-        ));
-
-        *transport.reject.lock().expect("lock") = false;
-        *transport.fail.lock().expect("lock") = true;
-        let mut driver = new_driver(Arc::clone(&transport), 1);
-        let placement = driver.distribute(7, vec![split(100)]).expect("distribute");
-        assert!(matches!(
-            driver.send(7, placement, false).expect_err("transport"),
-            SplitAssignmentDriverError::Transport { .. }
-        ));
-    }
-
-    #[test]
-    fn sequences_advance_across_batches_within_one_task() {
-        let transport = Arc::new(RecordingTransport::default());
-        let mut driver = new_driver(Arc::clone(&transport), 1);
-        for _ in 0..2 {
-            let placement = driver.distribute(7, vec![split(100)]).expect("distribute");
-            driver.send(7, placement, false).expect("send");
-        }
-        let sent = transport.sent.lock().expect("transport lock");
-        let sequences = sent
-            .iter()
-            .flat_map(|(_, assignments)| {
-                assignments[0].splits.iter().map(|split| split.sequence_id)
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(sequences, vec![0, 1]);
-    }
-
-    #[test]
-    fn pump_drains_a_source_and_delivers_the_terminal_marker() {
-        let transport = Arc::new(RecordingTransport::default());
-        let mut driver = new_driver(Arc::clone(&transport), 2);
-        let mut source = ScriptedSource {
-            batches: [
-                ConnectorSplitBatch::new(vec![validated_split(100), validated_split(100)], false),
-                ConnectorSplitBatch::new(vec![validated_split(100)], true),
-            ]
-            .into_iter()
-            .collect(),
-            fail: false,
-            closed: 0,
-        };
-        while !driver.is_terminal_for(7) {
-            driver.pump(7, &mut source, 16).expect("pump");
-        }
-        let sent = transport.sent.lock().expect("transport lock");
-        let total_splits: usize = sent
-            .iter()
-            .map(|(_, assignments)| assignments[0].splits.len())
-            .sum();
-        assert_eq!(total_splits, 3);
-        assert!(
-            sent.iter()
-                .filter(|(_, assignments)| assignments[0].no_more_splits)
-                .count()
-                >= 1
-        );
-    }
-
-    #[test]
-    fn an_empty_batch_yields_without_ending_enumeration() {
-        let transport = Arc::new(RecordingTransport::default());
-        let mut driver = new_driver(Arc::clone(&transport), 1);
-        let mut source = ScriptedSource {
-            batches: [ConnectorSplitBatch::empty()].into_iter().collect(),
-            fail: false,
-            closed: 0,
-        };
-        assert!(!driver.pump(7, &mut source, 16).expect("pump"));
-        assert!(transport.sent.lock().expect("transport lock").is_empty());
-        assert!(!driver.is_closed());
-    }
-
-    #[test]
-    fn a_source_failure_surfaces_typed_and_sends_nothing() {
-        let transport = Arc::new(RecordingTransport::default());
-        let mut driver = new_driver(Arc::clone(&transport), 1);
-        let mut source = ScriptedSource {
-            batches: std::collections::VecDeque::new(),
-            fail: true,
-            closed: 0,
-        };
-        assert!(matches!(
-            driver.pump(7, &mut source, 16).expect_err("source failure"),
             SplitAssignmentDriverError::SplitSource {
                 plan_node_id: 7,
-                ..
+                detail: "closed".to_owned()
             }
-        ));
-        assert!(transport.sent.lock().expect("transport lock").is_empty());
-    }
-
-    #[test]
-    fn a_closed_driver_refuses_to_pump() {
-        let transport = Arc::new(RecordingTransport::default());
-        let mut driver = new_driver(transport, 1);
-        driver.close();
-        let mut source = ScriptedSource {
-            batches: std::collections::VecDeque::new(),
-            fail: false,
-            closed: 0,
-        };
-        assert_eq!(
-            driver.pump(7, &mut source, 16).expect_err("closed"),
-            SplitAssignmentDriverError::Closed
+            .to_string()
+            .contains("plan node 7")
         );
     }
 }

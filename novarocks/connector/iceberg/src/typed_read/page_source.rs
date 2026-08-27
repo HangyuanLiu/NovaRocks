@@ -49,7 +49,7 @@ use novarocks_fs::{
     ParquetPhysicalType, ParquetStatisticsSortOrder, ParquetStatisticsValue, PhysicalPruning,
     inspect_parquet_metadata, open_file_reader,
 };
-use novarocks_proto_codec::connector_read::{ValidatedColumnHandle, WireDynamicFilter};
+use novarocks_spi::connector::read_stack::DynamicFilter;
 use novarocks_spi::connector::read_stack::{
     BoundsMatch, ColumnValueBounds, ConnectorPageSource, ConnectorSplit, ConnectorValue,
     ConnectorValueType, Domain, PageSourceMetrics, SourcePage, TupleDomain,
@@ -65,6 +65,8 @@ use crate::iceberg::spec::{
 use super::change_window::IcebergChangeWindowHandle;
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, parse_type, unsupported};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager, SplitDeleteFilter};
+pub(super) type IcebergDynamicFilter = dyn DynamicFilter<IcebergColumnHandle>;
+
 use super::schema_binding::{
     FileFieldIdCoverage, IcebergColumnSource, IcebergSchemaBinding, IcebergSchemaBindingRequest,
     IcebergSplitFacts, bind_scan_columns,
@@ -105,7 +107,7 @@ pub struct DynamicFilterObservation {
 }
 
 impl DynamicFilterObservation {
-    pub fn observe(filter: &WireDynamicFilter) -> Self {
+    pub fn observe(filter: &IcebergDynamicFilter) -> Self {
         let snapshot = filter.snapshot();
         Self {
             covered_columns: filter.columns_covered().len(),
@@ -145,12 +147,12 @@ impl DynamicFilterObservation {
 /// only scheduling identity there is.
 #[derive(Clone)]
 pub struct LiveDynamicFilter {
-    filter: Arc<WireDynamicFilter>,
+    filter: Arc<IcebergDynamicFilter>,
     scheduled_split_sequence_id: u64,
 }
 
 impl LiveDynamicFilter {
-    pub fn new(filter: Arc<WireDynamicFilter>, scheduled_split_sequence_id: u64) -> Self {
+    pub fn new(filter: Arc<IcebergDynamicFilter>, scheduled_split_sequence_id: u64) -> Self {
         Self {
             filter,
             scheduled_split_sequence_id,
@@ -218,7 +220,7 @@ pub struct DynamicFilterRowGroupId {
 /// One covered column bound to a primitive leaf of this Parquet file.
 #[derive(Clone, Debug)]
 struct DynamicFilterColumn {
-    column: ValidatedColumnHandle,
+    column: IcebergColumnHandle,
     /// The footer's physical-column ordinal for this Iceberg field id.
     physical_ordinal: u32,
     /// How a raw footer statistic becomes a comparable connector value.
@@ -226,8 +228,8 @@ struct DynamicFilterColumn {
 }
 
 impl DynamicFilterColumn {
-    fn resolve(column: &ValidatedColumnHandle, footer: &ParquetMetadataInspection) -> Option<Self> {
-        let handle = IcebergColumnHandle::from_column_handle_proto(column.as_proto()).ok()?;
+    fn resolve(column: &IcebergColumnHandle, footer: &ParquetMetadataInspection) -> Option<Self> {
+        let handle = column.clone();
         // A nested field has no single primitive leaf statistic to read, and
         // inferring one from an ancestor would be a guess.
         if !handle.is_base_column() {
@@ -631,7 +633,7 @@ pub struct IcebergPageSourceRequest<'a> {
     pub reader_options: FileReaderOptions,
     /// Names this split within its task attempt; the only scheduling identity.
     pub scheduled_split_sequence_id: u64,
-    pub dynamic_filter: Arc<WireDynamicFilter>,
+    pub dynamic_filter: Arc<IcebergDynamicFilter>,
 }
 
 /// Build the page source for one Iceberg data split.
@@ -2083,7 +2085,7 @@ mod tests {
                     novarocks_spi::connector::read_stack::CompleteAllDynamicFilter::new(
                         std::collections::BTreeSet::new(),
                     ),
-                ) as Arc<WireDynamicFilter>,
+                ) as Arc<IcebergDynamicFilter>,
             })
         }
     }
@@ -2149,7 +2151,7 @@ mod tests {
     /// it was asked, so a test can tell "never consulted" apart from "consulted
     /// and kept".
     struct TestDynamicFilter {
-        covered: std::collections::BTreeSet<ValidatedColumnHandle>,
+        covered: std::collections::BTreeSet<IcebergColumnHandle>,
         state: Mutex<TestFilterState>,
         asked: Mutex<Vec<ColumnValueBounds>>,
     }
@@ -2167,13 +2169,8 @@ mod tests {
         fn new(covered_field_id: i32, schema: &IcebergSchema) -> Arc<Self> {
             let handle =
                 IcebergColumnHandle::base_column_of(schema, covered_field_id).expect("handle");
-            let validated = ValidatedColumnHandle::parse(
-                handle.to_column_handle_proto(),
-                novarocks_proto_codec::FieldPath::root("column"),
-            )
-            .expect("a well-formed wire column handle");
             Arc::new(Self {
-                covered: std::collections::BTreeSet::from([validated]),
+                covered: std::collections::BTreeSet::from([handle]),
                 state: Mutex::new(TestFilterState {
                     rejected_minimums: Vec::new(),
                     reject_everything: false,
@@ -2201,12 +2198,12 @@ mod tests {
         }
     }
 
-    impl DynamicFilter<ValidatedColumnHandle> for TestDynamicFilter {
-        fn columns_covered(&self) -> &std::collections::BTreeSet<ValidatedColumnHandle> {
+    impl DynamicFilter<IcebergColumnHandle> for TestDynamicFilter {
+        fn columns_covered(&self) -> &std::collections::BTreeSet<IcebergColumnHandle> {
             &self.covered
         }
 
-        fn current_predicate(&self) -> TupleDomain<ValidatedColumnHandle> {
+        fn current_predicate(&self) -> TupleDomain<IcebergColumnHandle> {
             TupleDomain::all()
         }
 
@@ -2220,7 +2217,7 @@ mod tests {
 
         fn bounds_may_match(
             &self,
-            column: &ValidatedColumnHandle,
+            column: &IcebergColumnHandle,
             bounds: &ColumnValueBounds,
         ) -> BoundsMatch {
             self.asked.lock().expect("asked").push(bounds.clone());
@@ -2251,7 +2248,7 @@ mod tests {
             split: &IcebergSplit,
             handle: &IcebergTableHandle,
             columns: &[IcebergColumnHandle],
-            dynamic_filter: Arc<WireDynamicFilter>,
+            dynamic_filter: Arc<IcebergDynamicFilter>,
             scheduled_split_sequence_id: u64,
         ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
             let relation = IcebergReadRelation::of_table(handle, split.partition_spec_id())?;
@@ -2289,7 +2286,7 @@ mod tests {
                 novarocks_spi::connector::read_stack::CompleteAllDynamicFilter::new(
                     std::collections::BTreeSet::new(),
                 ),
-            ) as Arc<WireDynamicFilter>,
+            ) as Arc<IcebergDynamicFilter>,
             41,
         );
         assert_eq!(
@@ -2316,7 +2313,7 @@ mod tests {
                 &split,
                 &handle,
                 &id_column(&schema),
-                Arc::clone(&filter) as Arc<WireDynamicFilter>,
+                Arc::clone(&filter) as Arc<IcebergDynamicFilter>,
                 7,
             )
             .expect("page source");
@@ -2348,7 +2345,7 @@ mod tests {
                 &split,
                 &handle,
                 &id_column(&schema),
-                Arc::clone(&filter) as Arc<WireDynamicFilter>,
+                Arc::clone(&filter) as Arc<IcebergDynamicFilter>,
                 0,
             )
             .expect("page source");
@@ -2383,7 +2380,7 @@ mod tests {
                 &split,
                 &handle,
                 &id_column(&schema),
-                Arc::clone(&filter) as Arc<WireDynamicFilter>,
+                Arc::clone(&filter) as Arc<IcebergDynamicFilter>,
                 0,
             )
             .expect("page source");
@@ -2408,7 +2405,7 @@ mod tests {
                 &split,
                 &handle,
                 &id_column(&schema),
-                Arc::clone(&filter) as Arc<WireDynamicFilter>,
+                Arc::clone(&filter) as Arc<IcebergDynamicFilter>,
                 0,
             )
             .expect("page source");
@@ -2447,7 +2444,7 @@ mod tests {
                 &split,
                 &handle,
                 &id_column(&schema),
-                Arc::clone(&filter) as Arc<WireDynamicFilter>,
+                Arc::clone(&filter) as Arc<IcebergDynamicFilter>,
                 0,
             )
             .expect("page source");
@@ -2474,7 +2471,7 @@ mod tests {
                 &split,
                 &handle,
                 &id_column(&schema),
-                Arc::clone(&filter) as Arc<WireDynamicFilter>,
+                Arc::clone(&filter) as Arc<IcebergDynamicFilter>,
                 0,
             )
             .expect("page source");
@@ -2494,7 +2491,7 @@ mod tests {
                 &split,
                 &handle,
                 &id_column(&schema),
-                Arc::clone(&filter) as Arc<WireDynamicFilter>,
+                Arc::clone(&filter) as Arc<IcebergDynamicFilter>,
                 3,
             )
             .expect("page source");
@@ -2520,7 +2517,7 @@ mod tests {
                 &split,
                 &handle,
                 &id_column(&schema),
-                Arc::clone(&filter) as Arc<WireDynamicFilter>,
+                Arc::clone(&filter) as Arc<IcebergDynamicFilter>,
                 0,
             )
             .expect("page source");

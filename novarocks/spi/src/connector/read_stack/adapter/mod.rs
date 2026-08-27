@@ -31,12 +31,12 @@ use super::runtime::{
     ConnectorReadColumnHandle, ConnectorReadConstraint, ConnectorReadDynamicFilter,
     ConnectorReadDynamicFilterSnapshot, ConnectorReadFilterApplication,
     ConnectorReadLimitApplication, ConnectorReadMetadata, ConnectorReadPageSourceProvider,
-    ConnectorReadProviderFactory, ConnectorReadRelationVersion, ConnectorReadSplit,
-    ConnectorReadSplitFacts, ConnectorReadSplitManager, ConnectorReadSplitSource,
-    ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider, ConnectorReadTableHandle,
-    ConnectorReadTransactionHandle, binding_error, column_handle, column_value, map_constraint,
-    map_tuple_domain, split_handle, split_value, table_handle, table_value, transaction_handle,
-    type_error,
+    ConnectorReadProviderFactory, ConnectorReadRelationKind, ConnectorReadRelationVersion,
+    ConnectorReadSplit, ConnectorReadSplitFacts, ConnectorReadSplitManager,
+    ConnectorReadSplitSource, ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider,
+    ConnectorReadTableHandle, ConnectorReadTransactionHandle, binding_error, column_handle,
+    column_value, map_constraint, map_tuple_domain, split_handle, split_value, table_handle,
+    table_value, transaction_handle, transaction_value, type_error,
 };
 use super::{
     Assignment, BoundsMatch, ColumnHandle, ColumnValueBounds, ConnectorExpression,
@@ -54,16 +54,15 @@ use crate::connector::{
 pub trait ProviderReadRuntime: Send + Sync + 'static {
     type Table: Debug + Send + Sync + 'static;
     type Column: ColumnHandle;
-    type Transaction: Debug + Send + Sync + 'static;
+    type Transaction: Clone + Debug + Send + Sync + 'static;
     type Split: ConnectorSplit;
 
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn incarnation(&self) -> ConnectorInstanceIncarnation;
 
-    /// A deterministic semantic key for equality and ordering of a column
-    /// within this exact provider binding.  It is an in-memory key, never wire
-    /// bytes and never a provider payload exposed to a role.
-    fn column_identity(&self, column: &Self::Column) -> Vec<u8>;
+    /// The transaction frozen with this exact provider binding.  It is copied
+    /// only into an opaque relation at the provider-side creation boundary.
+    fn transaction(&self) -> Self::Transaction;
 }
 
 #[derive(Clone, Debug)]
@@ -295,20 +294,20 @@ pub trait ProviderReadSystemTableProvider<P: ProviderReadRuntime>: Send + Sync {
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
 }
 
-pub trait ProviderReadFactory: ProviderReadRuntime {
+/// Worker-side factory whose access resources may differ from the metadata
+/// runtime that owns table/column/split values.  `P` is the latter exact type
+/// family, so every page source still receives only handles decoded by the
+/// matching adapter.
+pub trait ProviderReadFactory<P: ProviderReadRuntime>: Send + Sync {
     fn create_page_source_provider(
         &self,
         request: &ConnectorRequestContext,
-    ) -> Result<Arc<dyn ProviderReadPageSourceProvider<Self>>, ConnectorError>
-    where
-        Self: Sized;
+    ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError>;
 
     fn create_system_table_provider(
         &self,
         request: &ConnectorRequestContext,
-    ) -> Result<Arc<dyn ProviderReadSystemTableProvider<Self>>, ConnectorError>
-    where
-        Self: Sized;
+    ) -> Result<Arc<dyn ProviderReadSystemTableProvider<P>>, ConnectorError>;
 }
 
 /// The single generic bridge from provider-owned types to role-visible SPI.
@@ -337,20 +336,42 @@ impl<P: ProviderReadRuntime> ReadRuntimeAdapter<P> {
         &self.binding
     }
 
+    /// Wrap a provider transaction at a provider-owned codec or service
+    /// boundary. Roles receive only the opaque result.
     pub fn wrap_transaction(&self, transaction: P::Transaction) -> ConnectorReadTransactionHandle {
         transaction_handle(self.binding.clone(), transaction)
     }
 
-    fn wrap_table(&self, table: P::Table) -> ConnectorReadTableHandle {
+    /// Pair a provider-bound table with this adapter's frozen transaction.
+    ///
+    /// Frontend code uses the returned neutral relation through planning and
+    /// lets the exact installed codec serialize it at fragment egress.  It
+    /// cannot observe or construct a transaction payload itself.
+    pub fn relation(
+        &self,
+        kind: ConnectorReadRelationKind,
+        table: ConnectorReadTableHandle,
+    ) -> Result<super::runtime::ConnectorReadRelation, ConnectorError> {
+        self.table(&table)?;
+        Ok(super::runtime::ConnectorReadRelation::new(
+            kind,
+            table,
+            self.wrap_transaction(self.provider.transaction()),
+        ))
+    }
+
+    /// Wrap a provider table at a provider-owned codec or service boundary.
+    pub fn wrap_table(&self, table: P::Table) -> ConnectorReadTableHandle {
         table_handle(self.binding.clone(), table)
     }
 
-    fn wrap_column(&self, column: P::Column) -> ConnectorReadColumnHandle {
-        let identity = self.provider.column_identity(&column);
-        column_handle(self.binding.clone(), Arc::<[u8]>::from(identity), column)
+    /// Wrap a provider column at a provider-owned codec or service boundary.
+    pub fn wrap_column(&self, column: P::Column) -> ConnectorReadColumnHandle {
+        column_handle(self.binding.clone(), column)
     }
 
-    fn wrap_split(&self, split: P::Split) -> ConnectorReadSplit {
+    /// Wrap a provider split at a provider-owned codec or service boundary.
+    pub fn wrap_split(&self, split: P::Split) -> ConnectorReadSplit {
         let facts = ConnectorReadSplitFacts::new(
             split.is_remotely_accessible(),
             split.addresses().to_vec(),
@@ -361,7 +382,11 @@ impl<P: ProviderReadRuntime> ReadRuntimeAdapter<P> {
         split_handle(self.binding.clone(), facts, split)
     }
 
-    fn table<'a>(
+    /// Recover a provider table only through this adapter's exact binding.
+    ///
+    /// A codec keeps the adapter privately.  No installed role service exposes
+    /// an adapter, an erased payload, or a generic downcast operation.
+    pub fn table<'a>(
         &self,
         handle: &'a ConnectorReadTableHandle,
     ) -> Result<&'a P::Table, ConnectorError> {
@@ -371,7 +396,8 @@ impl<P: ProviderReadRuntime> ReadRuntimeAdapter<P> {
         table_value(handle).ok_or_else(type_error)
     }
 
-    fn column<'a>(
+    /// Recover a provider column only through this adapter's exact binding.
+    pub fn column<'a>(
         &self,
         handle: &'a ConnectorReadColumnHandle,
     ) -> Result<&'a P::Column, ConnectorError> {
@@ -381,11 +407,26 @@ impl<P: ProviderReadRuntime> ReadRuntimeAdapter<P> {
         column_value(handle).ok_or_else(type_error)
     }
 
-    fn split<'a>(&self, handle: &'a ConnectorReadSplit) -> Result<&'a P::Split, ConnectorError> {
+    /// Recover a provider split only through this adapter's exact binding.
+    pub fn split<'a>(
+        &self,
+        handle: &'a ConnectorReadSplit,
+    ) -> Result<&'a P::Split, ConnectorError> {
         if handle.binding() != &self.binding {
             return Err(binding_error());
         }
         split_value(handle).ok_or_else(type_error)
+    }
+
+    /// Recover a provider transaction only through this adapter's exact binding.
+    pub fn transaction<'a>(
+        &self,
+        handle: &'a ConnectorReadTransactionHandle,
+    ) -> Result<&'a P::Transaction, ConnectorError> {
+        if handle.binding() != &self.binding {
+            return Err(binding_error());
+        }
+        transaction_value(handle).ok_or_else(type_error)
     }
 
     fn typed_constraint(
@@ -436,6 +477,14 @@ impl<P: ProviderReadRuntime> ReadRuntimeAdapter<P> {
 }
 
 impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
+    fn relation(
+        &self,
+        kind: ConnectorReadRelationKind,
+        table: ConnectorReadTableHandle,
+    ) -> Result<super::runtime::ConnectorReadRelation, ConnectorError> {
+        ReadRuntimeAdapter::relation(self, kind, table)
+    }
+
     fn get_table_handle(
         &self,
         session: &ConnectorSession,
@@ -839,14 +888,30 @@ impl<P: ProviderReadRuntime> ConnectorReadSystemTableProvider for AdapterSystemT
     }
 }
 
-impl<P: ProviderReadFactory> ConnectorReadProviderFactory for ReadRuntimeAdapter<P> {
+/// Combines a provider-owned execution factory with the separately-owned
+/// metadata type adapter. It is constructed by the concrete connector's
+/// exact-key bundle factory and never exposed as a typed accessor to a role.
+pub struct ProviderReadFactoryAdapter<P: ProviderReadRuntime, F: ProviderReadFactory<P>> {
+    factory: Arc<F>,
+    adapter: ReadRuntimeAdapter<P>,
+}
+
+impl<P: ProviderReadRuntime, F: ProviderReadFactory<P>> ProviderReadFactoryAdapter<P, F> {
+    pub fn new(adapter: ReadRuntimeAdapter<P>, factory: Arc<F>) -> Self {
+        Self { factory, adapter }
+    }
+}
+
+impl<P: ProviderReadRuntime, F: ProviderReadFactory<P>> ConnectorReadProviderFactory
+    for ProviderReadFactoryAdapter<P, F>
+{
     fn create_page_source_provider(
         &self,
         request: &ConnectorRequestContext,
     ) -> Result<Arc<dyn ConnectorReadPageSourceProvider>, ConnectorError> {
         Ok(Arc::new(AdapterPageSourceProvider {
-            provider: self.provider.create_page_source_provider(request)?,
-            adapter: self.clone(),
+            provider: self.factory.create_page_source_provider(request)?,
+            adapter: ReadRuntimeAdapter::clone(&self.adapter),
         }))
     }
 
@@ -855,8 +920,8 @@ impl<P: ProviderReadFactory> ConnectorReadProviderFactory for ReadRuntimeAdapter
         request: &ConnectorRequestContext,
     ) -> Result<Arc<dyn ConnectorReadSystemTableProvider>, ConnectorError> {
         Ok(Arc::new(AdapterSystemTableProvider {
-            provider: self.provider.create_system_table_provider(request)?,
-            adapter: self.clone(),
+            provider: self.factory.create_system_table_provider(request)?,
+            adapter: ReadRuntimeAdapter::clone(&self.adapter),
         }))
     }
 }
@@ -875,10 +940,13 @@ mod tests {
     struct Table;
     #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
     struct Column(u8);
+    #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct WrongColumn;
     #[derive(Debug)]
     struct Split;
 
     impl ColumnHandle for Column {}
+    impl ColumnHandle for WrongColumn {}
     impl ConnectorSplit for Split {
         fn retained_size_in_bytes(&self) -> u64 {
             0
@@ -914,9 +982,7 @@ mod tests {
             ConnectorInstanceIncarnation::from_bytes([3; 16])
         }
 
-        fn column_identity(&self, column: &Self::Column) -> Vec<u8> {
-            vec![column.0]
-        }
+        fn transaction(&self) -> Self::Transaction {}
     }
 
     struct BadFilter {
@@ -1016,11 +1082,7 @@ mod tests {
     ) {
         let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
         let valid = adapter.wrap_column(Column(1));
-        let bad = column_handle(
-            adapter.binding().clone(),
-            Arc::<[u8]>::from(vec![9]),
-            "wrong concrete column type".to_owned(),
-        );
+        let bad = column_handle(adapter.binding().clone(), WrongColumn);
         let filter: Arc<ConnectorReadDynamicFilter> = Arc::new(BadFilter {
             covered: BTreeSet::from([valid]),
             bad,
@@ -1028,6 +1090,21 @@ mod tests {
         let table = adapter.wrap_table(Table);
         let split = adapter.wrap_split(Split);
         (adapter, filter, table, split)
+    }
+
+    #[test]
+    fn relation_freezes_the_provider_transaction_without_exposing_payloads() {
+        let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let relation = adapter
+            .relation(ConnectorReadRelationKind::Table, adapter.wrap_table(Table))
+            .expect("same-binding table forms a relation");
+        assert_eq!(relation.kind(), ConnectorReadRelationKind::Table);
+        assert_eq!(
+            adapter
+                .transaction(relation.transaction())
+                .expect("transaction"),
+            &()
+        );
     }
 
     #[test]

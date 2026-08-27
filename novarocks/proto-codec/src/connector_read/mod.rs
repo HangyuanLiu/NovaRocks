@@ -39,8 +39,9 @@ pub use predicate::{
     encode_connector_expression, encode_tuple_domain,
 };
 pub use runtime_codec::{
-    ConnectorReadCodec, ConnectorReadCodecError, DecodedConnectorReadScan,
-    DecodedScheduledReadSplit, ReceivedScheduledSplitEvidence,
+    ConnectorReadCodec, ConnectorReadCodecError, ConnectorReadExecutionBundle,
+    ConnectorReadExecutionBundleFactory, DecodedConnectorReadScan, DecodedScheduledReadSplit,
+    ReceivedScheduledSplitEvidence,
 };
 pub use scan::{ConnectorTableScanSource, DynamicFilterBinding, ScanAssignment, ScanWorkSource};
 pub use split::{SplitCategory, ValidatedConnectorSplit};

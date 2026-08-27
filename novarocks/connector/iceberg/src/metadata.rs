@@ -23,11 +23,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU64;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use bytes::Bytes;
+use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
@@ -76,12 +77,37 @@ use novarocks_spi::connector::{
     CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY as HIDDEN_COLUMNS_PROPERTY,
 };
 
+/// Owns the frontend-local read registration for one Iceberg generation.
+///
+/// The registry sees only a weak edge.  Every clone of `IcebergMetadata`
+/// shares this owner, including the metadata/planning instances that cross a
+/// control binding's `into_parts` boundary, so the exact registry slot lives
+/// for precisely as long as this generation's control capabilities do.
+struct GenerationOwner {
+    registration_lease: OnceLock<Arc<dyn ConnectorReadRegistrationLease>>,
+}
+
+impl GenerationOwner {
+    fn install(
+        &self,
+        lease: Arc<dyn ConnectorReadRegistrationLease>,
+    ) -> Result<(), ConnectorError> {
+        self.registration_lease.set(lease).map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "Iceberg generation read registration lease was installed twice",
+            )
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct IcebergMetadata {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
     binding_key: ConnectorExecutionBindingKey,
     runtime: Arc<IcebergMetadataContext>,
+    generation_owner: Arc<GenerationOwner>,
 }
 
 impl IcebergMetadata {
@@ -99,6 +125,9 @@ impl IcebergMetadata {
             incarnation,
             binding_key,
             runtime,
+            generation_owner: Arc::new(GenerationOwner {
+                registration_lease: OnceLock::new(),
+            }),
         }
     }
 
@@ -112,6 +141,17 @@ impl IcebergMetadata {
 
     pub(crate) fn runtime(&self) -> &Arc<IcebergMetadataContext> {
         &self.runtime
+    }
+
+    /// Retain the exact frontend registration only after the caller has
+    /// assembled and validated the complete control binding.  The strong edge
+    /// remains private to this provider generation; roles retain weak edges
+    /// and have no authority to renew or retire it.
+    pub(crate) fn install_read_registration_lease(
+        &self,
+        lease: Arc<dyn ConnectorReadRegistrationLease>,
+    ) -> Result<(), ConnectorError> {
+        self.generation_owner.install(lease)
     }
 
     pub(crate) fn validate_context(

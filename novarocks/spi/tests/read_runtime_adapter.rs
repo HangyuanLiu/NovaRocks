@@ -91,9 +91,7 @@ where
         self.incarnation
     }
 
-    fn column_identity(&self, column: &Self::Column) -> Vec<u8> {
-        format!("{column:?}").into_bytes()
-    }
+    fn transaction(&self) -> Self::Transaction {}
 }
 
 #[derive(Debug)]

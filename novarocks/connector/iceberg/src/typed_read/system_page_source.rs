@@ -2767,6 +2767,43 @@ impl TypedConnectorSystemTableProvider for IcebergSystemTableProvider {
     }
 }
 
+impl<P> novarocks_spi::connector::read_stack::adapter::ProviderReadSystemTableProvider<P>
+    for IcebergSystemTableProvider
+where
+    P: novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime<
+            Table = crate::typed_read::IcebergRuntimeRelation,
+            Column = IcebergColumnHandle,
+            Transaction = crate::typed_read::HiveTransactionHandle,
+            Split = crate::typed_read::IcebergReadSplit,
+        >,
+{
+    fn create_system_page_source(
+        &self,
+        _session: &ConnectorSession,
+        table: &crate::typed_read::IcebergRuntimeRelation,
+        columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
+    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+        let crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) = table else {
+            return Err(invalid(
+                "an iceberg system page source reads a system relation, not another relation",
+            ));
+        };
+        let columns = columns
+            .iter()
+            .map(|assignment| assignment.column().clone())
+            .collect::<Vec<_>>();
+        match reference.system_table_type().execution() {
+            IcebergSystemTableExecution::SingleBackendDirectPageSource => {
+                self.create_single_backend_page_source(reference, &columns)
+            }
+            IcebergSystemTableExecution::DistributedSplits => Err(invalid(format!(
+                "iceberg {} is scheduled through a split source, not the direct system page source",
+                reference.system_table_type().suffix()
+            ))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

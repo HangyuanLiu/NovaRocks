@@ -17,7 +17,10 @@
 
 //! Backend-local ingress contracts for native fragment control.
 
+use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use novarocks_proto_codec::connector::AdmittedConnectorExecutionDeclaration;
 use novarocks_proto_codec::provider::{
@@ -25,6 +28,97 @@ use novarocks_proto_codec::provider::{
 };
 use novarocks_spi::connector::ConnectorExecutionBindingKey;
 use novarocks_types::{QueryExecutionId, QueryId, UniqueId};
+
+/// A split received by this backend after the exact binding codec recovered
+/// its provider-private SPI payload.  Replay compares the separately retained
+/// received canonical bytes; it never re-encodes an internal split.
+#[derive(Clone, Debug)]
+pub(crate) struct ReceivedReadSplit {
+    evidence: novarocks_proto_codec::connector_read::ReceivedScheduledSplitEvidence,
+    split: novarocks_spi::connector::read_stack::ConnectorReadSplit,
+}
+
+impl ReceivedReadSplit {
+    pub(crate) const fn new(
+        evidence: novarocks_proto_codec::connector_read::ReceivedScheduledSplitEvidence,
+        split: novarocks_spi::connector::read_stack::ConnectorReadSplit,
+    ) -> Self {
+        Self { evidence, split }
+    }
+
+    pub(crate) const fn split(&self) -> &novarocks_spi::connector::read_stack::ConnectorReadSplit {
+        &self.split
+    }
+}
+
+impl novarocks_execution::connector::ScheduledSplitFacts for ReceivedReadSplit {
+    fn sequence_id(&self) -> u64 {
+        self.evidence.sequence_id()
+    }
+
+    fn plan_node_id(&self) -> i32 {
+        self.evidence.plan_node_id()
+    }
+
+    fn canonical_bytes(&self) -> &[u8] {
+        self.evidence.canonical_bytes()
+    }
+
+    fn retained_size_in_bytes(&self) -> u64 {
+        self.split
+            .facts()
+            .retained_size_in_bytes()
+            .saturating_add(self.evidence.canonical_bytes().len() as u64)
+    }
+}
+
+/// Provisional per-attempt read contexts collected while the fragment plan is
+/// decoded. They become visible to TaskUpdate only after the existing fragment
+/// admission/registration path succeeds.
+pub(crate) struct TypedReadAttemptContext {
+    entries: Mutex<BTreeMap<i32, crate::connector::typed_registry::InstalledReadExecution>>,
+    published: AtomicBool,
+}
+
+impl TypedReadAttemptContext {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Mutex::new(BTreeMap::new()),
+            published: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn register(
+        &self,
+        plan_node_id: i32,
+        execution: crate::connector::typed_registry::InstalledReadExecution,
+    ) -> Result<(), String> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| "typed read context lock poisoned")?;
+        if entries.insert(plan_node_id, execution).is_some() {
+            return Err(format!(
+                "duplicate typed read execution for plan node {plan_node_id}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish(&self) {
+        self.published.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn resolve(
+        &self,
+        plan_node_id: i32,
+    ) -> Option<crate::connector::typed_registry::InstalledReadExecution> {
+        if !self.published.load(Ordering::Acquire) {
+            return None;
+        }
+        self.entries.lock().ok()?.get(&plan_node_id).cloned()
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(

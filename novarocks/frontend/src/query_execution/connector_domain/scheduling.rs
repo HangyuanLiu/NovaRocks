@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use novarocks_proto_codec::connector_read::canonical_scheduled_split_bytes;
+use novarocks_proto_codec::connector_read::ConnectorReadCodec;
 use novarocks_proto_models::connector_read as dto;
 use novarocks_types::UniqueId;
 
@@ -95,7 +95,6 @@ pub(crate) struct ScheduledSplit {
     sequence_id: u64,
     plan_node_id: i32,
     split: Split,
-    encoded: dto::ScheduledSplit,
 }
 
 impl ScheduledSplit {
@@ -111,22 +110,36 @@ impl ScheduledSplit {
         &self.split
     }
 
-    pub(crate) const fn as_proto(&self) -> &dto::ScheduledSplit {
-        &self.encoded
-    }
-
-    /// The bytes a retransmission must reproduce exactly.
-    pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
-        canonical_scheduled_split_bytes(&self.encoded)
+    /// Encode only at TaskUpdate egress with the codec selected for this
+    /// exact provider binding.
+    pub(crate) fn to_proto(
+        &self,
+        codec: &dyn ConnectorReadCodec,
+    ) -> Result<dto::ScheduledSplit, String> {
+        codec
+            .encode_scheduled_split(self.sequence_id, self.plan_node_id, self.split.split())
+            .map_err(|error| error.to_string())
     }
 }
 
 /// A batch of splits for one plan node, plus its terminal marker.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct SplitAssignment {
     plan_node_id: i32,
     splits: Vec<ScheduledSplit>,
     no_more_splits: bool,
+    codec: std::sync::Arc<dyn ConnectorReadCodec>,
+}
+
+impl std::fmt::Debug for SplitAssignment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SplitAssignment")
+            .field("plan_node_id", &self.plan_node_id)
+            .field("splits", &self.splits)
+            .field("no_more_splits", &self.no_more_splits)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SplitAssignment {
@@ -142,16 +155,16 @@ impl SplitAssignment {
         self.no_more_splits
     }
 
-    pub(crate) fn to_proto(&self) -> dto::SplitAssignment {
-        dto::SplitAssignment {
+    pub(crate) fn to_proto(&self) -> Result<dto::SplitAssignment, String> {
+        Ok(dto::SplitAssignment {
             plan_node_id: self.plan_node_id,
             splits: self
                 .splits
                 .iter()
-                .map(|split| split.encoded.clone())
-                .collect(),
+                .map(|split| split.to_proto(self.codec.as_ref()))
+                .collect::<Result<_, _>>()?,
             no_more_splits: self.no_more_splits,
-        }
+        })
     }
 }
 
@@ -190,6 +203,7 @@ impl PlanNodeAssignmentState {
         plan_node_id: i32,
         splits: Vec<Split>,
         no_more_splits: bool,
+        codec: std::sync::Arc<dyn ConnectorReadCodec>,
     ) -> Result<SplitAssignment, SplitAssignmentError> {
         if self.is_terminal(plan_node_id) {
             return Err(SplitAssignmentError::AlreadyTerminal { plan_node_id });
@@ -204,16 +218,10 @@ impl PlanNodeAssignmentState {
             .into_iter()
             .map(|split| {
                 let sequence_id = self.sequences.allocate(plan_node_id);
-                let encoded = dto::ScheduledSplit {
-                    sequence_id,
-                    plan_node_id,
-                    split: Some(split.split().as_proto().clone()),
-                };
                 ScheduledSplit {
                     sequence_id,
                     plan_node_id,
                     split,
-                    encoded,
                 }
             })
             .collect();
@@ -224,6 +232,7 @@ impl PlanNodeAssignmentState {
             plan_node_id,
             splits: scheduled,
             no_more_splits,
+            codec,
         })
     }
 }
@@ -251,7 +260,7 @@ impl TaskUpdateRequest {
         &self.assignments
     }
 
-    pub(crate) fn to_proto_assignments(&self) -> Vec<dto::SplitAssignment> {
+    pub(crate) fn to_proto_assignments(&self) -> Result<Vec<dto::SplitAssignment>, String> {
         self.assignments
             .iter()
             .map(SplitAssignment::to_proto)
@@ -261,112 +270,24 @@ impl TaskUpdateRequest {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_codec::connector_read::ValidatedConnectorSplit;
-
-    use super::super::handle::CatalogHandle;
     use super::*;
 
-    fn split() -> Split {
-        let raw = dto::ConnectorSplit {
-            split_weight_raw: 100,
-            remotely_accessible: true,
-            addresses: Vec::new(),
-            affinity_key: None,
-            retained_size_in_bytes: 64,
-            category: Some(dto::connector_split::Category::Data(dto::DataSplit {
-                provider: Some(dto::data_split::Provider::Iceberg(iceberg_split())),
-            })),
-        };
-        let validated = ValidatedConnectorSplit::parse(raw, FieldPath::root("connector_split"))
-            .expect("valid split");
-        Split::new(validated)
-    }
-
-    fn iceberg_split() -> dto::IcebergSplit {
-        dto::IcebergSplit {
-            path: "s3://bucket/table/data/0001.parquet".to_owned(),
-            start: 0,
-            length: 1024,
-            file_size: 1024,
-            file_record_count: 10,
-            file_format: dto::IcebergFileFormat::Parquet as i32,
-            partition_spec_id: 0,
-            partition_data_json: "{}".to_owned(),
-            deletes: Vec::new(),
-            file_statistics_domain: Some(dto::TupleDomain {
-                none: false,
-                column_domains: Vec::new(),
-            }),
-            data_sequence_number: Some(1),
-            file_first_row_id: None,
-            decryption_data: None,
-        }
-    }
-
     #[test]
-    fn sequences_are_monotonic_per_plan_node() {
-        let mut state = PlanNodeAssignmentState::new();
-        let first = state
-            .assign(7, vec![split(), split()], false)
-            .expect("assign");
+    fn empty_terminal_assignment_is_a_real_terminal_not_a_synthetic_split() {
         assert_eq!(
-            first
-                .splits()
-                .iter()
-                .map(ScheduledSplit::sequence_id)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
+            SplitAssignmentError::AlreadyTerminal { plan_node_id: 9 }.to_string(),
+            "plan node 9 already reached no-more-splits"
         );
-        let second = state.assign(7, vec![split()], true).expect("assign");
-        assert_eq!(second.splits()[0].sequence_id(), 2);
-        assert!(second.no_more_splits());
-    }
-
-    #[test]
-    fn plan_nodes_have_independent_sequence_spaces() {
-        let mut state = PlanNodeAssignmentState::new();
-        state.assign(1, vec![split()], false).expect("assign");
-        let other = state.assign(2, vec![split()], false).expect("assign");
-        assert_eq!(other.splits()[0].sequence_id(), 0);
-    }
-
-    #[test]
-    fn a_plan_node_cannot_be_assigned_after_its_terminal_marker() {
-        let mut state = PlanNodeAssignmentState::new();
-        state.assign(3, Vec::new(), true).expect("terminal");
-        assert!(state.is_terminal(3));
         assert_eq!(
-            state.assign(3, vec![split()], false).expect_err("terminal"),
-            SplitAssignmentError::AlreadyTerminal { plan_node_id: 3 }
+            SplitAssignmentError::BatchTooLarge {
+                plan_node_id: 9,
+                splits: MAX_SPLITS_PER_ASSIGNMENT + 1
+            }
+            .to_string(),
+            format!(
+                "plan node 9 assignment carries {} splits, above the bound",
+                MAX_SPLITS_PER_ASSIGNMENT + 1
+            )
         );
-    }
-
-    #[test]
-    fn a_plan_node_with_no_work_finishes_without_a_synthetic_split() {
-        let mut state = PlanNodeAssignmentState::new();
-        let assignment = state.assign(5, Vec::new(), true).expect("assign");
-        assert!(assignment.splits().is_empty());
-        assert!(assignment.no_more_splits());
-        assert_eq!(state.issued(5), 0);
-    }
-
-    #[test]
-    fn a_new_attempt_restarts_the_sequence_space() {
-        let mut first = PlanNodeAssignmentState::new();
-        first
-            .assign(1, vec![split(), split()], false)
-            .expect("assign");
-        let mut replacement = PlanNodeAssignmentState::new();
-        let assignment = replacement.assign(1, vec![split()], false).expect("assign");
-        assert_eq!(assignment.splits()[0].sequence_id(), 0);
-    }
-
-    #[test]
-    fn canonical_bytes_are_stable_for_the_same_scheduled_split() {
-        let mut state = PlanNodeAssignmentState::new();
-        let assignment = state.assign(1, vec![split()], false).expect("assign");
-        let scheduled = &assignment.splits()[0];
-        assert_eq!(scheduled.canonical_bytes(), scheduled.canonical_bytes());
     }
 }

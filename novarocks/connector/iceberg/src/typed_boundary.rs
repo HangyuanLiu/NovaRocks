@@ -54,6 +54,10 @@ use novarocks_proto_codec::connector_read::{
     encode_tuple_domain as encode_wire_tuple_domain,
 };
 use novarocks_proto_models::connector_read as dto;
+use novarocks_spi::connector::read_stack::adapter::{
+    ProviderReadColumnBinding, ProviderReadFilterApplication, ProviderReadLimitApplication,
+    ProviderReadRuntime, ProviderReadSplitSource, ProviderReadSystemTablePlan,
+};
 use novarocks_spi::connector::read_stack::{
     Assignment, Bound, ConnectorExpression, ConnectorSession, ConnectorSplitBatch,
     ConnectorSplitSource, ConnectorTableHandle as _, ConnectorValue, Constraint, Domain,
@@ -148,6 +152,46 @@ pub enum IcebergSystemRelation {
 }
 
 impl IcebergSystemRelation {
+    /// The internal planning representation.  Unlike `worker_plan`, this
+    /// never crosses the wire codec boundary.
+    const fn runtime_worker_plan(
+        self,
+    ) -> (
+        crate::typed_read::IcebergSystemTableType,
+        SystemTableDistribution,
+    ) {
+        match self {
+            Self::Files => (
+                crate::typed_read::IcebergSystemTableType::Files,
+                SystemTableDistribution::AllNodes,
+            ),
+            Self::Entries => (
+                crate::typed_read::IcebergSystemTableType::Entries,
+                SystemTableDistribution::SingleCoordinator,
+            ),
+            Self::Snapshots => (
+                crate::typed_read::IcebergSystemTableType::Snapshots,
+                SystemTableDistribution::SingleCoordinator,
+            ),
+            Self::History => (
+                crate::typed_read::IcebergSystemTableType::History,
+                SystemTableDistribution::SingleCoordinator,
+            ),
+            Self::Refs => (
+                crate::typed_read::IcebergSystemTableType::Refs,
+                SystemTableDistribution::SingleCoordinator,
+            ),
+            Self::Manifests => (
+                crate::typed_read::IcebergSystemTableType::Manifests,
+                SystemTableDistribution::SingleCoordinator,
+            ),
+            Self::Partitions => (
+                crate::typed_read::IcebergSystemTableType::Partitions,
+                SystemTableDistribution::SingleCoordinator,
+            ),
+        }
+    }
+
     /// How a worker is told to read this relation, when a worker can.
     ///
     /// FILES is distributed because it walks every manifest of the snapshot,
@@ -243,6 +287,15 @@ impl IcebergTypedBoundary {
 
     pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
         self.incarnation
+    }
+
+    /// Build the provider-only bridge retained by an exact role installation.
+    /// Roles receive its SPI trait objects, never this adapter or its concrete
+    /// Iceberg payload accessors.
+    pub fn read_runtime_adapter(
+        self: Arc<Self>,
+    ) -> novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter<Self> {
+        novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter::new(self)
     }
 
     /// Load one relation, distinguishing absence from a control-plane failure.
@@ -928,6 +981,482 @@ impl std::fmt::Debug for IcebergTypedBoundary {
     }
 }
 
+/// The provider type family is entirely Iceberg-owned.  The generic SPI
+/// adapter stores these values behind opaque handles; it is intentionally the
+/// codec, rather than an FE or BE role, that can recover them again.
+impl ProviderReadRuntime for IcebergTypedBoundary {
+    type Table = crate::typed_read::IcebergRuntimeRelation;
+    type Column = IcebergColumnHandle;
+    type Transaction = HiveTransactionHandle;
+    type Split = crate::typed_read::IcebergReadSplit;
+
+    fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+        &self.descriptor
+    }
+
+    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        self.incarnation
+    }
+
+    fn transaction(&self) -> Self::Transaction {
+        self.transaction.clone()
+    }
+}
+
+impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for IcebergTypedBoundary {
+    fn get_table_handle(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+        version: novarocks_spi::connector::read_stack::ConnectorReadRelationVersion,
+        reference: Option<&str>,
+    ) -> Result<Option<crate::typed_read::IcebergRuntimeRelation>, ConnectorError> {
+        if system_relation_of(name.table_name()).is_some() {
+            return Ok(None);
+        }
+        let Some(physical) = self.load_relation(name)? else {
+            return Ok(None);
+        };
+        let version = match version {
+            novarocks_spi::connector::read_stack::ConnectorReadRelationVersion::Current => {
+                TypedRelationVersion::Current
+            }
+            novarocks_spi::connector::read_stack::ConnectorReadRelationVersion::SnapshotId(id) => {
+                TypedRelationVersion::SnapshotId(id)
+            }
+            novarocks_spi::connector::read_stack::ConnectorReadRelationVersion::Reference => {
+                TypedRelationVersion::Reference
+            }
+        };
+        Ok(Some(crate::typed_read::IcebergRuntimeRelation::Table(
+            table_handle_for_version(name, physical.table.metadata(), version, reference)?,
+        )))
+    }
+
+    fn get_pinned_file_set_handle(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+        pinned: &ConnectorPinnedFileSet,
+    ) -> Result<Option<crate::typed_read::IcebergRuntimeRelation>, ConnectorError> {
+        if system_relation_of(name.table_name()).is_some() {
+            return Ok(None);
+        }
+        let Some(physical) = self.load_relation(name)? else {
+            return Ok(None);
+        };
+        let metadata = physical.table.metadata();
+        let snapshot_id = pinned.version_ordinal();
+        if metadata.snapshot_by_id(snapshot_id).is_none() {
+            return Err(corrupt(format!(
+                "iceberg relation {}.{} no longer holds snapshot {snapshot_id}, which a pinned read was frozen at",
+                name.schema_name(),
+                name.table_name()
+            )));
+        }
+        let files = IcebergPinnedDataFileSet::try_new(pinned.files())?;
+        if files.len() != pinned.files().len() {
+            return Err(invalid(
+                "iceberg pinned read was offered the same data file more than once",
+            ));
+        }
+        Ok(Some(crate::typed_read::IcebergRuntimeRelation::Table(
+            pinned_table_handle_with_files(name, metadata, Some(snapshot_id), Some(files))?,
+        )))
+    }
+
+    fn get_column_bindings(
+        &self,
+        _session: &ConnectorSession,
+        table: &crate::typed_read::IcebergRuntimeRelation,
+    ) -> Result<Vec<ProviderReadColumnBinding<IcebergColumnHandle>>, ConnectorError> {
+        let columns: Vec<(String, IcebergColumnHandle, bool)> = match table {
+            crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => handle
+                .columns()
+                .iter()
+                .cloned()
+                .map(|column| {
+                    (
+                        column.base_column_identity().name().to_string(),
+                        column,
+                        false,
+                    )
+                })
+                .collect(),
+            crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
+                let metadata = self.system_relation_metadata(reference)?;
+                system_relation_columns(
+                    reference.system_table_type(),
+                    metadata.current_schema(),
+                    &partition_specs_of(&metadata),
+                )?
+                .into_iter()
+                .map(|column| {
+                    (
+                        column.base_column_identity().name().to_string(),
+                        column,
+                        false,
+                    )
+                })
+                .collect()
+            }
+            crate::typed_read::IcebergRuntimeRelation::TableExecute(handle) => {
+                let mut columns = Vec::new();
+                match handle.procedure_handle() {
+                    Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_)) => {
+                        for (name, metadata) in REWRITE_POSITION_DELETE_OUTPUT_COLUMNS {
+                            columns.push((
+                                name.to_string(),
+                                rewrite_position_delete_pseudo_column(name, metadata)?,
+                                true,
+                            ));
+                        }
+                    }
+                    Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => {
+                        return Err(unsupported(
+                            "an iceberg optimize procedure reads the data relation's own columns",
+                        ));
+                    }
+                }
+                columns
+            }
+            crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
+                let schema = handle.parse_table_schema()?;
+                let mut columns = Vec::new();
+                for field in schema.as_struct().fields() {
+                    columns.push((
+                        field.name.to_string(),
+                        IcebergColumnHandle::base_column(field.as_ref())?,
+                        false,
+                    ));
+                }
+                for (name, column) in
+                    metadata_pseudo_columns(self.relation_has_row_lineage(handle)?)?
+                {
+                    columns.push((name.to_string(), column, true));
+                }
+                columns
+            }
+            crate::typed_read::IcebergRuntimeRelation::TableFunction(_) => {
+                return Err(unsupported(
+                    "an iceberg table-function relation has no data table handle",
+                ));
+            }
+            crate::typed_read::IcebergRuntimeRelation::MergeTable(_) => {
+                return Err(unsupported(
+                    "an iceberg merge relation has no data table handle",
+                ));
+            }
+        };
+        Ok(columns
+            .into_iter()
+            .map(|(name, column, hidden)| ProviderReadColumnBinding::new(name, column, hidden))
+            .collect())
+    }
+
+    fn apply_filter(
+        &self,
+        _session: &ConnectorSession,
+        table: &crate::typed_read::IcebergRuntimeRelation,
+        constraint: &Constraint<IcebergColumnHandle>,
+    ) -> Result<Option<ProviderReadFilterApplication<Self::Table, Self::Column>>, ConnectorError>
+    {
+        let crate::typed_read::IcebergRuntimeRelation::Table(handle) = table else {
+            return Ok(None);
+        };
+        if !handle.accepts_pushdown() {
+            return Ok(None);
+        }
+        let applied = handle.apply_filter(constraint)?;
+        if applied.handle() == handle {
+            return Ok(None);
+        }
+        let remaining_expression = applied.remaining_expression().cloned();
+        let remaining_constraint = Constraint::try_new(
+            applied.remaining_filter().clone(),
+            remaining_expression
+                .clone()
+                .unwrap_or_else(ConnectorExpression::constant_true),
+            constraint.assignments().clone(),
+        )?;
+        Ok(Some(ProviderReadFilterApplication::new(
+            crate::typed_read::IcebergRuntimeRelation::Table(applied.into_handle()),
+            remaining_constraint,
+            remaining_expression,
+        )))
+    }
+
+    fn apply_projection(
+        &self,
+        _session: &ConnectorSession,
+        table: &crate::typed_read::IcebergRuntimeRelation,
+        assignments: &[Assignment<IcebergColumnHandle>],
+    ) -> Result<Option<Self::Table>, ConnectorError> {
+        let crate::typed_read::IcebergRuntimeRelation::Table(handle) = table else {
+            return Ok(None);
+        };
+        let applied =
+            handle.apply_projection(&OrderedAssignments::try_new(assignments.to_vec())?)?;
+        if applied.handle() == handle {
+            return Ok(None);
+        }
+        Ok(Some(crate::typed_read::IcebergRuntimeRelation::Table(
+            applied.into_handle(),
+        )))
+    }
+
+    fn apply_limit(
+        &self,
+        _session: &ConnectorSession,
+        table: &crate::typed_read::IcebergRuntimeRelation,
+        limit: u64,
+    ) -> Result<Option<ProviderReadLimitApplication<Self::Table>>, ConnectorError> {
+        let crate::typed_read::IcebergRuntimeRelation::Table(handle) = table else {
+            return Ok(None);
+        };
+        if !handle.accepts_pushdown() {
+            return Ok(None);
+        }
+        let applied = handle.apply_limit(limit)?;
+        if applied.handle() == handle {
+            return Ok(None);
+        }
+        let guaranteed = applied.limit_guaranteed();
+        Ok(Some(ProviderReadLimitApplication::new(
+            crate::typed_read::IcebergRuntimeRelation::Table(applied.into_handle()),
+            guaranteed,
+        )))
+    }
+
+    fn get_system_table_plan(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+    ) -> Result<Option<ProviderReadSystemTablePlan<Self::Table>>, ConnectorError> {
+        let Some((base_table, relation)) = system_relation_of(name.table_name()) else {
+            return Ok(None);
+        };
+        let (system_table_type, distribution) = relation.runtime_worker_plan();
+        let base_name = SchemaTableName::try_new(name.schema_name(), &base_table)?;
+        let Some(physical) = self.load_relation(&base_name)? else {
+            return Ok(None);
+        };
+        let metadata = physical.table.metadata();
+        let reference = IcebergSystemTableReference::try_new(
+            crate::typed_read::IcebergSystemTableReferenceParams {
+                schema_table_name: base_name,
+                system_table_type,
+                metadata_file_location: physical
+                    .table
+                    .metadata_location()
+                    .ok_or_else(|| {
+                        corrupt(format!(
+                            "iceberg relation {}.{base_table} has no metadata file location",
+                            name.schema_name()
+                        ))
+                    })?
+                    .to_string(),
+                table_uuid: metadata.uuid().to_string(),
+                snapshot_id: metadata.current_snapshot_id(),
+            },
+        )?;
+        Ok(Some(ProviderReadSystemTablePlan::new(
+            crate::typed_read::IcebergRuntimeRelation::SystemTable(reference),
+            distribution,
+        )))
+    }
+
+    fn get_change_window_plan(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+        window: novarocks_spi::connector::read_stack::ConnectorReadChangeWindow,
+    ) -> Result<Option<Self::Table>, ConnectorError> {
+        if system_relation_of(name.table_name()).is_some() {
+            return Ok(None);
+        }
+        let Some(physical) = self.load_relation(name)? else {
+            return Ok(None);
+        };
+        let window = TypedChangeWindow::new(window.from_snapshot_id(), window.to_snapshot_id());
+        Ok(
+            pinned_change_window_handle(name, physical.table.metadata(), window)?
+                .map(crate::typed_read::IcebergRuntimeRelation::ChangeWindow),
+        )
+    }
+
+    fn get_table_execute_plan(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+        procedure: novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure,
+    ) -> Result<Option<Self::Table>, ConnectorError> {
+        let novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(group) = procedure;
+        // Reuse the existing frozen-artifact construction, but retain the
+        // resulting concrete handle instead of encoding it into a carrier.
+        if system_relation_of(name.table_name()).is_some() {
+            return Ok(None);
+        }
+        let Some(physical) = self.load_relation(name)? else {
+            return Ok(None);
+        };
+        let metadata = physical.table.metadata();
+        let loaded = crate::distributed_rewrite::load_frozen_rewrite_group(
+            &self.runtime,
+            physical.table.file_io(),
+            &crate::distributed_rewrite::IcebergRewriteGroupPayloadV1 {
+                version: crate::distributed_rewrite::GROUP_PAYLOAD_VERSION,
+                group_digest_hex: group.group_digest_hex().to_string(),
+                artifact_digest_hex: group.artifact_digest_hex().to_string(),
+                artifact_location: group.artifact_location().to_string(),
+            },
+        )?;
+        let snapshot_id =
+            validate_rewrite_position_delete_artifact(name, metadata, &loaded.artifact)?;
+        let table_handle = pinned_table_handle(name, metadata, Some(snapshot_id))?;
+        let procedure_handle = IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(
+            IcebergRewritePositionDeleteFilesHandle::try_new(
+                table_handle.clone(),
+                IcebergRewriteArtifactContentId::try_new(
+                    group.artifact_location(),
+                    group.artifact_digest_hex(),
+                )?,
+                group.group_digest_hex(),
+            )?,
+        );
+        Ok(Some(
+            crate::typed_read::IcebergRuntimeRelation::TableExecute(
+                IcebergTableExecuteHandle::try_new(IcebergTableExecuteHandleParams {
+                    schema_table_name: name.clone(),
+                    procedure_id: procedure_handle.procedure_id(),
+                    table_location: table_handle.table_location().to_string(),
+                    procedure_handle: Some(procedure_handle),
+                })?,
+            ),
+        ))
+    }
+}
+
+impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
+    for IcebergTypedBoundary
+{
+    fn get_splits(
+        &self,
+        _session: &ConnectorSession,
+        table: &Self::Table,
+        columns: &[Assignment<IcebergColumnHandle>],
+        _dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
+        constraint: &Constraint<IcebergColumnHandle>,
+    ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
+        match table {
+            crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => {
+                return Ok(Box::new(IcebergRuntimeSplitSource::new(
+                    self.change_window_split_source(handle)?,
+                )));
+            }
+            crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
+                return self.system_relation_runtime_split_source(reference);
+            }
+            crate::typed_read::IcebergRuntimeRelation::TableExecute(handle) => {
+                return self.table_execute_runtime_split_source(handle);
+            }
+            crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
+                let enumeration_handle = if columns.is_empty() {
+                    handle.clone()
+                } else {
+                    handle
+                        .apply_projection(&OrderedAssignments::try_new(columns.to_vec())?)?
+                        .into_handle()
+                };
+                let files = match handle.snapshot_id() {
+                    None => Vec::new(),
+                    Some(snapshot_id) => {
+                        self.planned_files_runtime(handle, snapshot_id, constraint)?
+                    }
+                };
+                return Ok(Box::new(IcebergRuntimeSplitSource::new(
+                    IcebergSplitSource::try_new(
+                        &enumeration_handle,
+                        files,
+                        self.split_source_options,
+                    )?,
+                )));
+            }
+            crate::typed_read::IcebergRuntimeRelation::TableFunction(_) => {
+                return Err(unsupported(
+                    "iceberg table-function split enumeration is not implemented",
+                ));
+            }
+            crate::typed_read::IcebergRuntimeRelation::MergeTable(_) => {
+                return Err(unsupported(
+                    "iceberg merge split enumeration is not implemented",
+                ));
+            }
+        }
+    }
+}
+
+impl IcebergTypedBoundary {
+    fn planned_files_runtime(
+        &self,
+        handle: &IcebergTableHandle,
+        snapshot_id: i64,
+        constraint: &Constraint<IcebergColumnHandle>,
+    ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
+        let schema = handle.parse_table_schema()?;
+        let pinned = handle.pinned_data_files();
+        let predicates = if pinned.is_some() {
+            Vec::new()
+        } else {
+            let static_predicate = handle
+                .effective_predicate()?
+                .intersect(constraint.summary())?;
+            if static_predicate.is_none() {
+                return Ok(Vec::new());
+            }
+            physical_predicates(&static_predicate, &schema)
+        };
+        let physical = self.load_pinned_relation(handle.schema_table_name())?;
+        let table = physical.table.clone();
+        let (read_snapshot, facts) = self
+            .runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { plan_pinned_snapshot(table, snapshot_id).await })
+            .map_err(unavailable)?
+            .map_err(unavailable)?;
+        let mut planned = Vec::with_capacity(read_snapshot.files.len());
+        let mut pinned_seen = 0_usize;
+        for read_file in read_snapshot.files {
+            if let Some(pinned) = pinned {
+                if !pinned.contains(&read_file.path) {
+                    continue;
+                }
+                pinned_seen += 1;
+            } else if !predicates.is_empty()
+                && !file_may_satisfy_physical_predicates(
+                    &pruning_view(handle, &schema, &read_file)?,
+                    &predicates,
+                )
+            {
+                continue;
+            }
+            planned.push(planned_data_file(read_file, &facts)?);
+        }
+        if let Some(pinned) = pinned
+            && pinned_seen != pinned.len()
+        {
+            return Err(corrupt(format!(
+                "iceberg pinned read of {}.{} names {} data files but snapshot {snapshot_id} holds only {pinned_seen} of them",
+                handle.schema_table_name().schema_name(),
+                handle.schema_table_name().table_name(),
+                pinned.len(),
+            )));
+        }
+        Ok(planned)
+    }
+}
+
 impl TypedConnectorMetadata for IcebergTypedBoundary {
     fn get_table_handle(
         &self,
@@ -1517,6 +2046,245 @@ where
     fn close(&mut self) -> Result<(), ConnectorError> {
         self.closed = true;
         self.inner.close()
+    }
+}
+
+/// The transport-neutral split source used by the generic SPI adapter.
+///
+/// It retains the established Iceberg enumeration lifecycle, but returns the
+/// concrete split enum directly. Encoding happens only at the role's wire
+/// egress through `IcebergConnectorReadCodec`.
+#[derive(Debug)]
+struct IcebergRuntimeSplitSource<S> {
+    inner: S,
+    closed: bool,
+}
+
+impl<S> IcebergRuntimeSplitSource<S> {
+    const fn new(inner: S) -> Self {
+        Self {
+            inner,
+            closed: false,
+        }
+    }
+}
+
+impl<S> ProviderReadSplitSource<IcebergTypedBoundary> for IcebergRuntimeSplitSource<S>
+where
+    S: ConnectorSplitSource<Column = IcebergColumnHandle> + Send,
+    S::Split: IntoIcebergRuntimeSplit,
+{
+    fn next_batch(
+        &mut self,
+        max_size: usize,
+        dynamic_filter: &DynamicFilterSnapshot<IcebergColumnHandle>,
+    ) -> Result<ConnectorSplitBatch<crate::typed_read::IcebergReadSplit>, ConnectorError> {
+        if self.closed {
+            return Ok(ConnectorSplitBatch::finished());
+        }
+        let batch = self.inner.next_batch(max_size, dynamic_filter)?;
+        let no_more_splits = batch.no_more_splits();
+        Ok(ConnectorSplitBatch::new(
+            batch
+                .into_splits()
+                .into_iter()
+                .map(IntoIcebergRuntimeSplit::into_runtime_split)
+                .collect(),
+            no_more_splits,
+        ))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.closed || self.inner.is_finished()
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        self.closed = true;
+        self.inner.close()
+    }
+}
+
+trait IntoIcebergRuntimeSplit {
+    fn into_runtime_split(self) -> crate::typed_read::IcebergReadSplit;
+}
+
+impl IntoIcebergRuntimeSplit for IcebergSplit {
+    fn into_runtime_split(self) -> crate::typed_read::IcebergReadSplit {
+        crate::typed_read::IcebergReadSplit::Data(self)
+    }
+}
+
+impl IntoIcebergRuntimeSplit for IcebergChangeSplit {
+    fn into_runtime_split(self) -> crate::typed_read::IcebergReadSplit {
+        crate::typed_read::IcebergReadSplit::ChangeWindow(self)
+    }
+}
+
+impl IntoIcebergRuntimeSplit for FilesTableSplit {
+    fn into_runtime_split(self) -> crate::typed_read::IcebergReadSplit {
+        crate::typed_read::IcebergReadSplit::SystemFiles(self)
+    }
+}
+
+struct RuntimeUnsplitRelationSource;
+
+impl ProviderReadSplitSource<IcebergTypedBoundary> for RuntimeUnsplitRelationSource {
+    fn next_batch(
+        &mut self,
+        _max_size: usize,
+        _dynamic_filter: &DynamicFilterSnapshot<IcebergColumnHandle>,
+    ) -> Result<ConnectorSplitBatch<crate::typed_read::IcebergReadSplit>, ConnectorError> {
+        Ok(ConnectorSplitBatch::finished())
+    }
+
+    fn is_finished(&self) -> bool {
+        true
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        Ok(())
+    }
+}
+
+impl IcebergTypedBoundary {
+    fn system_relation_runtime_split_source(
+        &self,
+        reference: &IcebergSystemTableReference,
+    ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
+        if reference.system_table_type().execution()
+            != IcebergSystemTableExecution::DistributedSplits
+        {
+            return Ok(Box::new(RuntimeUnsplitRelationSource));
+        }
+        let metadata = self.system_relation_metadata(reference)?;
+        let specs = partition_specs_of(&metadata);
+        let table_schema = metadata.current_schema().as_ref().clone();
+        let mut partition_spec_jsons = BTreeMap::new();
+        for spec in &specs {
+            partition_spec_jsons.insert(
+                spec.spec_id(),
+                serde_json::to_string(spec).map_err(|error| {
+                    corrupt(format!(
+                        "iceberg partition spec is not serializable: {error}"
+                    ))
+                })?,
+            );
+        }
+        let source = FilesTableSplitSource::try_new(FilesTableSplitSourceParams {
+            manifests: self.pinned_snapshot_manifests(reference)?,
+            table_schema_json: serde_json::to_string(&table_schema).map_err(|error| {
+                corrupt(format!("iceberg table schema is not serializable: {error}"))
+            })?,
+            metadata_table_schema_json: files_relation_schema_json(&table_schema, &specs)?,
+            partition_spec_jsons,
+            partition_column_type_json: partition_row_type(&table_schema, &specs)?
+                .as_ref()
+                .map(derived_row_type_json)
+                .transpose()?,
+            bounds_column_type_json: bounds_row_type(&table_schema)?
+                .as_ref()
+                .map(derived_row_type_json)
+                .transpose()?,
+            encryption_key_id: None,
+            reference: reference.clone(),
+        })?;
+        Ok(Box::new(IcebergRuntimeSplitSource::new(source)))
+    }
+
+    fn table_execute_runtime_split_source(
+        &self,
+        handle: &IcebergTableExecuteHandle,
+    ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
+        let rewrite = match handle.procedure_handle() {
+            Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(rewrite)) => {
+                rewrite
+            }
+            Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => {
+                return Err(unsupported(
+                    "an iceberg optimize procedure reads data splits, not a table-execute relation",
+                ));
+            }
+        };
+        let table_handle = rewrite.table_handle();
+        let snapshot_id = table_handle.snapshot_id().ok_or_else(|| {
+            corrupt("an iceberg rewrite position delete relation carries no pinned snapshot")
+        })?;
+        let physical = self.load_pinned_relation(table_handle.schema_table_name())?;
+        let (data_file, selected) =
+            crate::distributed_rewrite::plan_rewrite_position_delete_splits(
+                &self.runtime,
+                &physical.table,
+                snapshot_id,
+                &crate::distributed_rewrite::IcebergRewriteGroupPayloadV1 {
+                    version: crate::distributed_rewrite::GROUP_PAYLOAD_VERSION,
+                    group_digest_hex: rewrite.group_digest_hex().to_string(),
+                    artifact_digest_hex: rewrite.artifact().artifact_digest_hex().to_string(),
+                    artifact_location: rewrite.artifact().artifact_location().to_string(),
+                },
+            )?;
+        let deletes = selected
+            .iter()
+            .map(rewrite_position_delete_file)
+            .collect::<Result<Vec<_>, _>>()?;
+        let split = IcebergRewritePositionDeleteFilesSplit::try_new(
+            IcebergRewritePositionDeleteFilesSplitParams {
+                data_file_path: data_file.path.clone(),
+                data_file_size: data_file.size,
+                partition_spec_id: data_file.partition_spec_id.ok_or_else(|| {
+                    corrupt(format!(
+                        "iceberg rewrite position delete data file {} records no partition spec",
+                        data_file.path
+                    ))
+                })?,
+                partition_data_json: data_file
+                    .partition_key
+                    .clone()
+                    .unwrap_or_else(|| UNPARTITIONED_REWRITE_PARTITION_JSON.to_string()),
+                selected_position_deletes: deletes,
+                split_weight: SplitWeight::STANDARD,
+            },
+        )?;
+        Ok(Box::new(OneRuntimeSplitSource::new(
+            crate::typed_read::IcebergReadSplit::RewritePositionDeleteFiles(split),
+        )))
+    }
+}
+
+struct OneRuntimeSplitSource {
+    split: Option<crate::typed_read::IcebergReadSplit>,
+    closed: bool,
+}
+
+impl OneRuntimeSplitSource {
+    const fn new(split: crate::typed_read::IcebergReadSplit) -> Self {
+        Self {
+            split: Some(split),
+            closed: false,
+        }
+    }
+}
+
+impl ProviderReadSplitSource<IcebergTypedBoundary> for OneRuntimeSplitSource {
+    fn next_batch(
+        &mut self,
+        _max_size: usize,
+        _dynamic_filter: &DynamicFilterSnapshot<IcebergColumnHandle>,
+    ) -> Result<ConnectorSplitBatch<crate::typed_read::IcebergReadSplit>, ConnectorError> {
+        if self.closed {
+            return Ok(ConnectorSplitBatch::finished());
+        }
+        let split = self.split.take().into_iter().collect();
+        Ok(ConnectorSplitBatch::new(split, true))
+    }
+
+    fn is_finished(&self) -> bool {
+        self.closed || self.split.is_none()
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        self.closed = true;
+        self.split = None;
+        Ok(())
     }
 }
 
@@ -2755,6 +3523,32 @@ mod tests {
         // not an invitation to resolve a later one.
         assert_eq!(concrete.snapshot_id(), None);
         assert!(concrete.parse_table_schema().is_ok());
+    }
+
+    #[test]
+    fn concrete_codec_round_trips_a_frozen_relation_without_replanning() {
+        let fixture = fixture();
+        fixture.create_table("db", "codec_relation", StdHashMap::new());
+        let wire = TypedConnectorMetadata::get_table_handle(
+            &fixture.boundary,
+            &session(),
+            &name("db", "codec_relation"),
+            TypedRelationVersion::Current,
+            None,
+        )
+        .expect("get relation")
+        .expect("relation exists");
+        let adapter = StdArc::new(fixture.boundary.clone()).read_runtime_adapter();
+        let codec = crate::typed_read::IcebergConnectorReadCodec::new(adapter);
+        let relation = novarocks_proto_codec::connector_read::ConnectorReadCodec::decode_relation(
+            &codec, &wire,
+        )
+        .expect("decode relation");
+        let encoded = novarocks_proto_codec::connector_read::ConnectorReadCodec::encode_relation(
+            &codec, &relation,
+        )
+        .expect("encode relation");
+        assert_eq!(encoded, wire.as_proto().clone());
     }
 
     #[test]

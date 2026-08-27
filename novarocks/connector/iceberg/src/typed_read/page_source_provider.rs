@@ -35,7 +35,10 @@ use novarocks_proto_codec::connector_read::{
     TypedConnectorPageSourceProvider, ValidatedConnectorSplit, WireDynamicFilter,
 };
 use novarocks_spi::connector::ConnectorError;
-use novarocks_spi::connector::read_stack::{ConnectorPageSource, ConnectorSession};
+use novarocks_spi::connector::read_stack::{
+    BoundsMatch, ColumnValueBounds, ConnectorPageSource, ConnectorSession, DynamicFilter,
+    TupleDomain,
+};
 
 use crate::access_binding::IcebergReadBinding;
 
@@ -58,6 +61,63 @@ use super::table_execute::{
     IcebergTableExecuteProcedureHandle,
 };
 use super::table_handle::IcebergTableHandle;
+use super::{IcebergReadSplit, IcebergRuntimeRelation};
+
+/// Compatibility bridge for the temporary legacy wire-facing trait. New SPI
+/// calls pass an Iceberg-column filter directly and never construct this.
+struct LegacyWireFilter {
+    inner: Arc<WireDynamicFilter>,
+    covered: std::collections::BTreeSet<IcebergColumnHandle>,
+}
+
+impl LegacyWireFilter {
+    fn new(inner: Arc<WireDynamicFilter>) -> Result<Self, ConnectorError> {
+        let covered = inner
+            .columns_covered()
+            .iter()
+            .map(|column| IcebergColumnHandle::from_column_handle_proto(column.as_proto()))
+            .collect::<Result<_, _>>()?;
+        Ok(Self { inner, covered })
+    }
+}
+
+impl DynamicFilter<IcebergColumnHandle> for LegacyWireFilter {
+    fn columns_covered(&self) -> &std::collections::BTreeSet<IcebergColumnHandle> {
+        &self.covered
+    }
+
+    fn current_predicate(&self) -> TupleDomain<IcebergColumnHandle> {
+        super::column_handle::decode_tuple_domain(
+            &novarocks_proto_codec::connector_read::encode_tuple_domain(
+                &self.inner.current_predicate(),
+            ),
+        )
+        .unwrap_or_else(|_| TupleDomain::all())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+    fn is_awaitable(&self) -> bool {
+        self.inner.is_awaitable()
+    }
+    fn is_blocked(&self) -> bool {
+        self.inner.is_blocked()
+    }
+    fn bounds_may_match(
+        &self,
+        column: &IcebergColumnHandle,
+        bounds: &ColumnValueBounds,
+    ) -> BoundsMatch {
+        match novarocks_proto_codec::connector_read::ValidatedColumnHandle::parse(
+            column.to_column_handle_proto(),
+            novarocks_proto_codec::FieldPath::root("column_handle"),
+        ) {
+            Ok(column) => self.inner.bounds_may_match(&column, bounds),
+            Err(_) => BoundsMatch::Unknown,
+        }
+    }
+}
 
 /// Reader policy the fragment instance chose, not something a split carries.
 #[derive(Clone, Copy, Debug)]
@@ -138,6 +198,8 @@ impl TypedConnectorPageSourceProvider for IcebergPageSourceProvider {
         dynamic_filter: &Arc<WireDynamicFilter>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
         let columns = iceberg_scan_columns(columns)?;
+        let dynamic_filter: Arc<super::page_source::IcebergDynamicFilter> =
+            Arc::new(LegacyWireFilter::new(Arc::clone(dynamic_filter))?);
 
         // `$files` is the one system relation that is distributed, so its
         // split arrives on the same data path. Everything else about it is
@@ -170,7 +232,7 @@ impl TypedConnectorPageSourceProvider for IcebergPageSourceProvider {
                     budget: self.options.budget,
                     reader_options: self.options.reader_options,
                     scheduled_split_sequence_id,
-                    dynamic_filter: Arc::clone(dynamic_filter),
+                    dynamic_filter: Arc::clone(&dynamic_filter),
                 },
             );
         }
@@ -201,6 +263,95 @@ impl TypedConnectorPageSourceProvider for IcebergPageSourceProvider {
         create_iceberg_page_source(IcebergPageSourceRequest {
             relation: &relation,
             split: &split,
+            columns: &columns,
+            delete_manager: Arc::clone(&self.delete_manager),
+            delete_mode: DeleteEvaluationMode::ExcludeDeleted,
+            footers: Arc::clone(&self.footers),
+            access_binding: self.access_binding.clone(),
+            context: self.context.clone(),
+            budget: self.options.budget,
+            reader_options: self.options.reader_options,
+            scheduled_split_sequence_id,
+            dynamic_filter: Arc::clone(&dynamic_filter),
+        })
+    }
+}
+
+impl<P> novarocks_spi::connector::read_stack::adapter::ProviderReadPageSourceProvider<P>
+    for IcebergPageSourceProvider
+where
+    P: novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime<
+            Table = IcebergRuntimeRelation,
+            Column = IcebergColumnHandle,
+            Transaction = super::HiveTransactionHandle,
+            Split = IcebergReadSplit,
+        >,
+{
+    fn create_page_source(
+        &self,
+        _session: &ConnectorSession,
+        table: &IcebergRuntimeRelation,
+        split: &IcebergReadSplit,
+        scheduled_split_sequence_id: u64,
+        columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
+        dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
+    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+        let columns = columns
+            .iter()
+            .map(|assignment| assignment.column().clone())
+            .collect::<Vec<_>>();
+        if let IcebergReadSplit::SystemFiles(files_split) = split {
+            return self
+                .system_tables
+                .create_files_page_source(files_split, &columns);
+        }
+        if let (
+            IcebergRuntimeRelation::ChangeWindow(handle),
+            IcebergReadSplit::ChangeWindow(split),
+        ) = (table, split)
+        {
+            return create_iceberg_change_window_page_source(
+                IcebergChangeWindowPageSourceRequest {
+                    handle,
+                    split,
+                    columns: &columns,
+                    delete_manager: Arc::clone(&self.delete_manager),
+                    footers: Arc::clone(&self.footers),
+                    access_binding: self.access_binding.clone(),
+                    context: self.context.clone(),
+                    budget: self.options.budget,
+                    reader_options: self.options.reader_options,
+                    scheduled_split_sequence_id,
+                    dynamic_filter: Arc::clone(dynamic_filter),
+                },
+            );
+        }
+        if let (
+            IcebergRuntimeRelation::TableExecute(handle),
+            IcebergReadSplit::RewritePositionDeleteFiles(split),
+        ) = (table, split)
+        {
+            expect_rewrite_position_delete_files(handle)?;
+            return create_iceberg_rewrite_position_delete_files_page_source(
+                IcebergRewritePositionDeleteFilesPageSourceRequest {
+                    split,
+                    columns: &columns,
+                    access_binding: self.access_binding.clone(),
+                    context: self.context.clone(),
+                    budget: self.options.budget,
+                },
+            );
+        }
+        let (IcebergRuntimeRelation::Table(table), IcebergReadSplit::Data(split)) = (table, split)
+        else {
+            return Err(invalid(
+                "iceberg relation and split categories are incompatible",
+            ));
+        };
+        let relation = IcebergReadRelation::of_table(table, split.partition_spec_id())?;
+        create_iceberg_page_source(IcebergPageSourceRequest {
+            relation: &relation,
+            split,
             columns: &columns,
             delete_manager: Arc::clone(&self.delete_manager),
             delete_mode: DeleteEvaluationMode::ExcludeDeleted,

@@ -1091,8 +1091,7 @@ impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskU
         &self,
         execution_id: novarocks_proto_codec::lifecycle::QueryExecutionId,
         target: &crate::query_execution::split_assignment::AssignmentTarget,
-        fragment_instance_id: novarocks_types::UniqueId,
-        assignments: Vec<novarocks_proto_models::connector_read::SplitAssignment>,
+        request: crate::query_execution::connector_domain::TaskUpdateRequest,
     ) -> Result<
         crate::query_execution::split_assignment::TaskUpdateOutcome,
         crate::query_execution::split_assignment::TaskUpdateTransportError,
@@ -1116,10 +1115,12 @@ impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskU
                 attempt_id: execution_id.attempt_id().get(),
             }),
             fragment_instance_id: Some(ProtoUniqueId {
-                hi: fragment_instance_id.high(),
-                lo: fragment_instance_id.low(),
+                hi: request.fragment_instance_id().high(),
+                lo: request.fragment_instance_id().low(),
             }),
-            assignments,
+            assignments: request
+                .to_proto_assignments()
+                .map_err(TaskUpdateTransportError::new)?,
         };
         let response = client
             .data_runtime

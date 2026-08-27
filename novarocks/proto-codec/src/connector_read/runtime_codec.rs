@@ -30,9 +30,10 @@ use std::sync::Arc;
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
-    Assignment, ConnectorReadColumnHandle, ConnectorReadRelation, ConnectorReadSplit,
-    ConnectorReadTransactionHandle, ConnectorReadWorkSource, TupleDomain,
+    Assignment, ConnectorReadColumnHandle, ConnectorReadProviderFactory, ConnectorReadRelation,
+    ConnectorReadSplit, ConnectorReadTransactionHandle, ConnectorReadWorkSource, TupleDomain,
 };
+use novarocks_spi::connector::{ConnectorError, ConnectorExecutionBindingKey};
 
 use super::{
     CatalogTableHandle, ConnectorTableScanSource, ScheduledSplit, ValidatedColumnHandle,
@@ -83,6 +84,58 @@ impl fmt::Display for ConnectorReadCodecError {
 }
 
 impl std::error::Error for ConnectorReadCodecError {}
+
+/// One complete worker-side read bundle for an exact execution binding.
+///
+/// The backend installs this pair atomically after its existing Host has
+/// admitted the binding.  It has no registry or lifecycle authority; the
+/// factory merely gives the role matching provider services and codec for the
+/// same opaque-handle family.
+#[derive(Clone)]
+pub struct ConnectorReadExecutionBundle {
+    provider_factory: Arc<dyn ConnectorReadProviderFactory>,
+    codec: Arc<dyn ConnectorReadCodec>,
+}
+
+impl ConnectorReadExecutionBundle {
+    pub fn new(
+        provider_factory: Arc<dyn ConnectorReadProviderFactory>,
+        codec: Arc<dyn ConnectorReadCodec>,
+    ) -> Self {
+        Self {
+            provider_factory,
+            codec,
+        }
+    }
+
+    pub fn provider_factory(&self) -> Arc<dyn ConnectorReadProviderFactory> {
+        Arc::clone(&self.provider_factory)
+    }
+
+    pub fn codec(&self) -> Arc<dyn ConnectorReadCodec> {
+        Arc::clone(&self.codec)
+    }
+}
+
+impl fmt::Debug for ConnectorReadExecutionBundle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectorReadExecutionBundle")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Provider-owned constructor for a worker read bundle.
+///
+/// Server composition supplies implementations by provider kind. The backend
+/// invokes it only for a Host-admitted exact key and owns all subsequent
+/// installation, retirement, and query lifecycle state.
+pub trait ConnectorReadExecutionBundleFactory: Send + Sync {
+    fn build(
+        &self,
+        key: &ConnectorExecutionBindingKey,
+    ) -> Result<ConnectorReadExecutionBundle, ConnectorError>;
+}
 
 /// Immutable evidence retained by a role for exact TaskUpdate replay.
 ///

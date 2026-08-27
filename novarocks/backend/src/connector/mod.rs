@@ -28,8 +28,8 @@ pub use execution_host::{
     ConnectorExecutionHost, ConnectorExecutionLease, ConnectorExecutionQueryResolver,
 };
 pub use typed_registry::{
-    TypedConnectorProviderRegistry, TypedConnectorProviders, TypedProviderRegistryError,
-    TypedProviderRegistryErrorKind,
+    InstalledReadExecution, InstalledReadExecutionRegistry, TypedConnectorProviderRegistry,
+    TypedConnectorProviders, TypedProviderRegistryError, TypedProviderRegistryErrorKind,
 };
 
 /// Backend-local token passed through native plan decoding.

@@ -36,6 +36,10 @@ use crate::execution_declaration::IcebergInstanceDistribution;
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
 use crate::resources::IcebergMetadataResources;
+use novarocks_proto_codec::connector_read::ConnectorReadCodec;
+use novarocks_spi::connector::read_stack::{
+    ConnectorReadMetadata, ConnectorReadRegistrationLease, ConnectorReadSplitManager,
+};
 use novarocks_spi::connector::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
     ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
@@ -44,14 +48,22 @@ use novarocks_spi::connector::{
 };
 use std::sync::Arc;
 
-/// Notified with the coordinator-side typed boundary of each created control
-/// generation.
+/// Fallible composition-root installation of one completed coordinator read
+/// unit.
 ///
-/// The boundary must share the control generation's own catalog runtime, so it
-/// can only be minted here. The observer lets the composition root register it
-/// without this crate learning what a frontend registry is.
-pub type IcebergTypedBoundaryObserver = Arc<
-    dyn Fn(&ConnectorExecutionBindingKey, crate::typed_boundary::IcebergTypedBoundary)
+/// The concrete boundary must share the control generation's own catalog
+/// runtime, so it can only be minted here.  The Server composition root turns
+/// these SPI services and matching provider codec into its role-local bundle,
+/// returning the strong lease the Iceberg generation retains.  A failure is
+/// propagated: a control binding is never returned without its required read
+/// registration.
+pub type IcebergReadControlInstaller = Arc<
+    dyn Fn(
+            ConnectorExecutionBindingKey,
+            Arc<dyn ConnectorReadMetadata>,
+            Arc<dyn ConnectorReadSplitManager>,
+            Arc<dyn ConnectorReadCodec>,
+        ) -> Result<Arc<dyn ConnectorReadRegistrationLease>, ConnectorError>
         + Send
         + Sync,
 >;
@@ -60,7 +72,7 @@ pub type IcebergTypedBoundaryObserver = Arc<
 pub struct IcebergConnectorFactory {
     control_resources: IcebergMetadataResources,
     provider_id: ConnectorProviderId,
-    typed_boundary_observer: Option<IcebergTypedBoundaryObserver>,
+    read_control_installer: Option<IcebergReadControlInstaller>,
 }
 
 impl IcebergConnectorFactory {
@@ -69,13 +81,13 @@ impl IcebergConnectorFactory {
             control_resources,
             provider_id: ConnectorProviderId::parse(PROVIDER_ID)
                 .expect("static Iceberg provider ID is valid"),
-            typed_boundary_observer: None,
+            read_control_installer: None,
         }
     }
 
-    /// Register the composition root's typed-boundary sink.
-    pub fn with_typed_boundary_observer(mut self, observer: IcebergTypedBoundaryObserver) -> Self {
-        self.typed_boundary_observer = Some(observer);
+    /// Register the composition root's fallible coordinator read-unit sink.
+    pub fn with_read_control_installer(mut self, installer: IcebergReadControlInstaller) -> Self {
+        self.read_control_installer = Some(installer);
         self
     }
 
@@ -155,21 +167,6 @@ impl ConnectorControlFactory for IcebergConnectorFactory {
             instance_id: descriptor.instance_id.clone(),
             incarnation,
         };
-        if let Some(observer) = self.typed_boundary_observer.as_ref() {
-            // Minted from this generation's own runtime, so the coordinator
-            // never opens a second catalog path for the same binding.
-            observer(
-                &key,
-                unpublished.typed_boundary(
-                    descriptor.clone(),
-                    incarnation,
-                    crate::typed_read::table_handle::HiveTransactionHandle::new(
-                        true,
-                        incarnation.to_bytes(),
-                    ),
-                ),
-            );
-        }
         let metadata_maintenance = Arc::new(IcebergMetadataMaintenanceAdapter::new(
             key.clone(),
             Arc::clone(&unpublished.runtime),
@@ -223,7 +220,7 @@ impl ConnectorControlFactory for IcebergConnectorFactory {
                 incarnation,
                 provider.clone(),
                 provider.clone(),
-                Arc::new(IcebergInstanceDistribution::new(descriptor, incarnation)),
+                Arc::new(IcebergInstanceDistribution::new(descriptor.clone(), incarnation)),
                 Some(provider.clone()),
                 Some(data_mutation),
                 Some(metadata_maintenance),
@@ -237,8 +234,37 @@ impl ConnectorControlFactory for IcebergConnectorFactory {
                 capability as Arc<dyn novarocks_spi::connector::ConnectorUnanchoredCtasCleanup>
             }))?
             .try_with_staged_publication_recovery(Some(provider.clone()))?
-            .try_with_view_metadata(Some(provider))?;
-        ConnectorControlCreation::try_new(&request, binding, unpublished.durable_properties)
+            .try_with_view_metadata(Some(provider.clone()))?;
+        // Validate the completed control binding before the composition root
+        // can publish the matching read unit.  If that installation fails,
+        // this factory returns the error and never hands the binding back.
+        let creation = ConnectorControlCreation::try_new(
+            &request,
+            binding,
+            unpublished.durable_properties().to_vec(),
+        )?;
+        if let Some(installer) = self.read_control_installer.as_ref() {
+            let boundary = Arc::new(unpublished.typed_boundary(
+                descriptor,
+                incarnation,
+                crate::typed_read::table_handle::HiveTransactionHandle::new(
+                    true,
+                    incarnation.to_bytes(),
+                ),
+            ));
+            let adapter = Arc::new(boundary.read_runtime_adapter());
+            let codec: Arc<dyn ConnectorReadCodec> = Arc::new(
+                crate::typed_read::IcebergConnectorReadCodec::new(adapter.as_ref().clone()),
+            );
+            let lease = installer(
+                key,
+                Arc::clone(&adapter) as Arc<dyn ConnectorReadMetadata>,
+                adapter as Arc<dyn ConnectorReadSplitManager>,
+                codec,
+            )?;
+            provider.install_read_registration_lease(lease)?;
+        }
+        Ok(creation)
     }
 }
 
@@ -315,10 +341,11 @@ fn unavailable(error: String) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, Weak};
 
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::ConnectorInstanceId;
+    use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
 
     use super::*;
 
@@ -359,6 +386,10 @@ mod tests {
         )
         .expect("REST factory request")
     }
+
+    struct TestReadRegistrationLease;
+
+    impl ConnectorReadRegistrationLease for TestReadRegistrationLease {}
 
     #[test]
     fn factory_request_rejects_duplicate_properties_before_provider_construction() {
@@ -658,6 +689,107 @@ mod tests {
         assert_eq!(statistics.descriptor(), creation.binding().descriptor());
         assert_eq!(statistics.incarnation(), creation.binding().incarnation());
         assert!(statistics.collection().is_some());
+    }
+
+    #[test]
+    fn read_registration_is_fallible_and_is_owned_by_the_completed_generation() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let observed_key = Arc::new(Mutex::new(None));
+        let observed_lease: Arc<Mutex<Option<Weak<dyn ConnectorReadRegistrationLease>>>> =
+            Arc::new(Mutex::new(None));
+        let key_sink = Arc::clone(&observed_key);
+        let lease_sink = Arc::clone(&observed_lease);
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
+            binding,
+            runtime.handle().clone(),
+        ))
+        .with_read_control_installer(Arc::new(move |key, metadata, splits, codec| {
+            // The installer receives one complete matching unit, never an
+            // exposed provider boundary or a separately selected codec.
+            assert_eq!(codec.owner(), key.instance_id.as_str());
+            let _ = (metadata, splits);
+            *key_sink.lock().expect("key lock") = Some(key);
+            let lease: Arc<dyn ConnectorReadRegistrationLease> =
+                Arc::new(TestReadRegistrationLease);
+            *lease_sink.lock().expect("lease lock") = Some(Arc::downgrade(&lease));
+            Ok(lease)
+        }));
+        let request = ConnectorControlFactoryRequest::try_new(
+            factory.provider_id().clone(),
+            ConnectorInstanceId::parse("ice").expect("instance ID"),
+            vec![(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("request");
+
+        let creation = factory.create_control(request).expect("control creation");
+        let expected_key = ConnectorExecutionBindingKey {
+            instance_id: creation.binding().descriptor().instance_id.clone(),
+            incarnation: creation.binding().incarnation(),
+        };
+        assert_eq!(
+            observed_key.lock().expect("key lock").as_ref(),
+            Some(&expected_key)
+        );
+        let lease = observed_lease
+            .lock()
+            .expect("lease lock")
+            .clone()
+            .expect("installer recorded lease");
+        assert!(lease.upgrade().is_some());
+
+        // The callback's local strong reference is gone.  The only remaining
+        // strong edge is the private GenerationOwner carried by metadata and
+        // planning capabilities in the returned binding.
+        drop(creation);
+        assert!(lease.upgrade().is_none());
+    }
+
+    #[test]
+    fn read_registration_error_prevents_control_creation() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
+            binding,
+            runtime.handle().clone(),
+        ))
+        .with_read_control_installer(Arc::new(|_, _, _, _| {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "read-control registration rejected",
+            ))
+        }));
+        let request = ConnectorControlFactoryRequest::try_new(
+            factory.provider_id().clone(),
+            ConnectorInstanceId::parse("ice").expect("instance ID"),
+            vec![(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("request");
+
+        let error = match factory.create_control(request) {
+            Ok(_) => panic!("registration failure must prevent binding return"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::Internal);
+        assert!(error.message().contains("registration rejected"));
     }
 
     #[test]
