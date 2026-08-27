@@ -15,12 +15,99 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(StaticFileDisposableCarrier),
+        Box::new(CatalogPartialReadiness),
         Box::new(GracefulDrain),
         Box::new(ForcedDrain),
     ]
 }
 
 struct StaticFileDisposableCarrier;
+
+struct CatalogPartialReadiness;
+
+impl Scenario for CatalogPartialReadiness {
+    fn name(&self) -> &'static str {
+        "frontend-lifecycle/catalog-partial-readiness"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let warehouse = scenario_root.join("partial-ready-warehouse");
+        fs::create_dir_all(&warehouse).with_context(|| {
+            format!("create partial readiness warehouse {}", warehouse.display())
+        })?;
+        let snapshot = scenario_root.join("catalogs.toml");
+        fs::write(
+            &snapshot,
+            format!(
+                "format_version = 1\n\
+                 [[catalogs]]\n\
+                 instance_id = \"lnp8_healthy\"\n\
+                 provider_id = \"iceberg\"\n\
+                 display_name = \"lnp8_healthy\"\n\
+                 config_format_version = 1\n\
+                 [catalogs.properties]\n\
+                 type = \"iceberg\"\n\
+                 \"iceberg.catalog.type\" = \"hadoop\"\n\
+                 \"iceberg.catalog.warehouse\" = \"{}\"\n\
+                 [[catalogs]]\n\
+                 instance_id = \"lnp8_unavailable\"\n\
+                 provider_id = \"iceberg\"\n\
+                 display_name = \"lnp8_unavailable\"\n\
+                 config_format_version = 1\n\
+                 [catalogs.properties]\n\
+                 type = \"iceberg\"\n\
+                 \"iceberg.catalog.type\" = \"hadoop\"\n",
+                warehouse.display()
+            ),
+        )
+        .with_context(|| format!("write partial readiness snapshot {}", snapshot.display()))?;
+        Ok(ScenarioLaunchConfig {
+            config_overlay: CrossProcessConfigOverlay {
+                fe: Some(format!(
+                    "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n",
+                    snapshot.display()
+                )),
+                be: None,
+            },
+            ..Default::default()
+        })
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let ready = context
+            .handle()
+            .frontend_management_get("/readyz", Duration::from_secs(2))?;
+        let state = context
+            .handle()
+            .frontend_management_get("/v1/frontend/state", Duration::from_secs(2))?;
+        ensure!(
+            ready.status == 200,
+            "partial catalog failure must not block readiness"
+        );
+        ensure!(
+            state.body.contains("\"desired\":2")
+                && state.body.contains("\"ready\":1")
+                && state.body.contains("\"unavailable\":1"),
+            "unexpected partial catalog state: {}",
+            state.body
+        );
+        let mut connection = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect healthy partial catalog")?,
+        )?;
+        connection
+            .query_drop("SET CATALOG lnp8_healthy")
+            .context("select healthy catalog after partial bootstrap")?;
+        let rows: Vec<(i64,)> = connection
+            .query("SELECT 1")
+            .context("query through healthy partial catalog session")?;
+        ensure!(rows == vec![(1,)]);
+        context.action("proved one unavailable StaticFile catalog leaves the healthy catalog and FE readiness usable");
+        Ok(())
+    }
+}
 
 impl Scenario for StaticFileDisposableCarrier {
     fn name(&self) -> &'static str {
