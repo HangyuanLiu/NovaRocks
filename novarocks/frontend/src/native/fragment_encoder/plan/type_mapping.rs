@@ -117,6 +117,7 @@ fn encode_type_inner(dt: &DataType, field: Option<&Field>) -> Result<common::Typ
 
 fn encode_scalar_type(dt: &DataType) -> Result<common::TypeDesc, String> {
     use common::PrimitiveType;
+    let mut time_zone = None;
     let (primitive, precision, scale, time_unit) = match dt {
         DataType::Null => (PrimitiveType::NullType, None, None, None),
         DataType::Boolean => (PrimitiveType::Boolean, None, None, None),
@@ -145,7 +146,7 @@ fn encode_scalar_type(dt: &DataType) -> Result<common::TypeDesc, String> {
             )
         }
         DataType::Date32 => (PrimitiveType::Date, None, None, None),
-        DataType::Timestamp(unit, _) => {
+        DataType::Timestamp(unit, zone) => {
             let time_unit = match unit {
                 TimeUnit::Microsecond => None,
                 TimeUnit::Nanosecond => Some(3),
@@ -155,6 +156,10 @@ fn encode_scalar_type(dt: &DataType) -> Result<common::TypeDesc, String> {
                     ));
                 }
             };
+            // A zoned timestamp and an unzoned one are different types.
+            // Dropping the zone here rewrote a column's type across the process
+            // boundary, and the receiver then rejected the batch it was sent.
+            time_zone = zone.as_ref().map(|zone| zone.to_string());
             (PrimitiveType::Datetime, None, None, time_unit)
         }
         DataType::Time64(TimeUnit::Microsecond) => (PrimitiveType::Time, None, None, None),
@@ -173,7 +178,9 @@ fn encode_scalar_type(dt: &DataType) -> Result<common::TypeDesc, String> {
             ));
         }
     };
-    Ok(scalar_desc(primitive, precision, scale, time_unit))
+    Ok(scalar_desc_with_zone(
+        primitive, precision, scale, time_unit, time_zone,
+    ))
 }
 
 fn scalar_desc(
@@ -182,6 +189,16 @@ fn scalar_desc(
     scale: Option<i32>,
     time_unit: Option<i32>,
 ) -> common::TypeDesc {
+    scalar_desc_with_zone(primitive, precision, scale, time_unit, None)
+}
+
+fn scalar_desc_with_zone(
+    primitive: common::PrimitiveType,
+    precision: Option<i32>,
+    scale: Option<i32>,
+    time_unit: Option<i32>,
+    time_zone: Option<String>,
+) -> common::TypeDesc {
     common::TypeDesc {
         kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
             r#type: primitive as i32,
@@ -189,6 +206,7 @@ fn scalar_desc(
             precision,
             scale,
             time_unit,
+            time_zone,
         })),
     }
 }
@@ -260,6 +278,9 @@ fn sql_scalar_type(src: &SqlType) -> Result<common::ScalarType, String> {
         precision,
         scale,
         time_unit,
+        // A SQL type names no zone of its own; the engine's Arrow type is
+        // where a zoned timestamp comes from.
+        time_zone: None,
     })
 }
 

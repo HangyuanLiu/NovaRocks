@@ -233,6 +233,9 @@ async fn open_application(
         FrontendExecutionConfig::new("127.0.0.1", 19310, std::num::NonZeroUsize::new(1).unwrap()),
         backend_config(),
         Vec::new(),
+        std::sync::Arc::new(
+            novarocks_frontend::connector::typed_control_registry::TypedConnectorControlRegistry::default(),
+        ),
         tokio::runtime::Handle::current(),
         test_native_trust(),
         FrontendNativeTransport::plaintext(),
