@@ -207,6 +207,30 @@ pub fn frozen_connector_resolved_analyzer_table(
     )
 }
 
+/// Build the query-local analyzer table for one real relation read at one
+/// exact version.
+///
+/// This is the read an internal collection performs: no SQL text named the
+/// table, but the relation and its version are both real and stated, so the
+/// binding says so rather than presenting the read as a synthetic opaque
+/// source. Preparation then resolves it through the ordinary admitted-data
+/// lane, pinned to `version_ordinal`.
+pub fn pinned_version_resolved_analyzer_table(
+    identity: &FrozenConnectorScanIdentity,
+    input_schema: SchemaRef,
+    binding: SqlTableBindingId,
+    version_ordinal: i64,
+) -> ResolvedAnalyzerTable {
+    synthetic_resolved_analyzer_table(
+        identity,
+        input_schema,
+        binding,
+        crate::planner::table::SqlScanKind::Data {
+            version: crate::planner::table::SqlTableVersionSelector::Snapshot(version_ordinal),
+        },
+    )
+}
+
 /// Build the query-local analyzer table for a provider-frozen cohort read of a
 /// pinned file set.  SQL receives the same token, static identity, and Arrow
 /// schema as any synthetic source; the file set itself never enters SQL.

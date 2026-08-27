@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::{
@@ -36,9 +36,8 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use datasketches::theta::ThetaSketch;
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorBeginScanRequest, ConnectorControlPlanningLease,
-    ConnectorControlResolver, ConnectorReadSelector, ConnectorRequestContext,
-    ConnectorSplitPlanningRequest, StatisticsBasisRelation, StatisticsCollectionPlan,
+    ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorReadSelector,
+    ConnectorRequestContext, StatisticsBasisRelation, StatisticsCollectionPlan,
     StatisticsCollectionResult, StatisticsDataVersion, StatisticsEvidence,
     StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
     StatisticsMetricRequest, StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
@@ -49,9 +48,6 @@ use crate::common::backend_topology::BackendTopologySnapshot;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryRequest,
     build_statistics_query_request_with_execution,
-};
-use crate::query_execution::preparation::scan::{
-    PlannedConnectorRead, ResolvedScanExecution, ScanBindingResolver,
 };
 use sha2::{Digest, Sha256};
 
@@ -200,103 +196,72 @@ impl StatisticsCollectionProgram {
     }
 }
 
-/// Prepare the provider-neutral read portion of a statistics collection using
-/// the normal connector control path.  The table handle and physical
-/// projection originate from the provider's one-time pinned metadata
-/// resolution; this helper intentionally performs no catalog lookup and never
-/// opens a BE reader locally.  The returned planning lease keeps that exact
-/// connector generation live until the normal execution-binding barrier has
-/// consumed the declaration.
-pub(crate) fn prepare_statistics_connector_read(
-    lease: ConnectorControlPlanningLease,
-    topology: &BackendTopologySnapshot,
+/// Immutable naming of the relation one statistics collection measures.
+///
+/// A collection is not a query: no SQL text named this table, so preparation is
+/// handed the same three names the attempt itself was created from. `catalog`
+/// is the connector instance that owns the relation, which is what the typed
+/// scan stack checks the planning lease against.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StatisticsRelationIdentity {
+    catalog: String,
+    namespace: String,
+    table: String,
+}
+
+impl StatisticsRelationIdentity {
+    pub fn try_new(
+        catalog: impl Into<String>,
+        namespace: impl Into<String>,
+        table: impl Into<String>,
+    ) -> Result<Self, DistributedQueryError> {
+        let identity = Self {
+            catalog: catalog.into(),
+            namespace: namespace.into(),
+            table: table.into(),
+        };
+        if identity.catalog.is_empty() || identity.namespace.is_empty() || identity.table.is_empty()
+        {
+            return Err(contract_violation(
+                "statistics collection relation identity is incomplete",
+            ));
+        }
+        Ok(identity)
+    }
+
+    fn fqn(&self) -> String {
+        format!("{}.{}.{}", self.catalog, self.namespace, self.table)
+    }
+}
+
+/// The exact version a statistics collection must read.
+///
+/// The plan's `data_version` is an opaque provider token: it can be compared,
+/// but a relation cannot be read at it. The provider therefore also states the
+/// same pin as a neutral ordinal, and that ordinal is what freezes the scan.
+/// Without it there is no version to name, and reading the catalog's current
+/// version instead would measure rows the published evidence does not describe
+/// -- so this fails closed rather than defaulting.
+fn statistics_version_ordinal(
+    identity: &StatisticsRelationIdentity,
     program: &StatisticsCollectionProgram,
-    context: ConnectorRequestContext,
-) -> Result<PlannedConnectorRead, DistributedQueryError> {
-    let target_parallelism = statistics_target_parallelism(topology)?;
-    if lease.binding().descriptor().instance_id != *program.plan.table().owner() {
-        return Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::ContractViolation,
-            "statistics collection planning lease does not own its resolved table handle",
-        ));
-    }
-    let batch = ConnectorBatchBudget {
-        max_rows: NonZeroUsize::new(4096).expect("statistics batch rows are nonzero"),
-        max_bytes: NonZeroUsize::new(context.max_handle_payload_bytes())
-            .expect("validated connector payload budget is nonzero"),
-    };
-    // `Current` here is not a latest metadata lookup: the opaque table handle
-    // is the provider-resolved data-version pin.  Providers must bind this
-    // selector to that handle's version, as Iceberg does with snapshot_id.
-    let scan = lease
-        .binding()
-        .planning()
-        .begin_scan(
-            program.plan.table(),
-            ConnectorBeginScanRequest {
-                projection: program.plan.scan_projection(),
-                static_predicates: Vec::new(),
-                selection: novarocks_spi::connector::ConnectorScanSelection::Snapshot(
-                    ConnectorReadSelector::Current,
-                ),
-                purpose: novarocks_spi::connector::ConnectorReadPurpose::Query,
-                limit: None,
-                batch,
-                context: context.clone(),
-            },
-        )
-        .map_err(connector_planning_error)?;
-    scan.validate(
-        &novarocks_spi::connector::ConnectorExecutionBindingKey {
-            instance_id: lease.binding().descriptor().instance_id.clone(),
-            incarnation: lease.binding().incarnation(),
-        },
-        novarocks_spi::connector::ConnectorScanSelection::Snapshot(ConnectorReadSelector::Current),
-    )
-    .map_err(connector_planning_error)?;
-    let split_result = lease
-        .binding()
-        .planning()
-        .plan_splits(
-            scan.handle(),
-            ConnectorSplitPlanningRequest {
-                target_parallelism,
-                max_split_bytes: None,
-                context: context.clone(),
-            },
-        )
-        .map_err(connector_planning_error)?;
-    if split_result
-        .splits
-        .iter()
-        .any(|split| split.owner() != &lease.binding().descriptor().instance_id)
-    {
-        return Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::ContractViolation,
-            "statistics collection provider planned a split for another connector instance",
-        ));
-    }
-    let declaration = lease
-        .binding()
-        .execution_declaration(&context)
-        .map_err(connector_planning_error)?;
-    Ok(PlannedConnectorRead {
-        declaration,
-        provider_field_ordinals: (0..scan.output_schema().fields().len())
-            .map(|ordinal| u32::try_from(ordinal).expect("connector output ordinal fits u32"))
-            .collect(),
-        scan,
-        splits: split_result.splits,
-        planning_metrics: split_result.metrics,
-        static_predicates: Vec::new(),
-        predicate_dispositions: Vec::new(),
-        residual_predicates: Vec::new(),
-        batch,
-        planning_lease: lease,
-        read_session: split_result.session,
+) -> Result<i64, DistributedQueryError> {
+    program.plan().base_version_ordinal().ok_or_else(|| {
+        contract_violation(format!(
+            "statistics collection of `{}` has no provider-signed base version ordinal; \
+             measuring its current version instead would publish statistics for a version \
+             nobody asked about",
+            identity.fqn()
+        ))
     })
 }
 
+/// A collection is distributed work, so it needs somewhere to run.
+///
+/// This is checked before any provider work starts, and it is deliberately
+/// its own check rather than a side effect of building scan options: the
+/// shared option builder admits a single-backend fallback under `cfg(test)`,
+/// and a collection must never quietly run against one.
 fn statistics_target_parallelism(
     topology: &BackendTopologySnapshot,
 ) -> Result<NonZeroUsize, DistributedQueryError> {
@@ -354,65 +319,82 @@ impl PreparedStatisticsCollectionRequest {
 }
 
 /// Prepare an already-pinned connector statistics program for native
-/// distributed execution. Preparation receives the opaque read through a
-/// one-shot resolver; it cannot reopen the provider catalog or reinterpret
-/// the table's data version. The emitted fragment source remains the regular
-/// `ConnectorReadSource`, so BE execution has no statistics-only connector
-/// identity or reader path.
+/// distributed execution.
+///
+/// The collection reads one named relation at one exact version: the ordinal
+/// the provider signed beside its pinned data version. Preparation cannot
+/// reopen the provider catalog or reinterpret that version -- it admits a
+/// request-local binding pinned to it and then lowers through the ordinary
+/// typed connector scan stack, so BE execution has no statistics-only
+/// connector identity or reader path.
 pub fn prepare_statistics_collection_request(
     controls: &dyn ConnectorControlResolver,
+    typed_connector_control: &Arc<
+        crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+    >,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     context: ConnectorRequestContext,
+    identity: &StatisticsRelationIdentity,
     program: StatisticsCollectionProgram,
     planning_lease: ConnectorControlPlanningLease,
 ) -> Result<PreparedStatisticsCollectionRequest, DistributedQueryError> {
-    let read = prepare_statistics_connector_read(
-        planning_lease,
-        execution.topology(),
-        &program,
-        context.clone(),
-    )?;
+    statistics_target_parallelism(execution.topology())?;
+    let version_ordinal = statistics_version_ordinal(identity, &program)?;
+    // The lease that resolved the table handle is the only generation allowed
+    // to plan the read of it. A handle from one generation planned through
+    // another is a different table.
+    if planning_lease.binding().descriptor().instance_id != *program.plan().table().owner() {
+        return Err(contract_violation(
+            "statistics collection planning lease does not own its resolved table handle",
+        ));
+    }
+    if planning_lease.binding().descriptor().instance_id.as_str() != identity.catalog {
+        return Err(contract_violation(format!(
+            "statistics collection of `{}` was planned through connector instance `{}`",
+            identity.fqn(),
+            planning_lease.binding().descriptor().instance_id.as_str()
+        )));
+    }
     let table_bindings = Arc::new(
         crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
             .map_err(contract_violation)?,
     );
-    let source_binding = admit_statistics_scan_binding(table_bindings.as_ref(), &program)?;
+    let source_binding = admit_statistics_scan_binding(
+        table_bindings.as_ref(),
+        identity,
+        &program,
+        version_ordinal,
+        planning_lease,
+    )?;
     let distributed = novarocks_sql::planning::dml::build_statistics_connector_plan(
         novarocks_sql::planning::dml::StatisticsConnectorScan {
             binding: source_binding,
-            columns: program
-                .plan
-                .scan_columns()
-                .iter()
-                .map(|column| novarocks_types::schema::ColumnDef {
-                    name: column.name().to_string(),
-                    data_type: column.data_type().clone(),
-                    nullable: column.nullable(),
-                    write_default: None,
-                    logical_type: None,
-                })
-                .collect(),
+            catalog: identity.catalog.clone(),
+            namespace: identity.namespace.clone(),
+            table: identity.table.clone(),
+            version_ordinal,
+            columns: statistics_scan_column_defs(&program),
         },
         program.plan.metrics.clone(),
         execution.optimizer_settings(),
     )
     .map_err(contract_violation)?;
-    let resolver = PinnedStatisticsReadResolver::new(read);
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
         controls,
         &context,
         Some(table_bindings.as_ref()),
-        Some(&resolver),
-        crate::query_execution::preparation::ScanPreparationOptions::new(
-            true,
-            std::num::NonZeroUsize::new(execution.topology().targets().len()).ok_or_else(|| {
-                contract_violation(
-                    "statistics connector preparation requires a non-empty admitted backend topology",
-                )
-            })?,
-            None,
-        ),
+        None,
+        // The same options a statement's own scans are prepared under. A
+        // collection is an ordinary typed read of a real relation, so it
+        // resolves through the one installed control registry rather than a
+        // statistics-only planning path.
+        crate::query_execution::compiler::scan_preparation_options(
+            typed_connector_control,
+            execution.optimizer_settings(),
+            execution,
+        )
+        .map_err(contract_violation)?,
     )
     .map_err(contract_violation)?;
     Ok(PreparedStatisticsCollectionRequest {
@@ -425,15 +407,39 @@ pub fn prepare_statistics_collection_request(
     })
 }
 
-/// Retain a request-local SQL token even though the opaque statistics read is
-/// supplied by `PinnedStatisticsReadResolver`.  The resolver holds the exact
-/// statistics lease; the binding store keeps the synthetic compiler source
-/// scoped to this one submission and prevents a fallback catalog acquire.
+/// The provider-resolved physical columns this collection reads, in the
+/// provider's own ordinal order.
+fn statistics_scan_column_defs(
+    program: &StatisticsCollectionProgram,
+) -> Vec<novarocks_types::schema::ColumnDef> {
+    program
+        .plan
+        .scan_columns()
+        .iter()
+        .map(|column| novarocks_types::schema::ColumnDef {
+            name: column.name().to_string(),
+            data_type: column.data_type().clone(),
+            nullable: column.nullable(),
+            write_default: None,
+            logical_type: None,
+        })
+        .collect()
+}
+
+/// Admit the one request-local binding this collection scans through.
+///
+/// It names the real relation at the version the provider signed, and carries
+/// the exact lease and table handle that resolved it. Preparation recovers all
+/// of that from the token alone, so the scan can never fall back to a fresh
+/// catalog acquire or to the relation's current version.
 fn admit_statistics_scan_binding(
     bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
+    identity: &StatisticsRelationIdentity,
     program: &StatisticsCollectionProgram,
+    version_ordinal: i64,
+    planning_lease: ConnectorControlPlanningLease,
 ) -> Result<novarocks_sql::binding::SqlTableBindingId, DistributedQueryError> {
-    let input_schema = Arc::new(arrow::datatypes::Schema::new(
+    let input_schema: arrow::datatypes::SchemaRef = Arc::new(arrow::datatypes::Schema::new(
         program
             .plan
             .scan_columns()
@@ -447,56 +453,52 @@ fn admit_statistics_scan_binding(
             })
             .collect::<Vec<_>>(),
     ));
-    let identity = novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::new(
-        "__statistics",
-        "__statistics",
-        "__connector_pinned_statistics",
+    let scan_identity =
+        novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
+            identity.catalog.as_str(),
+            identity.namespace.as_str(),
+            identity.table.as_str(),
+        )
+        .map_err(contract_violation)?;
+    let key = crate::catalog_application::query_bindings::QueryTableBindingKey::snapshot(
+        &identity.catalog,
+        &identity.namespace,
+        &identity.table,
+        version_ordinal,
     );
-    crate::query_execution::frozen_connector_read::admit_frozen_connector_scan_binding(
-        bindings,
-        &identity,
-        &input_schema,
-    )
-    .map_err(contract_violation)
-}
-
-struct PinnedStatisticsReadResolver {
-    read: Mutex<Option<PlannedConnectorRead>>,
-}
-
-impl PinnedStatisticsReadResolver {
-    fn new(read: PlannedConnectorRead) -> Self {
-        Self {
-            read: Mutex::new(Some(read)),
-        }
-    }
-}
-
-impl ScanBindingResolver for PinnedStatisticsReadResolver {
-    fn resolve_scan(
-        &self,
-        _node_id: i32,
-        _scan: &novarocks_sql::plan_read::PlanScanNode,
-    ) -> Result<Option<ResolvedScanExecution>, String> {
-        Ok(Some(ResolvedScanExecution::ConnectorRead))
-    }
-
-    fn resolve_connector_read(
-        &self,
-        _node_id: i32,
-        _scan: &novarocks_sql::plan_read::PlanScanNode,
-    ) -> Result<Option<PlannedConnectorRead>, String> {
-        self.read
-            .lock()
-            .map_err(|_| "pinned statistics connector read lock poisoned".to_string())
-            .map(|mut read| read.take())
-    }
-}
-
-fn connector_planning_error(
-    error: novarocks_spi::connector::ConnectorError,
-) -> DistributedQueryError {
-    DistributedQueryError::new(DistributedQueryErrorKind::Failed, error.to_string())
+    bindings
+        .resolve_or_insert_with_id(key, |binding| {
+            Ok(
+                crate::catalog_application::query_bindings::QueryTableBinding {
+                    resolved:
+                        novarocks_sql::planning::query_execution::pinned_version_resolved_analyzer_table(
+                            &scan_identity,
+                            input_schema.clone(),
+                            binding,
+                            version_ordinal,
+                        ),
+                    statistics_pin: None,
+                    admission:
+                        crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
+                            planning_lease.clone(),
+                        ),
+                    scan_materialization: Some(
+                        crate::catalog_application::query_bindings::QueryScanMaterialization {
+                            table: program.plan().table().clone(),
+                            schema: input_schema.clone(),
+                            selector: ConnectorReadSelector::SnapshotId(version_ordinal),
+                            statistics_pin: None,
+                            planning_lease: planning_lease.clone(),
+                        },
+                    ),
+                    mv_target_read: None,
+                    write_target_admission: None,
+                    frozen_snapshot_materializations: BTreeMap::new(),
+                    admitted_change_scans: BTreeMap::new(),
+                },
+            )
+        })
+        .map_err(contract_violation)
 }
 
 /// A one-result bounded sink for an internal statistics execution. It rejects
@@ -1911,6 +1913,73 @@ mod tests {
         }
     }
 
+    /// Same program shape, minus the provider's version ordinal.
+    fn program_without_version_ordinal() -> StatisticsCollectionProgram {
+        let table = ConnectorTableHandle::try_new(
+            ConnectorInstanceId::parse("statistics-test").expect("instance id"),
+            Bytes::from_static(b"pinned-table"),
+        )
+        .expect("table handle");
+        let plan = StatisticsCollectionPlan::try_new(
+            table,
+            StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-1"))
+                .expect("data version"),
+            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"collection-1"))
+                .expect("evidence revision"),
+            None,
+            StatisticsMetricRequest::try_new(vec![StatisticsMetric::RowCount]).expect("metrics"),
+            Vec::new(),
+            Bytes::from_static(b"provider-plan"),
+        )
+        .expect("collection plan");
+        StatisticsCollectionProgram::try_new(
+            plan,
+            StatisticsExecutionPolicy::try_new(
+                StatisticsExecutionMode::ProcessJobAttempt,
+                Duration::from_secs(60),
+            )
+            .expect("policy"),
+        )
+        .expect("program")
+    }
+
+    fn relation_for_test() -> StatisticsRelationIdentity {
+        StatisticsRelationIdentity::try_new("statistics-test", "analytics", "orders")
+            .expect("relation identity")
+    }
+
+    /// The pinned data version is an opaque token; only the ordinal beside it
+    /// can pin a scan. Without one there is no version to read at, and reading
+    /// the current one would measure rows the published evidence does not
+    /// describe -- so preparation refuses instead of defaulting.
+    #[test]
+    fn a_collection_without_a_version_ordinal_is_refused() {
+        let error =
+            statistics_version_ordinal(&relation_for_test(), &program_without_version_ordinal())
+                .expect_err("a collection with no version ordinal must not be prepared");
+        assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
+        assert!(
+            error.to_string().contains("base version ordinal"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("statistics-test.analytics.orders"),
+            "{error}"
+        );
+    }
+
+    /// The ordinal the provider signed is the one the scan is pinned to.
+    #[test]
+    fn a_collection_reads_the_version_the_provider_signed() {
+        assert_eq!(
+            statistics_version_ordinal(&relation_for_test(), &program_for_preparation())
+                .expect("version ordinal"),
+            1
+        );
+    }
+
     fn program_for_preparation() -> StatisticsCollectionProgram {
         let table = ConnectorTableHandle::try_new(
             ConnectorInstanceId::parse("statistics-test").expect("instance id"),
@@ -1928,6 +1997,7 @@ mod tests {
             table,
             data_version,
             evidence_revision,
+            Some(1),
             metrics,
             Vec::new(),
             Bytes::from_static(b"provider-plan"),

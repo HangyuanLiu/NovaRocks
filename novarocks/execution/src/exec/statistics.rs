@@ -181,10 +181,30 @@ impl StatisticsBatchCollector {
         })
     }
 
+    /// Accumulate one batch of the pinned scan's output.
+    ///
+    /// The batch is checked against the pinned scan by *shape* -- its column
+    /// count and each column's type, in order -- rather than by whole-schema
+    /// equality. A connector read's chunk identifies its columns by slot id
+    /// and names its Arrow fields `slot_<id>` accordingly, while the pinned
+    /// plan schema names them as the relation does; both descriptions are
+    /// correct and neither is the other. Nullability is excluded for the same
+    /// reason: a reader declares every produced column nullable because a page
+    /// carries no nullability of its own.
+    ///
+    /// Position is what the collector actually relies on -- `column_indexes`
+    /// resolved each metric's column to an ordinal against the pinned schema
+    /// once -- so the type-and-arity check is exactly the assumption being
+    /// made, and a batch that is not this scan's output still fails here.
     pub fn push_batch(&mut self, batch: &RecordBatch) -> Result<(), StatisticsFragmentError> {
-        if batch.schema().as_ref() != self.schema.as_ref() {
+        let batch_schema = batch.schema();
+        let pinned_types = self.schema.fields().iter().map(|field| field.data_type());
+        let batch_types = batch_schema.fields().iter().map(|field| field.data_type());
+        if batch_schema.fields().len() != self.schema.fields().len()
+            || !pinned_types.eq(batch_types)
+        {
             return Err(StatisticsFragmentError::contract(
-                "statistics batch schema differs from the pinned scan schema",
+                "statistics batch shape differs from the pinned scan schema",
             ));
         }
         let rows = u64::try_from(batch.num_rows()).map_err(|_| {

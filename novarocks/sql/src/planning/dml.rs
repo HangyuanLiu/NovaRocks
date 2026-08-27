@@ -1274,18 +1274,25 @@ fn max_physical_column_id(node: &crate::optimizer::OptimizedOperatorNode) -> u32
         .unwrap_or(0)
 }
 
-/// Immutable synthetic scan facts used by Core's provider-neutral statistics
-/// collector.  The binding was admitted by Core from an exact provider lease;
-/// SQL only turns it into a sealed statistics distributed plan.
+/// Immutable scan facts used by Core's provider-neutral statistics collector.
+///
+/// The relation is named, not synthetic: a collection measures one real table
+/// at one exact version, and `version_ordinal` is that version. The binding was
+/// admitted by Core from an exact provider lease pinned to the same version, so
+/// SQL only turns these facts into a sealed statistics distributed plan.
 #[derive(Clone, Debug)]
 pub struct StatisticsConnectorScan {
     pub binding: crate::binding::SqlTableBindingId,
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
+    pub version_ordinal: i64,
     pub columns: Vec<novarocks_types::schema::ColumnDef>,
 }
 
 /// Build the SQL-owned physical and distributed statistics program from a
-/// pinned synthetic connector scan.  Core retains the encoder, preparation,
-/// provider resolver, and result finalization.
+/// pinned connector scan.  Core retains the encoder, preparation, provider
+/// resolver, and result finalization.
 pub fn build_statistics_connector_plan(
     scan: StatisticsConnectorScan,
     metrics: novarocks_spi::connector::StatisticsMetricRequest,
@@ -1314,20 +1321,28 @@ pub fn build_statistics_connector_plan(
     let physical = crate::planner::physical::PhysicalPlanNode {
         kind: crate::planner::physical::PhysicalPlanKind::Scan(
             crate::planner::payload::PlanScanNode {
-                database: "__statistics".to_string(),
+                database: scan.namespace.clone(),
                 table: crate::planner::table::TableDef {
-                    name: "__connector_pinned_statistics".to_string(),
+                    name: scan.table.clone(),
                     columns: scan.columns,
                     iceberg_row_lineage_metadata_columns: Vec::new(),
                     source: crate::planner::table::ScanSource::Sql(
                         crate::planner::table::SqlScanSource::new(
                             scan.binding,
                             crate::planner::table::SqlTableIdentity {
-                                catalog: "__statistics".to_string(),
-                                namespace: "__statistics".to_string(),
-                                table: "__connector_pinned_statistics".to_string(),
+                                catalog: scan.catalog,
+                                namespace: scan.namespace,
+                                table: scan.table,
                             },
-                            crate::planner::table::SqlScanKind::ConnectorRead,
+                            // The collection reads the relation as of exactly
+                            // the version its evidence is stamped with. Naming
+                            // the current version instead would measure rows
+                            // the answer does not describe.
+                            crate::planner::table::SqlScanKind::Data {
+                                version: crate::planner::table::SqlTableVersionSelector::Snapshot(
+                                    scan.version_ordinal,
+                                ),
+                            },
                         ),
                     ),
                 },

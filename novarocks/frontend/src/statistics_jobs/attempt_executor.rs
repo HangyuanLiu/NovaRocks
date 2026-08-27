@@ -49,6 +49,11 @@ use novarocks_spi::connector::{
 pub(crate) struct StatisticsAttemptExecutionPorts {
     execution_role: novarocks_types::ClusterRole,
     connector_control: Arc<dyn ConnectorControlRegistry>,
+    /// The composition root's single typed control registry. A collection is
+    /// an ordinary typed read, so it resolves its relation through the same
+    /// installed generation every statement does.
+    typed_connector_control:
+        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
     backend_topology: BackendTopologyService,
     query_execution: QueryExecutionService,
     attempt_timeout: Duration,
@@ -58,6 +63,9 @@ impl StatisticsAttemptExecutionPorts {
     pub(crate) fn new(
         execution_role: novarocks_types::ClusterRole,
         connector_control: Arc<dyn ConnectorControlRegistry>,
+        typed_connector_control: Arc<
+            crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+        >,
         backend_topology: BackendTopologyService,
         query_execution: QueryExecutionService,
         attempt_timeout: Duration,
@@ -65,6 +73,7 @@ impl StatisticsAttemptExecutionPorts {
         Self {
             execution_role,
             connector_control,
+            typed_connector_control,
             backend_topology,
             query_execution,
             attempt_timeout,
@@ -301,12 +310,23 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
             novarocks_sql::compiler::SessionOptimizerSettings::default(),
         );
 
+        // The attempt already names its relation; preparation must read that
+        // one and no other, so the names travel with the program rather than
+        // being recovered from a second catalog lookup.
+        let relation = crate::query_execution::statistics::StatisticsRelationIdentity::try_new(
+            request.connector_instance_id.as_str(),
+            request.namespace.as_str(),
+            request.table.as_str(),
+        )
+        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         // The sequence is intentional: Core prepares immutable provider facts;
         // Frontend maps the sealed view; Core consumes the exact attachment.
         let prepared = crate::query_execution::statistics::prepare_statistics_collection_request(
             self.ports.connector_control.as_ref(),
+            &self.ports.typed_connector_control,
             &execution,
             context.clone(),
+            &relation,
             program,
             planning_lease,
         )

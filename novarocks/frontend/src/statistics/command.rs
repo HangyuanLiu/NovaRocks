@@ -61,12 +61,42 @@ fn statistics_application_target(
     })
 }
 
+/// The state a statistics job reaches when its work actually happened.
+const SUCCEEDED_STATISTICS_JOB_STATE: &str = "SUCCEEDED";
+
+/// Report a waited statistics job as the statement's own outcome.
+///
+/// The statement waited for this job precisely so the client would learn what
+/// happened to it. Answering `OK` for a job that ended `FAILED` would report
+/// success for work that never ran and leave the table's statistics silently
+/// absent, which is worse than a loud failure: the next query plans on missing
+/// statistics with nothing to explain why.
+fn completed_statistics_job_result(
+    job: crate::statistics_jobs::application::StatisticsJobView,
+) -> Result<StatementResult, String> {
+    if job.state == SUCCEEDED_STATISTICS_JOB_STATE {
+        return Ok(StatementResult::Ok);
+    }
+    let mut message = format!(
+        "statistics job {} for `{}`.`{}`.`{}` ended in state {}",
+        job.job_id, job.target.catalog, job.target.namespace, job.target.table, job.state
+    );
+    if let Some(kind) = job.error_kind {
+        message.push_str(&format!(" ({kind})"));
+    }
+    if let Some(detail) = job.error_message {
+        message.push_str(&format!(": {detail}"));
+    }
+    Err(message)
+}
+
 fn statistics_application_result(
     result: StatisticsApplicationResult,
 ) -> Result<StatementResult, String> {
     match result {
         StatisticsApplicationResult::JobSubmitted(_)
         | StatisticsApplicationResult::JobCancellationRequested(_) => Ok(StatementResult::Ok),
+        StatisticsApplicationResult::JobCompleted(job) => completed_statistics_job_result(job),
         StatisticsApplicationResult::AnalyzeJobs(jobs) => statistics_string_result(
             &[
                 "job_id",
@@ -253,7 +283,7 @@ mod tests {
     use arrow::array::{Array, StringArray};
     use uuid::Uuid;
 
-    use super::StatisticsCommandExecutor;
+    use super::{StatementResult, StatisticsCommandExecutor};
     use crate::statistics_jobs::application::{
         StatisticsApplicationCommand, StatisticsApplicationError, StatisticsApplicationPort,
         StatisticsApplicationResult, StatisticsJobView, StatisticsTableStatView,
@@ -371,5 +401,91 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A statistics job whose terminal state the caller waited for.
+    struct TerminalStatisticsApplicationPort {
+        state: &'static str,
+        error_kind: Option<&'static str>,
+        error_message: Option<&'static str>,
+    }
+
+    impl StatisticsApplicationPort for TerminalStatisticsApplicationPort {
+        fn execute(
+            &self,
+            command: StatisticsApplicationCommand,
+            _execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
+        ) -> Result<StatisticsApplicationResult, StatisticsApplicationError> {
+            let StatisticsApplicationCommand::AnalyzeTable { target, .. } = command else {
+                panic!("this fixture answers only ANALYZE TABLE");
+            };
+            Ok(StatisticsApplicationResult::JobCompleted(
+                StatisticsJobView {
+                    job_id: Uuid::nil(),
+                    operation_id: novarocks_spi::connector::LakePublicationId::new_v7(),
+                    state: self.state.into(),
+                    attempt: 1,
+                    target,
+                    error_kind: self.error_kind.map(Into::into),
+                    error_message: self.error_message.map(Into::into),
+                },
+            ))
+        }
+    }
+
+    fn analyze_against(port: TerminalStatisticsApplicationPort) -> Result<StatementResult, String> {
+        let executor = StatisticsCommandExecutor::new(Arc::new(port));
+        let statements =
+            novarocks_parser::parse("ANALYZE TABLE ice.analytics.orders").expect("parse analyze");
+        let [novarocks_parser::ast::Statement::Statistics(statement)] = statements.as_slice()
+        else {
+            panic!("expected statistics statement");
+        };
+        executor.execute(statement, None, "default", None)
+    }
+
+    /// ANALYZE waits for its collection job, so the statement is the only
+    /// place the client can learn that the collection did not happen.
+    /// Answering `OK` there leaves the table with no statistics and nothing
+    /// to explain why every later plan is estimating blind.
+    #[test]
+    fn a_failed_collection_fails_its_analyze_statement() {
+        let error = analyze_against(TerminalStatisticsApplicationPort {
+            state: "FAILED",
+            error_kind: Some("COLLECTION"),
+            error_message: Some("scan source is a pre-pinned opaque connector read"),
+        })
+        .expect_err("a failed collection must not report success");
+        assert!(error.contains("FAILED"), "{error}");
+        assert!(error.contains("COLLECTION"), "{error}");
+        assert!(
+            error.contains("scan source is a pre-pinned opaque connector read"),
+            "{error}"
+        );
+        assert!(error.contains("orders"), "{error}");
+    }
+
+    /// A publish whose commit outcome is unknown is not a success either: the
+    /// caller must be told the statistics may or may not be there.
+    #[test]
+    fn a_commit_unknown_collection_fails_its_analyze_statement() {
+        let error = analyze_against(TerminalStatisticsApplicationPort {
+            state: "COMMIT_UNKNOWN",
+            error_kind: Some("COMMIT_UNKNOWN"),
+            error_message: None,
+        })
+        .expect_err("an unknown commit outcome must not report success");
+        assert!(error.contains("COMMIT_UNKNOWN"), "{error}");
+    }
+
+    #[test]
+    fn a_succeeded_collection_reports_statement_success() {
+        let result = analyze_against(TerminalStatisticsApplicationPort {
+            state: "SUCCEEDED",
+            error_kind: None,
+            error_message: None,
+        })
+        .expect("a succeeded collection reports success");
+        assert!(matches!(result, StatementResult::Ok));
     }
 }

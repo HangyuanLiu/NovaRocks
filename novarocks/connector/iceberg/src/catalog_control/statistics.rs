@@ -374,10 +374,18 @@ impl StatisticsCollection for IcebergMetadata {
         )))?;
         let columns = statistics_scan_layout(&table, &projection)?;
         let provider_payload = request.table.payload().clone();
+        // The snapshot the pinned data version names, restated as the neutral
+        // ordinal a typed scan can be pinned to. It is the same snapshot the
+        // evidence is stamped with, so the collection cannot measure one
+        // version and publish it under another. A table with no snapshot has
+        // no ordinal, and the engine refuses the collection rather than
+        // silently measuring the catalog's current version.
+        let base_version_ordinal = table_info.current_snapshot_id;
         StatisticsCollectionPlan::try_new(
             request.table,
             request.data_version,
             revision,
+            base_version_ordinal,
             request.metrics,
             columns,
             provider_payload,

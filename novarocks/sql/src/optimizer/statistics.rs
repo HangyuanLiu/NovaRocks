@@ -706,7 +706,16 @@ pub fn build_table_statistics_with_ndv(
     })
 }
 
-#[allow(dead_code)] // Task 5 consumes this through QueryStatsCollector.
+/// Build base-table statistics straight from manifest facts plus a
+/// name-keyed NDV map.
+///
+/// This is a test fixture, not a production path, and the difference matters
+/// because it also labels NDV differently. Production statistics reach the
+/// optimizer through `evidence_to_base_statistics`, which derives every
+/// value's confidence from the connector's own `StatisticsNumericNature` --
+/// so a Theta sketch arrives as `Estimated`. This fixture is handed bare
+/// `f64`s with no such fact attached and calls them `Exact`, which is only
+/// admissible because the values are the test's own.
 #[cfg(test)]
 pub(crate) fn build_base_table_statistics_with_ndv(
     files: &[SqlManifestFileStatistics],
