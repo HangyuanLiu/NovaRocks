@@ -38,8 +38,8 @@ use novarocks_spi::connector::{
     ConnectorStatisticsLease, ConnectorTableHandle, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    StatisticsCollectionRequest, StatisticsMetricRequest,
-    StatisticsPublishPreparationRequest, StatisticsPublishRequest,
+    StatisticsCollectionRequest, StatisticsMetricRequest, StatisticsPublishPreparationRequest,
+    StatisticsPublishRequest,
 };
 
 /// Exact Frontend composition leaves retained by the process-owned ANALYZE worker.

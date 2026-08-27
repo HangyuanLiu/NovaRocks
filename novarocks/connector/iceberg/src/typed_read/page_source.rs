@@ -2877,6 +2877,7 @@ mod tests {
             data_sequence_number: 9,
             content_offset: None,
             content_size_in_bytes: None,
+            referenced_data_file: None,
             decryption_data: None,
         })
         .expect("delete descriptor");

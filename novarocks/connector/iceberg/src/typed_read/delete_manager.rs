@@ -1175,6 +1175,7 @@ fn physical_delete_spec(
         length: Some(length),
         content_offset: delete.content_offset(),
         content_size_in_bytes: delete.content_size_in_bytes(),
+        referenced_data_file: delete.referenced_data_file().map(str::to_string),
     })
 }
 
@@ -1224,6 +1225,7 @@ fn validate_split_delete_cost(
             sequence_number: Some(delete.data_sequence_number()),
             partition_spec_id: Some(split.partition_spec_id()),
             partition_key: None,
+            referenced_data_file: delete.referenced_data_file().map(str::to_string),
             equality_column_names: Vec::new(),
             equality_field_ids: delete.equality_field_ids().to_vec(),
         });
@@ -1551,6 +1553,7 @@ mod tests {
                 data_sequence_number: self.data_sequence_number,
                 content_offset: self.content_offset,
                 content_size_in_bytes: self.content_size_in_bytes,
+                referenced_data_file: None,
                 decryption_data: None,
             })
             .expect("valid delete descriptor")

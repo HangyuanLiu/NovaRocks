@@ -44,6 +44,7 @@ pub struct IcebergDeleteFileSpec {
     pub length: Option<u64>,
     pub content_offset: Option<i64>,
     pub content_size_in_bytes: Option<i64>,
+    pub referenced_data_file: Option<String>,
 }
 
 impl IcebergDeleteFileSpec {
@@ -55,6 +56,7 @@ impl IcebergDeleteFileSpec {
             length,
             content_offset: None,
             content_size_in_bytes: None,
+            referenced_data_file: None,
         }
     }
 
@@ -71,6 +73,7 @@ impl IcebergDeleteFileSpec {
             length,
             content_offset: Some(content_offset),
             content_size_in_bytes: Some(content_size_in_bytes),
+            referenced_data_file: None,
         }
     }
 }
@@ -137,6 +140,7 @@ pub fn delete_specs_for_data_file(
                 length: delete.length.and_then(|length| u64::try_from(length).ok()),
                 content_offset: delete.content_offset,
                 content_size_in_bytes: delete.content_size_in_bytes,
+                referenced_data_file: delete.referenced_data_file.clone(),
             })
         })
         .collect()
@@ -250,6 +254,7 @@ mod tests {
             sequence_number: None,
             partition_spec_id: None,
             partition_key: None,
+            referenced_data_file: None,
             equality_column_names: Vec::new(),
             equality_field_ids: Vec::new(),
         });

@@ -432,6 +432,7 @@ fn delete_descriptor_of(
         data_sequence_number,
         content_offset: read_delete.content_offset,
         content_size_in_bytes: read_delete.content_size_in_bytes,
+        referenced_data_file: read_delete.referenced_data_file.clone(),
         decryption_data: facts.decryption_data.clone(),
     })
 }

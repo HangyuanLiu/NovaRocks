@@ -503,7 +503,8 @@ pub fn equality_delete_handle_from_payload(
 }
 
 /// Decode frozen position-delete or deletion-vector facts and validate the
-/// mandatory `_file UTF8, _pos INT64` prefix before a BE creates files.
+/// mandatory row-identity prefix before a BE creates files. Ordinary DML uses
+/// `_file`/`_pos`; `REWRITE_POSITION_DELETE_FILES` uses `file_path`/`pos`.
 pub fn position_delete_handle_from_payload(
     bytes: &[u8],
     input_schema: &SchemaRef,
@@ -515,13 +516,15 @@ pub fn position_delete_handle_from_payload(
     ) {
         return Err("Iceberg connector writer mode is not supported by the position-delete execution adapter".to_string());
     }
-    if input_schema.fields().len() < 2
-        || input_schema.fields()[0].name() != "_file"
-        || input_schema.fields()[0].data_type() != &DataType::Utf8
-        || input_schema.fields()[1].name() != "_pos"
-        || input_schema.fields()[1].data_type() != &DataType::Int64
+    let fields = input_schema.fields();
+    let accepted_identity_names = fields.len() >= 2
+        && ((fields[0].name() == "_file" && fields[1].name() == "_pos")
+            || (fields[0].name() == "file_path" && fields[1].name() == "pos"));
+    if !accepted_identity_names
+        || fields[0].data_type() != &DataType::Utf8
+        || fields[1].data_type() != &DataType::Int64
     {
-        return Err("Iceberg position-delete writer requires (_file UTF8, _pos INT64) as its first two input columns".to_string());
+        return Err("Iceberg position-delete writer requires (_file UTF8, _pos INT64) or (file_path UTF8, pos INT64) as its first two input columns".to_string());
     }
     Ok(IcebergPositionDeleteHandle {
         mode: payload.mode,

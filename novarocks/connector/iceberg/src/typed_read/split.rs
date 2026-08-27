@@ -212,6 +212,8 @@ pub struct IcebergDeleteFileParams {
     pub content_offset: Option<i64>,
     /// Puffin deletion vector only.
     pub content_size_in_bytes: Option<i64>,
+    /// Iceberg manifest identity of the data file this delete artifact applies to.
+    pub referenced_data_file: Option<String>,
     pub decryption_data: Option<ParquetFileDecryptionData>,
 }
 
@@ -229,6 +231,7 @@ pub struct IcebergDeleteFile {
     data_sequence_number: i64,
     content_offset: Option<i64>,
     content_size_in_bytes: Option<i64>,
+    referenced_data_file: Option<Arc<str>>,
     decryption_data: Option<ParquetFileDecryptionData>,
 }
 
@@ -246,12 +249,20 @@ impl IcebergDeleteFile {
             data_sequence_number,
             content_offset,
             content_size_in_bytes,
+            referenced_data_file,
             decryption_data,
         } = params;
 
         if path.is_empty() || path.len() > MAX_PATH_BYTES {
             return Err(invalid(
                 "iceberg delete file path must be non-empty and bounded",
+            ));
+        }
+        if let Some(referenced_data_file) = &referenced_data_file
+            && (referenced_data_file.is_empty() || referenced_data_file.len() > MAX_PATH_BYTES)
+        {
+            return Err(invalid(
+                "iceberg delete referenced data file must be non-empty and bounded",
             ));
         }
         if record_count < 0 || file_size_in_bytes < 0 || data_sequence_number < 0 {
@@ -335,6 +346,7 @@ impl IcebergDeleteFile {
             data_sequence_number,
             content_offset,
             content_size_in_bytes,
+            referenced_data_file: referenced_data_file.map(Arc::from),
             decryption_data,
         })
     }
@@ -383,6 +395,10 @@ impl IcebergDeleteFile {
         self.content_size_in_bytes
     }
 
+    pub fn referenced_data_file(&self) -> Option<&str> {
+        self.referenced_data_file.as_deref()
+    }
+
     pub const fn decryption_data(&self) -> Option<&ParquetFileDecryptionData> {
         self.decryption_data.as_ref()
     }
@@ -390,6 +406,10 @@ impl IcebergDeleteFile {
     fn retained_size_in_bytes(&self) -> usize {
         size_of::<Self>()
             + self.path.len()
+            + self
+                .referenced_data_file
+                .as_ref()
+                .map_or(0, |path| path.len())
             + self.equality_field_ids.len() * size_of::<i32>()
             + self
                 .decryption_data
@@ -410,6 +430,7 @@ impl IcebergDeleteFile {
             data_sequence_number: self.data_sequence_number,
             content_offset: self.content_offset,
             content_size_in_bytes: self.content_size_in_bytes,
+            referenced_data_file: self.referenced_data_file.as_ref().map(ToString::to_string),
             decryption_data: self
                 .decryption_data
                 .as_ref()
@@ -430,6 +451,7 @@ impl IcebergDeleteFile {
             data_sequence_number: raw.data_sequence_number,
             content_offset: raw.content_offset,
             content_size_in_bytes: raw.content_size_in_bytes,
+            referenced_data_file: raw.referenced_data_file.clone(),
             decryption_data: raw
                 .decryption_data
                 .as_ref()
@@ -878,6 +900,7 @@ pub(super) mod tests {
             data_sequence_number: 5,
             content_offset: None,
             content_size_in_bytes: None,
+            referenced_data_file: None,
             decryption_data: None,
         })
         .expect("position delete")
@@ -899,6 +922,7 @@ pub(super) mod tests {
             data_sequence_number: 6,
             content_offset: None,
             content_size_in_bytes: None,
+            referenced_data_file: None,
             decryption_data: None,
         })
         .expect("equality delete")
@@ -956,6 +980,7 @@ pub(super) mod tests {
             data_sequence_number: 1,
             content_offset: None,
             content_size_in_bytes: None,
+            referenced_data_file: None,
             decryption_data: None,
         };
         assert!(IcebergDeleteFile::try_new(params.clone()).is_err());

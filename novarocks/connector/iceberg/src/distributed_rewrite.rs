@@ -591,6 +591,18 @@ pub(crate) struct IcebergRewriteGroupPayloadV1 {
     pub artifact_location: String,
 }
 
+/// One exact group together with the immutable artifact that authenticated it.
+///
+/// The group alone is insufficient at a typed TableExecute boundary: the root
+/// owns the table identity and base-generation fences that prove which table
+/// state the group was cut from. Keep those facts together until every caller
+/// has validated them against its pinned relation.
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergLoadedFrozenRewriteGroupV1 {
+    pub artifact: IcebergFrozenRewriteArtifactV1,
+    pub group: IcebergFrozenRewriteGroupV1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactRootV1 {
@@ -639,7 +651,7 @@ pub(crate) fn load_frozen_rewrite_group(
     runtime: &IcebergMetadataContext,
     file_io: &crate::iceberg::io::FileIO,
     payload: &IcebergRewriteGroupPayloadV1,
-) -> Result<IcebergFrozenRewriteGroupV1, ConnectorError> {
+) -> Result<IcebergLoadedFrozenRewriteGroupV1, ConnectorError> {
     let root_location = format!("{}/manifest.json", payload.artifact_location);
     let root_bytes = read_artifact_file(
         runtime,
@@ -700,11 +712,16 @@ pub(crate) fn load_frozen_rewrite_group(
             "Iceberg rewrite logical artifact digest is invalid",
         ));
     }
-    logical
+    let group = logical
         .groups
-        .into_iter()
+        .iter()
         .find(|group| group.group_digest_hex == payload.group_digest_hex)
-        .ok_or_else(|| invalid("Iceberg rewrite artifact has no requested group"))
+        .cloned()
+        .ok_or_else(|| invalid("Iceberg rewrite artifact has no requested group"))?;
+    Ok(IcebergLoadedFrozenRewriteGroupV1 {
+        artifact: logical,
+        group,
+    })
 }
 
 fn write_frozen_artifact(
@@ -1198,8 +1215,8 @@ pub(crate) fn frozen_rewrite_scan_schema(
 ) -> SchemaRef {
     match operation_kind {
         REWRITE_POSITION_DELETES_KIND => Arc::new(Schema::new(vec![
-            Field::new("_file", DataType::Utf8, false),
-            Field::new("_pos", DataType::Int64, false),
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
         ])),
         _ if row_lineage => {
             let mut fields = physical_schema.fields().to_vec();
@@ -1247,9 +1264,14 @@ pub(crate) fn plan_rewrite_position_delete_splits(
     snapshot_id: i64,
     group_payload: &IcebergRewriteGroupPayloadV1,
 ) -> Result<(IcebergDataFileInfo, Vec<IcebergDeleteFileInfo>), ConnectorError> {
-    let group = load_frozen_rewrite_group(runtime, table.file_io(), group_payload)?;
+    let loaded = load_frozen_rewrite_group(runtime, table.file_io(), group_payload)?;
+    // The table can advance after the TableExecute relation was frozen. Its
+    // later current snapshot must never become a substitute generation for the
+    // immutable rewrite artifact, so fail before split dispatch if that fence
+    // no longer holds.
+    validate_frozen_rewrite_table(&loaded.artifact, table.metadata())?;
     let live = live_delete_file_paths_at(runtime, table, snapshot_id)?;
-    select_rewrite_position_delete_artifacts(&group, &live, snapshot_id)
+    select_rewrite_position_delete_artifacts(&loaded.group, &live, snapshot_id)
 }
 
 /// Pick out exactly the delete artifacts one frozen group names.
@@ -1988,6 +2010,7 @@ mod tests {
             sequence_number: Some(7),
             partition_spec_id: Some(0),
             partition_key: None,
+            referenced_data_file: Some("s3://bucket/data-1.parquet".to_string()),
             equality_column_names: Vec::new(),
             equality_field_ids: Vec::new(),
         }
@@ -2127,6 +2150,7 @@ mod tests {
             sequence_number: Some(3),
             partition_spec_id: Some(0),
             partition_key: None,
+            referenced_data_file: None,
             equality_column_names: vec!["id".to_string()],
             equality_field_ids: vec![1],
         };
@@ -2175,6 +2199,7 @@ mod tests {
             sequence_number: Some(3),
             partition_spec_id: Some(0),
             partition_key: None,
+            referenced_data_file: None,
             equality_column_names: Vec::new(),
             equality_field_ids: Vec::new(),
         });

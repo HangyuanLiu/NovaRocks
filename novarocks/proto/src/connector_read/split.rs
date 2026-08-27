@@ -489,6 +489,14 @@ fn validate_delete_file(
     let content = known_delete_content(raw.content, path.field("content"))?;
     let format = known_file_format(raw.format, path.field("format"))?;
     budget.text(&raw.path, MAX_PATH_BYTES, path.field("path"), false)?;
+    if let Some(referenced_data_file) = raw.referenced_data_file.as_deref() {
+        budget.text(
+            referenced_data_file,
+            MAX_PATH_BYTES,
+            path.field("referenced_data_file"),
+            false,
+        )?;
+    }
     nonnegative_i64(raw.record_count, path.field("record_count"), "record count")?;
     let file_size = nonnegative_i64(
         raw.file_size_in_bytes,
@@ -1004,6 +1012,12 @@ fn validate_rewrite_split(
                 "a rewrite split selects puffin deletion vectors only",
             ));
         }
+        if delete.referenced_data_file.as_deref() != Some(raw.data_file_path.as_str()) {
+            return Err(inconsistent(
+                delete_path.field("referenced_data_file"),
+                "a rewrite split deletion vector must name its exact data file",
+            ));
+        }
     }
     Ok(())
 }
@@ -1055,6 +1069,7 @@ mod tests {
             data_sequence_number: 8,
             content_offset: None,
             content_size_in_bytes: None,
+            referenced_data_file: None,
             decryption_data: None,
         }
     }
@@ -1067,6 +1082,7 @@ mod tests {
             path: "s3://bucket/table/data/0001-deletes.puffin".to_owned(),
             content_offset: Some(4),
             content_size_in_bytes: Some(64),
+            referenced_data_file: Some("s3://bucket/table/data/0001.parquet".to_owned()),
             ..position_delete()
         }
     }
@@ -1693,6 +1709,33 @@ mod tests {
         assert_eq!(
             error.path().to_string(),
             "connector_split.rewrite_position_delete_files.iceberg.selected_position_deletes"
+        );
+
+        let mut missing_identity = deletion_vector();
+        missing_identity.referenced_data_file = None;
+        let error = ValidatedConnectorSplit::parse(
+            envelope(rewrite_category(vec![missing_identity])),
+            root(),
+        )
+        .expect_err("missing data-file identity");
+        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
+        assert_eq!(
+            error.path().to_string(),
+            "connector_split.rewrite_position_delete_files.iceberg.selected_position_deletes[0].referenced_data_file"
+        );
+
+        let mut foreign_identity = deletion_vector();
+        foreign_identity.referenced_data_file =
+            Some("s3://bucket/table/data/other.parquet".to_owned());
+        let error = ValidatedConnectorSplit::parse(
+            envelope(rewrite_category(vec![foreign_identity])),
+            root(),
+        )
+        .expect_err("foreign data-file identity");
+        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
+        assert_eq!(
+            error.path().to_string(),
+            "connector_split.rewrite_position_delete_files.iceberg.selected_position_deletes[0].referenced_data_file"
         );
     }
 

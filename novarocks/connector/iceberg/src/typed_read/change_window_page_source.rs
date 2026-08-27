@@ -444,6 +444,7 @@ mod tests {
             data_sequence_number,
             content_offset: None,
             content_size_in_bytes: None,
+            referenced_data_file: None,
             decryption_data: None,
         })
         .expect("valid delete descriptor")
