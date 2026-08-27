@@ -39,6 +39,7 @@ use crate::query_execution::maintenance::{
     MaintenanceStatementResult, OptimizeSubmission, TableMaintenanceEngine,
     TableMaintenanceService,
 };
+use crate::workload_lifecycle::FrontendServingLifecycle;
 
 use self::activity::{MaintenanceActivityFamily, TableMaintenanceActivity};
 pub(crate) use self::admission::{
@@ -76,6 +77,7 @@ pub struct FrontendTableMaintenanceService {
     runtime: Handle,
     lake_publication_runtime_policy:
         Option<crate::common::admitted_query_context::LakePublicationRuntimePolicy>,
+    workload_lifecycle: Option<FrontendServingLifecycle>,
 }
 
 impl FrontendTableMaintenanceService {
@@ -106,6 +108,7 @@ impl FrontendTableMaintenanceService {
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime,
             lake_publication_runtime_policy: None,
+            workload_lifecycle: None,
         })
     }
 
@@ -114,6 +117,12 @@ impl FrontendTableMaintenanceService {
         policy: crate::common::admitted_query_context::LakePublicationRuntimePolicy,
     ) -> Self {
         self.lake_publication_runtime_policy = Some(policy);
+        self
+    }
+
+    /// Installs the FE lifecycle used to admit current-process OPTIMIZE attempts.
+    pub(crate) fn with_workload_lifecycle(mut self, lifecycle: FrontendServingLifecycle) -> Self {
+        self.workload_lifecycle = Some(lifecycle);
         self
     }
 
@@ -576,11 +585,16 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
         match &*lifecycle {
             WorkerLifecycle::NotStarted => {
+                let workload_lifecycle = self.workload_lifecycle.clone().ok_or_else(|| {
+                    "table maintenance worker requires the shared frontend serving lifecycle"
+                        .to_string()
+                })?;
                 *lifecycle = WorkerLifecycle::Started(OptimizeWorker::start_with_executor(
                     &self.runtime,
                     Arc::clone(&self.optimize_runtime),
                     Arc::downgrade(&engine),
                     Arc::new(DirectOptimizeExecutor),
+                    workload_lifecycle,
                 )?);
                 Ok(())
             }

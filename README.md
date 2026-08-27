@@ -132,13 +132,17 @@ Build artifacts:
 Deployable role configuration is explicit. Use the two templates as a pair:
 
 - `novarocks-fe.toml.example`: FE MySQL, coordinator-report gRPC, management
-  HTTP, StateStore, and additive backend seeds.
+  HTTP, an explicit catalog source, and optional local Accelerator carrier.
+- `novarocks-catalogs.toml.example`: the immutable, explicit empty catalog
+  snapshot paired with the static-file FE template.
 - `novarocks-be.toml.example`: BE Native gRPC, management HTTP, and local
   connector execution binding.
 
-Both files must contain `[cluster].role`; the command line asserts that role
-and never changes it. A frontend role uses `[state_store]` for durable control-plane
-state, never backend membership. A minimal FE outline is:
+Both role files must contain `[cluster].role`; the command line asserts that role
+and never changes it. A frontend selects exactly one `[catalog_source]` authority.
+This outline uses `dynamic-state-store` because it permits SQL catalog mutation;
+the checked-in FE template instead uses its paired static snapshot. `[state_store]`
+never selects the source mode implicitly and never owns backend membership.
 
 ```toml
 [state_store]
@@ -157,6 +161,9 @@ http_port = 8040
 
 [cluster]
 role = "fe"
+
+[catalog_source]
+mode = "dynamic-state-store"
 
 [standalone_server]
 mysql_port = 9030

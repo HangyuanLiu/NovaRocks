@@ -333,32 +333,41 @@ pub fn build_frontend_query_session_factory(
     host.dml_service()
         .install_local_catalog(Arc::clone(&catalog_service));
 
-    Ok(Arc::new(crate::query::FrontendQueryService::new(
-        session_catalog_resolver,
-        query_compiler,
-        catalog_command_executor,
-        statistics_command_executor,
-        backend_command_executor,
-        view_command_executor,
-        iceberg_ref_command_executor,
-        mv_command_executor,
-        maintenance_command_executor,
-        maintenance_read_command_executor,
-        host.query_control_service(),
-        client_connection_control,
-        query_execution,
-        role,
-        topology,
-        host.dml_service(),
-        dml_engines.insert,
-        dml_engines.delete,
-        dml_engines.mutation,
-        dml_engines.add_files,
-        dml_engines.ctas,
-        dml_engines.truncate,
-        host.optimizer_query_mem_limit_bytes(),
-        host.lake_publication_runtime_policy(),
-    )))
+    let query_service = Arc::new(
+        crate::query::FrontendQueryService::new(
+            session_catalog_resolver,
+            query_compiler,
+            catalog_command_executor,
+            statistics_command_executor,
+            backend_command_executor,
+            view_command_executor,
+            iceberg_ref_command_executor,
+            mv_command_executor,
+            maintenance_command_executor,
+            maintenance_read_command_executor,
+            host.query_control_service(),
+            client_connection_control,
+            query_execution,
+            role,
+            topology,
+            host.dml_service(),
+            dml_engines.insert,
+            dml_engines.delete,
+            dml_engines.mutation,
+            dml_engines.add_files,
+            dml_engines.ctas,
+            dml_engines.truncate,
+            host.optimizer_query_mem_limit_bytes(),
+            host.lake_publication_runtime_policy(),
+        )
+        .with_serving_lifecycle((*host.serving_lifecycle()).clone()),
+    );
+    host.serving_lifecycle().mark_ready().map_err(|error| {
+        FrontendApplicationError::server(format!(
+            "mark frontend serving lifecycle ready after bootstrap: {error:?}"
+        ))
+    })?;
+    Ok(query_service)
 }
 
 pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendApplicationError> {

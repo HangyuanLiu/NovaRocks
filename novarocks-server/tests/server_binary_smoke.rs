@@ -125,6 +125,9 @@ role = "fe"
 heartbeat_interval_ms = 100
 heartbeat_timeout_retries = 10
 
+[catalog_source]
+mode = "dynamic-state-store"
+
 [state_store]
 provider = "sqlite"
 cluster_id = "server-binary-smoke"
@@ -568,6 +571,9 @@ mysql_port = {}
 
 [cluster]
 role = "fe"
+
+[catalog_source]
+mode = "dynamic-state-store"
 
 [state_store]
 provider = "sqlite"

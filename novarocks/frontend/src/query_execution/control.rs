@@ -20,7 +20,9 @@
 use std::sync::Arc;
 
 use crate::client_connection::ClientConnectionToken;
-use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationView};
+use crate::common::query_cancellation::{
+    QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionIdentity {
@@ -160,6 +162,13 @@ pub trait QueryControlPort: Send + Sync + 'static {
         &self,
         session: SessionToken,
     ) -> Result<StatementRegistration, QueryControlError>;
+    fn begin_statement_with_cancellation(
+        &self,
+        session: SessionToken,
+        _cancellation: QueryCancellationSource,
+    ) -> Result<StatementRegistration, QueryControlError> {
+        self.begin_statement(session)
+    }
     fn finish_statement(&self, statement: StatementToken) -> StatementFinishOutcome;
     fn cancel_session_statement(
         &self,
@@ -201,7 +210,17 @@ impl QueryControlService {
         &self,
         session: SessionToken,
     ) -> Result<ActiveStatementLease, QueryControlError> {
-        let registration = self.port.begin_statement(session)?;
+        self.begin_statement_with_cancellation(session, QueryCancellationSource::new())
+    }
+
+    pub fn begin_statement_with_cancellation(
+        &self,
+        session: SessionToken,
+        cancellation: QueryCancellationSource,
+    ) -> Result<ActiveStatementLease, QueryControlError> {
+        let registration = self
+            .port
+            .begin_statement_with_cancellation(session, cancellation)?;
         Ok(ActiveStatementLease {
             service: self.clone(),
             registration,

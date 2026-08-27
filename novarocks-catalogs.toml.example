@@ -1,0 +1,5 @@
+# Immutable catalog desired-state snapshot for novarocks-fe.toml.example.
+# Copy this file next to the FE config as novarocks-catalogs.toml. An explicit
+# empty snapshot is valid; a missing or malformed file fails FE startup.
+format_version = 1
+catalogs = []

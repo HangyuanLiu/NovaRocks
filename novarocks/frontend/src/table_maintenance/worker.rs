@@ -32,6 +32,7 @@ use tokio::task::JoinHandle;
 use crate::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceTargetRebind, TableMaintenanceEngine,
 };
+use crate::workload_lifecycle::{FrontendServingLifecycle, FrontendWorkloadKind};
 
 use super::model::OptimizeJob;
 use super::now_unix_millis;
@@ -71,6 +72,7 @@ impl OptimizeWorker {
         jobs: Arc<OptimizeProcessRuntime>,
         engine: Weak<dyn TableMaintenanceEngine>,
         executor: Arc<dyn OptimizeJobExecutor>,
+        workload_lifecycle: FrontendServingLifecycle,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let wakeup = Arc::new(Notify::new());
@@ -86,6 +88,7 @@ impl OptimizeWorker {
                 executor,
                 worker_stop,
                 worker_wakeup,
+                workload_lifecycle,
             )
             .await
         });
@@ -130,6 +133,7 @@ async fn run_worker(
     executor: Arc<dyn OptimizeJobExecutor>,
     stop: Arc<AtomicBool>,
     wakeup: Arc<Notify>,
+    workload_lifecycle: FrontendServingLifecycle,
 ) -> Result<(), String> {
     loop {
         if stop.load(Ordering::Acquire) {
@@ -148,18 +152,31 @@ async fn run_worker(
                 })?;
             return Ok(());
         };
+        let workload_lease = match workload_lifecycle.try_admit(FrontendWorkloadKind::Background) {
+            Ok(lease) => lease,
+            Err(_) => return Ok(()),
+        };
         let Some(job) = jobs
             .claim_next(now_unix_millis())
             .await
             .map_err(|error| format!("claim current optimize job failed: {error}"))?
         else {
+            drop(workload_lease);
             tokio::select! {
                 _ = wakeup.notified() => {}
                 _ = jobs.wait_for_change() => {}
             }
             continue;
         };
-        execute_claimed_job(&runtime, jobs.as_ref(), engine, Arc::clone(&executor), job).await?;
+        execute_claimed_job(
+            &runtime,
+            jobs.as_ref(),
+            engine,
+            Arc::clone(&executor),
+            job,
+            workload_lease.cancellation_source().view(),
+        )
+        .await?;
     }
 }
 
@@ -169,9 +186,34 @@ async fn execute_claimed_job(
     engine: Arc<dyn TableMaintenanceEngine>,
     executor: Arc<dyn OptimizeJobExecutor>,
     job: OptimizeJob,
+    cancellation: crate::common::query_cancellation::QueryCancellationView,
 ) -> Result<(), String> {
     let job_id = job.job_id;
+    if cancellation.is_cancelled() {
+        jobs.finish(
+            job_id,
+            Err(OptimizeTerminalError::failed(
+                "optimize job cancelled before target rebind",
+            )),
+            now_unix_millis(),
+        )
+        .await
+        .map_err(|error| format!("record cancelled optimize job failed: {error}"))?;
+        return Ok(());
+    }
     stat2f_before_rebind_barrier(job_id)?;
+    if cancellation.is_cancelled() {
+        jobs.finish(
+            job_id,
+            Err(OptimizeTerminalError::failed(
+                "optimize job cancelled before target rebind",
+            )),
+            now_unix_millis(),
+        )
+        .await
+        .map_err(|error| format!("record cancelled optimize job failed: {error}"))?;
+        return Ok(());
+    }
     let expected_object_id = ConnectorTableObjectId::try_new(Bytes::copy_from_slice(
         &job.object_id,
     ))
@@ -194,10 +236,11 @@ async fn execute_claimed_job(
             .map_err(|error| format!("record optimize pre-dispatch terminal failed: {error}"))?;
         return Ok(());
     }
-    if jobs
-        .cancellation_requested(job_id)
-        .await
-        .map_err(|error| format!("read optimize cancellation failed: {error}"))?
+    if cancellation.is_cancelled()
+        || jobs
+            .cancellation_requested(job_id)
+            .await
+            .map_err(|error| format!("read optimize cancellation failed: {error}"))?
     {
         jobs.finish(
             job_id,

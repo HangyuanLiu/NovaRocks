@@ -562,6 +562,7 @@ fn map_query_service_error(kind: QueryServiceErrorKind) -> ErrorKind {
         QueryServiceErrorKind::Timeout => ErrorKind::ER_UNKNOWN_ERROR,
         QueryServiceErrorKind::InvalidValue => ErrorKind::ER_WRONG_VALUE,
         QueryServiceErrorKind::Unavailable => ErrorKind::ER_UNKNOWN_ERROR,
+        QueryServiceErrorKind::FrontendDraining => ErrorKind::ER_SERVER_SHUTDOWN,
         QueryServiceErrorKind::Internal => ErrorKind::ER_UNKNOWN_ERROR,
     }
 }
@@ -588,6 +589,11 @@ fn query_service_error_mapping_keeps_wire_concerns_in_frontend() {
         map_query_service_error(QueryServiceErrorKind::Unavailable),
         ErrorKind::ER_UNKNOWN_ERROR
     );
+    assert_eq!(
+        map_query_service_error(QueryServiceErrorKind::FrontendDraining),
+        ErrorKind::ER_SERVER_SHUTDOWN
+    );
+    assert_eq!(ErrorKind::ER_SERVER_SHUTDOWN.sqlstate(), b"08S01");
 }
 
 #[cfg(test)]

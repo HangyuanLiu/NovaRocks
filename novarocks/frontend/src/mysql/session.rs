@@ -170,6 +170,8 @@ pub enum QueryServiceErrorKind {
     Timeout,
     InvalidValue,
     Unavailable,
+    /// The FE-local serving lifecycle has irreversibly closed workload admission.
+    FrontendDraining,
     Internal,
 }
 
@@ -182,6 +184,16 @@ pub struct QueryServiceError {
 }
 
 impl QueryServiceError {
+    pub const FRONTEND_DRAINING_MESSAGE: &'static str =
+        "FRONTEND_DRAINING: frontend is draining; retry on another frontend";
+
+    pub fn frontend_draining() -> Self {
+        Self::new(
+            QueryServiceErrorKind::FrontendDraining,
+            Self::FRONTEND_DRAINING_MESSAGE,
+        )
+    }
+
     pub fn new(kind: QueryServiceErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -279,6 +291,16 @@ mod tests {
         assert_eq!(error.kind(), QueryServiceErrorKind::Timeout);
         assert_eq!(error.message(), "deadline elapsed");
         assert!(error.user_error().is_none());
+    }
+
+    #[test]
+    fn frontend_draining_error_uses_the_fixed_retry_message() {
+        let error = QueryServiceError::frontend_draining();
+        assert_eq!(error.kind(), QueryServiceErrorKind::FrontendDraining);
+        assert_eq!(
+            error.message(),
+            "FRONTEND_DRAINING: frontend is draining; retry on another frontend"
+        );
     }
 
     #[test]

@@ -107,6 +107,14 @@ impl QueryControlPort for FrontendQueryControl {
         &self,
         session: SessionToken,
     ) -> Result<StatementRegistration, QueryControlError> {
+        self.begin_statement_with_cancellation(session, QueryCancellationSource::new())
+    }
+
+    fn begin_statement_with_cancellation(
+        &self,
+        session: SessionToken,
+        cancellation: QueryCancellationSource,
+    ) -> Result<StatementRegistration, QueryControlError> {
         let mut state = self.lock();
         let entry = state
             .sessions
@@ -122,7 +130,6 @@ impl QueryControlPort for FrontendQueryControl {
         if entry.next_statement_generation == 0 {
             entry.next_statement_generation = 1;
         }
-        let cancellation = QueryCancellationSource::new();
         let registration = StatementRegistration::new(
             StatementToken::new(session, entry.next_statement_generation),
             cancellation.view(),
@@ -356,6 +363,32 @@ mod tests {
         assert!(
             control.begin_statement(target).is_ok(),
             "only the matching active generation is released"
+        );
+    }
+
+    #[test]
+    fn caller_owned_cancellation_source_controls_the_registered_statement() {
+        let control = FrontendQueryControl::default();
+        let session = register(&control, 7, 1, "root");
+        let source = QueryCancellationSource::new();
+        let active = control
+            .begin_statement_with_cancellation(session, source.clone())
+            .expect("begin statement with lifecycle source");
+
+        assert_eq!(
+            source.request(QueryCancellationReason::FrontendDrainDeadlineExceeded {
+                timeout_ms: 300_000,
+            }),
+            crate::common::query_cancellation::QueryCancellationRequestResult::Requested
+        );
+        assert!(active.cancellation().is_cancelled());
+        assert_eq!(
+            control.finish_statement(active.token()),
+            StatementFinishOutcome::Cancelled(
+                QueryCancellationReason::FrontendDrainDeadlineExceeded {
+                    timeout_ms: 300_000,
+                }
+            )
         );
     }
 

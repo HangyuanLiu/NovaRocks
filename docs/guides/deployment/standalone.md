@@ -40,9 +40,12 @@ FE 配置必须包括：
 - `[standalone_server].mysql_port`；
 - FE Native gRPC 的 `[server].grpc_port`；
 - FE management HTTP 的 `[server].http_port`；
-- durable `[state_store]`；
+- 一个显式 `[catalog_source]`：静态部署使用随配置挂载的 snapshot；只有需要 SQL
+  `CREATE/DROP CATALOG` 时才选择 `dynamic-state-store` 并配置 `[state_store]`；
+- 可选 `[state_store]` Accelerator carrier（SQLite `emptyDir` 可以随 Pod 删除；它不是 StaticFile
+  catalog truth）；
 - 与 BE 相同的 mandatory `[native_trust]` deployment id、shared secret 和 transport mode；
-- 指向 BE Native gRPC endpoint 的 `[cluster].backends` additive seed。
+- BE 会向 FE Native gRPC endpoint 自注册；`[cluster].backends` 不是 deployment 配置。
 
 BE 配置必须包括自身不同的 Native gRPC 与 management HTTP 端口，以及本地
 connector object-store binding。两份配置在同一进程共享 logging 与 data-runtime
@@ -108,13 +111,16 @@ cargo run -p novarocks-server -- standalone --role all-in-one \
 
 ## 停止与排障
 
-前台运行时按 `Ctrl-C`。后台运行时记录 PID 并优先发送 `SIGTERM`。
+前台运行时按 `Ctrl-C`。后台运行时记录 PID 并优先发送 `SIGTERM`。FE 收到信号后先
+停止新 workload 准入，等待已准入工作最多 300 秒，再最多用 30 秒完成 teardown；all-in-one
+会先完成 FE drain，之后才停止本地 BE。
 
 | 现象 | 处理方式 |
 | --- | --- |
 | 启动前报 endpoint overlap | 为 FE MySQL、FE/BE Native gRPC、FE/BE management HTTP 分配不同端口；也检查 wildcard bind。 |
 | 启动前报 process configuration mismatch | 两份配置的 logging 与 data-runtime sizing 必须相同。 |
-| FE 提示缺少 StateStore | 为 FE 配置 durable `[state_store]`；不要以 transient/in-memory membership 替代。 |
+| FE 提示缺少 StaticFile snapshot | 复制 `novarocks-catalogs.toml.example` 到 FE config 同目录，并使 `[catalog_source].static_file_path` 指向它；文件缺失不会降级为空 snapshot。 |
+| FE 提示 DynamicStateStore 缺少 StateStore | 仅在 `[catalog_source].mode = "dynamic-state-store"` 时配置 durable `[state_store]`；不要以 transient/in-memory membership 替代。 |
 | native trust preflight failure | 使 FE/BE 的 `deployment_id`、resolved shared secret 与 transport mode 完全相同；完整 secret rotation 只能 homogeneous restart。 |
 | Native RPC `Unauthenticated` 或 TLS handshake failure | 检查 secret/env、token clock 和双方 TLS profile；不要降级或删除 JWT 来绕过失败。 |
 | 访问 `/metrics` 得到 Native 协议错误或 404 | 改访问对应 role 的 management HTTP port，而不是 Native gRPC port。 |
