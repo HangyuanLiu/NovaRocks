@@ -28,11 +28,13 @@
 //! types only inside the provider that produced them.
 // Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
 
+pub mod adapter;
 pub mod dynamic_filter;
 pub mod handle;
 pub mod page_source;
 pub mod predicate;
 pub mod projection;
+pub mod runtime;
 pub mod session;
 pub mod split;
 pub mod split_source;
@@ -57,6 +59,16 @@ pub use predicate::{
 pub use projection::{
     Assignment, ConstraintApplicationResult, LimitApplicationResult, MAX_PROJECTION_ASSIGNMENTS,
     OrderedAssignments, ProjectionApplicationResult,
+};
+pub use runtime::{
+    ConnectorReadBinding, ConnectorReadChangeWindow, ConnectorReadColumnBinding,
+    ConnectorReadColumnHandle, ConnectorReadConstraint, ConnectorReadDynamicFilter,
+    ConnectorReadDynamicFilterSnapshot, ConnectorReadFilterApplication,
+    ConnectorReadFrozenRewriteGroup, ConnectorReadLimitApplication, ConnectorReadMetadata,
+    ConnectorReadPageSourceProvider, ConnectorReadProviderFactory, ConnectorReadRelationVersion,
+    ConnectorReadSplit, ConnectorReadSplitFacts, ConnectorReadSplitManager,
+    ConnectorReadSplitSource, ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider,
+    ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle, ConnectorReadTransactionHandle,
 };
 pub use session::{ConnectorSession, MAX_SESSION_PROPERTIES, SessionPropertyValue};
 pub use split::{ConnectorSplit, HostAddress, STANDARD_SPLIT_WEIGHT_RAW, SplitWeight};
