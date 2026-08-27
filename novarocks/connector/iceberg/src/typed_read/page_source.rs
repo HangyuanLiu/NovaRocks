@@ -1509,7 +1509,6 @@ impl IcebergParquetPageSource {
 
             let facts = IcebergSplitFacts {
                 path: self.split.path(),
-                partition_data_json: self.split.partition_data_json(),
                 file_first_row_id: self.split.file_first_row_id(),
                 data_sequence_number: self.split.data_sequence_number(),
             };

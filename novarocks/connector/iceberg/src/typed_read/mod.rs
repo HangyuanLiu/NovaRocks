@@ -80,12 +80,12 @@ pub use page_source_provider::{
     iceberg_change_window_split, iceberg_data_split, iceberg_scan_columns, iceberg_table_handle,
 };
 pub use schema_binding::{
-    FileFieldIdCoverage, ICEBERG_METADATA_FIELD_ID_FILE_MODIFIED_TIME,
-    ICEBERG_METADATA_FIELD_ID_IS_DELETED, ICEBERG_METADATA_FIELD_ID_PARTITION,
-    ICEBERG_METADATA_FIELD_ID_PATH, ICEBERG_METADATA_FIELD_ID_ROW_POSITION, IcebergBoundColumn,
-    IcebergColumnSource, IcebergMetadataColumn, IcebergPhysicalAdaptation, IcebergSchemaBinding,
-    IcebergSchemaBindingRequest, IcebergSplitFacts, IcebergTypePromotion, bind_scan_columns,
-    file_field_id_coverage, physical_adaptation,
+    ALWAYS_BOUND_METADATA_COLUMNS, FileFieldIdCoverage, ICEBERG_METADATA_FIELD_ID_IS_DELETED,
+    ICEBERG_METADATA_FIELD_ID_PATH, ICEBERG_METADATA_FIELD_ID_ROW_POSITION,
+    ROW_LINEAGE_METADATA_COLUMNS, IcebergBoundColumn, IcebergColumnSource, IcebergMetadataColumn,
+    IcebergPhysicalAdaptation, IcebergSchemaBinding, IcebergSchemaBindingRequest,
+    IcebergSplitFacts, IcebergTypePromotion, bind_scan_columns, file_field_id_coverage,
+    physical_adaptation,
 };
 pub use split::{
     DEFAULT_MINIMUM_ASSIGNED_SPLIT_WEIGHT, IcebergDeleteFile, IcebergDeleteFileContent,

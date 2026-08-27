@@ -56,7 +56,9 @@ use crate::iceberg::spec::{
     Type,
 };
 use crate::row_lineage_synth::{
+    ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL,
     ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+    ICEBERG_ROW_ID_COL, ICEBERG_ROW_POS_COL,
 };
 use crate::schema_mapping::{
     apply_name_mapping_to_schema, field_id_for_arrow_field, is_variant_struct_data_type,
@@ -66,88 +68,111 @@ use crate::schema_mapping::{
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, parse_type, unsupported};
 
-/// `$path`: the absolute location of the data file a row came from.
+/// `_file`: the absolute location of the data file a row came from.
 pub const ICEBERG_METADATA_FIELD_ID_PATH: i32 = i32::MAX - 1;
-/// `_pos`: the row's file-level absolute zero-based position. Internal only.
+/// `_pos`: the row's file-level absolute zero-based position.
 pub const ICEBERG_METADATA_FIELD_ID_ROW_POSITION: i32 = i32::MAX - 2;
 /// `_deleted`: whether a delete matched the row. Internal only.
 pub const ICEBERG_METADATA_FIELD_ID_IS_DELETED: i32 = i32::MAX - 3;
-/// `$partition`: the file's frozen partition values.
-pub const ICEBERG_METADATA_FIELD_ID_PARTITION: i32 = i32::MAX - 100;
-/// `$file_modified_time`: the data file's last modification time.
-pub const ICEBERG_METADATA_FIELD_ID_FILE_MODIFIED_TIME: i32 = i32::MAX - 101;
 
 /// A column that is not a field of the table schema.
 ///
-/// The externally visible set is exactly `$partition`, `$path`,
-/// `$file_modified_time`, `$row_id`, and `$last_updated_sequence_number`.
-/// `_pos` and `_deleted` exist only so a delete filter can name what it needs;
-/// they are never part of a scan's declared output.
+/// The names are the engine's own: `_file`, `_pos`, `_row_id` and
+/// `_last_updated_sequence_number` are what a query writes, what the frontend
+/// asks a relation to bind, and therefore what the boundary must publish. This
+/// enum is the single place they are spelled, so the identity a scan is planned
+/// with and the identity a reader answers can never drift apart.
+///
+/// Every variant here is one this page source can actually produce. `_deleted`
+/// is the exception and is deliberately not externally visible: only a read
+/// that keeps deleted rows can answer it, so it exists solely for a delete
+/// filter to name what it needs.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum IcebergMetadataColumn {
-    Partition,
     Path,
-    FileModifiedTime,
+    RowPosition,
     RowId,
     LastUpdatedSequenceNumber,
-    RowPosition,
     IsDeleted,
 }
+
+/// The metadata columns every data relation exposes, in publication order.
+///
+/// `_file` and `_pos` are facts of the split and of the row's position in its
+/// file, so they exist for every Iceberg table regardless of format version.
+pub const ALWAYS_BOUND_METADATA_COLUMNS: [IcebergMetadataColumn; 2] = [
+    IcebergMetadataColumn::Path,
+    IcebergMetadataColumn::RowPosition,
+];
+
+/// The metadata columns a row-lineage-bearing relation adds, in publication
+/// order.
+///
+/// They are absent from a table without row lineage rather than bound and
+/// empty: `_row_id` is `first_row_id + position`, and a table that stores no
+/// `first_row_id` has no value to report.
+pub const ROW_LINEAGE_METADATA_COLUMNS: [IcebergMetadataColumn; 2] = [
+    IcebergMetadataColumn::RowId,
+    IcebergMetadataColumn::LastUpdatedSequenceNumber,
+];
 
 impl IcebergMetadataColumn {
     pub const fn field_id(self) -> i32 {
         match self {
-            Self::Partition => ICEBERG_METADATA_FIELD_ID_PARTITION,
             Self::Path => ICEBERG_METADATA_FIELD_ID_PATH,
-            Self::FileModifiedTime => ICEBERG_METADATA_FIELD_ID_FILE_MODIFIED_TIME,
+            Self::RowPosition => ICEBERG_METADATA_FIELD_ID_ROW_POSITION,
             Self::RowId => ICEBERG_RESERVED_FIELD_ID_ROW_ID,
             Self::LastUpdatedSequenceNumber => {
                 ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
             }
-            Self::RowPosition => ICEBERG_METADATA_FIELD_ID_ROW_POSITION,
             Self::IsDeleted => ICEBERG_METADATA_FIELD_ID_IS_DELETED,
         }
     }
 
     pub const fn column_name(self) -> &'static str {
         match self {
-            Self::Partition => "$partition",
-            Self::Path => "$path",
-            Self::FileModifiedTime => "$file_modified_time",
-            Self::RowId => "$row_id",
-            Self::LastUpdatedSequenceNumber => "$last_updated_sequence_number",
-            Self::RowPosition => "_pos",
+            Self::Path => ICEBERG_FILE_PATH_COL,
+            Self::RowPosition => ICEBERG_ROW_POS_COL,
+            Self::RowId => ICEBERG_ROW_ID_COL,
+            Self::LastUpdatedSequenceNumber => ICEBERG_LAST_UPDATED_SEQ_COL,
             Self::IsDeleted => "_deleted",
+        }
+    }
+
+    /// The Iceberg type a handle for this column must declare.
+    ///
+    /// Both ends read it from here: the boundary mints the published handle
+    /// with it and the binder checks the handle against it, so a declared type
+    /// cannot disagree with the array the reader builds.
+    pub const fn declared_type(self) -> PrimitiveType {
+        match self {
+            Self::Path => PrimitiveType::String,
+            Self::RowPosition | Self::RowId | Self::LastUpdatedSequenceNumber => {
+                PrimitiveType::Long
+            }
+            Self::IsDeleted => PrimitiveType::Boolean,
         }
     }
 
     /// Whether a scan may name this column in its declared output.
     pub const fn is_externally_visible(self) -> bool {
         match self {
-            Self::Partition
-            | Self::Path
-            | Self::FileModifiedTime
-            | Self::RowId
-            | Self::LastUpdatedSequenceNumber => true,
-            Self::RowPosition | Self::IsDeleted => false,
+            Self::Path | Self::RowPosition | Self::RowId | Self::LastUpdatedSequenceNumber => true,
+            Self::IsDeleted => false,
         }
     }
 
     pub const fn from_field_id(field_id: i32) -> Option<Self> {
         // Written as a chain rather than a `match` because the arms are
         // associated constants, which patterns cannot name.
-        if field_id == ICEBERG_METADATA_FIELD_ID_PARTITION {
-            Some(Self::Partition)
-        } else if field_id == ICEBERG_METADATA_FIELD_ID_PATH {
+        if field_id == ICEBERG_METADATA_FIELD_ID_PATH {
             Some(Self::Path)
-        } else if field_id == ICEBERG_METADATA_FIELD_ID_FILE_MODIFIED_TIME {
-            Some(Self::FileModifiedTime)
+        } else if field_id == ICEBERG_METADATA_FIELD_ID_ROW_POSITION {
+            Some(Self::RowPosition)
         } else if field_id == ICEBERG_RESERVED_FIELD_ID_ROW_ID {
             Some(Self::RowId)
         } else if field_id == ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER {
             Some(Self::LastUpdatedSequenceNumber)
-        } else if field_id == ICEBERG_METADATA_FIELD_ID_ROW_POSITION {
-            Some(Self::RowPosition)
         } else if field_id == ICEBERG_METADATA_FIELD_ID_IS_DELETED {
             Some(Self::IsDeleted)
         } else {
@@ -237,7 +262,6 @@ impl IcebergBoundColumn {
 #[derive(Clone, Copy, Debug)]
 pub struct IcebergSplitFacts<'a> {
     pub path: &'a str,
-    pub partition_data_json: &'a str,
     pub file_first_row_id: Option<i64>,
     pub data_sequence_number: Option<i64>,
 }
@@ -742,25 +766,12 @@ fn bind_metadata_column(
         ));
     }
     let declared = parse_type(handle.type_json(), "type_json")?;
+    expect_primitive(&declared, metadata.declared_type(), metadata)?;
     let data_type = match metadata {
-        IcebergMetadataColumn::Path | IcebergMetadataColumn::Partition => {
-            expect_primitive(&declared, PrimitiveType::String, metadata)?;
-            DataType::Utf8
-        }
-        IcebergMetadataColumn::RowId
-        | IcebergMetadataColumn::LastUpdatedSequenceNumber
-        | IcebergMetadataColumn::RowPosition => {
-            expect_primitive(&declared, PrimitiveType::Long, metadata)?;
-            DataType::Int64
-        }
-        // The file's modification time is neither a manifest fact nor a
-        // physical fact this reader can obtain: the object-store binding
-        // exposes only a size. Inventing one would make a metadata read lie.
-        IcebergMetadataColumn::FileModifiedTime => {
-            return Err(unsupported(
-                "iceberg $file_modified_time is not carried by a frozen split fact",
-            ));
-        }
+        IcebergMetadataColumn::Path => DataType::Utf8,
+        IcebergMetadataColumn::RowPosition
+        | IcebergMetadataColumn::RowId
+        | IcebergMetadataColumn::LastUpdatedSequenceNumber => DataType::Int64,
         // `_deleted` only means something to a reader that keeps deleted rows.
         // This page source excludes them, so the column would be a constant
         // false dressed up as an answer.
@@ -1103,10 +1114,6 @@ fn metadata_column(
         IcebergMetadataColumn::Path => {
             Arc::new(arrow::array::StringArray::from(vec![facts.path; row_count]))
         }
-        IcebergMetadataColumn::Partition => Arc::new(arrow::array::StringArray::from(vec![
-            facts.partition_data_json;
-            row_count
-        ])),
         IcebergMetadataColumn::RowPosition => {
             let positions = require_positions()?;
             Arc::new(arrow::array::Int64Array::from(
@@ -1129,7 +1136,7 @@ fn metadata_column(
             // facts; neither is defaulted, and the sum never wraps.
             let first_row_id = facts.file_first_row_id.ok_or_else(|| {
                 corrupt(format!(
-                    "iceberg data file {} carries no first row id, so $row_id cannot be built",
+                    "iceberg data file {} carries no first row id, so _row_id cannot be built",
                     facts.path
                 ))
             })?;
@@ -1144,7 +1151,7 @@ fn metadata_column(
                             .map_err(|_| corrupt("iceberg absolute row position exceeds int64"))?;
                         first_row_id.checked_add(position).ok_or_else(|| {
                             corrupt(format!(
-                                "iceberg $row_id overflows int64 for data file {}",
+                                "iceberg _row_id overflows int64 for data file {}",
                                 facts.path
                             ))
                         })
@@ -1155,13 +1162,13 @@ fn metadata_column(
         IcebergMetadataColumn::LastUpdatedSequenceNumber => {
             let sequence = facts.data_sequence_number.ok_or_else(|| {
                 corrupt(format!(
-                    "iceberg data file {} carries no data sequence number, so $last_updated_sequence_number cannot be built",
+                    "iceberg data file {} carries no data sequence number, so _last_updated_sequence_number cannot be built",
                     facts.path
                 ))
             })?;
             Arc::new(arrow::array::Int64Array::from(vec![sequence; row_count]))
         }
-        IcebergMetadataColumn::FileModifiedTime | IcebergMetadataColumn::IsDeleted => {
+        IcebergMetadataColumn::IsDeleted => {
             return Err(unsupported(format!(
                 "iceberg metadata column {} is not produced by this page source",
                 metadata.column_name()
@@ -1299,7 +1306,6 @@ mod tests {
         .expect("physical batch");
         let facts = IcebergSplitFacts {
             path: "s3://bucket/data/file.parquet",
-            partition_data_json: "{\"1000\":\"emea\"}",
             file_first_row_id: None,
             data_sequence_number: None,
         };
@@ -1417,7 +1423,6 @@ mod tests {
         .expect("physical batch");
         let facts = IcebergSplitFacts {
             path: "file.parquet",
-            partition_data_json: "{}",
             file_first_row_id: None,
             data_sequence_number: None,
         };
@@ -1534,7 +1539,6 @@ mod tests {
         .expect("physical batch");
         let facts = IcebergSplitFacts {
             path: "file.parquet",
-            partition_data_json: "{}",
             file_first_row_id: None,
             data_sequence_number: None,
         };
@@ -1563,7 +1567,6 @@ mod tests {
         .expect("physical batch");
         let facts = IcebergSplitFacts {
             path: "file.parquet",
-            partition_data_json: "{}",
             file_first_row_id: None,
             data_sequence_number: None,
         };
@@ -1617,7 +1620,6 @@ mod tests {
             .expect("physical batch");
         let facts = IcebergSplitFacts {
             path: "file.parquet",
-            partition_data_json: "{}",
             file_first_row_id: None,
             data_sequence_number: None,
         };
@@ -1635,11 +1637,10 @@ mod tests {
 
     #[test]
     fn row_id_overflow_fails_closed_instead_of_wrapping() {
-        let target = Field::new("$row_id", DataType::Int64, false);
+        let target = Field::new("_row_id", DataType::Int64, false);
         let positions = UInt64Array::from(vec![1_u64]);
         let facts = IcebergSplitFacts {
             path: "file.parquet",
-            partition_data_json: "{}",
             file_first_row_id: Some(i64::MAX),
             data_sequence_number: Some(3),
         };
@@ -1659,10 +1660,9 @@ mod tests {
 
     #[test]
     fn row_lineage_without_a_frozen_fact_fails_closed() {
-        let target = Field::new("$last_updated_sequence_number", DataType::Int64, false);
+        let target = Field::new("_last_updated_sequence_number", DataType::Int64, false);
         let facts = IcebergSplitFacts {
             path: "file.parquet",
-            partition_data_json: "{}",
             file_first_row_id: None,
             data_sequence_number: None,
         };
@@ -1679,26 +1679,62 @@ mod tests {
     }
 
     #[test]
-    fn only_the_five_external_metadata_columns_are_visible() {
-        for column in [
-            IcebergMetadataColumn::Partition,
-            IcebergMetadataColumn::Path,
-            IcebergMetadataColumn::FileModifiedTime,
-            IcebergMetadataColumn::RowId,
-            IcebergMetadataColumn::LastUpdatedSequenceNumber,
-        ] {
+    fn every_metadata_column_a_scan_may_name_is_spelled_the_way_the_engine_asks_for_it() {
+        let published = ALWAYS_BOUND_METADATA_COLUMNS
+            .into_iter()
+            .chain(ROW_LINEAGE_METADATA_COLUMNS)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            published
+                .iter()
+                .map(|column| column.column_name())
+                .collect::<Vec<_>>(),
+            vec![
+                "_file",
+                "_pos",
+                "_row_id",
+                "_last_updated_sequence_number"
+            ]
+        );
+        for column in published {
             assert!(column.is_externally_visible(), "{column:?}");
             assert_eq!(
                 IcebergMetadataColumn::from_field_id(column.field_id()),
                 Some(column)
             );
         }
-        for column in [
-            IcebergMetadataColumn::RowPosition,
-            IcebergMetadataColumn::IsDeleted,
-        ] {
-            assert!(!column.is_externally_visible(), "{column:?}");
-        }
+        // `_deleted` is the one metadata column this page source cannot answer,
+        // so it is the one a scan may never name.
+        assert!(!IcebergMetadataColumn::IsDeleted.is_externally_visible());
+        assert_eq!(
+            IcebergMetadataColumn::from_field_id(IcebergMetadataColumn::IsDeleted.field_id()),
+            Some(IcebergMetadataColumn::IsDeleted)
+        );
+    }
+
+    #[test]
+    fn a_metadata_column_a_scan_may_not_name_refuses_to_bind() {
+        let handle = IcebergColumnHandle::try_new(IcebergColumnHandleParams {
+            base_column_identity: crate::typed_read::column_handle::ColumnIdentity::try_new(
+                ICEBERG_METADATA_FIELD_ID_IS_DELETED,
+                "_deleted",
+                crate::typed_read::column_handle::ColumnIdentityCategory::Primitive,
+                Vec::new(),
+            )
+            .expect("identity"),
+            base_type_json: "\"boolean\"".to_owned(),
+            field_id_path: Vec::new(),
+            type_json: "\"boolean\"".to_owned(),
+            nullable: true,
+            comment: None,
+        })
+        .expect("handle");
+        let error = bind_metadata_column(&handle, IcebergMetadataColumn::IsDeleted)
+            .expect_err("_deleted never binds");
+        assert_eq!(
+            error.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported
+        );
     }
 
     #[test]

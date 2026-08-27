@@ -113,47 +113,11 @@ const READER_VISIBLE_TABLE_PROPERTIES: [&str; 4] = [
     "read.split.target-size",
 ];
 
-/// Iceberg's reserved field ID for the `_file` metadata column.
-const RESERVED_FIELD_ID_FILE_PATH: i32 = i32::MAX - 1;
-
-/// Iceberg's reserved field ID for the `_partition` metadata column.
-const RESERVED_FIELD_ID_PARTITION: i32 = i32::MAX - 5;
-
 /// Iceberg's reserved field ID for `pos` in the position-delete schema.
 ///
 /// A position-delete file publishes its row-position bounds under this ID, so
 /// it is how the manifest walk recovers them without opening the delete file.
 const RESERVED_FIELD_ID_DELETE_FILE_POS: i32 = i32::MAX - 102;
-
-/// The field ID this connector assigns to `$file_modified_time`.
-///
-/// Iceberg reserves IDs 2147483447..=2147483646 for metadata columns but
-/// assigns no ID to a file's modification time: the object store, not the table
-/// format, owns that fact. Taking the lowest ID of the reserved block keeps it
-/// from ever colliding with a format-assigned metadata column or with a real
-/// table field, which the format keeps below the block.
-const RESERVED_FIELD_ID_FILE_MODIFIED_TIME: i32 = i32::MAX - 200;
-
-/// The Iceberg field name behind the `$partition` pseudo-column.
-const ICEBERG_PARTITION_COL: &str = "_partition";
-
-/// The Iceberg field name behind the `$file_modified_time` pseudo-column.
-const ICEBERG_FILE_MODIFIED_TIME_COL: &str = "_file_modified_time";
-
-/// SQL-visible name of the data file path pseudo-column.
-pub const PSEUDO_COLUMN_PATH: &str = "$path";
-
-/// SQL-visible name of the partition-value pseudo-column.
-pub const PSEUDO_COLUMN_PARTITION: &str = "$partition";
-
-/// SQL-visible name of the file modification-time pseudo-column.
-pub const PSEUDO_COLUMN_FILE_MODIFIED_TIME: &str = "$file_modified_time";
-
-/// SQL-visible name of the Iceberg v3 row-id pseudo-column.
-pub const PSEUDO_COLUMN_ROW_ID: &str = "$row_id";
-
-/// SQL-visible name of the Iceberg v3 row-lineage sequence pseudo-column.
-pub const PSEUDO_COLUMN_LAST_UPDATED_SEQUENCE_NUMBER: &str = "$last_updated_sequence_number";
 
 /// One Iceberg system relation reachable as `<table>$<suffix>`.
 ///
@@ -585,21 +549,28 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
     ) -> Result<Vec<TypedColumnBinding>, ConnectorError> {
         self.ensure_owned(table)?;
         // A change window exposes a different column set from the data
-        // relation it differences, so the two are answered separately rather
-        // than by one shape that would have to be right for both.
+        // relation it differences, and a system relation exposes metadata
+        // columns rather than table fields. Each is answered separately rather
+        // than by one shape that would have to be right for all three.
         match table.relation() {
             ConnectorRelation::ChangeWindow(_) => {
                 change_window_column_bindings(&self.change_window_handle(table)?)
             }
+            ConnectorRelation::SystemTable(reference) => {
+                self.system_relation_column_bindings(reference)
+            }
             ConnectorRelation::Table(_)
             | ConnectorRelation::TableFunction(_)
-            | ConnectorRelation::SystemTable(_)
             | ConnectorRelation::TableExecute(_)
             | ConnectorRelation::MergeTable(_) => {
                 let handle = self.data_table_handle(table)?;
                 let schema = handle.parse_table_schema()?;
                 let fields = schema.as_struct().fields();
-                let mut bindings = Vec::with_capacity(fields.len() + 5);
+                let mut bindings = Vec::with_capacity(
+                    fields.len()
+                        + ALWAYS_BOUND_METADATA_COLUMNS.len()
+                        + ROW_LINEAGE_METADATA_COLUMNS.len(),
+                );
                 for field in fields {
                     let column = IcebergColumnHandle::base_column(field.as_ref())?;
                     bindings.push(TypedColumnBinding::new(
@@ -608,7 +579,8 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
                         false,
                     ));
                 }
-                for (name, column) in metadata_pseudo_columns(&handle, &schema)? {
+                for (name, column) in metadata_pseudo_columns(self.relation_has_row_lineage(&handle)?)?
+                {
                     bindings.push(TypedColumnBinding::new(
                         name,
                         iceberg_column_to_wire(&column)?,
@@ -1261,79 +1233,44 @@ fn reader_visible_storage_properties(
 // Column bindings
 // ---------------------------------------------------------------------------
 
-/// The hidden Iceberg metadata columns, paired with their SQL-visible names.
+/// The hidden Iceberg metadata columns of one data relation.
 ///
-/// Each one is addressable by name but never part of `SELECT *`. The SQL name
-/// is the `$`-prefixed spelling; the identity behind it is the Iceberg reserved
-/// field, so a rename of a real table column can never collide with one.
+/// Each one is addressable by name but never part of `SELECT *`. The name is
+/// the engine's own spelling -- `_file`, `_pos`, `_row_id`,
+/// `_last_updated_sequence_number` -- because that is what a query writes and
+/// what the frontend asks this relation to bind. Both the name and the declared
+/// type come from [`IcebergMetadataColumn`], which is also what the reader binds
+/// against, so a published identity and a readable one cannot drift apart.
+///
+/// `row_lineage` decides membership, not nullability: a table without row
+/// lineage has no `first_row_id` to build `_row_id` from, so those two columns
+/// are absent rather than bound and empty.
 fn metadata_pseudo_columns(
-    handle: &IcebergTableHandle,
-    schema: &Schema,
+    row_lineage: bool,
 ) -> Result<Vec<(&'static str, IcebergColumnHandle)>, ConnectorError> {
-    let spec_id = handle.spec_id().ok_or_else(|| {
-        corrupt("iceberg table handle carries no default partition spec for $partition")
-    })?;
-    let partition_type = handle
-        .parse_partition_spec(spec_id)?
-        .partition_type(schema)
-        .map_err(|error| {
-            corrupt(format!(
-                "iceberg partition spec {spec_id} does not bind to the frozen table schema: {error}"
-            ))
-        })?;
-
-    Ok(vec![
-        (
-            PSEUDO_COLUMN_PATH,
-            pseudo_column(
-                RESERVED_FIELD_ID_FILE_PATH,
-                ICEBERG_FILE_PATH_COL,
-                Type::Primitive(PrimitiveType::String),
-            )?,
-        ),
-        (
-            PSEUDO_COLUMN_PARTITION,
-            pseudo_column(
-                RESERVED_FIELD_ID_PARTITION,
-                ICEBERG_PARTITION_COL,
-                Type::Struct(partition_type),
-            )?,
-        ),
-        (
-            PSEUDO_COLUMN_FILE_MODIFIED_TIME,
-            pseudo_column(
-                RESERVED_FIELD_ID_FILE_MODIFIED_TIME,
-                ICEBERG_FILE_MODIFIED_TIME_COL,
-                Type::Primitive(PrimitiveType::Timestamptz),
-            )?,
-        ),
-        (
-            PSEUDO_COLUMN_ROW_ID,
-            pseudo_column(
-                ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                ICEBERG_ROW_ID_COL,
-                Type::Primitive(PrimitiveType::Long),
-            )?,
-        ),
-        (
-            PSEUDO_COLUMN_LAST_UPDATED_SEQUENCE_NUMBER,
-            pseudo_column(
-                ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER,
-                ICEBERG_LAST_UPDATED_SEQ_COL,
-                Type::Primitive(PrimitiveType::Long),
-            )?,
-        ),
-    ])
+    let mut columns = Vec::with_capacity(
+        ALWAYS_BOUND_METADATA_COLUMNS.len() + ROW_LINEAGE_METADATA_COLUMNS.len(),
+    );
+    for metadata in ALWAYS_BOUND_METADATA_COLUMNS {
+        columns.push((metadata.column_name(), pseudo_column(metadata)?));
+    }
+    if row_lineage {
+        for metadata in ROW_LINEAGE_METADATA_COLUMNS {
+            columns.push((metadata.column_name(), pseudo_column(metadata)?));
+        }
+    }
+    Ok(columns)
 }
 
-/// A metadata column is always optional: a v2 table has no row lineage, and a
-/// synthesized column is absent rather than wrong when the fact is unavailable.
-fn pseudo_column(
-    field_id: i32,
-    name: &str,
-    field_type: Type,
-) -> Result<IcebergColumnHandle, ConnectorError> {
-    IcebergColumnHandle::base_column(&NestedField::optional(field_id, name, field_type))
+/// A metadata column is always optional: it is synthesized per row from split
+/// facts, and a nullable declaration is what lets the engine model a row the
+/// fact does not cover.
+fn pseudo_column(metadata: IcebergMetadataColumn) -> Result<IcebergColumnHandle, ConnectorError> {
+    IcebergColumnHandle::base_column(&NestedField::optional(
+        metadata.field_id(),
+        metadata.column_name(),
+        Type::Primitive(metadata.declared_type()),
+    ))
 }
 
 // ---------------------------------------------------------------------------
