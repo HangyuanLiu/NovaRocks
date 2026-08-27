@@ -1933,7 +1933,7 @@ pub trait ServerHandle: Send {
     fn kill_query_until(&mut self, connection_id: u32, _deadline: Instant) -> Result<()> {
         self.kill_query(connection_id)
     }
-    fn backend_process_id(&self, index: usize) -> Result<String> {
+    fn backend_process_id(&self, index: usize) -> Result<novarocks_types::BackendProcessId> {
         bail!("backend process identity is unsupported by this server mode (index={index})")
     }
     fn fe_log_count(&self, needle: &str) -> Result<usize> {
@@ -3573,7 +3573,7 @@ impl ServerHandle for CrossProcessServerHandle {
             })
     }
 
-    fn backend_process_id(&self, index: usize) -> Result<String> {
+    fn backend_process_id(&self, index: usize) -> Result<novarocks_types::BackendProcessId> {
         self.ensure_be_index(index)?;
         let grpc_port = self.be_grpc_ports[index];
         let rows = query_frontend_backend_topology(
@@ -3594,6 +3594,13 @@ impl ServerHandle for CrossProcessServerHandle {
                 anyhow::anyhow!(
                     "SHOW BACKENDS has no row for cross-process BE[{index}] grpc_port={grpc_port}"
                 )
+            })?
+            // The harness is where wire text becomes a typed fact: a caller
+            // comparing two process identities must not be handed two strings
+            // that merely look alike.
+            .parse::<novarocks_types::BackendProcessId>()
+            .with_context(|| {
+                format!("SHOW BACKENDS process_id for BE[{index}] is not a backend process id")
             })
     }
 
@@ -3834,7 +3841,7 @@ impl ServerHandle for CrossProcessServerHandle {
             });
             if observed
                 .as_ref()
-                .is_some_and(|row| row.alive && row.process_id != old_process_id)
+                .is_some_and(|row| row.alive && row.process_id != old_process_id.to_string())
             {
                 println!(
                     "cross-process BE[{index}] process-identity barrier PASS: old_process_id={old_process_id} new_process_id={}",
