@@ -1,8 +1,10 @@
 use crate::actors::mysql as mysql_actor;
-use crate::scenario::{Scenario, ScenarioContext};
+use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::{CrossProcessConfigOverlay, ServerHandle};
+use std::fs;
+use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -11,7 +13,84 @@ const REQUIRED_BACKENDS: usize = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![Box::new(GracefulDrain)]
+    vec![
+        Box::new(StaticFileDisposableCarrier),
+        Box::new(GracefulDrain),
+    ]
+}
+
+struct StaticFileDisposableCarrier;
+
+impl Scenario for StaticFileDisposableCarrier {
+    fn name(&self) -> &'static str {
+        "frontend-lifecycle/static-file-disposable-carrier"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let warehouse = scenario_root.join("static-file-warehouse");
+        fs::create_dir_all(&warehouse)
+            .with_context(|| format!("create StaticFile warehouse {}", warehouse.display()))?;
+        let snapshot = scenario_root.join("catalogs.toml");
+        fs::write(
+            &snapshot,
+            format!(
+                "format_version = 1\n\
+                 [[catalogs]]\n\
+                 instance_id = \"catalog.lnp8_static\"\n\
+                 provider_id = \"iceberg\"\n\
+                 display_name = \"lnp8_static\"\n\
+                 config_format_version = 1\n\
+                 [catalogs.properties]\n\
+                 type = \"iceberg\"\n\
+                 \"iceberg.catalog.type\" = \"hadoop\"\n\
+                 \"iceberg.catalog.warehouse\" = \"{}\"\n",
+                warehouse.display()
+            ),
+        )
+        .with_context(|| format!("write StaticFile snapshot {}", snapshot.display()))?;
+        Ok(ScenarioLaunchConfig {
+            config_overlay: CrossProcessConfigOverlay {
+                fe: Some(format!(
+                    "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n",
+                    snapshot.display()
+                )),
+                be: None,
+            },
+            ..Default::default()
+        })
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let state_before = context
+            .handle()
+            .frontend_management_get("/v1/frontend/state", Duration::from_secs(2))?;
+        let digest_before = static_snapshot_digest(&state_before.body)?;
+        ensure!(
+            state_before
+                .body
+                .contains("\"source_mode\":\"static-file\"")
+                && state_before.body.contains("\"desired\":1"),
+            "StaticFile bootstrap state is incomplete: {}",
+            state_before.body
+        );
+        context.action("captured the bootstrapped StaticFile catalog snapshot identity");
+
+        let deadline = context.deadline();
+        context
+            .handle()
+            .wipe_fe_state_store_and_restart_until(deadline)
+            .context("dispose FE SQLite state and restart from StaticFile")?;
+        let state_after = context
+            .handle()
+            .frontend_management_get("/v1/frontend/state", Duration::from_secs(2))?;
+        ensure!(
+            static_snapshot_digest(&state_after.body)? == digest_before,
+            "StaticFile snapshot digest changed after FE disposal"
+        );
+        context.action("proved an empty FE SQLite store rebuilt the same StaticFile catalog state");
+        Ok(())
+    }
 }
 
 struct GracefulDrain;
@@ -79,6 +158,30 @@ impl Scenario for GracefulDrain {
         context.action("FE exited successfully only after its admitted work completed");
         Ok(())
     }
+}
+
+fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
+    let count = context.handle().be_count();
+    ensure!(
+        count == REQUIRED_BACKENDS,
+        "{} requires native 1FE+3BE, received 1FE+{count}BE",
+        context.name()
+    );
+    context.action("verified native 1FE+3BE topology");
+    Ok(())
+}
+
+fn static_snapshot_digest(state: &str) -> Result<String> {
+    let marker = "\"digest\":\"";
+    let start = state
+        .find(marker)
+        .map(|offset| offset + marker.len())
+        .context("StaticFile management state omitted catalog snapshot digest")?;
+    let end = state[start..]
+        .find('"')
+        .map(|offset| start + offset)
+        .context("StaticFile management state has an unterminated catalog digest")?;
+    Ok(state[start..end].to_string())
 }
 
 fn wait_for_active_statement(context: &mut ScenarioContext) -> Result<()> {
