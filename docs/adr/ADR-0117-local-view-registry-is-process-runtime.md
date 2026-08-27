@@ -7,7 +7,7 @@ supersedes: []
 superseded-by: null
 date: 2026-08-26
 provenance:
-  - "PR: pending; mechanism: closed frontend state family manifest and catalog desired-state source modes"
+  - "PR: https://github.com/NovaRocks/NovaRocks/pull/984"
   - "discussion: 2026-08-25, which frontend-local state may remain durable"
 code-anchors:
   - "novarocks/frontend/src/view/mod.rs (FrontendViewService)"
