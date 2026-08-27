@@ -1415,11 +1415,15 @@ fn validate_disjoint_splits(splits: &[IcebergChangeSplit]) -> Result<(), Connect
     Ok(())
 }
 
-/// Byte ranges of one variant must cover the file exactly once.
+/// Byte ranges of one variant must cover the file's planned scan region
+/// exactly once.
 ///
 /// A gap silently drops rows the difference owns; an overlap emits them twice.
 /// Both are indistinguishable from a correct answer downstream, so they are
-/// rejected here rather than surfaced as a wrong materialized view.
+/// rejected here rather than surfaced as a wrong materialized view. The first
+/// range need not start at byte zero: manifest split offsets identify row-group
+/// boundaries, and a Parquet file commonly starts its first row group after
+/// the file header.
 fn validate_tiling(
     path: &str,
     variant: &'static str,
@@ -1428,7 +1432,7 @@ fn validate_tiling(
 ) -> Result<(), ConnectorError> {
     let mut sorted = ranges.to_vec();
     sorted.sort_unstable();
-    let mut cursor = 0_i64;
+    let mut cursor = sorted.first().map_or(0_i64, |(start, _)| *start);
     for (start, length) in sorted {
         if start != cursor {
             return Err(corrupt(format!(
@@ -1957,7 +1961,7 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_data_file_must_cover_every_one_of_its_bytes_exactly_once() {
+    fn a_removed_data_file_must_cover_its_planned_scan_region_exactly_once() {
         // Two ranges that tile the file are fine.
         let tiled = expect_incremental(vec![
             IcebergChangeSplit::DeletedDataFileRows(
@@ -1976,6 +1980,27 @@ mod tests {
             ),
         ]);
         assert_eq!(tiled.splits().len(), 2);
+
+        // Parquet manifest offsets begin at the first row group, commonly
+        // after the four-byte file header. That header contains no row the
+        // change window could own.
+        let offset_tiled = expect_incremental(vec![
+            IcebergChangeSplit::DeletedDataFileRows(
+                IcebergDeletedDataFileRows::try_new(
+                    data_split("offset.parquet", 4, 36, 100),
+                    Vec::new(),
+                )
+                .expect("removed"),
+            ),
+            IcebergChangeSplit::DeletedDataFileRows(
+                IcebergDeletedDataFileRows::try_new(
+                    data_split("offset.parquet", 40, 60, 100),
+                    Vec::new(),
+                )
+                .expect("removed"),
+            ),
+        ]);
+        assert_eq!(offset_tiled.splits().len(), 2);
 
         // A gap silently drops rows the difference owns.
         let error = plan(vec![IcebergChangeSplit::DeletedDataFileRows(

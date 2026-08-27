@@ -946,9 +946,10 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
             return Ok(None);
         };
         let metadata = physical.table.metadata();
-        let snapshot_id = pin_snapshot(metadata, version, reference)?;
-        self.wrap_table(pinned_table_handle(name, metadata, snapshot_id)?)
-            .map(Some)
+        self.wrap_table(table_handle_for_version(
+            name, metadata, version, reference,
+        )?)
+        .map(Some)
     }
 
     fn get_pinned_file_set_handle(
@@ -1005,7 +1006,8 @@ impl TypedConnectorMetadata for IcebergTypedBoundary {
         // than by one shape that would have to be right for all three.
         match table.relation() {
             ConnectorRelation::ChangeWindow(_) => {
-                change_window_column_bindings(&self.change_window_handle(table)?)
+                let handle = self.change_window_handle(table)?;
+                change_window_column_bindings(&handle)
             }
             ConnectorRelation::SystemTable(reference) => {
                 self.system_relation_column_bindings(reference)
@@ -1595,6 +1597,26 @@ fn pinned_table_handle(
     pinned_table_handle_with_files(name, metadata, snapshot_id, None)
 }
 
+fn table_handle_for_version(
+    name: &SchemaTableName,
+    metadata: &TableMetadata,
+    version: TypedRelationVersion,
+    reference: Option<&str>,
+) -> Result<IcebergTableHandle, ConnectorError> {
+    let snapshot_id = pin_snapshot(metadata, version, reference)?;
+    let schema = match version {
+        // A current read pins the current snapshot for row visibility but
+        // projects it through the table's current schema. Iceberg field IDs
+        // make metadata-only add/rename evolution readable without a new
+        // snapshot.
+        TypedRelationVersion::Current => metadata.current_schema().clone(),
+        TypedRelationVersion::SnapshotId(_) | TypedRelationVersion::Reference => {
+            pinned_schema(metadata, snapshot_id)?
+        }
+    };
+    pinned_table_handle_with_schema(name, metadata, snapshot_id, schema, None)
+}
+
 fn pinned_table_handle_with_files(
     name: &SchemaTableName,
     metadata: &TableMetadata,
@@ -1602,6 +1624,16 @@ fn pinned_table_handle_with_files(
     pinned_data_files: Option<IcebergPinnedDataFileSet>,
 ) -> Result<IcebergTableHandle, ConnectorError> {
     let schema = pinned_schema(metadata, snapshot_id)?;
+    pinned_table_handle_with_schema(name, metadata, snapshot_id, schema, pinned_data_files)
+}
+
+fn pinned_table_handle_with_schema(
+    name: &SchemaTableName,
+    metadata: &TableMetadata,
+    snapshot_id: Option<i64>,
+    schema: SchemaRef,
+    pinned_data_files: Option<IcebergPinnedDataFileSet>,
+) -> Result<IcebergTableHandle, ConnectorError> {
     let mut partition_spec_jsons = BTreeMap::new();
     for spec in metadata.partition_specs_iter() {
         let json = serde_json::to_string(spec.as_ref()).map_err(|error| {
@@ -1695,11 +1727,7 @@ fn pinned_change_window_handle(
         )));
     }
 
-    let fields = to_schema.as_struct().fields();
-    let mut columns = Vec::with_capacity(fields.len());
-    for field in fields {
-        columns.push(IcebergColumnHandle::base_column(field.as_ref())?);
-    }
+    let columns = change_window_columns(to_schema.as_ref(), row_lineage_enabled(metadata))?;
     let table_schema_json = serde_json::to_string(to_schema.as_ref())
         .map_err(|error| corrupt(format!("iceberg table schema cannot be encoded: {error}")))?;
 
@@ -1819,19 +1847,38 @@ fn change_window_partition_types(
 
 /// The columns a change-window relation exposes.
 ///
-/// They are the frozen relation's own fields plus `__change_op`. The sign is
-/// visible rather than hidden because it is the point of the relation: a change
-/// row without it says a row differs between the endpoints but not in which
-/// direction. It is also the one column no file can supply -- the split variant
-/// is its only source -- so it is appended, never bound to a table field.
+/// They are the frozen relation's own fields, its frozen row-lineage metadata
+/// columns when present, and `__change_op`. The sign is visible rather than
+/// hidden because it is the point of the relation: a change row without it says
+/// a row differs between the endpoints but not in which direction. It is also
+/// the one column no file can supply -- the split variant is its only source --
+/// so it is appended, never bound to a table field.
+fn change_window_columns(
+    schema: &Schema,
+    row_lineage: bool,
+) -> Result<Vec<IcebergColumnHandle>, ConnectorError> {
+    let fields = schema.as_struct().fields();
+    let mut columns = Vec::with_capacity(
+        fields.len() + usize::from(row_lineage) * ROW_LINEAGE_METADATA_COLUMNS.len(),
+    );
+    for field in fields {
+        columns.push(IcebergColumnHandle::base_column(field.as_ref())?);
+    }
+    if row_lineage {
+        for metadata in ROW_LINEAGE_METADATA_COLUMNS {
+            columns.push(pseudo_column(metadata)?);
+        }
+    }
+    Ok(columns)
+}
+
 fn change_window_column_bindings(
     handle: &IcebergChangeWindowHandle,
 ) -> Result<Vec<TypedColumnBinding>, ConnectorError> {
-    let schema = handle.parse_table_schema()?;
-    let fields = schema.as_struct().fields();
-    let mut bindings = Vec::with_capacity(fields.len() + 1);
-    for field in fields {
-        if field.name == ICEBERG_CHANGE_OP_COLUMN {
+    let mut bindings = Vec::with_capacity(handle.columns().len() + 1);
+    for column in handle.columns() {
+        let name = column.base_column_identity().name();
+        if name == ICEBERG_CHANGE_OP_COLUMN {
             // Two columns of the same name would make the relation ambiguous,
             // and silently renaming either one would hide a real collision.
             return Err(unsupported(format!(
@@ -1840,11 +1887,13 @@ fn change_window_column_bindings(
                 handle.schema_table_name().table_name()
             )));
         }
-        let column = IcebergColumnHandle::base_column(field.as_ref())?;
+        let hidden = ROW_LINEAGE_METADATA_COLUMNS
+            .iter()
+            .any(|metadata| metadata.field_id() == column.base_field_id());
         bindings.push(TypedColumnBinding::new(
-            &field.name,
-            iceberg_column_to_wire(&column)?,
-            false,
+            name,
+            iceberg_column_to_wire(column)?,
+            hidden,
         ));
     }
     bindings.push(TypedColumnBinding::new(
@@ -2798,6 +2847,79 @@ mod tests {
             .is_err()
         );
         assert!(pin_snapshot(&metadata, TypedRelationVersion::Reference, Some("absent")).is_err());
+    }
+
+    #[test]
+    fn a_current_read_uses_the_current_schema_over_its_pinned_snapshot() {
+        let evolved = Schema::builder()
+            .with_schema_id(1)
+            .with_fields(vec![
+                StdArc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+                StdArc::new(NestedField::optional(
+                    2,
+                    "territory",
+                    Type::Primitive(PrimitiveType::String),
+                )),
+                StdArc::new(NestedField::optional(
+                    3,
+                    "amount",
+                    Type::Primitive(PrimitiveType::Long),
+                )),
+            ])
+            .build()
+            .expect("evolved schema");
+        let metadata = TableMetadataBuilder::new_from_metadata(metadata_with_history(), None)
+            .add_schema(evolved)
+            .expect("add evolved schema")
+            .set_current_schema(-1)
+            .expect("set current schema")
+            .build()
+            .expect("evolved metadata")
+            .metadata;
+
+        let current = table_handle_for_version(
+            &name("db", "t"),
+            &metadata,
+            TypedRelationVersion::Current,
+            None,
+        )
+        .expect("current handle");
+        let historical = table_handle_for_version(
+            &name("db", "t"),
+            &metadata,
+            TypedRelationVersion::SnapshotId(12),
+            None,
+        )
+        .expect("historical handle");
+
+        assert_eq!(current.snapshot_id(), Some(12));
+        assert_eq!(historical.snapshot_id(), Some(12));
+        assert_eq!(
+            current
+                .parse_table_schema()
+                .expect("current schema")
+                .as_struct()
+                .fields()
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "territory", "amount"]
+        );
+        assert_eq!(
+            historical
+                .parse_table_schema()
+                .expect("historical schema")
+                .as_struct()
+                .fields()
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["id", "region", "amount"]
+        );
     }
 
     #[test]
@@ -3778,6 +3900,36 @@ mod tests {
         // A data relation and a change window are different questions, so
         // neither carrier answers the other one's decoder.
         assert!(fixture.boundary.data_table_handle(&wrapped).is_err());
+    }
+
+    #[test]
+    fn a_row_lineage_change_window_freezes_its_hidden_lineage_columns() {
+        let schema = table_schema();
+        let columns = change_window_columns(&schema, true).expect("change columns");
+        let handle = IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
+            schema_table_name: name("db", "lineage"),
+            table_schema_json: serde_json::to_string(&schema).expect("schema json"),
+            columns,
+            name_mapping_json: None,
+            from_snapshot_id_exclusive: 11,
+            to_snapshot_id_inclusive: 12,
+            partition_spec_jsons: BTreeMap::new(),
+        })
+        .expect("change window");
+
+        let bindings = change_window_column_bindings(&handle).expect("column bindings");
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|binding| binding.is_hidden())
+                .map(TypedColumnBinding::name)
+                .collect::<Vec<_>>(),
+            vec!["_row_id", "_last_updated_sequence_number"]
+        );
+        assert_eq!(
+            bindings.last().map(TypedColumnBinding::name),
+            Some(ICEBERG_CHANGE_OP_COLUMN)
+        );
     }
 
     #[test]

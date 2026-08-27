@@ -711,6 +711,10 @@ fn prepare_planned_ctas_connector_write(
                 .connector_static_predicate_pushdown_enabled(),
             planned.connector_target_parallelism,
             None,
+        )
+        .with_typed_connector_control(
+            Arc::clone(state.typed_connector_control()),
+            crate::query_execution::compiler::typed_connector_session()?,
         ),
     )?;
     let cohort_id = template.cohort_id();
