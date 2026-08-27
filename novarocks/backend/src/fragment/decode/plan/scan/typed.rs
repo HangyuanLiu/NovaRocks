@@ -83,15 +83,14 @@ pub(super) fn lower_typed_connector_scan(
     match table.relation() {
         // A system relation is read like any other: what differs is only how
         // its work reaches this backend, which the carrier states separately as
-        // its work source. A table-execute relation is read like any other too:
-        // its splits name delete artifacts rather than data files, and the
+        // its work source. Change-window and table-execute relations are read
+        // like any other too: their splits name their specialized work, and the
         // connector's own page source is what knows the difference.
         ConnectorRelation::Table(_)
+        | ConnectorRelation::ChangeWindow(_)
         | ConnectorRelation::SystemTable(_)
         | ConnectorRelation::TableExecute(_) => {}
-        ConnectorRelation::TableFunction(_)
-        | ConnectorRelation::ChangeWindow(_)
-        | ConnectorRelation::MergeTable(_) => {
+        ConnectorRelation::TableFunction(_) | ConnectorRelation::MergeTable(_) => {
             return Err(unsupported_relation(table.relation_kind()));
         }
     }
@@ -644,6 +643,25 @@ mod tests {
         })
     }
 
+    fn change_window_relation() -> dto::catalog_table_handle::Relation {
+        dto::catalog_table_handle::Relation::ChangeWindow(dto::ConnectorChangeWindowHandle {
+            handle: Some(dto::connector_change_window_handle::Handle::Iceberg(
+                dto::IcebergChangeWindowHandle {
+                    schema_table_name: Some(test_support::schema_table_name()),
+                    table_schema_json: "{\"type\":\"struct\"}".to_owned(),
+                    columns: vec![test_support::iceberg_column_handle(1)],
+                    name_mapping_json: None,
+                    from_snapshot_id_exclusive: 3,
+                    to_snapshot_id_inclusive: 9,
+                    partition_spec_jsons: std::collections::BTreeMap::from([(
+                        0,
+                        "{\"spec-id\":0}".to_owned(),
+                    )]),
+                },
+            )),
+        })
+    }
+
     /// A system relation carrier that states how its work reaches this backend.
     fn system_table_scan_source(work_source: dto::ScanWorkSource) -> dto::ConnectorTableScanSource {
         let mut source = scan_with_relation(system_table_relation());
@@ -896,6 +914,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn typed_scan_decode_lowers_a_change_window_to_the_split_driven_source() {
+        let node = typed_scan_node(
+            scan_with_relation(change_window_relation()),
+            vec![output_column(1, "id")],
+        );
+        let (profile, morsels) = lower_and_build_morsels(&node);
+        assert_eq!(profile, "TypedConnectorScan");
+        assert_eq!(morsels.morsels.len(), 1);
+        assert!(!morsels.has_more);
+    }
+
     /// A single-backend system relation has no split at all: one backend reads
     /// the whole relation itself, so it binds the split-free source.
     #[test]
@@ -950,27 +980,6 @@ mod tests {
                     },
                 ),
                 "table_function",
-            ),
-            (
-                dto::catalog_table_handle::Relation::ChangeWindow(
-                    dto::ConnectorChangeWindowHandle {
-                        handle: Some(dto::connector_change_window_handle::Handle::Iceberg(
-                            dto::IcebergChangeWindowHandle {
-                                schema_table_name: Some(test_support::schema_table_name()),
-                                table_schema_json: "{\"type\":\"struct\"}".to_owned(),
-                                columns: vec![test_support::iceberg_column_handle(1)],
-                                name_mapping_json: None,
-                                from_snapshot_id_exclusive: 3,
-                                to_snapshot_id_inclusive: 9,
-                                partition_spec_jsons: std::collections::BTreeMap::from([(
-                                    0,
-                                    "{\"spec-id\":0}".to_owned(),
-                                )]),
-                            },
-                        )),
-                    },
-                ),
-                "change_window",
             ),
             (
                 dto::catalog_table_handle::Relation::MergeTable(dto::ConnectorMergeTableHandle {

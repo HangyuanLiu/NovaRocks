@@ -76,7 +76,7 @@ AS SELECT id FROM orders_${uuid0};
 DROP TABLE analytics_${uuid0}.mv_conflict_${uuid0};
 
 -- query 9
--- @expect_error=requires current catalog to be an Iceberg catalog
+-- @expect_error=requires current Iceberg catalog context
 SET CATALOG default_catalog;
 USE default;
 CREATE MATERIALIZED VIEW mv_bad_${uuid0}
