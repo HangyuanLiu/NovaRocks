@@ -593,10 +593,6 @@ pub(crate) struct PreparedUpdateMutation {
     pub(crate) target: crate::catalog_application::resolver::TargetBackend,
     pub(crate) target_columns: Vec<novarocks_types::schema::ColumnDef>,
     pub(crate) target_ref: String,
-    /// Exact Provider schema that belongs to the opaque preparation table.
-    /// COW match materialization scans this schema through the retained lease;
-    /// it must not resolve the target through the current catalog again.
-    pub(crate) match_target_schema: arrow::datatypes::SchemaRef,
     /// The one exact connector generation admitted with this statement.
     pub(crate) planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     /// The one write lease this statement will use, derived once here.
@@ -640,8 +636,6 @@ pub(crate) struct PreparedMergeMutation {
     pub(crate) target: crate::catalog_application::resolver::TargetBackend,
     pub(crate) target_columns: Vec<novarocks_types::schema::ColumnDef>,
     pub(crate) target_ref: String,
-    /// See [`PreparedUpdateMutation::match_target_schema`].
-    pub(crate) match_target_schema: arrow::datatypes::SchemaRef,
     /// See [`PreparedUpdateMutation::mode`].
     pub(crate) table_write_mode: novarocks_spi::connector::ConnectorRowMutationStrategy,
     /// The one exact connector generation admitted with this statement.
@@ -900,7 +894,6 @@ pub(crate) fn prepare_update_mutation(
         }
     };
     let admitted_base_snapshot_id = strategy_preparation.base_version_ordinal();
-    let match_target_schema = strategy_preparation.match_source_schema().clone();
     let target_columns =
         if mode == novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite {
             cow_target_columns(&strategy_preparation)
@@ -959,7 +952,6 @@ pub(crate) fn prepare_update_mutation(
         target,
         target_columns,
         target_ref,
-        match_target_schema,
         planning_lease,
         write_lease,
         cow_preparations,
@@ -1065,7 +1057,6 @@ pub(crate) fn prepare_merge_mutation(
         }
     };
     let admitted_base_snapshot_id = preparations.preparation.base_version_ordinal();
-    let match_target_schema = preparations.preparation.match_source_schema().clone();
     let target_columns = if table_write_mode
         == novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite
     {
@@ -1120,7 +1111,6 @@ pub(crate) fn prepare_merge_mutation(
         target,
         target_columns,
         target_ref,
-        match_target_schema,
         table_write_mode,
         planning_lease,
         write_lease,
@@ -1148,7 +1138,6 @@ pub(crate) fn stage_prepared_update_mutation(
         target,
         target_columns,
         target_ref,
-        match_target_schema,
         planning_lease,
         write_lease,
         cow_preparations,
@@ -1175,9 +1164,6 @@ pub(crate) fn stage_prepared_update_mutation(
                 state,
                 &target,
                 &query,
-                &cow_preparations.preparation,
-                planning_lease.clone(),
-                &match_target_schema,
                 &execution,
                 &connector_context,
                 native_encoder,
@@ -2858,51 +2844,21 @@ fn execute_update_match_query(
     )
 }
 
-/// Execute a COW match query with the target replaced by the exact opaque
-/// table handle retained by row-mutation preparation. Other statement sources
-/// still resolve normally, but the mutation target cannot observe a later
-/// catalog generation or ref head.
-#[allow(clippy::too_many_arguments)]
+/// Execute a COW match query whose target is pinned to the exact snapshot the
+/// commit will be validated against. The pin is expressed by the generated
+/// statement itself (see [`exact_cow_match_target_relation_sql`]), so the
+/// target resolves through the ordinary admitted frozen-snapshot scan lane and
+/// cannot observe a later ref head. Other statement sources still resolve
+/// normally.
 fn execute_exact_cow_match_query(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
     query: &novarocks_parser::ast::Query,
-    preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
-    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
-    target_schema: &arrow::datatypes::SchemaRef,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
 ) -> Result<QueryResult, crate::dml::error::DmlExecutionError> {
-    let identity = novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::new(
-        target.catalog.clone(),
-        target.namespace.clone(),
-        target.table.clone(),
-    );
-    let read = crate::query_execution::frozen_connector_read::plan_frozen_connector_read(
-        planning_lease,
-        execution.topology(),
-        preparation.match_source(),
-        target_schema,
-        Vec::new(),
-        connector_context.clone(),
-    )
-    .map_err(|error| format!("plan exact COW match target: {error}"))?;
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let binding =
-        crate::query_execution::frozen_connector_read::admit_frozen_connector_scan_binding(
-            table_bindings.as_ref(),
-            &identity,
-            target_schema,
-        )?;
-    let overlay =
-        crate::query_execution::frozen_connector_read::frozen_connector_query_local_overlay(
-            &identity,
-            target_schema,
-        );
-    let resolver = crate::query_execution::frozen_connector_read::FrozenConnectorReadResolver::new(
-        binding, identity, read,
-    );
     let catalog_service_snapshot =
         crate::catalog_application::query_catalog::catalog_service_snapshot(state);
     let analyzer_catalog =
@@ -2912,7 +2868,7 @@ fn execute_exact_cow_match_query(
             state.connector_control().as_ref(),
             connector_context.clone(),
             Arc::clone(&table_bindings),
-            vec![overlay],
+            Vec::new(),
             state.catalog_application().map(Arc::as_ref),
         );
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
@@ -2956,7 +2912,7 @@ fn execute_exact_cow_match_query(
         state.connector_control().as_ref(),
         connector_context,
         Some(table_bindings.as_ref()),
-        Some(&resolver),
+        None,
         crate::query_execution::dml::write::scan_preparation_options(
             state.typed_connector_control(),
             execution.optimizer_settings(),
@@ -3250,6 +3206,40 @@ fn build_update_match_query_sql(
     sql
 }
 
+/// Name the mutation target as the relation frozen at the exact snapshot the
+/// provider signed as this statement's base version.
+///
+/// The COW match must read that snapshot and no other. The ordinary relation
+/// name means "current", which for a branch mutation is a different ref
+/// entirely, and even on the same ref would let a write that landed after
+/// admission enter the match and be silently overwritten by the rewrite. The
+/// query-local snapshot identity states the pin in the statement itself, so the
+/// target resolves through the admitted frozen-snapshot scan lane that time
+/// travel already uses.
+fn exact_cow_match_target_relation_sql(
+    target: &crate::catalog_application::resolver::TargetBackend,
+    preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
+) -> Result<String, String> {
+    let base_snapshot_id = preparation.base_version_ordinal().ok_or_else(|| {
+        format!(
+            "COW match target `{}`.`{}`.`{}` has no provider-signed base version ordinal; \
+             reading its current snapshot instead would silently drop a concurrent write",
+            target.catalog, target.namespace, target.table
+        )
+    })?;
+    Ok(format!(
+        "{}.{}.{}",
+        sql_identifier(&target.catalog),
+        sql_identifier(&target.namespace),
+        sql_identifier(
+            &crate::catalog_application::query_bindings::time_travel_overlay_identity(
+                &target.table,
+                base_snapshot_id,
+            )
+        ),
+    ))
+}
+
 fn build_exact_cow_update_selection_query(
     target: &crate::catalog_application::resolver::TargetBackend,
     stmt: &PreparedUpdateStatement,
@@ -3292,11 +3282,9 @@ fn build_exact_cow_update_selection_query(
         })
         .collect::<Vec<_>>();
     let mut sql = format!(
-        "SELECT {} FROM {}.{}.{} AS {}",
+        "SELECT {} FROM {} AS {}",
         select_items.join(", "),
-        sql_identifier(&target.catalog),
-        sql_identifier(&target.namespace),
-        sql_identifier(&target.table),
+        exact_cow_match_target_relation_sql(target, preparation)?,
         sql_identifier(target_alias),
     );
     if let Some(source) = source_sql {
@@ -3334,7 +3322,6 @@ pub(crate) fn stage_prepared_merge_mutation(
         target,
         target_columns,
         target_ref,
-        match_target_schema,
         table_write_mode,
         planning_lease,
         write_lease,
@@ -3478,9 +3465,6 @@ pub(crate) fn stage_prepared_merge_mutation(
         state,
         &target,
         &query,
-        &cow_preparations.preparation,
-        planning_lease.clone(),
-        &match_target_schema,
         &execution,
         &connector_context,
         native_encoder,
@@ -4019,12 +4003,10 @@ fn build_exact_cow_merge_selection_query(
     }
     parse_generated_query(
         &format!(
-            "SELECT {} FROM {} LEFT JOIN {}.{}.{} AS {} ON {} WHERE {}",
+            "SELECT {} FROM {} LEFT JOIN {} AS {} ON {} WHERE {}",
             select_items.join(", "),
             source_sql,
-            sql_identifier(&target.catalog),
-            sql_identifier(&target.namespace),
-            sql_identifier(&target.table),
+            exact_cow_match_target_relation_sql(target, preparation)?,
             sql_identifier(target_alias),
             stmt.on_sql,
             admitted_actions.join(" OR "),
@@ -4473,6 +4455,161 @@ mod tests {
             namespace: "db1".to_string(),
             table: "t".to_string(),
         }
+    }
+
+    /// One signed COW row-mutation preparation whose base version ordinal is
+    /// under the test's control. Everything else is the minimum the SPI accepts.
+    fn cow_match_preparation(
+        base_version_ordinal: Option<i64>,
+    ) -> novarocks_spi::connector::ConnectorRowMutationPreparation {
+        use novarocks_spi::connector::{
+            ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
+            ConnectorMutationEffectField, ConnectorMutationMatchContract,
+            ConnectorMutationSourceField, ConnectorMutationTargetField, ConnectorRowMutationIntent,
+            ConnectorRowMutationPreparation, ConnectorRowMutationStrategy, ConnectorTableHandle,
+            ConnectorWriteBaseVersion, ConnectorWriteFieldToken, ConnectorWriteOperationId,
+            ConnectorWriteTargetRef,
+        };
+
+        let instance_id = ConnectorInstanceId::parse("iceberg").expect("instance ID");
+        let owner = ConnectorExecutionBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        };
+        let table = ConnectorTableHandle::try_new(instance_id, bytes::Bytes::from_static(b"table"))
+            .expect("table handle");
+        let base = ConnectorWriteBaseVersion::try_new(bytes::Bytes::from_static(b"base"))
+            .expect("base version");
+        let row_id_token = ConnectorWriteFieldToken::from_bytes([1; 32]);
+        let value_token = ConnectorWriteFieldToken::from_bytes([4; 32]);
+        let effect_token = ConnectorWriteFieldToken::from_bytes([5; 32]);
+        let match_contract = ConnectorMutationMatchContract::try_new(
+            owner.clone(),
+            table.clone(),
+            base.clone(),
+            vec![ConnectorMutationSourceField::new(
+                row_id_token,
+                arrow::datatypes::Field::new("match_key", DataType::Int64, false),
+                0,
+            )],
+            Vec::new(),
+            vec![ConnectorMutationTargetField::new(
+                value_token,
+                arrow::datatypes::Field::new("after_value", DataType::Int64, true),
+                1,
+            )],
+            vec![row_id_token],
+            ConnectorMutationEffectField::try_new(
+                effect_token,
+                arrow::datatypes::Field::new("effect", DataType::Int8, false),
+                2,
+            )
+            .expect("effect field"),
+        )
+        .expect("match contract");
+        ConnectorRowMutationPreparation::try_new(
+            owner,
+            ConnectorWriteOperationId::from_bytes([8; 16]),
+            table.clone(),
+            table,
+            Arc::new(Schema::new(vec![
+                arrow::datatypes::Field::new("match_key", DataType::Int64, false),
+                arrow::datatypes::Field::new("after_value", DataType::Int64, false),
+            ])),
+            ConnectorWriteTargetRef::main(),
+            ConnectorRowMutationIntent::Update,
+            base,
+            match_contract,
+            ConnectorRowMutationStrategy::CopyOnWrite,
+            base_version_ordinal,
+            Some(42),
+            bytes::Bytes::from_static(b"row-mutation"),
+        )
+        .expect("row-mutation preparation")
+    }
+
+    fn cow_update_statement() -> PreparedUpdateStatement {
+        PreparedUpdateStatement {
+            table: ObjectName {
+                parts: vec!["ice".to_string(), "db1".to_string(), "t".to_string()],
+            },
+            alias: None,
+            assignments: vec![PreparedMutationAssignment {
+                column: "after_value".to_string(),
+                value_sql: "99".to_string(),
+            }],
+            source: None,
+            where_sql: None,
+        }
+    }
+
+    /// The COW match must name the mutation target as the relation frozen at
+    /// the provider-signed base snapshot. Naming the bare relation produced a
+    /// pre-pinned opaque connector read, which scan preparation refuses before
+    /// it ever consults a resolver; the pinned identity instead resolves through
+    /// the admitted frozen-snapshot lane time travel already uses.
+    #[test]
+    fn cow_match_selection_pins_the_target_to_its_signed_base_snapshot() {
+        let target = iceberg_target();
+        let preparation = cow_match_preparation(Some(41));
+        let query = build_exact_cow_update_selection_query(
+            &target,
+            &cow_update_statement(),
+            None,
+            &preparation,
+        )
+        .expect("exact COW UPDATE selection");
+        let printed = novarocks_parser::printer::print_query(&query);
+
+        assert!(
+            printed.contains("__sqlx1_tt_t_41"),
+            "COW match must read the target at its signed base snapshot: {printed}"
+        );
+        let unpinned = format!(
+            "{}.{}.{}",
+            sql_identifier(&target.catalog),
+            sql_identifier(&target.namespace),
+            sql_identifier(&target.table),
+        );
+        assert!(
+            !printed.contains(&unpinned),
+            "COW match must not name the unpinned current relation: {printed}"
+        );
+        assert_eq!(
+            crate::catalog_application::query_bindings::QueryTableBindingKey::analysis_lookup(
+                &target.catalog,
+                &target.namespace,
+                "__sqlx1_tt_t_41",
+            ),
+            crate::catalog_application::query_bindings::QueryTableBindingKey::snapshot(
+                &target.catalog,
+                &target.namespace,
+                &target.table,
+                41,
+            ),
+            "the pinned COW match identity must resolve to the frozen-snapshot binding"
+        );
+    }
+
+    /// Reading a later snapshot than the one the commit is validated against is
+    /// how a mutation silently loses a concurrent write, so an unsigned base
+    /// version fails the statement instead of falling back to `Current`.
+    #[test]
+    fn cow_match_selection_fails_closed_without_a_signed_base_snapshot() {
+        let target = iceberg_target();
+        let preparation = cow_match_preparation(None);
+        let error = build_exact_cow_update_selection_query(
+            &target,
+            &cow_update_statement(),
+            None,
+            &preparation,
+        )
+        .expect_err("COW match without a signed base version must fail closed");
+
+        assert!(
+            error.contains("no provider-signed base version ordinal"),
+            "unexpected COW match failure: {error}"
+        );
     }
 
     struct CowRewriteQueryFixture {
