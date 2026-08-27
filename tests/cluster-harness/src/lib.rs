@@ -368,6 +368,15 @@ pub struct CrossProcessRuntime {
     pub fe_mysql_port: u16,
 }
 
+/// Sanitized response captured from the FE management listener during a
+/// lifecycle scenario. The harness exposes it read-only; it has no drain or
+/// administration mutation endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontendManagementResponse {
+    pub status: u16,
+    pub body: String,
+}
+
 /// Native transport profile owned by the system-test harness.
 ///
 /// The profile selects the server configuration and the companion raw probe
@@ -1698,6 +1707,51 @@ fn scrape_prometheus_metrics(port: u16) -> Result<String> {
         );
     }
     Ok(body.to_string())
+}
+
+fn get_frontend_management(
+    port: u16,
+    path: &str,
+    timeout: Duration,
+) -> Result<FrontendManagementResponse> {
+    if !path.starts_with('/') || path.contains('\r') || path.contains('\n') {
+        bail!("invalid frontend management path {path:?}");
+    }
+    let address = format!("127.0.0.1:{port}");
+    let socket = address
+        .parse()
+        .with_context(|| format!("parse frontend management address {address}"))?;
+    let mut stream = TcpStream::connect_timeout(&socket, timeout)
+        .with_context(|| format!("connect FE management endpoint {address}{path}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("set FE management read timeout")?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .context("set FE management write timeout")?;
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .with_context(|| format!("request FE management endpoint {path}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .with_context(|| format!("read FE management endpoint {path}"))?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .context("malformed FE management HTTP response")?;
+    let status = headers
+        .split_whitespace()
+        .nth(1)
+        .context("missing FE management HTTP status")?
+        .parse::<u16>()
+        .context("parse FE management HTTP status")?;
+    Ok(FrontendManagementResponse {
+        status,
+        body: body.to_string(),
+    })
 }
 
 const FRONTEND_METRIC_FAMILIES: [&str; 14] = [
@@ -3099,6 +3153,15 @@ impl CrossProcessServerHandle {
             .wait_for_successful_exit_until(deadline)
             .context("wait for cross-process FE graceful exit")
             .map(|_| ())
+    }
+
+    /// Reads one FE management endpoint with a caller-owned deadline.
+    pub fn frontend_management_get(
+        &self,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<FrontendManagementResponse> {
+        get_frontend_management(self.runtime.fe_http_port, path, timeout)
     }
 
     /// Keep generated config and logs when the handle is dropped.
