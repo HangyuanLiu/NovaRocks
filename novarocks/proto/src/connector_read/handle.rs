@@ -652,16 +652,15 @@ fn validate_iceberg_system_table_reference(
                 "iceberg system table type must be specified",
             ));
         }
-        // The closed worker-visible set. PARTITIONS is deliberately absent --
-        // it is a view over the same pinned snapshot's FILES relation -- and
-        // there is no ALL_* variant to widen a pinned reference into a scan of
-        // every snapshot.
+        // The closed worker-visible set. There is no ALL_* variant, so a
+        // pinned reference can never widen into a scan of every snapshot.
         dto::IcebergSystemTableType::Files
         | dto::IcebergSystemTableType::Entries
         | dto::IcebergSystemTableType::Snapshots
         | dto::IcebergSystemTableType::History
         | dto::IcebergSystemTableType::Refs
-        | dto::IcebergSystemTableType::Manifests => {}
+        | dto::IcebergSystemTableType::Manifests
+        | dto::IcebergSystemTableType::Partitions => {}
     }
     bounded_text(
         &raw.metadata_file_location,

@@ -132,28 +132,23 @@ pub enum IcebergSystemRelation {
     History,
     Refs,
     Manifests,
-    /// `$partitions` aggregates the very rows `$files` produces for the same
-    /// pinned snapshot. It is deliberately absent from the wire's system-table
-    /// enum: minting a seventh reference kind would give the aggregation its
-    /// own resolution path, and the two could then disagree about which
-    /// snapshot they describe.
+    /// The aggregation over the very rows `$files` produces for the same
+    /// pinned snapshot. It has its own reference kind rather than borrowing
+    /// FILES: a FILES reference reaching a backend reads as the un-aggregated
+    /// relation, one row per data file instead of one row per partition. Both
+    /// are minted by one resolution, so they cannot describe different
+    /// snapshots.
     Partitions,
 }
 
 impl IcebergSystemRelation {
     /// How a worker is told to read this relation, when a worker can.
     ///
-    /// `None` is `$partitions` and only `$partitions`: it is an aggregation
-    /// over `$files`, and the wire has no reference kind that says so. A FILES
-    /// reference would reach a backend as the un-aggregated `$files` relation,
-    /// which answers a different question with a plausible shape -- one row per
-    /// data file instead of one row per partition -- so it is refused at
-    /// planning instead.
-    ///
     /// FILES is distributed because it walks every manifest of the snapshot,
-    /// which is real divisible I/O. The other five read only the single pinned
+    /// which is real divisible I/O. The others read only the single pinned
     /// metadata file, so spreading them over the cluster would multiply one
-    /// small read rather than divide any work.
+    /// small read rather than divide any work -- and `$partitions`, which does
+    /// walk every manifest, still has to see all of them at once to aggregate.
     const fn worker_plan(self) -> Option<(dto::IcebergSystemTableType, SystemTableDistribution)> {
         match self {
             Self::Files => Some((
@@ -180,7 +175,15 @@ impl IcebergSystemRelation {
                 dto::IcebergSystemTableType::Manifests,
                 SystemTableDistribution::SingleCoordinator,
             )),
-            Self::Partitions => None,
+            // Minted by the same resolution as FILES, from the same metadata
+            // file, uuid and snapshot, so the aggregation and the relation it
+            // aggregates can never describe different snapshots. It is single
+            // backend because an aggregate over one manifest would report a
+            // partition that only part of the snapshot describes.
+            Self::Partitions => Some((
+                dto::IcebergSystemTableType::Partitions,
+                SystemTableDistribution::SingleCoordinator,
+            )),
         }
     }
 }
@@ -2650,24 +2653,65 @@ mod tests {
         }
     }
 
-    /// `$partitions` is a relation this connector can name and cannot carry:
-    /// the wire's reference kinds do not include the aggregation, and a FILES
-    /// reference would reach a backend as un-aggregated `$files` -- one row per
-    /// data file where the query asked for one row per partition. Refusing is
-    /// the only answer that is not silently wrong.
+    /// The aggregation and the relation it aggregates are minted by one
+    /// resolution, so they name the same pinned snapshot. Reaching a backend as
+    /// a FILES reference instead would answer a different question with a
+    /// plausible shape -- one row per data file where the query asked for one
+    /// row per partition -- so `$partitions` carries its own reference kind.
     #[test]
-    fn partitions_is_refused_rather_than_answered_with_files_rows() {
+    fn partitions_and_files_pin_the_same_snapshot_under_different_kinds() {
         let fixture = fixture();
         fixture.create_table("db", "t", StdHashMap::new());
 
-        let error = fixture
+        let files = fixture
+            .boundary
+            .get_system_table_plan(&session(), &name("db", "t$files"))
+            .expect("files plan")
+            .expect("files plan exists");
+        let partitions = fixture
             .boundary
             .get_system_table_plan(&session(), &name("db", "t$partitions"))
-            .expect_err("partitions has no worker plan");
-        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-        assert!(
-            error.to_string().contains("aggregation over $files"),
-            "{error}"
+            .expect("partitions plan")
+            .expect("partitions plan exists");
+
+        // An aggregate over one manifest would describe only part of the
+        // snapshot, so this one cannot be spread over the cluster.
+        assert_eq!(
+            partitions.distribution(),
+            SystemTableDistribution::SingleCoordinator
+        );
+        assert_eq!(files.distribution(), SystemTableDistribution::AllNodes);
+
+        // Read the raw wire facts rather than the validating decoder: a
+        // freshly created table has no snapshot, and both kinds refuse to
+        // decode without one. What matters here is that one resolution stamped
+        // both, so they cannot describe different snapshots.
+        let raw_reference = |handle: &CatalogTableHandle| -> dto::IcebergSystemTableReference {
+            match handle.as_proto().relation.as_ref().expect("relation") {
+                dto::catalog_table_handle::Relation::SystemTable(system) => {
+                    match system.reference.as_ref().expect("reference") {
+                        dto::connector_system_table_reference::Reference::Iceberg(iceberg) => {
+                            iceberg.clone()
+                        }
+                    }
+                }
+                other => panic!("expected a system relation, got {other:?}"),
+            }
+        };
+        let files_reference = raw_reference(files.handle());
+        let partitions_reference = raw_reference(partitions.handle());
+        assert_ne!(
+            files_reference.system_table_type, partitions_reference.system_table_type,
+            "the aggregation must not reach a backend as the relation it aggregates"
+        );
+        assert_eq!(
+            files_reference.metadata_file_location,
+            partitions_reference.metadata_file_location
+        );
+        assert_eq!(files_reference.table_uuid, partitions_reference.table_uuid);
+        assert_eq!(
+            files_reference.snapshot_id,
+            partitions_reference.snapshot_id
         );
     }
 

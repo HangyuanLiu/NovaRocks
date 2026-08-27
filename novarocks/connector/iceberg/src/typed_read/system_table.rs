@@ -58,7 +58,7 @@ pub const MAX_FILES_TABLE_MANIFESTS: usize = 1_000_000;
 /// `ALL_MANIFESTS` are absent because they aggregate across snapshots, which
 /// contradicts a single pinned metadata reference; `PARTITIONS` is absent
 /// because it is a view over `FILES` rather than a relation of its own (see
-/// [`IcebergPartitionsView`]). There is no unknown variant: a relation this
+/// its own reference kind. There is no unknown variant: a relation this
 /// stack cannot name is a planning error, not a value to carry.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum IcebergSystemTableType {
@@ -68,6 +68,12 @@ pub enum IcebergSystemTableType {
     History,
     Refs,
     Manifests,
+    /// The aggregation over the rows `Files` produces for the same pinned
+    /// snapshot. It is a relation of its own rather than a `Files` reference a
+    /// worker is told to aggregate: a `Files` reference reaching a backend
+    /// reads as the un-aggregated relation, one row per data file instead of
+    /// one row per partition.
+    Partitions,
 }
 
 /// How one system relation actually runs.
@@ -95,6 +101,7 @@ impl IcebergSystemTableType {
             Self::History => "$history",
             Self::Refs => "$refs",
             Self::Manifests => "$manifests",
+            Self::Partitions => "$partitions",
         }
     }
 
@@ -141,9 +148,15 @@ impl IcebergSystemTableType {
             // These five read only the metadata file and its manifest list.
             // There is nothing to divide, and dividing it would mean reading
             // the same metadata file on every backend.
-            Self::Entries | Self::Snapshots | Self::History | Self::Refs | Self::Manifests => {
-                IcebergSystemTableExecution::SingleBackendDirectPageSource
-            }
+            // `$partitions` joins them: it walks every manifest of the
+            // snapshot, but it must see all of them at once to aggregate, so
+            // there is nothing to divide either.
+            Self::Entries
+            | Self::Snapshots
+            | Self::History
+            | Self::Refs
+            | Self::Manifests
+            | Self::Partitions => IcebergSystemTableExecution::SingleBackendDirectPageSource,
         }
     }
 
@@ -172,6 +185,7 @@ impl IcebergSystemTableType {
             Self::History => dto::IcebergSystemTableType::History,
             Self::Refs => dto::IcebergSystemTableType::Refs,
             Self::Manifests => dto::IcebergSystemTableType::Manifests,
+            Self::Partitions => dto::IcebergSystemTableType::Partitions,
         }
     }
 
@@ -188,6 +202,7 @@ impl IcebergSystemTableType {
             dto::IcebergSystemTableType::History => Ok(Self::History),
             dto::IcebergSystemTableType::Refs => Ok(Self::Refs),
             dto::IcebergSystemTableType::Manifests => Ok(Self::Manifests),
+            dto::IcebergSystemTableType::Partitions => Ok(Self::Partitions),
         }
     }
 }
@@ -242,12 +257,20 @@ impl IcebergSystemTableReference {
         // a scheduled task to learn a fact the frontend already had.
         let table_uuid = uuid::Uuid::parse_str(&table_uuid)
             .map_err(|error| invalid(format!("iceberg table uuid is invalid: {error}")))?;
-        if snapshot_id.is_none() && system_table_type == IcebergSystemTableType::Files {
-            // `$files` reports the files of one snapshot. Without a selected
-            // snapshot there is no manifest list to walk, and picking the
-            // current one on the backend is exactly the fallback this
-            // reference exists to forbid.
-            return Err(invalid("iceberg $files requires a selected snapshot id"));
+        if snapshot_id.is_none()
+            && matches!(
+                system_table_type,
+                IcebergSystemTableType::Files | IcebergSystemTableType::Partitions
+            )
+        {
+            // `$files` reports the files of one snapshot, and `$partitions`
+            // aggregates those same files. Without a selected snapshot there is
+            // no manifest list to walk, and picking the current one on the
+            // backend is exactly the fallback this reference exists to forbid.
+            return Err(invalid(format!(
+                "iceberg {} requires a selected snapshot id",
+                system_table_type.suffix()
+            )));
         }
 
         Ok(Self {
@@ -357,37 +380,6 @@ impl IcebergSystemTableReference {
         }
     }
 }
-
-/// `$partitions`, modelled where it belongs: on the frontend.
-///
-/// Trino exposes `$partitions` as a `PartitionsView` -- an aggregation over the
-/// same pinned snapshot's `$files` rows, not a separate scan of Iceberg
-/// metadata. Keeping it here, rather than as a seventh worker enum variant,
-/// keeps exactly one worker relation reading manifests: a `PARTITIONS` variant
-/// would need its own manifest walk, its own split shape, and its own
-/// aggregation, all producing rows that `$files` already produces. It never
-/// crosses the wire and therefore has no proto form.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IcebergPartitionsView {
-    files: IcebergSystemTableReference,
-}
-
-impl IcebergPartitionsView {
-    pub fn try_new(files: IcebergSystemTableReference) -> Result<Self, ConnectorError> {
-        if files.system_table_type() != IcebergSystemTableType::Files {
-            return Err(invalid(
-                "iceberg $partitions is bound to a $files reference of the same pinned snapshot",
-            ));
-        }
-        Ok(Self { files })
-    }
-
-    /// The `$files` relation this view aggregates.
-    pub const fn files(&self) -> &IcebergSystemTableReference {
-        &self.files
-    }
-}
-
 /// What one manifest tracks.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum TrinoManifestContent {
@@ -1263,6 +1255,7 @@ mod tests {
             (4, IcebergSystemTableType::History),
             (5, IcebergSystemTableType::Refs),
             (6, IcebergSystemTableType::Manifests),
+            (7, IcebergSystemTableType::Partitions),
         ] {
             assert_eq!(
                 IcebergSystemTableType::from_proto(raw).expect("known type"),
@@ -1271,7 +1264,7 @@ mod tests {
             assert_eq!(expected.to_proto() as i32, raw);
         }
         assert!(IcebergSystemTableType::from_proto(0).is_err());
-        assert!(IcebergSystemTableType::from_proto(7).is_err());
+        assert!(IcebergSystemTableType::from_proto(8).is_err());
         assert!(IcebergSystemTableType::from_proto(-1).is_err());
     }
 
@@ -1444,25 +1437,14 @@ mod tests {
             "s3://warehouse/db/t/metadata/00007-abc.metadata.json".to_string();
 
         // `$files` reports one snapshot's files; without one there is nothing
-        // to walk and no legal fallback.
+        // to walk and no legal fallback. `$partitions` aggregates those same
+        // files, so it needs one for the same reason.
         params.snapshot_id = None;
+        assert!(IcebergSystemTableReference::try_new(params.clone()).is_err());
+        params.system_table_type = IcebergSystemTableType::Partitions;
         assert!(IcebergSystemTableReference::try_new(params.clone()).is_err());
         params.system_table_type = IcebergSystemTableType::Refs;
         assert!(IcebergSystemTableReference::try_new(params).is_ok());
-    }
-
-    #[test]
-    fn partitions_is_a_frontend_local_view_over_the_same_pinned_files_relation() {
-        let view =
-            IcebergPartitionsView::try_new(reference(IcebergSystemTableType::Files)).expect("view");
-        assert_eq!(
-            view.files().system_table_type(),
-            IcebergSystemTableType::Files
-        );
-        assert_eq!(view.files().snapshot_id(), Some(11));
-        assert!(
-            IcebergPartitionsView::try_new(reference(IcebergSystemTableType::Manifests)).is_err()
-        );
     }
 
     #[test]

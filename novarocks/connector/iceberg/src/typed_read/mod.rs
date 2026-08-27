@@ -104,9 +104,9 @@ pub use system_page_source::{
 };
 pub use system_table::{
     FilesTableSplit, FilesTableSplitParams, FilesTableSplitSource, FilesTableSplitSourceParams,
-    IcebergPartitionsView, IcebergSystemTableExecution, IcebergSystemTableReference,
-    IcebergSystemTableReferenceParams, IcebergSystemTableType, MAX_FILES_TABLE_MANIFESTS,
-    TrinoManifestContent, TrinoManifestFile, TrinoManifestFileParams,
+    IcebergSystemTableExecution, IcebergSystemTableReference, IcebergSystemTableReferenceParams,
+    IcebergSystemTableType, MAX_FILES_TABLE_MANIFESTS, TrinoManifestContent, TrinoManifestFile,
+    TrinoManifestFileParams,
 };
 pub use table_execute::{
     IcebergOptimizeHandle, IcebergProcedureExecution, IcebergProcedureId,

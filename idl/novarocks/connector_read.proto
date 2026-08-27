@@ -339,6 +339,14 @@ enum IcebergSystemTableType {
   ICEBERG_SYSTEM_TABLE_TYPE_HISTORY = 4;
   ICEBERG_SYSTEM_TABLE_TYPE_REFS = 5;
   ICEBERG_SYSTEM_TABLE_TYPE_MANIFESTS = 6;
+  // `$partitions` aggregates the rows `$files` produces for the same pinned
+  // snapshot. It is a kind of its own rather than a FILES reference the worker
+  // is told to aggregate: a FILES reference reaching a backend reads as the
+  // un-aggregated relation, which answers a different question with a
+  // plausible shape -- one row per data file instead of one row per partition.
+  // Both kinds are minted by the same resolution, from the same metadata file,
+  // uuid and snapshot, so the two cannot describe different snapshots.
+  ICEBERG_SYSTEM_TABLE_TYPE_PARTITIONS = 7;
 }
 
 // An immutable metadata reference. The selected backend validates the UUID and
