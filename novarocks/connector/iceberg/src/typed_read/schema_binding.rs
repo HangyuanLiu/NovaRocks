@@ -1689,12 +1689,7 @@ mod tests {
                 .iter()
                 .map(|column| column.column_name())
                 .collect::<Vec<_>>(),
-            vec![
-                "_file",
-                "_pos",
-                "_row_id",
-                "_last_updated_sequence_number"
-            ]
+            vec!["_file", "_pos", "_row_id", "_last_updated_sequence_number"]
         );
         for column in published {
             assert!(column.is_externally_visible(), "{column:?}");

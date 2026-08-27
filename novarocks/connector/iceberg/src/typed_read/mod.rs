@@ -81,11 +81,10 @@ pub use page_source_provider::{
 };
 pub use schema_binding::{
     ALWAYS_BOUND_METADATA_COLUMNS, FileFieldIdCoverage, ICEBERG_METADATA_FIELD_ID_IS_DELETED,
-    ICEBERG_METADATA_FIELD_ID_PATH, ICEBERG_METADATA_FIELD_ID_ROW_POSITION,
-    ROW_LINEAGE_METADATA_COLUMNS, IcebergBoundColumn, IcebergColumnSource, IcebergMetadataColumn,
-    IcebergPhysicalAdaptation, IcebergSchemaBinding, IcebergSchemaBindingRequest,
-    IcebergSplitFacts, IcebergTypePromotion, bind_scan_columns, file_field_id_coverage,
-    physical_adaptation,
+    ICEBERG_METADATA_FIELD_ID_PATH, ICEBERG_METADATA_FIELD_ID_ROW_POSITION, IcebergBoundColumn,
+    IcebergColumnSource, IcebergMetadataColumn, IcebergPhysicalAdaptation, IcebergSchemaBinding,
+    IcebergSchemaBindingRequest, IcebergSplitFacts, IcebergTypePromotion,
+    ROW_LINEAGE_METADATA_COLUMNS, bind_scan_columns, file_field_id_coverage, physical_adaptation,
 };
 pub use split::{
     DEFAULT_MINIMUM_ASSIGNED_SPLIT_WEIGHT, IcebergDeleteFile, IcebergDeleteFileContent,
@@ -98,9 +97,10 @@ pub use split_source::{
     READ_SPLIT_TARGET_SIZE_PROPERTY, plan_change_window_splits,
 };
 pub use system_page_source::{
-    IcebergSystemPageSource, IcebergSystemTableProvider, bounds_row_type,
-    iceberg_system_table_reference, partition_row_type, partitions_view_schema,
-    project_system_relation_columns, system_relation_schema,
+    IcebergSystemPageSource, IcebergSystemTableProvider, bounds_row_type, derived_row_type_json,
+    files_relation_schema_json, iceberg_system_table_reference, partition_row_type,
+    partitions_view_schema, project_system_relation_columns, system_relation_columns,
+    system_relation_schema,
 };
 pub use system_table::{
     FilesTableSplit, FilesTableSplitParams, FilesTableSplitSource, FilesTableSplitSourceParams,
