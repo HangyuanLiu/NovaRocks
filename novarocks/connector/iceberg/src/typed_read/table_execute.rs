@@ -51,14 +51,13 @@ use super::table_handle::IcebergTableHandle;
 /// order the writer expects them. The page source produces nothing else: it is
 /// re-encoding delete positions, not projecting table columns.
 ///
-/// They are stated as metadata columns of the relation being rewritten rather
-/// than as fresh names, because that is what they are -- the data file a
-/// removed row lives in, and its absolute position inside it -- and because the
-/// cohort's frozen scan schema is spelled from the same vocabulary. A second
-/// spelling here could disagree with it, and the writer binds by name.
-pub const REWRITE_POSITION_DELETE_OUTPUT_COLUMNS: [IcebergMetadataColumn; 2] = [
-    IcebergMetadataColumn::Path,
-    IcebergMetadataColumn::RowPosition,
+/// The physical field IDs retain Iceberg's metadata-column identity. The wire
+/// and Arrow names are deliberately procedure-specific: they are the public
+/// `REWRITE_POSITION_DELETE_FILES` result contract, not ordinary `_file` /
+/// `_pos` scan metadata aliases.
+pub const REWRITE_POSITION_DELETE_OUTPUT_COLUMNS: [(&str, IcebergMetadataColumn); 2] = [
+    ("file_path", IcebergMetadataColumn::Path),
+    ("pos", IcebergMetadataColumn::RowPosition),
 ];
 
 /// Length of a SHA-256 digest rendered as lowercase hex.
@@ -605,6 +604,12 @@ impl IcebergRewritePositionDeleteFilesSplit {
                     delete.path()
                 )));
             }
+            if delete.referenced_data_file() != Some(data_file_path.as_str()) {
+                return Err(invalid(format!(
+                    "iceberg rewrite selected delete {} does not belong to data file {data_file_path}",
+                    delete.path()
+                )));
+            }
         }
 
         let retained_size_in_bytes = (size_of::<Self>()
@@ -809,6 +814,7 @@ mod tests {
             data_sequence_number: 9,
             content_offset: Some(64),
             content_size_in_bytes: Some(256),
+            referenced_data_file: Some("s3://warehouse/db/t/data/a.parquet".to_string()),
             decryption_data: None,
         })
         .expect("deletion vector")
@@ -1052,6 +1058,26 @@ mod tests {
         )])
         .expect_err("equality delete");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        let split = rewrite_split(vec![deletion_vector("dv.puffin")]).expect("split");
+        let mut missing_identity = split.to_proto();
+        missing_identity.selected_position_deletes[0].referenced_data_file = None;
+        assert!(
+            IcebergRewritePositionDeleteFilesSplit::from_proto(
+                &missing_identity,
+                SplitWeight::STANDARD,
+            )
+            .is_err()
+        );
+        let mut foreign_identity = split.to_proto();
+        foreign_identity.selected_position_deletes[0].referenced_data_file =
+            Some("s3://warehouse/db/t/data/other.parquet".to_string());
+        assert!(
+            IcebergRewritePositionDeleteFilesSplit::from_proto(
+                &foreign_identity,
+                SplitWeight::STANDARD,
+            )
+            .is_err()
+        );
         // And a split with nothing selected has no work to do.
         assert!(rewrite_split(Vec::new()).is_err());
     }
@@ -1059,8 +1085,8 @@ mod tests {
     #[test]
     fn the_rewrite_page_source_emits_exactly_the_data_file_and_the_position() {
         assert_eq!(
-            REWRITE_POSITION_DELETE_OUTPUT_COLUMNS.map(IcebergMetadataColumn::column_name),
-            ["_file", "_pos"]
+            REWRITE_POSITION_DELETE_OUTPUT_COLUMNS.map(|(name, _)| name),
+            ["file_path", "pos"]
         );
     }
 

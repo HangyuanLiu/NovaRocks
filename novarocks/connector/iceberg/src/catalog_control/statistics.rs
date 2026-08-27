@@ -1127,6 +1127,7 @@ mod tests {
                     sequence_number: None,
                     partition_spec_id: None,
                     partition_key: None,
+                    referenced_data_file: None,
                     equality_column_names: Vec::new(),
                     equality_field_ids: Vec::new(),
                 }]

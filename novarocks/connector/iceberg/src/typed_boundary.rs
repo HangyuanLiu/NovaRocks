@@ -781,10 +781,12 @@ fn rewrite_position_delete_column_bindings(
     match handle.procedure_handle() {
         Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(_)) => {
             let mut bindings = Vec::with_capacity(REWRITE_POSITION_DELETE_OUTPUT_COLUMNS.len());
-            for metadata in REWRITE_POSITION_DELETE_OUTPUT_COLUMNS {
+            for (name, metadata) in REWRITE_POSITION_DELETE_OUTPUT_COLUMNS {
                 bindings.push(TypedColumnBinding::new(
-                    metadata.column_name(),
-                    iceberg_column_to_wire(&pseudo_column(metadata)?)?,
+                    name,
+                    iceberg_column_to_wire(&rewrite_position_delete_pseudo_column(
+                        name, metadata,
+                    )?)?,
                     true,
                 ));
             }
@@ -827,6 +829,7 @@ fn rewrite_position_delete_file(
         data_sequence_number: delete.sequence_number.unwrap_or_default(),
         content_offset: delete.content_offset,
         content_size_in_bytes: delete.content_size_in_bytes,
+        referenced_data_file: delete.referenced_data_file.clone(),
         decryption_data: None,
     })
 }
@@ -1906,6 +1909,19 @@ fn pseudo_column(metadata: IcebergMetadataColumn) -> Result<IcebergColumnHandle,
     IcebergColumnHandle::base_column(&NestedField::optional(
         metadata.field_id(),
         metadata.column_name(),
+        Type::Primitive(metadata.declared_type()),
+    ))
+}
+
+/// A `REWRITE_POSITION_DELETE_FILES` result retains the reserved metadata
+/// field IDs while exposing its procedure-specific output names on the wire.
+fn rewrite_position_delete_pseudo_column(
+    name: &str,
+    metadata: IcebergMetadataColumn,
+) -> Result<IcebergColumnHandle, ConnectorError> {
+    IcebergColumnHandle::base_column(&NestedField::optional(
+        metadata.field_id(),
+        name,
         Type::Primitive(metadata.declared_type()),
     ))
 }

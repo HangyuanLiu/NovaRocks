@@ -42,7 +42,9 @@ use crate::position_delete::load_position_deletes_with_context;
 use super::column_handle::{IcebergColumnHandle, invalid};
 use super::schema_binding::IcebergMetadataColumn;
 use super::split::IcebergDeleteFile;
-use super::table_execute::IcebergRewritePositionDeleteFilesSplit;
+use super::table_execute::{
+    IcebergRewritePositionDeleteFilesSplit, REWRITE_POSITION_DELETE_OUTPUT_COLUMNS,
+};
 
 /// The frozen facts one rewrite-position page source reads.
 pub struct IcebergRewritePositionDeleteFilesPageSourceRequest<'a> {
@@ -80,8 +82,24 @@ fn resolve_outputs(
                 )));
             }
             match IcebergMetadataColumn::from_field_id(column.base_field_id()) {
-                Some(IcebergMetadataColumn::Path) => Ok(RewritePositionOutput::FilePath),
-                Some(IcebergMetadataColumn::RowPosition) => Ok(RewritePositionOutput::Position),
+                Some(IcebergMetadataColumn::Path)
+                    if column.base_column_identity().name()
+                        == REWRITE_POSITION_DELETE_OUTPUT_COLUMNS[0].0 =>
+                {
+                    Ok(RewritePositionOutput::FilePath)
+                }
+                Some(IcebergMetadataColumn::RowPosition)
+                    if column.base_column_identity().name()
+                        == REWRITE_POSITION_DELETE_OUTPUT_COLUMNS[1].0 =>
+                {
+                    Ok(RewritePositionOutput::Position)
+                }
+                Some(IcebergMetadataColumn::Path | IcebergMetadataColumn::RowPosition) => {
+                    Err(invalid(format!(
+                        "the iceberg rewrite-position reader requires canonical output column names file_path and pos, not '{}'",
+                        column.base_column_identity().name()
+                    )))
+                }
                 Some(
                     IcebergMetadataColumn::RowId
                     | IcebergMetadataColumn::LastUpdatedSequenceNumber
@@ -127,6 +145,7 @@ fn selected_delete_specs(
                 length: u64::try_from(delete.file_size_in_bytes()).ok(),
                 content_offset: Some(content_offset),
                 content_size_in_bytes: Some(content_size_in_bytes),
+                referenced_data_file: delete.referenced_data_file().map(str::to_string),
             })
         })
         .collect()
@@ -242,5 +261,151 @@ impl ConnectorPageSource for IcebergRewritePositionDeleteFilesPageSource {
         self.rows.clear();
         self.rows.shrink_to_fit();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use arrow::array::Array;
+    use novarocks_fs::{
+        FileCancellation, FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime,
+        TokioFileTaskSpawner,
+    };
+    use novarocks_spi::connector::read_stack::SplitWeight;
+
+    use crate::commit::DeletionVector;
+    use crate::iceberg::spec::{NestedField, Type};
+    use crate::typed_read::split::{
+        IcebergDeleteFileContent, IcebergDeleteFileParams, IcebergFileFormat,
+    };
+    use crate::typed_read::table_execute::IcebergRewritePositionDeleteFilesSplitParams;
+
+    use super::*;
+
+    #[test]
+    fn page_source_reads_selected_vectors_and_emits_canonical_output_columns() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let delete_path = directory.path().join("deletes.puffin");
+        let data_file_path = directory
+            .path()
+            .join("data.parquet")
+            .to_string_lossy()
+            .to_string();
+
+        let mut first = DeletionVector::new();
+        first.insert(1).expect("position");
+        first.insert(4).expect("position");
+        let mut second = DeletionVector::new();
+        second.insert(4).expect("position");
+        second.insert(9).expect("position");
+        let first_payload = first.to_iceberg_payload().expect("first payload");
+        let second_payload = second.to_iceberg_payload().expect("second payload");
+        let mut payloads = first_payload.clone();
+        payloads.extend_from_slice(&second_payload);
+        fs::write(&delete_path, &payloads).expect("write deletion vectors");
+
+        let delete_path = delete_path.to_string_lossy().to_string();
+        let delete = |offset: usize, payload: &[u8]| {
+            IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+                content: IcebergDeleteFileContent::PositionDeletes,
+                path: delete_path.clone(),
+                format: IcebergFileFormat::Puffin,
+                record_count: 2,
+                file_size_in_bytes: payloads.len() as i64,
+                equality_field_ids: Vec::new(),
+                row_position_lower_bound: None,
+                row_position_upper_bound: None,
+                data_sequence_number: 1,
+                content_offset: Some(offset as i64),
+                content_size_in_bytes: Some(payload.len() as i64),
+                referenced_data_file: Some(data_file_path.clone()),
+                decryption_data: None,
+            })
+            .expect("selected deletion vector")
+        };
+        let split = IcebergRewritePositionDeleteFilesSplit::try_new(
+            IcebergRewritePositionDeleteFilesSplitParams {
+                data_file_path: data_file_path.clone(),
+                data_file_size: 0,
+                partition_spec_id: 0,
+                partition_data_json: "{}".to_string(),
+                selected_position_deletes: vec![
+                    delete(0, &first_payload),
+                    delete(first_payload.len(), &second_payload),
+                ],
+                split_weight: SplitWeight::STANDARD,
+            },
+        )
+        .expect("rewrite split");
+
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let file_runtime: Arc<dyn FileIoRuntime> =
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
+        let task_spawner: Arc<dyn FileTaskSpawner> =
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let binding = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::clone(&file_runtime),
+            Arc::clone(&task_spawner),
+        );
+        let context = FileReadContext {
+            cancellation: FileCancellation::new(),
+            deadline: Some(Instant::now() + Duration::from_secs(10)),
+            runtime: file_runtime,
+            task_spawner,
+        };
+        let columns = REWRITE_POSITION_DELETE_OUTPUT_COLUMNS.map(|(name, metadata)| {
+            IcebergColumnHandle::base_column(&NestedField::optional(
+                metadata.field_id(),
+                name,
+                Type::Primitive(metadata.declared_type()),
+            ))
+            .expect("canonical output handle")
+        });
+        let mut source = create_iceberg_rewrite_position_delete_files_page_source(
+            IcebergRewritePositionDeleteFilesPageSourceRequest {
+                split: &split,
+                columns: &columns,
+                access_binding: binding,
+                context,
+                budget: FileReadBudget {
+                    max_rows: NonZeroUsize::new(16).expect("nonzero"),
+                    max_bytes: NonZeroUsize::new(1024).expect("nonzero"),
+                },
+            },
+        )
+        .expect("page source");
+        let page = source
+            .next_source_page()
+            .expect("read page")
+            .expect("one output page");
+        let (rows, columns) = page.into_columns().expect("materialize page");
+        assert_eq!(rows, 3);
+        let paths = columns[0]
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("file_path string column");
+        let positions = columns[1]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("pos bigint column");
+        assert_eq!(
+            paths.iter().collect::<Vec<_>>(),
+            vec![Some(data_file_path.as_str()); 3]
+        );
+        assert_eq!(positions.values(), &[1, 4, 9]);
+        assert!(
+            source
+                .next_source_page()
+                .expect("finish page source")
+                .is_none()
+        );
+        assert!(source.is_finished());
     }
 }

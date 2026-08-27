@@ -1128,16 +1128,16 @@ impl ConnectorBatchWriter for IcebergEqualityDeleteBatchWriter {
     }
 }
 
-/// The execution plan uses `_file`/`_pos` as internal row-identity columns,
-/// while Iceberg position-delete Parquet files have the standardized
-/// `file_path`/`pos` schema.  Keep that translation at the writer boundary so
-/// an internal construction detail never becomes persisted table data.
+/// Ordinary row mutations use `_file`/`_pos` while
+/// `REWRITE_POSITION_DELETE_FILES` exposes `file_path`/`pos`. Both carry the
+/// same first-two-column identity contract; normalize the persisted schema at
+/// the writer boundary so neither transport spelling becomes table data.
 fn position_delete_storage_batch(batch: &RecordBatch) -> Result<RecordBatch, ConnectorError> {
     let input_schema = batch.schema();
     if input_schema.fields().len() < 2 {
         return Err(error(
             ConnectorErrorKind::InvalidRequest,
-            "Iceberg position-delete storage batch requires _file and _pos as its first two columns",
+            "Iceberg position-delete storage batch requires file-path and position as its first two columns",
         ));
     }
     let schema = canonical_output_schema();

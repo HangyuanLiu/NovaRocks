@@ -52,6 +52,14 @@ fn accumulate_deletes_from_file(
     context: &FileReadContext,
     deleted: &mut RoaringTreemap,
 ) -> Result<(), String> {
+    if let Some(referenced_data_file) = spec.referenced_data_file.as_deref()
+        && referenced_data_file != data_file_path
+    {
+        return Err(format!(
+            "iceberg position-delete file {} belongs to data file {referenced_data_file}, not {data_file_path}",
+            spec.path
+        ));
+    }
     if spec.content_offset.is_some() || spec.content_size_in_bytes.is_some() {
         let offset = spec.content_offset.ok_or_else(|| {
             format!(
@@ -82,7 +90,6 @@ fn accumulate_deletes_from_file(
                 spec.path
             )
         })?;
-        let _ = data_file_path;
         *deleted |= dv.to_roaring_treemap();
         return Ok(());
     }
@@ -204,12 +211,26 @@ mod tests {
             length: None,
             content_offset: None,
             content_size_in_bytes: None,
+            referenced_data_file: Some("/data/a.parquet".to_string()),
         };
 
-        let deleted =
-            load_position_deletes_with_context(&[spec], "/data/a.parquet", &access, &context)
-                .expect("read position deletes");
+        let deleted = load_position_deletes_with_context(
+            &[spec.clone()],
+            "/data/a.parquet",
+            &access,
+            &context,
+        )
+        .expect("read position deletes");
         assert_eq!(deleted.iter().collect::<Vec<_>>(), vec![2, 5]);
+
+        let foreign = IcebergDeleteFileSpec {
+            referenced_data_file: Some("/data/b.parquet".to_string()),
+            ..spec
+        };
+        let error =
+            load_position_deletes_with_context(&[foreign], "/data/a.parquet", &access, &context)
+                .expect_err("a delete file for another data file must fail before it is read");
+        assert!(error.contains("belongs to data file /data/b.parquet"));
     }
 
     fn write_delete_parquet(path: &std::path::Path, file_paths: &[&str], positions: &[i64]) {

@@ -268,6 +268,7 @@ fn plan_jobs(
                 sequence_number: source.data_sequence_number,
                 partition_spec_id: source.partition_spec_id,
                 partition_key: source.partition_key.clone(),
+                referenced_data_file: None,
                 equality_column_names: Vec::new(),
                 equality_field_ids: equality_field_ids.clone(),
             };
@@ -417,6 +418,7 @@ fn delete_visibility_specs(
                 sequence_number: None,
                 partition_spec_id: None,
                 partition_key: None,
+                referenced_data_file: None,
                 equality_column_names: Vec::new(),
                 equality_field_ids: Vec::new(),
             })

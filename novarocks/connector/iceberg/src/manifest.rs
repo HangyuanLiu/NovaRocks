@@ -235,6 +235,7 @@ fn read_delete_to_catalog_delete(
         sequence_number: delete_file.sequence_number,
         partition_spec_id: delete_file.partition_spec_id,
         partition_key: delete_file.partition_key,
+        referenced_data_file: delete_file.referenced_data_file,
         equality_column_names,
         equality_field_ids,
     })

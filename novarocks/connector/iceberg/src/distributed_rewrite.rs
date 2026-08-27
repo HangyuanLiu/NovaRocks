@@ -1215,8 +1215,8 @@ pub(crate) fn frozen_rewrite_scan_schema(
 ) -> SchemaRef {
     match operation_kind {
         REWRITE_POSITION_DELETES_KIND => Arc::new(Schema::new(vec![
-            Field::new("_file", DataType::Utf8, false),
-            Field::new("_pos", DataType::Int64, false),
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
         ])),
         _ if row_lineage => {
             let mut fields = physical_schema.fields().to_vec();
@@ -2010,6 +2010,7 @@ mod tests {
             sequence_number: Some(7),
             partition_spec_id: Some(0),
             partition_key: None,
+            referenced_data_file: Some("s3://bucket/data-1.parquet".to_string()),
             equality_column_names: Vec::new(),
             equality_field_ids: Vec::new(),
         }
@@ -2149,6 +2150,7 @@ mod tests {
             sequence_number: Some(3),
             partition_spec_id: Some(0),
             partition_key: None,
+            referenced_data_file: None,
             equality_column_names: vec!["id".to_string()],
             equality_field_ids: vec![1],
         };
@@ -2197,6 +2199,7 @@ mod tests {
             sequence_number: Some(3),
             partition_spec_id: Some(0),
             partition_key: None,
+            referenced_data_file: None,
             equality_column_names: Vec::new(),
             equality_field_ids: Vec::new(),
         });

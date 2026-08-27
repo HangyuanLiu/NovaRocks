@@ -52,6 +52,7 @@ SELECT id, user_id, amount FROM orders ORDER BY id;
 
 -- query 3
 -- @db=dv_proc_${uuid0}.ns_${uuid0}
+-- @be_log_contains=NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN
 -- @be_log_contains=NOVAROCKS_CONNECTOR_WRITER_OPENED
 -- @result_contains=rewritten_delete_files_count	added_delete_files_count	rewritten_bytes_count	added_bytes_count
 -- @skip_result_check=true

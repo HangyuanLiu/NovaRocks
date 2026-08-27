@@ -499,6 +499,10 @@ message IcebergDeleteFile {
   optional int64 content_offset = 10;        // Puffin deletion vector only.
   optional int64 content_size_in_bytes = 11; // Puffin deletion vector only.
   optional ParquetFileDecryptionData decryption_data = 12;
+  // Present when the Iceberg manifest ties this delete artifact to one data
+  // file. Rewrite-position splits require this exact identity; ordinary
+  // position/equality delete readers retain their existing optional behavior.
+  optional string referenced_data_file = 13;
 }
 
 // ---------------------------------------------------------------------------

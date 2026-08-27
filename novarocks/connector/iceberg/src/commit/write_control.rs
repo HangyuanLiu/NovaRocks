@@ -3663,15 +3663,18 @@ fn validate_position_delete_shape(
     }
     let file = identity_fields[0].field();
     let position = identity_fields[1].field();
-    if !file.name().eq_ignore_ascii_case("_file")
+    let accepted_identity_names = (file.name().eq_ignore_ascii_case("_file")
+        && position.name().eq_ignore_ascii_case("_pos"))
+        || (file.name().eq_ignore_ascii_case("file_path")
+            && position.name().eq_ignore_ascii_case("pos"));
+    if !accepted_identity_names
         || file.data_type() != &DataType::Utf8
         || file.is_nullable()
-        || !position.name().eq_ignore_ascii_case("_pos")
         || position.data_type() != &DataType::Int64
         || position.is_nullable()
     {
         return Err(invalid(
-            "Iceberg row-level write identity must be non-null `_file` UTF-8 followed by non-null `_pos` INT64",
+            "Iceberg row-level write identity must be non-null `_file`/`_pos` or `file_path`/`pos` with UTF-8 then INT64 types",
         ));
     }
     let partition_fields = metadata.default_partition_spec().fields();
