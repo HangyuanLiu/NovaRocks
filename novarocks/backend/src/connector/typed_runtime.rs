@@ -383,18 +383,24 @@ impl ScanOp for TypedConnectorScanOp {
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String> {
-        // Deliberately empty: a task scan may legally start before its first
-        // split arrives, and may receive none at all. `has_more` stays true
-        // until this plan node's queue can never produce another split, which
-        // is what keeps the operator alive instead of finishing at zero rows.
-        Ok(ScanMorsels::new(Vec::new(), !self.queue.is_exhausted()))
+        // Exactly one, and never zero. A typed scan's work is not a morsel set
+        // at all — it is the task's split queue, which the morsel's driver
+        // drains until the queue says no split can ever follow. Reporting no
+        // morsel would leave nobody to drain it: the splits would arrive, be
+        // enqueued, and never be read, and the query would return zero rows
+        // while every part of it reported success.
+        //
+        // `has_more` is false for the same reason: the set does not grow, the
+        // queue does. A scan that starts before its first split arrives, or
+        // receives none at all, is expressed by the driver parking on the
+        // queue, not by an empty morsel set.
+        Ok(ScanMorsels::new(vec![ScanMorsel::OperatorDriven], false))
     }
 
     fn supports_incremental_scan_ranges(&self) -> bool {
-        // The morsel set of a typed scan can still grow after the plan was
-        // frozen. This says only that; the growth itself arrives as splits on
-        // the task-update queue, never as a legacy incremental scan range.
-        true
+        // Growth arrives as splits on the task-update queue, never as a legacy
+        // incremental scan range, so the morsel set itself is final.
+        false
     }
 
     fn build_incremental_morsels(
@@ -419,9 +425,16 @@ impl ScanOp for TypedConnectorScanOp {
         // through `with_backend_dynamic_filter`. Applying an execution filter
         // here would push a predicate the provider never agreed to.
         match morsel {
-            // The neutral morsel: this scan's work unit is its split queue, so
-            // the morsel carries no scheduling identity of its own yet.
-            ScanMorsel::Empty => {}
+            // This scan's work unit is its split queue, so the morsel carries
+            // no scheduling identity of its own.
+            ScanMorsel::OperatorDriven => {}
+            ScanMorsel::Empty => {
+                return Err(
+                    "typed connector scan received an empty morsel, which would read none of \
+                     the splits delivered to its task"
+                        .to_string(),
+                );
+            }
             ScanMorsel::FileRange { .. } => {
                 return Err(
                     "typed connector scan received a file-range morsel it does not own".to_string(),
@@ -1297,21 +1310,23 @@ mod tests {
         );
         let op = bind(&source);
 
+        // Exactly one morsel, before any split exists: it is the driver that
+        // will drain the queue. Reporting none would leave the splits enqueued
+        // and unread, and the query would return zero rows while reporting
+        // success everywhere.
         let morsels = op.build_morsels().expect("build morsels");
-        assert!(morsels.morsels.is_empty());
-        // Still open: a scan that received nothing yet has not finished.
-        assert!(morsels.has_more);
-        assert!(op.supports_incremental_scan_ranges());
+        assert_eq!(morsels.morsels.len(), 1);
+        // The morsel set is final; it is the queue that grows.
+        assert!(!morsels.has_more);
+        assert!(!op.supports_incremental_scan_ranges());
 
         // The terminal marker alone is a clean, empty end of stream.
         queues
             .queue(NODE)
             .offer_splits(NODE, Vec::new(), true)
             .expect("terminal marker");
-        let morsels = op.build_morsels().expect("build morsels after the marker");
-        assert!(!morsels.has_more);
         let rows = op
-            .execute_iter(ScanMorsel::Empty, None, None)
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
             .expect("driver")
             .collect::<Result<Vec<_>, _>>()
             .expect("drive an empty typed scan");
@@ -1378,7 +1393,7 @@ mod tests {
         assert!(!morsels.has_more);
 
         let rows = op
-            .execute_iter(ScanMorsel::Empty, None, None)
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
             .expect("driver")
             .collect::<Result<Vec<_>, _>>()
             .expect("drain the metadata file");
@@ -1437,7 +1452,7 @@ mod tests {
         let op = bind(&source);
 
         let mut iter = op
-            .execute_iter(ScanMorsel::Empty, None, None)
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
             .expect("driver");
         // The driver parks on an empty queue; the split arrives only now.
         let offering = {
@@ -1483,7 +1498,7 @@ mod tests {
             .expect("one split");
 
         let rows = op
-            .execute_iter(ScanMorsel::Empty, None, None)
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
             .expect("driver")
             .collect::<Result<Vec<_>, _>>()
             .expect("drive across idle turns");
@@ -1515,7 +1530,7 @@ mod tests {
             .expect("two splits");
 
         let rows = op
-            .execute_iter(ScanMorsel::Empty, None, None)
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
             .expect("driver")
             .collect::<Result<Vec<_>, _>>()
             .expect("drive both splits");
@@ -1548,7 +1563,7 @@ mod tests {
         let woken_by_offer = closes.load(Ordering::Acquire);
 
         let mut iter = op
-            .execute_iter(ScanMorsel::Empty, None, None)
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
             .expect("driver");
         iter.next()
             .expect("first page")
@@ -1584,7 +1599,7 @@ mod tests {
         op.terminate().expect("terminate before any read");
 
         let rows = op
-            .execute_iter(ScanMorsel::Empty, None, None)
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
             .expect("driver")
             .collect::<Result<Vec<_>, _>>()
             .expect("a terminated scan yields nothing");
@@ -1608,7 +1623,7 @@ mod tests {
             .expect("one split");
 
         let error = op
-            .execute_iter(ScanMorsel::Empty, None, None)
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
             .expect("driver")
             .collect::<Result<Vec<_>, _>>()
             .expect_err("a cancelled attempt must not read");
@@ -1684,7 +1699,7 @@ mod tests {
             .expect("one split");
 
         let _ = op
-            .execute_iter(ScanMorsel::Empty, None, None)
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
             .expect("driver")
             .collect::<Result<Vec<_>, _>>()
             .expect("drive the scan");
@@ -1851,7 +1866,7 @@ impl ScanOp for TypedConnectorSystemTableScanOp {
         // Exactly one unit of work, known before execution starts: the whole
         // relation is one metadata file. `has_more` is false because nothing
         // can add work to this scan later.
-        Ok(ScanMorsels::new(vec![ScanMorsel::Empty], false))
+        Ok(ScanMorsels::new(vec![ScanMorsel::OperatorDriven], false))
     }
 
     fn execute_iter(
@@ -1861,7 +1876,14 @@ impl ScanOp for TypedConnectorSystemTableScanOp {
         _runtime_filters: Option<&RuntimeFilterContext>,
     ) -> Result<BoxedExecIter, String> {
         match morsel {
-            ScanMorsel::Empty => {}
+            ScanMorsel::OperatorDriven => {}
+            ScanMorsel::Empty => {
+                return Err(
+                    "typed system relation scan received an empty morsel, which would read \
+                     none of the relation"
+                        .to_string(),
+                );
+            }
             ScanMorsel::FileRange { .. } => {
                 return Err(
                     "typed system relation scan received a file-range morsel it does not own"

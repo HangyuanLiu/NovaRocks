@@ -81,39 +81,42 @@ pub(super) fn resolve_physical_columns(
 
 /// The physical columns one typed connector scan actually reads.
 ///
-/// A scan node carries every column of its relation, including the Iceberg
-/// metadata pseudo-columns (`_file`, `_pos`). Those are not stored in any data
-/// file and no connector column binding names them, so assigning one the query
-/// never mentioned turns every scan of the relation into a failure.
+/// The physical columns one typed connector scan reads, in scan output order.
 ///
-/// The backend derives its own read slots from its decoded output, which
-/// `required_columns` narrows the same way, so the two sides agree.
+/// This is the same set the wire declares as `required_columns`, resolved
+/// through the same helper, because the backend filters its own decoded output
+/// by exactly that list and then reads whatever survives. Deriving the
+/// assignments from any wider list — every column the relation has, say — makes
+/// the two sides describe different columns, and for an Iceberg relation the
+/// wider list also contains the metadata pseudo-columns (`_file`, `_pos`) that
+/// no data file holds and no connector column binding names.
 pub(super) fn resolve_read_physical_columns(
     node_id: i32,
     scan: &PlanScanNode,
 ) -> Result<Vec<ResolvedScanColumn>, String> {
+    // Resolved first so a projection that cannot be resolved at all is
+    // reported as the projection defect it is, rather than as whichever
+    // required name happened to reach the read resolver first.
     let physical = resolve_physical_columns(node_id, scan)?;
-    // What this scan effectively projects. A refresh lane states its own
-    // projection; otherwise the planner's required set is it. Absent both,
-    // nothing narrows the relation and every column is read — which is what an
-    // MV target locator scan relies on to read row identity at all.
-    let projection = effective_projection_names(scan);
+    // No equality-delete columns: those are a mutation-lane fact, and a typed
+    // read never adds one of its own.
+    let required = resolve_effective_required_reads(node_id, scan, &[])?;
+    let mut required_ids = required
+        .iter()
+        .filter_map(|read| read.planner_column_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    // A VARIANT path column is built above the connector out of a physical
+    // source column. The derived column is required, the source it is derived
+    // from may not be named anywhere else, and dropping it would leave the
+    // materialization with no input.
+    required_ids.extend(
+        scan.variant_columns
+            .iter()
+            .map(|variant| variant.source_column_id),
+    );
     Ok(physical
         .into_iter()
-        .filter(|column| {
-            // An ordinary table column is read whether or not the query
-            // narrows to it: over-reading one costs I/O, and the old opaque
-            // path did the same. A metadata pseudo-column is different — no
-            // data file holds it and no connector column binding names it — so
-            // asking for one the query never mentioned turns every scan of the
-            // relation into a failure.
-            column.kind != ResolvedScanColumnKind::IcebergMetadataColumn
-                || projection.as_ref().is_none_or(|projected| {
-                    projected
-                        .iter()
-                        .any(|name| name.eq_ignore_ascii_case(&column.planner.name))
-                })
-        })
+        .filter(|column| required_ids.contains(&column.planner.column_id))
         .collect())
 }
 

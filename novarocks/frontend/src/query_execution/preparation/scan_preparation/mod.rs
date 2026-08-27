@@ -54,9 +54,7 @@ use novarocks_sql::planning::query_execution::{
 mod projection;
 mod pruning;
 
-use projection::{
-    resolve_effective_required_reads, resolve_physical_columns, resolve_read_physical_columns,
-};
+use projection::{resolve_effective_required_reads, resolve_read_physical_columns};
 
 /// A `DistributedNode::limit` of this value means the node declares no limit.
 const NO_NODE_LIMIT: i64 = -1;
@@ -368,17 +366,20 @@ fn prepare_scan_node(
     // output — a VARIANT path column — is deliberately not one of them: the
     // backend materializes those on top of the physical read slots, so
     // offering one to the connector would ask for a column it does not have.
-    let physical_columns = resolve_physical_columns(node_id, scan)?;
-    // What the connector is asked to produce: the node's own narrowed output,
-    // never every column the relation has.
-    let read_columns = resolve_read_physical_columns(node_id, scan)?;
+    // What the connector is asked to produce, and therefore what this scan
+    // outputs: the node's own projection, never every column the relation has.
+    let physical_columns = resolve_read_physical_columns(node_id, scan)?;
     // The runtime filters this scan must offer the connector. They are resolved
     // before the relation is frozen so the scan carrier declares them itself; a
     // filter added afterwards would never reach the reader.
     // Resolved against the same list the assignments are built from, so a
     // filter can only ever name a column this scan actually reads.
-    let dynamic_filters =
-        scan_dynamic_filters(fragment_id, node_id, &read_columns, runtime_filter_scans)?;
+    let dynamic_filters = scan_dynamic_filters(
+        fragment_id,
+        node_id,
+        &physical_columns,
+        runtime_filter_scans,
+    )?;
     let dynamic_filters = dynamic_filters.as_slice();
     let (ranges, equality_required, typed_scan) = match &execution {
         // The opaque lane is produced only by the pre-pinned source refused
@@ -394,7 +395,7 @@ fn prepare_scan_node(
                 node_id,
                 node_limit,
                 scan,
-                &read_columns,
+                &physical_columns,
                 &facts,
                 materialization,
                 TypedRelationFreeze::SystemTable,
@@ -414,7 +415,7 @@ fn prepare_scan_node(
                 node_id,
                 node_limit,
                 scan,
-                &read_columns,
+                &physical_columns,
                 &facts,
                 materialization,
                 TypedRelationFreeze::ChangeWindow(TypedChangeWindow::new(
@@ -433,7 +434,7 @@ fn prepare_scan_node(
                 node_id,
                 node_limit,
                 scan,
-                &read_columns,
+                &physical_columns,
                 &facts,
                 materialization,
                 TypedRelationFreeze::Table {

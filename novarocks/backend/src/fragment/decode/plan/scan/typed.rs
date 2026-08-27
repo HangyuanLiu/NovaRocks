@@ -883,11 +883,13 @@ mod tests {
         );
         let (profile, morsels) = lower_and_build_morsels(&node);
         assert_eq!(profile, "TypedConnectorScan");
-        // Nothing has been offered yet, and this lane must keep asking.
-        assert!(morsels.morsels.is_empty());
+        // One morsel even before a split exists: it is the driver that drains
+        // the queue, and reporting none would leave every delivered split
+        // unread.
+        assert_eq!(morsels.morsels.len(), 1);
         assert!(
-            morsels.has_more,
-            "a split-driven scan stays alive until its queue is exhausted"
+            !morsels.has_more,
+            "a split-driven scan grows its queue, not its morsel set"
         );
     }
 
@@ -914,7 +916,7 @@ mod tests {
         );
         let (_, morsels) = lower_and_build_morsels(&node);
         assert!(
-            matches!(&morsels.morsels[..], [ScanMorsel::Empty]),
+            matches!(&morsels.morsels[..], [ScanMorsel::OperatorDriven]),
             "the whole relation is exactly one unit of work: {:?}",
             morsels.morsels
         );

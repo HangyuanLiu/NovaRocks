@@ -48,6 +48,16 @@ pub enum ScanMorsel {
     Schema {
         table_name: String,
     },
+    /// The scan's work is not described by a morsel at all: the operator owns
+    /// it and produces rows until it says it is done.
+    ///
+    /// Deliberately not [`Self::Empty`]. An empty morsel means "nothing to
+    /// read", and the runner short-circuits it without ever touching the
+    /// operator — which is right for a scan whose work is fully described by
+    /// its morsels, and silently wrong for one whose work arrives afterwards.
+    /// A typed connector scan reads splits delivered to its task at runtime,
+    /// so its morsel has to reach the operator or the splits are never read.
+    OperatorDriven,
     Empty,
 }
 
@@ -76,6 +86,7 @@ impl ScanMorsel {
                     .unwrap_or_else(|| "none".to_string())
             ),
             ScanMorsel::Schema { table_name } => format!("schema_table={table_name}"),
+            ScanMorsel::OperatorDriven => "operator_driven".to_string(),
             ScanMorsel::Empty => "empty".to_string(),
         }
     }
