@@ -721,22 +721,31 @@ Durable design decisions, philosophies, and their honestly-recorded trade-offs l
 `docs/adr/` (index and authoring rules: `docs/adr/README.md`).
 Before changing architecture-level behavior, check the index for the affected domain.
 Any PR that embodies a new design decision or accepts a compromise must add or
-supersede an ADR — use the `/adr` skill (`.agents/skills/adr/`, exposed directly
-to Codex and to Claude Code via the `.claude/skills` → `.agents/skills` symlink),
-which embeds the template, numbering, supersede, and collision-renumbering rules.
+supersede an ADR — use `$ops-capture` from the `workbench` plugin
+(`.agents/skills/workbench/`, exposed directly to Codex and to Claude Code via the
+`.claude/skills` → `.agents/skills` symlink). Its contract embeds the template,
+numbering, supersede, and collision-renumbering rules. `docs/adr/README.md` remains
+authoritative for this repository: where it and the skill contract disagree, the
+README wins.
 
 ---
 
-## 12. Project Development Workflow
+## 12. Project Development Workflow and Knowledge Base
 
 For NovaRocks feature, architecture, roadmap, and refactor work, resolve the
 project documentation root from memory. Use the newest directly applicable,
 existing path; when memory has no usable project documentation path, use
-`<repo-root>/docs/workflow`.
+`<repo-root>/docs/workbench`.
 
-Use the generic skills-only plugin under `.agents/skills/dev-workflow/`:
+The documentation root holds two side-by-side halves: `workflow/` for staged
+development artifacts (spec, plan, umbrella, archive) and `ops/` for the durable
+engineering knowledge base (scenarios, cases, and — for projects without an
+in-repo ADR directory — ADRs). Resolve the root itself, never either half; if a
+memory entry points straight at `.../workflow`, take its parent.
 
-- `dev-workflow`: identify and route the current stage;
+Use the generic skills-only plugin under `.agents/skills/workbench/`:
+
+- `workbench`: identify and route the current stage or knowledge operation;
 - `dev-workflow-explain-technical-concept`: explain technical concepts and
   current mechanisms in Chinese from first principles, with one concrete
   running example and explicit concept/design/implementation/impact layers;
@@ -746,9 +755,18 @@ Use the generic skills-only plugin under `.agents/skills/dev-workflow/`:
   then mark the persisted version approved after explicit user approval;
 - `dev-workflow-execute`: create a goal and execute continuously through
   verification;
-- `dev-workflow-finish`: publish and archive only when authorized.
+- `dev-workflow-finish`: publish and archive only when authorized;
+- `ops-capture`: record a reproducible scenario, a first-hand debugging case, or
+  an ADR, with its symptoms written both the way the field describes them and the
+  way they appear in logs;
+- `ops-lookup`: check our own records for whether a symptom has been hit before,
+  and hand off to external-source search when it has not.
 
 Codex discovers the project-local skill sources directly under `.agents/skills/`.
+
+Knowledge operations are a side route available from every stage. `ops-lookup` is
+read-only; `ops-capture` writes only knowledge entries. Neither changes spec, plan,
+goal, or publication state.
 
 Technical explanation is a read-only side route available from every stage. It
 does not accept a design, approve a plan, authorize implementation, or modify
@@ -760,10 +778,10 @@ in every stage when they provide useful parallel investigation, independent
 verification, isolated implementation, or risk review. The main agent retains
 ownership and verifies their results.
 
-The bundle's
-`.agents/skills/dev-workflow/skills/dev-workflow/references/workflow-contract.md` is the
-only development-workflow contract. Do not depend on an external workflow
-document. The plan stage runs in the current editable mode and persists its
+The bundle carries two contracts under
+`.agents/skills/workbench/skills/workbench/references/`: `workflow-contract.md` is
+the only development-workflow contract, and `ops-contract.md` is the only
+knowledge-base contract. Do not depend on an external workflow document. The plan stage runs in the current editable mode and persists its
 draft immediately; do not require Codex Plan mode. Produce a task DAG with hard
 dependencies, parallel waves, non-overlapping file ownership, sub-agent
 scheduling labels, independent validation, integration gates, and local commit

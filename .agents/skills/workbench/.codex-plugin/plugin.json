@@ -1,0 +1,26 @@
+{
+  "name": "workbench",
+  "version": "0.2.0",
+  "description": "Staged development workflow plus a durable engineering knowledge base (scenarios, cases, ADRs)",
+  "author": {
+    "name": "Workbench"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Workbench",
+    "shortDescription": "Drive changes through explicit stages; capture and look up engineering knowledge.",
+    "longDescription": "Two halves sharing one documentation root. The development half explains, discusses, specifies, plans, executes, and finishes changes under explicit human gates, with persisted parallel-ready task graphs and local checkpoint commits. The knowledge half captures reproducible customer scenarios, first-hand debugging cases, and architecture decision records, then retrieves them by symptom when a problem recurs.",
+    "developerName": "Workbench",
+    "category": "Productivity",
+    "capabilities": [
+      "Design",
+      "Explanation",
+      "Planning",
+      "Implementation",
+      "Knowledge"
+    ],
+    "defaultPrompt": [
+      "Explain this topic, drive the change through discussion, a parallel-ready plan, goal execution, and verification, or capture and look up engineering knowledge."
+    ]
+  }
+}

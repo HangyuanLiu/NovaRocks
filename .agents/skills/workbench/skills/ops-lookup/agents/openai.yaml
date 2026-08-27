@@ -1,0 +1,4 @@
+interface:
+  display_name: "Look Up Engineering Knowledge"
+  short_description: "Check whether we have hit this problem before"
+  default_prompt: "Use $ops-lookup to check our own knowledge base for a scenario, debugging case, or decision matching this symptom."

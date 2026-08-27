@@ -1,0 +1,20 @@
+{
+  "name": "novarocks-workbench",
+  "metadata": {
+    "description": "Local marketplace for the workbench plugin"
+  },
+  "owner": {
+    "name": "Workbench"
+  },
+  "plugins": [
+    {
+      "name": "workbench",
+      "description": "Staged development workflow plus a durable engineering knowledge base (scenarios, cases, ADRs)",
+      "version": "0.2.0",
+      "source": "./",
+      "author": {
+        "name": "Workbench"
+      }
+    }
+  ]
+}

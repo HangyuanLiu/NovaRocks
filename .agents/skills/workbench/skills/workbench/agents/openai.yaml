@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workbench"
+  short_description: "Route work to a development stage or to the knowledge base"
+  default_prompt: "Use $workbench to explain this topic, drive the change through the correct development stage, or capture and look up engineering knowledge."

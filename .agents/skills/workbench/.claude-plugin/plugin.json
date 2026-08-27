@@ -1,0 +1,8 @@
+{
+  "name": "workbench",
+  "description": "Staged development workflow plus a durable engineering knowledge base (scenarios, cases, ADRs)",
+  "version": "0.2.0",
+  "author": {
+    "name": "Workbench"
+  }
+}

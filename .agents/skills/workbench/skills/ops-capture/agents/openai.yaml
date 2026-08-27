@@ -1,0 +1,4 @@
+interface:
+  display_name: "Capture Engineering Knowledge"
+  short_description: "Record a scenario, a debugging case, or an ADR"
+  default_prompt: "Use $ops-capture to record this scenario, debugging case, or design decision as a retrievable knowledge entry."
