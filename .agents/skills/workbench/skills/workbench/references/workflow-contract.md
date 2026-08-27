@@ -135,8 +135,9 @@ umbrella 子任务面板建立反向入口。
 
 ## 5. Frontmatter
 
-> **tags 前缀刻意保持 `dev-workflow/*`**，即使 bundle 已更名为 `workbench`：现有 spec / plan / umbrella
-> 与 `Specs.base` / `Umbrella.base` 的聚合都依赖它，改名会断掉 Roadmap 索引。不要「顺手」统一。
+> **tags 前缀沿用项目既有约定，不因 bundle 更名而改**。下方模板中的 `dev-workflow/*` 是默认值；
+> 项目已在用别的前缀（如 `<project>/design`）时以项目为准。现有 spec / plan / umbrella 与
+> `Specs.base` / `Umbrella.base` 的聚合都依赖当前前缀，改名会断掉 Roadmap 索引——不要「顺手」统一。
 
 Spec 的最小 frontmatter 使用：
 
