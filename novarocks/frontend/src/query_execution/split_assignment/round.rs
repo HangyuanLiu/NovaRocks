@@ -30,6 +30,7 @@ use novarocks_proto_codec::connector_read::ConnectorReadCodec;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::read_stack::ConnectorReadColumnHandle;
 use novarocks_spi::connector::read_stack::ConnectorReadSplitSource;
+use novarocks_spi::connector::read_stack::SplitSourceProfile;
 
 use super::super::connector_domain::CatalogHandle;
 use super::driver::{
@@ -76,6 +77,19 @@ pub(crate) struct RoundSplitAssignment {
 }
 
 impl RoundSplitAssignment {
+    pub(crate) fn profile_snapshot(&self) -> SplitSourceProfile {
+        self.sources
+            .iter()
+            .fold(SplitSourceProfile::default(), |mut total, source| {
+                let next = source.source.profile_snapshot();
+                total.files_considered =
+                    total.files_considered.saturating_add(next.files_considered);
+                total.files_pruned = total.files_pruned.saturating_add(next.files_pruned);
+                total.files_expanded = total.files_expanded.saturating_add(next.files_expanded);
+                total.splits_emitted = total.splits_emitted.saturating_add(next.splits_emitted);
+                total
+            })
+    }
     pub(crate) fn new(
         execution_id: QueryExecutionId,
         transport: Arc<dyn TaskUpdateTransport>,
@@ -127,7 +141,9 @@ impl RoundSplitAssignment {
     ///
     /// A source that yields nothing right now is retried after the other
     /// sources get a turn, so one slow enumeration cannot starve the rest.
-    pub(crate) fn pump_to_completion(&mut self) -> Result<(), SplitAssignmentDriverError> {
+    pub(crate) fn pump_to_completion(
+        &mut self,
+    ) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
         while !self.stop.is_stopped() {
             let mut progressed = false;
             let mut pending = false;
@@ -169,7 +185,7 @@ impl RoundSplitAssignment {
                 }
             }
             if !pending {
-                return Ok(());
+                return Ok(self.profile_snapshot());
             }
             if !progressed {
                 // Either every remaining task is at its queue ceiling, or every
@@ -182,7 +198,7 @@ impl RoundSplitAssignment {
                 std::thread::sleep(IDLE_PUMP_BACKOFF);
             }
         }
-        Ok(())
+        Ok(self.profile_snapshot())
     }
 
     /// Idempotent. Closes the driver and every source exactly once.

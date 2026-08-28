@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_spi::connector::read_stack::SplitSourceProfile;
 
 use crate::query_execution::artifact::ValidatedFragmentSchedule;
 use crate::query_execution::split_assignment::{
@@ -144,7 +145,7 @@ impl Drop for RoundSplitAssignmentPlan {
 /// remember to.
 pub(crate) struct SplitAssignmentRoundGuard {
     stop: RoundSplitAssignmentStop,
-    worker: Option<std::thread::JoinHandle<Result<(), SplitAssignmentDriverError>>>,
+    worker: Option<std::thread::JoinHandle<Result<SplitSourceProfile, SplitAssignmentDriverError>>>,
 }
 
 impl SplitAssignmentRoundGuard {
@@ -201,10 +202,10 @@ impl SplitAssignmentRoundGuard {
     /// therefore not stop the worker: doing so would discard an accepted but
     /// unconfirmed immutable assignment. Cancellation and unwinding still use
     /// `Drop`, which signals stop before joining.
-    pub(crate) fn finish(mut self) -> Result<(), SplitAssignmentDriverError> {
+    pub(crate) fn finish(mut self) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
         match self.worker.take() {
-            Some(worker) => worker.join().unwrap_or(Ok(())),
-            None => Ok(()),
+            Some(worker) => worker.join().unwrap_or(Ok(SplitSourceProfile::default())),
+            None => Ok(SplitSourceProfile::default()),
         }
     }
 }
@@ -277,7 +278,7 @@ mod tests {
             worker: Some(std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(10));
                 worker_observed_stop.store(worker_stop.is_stopped(), Ordering::SeqCst);
-                Ok(())
+                Ok(SplitSourceProfile::default())
             })),
         };
 

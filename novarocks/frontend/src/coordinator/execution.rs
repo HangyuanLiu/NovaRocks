@@ -1296,15 +1296,20 @@ impl FrontendDistributedQueryCoordinator {
         // the guard's Drop path stops and closes the sources; on success we
         // join explicitly so every immutable split assignment is either
         // confirmed or reported as the query failure.
-        if let Some(assignment) = split_assignment.take()
-            && let Err(error) = assignment.finish()
-        {
-            return Err(self.fail_cancel_then_abort_query_lifecycle(
-                query_id,
-                &mut query_lifecycle_lease,
-                format!("split assignment did not finish: {error}"),
-            ));
-        }
+        let split_assignment_profile = if let Some(assignment) = split_assignment.take() {
+            match assignment.finish() {
+                Ok(profile) => profile,
+                Err(error) => {
+                    return Err(self.fail_cancel_then_abort_query_lifecycle(
+                        query_id,
+                        &mut query_lifecycle_lease,
+                        format!("split assignment did not finish: {error}"),
+                    ));
+                }
+            }
+        } else {
+            novarocks_spi::connector::read_stack::SplitSourceProfile::default()
+        };
 
         let terminal_set = query_lifecycle_lease
             .take()
@@ -1394,6 +1399,7 @@ impl FrontendDistributedQueryCoordinator {
                         builder.apply_terminal(fragment.as_proto())?;
                     }
                 }
+                builder.apply_split_assignment_profile(split_assignment_profile);
                 parts.completion.profile(result, builder.finish())
             }
             DistributedQueryIntent::Statistics => {

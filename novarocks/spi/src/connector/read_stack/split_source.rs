@@ -105,8 +105,9 @@ pub trait ConnectorSplitSource: Send {
 }
 
 /// Provider-neutral facts collected while a source decides which unexpanded
-/// units become splits.  `files_pruned` is deliberately separate from actual
-/// I/O metrics: it is an avoided-work estimate, not bytes read.
+/// units become splits. `files_pruned` counts only files ruled out by a
+/// completed dynamic-filter snapshot, not files the static predicate already
+/// excluded. It is an avoided-work estimate, not bytes read.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SplitSourceProfile {
     pub files_considered: u64,
