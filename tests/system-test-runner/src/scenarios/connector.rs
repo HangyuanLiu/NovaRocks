@@ -21,7 +21,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(DistributedReaderCancel),
         Box::new(DistributedReaderKillConnection),
-        Box::new(GenerationReplacement),
+        Box::new(CatalogVersionDrain),
         Box::new(PredicatePageIndexPruning),
         Box::new(TypedReadData),
     ]
@@ -346,7 +346,7 @@ impl Scenario for DistributedReaderKillConnection {
     }
 }
 
-struct GenerationReplacement;
+struct CatalogVersionDrain;
 
 struct PredicatePageIndexPruning;
 
@@ -411,9 +411,9 @@ impl Scenario for PredicatePageIndexPruning {
     }
 }
 
-impl Scenario for GenerationReplacement {
+impl Scenario for CatalogVersionDrain {
     fn name(&self) -> &'static str {
-        "connector/generation-replacement"
+        "connector/catalog-version-drain"
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
@@ -431,11 +431,11 @@ impl Scenario for GenerationReplacement {
         let mut control = mysql_actor::connect(
             &user,
             port,
-            context.remaining("connect connector generation control session")?,
+            context.remaining("connect catalog version drain control session")?,
         )?;
 
-        let warehouse = create_warehouse(context, "generation-replacement")?;
-        context.action("create first Iceberg connector generation and three data files");
+        let warehouse = create_warehouse(context, "catalog-version-drain")?;
+        context.action("create the first Iceberg catalog version and three data files");
         create_catalog_table_and_data(
             &mut control,
             "connector_generation_catalog",
@@ -444,7 +444,7 @@ impl Scenario for GenerationReplacement {
             &warehouse,
         )?;
 
-        context.action("start a read pinned to the first connector generation");
+        context.action("start a read pinned to the first catalog version");
         let target = start_connector_read(
             &user,
             port,
@@ -454,44 +454,56 @@ impl Scenario for GenerationReplacement {
         )?;
         let connection_id = target
             .ready
-            .recv_timeout(context.remaining("receive old-generation connection id")?)
-            .context(
-                "old-generation connector read terminated before publishing its connection id",
-            )?;
+            .recv_timeout(context.remaining("receive old-version connection id")?)
+            .context("old-version connector read terminated before publishing its connection id")?;
         let old_logs = wait_for_open_reader_on_every_backend(
             context,
             "connector_generation_catalog",
-            "wait for every BE to open an old-generation connector reader",
+            "wait for every BE to open an old-version connector reader",
         )?;
         assert_readers_are_in_flight(&old_logs, "before catalog replacement")?;
-        let old_incarnations = reader_incarnations(&old_logs, "connector_generation_catalog")?;
+        let old_versions = reader_catalog_versions(&old_logs, "connector_generation_catalog")?;
         if let Ok(result) = target.done.try_recv() {
             bail!(
-                "old-generation connector read completed before replacement was published: {result:?}"
+                "old-version connector read completed before replacement was published: {result:?}"
             );
         }
 
         context.action("drop and recreate the catalog while old readers remain in flight");
         control
             .query_drop("DROP CATALOG connector_generation_catalog")
-            .context("retire first connector generation")?;
+            .context("retire first catalog version")?;
         create_catalog(&mut control, "connector_generation_catalog", &warehouse)?;
 
-        context.action("reject the replacement generation while the old generation is leased");
-        let replacement_while_leased = control.query::<i64, _>(
-            "SELECT count(*) FROM connector_generation_catalog.connector_generation_db.connector_generation_data",
-        );
-        assert_generation_replacement_blocked(replacement_while_leased)?;
+        context.action("read the replacement catalog version while the old version is leased");
+        let replacement_rows: Vec<i64> = control
+            .query(
+                "SELECT count(*) FROM connector_generation_catalog.connector_generation_db.connector_generation_data",
+            )
+            .context("read table through replacement catalog version while old version is leased")?;
+        if replacement_rows != [300_000] {
+            bail!("replacement catalog version returned {replacement_rows:?}, expected [300000]");
+        }
+        wait_for_replacement_reader_on_every_backend(
+            context,
+            "connector_generation_catalog",
+            &old_versions,
+        )?;
+        if let Ok(result) = target.done.try_recv() {
+            bail!(
+                "old-version connector read completed while replacement was being verified: {result:?}"
+            );
+        }
 
         context.action(format!(
-            "cancel old-generation reader through KILL QUERY {connection_id}"
+            "cancel old-version reader through KILL QUERY {connection_id}"
         ));
         control
             .query_drop(format!("KILL QUERY {connection_id}"))
             .context("issue public MySQL KILL QUERY for old-generation reader")?;
         assert_cancelled_query(
             &target.done,
-            context.remaining("await old-generation reader cancellation")?,
+            context.remaining("await old-version reader cancellation")?,
         )?;
         assert_target_connection_remains_usable(
             &target,
@@ -504,27 +516,13 @@ impl Scenario for GenerationReplacement {
             .join()
             .map_err(|_| anyhow::anyhow!("old-generation connector read thread panicked"))??;
 
-        wait_for_retired_incarnation_close(
+        wait_for_retired_catalog_version_close(
             context,
             "connector_generation_catalog",
-            &old_incarnations,
+            &old_versions,
         )?;
 
-        context.action("read the same table through the replacement connector generation");
-        let rows: Vec<i64> = control
-            .query(
-                "SELECT count(*) FROM connector_generation_catalog.connector_generation_db.connector_generation_data",
-            )
-            .context("read table through replacement connector generation after old lease release")?;
-        if rows != [300_000] {
-            bail!("replacement connector generation returned {rows:?}, expected [300000]");
-        }
-        wait_for_replacement_reader_on_every_backend(
-            context,
-            "connector_generation_catalog",
-            &old_incarnations,
-        )?;
-        await_resource_convergence(context, &baseline, "connector generation replacement")?;
+        await_resource_convergence(context, &baseline, "catalog version drain")?;
         Ok(())
     }
 }
@@ -877,31 +875,6 @@ fn assert_cancelled_query(
     }
 }
 
-fn assert_generation_replacement_blocked(
-    result: std::result::Result<Vec<i64>, mysql::Error>,
-) -> Result<()> {
-    let error = match result {
-        Ok(rows) => bail!(
-            "replacement connector generation unexpectedly ran while the old generation was leased: {rows:?}"
-        ),
-        Err(error) => error,
-    };
-    match error {
-        mysql::Error::MySqlError(error)
-            if error.code == 1105
-                && error.message.contains("reason=QueryIncarnationConflict")
-                && error.message.contains(
-                    "a prior connector generation is still leased by an active query",
-                ) =>
-        {
-            Ok(())
-        }
-        other => bail!(
-            "expected typed connector generation lease conflict while the old reader was active, received {other}"
-        ),
-    }
-}
-
 fn assert_connection_killed_query(
     done: &mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
     timeout: Duration,
@@ -929,15 +902,15 @@ fn wait_for_open_reader_on_every_backend(
 fn wait_for_replacement_reader_on_every_backend(
     context: &mut ScenarioContext,
     catalog: &str,
-    old_incarnations: &[String],
+    old_versions: &[String],
 ) -> Result<Vec<String>> {
     wait_for_backend_logs(
         context,
-        "wait for every BE to resolve the replacement connector incarnation",
+        "wait for every BE to resolve the replacement catalog version",
         |logs| {
-            logs.iter().zip(old_incarnations).all(|(log, old)| {
+            logs.iter().zip(old_versions).all(|(log, old)| {
                 reader_open_lines(log, catalog)
-                    .any(|line| reader_incarnation(line).is_some_and(|current| current != old))
+                    .any(|line| reader_catalog_version(line).is_some_and(|current| current != old))
             })
         },
     )
@@ -955,17 +928,17 @@ fn wait_for_balanced_reader_lifecycle(
     })
 }
 
-fn wait_for_retired_incarnation_close(
+fn wait_for_retired_catalog_version_close(
     context: &mut ScenarioContext,
     catalog: &str,
-    old_incarnations: &[String],
+    old_versions: &[String],
 ) -> Result<Vec<String>> {
     wait_for_backend_logs(
         context,
-        "wait for every retired-generation connector reader to close",
+        "wait for every retired catalog-version reader to close",
         |logs| {
-            logs.iter().zip(old_incarnations).all(|(log, incarnation)| {
-                let (opens, closes) = reader_counts_for_incarnation(log, catalog, incarnation);
+            logs.iter().zip(old_versions).all(|(log, version)| {
+                let (opens, closes) = reader_counts_for_catalog_version(log, catalog, version);
                 opens > 0 && opens == closes
             })
         },
@@ -1014,15 +987,15 @@ fn assert_no_reader_open_after_abort(logs: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn reader_incarnations(logs: &[String], catalog: &str) -> Result<Vec<String>> {
+fn reader_catalog_versions(logs: &[String], catalog: &str) -> Result<Vec<String>> {
     logs.iter()
         .enumerate()
         .map(|(index, log)| {
             reader_open_lines(log, catalog)
-                .find_map(reader_incarnation)
+                .find_map(reader_catalog_version)
                 .map(ToOwned::to_owned)
                 .with_context(|| {
-                    format!("BE[{index}] reader marker did not include connector incarnation")
+                    format!("BE[{index}] reader marker did not include catalog version")
                 })
         })
         .collect()
@@ -1036,9 +1009,9 @@ fn reader_open_lines<'a>(log: &'a str, catalog: &str) -> impl Iterator<Item = &'
     })
 }
 
-fn reader_incarnation(line: &str) -> Option<&str> {
+fn reader_catalog_version(line: &str) -> Option<&str> {
     line.split_whitespace()
-        .find_map(|field| field.strip_prefix("incarnation="))
+        .find_map(|field| field.strip_prefix("catalog_version="))
 }
 
 fn reader_counts(log: &str) -> (usize, usize) {
@@ -1048,14 +1021,14 @@ fn reader_counts(log: &str) -> (usize, usize) {
     )
 }
 
-fn reader_counts_for_incarnation(log: &str, catalog: &str, incarnation: &str) -> (usize, usize) {
+fn reader_counts_for_catalog_version(log: &str, catalog: &str, version: &str) -> (usize, usize) {
     let count = |event| {
         log.lines()
             .filter(|line| {
                 line.contains(event)
                     && line.contains("provider=iceberg")
                     && line.contains(&format!("instance={catalog}"))
-                    && reader_incarnation(line) == Some(incarnation)
+                    && reader_catalog_version(line) == Some(version)
             })
             .count()
     };
