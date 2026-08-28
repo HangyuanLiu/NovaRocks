@@ -1495,6 +1495,20 @@ impl QueryLifecycleRegistry {
     pub(crate) fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         let manifest = validated(request.manifest());
         let execution_id = validated(manifest.execution_id());
+        // A nonempty catalog contribution is intentionally fail-closed until
+        // the lifecycle owner has atomically registered its CatalogManager
+        // references. Reporting ControlReady before that point would let
+        // Stage observe an unmaterialized catalog runtime.
+        if !validated(validated(manifest.catalog_set()).catalogs()).is_empty() {
+            let digest = validated(manifest.digest());
+            let ack = QueryInitAck::new(
+                execution_id,
+                digest,
+                QueryInitOutcome::QueryInitRejectedInvalidManifest,
+            );
+            self.log_init(&ack);
+            return ack;
+        }
         if validated(manifest.native_compatibility_id()) != self.native_compatibility_id {
             let digest = validated(manifest.digest());
             let ack = QueryInitAck::new(
