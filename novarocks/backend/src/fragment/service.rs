@@ -66,27 +66,6 @@ pub(super) enum NativeFragmentLifecycleEvent {
 
 type LifecycleObserver = Arc<dyn Fn(NativeFragmentLifecycleEvent) + Send + Sync>;
 
-/// The opaque `ConnectorReadSource` carrier has no FE encoder after the
-/// CatalogHandle cutover. Keep decoding fail-closed while old wire fields are
-/// removed in the next protocol-compatibility revision; it must never regain
-/// a process-wide execution-host lookup path.
-struct RejectLegacyConnectorExecutionResolver;
-
-impl novarocks_spi::connector::ConnectorExecutionResolver for RejectLegacyConnectorExecutionResolver {
-    fn resolve(
-        &self,
-        _key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
-    ) -> Result<
-        Arc<novarocks_spi::connector::ConnectorExecutionBinding>,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        Err(novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-            "opaque ConnectorReadSource is retired; use typed_connector_read",
-        ))
-    }
-}
-
 /// The native task-update protocol owns this ceiling.  Execution receives the
 /// value as configuration and therefore does not depend on ProtoCodec.
 fn split_queue_config() -> novarocks_execution::connector::SplitQueueConfig {
@@ -607,12 +586,11 @@ impl NativeFragmentService {
                 ),
             );
             let typed_runtime = self.typed_scan_runtime(execution_id, fragment.instance_params());
-            let request = NativeFragmentRequest::try_decode_with_execution_resolver(
+            let request = NativeFragmentRequest::try_decode_with_runtime(
                 execution_id,
                 fragment.plan().clone(),
                 fragment.instance_params().clone(),
                 Arc::clone(&self.connector_registry),
-                Arc::new(RejectLegacyConnectorExecutionResolver),
                 self.queries
                     .connector_cancellation_for_execution(execution_id),
                 std::time::Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),

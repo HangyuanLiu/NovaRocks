@@ -32,7 +32,7 @@ use novarocks_execution::runtime::fragment::{
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{novarocks as proto, plan};
-use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
+use novarocks_spi::connector::ConnectorCancellation;
 
 use crate::fragment::decode::envelope::{require_root, require_sink};
 use crate::fragment::decode::exchange::decode_exchange_contracts;
@@ -66,7 +66,6 @@ pub(crate) fn decode_fragment_submission(
     instance: NativeFragmentInstanceInput,
     instance_params: &proto::InstanceParams,
     connectors: Arc<ConnectorRegistry>,
-    execution_resolver: Arc<dyn ConnectorExecutionResolver>,
     connector_cancellation: Arc<dyn ConnectorCancellation>,
     exchange_wait: Duration,
     typed_scan_runtime: Option<super::context::TypedScanRuntime>,
@@ -101,7 +100,6 @@ pub(crate) fn decode_fragment_submission(
         instance.raw_scan_ranges,
         instance.query_options.clone(),
         connectors,
-        execution_resolver,
         connector_cancellation,
         instance.query_id,
         instance.fragment_instance_id,
@@ -194,30 +192,13 @@ mod tests {
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_proto_models::{common, expr, novarocks as proto, plan};
-    use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
-        ConnectorExecutionBindingKey, ConnectorExecutionResolver,
-    };
+    use novarocks_spi::connector::ConnectorCancellation;
     use novarocks_types::UniqueId;
 
     use super::{DecodedNativeFragment, NativeFragmentDecodeError, decode_fragment_submission};
     use crate::fragment::decode::instance::decode_instance_params;
     use crate::fragment::decode::request::NativeFragmentRequest;
     use crate::fragment::decode::type_decode::encode_type;
-
-    struct NeverResolved;
-
-    impl ConnectorExecutionResolver for NeverResolved {
-        fn resolve(
-            &self,
-            _key: &ConnectorExecutionBindingKey,
-        ) -> Result<Arc<ConnectorExecutionBinding>, ConnectorError> {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Unavailable,
-                "test resolver must not be used for malformed submissions",
-            ))
-        }
-    }
 
     struct NeverCancelled;
 
@@ -295,7 +276,6 @@ mod tests {
             instance,
             params,
             Arc::new(ConnectorRegistry::new()),
-            Arc::new(NeverResolved),
             Arc::new(NeverCancelled),
             Duration::from_secs(1),
             None,

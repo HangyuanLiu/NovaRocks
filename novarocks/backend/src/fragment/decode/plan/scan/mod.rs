@@ -18,6 +18,7 @@
 //! Fragment scan plan decoding.
 
 mod common;
+#[cfg(test)]
 mod generic;
 mod typed;
 mod variant_path;
@@ -79,6 +80,7 @@ pub(crate) fn lower_scan_node(
             arena,
         )
         .map_err(|error| error.into_native(source_path.field("typed_connector_read"))),
+        #[cfg(test)]
         plan::scan_source::Kind::ConnectorRead(source) => generic::lower_connector_read_scan(
             node,
             scan,
@@ -89,6 +91,11 @@ pub(crate) fn lower_scan_node(
             arena,
         )
         .map_err(|error| error.into_native(source_path.field("connector_read"))),
+        #[cfg(not(test))]
+        plan::scan_source::Kind::ConnectorRead(_) => Err(NativeFragmentDecodeError::unsupported(
+            source_path.field("connector_read"),
+            "opaque ConnectorReadSource is retired; use typed_connector_read",
+        )),
     }
 }
 

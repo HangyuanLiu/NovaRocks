@@ -35,7 +35,9 @@ use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{common, expr};
-use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
+use novarocks_spi::connector::ConnectorCancellation;
+#[cfg(test)]
+use novarocks_spi::connector::ConnectorExecutionResolver;
 use novarocks_types::QueryId;
 
 use crate::fragment::decode::plan::error::{
@@ -176,6 +178,7 @@ pub(crate) struct NativePlanDecodeContext {
     captured_scan_ranges: RefCell<BTreeMap<FragmentNodeId, BoundScanRanges>>,
     query_options: Option<QueryOptions>,
     connectors: Option<Arc<ConnectorRegistry>>,
+    #[cfg(test)]
     execution_resolver: Option<Arc<dyn ConnectorExecutionResolver>>,
     connector_cancellation: Option<Arc<dyn ConnectorCancellation>>,
     query_id: Option<QueryId>,
@@ -195,6 +198,7 @@ impl Default for NativePlanDecodeContext {
             captured_scan_ranges: RefCell::new(BTreeMap::new()),
             query_options: None,
             connectors: None,
+            #[cfg(test)]
             execution_resolver: None,
             connector_cancellation: None,
             query_id: None,
@@ -216,7 +220,6 @@ impl NativePlanDecodeContext {
         raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
         query_options: QueryOptions,
         connectors: Arc<ConnectorRegistry>,
-        execution_resolver: Arc<dyn ConnectorExecutionResolver>,
         connector_cancellation: Arc<dyn ConnectorCancellation>,
         query_id: QueryId,
         fragment_instance_id: FragmentInstanceId,
@@ -228,7 +231,8 @@ impl NativePlanDecodeContext {
             captured_scan_ranges: RefCell::new(BTreeMap::new()),
             query_options: Some(query_options),
             connectors: Some(connectors),
-            execution_resolver: Some(execution_resolver),
+            #[cfg(test)]
+            execution_resolver: None,
             connector_cancellation: Some(connector_cancellation),
             query_id: Some(query_id),
             fragment_instance_id,
@@ -327,6 +331,7 @@ impl NativePlanDecodeContext {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn execution_resolver(
         &self,
     ) -> Result<&dyn ConnectorExecutionResolver, NativeFragmentLeafDecodeError> {
