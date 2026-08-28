@@ -448,6 +448,7 @@ mod tests {
                 .expect("valid endpoint"),
             "test-deployment",
             "test-build",
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         )
         .expect("valid descriptor")
     }

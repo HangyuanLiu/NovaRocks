@@ -43,7 +43,12 @@ fn state_store_input(temp: &TempDir) -> novarocks_frontend::StateStoreHostInput 
 }
 
 fn execution_config() -> FrontendExecutionConfig {
-    FrontendExecutionConfig::new("127.0.0.1", 19090, std::num::NonZeroUsize::new(1).unwrap())
+    FrontendExecutionConfig::new(
+        "127.0.0.1",
+        19090,
+        std::num::NonZeroUsize::new(1).unwrap(),
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+    )
 }
 
 async fn open_host(
@@ -67,6 +72,7 @@ async fn open_host(
 fn backend_config() -> ClusterBackendOpenConfig {
     ClusterBackendOpenConfig::new(
         novarocks_types::ClusterRole::Fe,
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         Duration::from_secs(1),
         1,
         Duration::from_secs(1),

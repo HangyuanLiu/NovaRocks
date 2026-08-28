@@ -58,6 +58,7 @@ use novarocks_spi::connector::{
 };
 use novarocks_spi::state_store::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_sqlite::SqliteStateStoreContribution;
+use novarocks_types::NativeCompatibilityId;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IcebergMvStorageObservationAdapter {
@@ -400,6 +401,7 @@ pub fn compose_backend_execution_installers(
 pub fn compose_backend_server_config(
     config: &NovaRocksConfig,
     native_trust: &NativeTrustSnapshot,
+    native_compatibility_id: NativeCompatibilityId,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<BackendServerConfig> {
     let runtime_config = &config.runtime;
@@ -420,6 +422,7 @@ pub fn compose_backend_server_config(
         metrics_http_port: config.server.http_port,
         advertise_endpoint,
         native_trust: std::sync::Arc::clone(native_trust.trust()),
+        native_compatibility_id,
         native_transport: backend_native_transport(native_trust.transport()),
         frontend_endpoint,
         announce_interval: Duration::from_millis(config.cluster.backend_announce_interval_ms()),
@@ -474,6 +477,7 @@ pub fn compose_frontend_server_config(
     config: &NovaRocksConfig,
     native_trust: &NativeTrustSnapshot,
     port_override: Option<u16>,
+    native_compatibility_id: NativeCompatibilityId,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<FrontendServerConfig> {
     let runtime_config = &config.runtime;
@@ -492,6 +496,7 @@ pub fn compose_frontend_server_config(
         native_trust.advertised_endpoint().host().to_string(),
         native_trust.advertised_endpoint().port(),
         runtime_filter_worker_count,
+        native_compatibility_id,
     )
     .with_catalog_desired_state_source(catalog_source)
     .with_lake_publication_runtime_policy(
@@ -559,6 +564,7 @@ pub fn compose_frontend_server_config(
     }
     let backend_open = ClusterBackendOpenConfig::new(
         config.cluster.role,
+        native_compatibility_id,
         Duration::from_millis(config.cluster.heartbeat_interval_ms()),
         config.cluster.heartbeat_timeout_retries(),
         Duration::from_millis(config.cluster.backend_announce_lease_ttl_ms()),

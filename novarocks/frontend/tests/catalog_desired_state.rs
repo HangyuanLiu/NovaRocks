@@ -555,10 +555,12 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
                 "127.0.0.1",
                 19090,
                 std::num::NonZeroUsize::new(1).expect("one worker"),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             )
             .with_catalog_desired_state_source(CatalogDesiredStateSourceInput::ManagedControllerUnsupported),
             ClusterBackendOpenConfig::new(
                 novarocks_types::ClusterRole::Fe,
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 Duration::from_secs(1),
                 1,
                 Duration::from_secs(1),

@@ -279,6 +279,7 @@ fn query_control_typestate_initializes_before_native_assembly() {
             .expect("valid endpoint"),
         "test-deployment",
         "test-build",
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
     )
     .expect("valid test descriptor");
     let mut draft = FragmentScheduleDraft::new();
@@ -295,6 +296,7 @@ fn query_control_typestate_initializes_before_native_assembly() {
             .expect("validate schedule");
     let options = QueryInitOptions::new(
         protocol_execution_id,
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         vec![crate::common::backend_topology::LiveBackendTarget::new(
             3, descriptor,
         )],

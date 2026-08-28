@@ -28,6 +28,55 @@ fn generated_dtos_and_descriptor_match_the_native_schema_contract() {
 }
 
 #[test]
+fn native_compatibility_identity_fields_are_exact_and_append_only() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    for (message_name, field_name, field_number) in [
+        (
+            "novarocks.BackendProcessDescriptor",
+            "native_compatibility_id",
+            5,
+        ),
+        (
+            "novarocks.ParticipantManifest",
+            "native_compatibility_id",
+            11,
+        ),
+    ] {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        let field = message
+            .get_field_by_name(field_name)
+            .unwrap_or_else(|| panic!("{message_name}.{field_name} descriptor"));
+        assert_eq!(field.number(), field_number);
+        assert_eq!(
+            field.kind().as_message().unwrap().full_name(),
+            "novarocks.NativeCompatibilityId"
+        );
+    }
+    let identity = pool
+        .get_message_by_name("novarocks.NativeCompatibilityId")
+        .expect("NativeCompatibilityId descriptor");
+    assert_eq!(identity.fields().count(), 1);
+    let value = identity
+        .get_field_by_name("value")
+        .expect("identity value field");
+    assert_eq!(value.number(), 1);
+
+    let outcome = pool
+        .get_enum_by_name("novarocks.QueryInitOutcome")
+        .expect("QueryInitOutcome descriptor");
+    assert_eq!(
+        outcome
+            .get_value_by_name("QUERY_INIT_REJECTED_COMPATIBILITY_MISMATCH")
+            .expect("compatibility mismatch outcome")
+            .number(),
+        10
+    );
+}
+
+#[test]
 fn retired_starrocks_native_scan_fields_remain_reserved() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");

@@ -22,7 +22,7 @@ use novarocks_proto_codec::lifecycle::{
     QueryExecutionId, QueryInitRequest, QueryOptions, RuntimeFilterContribution,
 };
 use novarocks_proto_models::novarocks;
-use novarocks_types::{BackendProcessId, QueryId};
+use novarocks_types::{BackendProcessId, NativeCompatibilityId, QueryId};
 
 fn request_with_runtime_filter() -> QueryInitRequest {
     let execution_id = QueryExecutionId::new(
@@ -42,6 +42,7 @@ fn request_with_runtime_filter() -> QueryInitRequest {
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
         )
         .expect("valid backend"),
+        NativeCompatibilityId::new([0x71; 32]),
         [],
         QueryOptions::parse(novarocks::QueryOptions::default()).expect("valid query options"),
         10_000,

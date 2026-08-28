@@ -209,6 +209,7 @@ fn test_native_trust() -> Arc<NativeTrust> {
 fn backend_config() -> ClusterBackendOpenConfig {
     ClusterBackendOpenConfig::new(
         novarocks_types::ClusterRole::Fe,
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         Duration::from_secs(1),
         1,
         Duration::from_secs(1),
@@ -230,7 +231,12 @@ async fn open_application(
     FrontendApplicationHost::open_with_factories_and_state_store_registry(
         Some(input),
         &registry,
-        FrontendExecutionConfig::new("127.0.0.1", 19310, std::num::NonZeroUsize::new(1).unwrap()),
+        FrontendExecutionConfig::new(
+            "127.0.0.1",
+            19310,
+            std::num::NonZeroUsize::new(1).unwrap(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+        ),
         backend_config(),
         Vec::new(),
         std::sync::Arc::new(

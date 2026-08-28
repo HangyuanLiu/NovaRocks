@@ -537,7 +537,8 @@ fn parse_init_outcome(raw: i32) -> Result<QueryInitOutcome, ProtocolError> {
             | QueryInitOutcome::QueryInitRejectedInvalidManifest
             | QueryInitOutcome::QueryInitRejectedTerminated
             | QueryInitOutcome::QueryInitRejectedBackendDraining
-            | QueryInitOutcome::QueryInitRejectedBackendProcessMismatch),
+            | QueryInitOutcome::QueryInitRejectedBackendProcessMismatch
+            | QueryInitOutcome::QueryInitRejectedCompatibilityMismatch),
         ) => Ok(outcome),
         Ok(QueryInitOutcome::Unspecified) | Err(_) => Err(ProtocolError::new(
             FieldPath::root("init_query_response").field("outcome"),

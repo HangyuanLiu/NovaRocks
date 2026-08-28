@@ -1289,6 +1289,7 @@ fn test_request_context_with_role(
                             .expect("valid loopback endpoint"),
                         "test-deployment",
                         "test-build",
+                        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                     )
                     .expect("valid test descriptor"),
                 )],

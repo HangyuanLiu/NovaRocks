@@ -7,7 +7,9 @@
 use crate::lifecycle::QueryControlEndpoint;
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::novarocks;
-use novarocks_types::{BackendProcessId as DomainBackendProcessId, BackendProcessIdentityError};
+use novarocks_types::{
+    BackendProcessId as DomainBackendProcessId, BackendProcessIdentityError, NativeCompatibilityId,
+};
 
 const MAX_DEPLOYMENT_ID_BYTES: usize = 256;
 const MAX_BUILD_IDENTITY_BYTES: usize = 256;
@@ -57,12 +59,16 @@ impl BackendProcessDescriptor {
         endpoint: QueryControlEndpoint,
         deployment_id: impl Into<String>,
         build_identity: impl Into<String>,
+        native_compatibility_id: NativeCompatibilityId,
     ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::BackendProcessDescriptor {
             process_id: Some(BackendProcessId::from_domain(process_id).raw),
             endpoint: Some(endpoint.as_proto().clone()),
             deployment_id: deployment_id.into(),
             build_identity: build_identity.into(),
+            native_compatibility_id: Some(novarocks::NativeCompatibilityId {
+                value: native_compatibility_id.as_bytes().to_vec(),
+            }),
         })
     }
 
@@ -95,6 +101,10 @@ impl BackendProcessDescriptor {
             FieldPath::root("backend_process_descriptor").field("build_identity"),
             "build identity",
         )?;
+        required_native_compatibility_id(
+            &raw.native_compatibility_id,
+            FieldPath::root("backend_process_descriptor").field("native_compatibility_id"),
+        )?;
         Ok(Self { raw })
     }
 
@@ -125,6 +135,13 @@ impl BackendProcessDescriptor {
 
     pub fn build_identity(&self) -> &str {
         &self.raw.build_identity
+    }
+
+    pub fn native_compatibility_id(&self) -> Result<NativeCompatibilityId, ProtocolError> {
+        required_native_compatibility_id(
+            &self.raw.native_compatibility_id,
+            FieldPath::root("backend_process_descriptor").field("native_compatibility_id"),
+        )
     }
 }
 
@@ -326,6 +343,21 @@ fn required_process_id(
         .map_err(|error| ProtocolError::new(path, error.kind(), error.detail().to_owned()))
 }
 
+pub(crate) fn required_native_compatibility_id(
+    raw: &Option<novarocks::NativeCompatibilityId>,
+    path: FieldPath,
+) -> Result<NativeCompatibilityId, ProtocolError> {
+    let raw = raw
+        .as_ref()
+        .ok_or_else(|| missing(path.clone(), "native compatibility id is required"))?;
+    NativeCompatibilityId::try_from_slice(&raw.value).map_err(|error| {
+        invalid(
+            path.field("value"),
+            format!("native compatibility id must contain exactly 32 bytes: {error}"),
+        )
+    })
+}
+
 fn domain_process_id(raw: &[u8]) -> Result<DomainBackendProcessId, ProtocolError> {
     let value: [u8; 16] = raw.try_into().map_err(|_| {
         invalid(
@@ -386,7 +418,7 @@ mod tests {
     };
     use crate::lifecycle::QueryControlEndpoint;
     use novarocks_proto_models::novarocks;
-    use novarocks_types::BackendProcessId as DomainBackendProcessId;
+    use novarocks_types::{BackendProcessId as DomainBackendProcessId, NativeCompatibilityId};
 
     fn descriptor() -> BackendProcessDescriptor {
         BackendProcessDescriptor::new(
@@ -394,6 +426,7 @@ mod tests {
             QueryControlEndpoint::new("be-0.internal", 9090).expect("endpoint"),
             "warehouse-a",
             "build-identity",
+            NativeCompatibilityId::new([7; 32]),
         )
         .expect("descriptor")
     }
@@ -432,5 +465,35 @@ mod tests {
         );
         assert!(BackendAnnounceResult::accepted(0).is_err());
         assert!(BackendAnnounceResult::accepted(1).is_ok());
+    }
+
+    #[test]
+    fn descriptor_requires_an_exact_width_native_compatibility_id() {
+        let mut missing = descriptor().as_proto().clone();
+        missing.native_compatibility_id = None;
+        let error = BackendProcessDescriptor::parse(missing).expect_err("missing id rejects");
+        assert_eq!(error.kind(), crate::ProtocolErrorKind::MissingField);
+        assert_eq!(
+            error.path().to_string(),
+            "backend_process_descriptor.native_compatibility_id"
+        );
+
+        for width in [31, 33] {
+            let mut malformed = descriptor().as_proto().clone();
+            malformed.native_compatibility_id = Some(novarocks::NativeCompatibilityId {
+                value: vec![7; width],
+            });
+            let error = BackendProcessDescriptor::parse(malformed).expect_err("bad id rejects");
+            assert_eq!(error.kind(), crate::ProtocolErrorKind::InvalidValue);
+            assert_eq!(
+                error.path().to_string(),
+                "backend_process_descriptor.native_compatibility_id.value"
+            );
+        }
+
+        assert_eq!(
+            descriptor().native_compatibility_id().expect("exact id"),
+            NativeCompatibilityId::new([7; 32])
+        );
     }
 }

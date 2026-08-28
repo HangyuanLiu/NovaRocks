@@ -826,6 +826,7 @@ fn init_request_fixture_for_process(
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
         )
         .expect("valid backend identity"),
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         [],
         default_query_options(),
         query_deadline_unix_ms,
@@ -847,6 +848,7 @@ fn fragment_init_request_fixture(query_low: i64, expected: &[UniqueId]) -> Query
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
         )
         .expect("valid backend identity"),
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         expected.iter().copied().map(protocol_unique_id),
         default_query_options(),
         10_000,
@@ -871,6 +873,7 @@ fn fragment_runtime_filter_init_request_fixture(
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
         )
         .expect("valid backend identity"),
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         expected.iter().copied().map(protocol_unique_id),
         default_query_options(),
         10_000,

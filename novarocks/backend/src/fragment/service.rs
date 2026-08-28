@@ -1428,6 +1428,7 @@ mod tests {
                 QueryControlEndpoint::new("127.0.0.1", 19030).expect("control endpoint"),
             )
             .expect("backend identity"),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             expected_fragments
                 .into_iter()
                 .map(|id| proto::common::UniqueId {

@@ -1997,6 +1997,7 @@ mod tests {
                 .expect("valid endpoint"),
             "artifact-test-deployment",
             "artifact-test-build",
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         )
         .expect("valid backend descriptor");
         LiveBackendTarget::new(backend_idx, descriptor)

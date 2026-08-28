@@ -948,6 +948,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             ),
             backend_open: frontend_backend_open_config(),
             report_bind_host: "127.0.0.1".to_string(),
@@ -974,6 +975,7 @@ mod tests {
     fn frontend_backend_open_config() -> ClusterBackendOpenConfig {
         ClusterBackendOpenConfig::new(
             novarocks_types::ClusterRole::Fe,
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             Duration::from_secs(1),
             3,
             Duration::from_secs(1),
@@ -1028,6 +1030,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             )
             .with_catalog_desired_state_source(CatalogDesiredStateSourceInput::DynamicStateStore),
             frontend_backend_open_config(),
@@ -1124,7 +1127,12 @@ mod tests {
         let host = FrontendApplicationHost::open_with_factories_and_state_store_registry(
             Some(state_store),
             &registry,
-            FrontendExecutionConfig::new("127.0.0.1", 0, std::num::NonZeroUsize::new(1).unwrap()),
+            FrontendExecutionConfig::new(
+                "127.0.0.1",
+                0,
+                std::num::NonZeroUsize::new(1).unwrap(),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            ),
             frontend_backend_open_config(),
             Vec::new(),
             Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new()),
@@ -1174,6 +1182,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             ),
             frontend_backend_open_config(),
             Vec::new(),

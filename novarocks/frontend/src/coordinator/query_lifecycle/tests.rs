@@ -886,6 +886,7 @@ fn fixture_descriptor(endpoint: std::net::SocketAddr) -> BackendProcessDescripto
             .expect("fixture backend endpoint"),
         "test-deployment",
         "test-build",
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
     )
     .expect("fixture backend descriptor")
 }
@@ -948,6 +949,7 @@ fn manifest(
     ParticipantManifest::new(
         execution_id,
         backend,
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         fragments,
         QueryOptions::parse(proto::QueryOptions::default()).expect("fixture query options"),
         1_900_000_000_000,
@@ -3139,6 +3141,7 @@ fn live_init_request(
         ParticipantManifest::new(
             execution_id,
             protocol_backend_from_live(backend.clone()),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             [proto_id(UniqueId::new(finst_high, 1))],
             QueryOptions::parse(proto::QueryOptions::default()).expect("fixture query options"),
             1_900_000_000_000,

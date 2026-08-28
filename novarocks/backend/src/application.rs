@@ -17,7 +17,7 @@ use novarocks_proto_codec::membership::{
     BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
 };
 use novarocks_spi::connector::ConnectorExecutionInstaller;
-use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
+use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 
 use crate::BackendDataRuntime;
 use crate::connector::ConnectorRegistry;
@@ -52,6 +52,8 @@ pub struct BackendServerConfig {
     /// Backend receives this immutable capability and never reads trust source
     /// configuration or credentials itself.
     pub native_trust: Arc<NativeTrust>,
+    /// Server-resolved compatibility identity frozen before role composition.
+    pub native_compatibility_id: NativeCompatibilityId,
     pub native_transport: BackendNativeTransport,
     /// Exact FE native ingress used exclusively for authenticated membership announce.
     pub frontend_endpoint: NativeEndpoint,
@@ -643,6 +645,7 @@ impl BackendApplicationHost {
             metrics_http_port,
             advertise_endpoint,
             native_trust,
+            native_compatibility_id,
             native_transport,
             frontend_endpoint,
             announce_interval,
@@ -683,6 +686,7 @@ impl BackendApplicationHost {
                 })?,
             native_trust.deployment_id().as_str(),
             novarocks_version::native_build_identity(),
+            native_compatibility_id,
         )
         .map_err(|error| {
             BackendApplicationError::new(
@@ -1077,6 +1081,7 @@ mod tests {
                 port: advertise_port,
             },
             native_trust: crate::rpc::runtime::test_backend_native_trust(),
+            native_compatibility_id: novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             native_transport: crate::rpc::runtime::BackendNativeTransport::Plaintext,
             frontend_endpoint: NativeEndpoint::from_host_port("127.0.0.1", unused_port())
                 .expect("valid frontend endpoint"),
@@ -1106,6 +1111,7 @@ mod tests {
                     QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid backend endpoint"),
                 )
                 .expect("valid backend identity"),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 [novarocks_proto_models::common::UniqueId {
                     hi: query_low,
                     lo: 1,

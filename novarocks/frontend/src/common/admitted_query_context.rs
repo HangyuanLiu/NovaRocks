@@ -432,6 +432,7 @@ mod tests {
                     QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid loopback endpoint"),
                     "test-deployment",
                     "test-build",
+                    novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 )
                 .expect("valid test descriptor"),
             )],

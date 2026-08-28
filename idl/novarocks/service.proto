@@ -102,6 +102,10 @@ message BackendProcessId {
   bytes value = 1;  // exactly 16 non-nil UUID-v7 bytes
 }
 
+message NativeCompatibilityId {
+  bytes value = 1;  // exactly 32 bytes
+}
+
 enum BackendReportedState {
   BACKEND_REPORTED_STATE_UNSPECIFIED = 0;
   BACKEND_REPORTED_STATE_RUNNING = 1;
@@ -113,6 +117,7 @@ message BackendProcessDescriptor {
   QueryControlEndpoint endpoint = 2;
   string deployment_id = 3;
   string build_identity = 4;
+  NativeCompatibilityId native_compatibility_id = 5;
 }
 
 message AnnounceBackendRequest {
@@ -177,6 +182,7 @@ message ParticipantManifest {
   RuntimeFilterContribution runtime_filter = 8;
   uint64 pre_start_timeout_ms = 9;
   QueryControlEndpoint report_endpoint = 10;
+  NativeCompatibilityId native_compatibility_id = 11;
 }
 
 enum QueryInitOutcome {
@@ -190,6 +196,7 @@ enum QueryInitOutcome {
   QUERY_INIT_REJECTED_TERMINATED = 7;
   QUERY_INIT_REJECTED_BACKEND_DRAINING = 8;
   QUERY_INIT_REJECTED_BACKEND_PROCESS_MISMATCH = 9;
+  QUERY_INIT_REJECTED_COMPATIBILITY_MISMATCH = 10;
 }
 
 enum QueryTerminationReason {

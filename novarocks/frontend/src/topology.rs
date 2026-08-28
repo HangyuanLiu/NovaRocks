@@ -32,7 +32,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
-use novarocks_types::{BackendProcessId, ClusterRole, NativeEndpoint};
+use novarocks_types::{BackendProcessId, ClusterRole, NativeCompatibilityId, NativeEndpoint};
 use novarocks_version::native_build_identity;
 use tokio::runtime::Handle;
 
@@ -49,6 +49,7 @@ use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_
 #[derive(Clone, Debug)]
 pub struct ClusterBackendOpenConfig {
     role: ClusterRole,
+    native_compatibility_id: NativeCompatibilityId,
     heartbeat_interval: Duration,
     heartbeat_timeout_retries: u32,
     announce_lease_ttl: Duration,
@@ -57,6 +58,7 @@ pub struct ClusterBackendOpenConfig {
 impl ClusterBackendOpenConfig {
     pub fn new(
         role: ClusterRole,
+        native_compatibility_id: NativeCompatibilityId,
         heartbeat_interval: Duration,
         heartbeat_timeout_retries: u32,
         announce_lease_ttl: Duration,
@@ -72,6 +74,7 @@ impl ClusterBackendOpenConfig {
         }
         Ok(Self {
             role,
+            native_compatibility_id,
             heartbeat_interval,
             heartbeat_timeout_retries,
             announce_lease_ttl,
@@ -79,6 +82,9 @@ impl ClusterBackendOpenConfig {
     }
     pub const fn role(&self) -> ClusterRole {
         self.role
+    }
+    pub const fn native_compatibility_id(&self) -> NativeCompatibilityId {
+        self.native_compatibility_id
     }
     pub const fn heartbeat_interval(&self) -> Duration {
         self.heartbeat_interval
@@ -240,6 +246,7 @@ impl ClusterBackendService {
     pub(crate) fn new_transient_for_test(timeout_retries: u32) -> Self {
         let config = ClusterBackendOpenConfig::new(
             ClusterRole::Fe,
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             Duration::from_millis(1),
             timeout_retries.max(1),
             Duration::from_secs(1),
@@ -996,6 +1003,7 @@ mod tests {
             QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port()).unwrap(),
             "test",
             native_build_identity(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         )
         .unwrap()
     }
