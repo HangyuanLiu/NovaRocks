@@ -72,9 +72,7 @@ use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use super::split_assignment_round::{
     RoundSplitAssignmentPlan, SplitAssignmentRoundGuard, assignment_endpoints, assignment_targets,
 };
-use crate::connector::{
-    ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
-};
+use crate::connector::ConnectorControlHost;
 use crate::metrics::{
     observe_pre_ready_replan, observe_waiting_for_backend, record_pre_ready_effect_gate,
     record_pre_ready_replan,
@@ -208,57 +206,6 @@ impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
 
 struct FrontendConnectorBindingInstallObserver {
     control: Arc<ConnectorControlHost>,
-}
-
-struct GrpcConnectorControlRetirementSink {
-    data_runtime: FrontendDataRuntime,
-}
-
-impl ConnectorControlRetirementSink for GrpcConnectorControlRetirementSink {
-    fn retire(&self, retirement: ConnectorControlRetirement) {
-        let endpoints = retirement
-            .installed_backends
-            .iter()
-            .enumerate()
-            .filter_map(|(index, endpoint)| match RuntimeEndpoint::parse(endpoint) {
-                Ok(endpoint) => Some((index, endpoint)),
-                Err(error) => {
-                    tracing::warn!(
-                        instance_id = %retirement.key.instance_id.as_str(),
-                        incarnation = ?retirement.key.incarnation,
-                        endpoint = %endpoint,
-                        %error,
-                        "connector control retirement skipped an invalid recorded backend endpoint"
-                    );
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        let dispatcher =
-            match new_connector_binding_dispatcher(&endpoints, self.data_runtime.clone()) {
-                Ok(dispatcher) => dispatcher,
-                Err(error) => {
-                    tracing::warn!(
-                        instance_id = %retirement.key.instance_id.as_str(),
-                        incarnation = ?retirement.key.incarnation,
-                        %error,
-                        "connector execution retirement dispatcher could not be composed"
-                    );
-                    return;
-                }
-            };
-        for (_, endpoint) in endpoints {
-            if let Err(error) = dispatcher.retire(endpoint.clone(), &retirement.key) {
-                tracing::warn!(
-                    instance_id = %retirement.key.instance_id.as_str(),
-                    incarnation = ?retirement.key.incarnation,
-                    %endpoint,
-                    %error,
-                    "connector execution binding retirement was not acknowledged"
-                );
-            }
-        }
-    }
 }
 
 impl ConnectorBindingInstallObserver for FrontendConnectorBindingInstallObserver {
@@ -734,9 +681,6 @@ impl FrontendDistributedQueryCoordinator {
         // Reject an unusable `[runtime]` query-control section at startup rather
         // than on the first query that tries to use it.
         let lifecycle_config = build_lifecycle_config(query_control_timeouts)?;
-        connector_control.set_retirement_sink(Arc::new(GrpcConnectorControlRetirementSink {
-            data_runtime: data_runtime.clone(),
-        }));
         let query_id_source = UniqueQueryIdSource::default();
         let query_namespace = query_id_source.namespace();
         tracing::info!(
@@ -947,42 +891,6 @@ impl FrontendDistributedQueryCoordinator {
         self.execute_request(request)
     }
 
-    fn dispatch_ready_connector_retires(&self, dispatcher: &dyn ConnectorBindingDispatcher) {
-        let ready = match self.connector_control.take_ready_retires() {
-            Ok(ready) => ready,
-            Err(error) => {
-                tracing::warn!(error = %error, "connector control retirement queue is unavailable");
-                return;
-            }
-        };
-        for retirement in ready {
-            for endpoint in retirement.installed_backends {
-                let endpoint = match RuntimeEndpoint::parse(&endpoint) {
-                    Ok(endpoint) => endpoint,
-                    Err(error) => {
-                        tracing::warn!(
-                            instance_id = %retirement.key.instance_id.as_str(),
-                            incarnation = ?retirement.key.incarnation,
-                            endpoint = %endpoint,
-                            %error,
-                            "connector control retirement skipped an invalid recorded backend endpoint"
-                        );
-                        continue;
-                    }
-                };
-                if let Err(error) = dispatcher.retire(endpoint.clone(), &retirement.key) {
-                    tracing::warn!(
-                        instance_id = %retirement.key.instance_id.as_str(),
-                        incarnation = ?retirement.key.incarnation,
-                        %endpoint,
-                        %error,
-                        "connector execution binding retirement was not acknowledged"
-                    );
-                }
-            }
-        }
-    }
-
     fn execute_request(
         &self,
         request: DistributedQueryRequest,
@@ -1035,9 +943,6 @@ impl FrontendDistributedQueryCoordinator {
         #[cfg(not(test))]
         let backend_services =
             production_backend_services(parts.topology.targets(), self.data_runtime.clone())?;
-        self.dispatch_ready_connector_retires(
-            backend_services.connector_binding_dispatcher.as_ref(),
-        );
         let dispatcher = Arc::clone(&backend_services.dispatcher);
         let _query = self
             .registry
@@ -1204,7 +1109,6 @@ impl FrontendDistributedQueryCoordinator {
         let submission_view = connector_binding_ready.native_submission_view()?;
         let submission_attachment = encode_native_submission(&submission_view).map_err(failed)?;
         let stage_prepared = connector_binding_ready.finish_stage(submission_attachment)?;
-        self.dispatch_ready_connector_retires(connector_binding_dispatcher.as_ref());
         let staged = stage_prepared.stage(&lifecycle_barrier)?;
         if let Some(retry_boundary) = retry_boundary {
             retry_boundary.close_after_stage_or_start();
