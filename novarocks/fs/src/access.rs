@@ -15,17 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer, RetryLayer, TimeoutLayer};
-use url::Url;
+use url::{Host, Url};
 
 use crate::{FileCancellation, FileError, FileErrorKind, FileReadRange, FileResult, SecretValue};
 
@@ -36,6 +38,13 @@ const DEFAULT_OBJECT_STORE_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_OBJECT_STORE_IO_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_OBJECT_STORE_CONCURRENT_LIMIT: usize = 1024;
 const DEFAULT_OBJECT_STORE_HTTP_CONCURRENT_LIMIT: usize = 256;
+const DEFAULT_OBJECT_STORE_PROVIDER_POOL_CAPACITY: usize = 1024;
+const MIN_OBJECT_STORE_PROVIDER_POOL_CAPACITY: usize = 1;
+const MAX_OBJECT_STORE_PROVIDER_POOL_CAPACITY: usize = 16_384;
+const DEFAULT_OBJECT_STORE_PROVIDER_POOL_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+const MIN_OBJECT_STORE_PROVIDER_POOL_IDLE_TTL: Duration = Duration::from_secs(60);
+const MAX_OBJECT_STORE_PROVIDER_POOL_IDLE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const OBJECT_STORE_PROVIDER_BUILD_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FsScheme {
@@ -202,6 +211,7 @@ impl ResolvedFsPath {
 
 #[derive(Clone)]
 pub struct FsAccessHandle {
+    access_domain: StorageAccessDomainId,
     scheme: FsScheme,
     operator: Operator,
     authority: Option<String>,
@@ -211,6 +221,7 @@ pub struct FsAccessHandle {
 
 impl FsAccessHandle {
     pub fn new(
+        access_domain: StorageAccessDomainId,
         scheme: FsScheme,
         operator: Operator,
         authority: Option<String>,
@@ -218,12 +229,17 @@ impl FsAccessHandle {
         paths: Vec<ResolvedFsPath>,
     ) -> Self {
         Self {
+            access_domain,
             scheme,
             operator,
             authority,
             root,
             paths,
         }
+    }
+
+    pub const fn access_domain(&self) -> StorageAccessDomainId {
+        self.access_domain
     }
 
     pub fn scheme(&self) -> FsScheme {
@@ -436,6 +452,7 @@ pub fn parse_object_store_path_parse_only(location: &str) -> FileResult<(String,
 impl Debug for FsAccessHandle {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FsAccessHandle")
+            .field("access_domain", &self.access_domain)
             .field("scheme", &self.scheme)
             .field("authority", &self.authority)
             .field("root", &self.root)
@@ -454,6 +471,10 @@ pub struct BoundFile {
 impl BoundFile {
     pub fn access(&self) -> &FsAccessHandle {
         &self.access
+    }
+
+    pub const fn access_domain(&self) -> StorageAccessDomainId {
+        self.access.access_domain()
     }
 
     pub fn location(&self) -> &FsLocation {
@@ -555,7 +576,7 @@ impl FileIdentity {
     }
 }
 
-#[derive(Clone, Eq, Hash, PartialEq)]
+#[derive(Clone)]
 pub struct ObjectStoreConfig {
     pub endpoint: String,
     pub access_key_id: SecretValue,
@@ -570,15 +591,26 @@ pub struct ObjectStoreConfig {
     pub io_timeout_ms: Option<u64>,
 }
 
-impl Debug for ObjectStoreConfig {
+/// Non-secret object-store configuration that participates in provider reuse.
+#[derive(Clone)]
+pub struct ObjectStoreEndpointConfig {
+    pub endpoint: String,
+    pub enable_path_style_access: Option<bool>,
+    pub region: Option<String>,
+    pub retry_max_times: Option<usize>,
+    pub retry_min_delay_ms: Option<u64>,
+    pub retry_max_delay_ms: Option<u64>,
+    pub timeout_ms: Option<u64>,
+    pub io_timeout_ms: Option<u64>,
+}
+
+impl Debug for ObjectStoreEndpointConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ObjectStoreConfig")
-            .field("endpoint", &self.endpoint)
-            .field("access_key_id", &"<redacted>")
-            .field("access_key_secret", &"<redacted>")
+        let endpoint = normalize_s3_endpoint(&self.endpoint).ok();
+        f.debug_struct("ObjectStoreEndpointConfig")
             .field(
-                "session_token",
-                &self.session_token.as_ref().map(|_| "<redacted>"),
+                "endpoint",
+                &endpoint.as_deref().unwrap_or("<invalid-endpoint>"),
             )
             .field("enable_path_style_access", &self.enable_path_style_access)
             .field("region", &self.region)
@@ -588,6 +620,606 @@ impl Debug for ObjectStoreConfig {
             .field("timeout_ms", &self.timeout_ms)
             .field("io_timeout_ms", &self.io_timeout_ms)
             .finish()
+    }
+}
+
+/// Role-local secret material used only while constructing an object-store provider.
+#[derive(Clone)]
+pub struct ObjectStoreSecretMaterial {
+    pub access_key_id: SecretValue,
+    pub access_key_secret: SecretValue,
+    pub session_token: Option<SecretValue>,
+}
+
+impl Debug for ObjectStoreSecretMaterial {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStoreSecretMaterial")
+            .field("access_key_id", &"<redacted>")
+            .field("access_key_secret", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl ObjectStoreConfig {
+    pub fn endpoint_config(&self) -> ObjectStoreEndpointConfig {
+        ObjectStoreEndpointConfig {
+            endpoint: self.endpoint.clone(),
+            enable_path_style_access: self.enable_path_style_access,
+            region: self.region.clone(),
+            retry_max_times: self.retry_max_times,
+            retry_min_delay_ms: self.retry_min_delay_ms,
+            retry_max_delay_ms: self.retry_max_delay_ms,
+            timeout_ms: self.timeout_ms,
+            io_timeout_ms: self.io_timeout_ms,
+        }
+    }
+
+    pub fn secret_material(&self) -> ObjectStoreSecretMaterial {
+        ObjectStoreSecretMaterial {
+            access_key_id: self.access_key_id.clone(),
+            access_key_secret: self.access_key_secret.clone(),
+            session_token: self.session_token.clone(),
+        }
+    }
+}
+
+impl Debug for ObjectStoreConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStoreConfig")
+            .field("endpoint_config", &self.endpoint_config())
+            .field("access_key_id", &"<redacted>")
+            .field("access_key_secret", &"<redacted>")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ObjectStoreProviderPoolOptions {
+    pub capacity: usize,
+    pub idle_ttl: Duration,
+}
+
+impl Default for ObjectStoreProviderPoolOptions {
+    fn default() -> Self {
+        Self {
+            capacity: DEFAULT_OBJECT_STORE_PROVIDER_POOL_CAPACITY,
+            idle_ttl: DEFAULT_OBJECT_STORE_PROVIDER_POOL_IDLE_TTL,
+        }
+    }
+}
+
+impl ObjectStoreProviderPoolOptions {
+    pub fn validate(self) -> FileResult<Self> {
+        if !(MIN_OBJECT_STORE_PROVIDER_POOL_CAPACITY..=MAX_OBJECT_STORE_PROVIDER_POOL_CAPACITY)
+            .contains(&self.capacity)
+        {
+            return Err(FileError::invalid(format!(
+                "object-store provider pool capacity must be in {MIN_OBJECT_STORE_PROVIDER_POOL_CAPACITY}..={MAX_OBJECT_STORE_PROVIDER_POOL_CAPACITY}"
+            )));
+        }
+        if !(MIN_OBJECT_STORE_PROVIDER_POOL_IDLE_TTL..=MAX_OBJECT_STORE_PROVIDER_POOL_IDLE_TTL)
+            .contains(&self.idle_ttl)
+        {
+            return Err(FileError::invalid(
+                "object-store provider pool idle TTL must be in 60s..=24h",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ObjectStoreProviderPoolMetrics {
+    pub operator_constructions: u64,
+    pub operator_construction_failures: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub singleflight_waits: u64,
+    pub resident_entries: usize,
+    pub high_water_entries: usize,
+    pub capacity_evictions: u64,
+    pub idle_expirations: u64,
+}
+
+/// Explicit, bounded owner for credential-bound object-store operators.
+///
+/// Keys contain only canonical non-secret endpoint identity, access domain,
+/// and credential provider identity. Secret values are never retained as map
+/// keys, and construction happens outside the pool lock behind a per-key
+/// single-flight reservation.
+pub struct ObjectStoreProviderPool {
+    state: Arc<ObjectStoreProviderPoolState>,
+    janitor: Option<JoinHandle<()>>,
+}
+
+impl ObjectStoreProviderPool {
+    pub fn new(options: ObjectStoreProviderPoolOptions) -> FileResult<Self> {
+        Self::start(options.validate()?)
+    }
+
+    #[cfg(test)]
+    fn new_for_test(capacity: usize, idle_ttl: Duration) -> FileResult<Self> {
+        debug_assert!(capacity > 0);
+        Self::start(ObjectStoreProviderPoolOptions { capacity, idle_ttl })
+    }
+
+    fn start(options: ObjectStoreProviderPoolOptions) -> FileResult<Self> {
+        let state = Arc::new(ObjectStoreProviderPoolState {
+            options,
+            inner: Mutex::new(ObjectStoreProviderPoolInner::default()),
+            wake: Condvar::new(),
+        });
+        let weak_state = Arc::downgrade(&state);
+        let janitor = std::thread::Builder::new()
+            .name("novarocks-object-store-provider-janitor".to_string())
+            .spawn(move || run_object_store_provider_janitor(weak_state))
+            .map_err(|error| {
+                FileError::with_source(
+                    FileErrorKind::Internal,
+                    "spawn object-store provider janitor",
+                    error,
+                )
+            })?;
+        Ok(Self {
+            state,
+            janitor: Some(janitor),
+        })
+    }
+
+    pub fn options(&self) -> ObjectStoreProviderPoolOptions {
+        self.state.options
+    }
+
+    pub fn metrics_snapshot(&self) -> FileResult<ObjectStoreProviderPoolMetrics> {
+        let inner = self.state.lock_inner()?;
+        Ok(inner.metrics())
+    }
+
+    fn acquire(
+        &self,
+        access_domain: StorageAccessDomainId,
+        bucket: &str,
+        endpoint_config: &ObjectStoreEndpointConfig,
+        credential_identity: &ObjectStoreCredentialProviderIdentity,
+        secret_material: &ObjectStoreSecretMaterial,
+    ) -> FileResult<Operator> {
+        self.acquire_with_builder(
+            access_domain,
+            bucket,
+            endpoint_config,
+            credential_identity,
+            secret_material,
+            build_object_store_operator,
+        )
+    }
+
+    fn acquire_with_builder<F>(
+        &self,
+        access_domain: StorageAccessDomainId,
+        bucket: &str,
+        endpoint_config: &ObjectStoreEndpointConfig,
+        credential_identity: &ObjectStoreCredentialProviderIdentity,
+        secret_material: &ObjectStoreSecretMaterial,
+        builder: F,
+    ) -> FileResult<Operator>
+    where
+        F: FnOnce(&ObjectStoreEndpointIdentity, &ObjectStoreSecretMaterial) -> FileResult<Operator>,
+    {
+        let endpoint = ObjectStoreEndpointIdentity::try_new(bucket, endpoint_config)?;
+        let key = ObjectStoreProviderKey {
+            endpoint: endpoint.clone(),
+            access_domain,
+            credential_identity: credential_identity.clone(),
+        };
+        let now = Instant::now();
+        let acquisition = {
+            let mut inner = self.state.lock_inner()?;
+            inner.expire_due(now);
+            if let Some(operator) = inner.touch(&key, now, self.state.options.idle_ttl) {
+                inner.cache_hits = inner.cache_hits.saturating_add(1);
+                self.state.wake.notify_one();
+                return Ok(operator);
+            }
+            inner.cache_misses = inner.cache_misses.saturating_add(1);
+            if let Some(reservation) = inner.inflight.get(&key).cloned() {
+                inner.singleflight_waits = inner.singleflight_waits.saturating_add(1);
+                ProviderAcquisition::Wait(reservation)
+            } else {
+                if inner.inflight.len() >= self.state.options.capacity {
+                    return Err(FileError::new(
+                        FileErrorKind::ResourceExhausted,
+                        "object-store provider construction reservations are full",
+                    ));
+                }
+                let reservation = Arc::new(ObjectStoreBuildReservation::default());
+                inner.inflight.insert(key.clone(), Arc::clone(&reservation));
+                ProviderAcquisition::Build(reservation)
+            }
+        };
+
+        let reservation = match acquisition {
+            ProviderAcquisition::Build(reservation) => reservation,
+            ProviderAcquisition::Wait(reservation) => {
+                return reservation.wait(OBJECT_STORE_PROVIDER_BUILD_WAIT_TIMEOUT);
+            }
+        };
+
+        let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            builder(&endpoint, secret_material)
+        }))
+        .unwrap_or_else(|_| {
+            Err(FileError::new(
+                FileErrorKind::Internal,
+                "object-store provider construction panicked",
+            ))
+        });
+        let result = {
+            let mut inner = self.state.lock_inner()?;
+            inner.inflight.remove(&key);
+            match build_result {
+                Ok(operator) => {
+                    if inner.entries.len() >= self.state.options.capacity {
+                        inner.evict_oldest();
+                    }
+                    inner.operator_constructions = inner.operator_constructions.saturating_add(1);
+                    inner.insert(
+                        key,
+                        operator.clone(),
+                        Instant::now(),
+                        self.state.options.idle_ttl,
+                    );
+                    Ok(operator)
+                }
+                Err(error) => {
+                    inner.operator_construction_failures =
+                        inner.operator_construction_failures.saturating_add(1);
+                    Err(error)
+                }
+            }
+        };
+        reservation.complete(&result);
+        self.state.wake.notify_all();
+        result
+    }
+}
+
+impl Drop for ObjectStoreProviderPool {
+    fn drop(&mut self) {
+        if let Ok(mut inner) = self.state.inner.lock() {
+            inner.shutting_down = true;
+        }
+        self.state.wake.notify_all();
+        if let Some(janitor) = self.janitor.take() {
+            let _ = janitor.join();
+        }
+    }
+}
+
+impl Debug for ObjectStoreProviderPool {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStoreProviderPool")
+            .field("options", &self.state.options)
+            .finish_non_exhaustive()
+    }
+}
+
+struct ObjectStoreProviderPoolState {
+    options: ObjectStoreProviderPoolOptions,
+    inner: Mutex<ObjectStoreProviderPoolInner>,
+    wake: Condvar,
+}
+
+impl ObjectStoreProviderPoolState {
+    fn lock_inner(&self) -> FileResult<std::sync::MutexGuard<'_, ObjectStoreProviderPoolInner>> {
+        self.inner
+            .lock()
+            .map_err(|_| FileError::new(FileErrorKind::Internal, "lock object-store provider pool"))
+    }
+}
+
+fn run_object_store_provider_janitor(weak_state: Weak<ObjectStoreProviderPoolState>) {
+    let Some(state) = weak_state.upgrade() else {
+        return;
+    };
+    let Ok(mut inner) = state.inner.lock() else {
+        return;
+    };
+    loop {
+        if inner.shutting_down {
+            return;
+        }
+        inner.expire_due(Instant::now());
+        let wait = inner
+            .next_expiration()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        inner = match wait {
+            Some(wait) => match state.wake.wait_timeout(inner, wait) {
+                Ok((inner, _)) => inner,
+                Err(_) => return,
+            },
+            None => match state.wake.wait(inner) {
+                Ok(inner) => inner,
+                Err(_) => return,
+            },
+        };
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ObjectStoreEndpointIdentity {
+    bucket: String,
+    endpoint: String,
+    use_path_style: bool,
+    region: String,
+    retry_max_times: usize,
+    retry_min_delay_ms: u64,
+    retry_max_delay_ms: u64,
+    timeout_ms: u64,
+    io_timeout_ms: u64,
+}
+
+impl ObjectStoreEndpointIdentity {
+    fn try_new(bucket: &str, config: &ObjectStoreEndpointConfig) -> FileResult<Self> {
+        let bucket = bucket.trim();
+        if bucket.is_empty() {
+            return Err(FileError::invalid("empty object-store bucket"));
+        }
+        let endpoint = normalize_s3_endpoint(&config.endpoint)?;
+        Ok(Self {
+            bucket: bucket.to_string(),
+            use_path_style: config
+                .enable_path_style_access
+                .unwrap_or_else(|| !prefer_virtual_host_style(&endpoint)),
+            endpoint,
+            region: config
+                .region
+                .as_deref()
+                .filter(|region| !region.is_empty())
+                .unwrap_or("us-east-1")
+                .to_string(),
+            retry_max_times: config
+                .retry_max_times
+                .unwrap_or(DEFAULT_OBJECT_STORE_RETRY_MAX_TIMES),
+            retry_min_delay_ms: config
+                .retry_min_delay_ms
+                .unwrap_or(DEFAULT_OBJECT_STORE_RETRY_MIN_DELAY_MS),
+            retry_max_delay_ms: config
+                .retry_max_delay_ms
+                .unwrap_or(DEFAULT_OBJECT_STORE_RETRY_MAX_DELAY_MS),
+            timeout_ms: config.timeout_ms.unwrap_or(DEFAULT_OBJECT_STORE_TIMEOUT_MS),
+            io_timeout_ms: config
+                .io_timeout_ms
+                .unwrap_or(DEFAULT_OBJECT_STORE_IO_TIMEOUT_MS),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ObjectStoreProviderKey {
+    endpoint: ObjectStoreEndpointIdentity,
+    access_domain: StorageAccessDomainId,
+    credential_identity: ObjectStoreCredentialProviderIdentity,
+}
+
+struct ObjectStoreProviderEntry {
+    operator: Operator,
+    expiration_key: (Instant, u64),
+}
+
+#[derive(Default)]
+struct ObjectStoreProviderPoolInner {
+    entries: HashMap<ObjectStoreProviderKey, ObjectStoreProviderEntry>,
+    expiration_index: BTreeMap<(Instant, u64), ObjectStoreProviderKey>,
+    inflight: HashMap<ObjectStoreProviderKey, Arc<ObjectStoreBuildReservation>>,
+    next_sequence: u64,
+    operator_constructions: u64,
+    operator_construction_failures: u64,
+    cache_hits: u64,
+    cache_misses: u64,
+    singleflight_waits: u64,
+    high_water_entries: usize,
+    capacity_evictions: u64,
+    idle_expirations: u64,
+    shutting_down: bool,
+}
+
+impl ObjectStoreProviderPoolInner {
+    fn touch(
+        &mut self,
+        key: &ObjectStoreProviderKey,
+        now: Instant,
+        idle_ttl: Duration,
+    ) -> Option<Operator> {
+        let entry = self.entries.remove(key)?;
+        self.expiration_index.remove(&entry.expiration_key);
+        let operator = entry.operator.clone();
+        self.insert(key.clone(), entry.operator, now, idle_ttl);
+        Some(operator)
+    }
+
+    fn insert(
+        &mut self,
+        key: ObjectStoreProviderKey,
+        operator: Operator,
+        now: Instant,
+        idle_ttl: Duration,
+    ) {
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        let expiration_key = (now.checked_add(idle_ttl).unwrap_or(now), self.next_sequence);
+        self.expiration_index.insert(expiration_key, key.clone());
+        self.entries.insert(
+            key,
+            ObjectStoreProviderEntry {
+                operator,
+                expiration_key,
+            },
+        );
+        self.high_water_entries = self.high_water_entries.max(self.entries.len());
+    }
+
+    fn expire_due(&mut self, now: Instant) {
+        loop {
+            let expired = self
+                .expiration_index
+                .first_key_value()
+                .filter(|(expiration, _)| expiration.0 <= now)
+                .map(|(expiration, key)| (*expiration, key.clone()));
+            let Some((expiration, key)) = expired else {
+                return;
+            };
+            self.expiration_index.remove(&expiration);
+            if self.entries.remove(&key).is_some() {
+                self.idle_expirations = self.idle_expirations.saturating_add(1);
+            }
+        }
+    }
+
+    fn next_expiration(&self) -> Option<Instant> {
+        self.expiration_index
+            .first_key_value()
+            .map(|(expiration, _)| expiration.0)
+    }
+
+    fn evict_oldest(&mut self) {
+        if let Some((_, oldest)) = self.expiration_index.pop_first() {
+            self.entries.remove(&oldest);
+            self.capacity_evictions = self.capacity_evictions.saturating_add(1);
+        }
+    }
+
+    fn metrics(&self) -> ObjectStoreProviderPoolMetrics {
+        ObjectStoreProviderPoolMetrics {
+            operator_constructions: self.operator_constructions,
+            operator_construction_failures: self.operator_construction_failures,
+            cache_hits: self.cache_hits,
+            cache_misses: self.cache_misses,
+            singleflight_waits: self.singleflight_waits,
+            resident_entries: self.entries.len(),
+            high_water_entries: self.high_water_entries,
+            capacity_evictions: self.capacity_evictions,
+            idle_expirations: self.idle_expirations,
+        }
+    }
+}
+
+enum ProviderAcquisition {
+    Build(Arc<ObjectStoreBuildReservation>),
+    Wait(Arc<ObjectStoreBuildReservation>),
+}
+
+#[derive(Default)]
+struct ObjectStoreBuildReservation {
+    state: Mutex<ObjectStoreBuildReservationState>,
+    ready: Condvar,
+}
+
+#[derive(Clone, Default)]
+enum ObjectStoreBuildReservationState {
+    #[default]
+    Building,
+    Complete(Result<Operator, ObjectStoreBuildFailure>),
+}
+
+#[derive(Clone)]
+struct ObjectStoreBuildFailure {
+    kind: FileErrorKind,
+}
+
+impl ObjectStoreBuildReservation {
+    fn wait(&self, timeout: Duration) -> FileResult<Operator> {
+        let state = self.state.lock().map_err(|_| {
+            FileError::new(
+                FileErrorKind::Internal,
+                "lock object-store provider construction reservation",
+            )
+        })?;
+        let (state, wait) = self
+            .ready
+            .wait_timeout_while(state, timeout, |state| {
+                matches!(state, ObjectStoreBuildReservationState::Building)
+            })
+            .map_err(|_| {
+                FileError::new(
+                    FileErrorKind::Internal,
+                    "wait for object-store provider construction",
+                )
+            })?;
+        match &*state {
+            ObjectStoreBuildReservationState::Complete(Ok(operator)) => Ok(operator.clone()),
+            ObjectStoreBuildReservationState::Complete(Err(error)) => Err(FileError::new(
+                error.kind,
+                "object-store provider construction failed",
+            )),
+            ObjectStoreBuildReservationState::Building if wait.timed_out() => Err(
+                FileError::deadline("timed out waiting for object-store provider construction"),
+            ),
+            ObjectStoreBuildReservationState::Building => Err(FileError::new(
+                FileErrorKind::Internal,
+                "object-store provider construction waiter woke without completion",
+            )),
+        }
+    }
+
+    fn complete(&self, result: &FileResult<Operator>) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = ObjectStoreBuildReservationState::Complete(match result {
+                Ok(operator) => Ok(operator.clone()),
+                Err(error) => Err(ObjectStoreBuildFailure { kind: error.kind() }),
+            });
+        }
+        self.ready.notify_all();
+    }
+}
+
+/// Non-secret identity of the credential provider bound to one Operator.
+///
+/// M2 extends this enum with query-attempt lease identity and epoch; secret
+/// material remains outside this type and outside all pool keys.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum ObjectStoreCredentialProviderIdentity {
+    Static(StaticCredentialReference),
+}
+
+pub struct ObjectStoreAccessContext<'a> {
+    endpoint_config: ObjectStoreEndpointConfig,
+    credential_identity: ObjectStoreCredentialProviderIdentity,
+    secret_material: ObjectStoreSecretMaterial,
+    provider_pool: &'a ObjectStoreProviderPool,
+}
+
+impl<'a> ObjectStoreAccessContext<'a> {
+    pub fn new(
+        endpoint_config: ObjectStoreEndpointConfig,
+        credential_identity: ObjectStoreCredentialProviderIdentity,
+        secret_material: ObjectStoreSecretMaterial,
+        provider_pool: &'a ObjectStoreProviderPool,
+    ) -> Self {
+        Self {
+            endpoint_config,
+            credential_identity,
+            secret_material,
+            provider_pool,
+        }
+    }
+}
+
+impl Debug for ObjectStoreAccessContext<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectStoreAccessContext")
+            .field("endpoint_config", &self.endpoint_config)
+            .field("credential_identity", &self.credential_identity)
+            .field("secret_material", &self.secret_material)
+            .field("provider_pool", &self.provider_pool)
+            .finish_non_exhaustive()
     }
 }
 
@@ -616,16 +1248,22 @@ impl FsAccessResolver {
 
     pub fn resolve_location(
         &self,
+        access_domain: StorageAccessDomainId,
         location: impl AsRef<str>,
-        object_store_config: Option<&ObjectStoreConfig>,
+        object_store_access: Option<ObjectStoreAccessContext<'_>>,
     ) -> FileResult<FsAccessHandle> {
-        self.resolve_locations(std::iter::once(location), object_store_config)
+        self.resolve_locations(
+            access_domain,
+            std::iter::once(location),
+            object_store_access,
+        )
     }
 
     pub fn resolve_locations<I, S>(
         &self,
+        access_domain: StorageAccessDomainId,
         locations: I,
-        object_store_config: Option<&ObjectStoreConfig>,
+        object_store_access: Option<ObjectStoreAccessContext<'_>>,
     ) -> FileResult<FsAccessHandle>
     where
         I: IntoIterator<Item = S>,
@@ -643,14 +1281,19 @@ impl FsAccessResolver {
         }
 
         match scheme {
-            FsScheme::Local => resolve_local_locations(locations),
-            FsScheme::ObjectStore => resolve_object_store_locations(locations, object_store_config),
-            FsScheme::Hdfs => resolve_hdfs_locations(locations),
+            FsScheme::Local => resolve_local_locations(access_domain, locations),
+            FsScheme::ObjectStore => {
+                resolve_object_store_locations(access_domain, locations, object_store_access)
+            }
+            FsScheme::Hdfs => resolve_hdfs_locations(access_domain, locations),
         }
     }
 }
 
-fn resolve_local_locations(locations: Vec<FsLocation>) -> FileResult<FsAccessHandle> {
+fn resolve_local_locations(
+    access_domain: StorageAccessDomainId,
+    locations: Vec<FsLocation>,
+) -> FileResult<FsAccessHandle> {
     let raw_paths = locations.iter().map(FsLocation::path).collect::<Vec<_>>();
     let (root, relative_paths) = normalize_local_paths(&raw_paths)?;
     let builder = opendal::services::Fs::default().root(&root);
@@ -663,6 +1306,7 @@ fn resolve_local_locations(locations: Vec<FsLocation>) -> FileResult<FsAccessHan
         .map(|(location, relative_path)| ResolvedFsPath::new(location, relative_path))
         .collect::<FileResult<Vec<_>>>()?;
     Ok(FsAccessHandle::new(
+        access_domain,
         FsScheme::Local,
         operator,
         None,
@@ -754,11 +1398,13 @@ fn common_path_prefix(paths: &[PathBuf]) -> Option<PathBuf> {
 }
 
 fn resolve_object_store_locations(
+    access_domain: StorageAccessDomainId,
     locations: Vec<FsLocation>,
-    object_store_config: Option<&ObjectStoreConfig>,
+    object_store_access: Option<ObjectStoreAccessContext<'_>>,
 ) -> FileResult<FsAccessHandle> {
-    let config = object_store_config
-        .ok_or_else(|| FileError::invalid("object-store location requires object store config"))?;
+    let object_store_access = object_store_access.ok_or_else(|| {
+        FileError::invalid("object-store location requires explicit access context")
+    })?;
     let bucket = locations
         .first()
         .and_then(FsLocation::authority)
@@ -772,7 +1418,13 @@ fn resolve_object_store_locations(
             "mixed object-store buckets are not allowed",
         ));
     }
-    let operator = build_object_store_operator(&bucket, config)?;
+    let operator = object_store_access.provider_pool.acquire(
+        access_domain,
+        &bucket,
+        &object_store_access.endpoint_config,
+        &object_store_access.credential_identity,
+        &object_store_access.secret_material,
+    )?;
     let paths = locations
         .into_iter()
         .map(|location| {
@@ -781,6 +1433,7 @@ fn resolve_object_store_locations(
         })
         .collect::<FileResult<Vec<_>>>()?;
     Ok(FsAccessHandle::new(
+        access_domain,
         FsScheme::ObjectStore,
         operator,
         Some(bucket),
@@ -789,60 +1442,26 @@ fn resolve_object_store_locations(
     ))
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ObjectStoreOperatorKey {
-    bucket: String,
-    config: ObjectStoreConfig,
-}
-
-fn object_store_operator_cache() -> &'static Mutex<HashMap<ObjectStoreOperatorKey, Operator>> {
-    static CACHE: OnceLock<Mutex<HashMap<ObjectStoreOperatorKey, Operator>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn build_object_store_operator(bucket: &str, config: &ObjectStoreConfig) -> FileResult<Operator> {
-    let bucket = bucket.trim();
-    if bucket.is_empty() {
-        return Err(FileError::invalid("empty object-store bucket"));
-    }
-    let key = ObjectStoreOperatorKey {
-        bucket: bucket.to_string(),
-        config: config.clone(),
-    };
-    if let Some(operator) = object_store_operator_cache()
-        .lock()
-        .map_err(|_| FileError::new(FileErrorKind::Internal, "lock object store operator cache"))?
-        .get(&key)
-        .cloned()
-    {
-        return Ok(operator);
-    }
-
-    let endpoint = normalize_s3_endpoint(&config.endpoint)?;
-    let use_path_style = config
-        .enable_path_style_access
-        .unwrap_or_else(|| !prefer_virtual_host_style(&endpoint));
-    let region = config
-        .region
-        .as_deref()
-        .filter(|region| !region.is_empty())
-        .unwrap_or("us-east-1");
+fn build_object_store_operator(
+    endpoint: &ObjectStoreEndpointIdentity,
+    secrets: &ObjectStoreSecretMaterial,
+) -> FileResult<Operator> {
     let mut builder = opendal::services::S3::default()
-        .endpoint(&endpoint)
-        .bucket(bucket)
-        .region(region)
-        .access_key_id(config.access_key_id.expose_secret())
-        .secret_access_key(config.access_key_secret.expose_secret());
-    if !use_path_style {
+        .endpoint(&endpoint.endpoint)
+        .bucket(&endpoint.bucket)
+        .region(&endpoint.region)
+        .access_key_id(secrets.access_key_id.expose_secret())
+        .secret_access_key(secrets.access_key_secret.expose_secret());
+    if !endpoint.use_path_style {
         builder = builder.enable_virtual_host_style();
     }
-    if let Some(session_token) = config.session_token.as_ref() {
+    if let Some(session_token) = secrets.session_token.as_ref() {
         builder = builder.session_token(session_token.expose_secret());
     }
     let mut operator = Operator::new(builder)
         .map_err(|error| map_opendal_error("initialize object store operator", error))?
         .finish();
-    if is_local_endpoint(&endpoint) {
+    if is_local_endpoint(&endpoint.endpoint) {
         let client = reqwest::Client::builder()
             .no_proxy()
             .build()
@@ -856,14 +1475,8 @@ fn build_object_store_operator(bucket: &str, config: &ObjectStoreConfig) -> File
         operator = operator.layer(HttpClientLayer::new(opendal::raw::HttpClient::with(client)));
     }
     let mut timeout = TimeoutLayer::new();
-    timeout = timeout.with_timeout(Duration::from_millis(
-        config.timeout_ms.unwrap_or(DEFAULT_OBJECT_STORE_TIMEOUT_MS),
-    ));
-    timeout = timeout.with_io_timeout(Duration::from_millis(
-        config
-            .io_timeout_ms
-            .unwrap_or(DEFAULT_OBJECT_STORE_IO_TIMEOUT_MS),
-    ));
+    timeout = timeout.with_timeout(Duration::from_millis(endpoint.timeout_ms));
+    timeout = timeout.with_io_timeout(Duration::from_millis(endpoint.io_timeout_ms));
     operator = operator.layer(timeout);
     operator = operator.layer(
         ConcurrentLimitLayer::new(DEFAULT_OBJECT_STORE_CONCURRENT_LIMIT)
@@ -872,61 +1485,87 @@ fn build_object_store_operator(bucket: &str, config: &ObjectStoreConfig) -> File
     operator = operator.layer(
         RetryLayer::new()
             .with_jitter()
-            .with_min_delay(Duration::from_millis(
-                config
-                    .retry_min_delay_ms
-                    .unwrap_or(DEFAULT_OBJECT_STORE_RETRY_MIN_DELAY_MS),
-            ))
-            .with_max_delay(Duration::from_millis(
-                config
-                    .retry_max_delay_ms
-                    .unwrap_or(DEFAULT_OBJECT_STORE_RETRY_MAX_DELAY_MS),
-            ))
-            .with_max_times(
-                config
-                    .retry_max_times
-                    .unwrap_or(DEFAULT_OBJECT_STORE_RETRY_MAX_TIMES),
-            ),
+            .with_min_delay(Duration::from_millis(endpoint.retry_min_delay_ms))
+            .with_max_delay(Duration::from_millis(endpoint.retry_max_delay_ms))
+            .with_max_times(endpoint.retry_max_times),
     );
-    object_store_operator_cache()
-        .lock()
-        .map_err(|_| FileError::new(FileErrorKind::Internal, "lock object store operator cache"))?
-        .insert(key, operator.clone());
     Ok(operator)
 }
 
 fn normalize_s3_endpoint(raw_endpoint: &str) -> FileResult<String> {
-    let endpoint = raw_endpoint.trim().trim_end_matches('/');
+    let endpoint = raw_endpoint.trim();
     if endpoint.is_empty() {
         return Err(FileError::invalid("empty object-store endpoint"));
     }
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        return Ok(endpoint.to_string());
-    }
-    let scheme = if is_local_endpoint(endpoint) {
-        "http"
+
+    let explicit_scheme = endpoint.contains("://");
+    let candidate = if explicit_scheme {
+        endpoint.to_string()
     } else {
-        "https"
+        format!("http://{endpoint}")
     };
-    Ok(format!("{scheme}://{endpoint}"))
+    let mut url = Url::parse(&candidate)
+        .map_err(|_| FileError::invalid("invalid object-store endpoint URL"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(FileError::invalid(
+            "object-store endpoint scheme must be http or https",
+        ));
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(FileError::invalid(
+            "object-store endpoint must not contain userinfo, query, or fragment",
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| FileError::invalid("object-store endpoint is missing a host"))?;
+    if !explicit_scheme {
+        let scheme = if host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok() {
+            "http"
+        } else {
+            "https"
+        };
+        url.set_scheme(scheme)
+            .map_err(|_| FileError::invalid("invalid object-store endpoint scheme"))?;
+    }
+    let default_port = match url.scheme() {
+        "http" => 80,
+        "https" => 443,
+        _ => unreachable!(),
+    };
+    if url.port() == Some(default_port) {
+        url.set_port(None)
+            .map_err(|_| FileError::invalid("invalid object-store endpoint port"))?;
+    }
+
+    let normalized_path = url
+        .path()
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    if normalized_path.is_empty() {
+        url.set_path("/");
+    } else {
+        url.set_path(&format!("/{normalized_path}"));
+    }
+    Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
 fn endpoint_host(endpoint: &str) -> String {
-    let mut view = endpoint.trim();
-    if let Some(rest) = view.strip_prefix("http://") {
-        view = rest;
-    } else if let Some(rest) = view.strip_prefix("https://") {
-        view = rest;
-    }
-    if let Some((authority, _)) = view.split_once('/') {
-        view = authority;
-    }
-    if let Some(rest) = view.strip_prefix('[')
-        && let Some((host, _)) = rest.split_once(']')
-    {
-        return host.to_ascii_lowercase();
-    }
-    view.split(':').next().unwrap_or(view).to_ascii_lowercase()
+    Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host().map(|host| host.to_owned()))
+        .map(|host| match host {
+            Host::Domain(host) => host.to_ascii_lowercase(),
+            Host::Ipv4(host) => host.to_string(),
+            Host::Ipv6(host) => host.to_string(),
+        })
+        .unwrap_or_default()
 }
 
 fn is_local_endpoint(endpoint: &str) -> bool {
@@ -961,7 +1600,10 @@ fn hdfs_operator_cache() -> &'static Mutex<HashMap<HdfsOperatorKey, Operator>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn resolve_hdfs_locations(locations: Vec<FsLocation>) -> FileResult<FsAccessHandle> {
+fn resolve_hdfs_locations(
+    access_domain: StorageAccessDomainId,
+    locations: Vec<FsLocation>,
+) -> FileResult<FsAccessHandle> {
     let mut parsed = locations
         .iter()
         .map(|location| parse_hdfs_path(location.original()))
@@ -987,6 +1629,7 @@ fn resolve_hdfs_locations(locations: Vec<FsLocation>) -> FileResult<FsAccessHand
         .map(|(location, path)| ResolvedFsPath::new(location, path.relative_path))
         .collect::<FileResult<Vec<_>>>()?;
     Ok(FsAccessHandle::new(
+        access_domain,
         FsScheme::Hdfs,
         operator,
         Some(first.name_node.clone()),
@@ -1150,4 +1793,342 @@ fn ensure_non_empty_path(original: &str, scheme: &str, path: &str) -> FileResult
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    fn domain(value: u8) -> StorageAccessDomainId {
+        StorageAccessDomainId::from_bytes([value; 32])
+    }
+
+    fn credential_identity(generation: &str) -> ObjectStoreCredentialProviderIdentity {
+        ObjectStoreCredentialProviderIdentity::Static(
+            StaticCredentialReference::try_new("warehouse-data", generation).unwrap(),
+        )
+    }
+
+    fn endpoint_config(endpoint: &str) -> ObjectStoreEndpointConfig {
+        ObjectStoreEndpointConfig {
+            endpoint: endpoint.to_string(),
+            enable_path_style_access: Some(true),
+            region: Some("us-east-1".to_string()),
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        }
+    }
+
+    fn secret_material(secret_suffix: &str) -> ObjectStoreSecretMaterial {
+        ObjectStoreSecretMaterial {
+            access_key_id: SecretValue::new(format!("access-{secret_suffix}")),
+            access_key_secret: SecretValue::new(format!("secret-{secret_suffix}")),
+            session_token: Some(SecretValue::new(format!("token-{secret_suffix}"))),
+        }
+    }
+
+    fn legacy_config(endpoint: &str, secret_suffix: &str) -> ObjectStoreConfig {
+        ObjectStoreConfig {
+            endpoint: endpoint.to_string(),
+            access_key_id: SecretValue::new(format!("access-{secret_suffix}")),
+            access_key_secret: SecretValue::new(format!("secret-{secret_suffix}")),
+            session_token: Some(SecretValue::new(format!("token-{secret_suffix}"))),
+            enable_path_style_access: Some(true),
+            region: Some("us-east-1".to_string()),
+            retry_max_times: None,
+            retry_min_delay_ms: None,
+            retry_max_delay_ms: None,
+            timeout_ms: None,
+            io_timeout_ms: None,
+        }
+    }
+
+    fn memory_operator() -> FileResult<Operator> {
+        Operator::new(opendal::services::Memory::default())
+            .map(|builder| builder.finish())
+            .map_err(|error| map_opendal_error("initialize test memory operator", error))
+    }
+
+    #[test]
+    fn provider_pool_options_enforce_capacity_and_idle_ttl_bounds() {
+        for capacity in [0, 16_385] {
+            assert!(
+                ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions {
+                    capacity,
+                    idle_ttl: Duration::from_secs(60),
+                })
+                .is_err()
+            );
+        }
+        for idle_ttl in [Duration::from_secs(59), Duration::from_secs(86_401)] {
+            assert!(
+                ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions {
+                    capacity: 1,
+                    idle_ttl,
+                })
+                .is_err()
+            );
+        }
+        assert!(ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn provider_pool_reuses_static_reference_without_secret_keys() {
+        let pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default()).unwrap();
+        let endpoint = endpoint_config("http://localhost:9000");
+        let identity = credential_identity("blue");
+        pool.acquire_with_builder(
+            domain(1),
+            "warehouse",
+            &endpoint,
+            &identity,
+            &secret_material("first"),
+            |_, _| memory_operator(),
+        )
+        .unwrap();
+        pool.acquire_with_builder(
+            domain(1),
+            "warehouse",
+            &endpoint,
+            &identity,
+            &secret_material("different-value-same-reference"),
+            |_, _| -> FileResult<Operator> {
+                panic!("secret material must not participate in the provider key")
+            },
+        )
+        .unwrap();
+
+        let metrics = pool.metrics_snapshot().unwrap();
+        assert_eq!(metrics.operator_constructions, 1);
+        assert_eq!(metrics.cache_hits, 1);
+        assert_eq!(metrics.cache_misses, 1);
+        assert_eq!(metrics.resident_entries, 1);
+        assert_eq!(metrics.high_water_entries, 1);
+    }
+
+    #[test]
+    fn provider_pool_capacity_evicts_the_oldest_access_domain() {
+        let pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions {
+            capacity: 1,
+            idle_ttl: Duration::from_secs(60),
+        })
+        .unwrap();
+        let endpoint = endpoint_config("http://localhost:9000");
+        let identity = credential_identity("blue");
+        let secrets = secret_material("one");
+        pool.acquire_with_builder(
+            domain(1),
+            "warehouse",
+            &endpoint,
+            &identity,
+            &secrets,
+            |_, _| memory_operator(),
+        )
+        .unwrap();
+        pool.acquire_with_builder(
+            domain(2),
+            "warehouse",
+            &endpoint,
+            &identity,
+            &secrets,
+            |_, _| memory_operator(),
+        )
+        .unwrap();
+
+        let metrics = pool.metrics_snapshot().unwrap();
+        assert_eq!(metrics.operator_constructions, 2);
+        assert_eq!(metrics.resident_entries, 1);
+        assert_eq!(metrics.high_water_entries, 1);
+        assert_eq!(metrics.capacity_evictions, 1);
+    }
+
+    #[test]
+    fn provider_pool_janitor_actively_expires_idle_entries() {
+        let pool = ObjectStoreProviderPool::new_for_test(2, Duration::from_millis(30)).unwrap();
+        pool.acquire_with_builder(
+            domain(1),
+            "warehouse",
+            &endpoint_config("http://localhost:9000"),
+            &credential_identity("blue"),
+            &secret_material("one"),
+            |_, _| memory_operator(),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let metrics = pool.metrics_snapshot().unwrap();
+            if metrics.resident_entries == 0 {
+                assert_eq!(metrics.idle_expirations, 1);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "janitor did not evict idle entry"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn concurrent_same_key_construction_is_single_flight() {
+        let pool =
+            Arc::new(ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(1)).unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+        let constructions = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+            let constructions = Arc::clone(&constructions);
+            workers.push(std::thread::spawn(move || {
+                let endpoint = endpoint_config("http://localhost:9000");
+                let identity = credential_identity("blue");
+                let secrets = secret_material("one");
+                barrier.wait();
+                pool.acquire_with_builder(
+                    domain(1),
+                    "warehouse",
+                    &endpoint,
+                    &identity,
+                    &secrets,
+                    |_, _| {
+                        constructions.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(50));
+                        memory_operator()
+                    },
+                )
+                .unwrap();
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        assert_eq!(constructions.load(Ordering::SeqCst), 1);
+        let metrics = pool.metrics_snapshot().unwrap();
+        assert_eq!(metrics.operator_constructions, 1);
+        assert_eq!(metrics.singleflight_waits, 1);
+        assert_eq!(metrics.resident_entries, 1);
+    }
+
+    #[test]
+    fn failed_construction_does_not_evict_a_healthy_entry() {
+        let pool = ObjectStoreProviderPool::new_for_test(1, Duration::from_secs(1)).unwrap();
+        let endpoint = endpoint_config("http://localhost:9000");
+        let identity = credential_identity("blue");
+        let secrets = secret_material("one");
+        pool.acquire_with_builder(
+            domain(1),
+            "warehouse",
+            &endpoint,
+            &identity,
+            &secrets,
+            |_, _| memory_operator(),
+        )
+        .unwrap();
+        let error = pool
+            .acquire_with_builder(
+                domain(2),
+                "warehouse",
+                &endpoint,
+                &identity,
+                &secrets,
+                |_, _| {
+                    Err(FileError::new(
+                        FileErrorKind::Invalid,
+                        "injected construction failure",
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), FileErrorKind::Invalid);
+        pool.acquire_with_builder(
+            domain(1),
+            "warehouse",
+            &endpoint,
+            &identity,
+            &secrets,
+            |_, _| -> FileResult<Operator> { panic!("healthy entry must remain resident") },
+        )
+        .unwrap();
+
+        let metrics = pool.metrics_snapshot().unwrap();
+        assert_eq!(metrics.operator_constructions, 1);
+        assert_eq!(metrics.operator_construction_failures, 1);
+        assert_eq!(metrics.capacity_evictions, 0);
+        assert_eq!(metrics.resident_entries, 1);
+    }
+
+    #[test]
+    fn endpoint_identity_is_canonical_and_rejects_secret_bearing_url_parts() {
+        assert_eq!(
+            normalize_s3_endpoint("HTTPS://EXAMPLE.COM:443/a/../api//").unwrap(),
+            "https://example.com/api"
+        );
+        assert_eq!(
+            normalize_s3_endpoint("localhost:9000/").unwrap(),
+            "http://localhost:9000"
+        );
+
+        let canary = "endpoint-secret-canary";
+        for raw in [
+            format!("https://user:{canary}@example.com"),
+            format!("https://example.com?token={canary}"),
+            format!("https://example.com#{canary}"),
+        ] {
+            let config = endpoint_config(&raw);
+            let error = normalize_s3_endpoint(&raw).unwrap_err();
+            let diagnostic = format!("{config:?} {error:?} {error}");
+            assert!(!diagnostic.contains(canary));
+            assert!(diagnostic.contains("<invalid-endpoint>"));
+        }
+
+        let legacy = legacy_config(
+            "https://user:endpoint-secret-canary@example.com",
+            "material-canary",
+        );
+        let debug = format!("{legacy:?}");
+        assert!(!debug.contains("endpoint-secret-canary"));
+        assert!(!debug.contains("material-canary"));
+    }
+
+    #[test]
+    fn canonical_equivalent_endpoints_share_one_provider_key() {
+        let pool = ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(1)).unwrap();
+        let identity = credential_identity("blue");
+        let secrets = secret_material("one");
+        pool.acquire_with_builder(
+            domain(1),
+            "warehouse",
+            &endpoint_config("HTTPS://EXAMPLE.COM:443/a/../api//"),
+            &identity,
+            &secrets,
+            |_, _| memory_operator(),
+        )
+        .unwrap();
+        pool.acquire_with_builder(
+            domain(1),
+            "warehouse",
+            &endpoint_config("https://example.com/api"),
+            &identity,
+            &secrets,
+            |_, _| -> FileResult<Operator> {
+                panic!("canonical equivalent endpoint must reuse the resident provider")
+            },
+        )
+        .unwrap();
+
+        let metrics = pool.metrics_snapshot().unwrap();
+        assert_eq!(metrics.operator_constructions, 1);
+        assert_eq!(metrics.cache_hits, 1);
+        assert_eq!(metrics.resident_entries, 1);
+    }
 }

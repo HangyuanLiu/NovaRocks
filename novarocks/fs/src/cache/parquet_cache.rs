@@ -18,6 +18,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use novarocks_spi::connector::StorageAccessDomainId;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 
 use crate::{DataCacheManager, DataCachePageKey, FileIdentity};
@@ -55,6 +56,7 @@ pub fn init_parquet_cache(options: ParquetCacheOptions) -> bool {
 
 pub(crate) fn metadata_get(
     request_cache_enabled: bool,
+    access_domain: StorageAccessDomainId,
     identity: &FileIdentity,
     require_page_index: bool,
 ) -> Option<ArrowReaderMetadata> {
@@ -62,7 +64,8 @@ pub(crate) fn metadata_get(
         return None;
     }
     let cache = DataCacheManager::instance().page_cache()?;
-    let cached = cache.lookup::<TimedArrowReaderMetadata>(&metadata_key(identity))?;
+    let cached =
+        cache.lookup::<TimedArrowReaderMetadata>(&metadata_key(access_domain, identity))?;
     if cached.expire_at <= Instant::now() {
         return None;
     }
@@ -83,6 +86,7 @@ pub(crate) fn metadata_get(
 
 pub(crate) fn metadata_put(
     request_cache_enabled: bool,
+    access_domain: StorageAccessDomainId,
     identity: &FileIdentity,
     metadata: ArrowReaderMetadata,
 ) {
@@ -98,7 +102,12 @@ pub(crate) fn metadata_put(
             .checked_add(options().metadata_ttl)
             .unwrap_or_else(Instant::now),
     };
-    let _ = cache.insert(metadata_key(identity), Arc::new(value), 1, None);
+    let _ = cache.insert(
+        metadata_key(access_domain, identity),
+        Arc::new(value),
+        1,
+        None,
+    );
 }
 
 pub(crate) fn page_cache_enabled(request_cache_enabled: bool) -> bool {
@@ -109,12 +118,31 @@ fn options() -> &'static ParquetCacheOptions {
     PARQUET_CACHE_OPTIONS.get_or_init(ParquetCacheOptions::default)
 }
 
-fn metadata_key(identity: &FileIdentity) -> DataCachePageKey {
+fn metadata_key(access_domain: StorageAccessDomainId, identity: &FileIdentity) -> DataCachePageKey {
     let key = format!(
         "{}\0{}\0{}",
         identity.path(),
         identity.file_size(),
         identity.modification_time().unwrap_or_default()
     );
-    DataCachePageKey::new(PARQUET_METADATA_CACHE_NAMESPACE, key.into_bytes())
+    DataCachePageKey::new(
+        access_domain,
+        PARQUET_METADATA_CACHE_NAMESPACE,
+        key.into_bytes(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_key_is_scoped_before_physical_identity() {
+        let identity = FileIdentity::new("s3://bucket/data.parquet", 42, Some(7));
+        let first = metadata_key(StorageAccessDomainId::from_bytes([1; 32]), &identity);
+        let second = metadata_key(StorageAccessDomainId::from_bytes([2; 32]), &identity);
+        assert_ne!(first, second);
+        assert_eq!(first.namespace(), second.namespace());
+        assert_eq!(first.key(), second.key());
+    }
 }

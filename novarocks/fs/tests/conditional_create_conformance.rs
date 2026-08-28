@@ -20,7 +20,12 @@ use novarocks_fs::{
     ConditionalCreateOutcome, FileCancellation, FileErrorKind, FsAccessHandle, FsAccessResolver,
     FsLocation, FsScheme, ResolvedFsPath,
 };
+use novarocks_spi::connector::StorageAccessDomainId;
 use opendal::Operator;
+
+fn domain() -> StorageAccessDomainId {
+    StorageAccessDomainId::from_bytes([1; 32])
+}
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -34,7 +39,7 @@ fn local_create_is_atomic_and_preserves_original_payload() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("v1.metadata.json");
     let access = FsAccessResolver::new()
-        .resolve_location(path.to_string_lossy(), None)
+        .resolve_location(domain(), path.to_string_lossy(), None)
         .expect("resolve local file");
     let cancellation = FileCancellation::new();
     let runtime = runtime();
@@ -70,7 +75,7 @@ fn cancelled_create_has_no_side_effect() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("cancelled.metadata.json");
     let access = FsAccessResolver::new()
-        .resolve_location(path.to_string_lossy(), None)
+        .resolve_location(domain(), path.to_string_lossy(), None)
         .expect("resolve local file");
     let cancellation = FileCancellation::new();
     cancellation.cancel();
@@ -94,6 +99,7 @@ fn unsupported_backend_fails_before_write() {
     let location = FsLocation::parse("unsupported.metadata.json").expect("memory path");
     let path = ResolvedFsPath::new(location, "unsupported.metadata.json").expect("resolved path");
     let access = FsAccessHandle::new(
+        domain(),
         FsScheme::Local,
         operator.clone(),
         None,

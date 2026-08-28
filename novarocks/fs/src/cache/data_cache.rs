@@ -24,6 +24,7 @@ use super::{
     BlockCache, CacheDomain, CacheOptions, DataCacheIoOptions, ExternalDataCacheRangeOptions,
 };
 use bytes::Bytes;
+use novarocks_spi::connector::StorageAccessDomainId;
 
 pub trait DataCacheMetricsRecorder {
     fn record_cache_hit(&self, length: usize);
@@ -48,16 +49,26 @@ impl Default for DataCachePageCacheOptions {
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct DataCachePageKey {
+    access_domain: StorageAccessDomainId,
     namespace: String,
     key: Vec<u8>,
 }
 
 impl DataCachePageKey {
-    pub fn new(namespace: impl Into<String>, key: impl Into<Vec<u8>>) -> Self {
+    pub fn new(
+        access_domain: StorageAccessDomainId,
+        namespace: impl Into<String>,
+        key: impl Into<Vec<u8>>,
+    ) -> Self {
         Self {
+            access_domain,
             namespace: namespace.into(),
             key: key.into(),
         }
+    }
+
+    pub const fn access_domain(&self) -> StorageAccessDomainId {
+        self.access_domain
     }
 
     pub fn namespace(&self) -> &str {
@@ -410,10 +421,50 @@ mod tests {
             capacity: 16,
             evict_probability: 100,
         });
-        let key = DataCachePageKey::new("test", b"k1".to_vec());
+        let key = DataCachePageKey::new(
+            StorageAccessDomainId::from_bytes([1; 32]),
+            "test",
+            b"k1".to_vec(),
+        );
         let inserted = cache.insert_bytes(key.clone(), Bytes::from_static(b"hello"), 1, Some(100));
         assert!(inserted);
         let value = cache.lookup_bytes(&key).expect("lookup bytes");
         assert_eq!(value, Bytes::from_static(b"hello"));
+    }
+
+    #[test]
+    fn page_cache_hits_only_within_the_same_access_domain() {
+        let cache = DataCachePageCache::new(DataCachePageCacheOptions {
+            capacity: 16,
+            evict_probability: 100,
+        });
+        let physical_identity = b"s3://bucket/data.parquet\0size=42\0mtime=7".to_vec();
+        let first_domain = DataCachePageKey::new(
+            StorageAccessDomainId::from_bytes([1; 32]),
+            "physical-file-range",
+            physical_identity.clone(),
+        );
+        let same_domain = DataCachePageKey::new(
+            StorageAccessDomainId::from_bytes([1; 32]),
+            "physical-file-range",
+            physical_identity.clone(),
+        );
+        let other_domain = DataCachePageKey::new(
+            StorageAccessDomainId::from_bytes([2; 32]),
+            "physical-file-range",
+            physical_identity,
+        );
+
+        assert!(cache.insert_bytes(
+            first_domain,
+            Bytes::from_static(b"authorized-bytes"),
+            1,
+            Some(100),
+        ));
+        assert_eq!(
+            cache.lookup_bytes(&same_domain),
+            Some(Bytes::from_static(b"authorized-bytes"))
+        );
+        assert_eq!(cache.lookup_bytes(&other_domain), None);
     }
 }

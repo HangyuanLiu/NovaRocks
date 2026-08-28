@@ -209,6 +209,7 @@ impl BoundChunkReader {
             length
         );
         Some(DataCachePageKey::new(
+            self.file.access_domain(),
             "physical-file-range",
             key.into_bytes(),
         ))

@@ -25,6 +25,8 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use novarocks_spi::connector::StorageAccessDomainId;
+
 use crate::FileIdentity;
 
 const BLOCK_FILE_PREFIX: &str = "blockfile";
@@ -34,18 +36,19 @@ const DEFAULT_SLICE_SIZE: u64 = 64 * 1024;
 const DEFAULT_IO_ALIGN_UNIT_SIZE: u64 = 4096;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub struct CacheKey([u8; 12]);
+pub struct CacheKey([u8; 44]);
 
 impl CacheKey {
-    pub fn from_identity(identity: &FileIdentity) -> Self {
+    pub fn from_identity(access_domain: StorageAccessDomainId, identity: &FileIdentity) -> Self {
         let hash_value = hash64(identity.path().as_bytes(), 0);
-        let mut data = [0u8; 12];
-        data[..8].copy_from_slice(&hash_value.to_le_bytes());
-        data[8..12].copy_from_slice(&identity.starrocks_cache_tail().to_le_bytes());
+        let mut data = [0u8; 44];
+        data[..32].copy_from_slice(access_domain.as_bytes());
+        data[32..40].copy_from_slice(&hash_value.to_le_bytes());
+        data[40..44].copy_from_slice(&identity.starrocks_cache_tail().to_le_bytes());
         Self(data)
     }
 
-    fn as_bytes(&self) -> &[u8; 12] {
+    fn as_bytes(&self) -> &[u8; 44] {
         &self.0
     }
 }
@@ -1065,16 +1068,21 @@ pub fn get_block_cache() -> Option<Arc<BlockCache>> {
 #[cfg(test)]
 mod tests {
     use crate::FileIdentity;
+    use novarocks_spi::connector::StorageAccessDomainId;
 
     use super::CacheKey;
+
+    fn domain(value: u8) -> StorageAccessDomainId {
+        StorageAccessDomainId::from_bytes([value; 32])
+    }
 
     #[test]
     fn cache_key_distinguishes_positive_mtime() {
         let first = FileIdentity::new("a.parquet", 128, Some(1 << 9));
         let second = FileIdentity::new("a.parquet", 128, Some(2 << 9));
         assert_ne!(
-            CacheKey::from_identity(&first),
-            CacheKey::from_identity(&second)
+            CacheKey::from_identity(domain(1), &first),
+            CacheKey::from_identity(domain(1), &second)
         );
     }
 
@@ -1083,8 +1091,19 @@ mod tests {
         let none_mtime = FileIdentity::new("a.parquet", 128, None);
         let zero_mtime = FileIdentity::new("a.parquet", 128, Some(0));
         assert_eq!(
-            CacheKey::from_identity(&none_mtime),
-            CacheKey::from_identity(&zero_mtime)
+            CacheKey::from_identity(domain(1), &none_mtime),
+            CacheKey::from_identity(domain(1), &zero_mtime)
         );
+    }
+
+    #[test]
+    fn cache_key_places_access_domain_before_physical_identity() {
+        let identity = FileIdentity::new("s3://bucket/data.parquet", 42, Some(7));
+        let first = CacheKey::from_identity(domain(1), &identity);
+        let second = CacheKey::from_identity(domain(2), &identity);
+        assert_ne!(first, second);
+        assert_eq!(&first.as_bytes()[..32], domain(1).as_bytes());
+        assert_eq!(&second.as_bytes()[..32], domain(2).as_bytes());
+        assert_eq!(&first.as_bytes()[32..], &second.as_bytes()[32..]);
     }
 }

@@ -3361,6 +3361,7 @@ dependencies = [
  "crc32c",
  "libc",
  "novarocks-secret",
+ "novarocks-spi",
  "opendal",
  "orc-rust",
  "parquet",
