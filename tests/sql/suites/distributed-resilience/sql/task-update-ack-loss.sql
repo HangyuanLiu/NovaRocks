@@ -78,7 +78,7 @@ SELECT SUM(id) AS total FROM ${case_db}.task_update_ack_loss;
 -- @result_contains=45
 -- @be_log_contains=NOVAROCKS_TASK_UPDATE_TERMINAL_ACK_DROPPED
 -- @be_log_contains=NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED
--- @be_log_contains=duplicate=
+-- @be_log_contains=NOVAROCKS_TASK_SPLIT_ASSIGNMENT_DUPLICATE
 SELECT SUM(id) AS total FROM ${case_db}.task_update_ack_loss;
 
 -- query 13

@@ -637,6 +637,14 @@ pub(crate) trait QueryLifecycleLocalRuntime: Send + Sync + 'static {
     fn release_query_resources(&self, execution_id: QueryExecutionId);
 }
 
+/// Backend-local ingress state that remains useful until an attempt reaches
+/// its lifecycle tombstone. It is deliberately separate from execution
+/// resources: a late TaskUpdate must still be able to confirm an immutable
+/// split watermark after a fragment has finished.
+pub(crate) trait QueryLifecycleTerminalCleanup: Send + Sync + 'static {
+    fn cleanup_terminal_execution(&self, execution_id: QueryExecutionId);
+}
+
 pub(crate) trait MonotonicClock: Send + Sync + 'static {
     fn now(&self) -> Instant;
 }
@@ -868,6 +876,7 @@ pub(crate) struct QueryLifecycleRegistry {
     metrics: Arc<dyn QueryLifecycleMetricsSink>,
     stage_resources: Arc<Mutex<StageResourceLedger>>,
     terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
+    terminal_cleanup: Mutex<Option<Weak<dyn QueryLifecycleTerminalCleanup>>>,
     /// Test-only local fault claims exercise the same terminal delivery
     /// transitions as runner-bound faults without sharing process environment
     /// state between unit tests.
@@ -1252,6 +1261,7 @@ impl QueryLifecycleRegistry {
             metrics,
             stage_resources: Arc::new(Mutex::new(StageResourceLedger::default())),
             terminal_fallback,
+            terminal_cleanup: Mutex::new(None),
             #[cfg(test)]
             terminal_test_faults: Mutex::new(BTreeMap::new()),
             self_weak: self_weak.clone(),
@@ -1262,6 +1272,24 @@ impl QueryLifecycleRegistry {
 
     pub(crate) const fn local_process_id(&self) -> BackendProcessId {
         self.local_process_id
+    }
+
+    /// Install the backend-local cleanup owner after application composition
+    /// has created the fragment service. The registry holds only a weak link:
+    /// the service already owns this registry, so a strong link would form a
+    /// shutdown-retaining reference cycle.
+    pub(crate) fn install_terminal_cleanup(
+        &self,
+        cleanup: Weak<dyn QueryLifecycleTerminalCleanup>,
+    ) {
+        let mut installed = self
+            .terminal_cleanup
+            .lock()
+            .expect("query lifecycle terminal cleanup lock");
+        assert!(
+            installed.replace(cleanup).is_none(),
+            "query lifecycle terminal cleanup installed twice"
+        );
     }
 
     /// Reject new attempts after SIGTERM drain has begun. Existing attempts
@@ -3880,6 +3908,15 @@ impl QueryLifecycleRegistry {
             "backend query lifecycle terminated"
         );
         self.publish_metrics();
+        if let Some(cleanup) = self
+            .terminal_cleanup
+            .lock()
+            .expect("query lifecycle terminal cleanup lock")
+            .clone()
+            .and_then(|cleanup| cleanup.upgrade())
+        {
+            cleanup.cleanup_terminal_execution(execution_id);
+        }
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
                 "NOVAROCKS_QUERY_LIFECYCLE_CLEANUP execution_id={} process_id={} active=false tombstone=true reason={reason:?} {}",

@@ -592,6 +592,8 @@ impl SplitAssignmentDriver {
         request: &super::super::connector_domain::TaskUpdateRequest,
     ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
         let mut first_retryable_error = None;
+        let mut last_retryable_error = None;
+        let mut retryable_attempts = 0_u64;
         let mut backoff = self.retry_policy.initial_backoff;
         loop {
             if self.stop.is_stopped() || self.closed {
@@ -605,8 +607,15 @@ impl SplitAssignmentDriver {
                     .saturating_sub(started.elapsed())
             });
             if remaining.is_some_and(|remaining| remaining.is_zero()) {
-                return Err(TaskUpdateTransportError::retryable_network(
-                    "task update retry error duration exhausted",
+                let started = first_retryable_error.expect("retry budget has a first failure");
+                let last_error = last_retryable_error
+                    .as_ref()
+                    .expect("retry budget has a latest failure");
+                return Err(retry_budget_exhausted(
+                    target,
+                    retryable_attempts,
+                    started.elapsed(),
+                    last_error,
                 ));
             }
             let rpc_timeout = remaining
@@ -619,12 +628,19 @@ impl SplitAssignmentDriver {
                 Ok(outcome) => return Ok(outcome),
                 Err(error) if error.kind() == TaskUpdateTransportErrorKind::RetryableNetwork => {
                     let started = *first_retryable_error.get_or_insert_with(Instant::now);
+                    retryable_attempts = retryable_attempts.saturating_add(1);
+                    last_retryable_error = Some(error.clone());
                     let remaining = self
                         .retry_policy
                         .error_duration
                         .saturating_sub(started.elapsed());
                     if remaining.is_zero() {
-                        return Err(error);
+                        return Err(retry_budget_exhausted(
+                            target,
+                            retryable_attempts,
+                            started.elapsed(),
+                            &error,
+                        ));
                     }
                     let wait = backoff.min(remaining);
                     tracing::debug!(
@@ -635,6 +651,19 @@ impl SplitAssignmentDriver {
                         error_kind = "retryable_network",
                         "retrying task update after unknown outcome"
                     );
+                    if cfg!(debug_assertions)
+                        && std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER")
+                            .is_some()
+                    {
+                        eprintln!(
+                            "NOVAROCKS_TASK_UPDATE_RETRY backend={} finst={:x}:{:x} attempt={} elapsed_ms={}",
+                            target.backend_idx,
+                            request.fragment_instance_id().high(),
+                            request.fragment_instance_id().low(),
+                            retryable_attempts,
+                            started.elapsed().as_millis(),
+                        );
+                    }
                     if self.stop.wait_backoff(wait) {
                         return Err(TaskUpdateTransportError::closed(
                             "split assignment round stopped during task update retry",
@@ -646,6 +675,21 @@ impl SplitAssignmentDriver {
             }
         }
     }
+}
+
+fn retry_budget_exhausted(
+    target: &AssignmentTarget,
+    retryable_attempts: u64,
+    elapsed: Duration,
+    last_error: &TaskUpdateTransportError,
+) -> TaskUpdateTransportError {
+    TaskUpdateTransportError::retryable_network(format!(
+        "task update retry error duration exhausted backend={} attempts={} elapsed_ms={} last_error={}",
+        target.backend_idx,
+        retryable_attempts,
+        elapsed.as_millis(),
+        last_error.detail(),
+    ))
 }
 
 /// Validate that an Accepted acknowledgement covers exactly the immutable
@@ -683,7 +727,206 @@ fn validate_accepted_ack<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    use novarocks_types::{AttemptId, QueryId};
+
+    use crate::query_execution::connector_domain::TaskUpdateRequest;
+
     use super::*;
+
+    struct ScriptedTransport {
+        outcomes: Mutex<VecDeque<Result<TaskUpdateOutcome, TaskUpdateTransportError>>>,
+        requests: Mutex<Vec<usize>>,
+        stop_after_first_send: bool,
+    }
+
+    impl TaskUpdateTransport for ScriptedTransport {
+        fn send(
+            &self,
+            _execution_id: QueryExecutionId,
+            _target: &AssignmentTarget,
+            request: &TaskUpdateRequest,
+            _timeout: Duration,
+            stop: &SplitAssignmentStop,
+        ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
+            self.requests
+                .lock()
+                .expect("scripted transport requests")
+                .push(std::ptr::from_ref(request).addr());
+            if self.stop_after_first_send {
+                stop.stop();
+            }
+            self.outcomes
+                .lock()
+                .expect("scripted transport outcomes")
+                .pop_front()
+                .expect("scripted transport has an outcome")
+        }
+    }
+
+    fn target() -> AssignmentTarget {
+        AssignmentTarget {
+            backend_idx: 7,
+            fragment_instance_id: UniqueId::new(8, 9),
+        }
+    }
+
+    fn retry_policy(error_duration: Duration, initial_backoff: Duration) -> TaskUpdateRetryPolicy {
+        TaskUpdateRetryPolicy::try_new(
+            error_duration,
+            error_duration,
+            initial_backoff,
+            initial_backoff,
+        )
+        .expect("valid retry policy")
+    }
+
+    fn driver(
+        transport: Arc<dyn TaskUpdateTransport>,
+        retry_policy: TaskUpdateRetryPolicy,
+        stop: SplitAssignmentStop,
+    ) -> SplitAssignmentDriver {
+        let execution_id =
+            QueryExecutionId::new(QueryId::new(1, 2), AttemptId::new(1).expect("attempt id"))
+                .expect("execution id");
+        SplitAssignmentDriver::new(
+            execution_id,
+            transport,
+            BTreeMap::new(),
+            1,
+            BTreeMap::new(),
+            retry_policy,
+            stop,
+        )
+    }
+
+    #[test]
+    fn retryable_unknown_outcome_reuses_the_same_immutable_request() {
+        let transport = Arc::new(ScriptedTransport {
+            outcomes: Mutex::new(VecDeque::from([
+                Err(TaskUpdateTransportError::retryable_network("ack dropped")),
+                Ok(TaskUpdateOutcome::Accepted(Vec::new())),
+            ])),
+            requests: Mutex::new(Vec::new()),
+            stop_after_first_send: false,
+        });
+        let stop = SplitAssignmentStop::default();
+        let driver = driver(
+            Arc::clone(&transport) as Arc<dyn TaskUpdateTransport>,
+            retry_policy(Duration::from_millis(50), Duration::from_millis(1)),
+            stop,
+        );
+        let target = target();
+        let request = TaskUpdateRequest::new(target.fragment_instance_id, Vec::new());
+
+        assert!(matches!(
+            driver.send_until_confirmed(&target, &request),
+            Ok(TaskUpdateOutcome::Accepted(_))
+        ));
+        assert_eq!(
+            *transport
+                .requests
+                .lock()
+                .expect("scripted transport requests"),
+            vec![std::ptr::from_ref(&request).addr(); 2]
+        );
+    }
+
+    #[test]
+    fn fatal_transport_error_is_not_retried() {
+        let transport = Arc::new(ScriptedTransport {
+            outcomes: Mutex::new(VecDeque::from([Err(TaskUpdateTransportError::fatal(
+                "request encoding failed",
+            ))])),
+            requests: Mutex::new(Vec::new()),
+            stop_after_first_send: false,
+        });
+        let stop = SplitAssignmentStop::default();
+        let driver = driver(
+            Arc::clone(&transport) as Arc<dyn TaskUpdateTransport>,
+            retry_policy(Duration::from_millis(50), Duration::from_millis(1)),
+            stop,
+        );
+        let target = target();
+        let request = TaskUpdateRequest::new(target.fragment_instance_id, Vec::new());
+
+        let error = driver
+            .send_until_confirmed(&target, &request)
+            .expect_err("fatal transport failure must stop the send");
+        assert_eq!(error.kind(), TaskUpdateTransportErrorKind::Fatal);
+        assert_eq!(
+            transport
+                .requests
+                .lock()
+                .expect("scripted transport requests")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn exhausted_retry_budget_keeps_the_last_network_error_and_context() {
+        let transport = Arc::new(ScriptedTransport {
+            outcomes: Mutex::new(VecDeque::from([Err(
+                TaskUpdateTransportError::retryable_network("last response lost"),
+            )])),
+            requests: Mutex::new(Vec::new()),
+            stop_after_first_send: false,
+        });
+        let stop = SplitAssignmentStop::default();
+        let driver = driver(
+            Arc::clone(&transport) as Arc<dyn TaskUpdateTransport>,
+            retry_policy(Duration::from_millis(2), Duration::from_millis(2)),
+            stop,
+        );
+        let target = target();
+        let request = TaskUpdateRequest::new(target.fragment_instance_id, Vec::new());
+
+        let error = driver
+            .send_until_confirmed(&target, &request)
+            .expect_err("retry budget must eventually expire");
+        assert_eq!(error.kind(), TaskUpdateTransportErrorKind::RetryableNetwork);
+        assert!(error.detail().contains("backend=7"));
+        assert!(error.detail().contains("attempts=1"));
+        assert!(error.detail().contains("elapsed_ms="));
+        assert!(error.detail().contains("last response lost"));
+    }
+
+    #[test]
+    fn stop_interrupts_retry_backoff_without_waiting_for_the_budget() {
+        let transport = Arc::new(ScriptedTransport {
+            outcomes: Mutex::new(VecDeque::from([Err(
+                TaskUpdateTransportError::retryable_network("connection reset"),
+            )])),
+            requests: Mutex::new(Vec::new()),
+            stop_after_first_send: true,
+        });
+        let stop = SplitAssignmentStop::default();
+        let driver = driver(
+            Arc::clone(&transport) as Arc<dyn TaskUpdateTransport>,
+            retry_policy(Duration::from_secs(2), Duration::from_secs(1)),
+            stop,
+        );
+        let target = target();
+        let request = TaskUpdateRequest::new(target.fragment_instance_id, Vec::new());
+        let started = Instant::now();
+
+        let error = driver
+            .send_until_confirmed(&target, &request)
+            .expect_err("stop must interrupt retry backoff");
+        assert_eq!(error.kind(), TaskUpdateTransportErrorKind::Closed);
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn malformed_ack_shape_is_a_fatal_contract_error() {
+        let request = TaskUpdateRequest::new(UniqueId::new(8, 9), Vec::new());
+        let error = validate_accepted_ack(&request, &[])
+            .expect_err("an empty request may not accept a malformed empty acknowledgement");
+        assert!(error.contains("node count"));
+    }
 
     #[test]
     fn split_source_error_names_its_plan_node() {

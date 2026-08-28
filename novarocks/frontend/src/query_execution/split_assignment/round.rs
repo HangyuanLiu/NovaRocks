@@ -57,6 +57,10 @@ pub(crate) struct RoundSplitAssignment {
     driver: SplitAssignmentDriver,
     sources: Vec<RoundSplitSource>,
     stop: SplitAssignmentStop,
+    /// Closing owns source cleanup. It is deliberately independent from
+    /// `stop`: the coordinator signals stop before it joins the worker, and
+    /// that worker must still release every source after observing the signal.
+    closed: bool,
 }
 
 impl RoundSplitAssignment {
@@ -84,6 +88,7 @@ impl RoundSplitAssignment {
             ),
             sources,
             stop,
+            closed: false,
         }
     }
 
@@ -143,9 +148,10 @@ impl RoundSplitAssignment {
 
     /// Idempotent. Closes the driver and every source exactly once.
     pub(crate) fn close(&mut self) {
-        if self.stop.is_stopped() {
+        if self.closed {
             return;
         }
+        self.closed = true;
         self.stop.stop();
         self.driver.close();
         for entry in &mut self.sources {
@@ -187,7 +193,162 @@ pub(crate) type RoundSplitAssignmentStop = SplitAssignmentStop;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use novarocks_proto_codec::connector_read::{
+        CatalogTableHandle, ConnectorReadCodecError, ValidatedColumnHandle,
+        ValidatedConnectorSplit, ValidatedTransactionHandle,
+    };
+    use novarocks_spi::connector::ConnectorError;
+    use novarocks_spi::connector::read_stack::{
+        ConnectorReadDynamicFilterSnapshot, ConnectorReadSplit, ConnectorReadSplitSource,
+        ConnectorSplitBatch,
+    };
+    use novarocks_types::{AttemptId, QueryId};
+
+    use crate::query_execution::connector_domain::TaskUpdateRequest;
+    use crate::query_execution::split_assignment::{TaskUpdateOutcome, TaskUpdateTransportError};
+
     use super::*;
+
+    struct NeverSend;
+
+    impl TaskUpdateTransport for NeverSend {
+        fn send(
+            &self,
+            _execution_id: QueryExecutionId,
+            _target: &AssignmentTarget,
+            _request: &TaskUpdateRequest,
+            _timeout: std::time::Duration,
+            _stop: &SplitAssignmentStop,
+        ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
+            panic!("closing a round must not send a task update")
+        }
+    }
+
+    struct CloseCountingSource {
+        close_calls: Arc<AtomicUsize>,
+    }
+
+    impl ConnectorReadSplitSource for CloseCountingSource {
+        fn next_batch(
+            &mut self,
+            _max_size: usize,
+            _dynamic_filter: &ConnectorReadDynamicFilterSnapshot,
+        ) -> Result<ConnectorSplitBatch<ConnectorReadSplit>, ConnectorError> {
+            panic!("close lifecycle tests must not enumerate splits")
+        }
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+
+        fn close(&mut self) -> Result<(), ConnectorError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct InertCodec;
+
+    impl ConnectorReadCodec for InertCodec {
+        fn owner(&self) -> &str {
+            "round-close-test"
+        }
+
+        fn decode_relation(
+            &self,
+            _relation: &CatalogTableHandle,
+        ) -> Result<
+            novarocks_spi::connector::read_stack::ConnectorReadRelation,
+            ConnectorReadCodecError,
+        > {
+            unreachable!("close lifecycle tests must not decode relations")
+        }
+
+        fn encode_relation(
+            &self,
+            _relation: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
+        ) -> Result<
+            novarocks_proto_models::connector_read::CatalogTableHandle,
+            ConnectorReadCodecError,
+        > {
+            unreachable!("close lifecycle tests must not encode relations")
+        }
+
+        fn decode_column(
+            &self,
+            _column: &ValidatedColumnHandle,
+        ) -> Result<
+            novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+            ConnectorReadCodecError,
+        > {
+            unreachable!("close lifecycle tests must not decode columns")
+        }
+
+        fn encode_column(
+            &self,
+            _column: &novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+        ) -> Result<novarocks_proto_models::connector_read::ColumnHandle, ConnectorReadCodecError>
+        {
+            unreachable!("close lifecycle tests must not encode columns")
+        }
+
+        fn decode_transaction(
+            &self,
+            _transaction: &ValidatedTransactionHandle,
+        ) -> Result<
+            novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
+            ConnectorReadCodecError,
+        > {
+            unreachable!("close lifecycle tests must not decode transactions")
+        }
+
+        fn encode_transaction(
+            &self,
+            _transaction: &novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
+        ) -> Result<
+            novarocks_proto_models::connector_read::ConnectorTransactionHandle,
+            ConnectorReadCodecError,
+        > {
+            unreachable!("close lifecycle tests must not encode transactions")
+        }
+
+        fn decode_split(
+            &self,
+            _split: &ValidatedConnectorSplit,
+        ) -> Result<ConnectorReadSplit, ConnectorReadCodecError> {
+            unreachable!("close lifecycle tests must not decode splits")
+        }
+
+        fn encode_split(
+            &self,
+            _split: &ConnectorReadSplit,
+        ) -> Result<novarocks_proto_models::connector_read::ConnectorSplit, ConnectorReadCodecError>
+        {
+            unreachable!("close lifecycle tests must not encode splits")
+        }
+    }
+
+    fn assignment(close_calls: Arc<AtomicUsize>) -> RoundSplitAssignment {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(9, 9),
+            AttemptId::new(1).expect("attempt id must be valid"),
+        )
+        .expect("execution id must be valid");
+        RoundSplitAssignment::new(
+            execution_id,
+            Arc::new(NeverSend),
+            BTreeMap::new(),
+            1,
+            vec![RoundSplitSource {
+                plan_node_id: 7,
+                source: Box::new(CloseCountingSource { close_calls }),
+                codec: Arc::new(InertCodec),
+            }],
+            TaskUpdateRetryPolicy::default(),
+        )
+    }
 
     #[test]
     fn stop_handle_is_visible_to_the_pump() {
@@ -195,5 +356,27 @@ mod tests {
         assert!(!stop.is_stopped());
         stop.stop();
         assert!(stop.is_stopped());
+    }
+
+    #[test]
+    fn close_releases_sources_after_an_external_stop() {
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let mut assignment = assignment(Arc::clone(&close_calls));
+
+        assignment.stop_handle().stop();
+        assignment.close();
+
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn close_releases_each_source_only_once() {
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let mut assignment = assignment(Arc::clone(&close_calls));
+
+        assignment.close();
+        assignment.close();
+
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
     }
 }

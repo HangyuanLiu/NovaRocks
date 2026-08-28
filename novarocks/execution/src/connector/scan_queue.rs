@@ -243,6 +243,10 @@ impl SplitSequencePreflight {
 pub struct SplitQueueStats {
     pub queued_splits: usize,
     pub queued_bytes: u64,
+    /// Number of splits skipped because their sequence was at or below the
+    /// accepted watermark. This is observability only: it never retains or
+    /// compares split payloads.
+    pub duplicate_splits_skipped: u64,
     pub max_accepted_sequence: Option<u64>,
     pub no_more_splits: bool,
     pub closed: bool,
@@ -268,6 +272,7 @@ struct SplitQueueState<S> {
     pending: VecDeque<S>,
     max_accepted_sequence: Option<u64>,
     queued_bytes: u64,
+    duplicate_splits_skipped: u64,
     no_more_splits: bool,
     closed: bool,
 }
@@ -299,6 +304,7 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
                 pending: VecDeque::new(),
                 max_accepted_sequence: None,
                 queued_bytes: 0,
+                duplicate_splits_skipped: 0,
                 no_more_splits: false,
                 closed: false,
             }),
@@ -491,6 +497,9 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
                 SplitDecision::Duplicate => outcome.duplicate_sequences.push(sequence_id),
             }
         }
+        state.duplicate_splits_skipped = state
+            .duplicate_splits_skipped
+            .saturating_add(outcome.duplicate_sequences.len() as u64);
 
         // The terminal marker is idempotent: only the first transition wakes.
         let marked_terminal = no_more_splits && !state.no_more_splits;
@@ -576,11 +585,27 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
         state.closed
     }
 
+    /// Record duplicates classified by a role before provider decoding.
+    ///
+    /// `preflight_sequences` intentionally leaves queue state unchanged, so a
+    /// role calls this only after the matching offer has committed. Duplicates
+    /// discovered again during that commit are accounted for by
+    /// [`Self::offer_splits`].
+    pub fn record_preflight_duplicate_splits(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut state = self.state.lock().expect("split queue lock");
+        state.duplicate_splits_skipped =
+            state.duplicate_splits_skipped.saturating_add(count as u64);
+    }
+
     pub fn stats(&self) -> SplitQueueStats {
         let state = self.state.lock().expect("split queue lock");
         SplitQueueStats {
             queued_splits: state.pending.len(),
             queued_bytes: state.queued_bytes,
+            duplicate_splits_skipped: state.duplicate_splits_skipped,
             max_accepted_sequence: state.max_accepted_sequence,
             no_more_splits: state.no_more_splits,
             closed: state.closed,
@@ -793,6 +818,28 @@ impl<S: ScheduledSplitFacts> SplitQueueRegistry<S> {
         }
     }
 
+    /// Drop every queue owned by one query execution. The lifecycle owner uses
+    /// this only after the attempt reaches its bounded terminal tombstone, so
+    /// a late TaskUpdate can still confirm an already accepted watermark.
+    pub fn close_execution(&self, execution_id: QueryExecutionId) -> usize {
+        let attempts = {
+            let mut attempts = self.attempts.lock().expect("split queue registry lock");
+            let keys = attempts
+                .keys()
+                .filter(|key| key.execution_id() == execution_id)
+                .copied()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| attempts.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        let count = attempts.len();
+        for attempt in attempts {
+            attempt.close();
+        }
+        count
+    }
+
     pub fn len(&self) -> usize {
         let attempts = self.attempts.lock().expect("split queue registry lock");
         attempts.len()
@@ -939,6 +986,7 @@ mod tests {
         let after = queue.stats();
         assert_eq!(after.queued_splits, before.queued_splits);
         assert_eq!(after.queued_bytes, before.queued_bytes);
+        assert_eq!(after.duplicate_splits_skipped, 1);
     }
 
     #[test]
@@ -967,6 +1015,7 @@ mod tests {
         assert_eq!(duplicate.duplicate_sequences, vec![1, 2]);
         assert_eq!(duplicate.max_accepted_sequence, Some(2));
         assert_eq!(queue.stats().queued_splits, 2);
+        assert_eq!(queue.stats().duplicate_splits_skipped, 2);
     }
 
     #[test]
@@ -988,6 +1037,9 @@ mod tests {
         assert_eq!(preflight.duplicate_sequences(), &[1]);
         assert_eq!(preflight.new_sequences(), &[2]);
         assert_eq!(queue.stats().queued_splits, 1);
+        assert_eq!(queue.stats().duplicate_splits_skipped, 0);
+        queue.record_preflight_duplicate_splits(preflight.duplicate_sequences().len());
+        assert_eq!(queue.stats().duplicate_splits_skipped, 1);
     }
 
     #[test]
@@ -1225,6 +1277,24 @@ mod tests {
         assert!(!Arc::ptr_eq(&reopened, &first));
         assert!(!reopened.is_closed());
         assert_eq!(reopened.queue(NODE).stats(), SplitQueueStats::default());
+    }
+
+    #[test]
+    fn closing_an_execution_releases_all_of_its_attempts_only() {
+        let registry: SplitQueueRegistry<TestSplit> = SplitQueueRegistry::new();
+        let execution_id = attempt_key(1).execution_id();
+        let first = registry.open_attempt(attempt_key(1), SplitQueueConfig::default());
+        let sibling = registry.open_attempt(
+            TaskAttemptKey::new(execution_id, UniqueId::new(3, 5)),
+            SplitQueueConfig::default(),
+        );
+        let other = registry.open_attempt(attempt_key(2), SplitQueueConfig::default());
+
+        assert_eq!(registry.close_execution(execution_id), 2);
+        assert!(first.is_closed());
+        assert!(sibling.is_closed());
+        assert!(!other.is_closed());
+        assert_eq!(registry.len(), 1);
     }
 
     #[test]

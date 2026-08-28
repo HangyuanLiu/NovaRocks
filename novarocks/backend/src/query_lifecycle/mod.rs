@@ -29,7 +29,9 @@ pub(crate) use contract::{
 };
 pub(crate) use local_runtime::NativeQueryLifecycleLocalRuntime;
 pub use registry::QueryLifecycleRegistryConfig;
-pub(crate) use registry::{QueryLifecycleRegistry, StageBuildDecision};
+pub(crate) use registry::{
+    QueryLifecycleRegistry, QueryLifecycleTerminalCleanup, StageBuildDecision,
+};
 
 #[cfg(test)]
 mod tests;
