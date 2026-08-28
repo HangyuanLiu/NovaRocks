@@ -26,9 +26,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorRequestContext,
-    ConnectorTableHandle,
+    ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorMetadata, ConnectorRequestContext, ConnectorTableHandle,
 };
 
 pub const CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION: u16 = 2;
@@ -1282,14 +1282,15 @@ pub trait ConnectorCleanupMaintenanceResolver: Send + Sync {
     ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError>;
     fn acquire_exact_cleanup_maintenance(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError>;
 }
 
 #[derive(Clone)]
 pub struct ConnectorCleanupMaintenanceLease {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    control_runtime_id: ConnectorControlRuntimeId,
+    provider_binding_key: ConnectorExecutionBindingKey,
     metadata: Arc<dyn ConnectorMetadata>,
     cleanup: Arc<dyn ConnectorCleanupMaintenance>,
     _release: Arc<CleanupRelease>,
@@ -1301,15 +1302,19 @@ struct CleanupRelease {
 impl ConnectorCleanupMaintenanceLease {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
-        key: ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
+        provider_incarnation: ConnectorInstanceIncarnation,
         metadata: Arc<dyn ConnectorMetadata>,
         cleanup: Arc<dyn ConnectorCleanupMaintenance>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
-        if descriptor.instance_id != key.instance_id
-            || metadata.instance_id() != &descriptor.instance_id
+        let provider_binding_key = ConnectorExecutionBindingKey {
+            instance_id: descriptor.instance_id.clone(),
+            incarnation: provider_incarnation,
+        };
+        if metadata.instance_id() != &descriptor.instance_id
             || cleanup.descriptor() != &descriptor
-            || cleanup.binding_key() != &key
+            || cleanup.binding_key() != &provider_binding_key
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -1318,7 +1323,8 @@ impl ConnectorCleanupMaintenanceLease {
         }
         Ok(Self {
             descriptor,
-            key,
+            control_runtime_id,
+            provider_binding_key,
             metadata,
             cleanup,
             _release: Arc::new(CleanupRelease {
@@ -1329,18 +1335,52 @@ impl ConnectorCleanupMaintenanceLease {
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
-    pub fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-        &self.key
+    pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
+        self.control_runtime_id
     }
     pub fn metadata(&self) -> &Arc<dyn ConnectorMetadata> {
         &self.metadata
+    }
+    /// Builds a provider planning request behind the FE-owned control-runtime
+    /// lease. The provider's legacy binding fence stays private to this
+    /// capability boundary.
+    pub fn plan_operation(
+        &self,
+        operation_id: ConnectorCleanupOperationId,
+        operation: ConnectorCleanupOperation,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorCleanupPlan, ConnectorError> {
+        let request = ConnectorCleanupPlanningRequest::try_new(
+            operation_id,
+            self.provider_binding_key.clone(),
+            operation,
+            context,
+        )?;
+        self.plan_cleanup(request)
+    }
+    /// Builds the selected-owned-refs plan behind the same exact lease.
+    pub fn plan_selected_owned_refs(
+        &self,
+        operation_id: ConnectorCleanupOperationId,
+        operation: ConnectorCleanupOperation,
+        selection: ConnectorCleanupOwnedRefSelection,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorCleanupPlan, ConnectorError> {
+        let request = ConnectorCleanupPlanningRequest::try_new_selected_owned_refs(
+            operation_id,
+            self.provider_binding_key.clone(),
+            operation,
+            selection,
+            context,
+        )?;
+        self.plan_cleanup(request)
     }
     pub fn plan_cleanup(
         &self,
         request: ConnectorCleanupPlanningRequest,
     ) -> Result<ConnectorCleanupPlan, ConnectorError> {
         request.validate()?;
-        if request.owner != self.key {
+        if request.owner != self.provider_binding_key {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "cleanup request does not match lease",
@@ -1348,7 +1388,7 @@ impl ConnectorCleanupMaintenanceLease {
         }
         let plan = self.cleanup.plan_cleanup(request.clone())?;
         plan.validate()?;
-        if plan.owner != self.key
+        if plan.owner != self.provider_binding_key
             || plan.operation_id != request.operation_id
             || plan.request_digest != request.request_digest
         {
@@ -1392,7 +1432,7 @@ impl ConnectorCleanupMaintenanceLease {
         self.validate_plan(&request.plan)?;
         let page = self.cleanup.read_candidate_page(request.clone())?;
         page.validate()?;
-        if page.owner != self.key
+        if page.owner != self.provider_binding_key
             || page.operation_id != request.plan.operation_id
             || page.manifest_digest != request.plan.manifest_digest
             || page.offset != request.offset
@@ -1414,7 +1454,7 @@ impl ConnectorCleanupMaintenanceLease {
     }
     fn validate_plan(&self, plan: &ConnectorCleanupPlan) -> Result<(), ConnectorError> {
         plan.validate()?;
-        if plan.owner != self.key {
+        if plan.owner != self.provider_binding_key {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "cleanup plan does not match lease",
@@ -1430,7 +1470,7 @@ impl ConnectorCleanupMaintenanceLease {
     ) -> Result<(), ConnectorError> {
         receipt.validate()?;
         if receipt.descriptor != self.descriptor
-            || receipt.owner != self.key
+            || receipt.owner != self.provider_binding_key
             || receipt.operation_id != plan.operation_id
             || receipt.plan_digest != plan.plan_digest
             || receipt.manifest_digest != plan.manifest_digest

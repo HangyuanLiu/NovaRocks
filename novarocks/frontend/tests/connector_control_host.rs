@@ -851,12 +851,14 @@ fn cleanup_maintenance_lease_requires_the_capability_and_fences_retirement() {
         .expect("retire no-cleanup-maintenance generation");
     assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
 
-    host.register(binding_with_cleanup_maintenance(8))
+    let binding = binding_with_cleanup_maintenance(8);
+    let control_runtime_id = binding.control_runtime_id();
+    host.register(binding)
         .expect("register cleanup-maintenance generation");
     let lease = host
         .acquire_current_cleanup_maintenance(&instance_id)
         .expect("cleanup-maintenance lease");
-    assert_eq!(lease.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(lease.control_runtime_id(), control_runtime_id);
     assert_eq!(lease.metadata().instance_id(), &instance_id);
     host.retire_current(&instance_id)
         .expect("retire cleanup-maintenance generation");
@@ -866,15 +868,16 @@ fn cleanup_maintenance_lease_requires_the_capability_and_fences_retirement() {
 }
 
 #[test]
-fn exact_cleanup_maintenance_lease_never_uses_a_replacement_incarnation() {
+fn exact_cleanup_maintenance_lease_never_uses_a_replacement_runtime() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
     let old_key = ConnectorExecutionBindingKey {
         instance_id: instance_id.clone(),
         incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
     };
-    host.register(binding_with_cleanup_maintenance(7))
-        .expect("register old generation");
+    let old_binding = binding_with_cleanup_maintenance(7);
+    let old_control_runtime_id = old_binding.control_runtime_id();
+    host.register(old_binding).expect("register old generation");
     let planning = host.acquire_current(&instance_id).expect("planning lease");
     host.retire_current(&instance_id)
         .expect("retire old generation");
@@ -885,24 +888,27 @@ fn exact_cleanup_maintenance_lease_never_uses_a_replacement_incarnation() {
     };
     assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
 
-    host.register(binding_with_cleanup_maintenance(8))
+    let replacement_binding = binding_with_cleanup_maintenance(8);
+    let replacement_control_runtime_id = replacement_binding.control_runtime_id();
+    host.register(replacement_binding)
         .expect("register replacement generation");
     let replacement = host
         .acquire_current_cleanup_maintenance(&instance_id)
         .expect("replacement cleanup-maintenance lease");
-    assert_eq!(replacement.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(
+        replacement.control_runtime_id(),
+        replacement_control_runtime_id
+    );
 
     let exact_old = host
-        .acquire_exact_cleanup_maintenance(&old_key)
+        .acquire_exact_cleanup_maintenance(old_control_runtime_id)
         .expect("exact retiring generation lease");
-    assert_eq!(exact_old.binding_key(), &old_key);
+    assert_eq!(exact_old.control_runtime_id(), old_control_runtime_id);
 
-    let unknown_key = ConnectorExecutionBindingKey {
-        instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
-    };
-    let error = match host.acquire_exact_cleanup_maintenance(&unknown_key) {
-        Ok(_) => panic!("unknown incarnation must not use the replacement"),
+    let error = match host
+        .acquire_exact_cleanup_maintenance(ConnectorControlRuntimeId::from_bytes([9; 16]))
+    {
+        Ok(_) => panic!("unknown control runtime must not use the replacement"),
         Err(error) => error,
     };
     assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
@@ -914,7 +920,7 @@ fn exact_cleanup_maintenance_lease_never_uses_a_replacement_incarnation() {
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].key, old_key);
 
-    let error = match host.acquire_exact_cleanup_maintenance(&old_key) {
+    let error = match host.acquire_exact_cleanup_maintenance(old_control_runtime_id) {
         Ok(_) => panic!("retired generation must not be recreated"),
         Err(error) => error,
     };

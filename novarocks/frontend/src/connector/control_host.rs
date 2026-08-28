@@ -552,18 +552,26 @@ impl ConnectorControlHost {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
-        let legacy_key = {
+        let control_runtime_id = {
             let state = self.lock_state()?;
-            state.active_legacy_effect(instance_id)?
+            state.active.get(instance_id).copied().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
+                )
+            })?
         };
-        self.acquire_cleanup_maintenance(&legacy_key, true)
+        self.acquire_cleanup_maintenance(control_runtime_id, true)
     }
 
     fn acquire_exact_cleanup_maintenance(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
-        self.acquire_cleanup_maintenance(key, false)
+        self.acquire_cleanup_maintenance(control_runtime_id, false)
     }
 
     /// Acquires metadata and cleanup from one exact control generation. Cleanup
@@ -571,18 +579,20 @@ impl ConnectorControlHost {
     /// immutable prepared evidence; it never substitutes a current generation.
     fn acquire_cleanup_maintenance(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
         require_active: bool,
     ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
-        let (descriptor, metadata, cleanup, runtime_id) = {
+        let (descriptor, provider_incarnation, metadata, cleanup) = {
             let mut state = self.lock_state()?;
-            let runtime_id = state.runtime_for_legacy_effect(key)?;
-            let generation = state.generations.get_mut(&runtime_id).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "connector control generation is missing",
-                )
-            })?;
+            let generation = state
+                .generations
+                .get_mut(&control_runtime_id)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "connector control runtime is not registered",
+                    )
+                })?;
             if require_active && generation.state != ControlGenerationState::Active {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Unavailable,
@@ -603,21 +613,19 @@ impl ConnectorControlHost {
                 generation.cleanup_maintenance_leases.saturating_add(1);
             (
                 generation.binding.descriptor().clone(),
+                generation.binding.incarnation(),
                 Arc::clone(generation.binding.metadata()),
                 cleanup,
-                runtime_id,
             )
         };
         let state = Arc::downgrade(&self.state);
-        let lease_runtime_id = runtime_id;
         ConnectorCleanupMaintenanceLease::new(
             descriptor,
-            key.clone(),
+            control_runtime_id,
+            provider_incarnation,
             metadata,
             cleanup,
-            move || {
-                release_lease(&state, lease_runtime_id, LeaseKind::CleanupMaintenance);
-            },
+            move || release_lease(&state, control_runtime_id, LeaseKind::CleanupMaintenance),
         )
     }
 
@@ -984,9 +992,9 @@ impl ConnectorCleanupMaintenanceResolver for ConnectorControlHost {
 
     fn acquire_exact_cleanup_maintenance(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
-        Self::acquire_exact_cleanup_maintenance(self, key)
+        Self::acquire_exact_cleanup_maintenance(self, control_runtime_id)
     }
 }
 
