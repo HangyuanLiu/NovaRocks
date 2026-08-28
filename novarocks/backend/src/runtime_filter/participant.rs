@@ -24,7 +24,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::{
@@ -43,11 +43,12 @@ use sha2::{Digest, Sha256};
 
 use super::domain::{
     BackendChannelIdentity, BackendConsumerSubscriptionIdentity, BackendDeliveryAdmission,
-    BackendDeliveryRouteIdentity, BackendEnvelopeKind, BackendIngressDedupe, BackendIngressResult,
-    BackendMaterializedDelivery, BackendMaterializedDeliverySink, BackendParticipantInstall,
-    BackendProducerStreamIdentity, BackendRouteDecision, BackendRoutingError,
-    BackendRuntimeFilterEvent, BackendRuntimeFilterEventObserver, BackendRuntimeFilterSession,
-    BackendTransportEventIdentity, BackendTransportEventKind, BackendTransportFailOpenReason,
+    BackendDeliveryRouteIdentity, BackendEnvelopeKind, BackendFrontendFeedbackSink,
+    BackendIngressDedupe, BackendIngressResult, BackendMaterializedDelivery,
+    BackendMaterializedDeliverySink, BackendParticipantInstall, BackendProducerStreamIdentity,
+    BackendRouteDecision, BackendRoutingError, BackendRuntimeFilterEvent,
+    BackendRuntimeFilterEventObserver, BackendRuntimeFilterSession, BackendTransportEventIdentity,
+    BackendTransportEventKind, BackendTransportFailOpenReason,
 };
 use super::observation::{RuntimeFilterObservationEmitter, RuntimeFilterObservationSnapshot};
 use crate::BackendDataRuntime;
@@ -311,6 +312,10 @@ impl RuntimeFilterParticipant {
             | BackendEnvelopeKind::CompletedWithoutArtifact
             | BackendEnvelopeKind::DegradedLogical => self.dispatch_delivery_envelope(envelope),
         }
+    }
+
+    pub(crate) const fn local_participant_id(&self) -> u32 {
+        self.install.local_participant_id()
     }
 
     fn dispatch_delivery_envelope(
@@ -742,7 +747,19 @@ impl RuntimeFilterParticipant {
 
     pub(crate) fn close(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError> {
         self.cancelled.store(true, Ordering::Release);
+        for session in self.producer_sessions.values() {
+            session.clear_frontend_feedback_sink();
+        }
         (self.close_hook)(self, reason)
+    }
+
+    /// The attempt owner installs a weak egress only after control attachment.
+    /// A participant never owns that queue, so lifecycle retirement cannot form
+    /// a query-retention cycle through a background feedback publisher.
+    pub(crate) fn set_frontend_feedback_sink(&self, sink: Weak<dyn BackendFrontendFeedbackSink>) {
+        for session in self.producer_sessions.values() {
+            session.set_frontend_feedback_sink(sink.clone());
+        }
     }
 
     #[allow(

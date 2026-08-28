@@ -285,6 +285,10 @@ fn complete_profile(
         ),
         (CONNECTOR_FILE_COUNTER_NAMES, "ConnectorFileMetrics"),
         (TYPED_CONNECTOR_COUNTER_NAMES, "TypedConnectorMetrics"),
+        (
+            FRONTEND_SPLIT_ASSIGNMENT_COUNTER_NAMES,
+            "FrontendSplitAssignmentMetrics",
+        ),
     ] {
         if let Some(counters) =
             crate::query_execution::profile::format_counter_sums_from_profile_trees(
@@ -383,6 +387,12 @@ const TYPED_CONNECTOR_COUNTER_NAMES: &[&str] = &[
     "TypedConnectorPageSourcesOpened",
     "TypedConnectorSplitsRead",
 ];
+const FRONTEND_SPLIT_ASSIGNMENT_COUNTER_NAMES: &[&str] = &[
+    "ConnectorFilesConsidered",
+    "ConnectorWholeFilesPruned",
+    "ConnectorFilesExpanded",
+    "ConnectorSplitsEmitted",
+];
 
 fn format_distributed_profile_summary(
     summary: &crate::query_execution::profile::DistributedProfileSummary,
@@ -445,6 +455,19 @@ mod tests {
             [
                 "TypedConnectorPageSourcesOpened",
                 "TypedConnectorSplitsRead"
+            ]
+        );
+    }
+
+    #[test]
+    fn frontend_split_assignment_summary_includes_dynamic_file_pruning_counters() {
+        assert_eq!(
+            super::FRONTEND_SPLIT_ASSIGNMENT_COUNTER_NAMES,
+            [
+                "ConnectorFilesConsidered",
+                "ConnectorWholeFilesPruned",
+                "ConnectorFilesExpanded",
+                "ConnectorSplitsEmitted",
             ]
         );
     }

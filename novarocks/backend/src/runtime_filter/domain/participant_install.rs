@@ -51,6 +51,45 @@ pub(crate) enum BackendMaterializationOwner {
     Aggregator,
 }
 
+/// Sealed authority for one best-effort Frontend feedback publication.  This
+/// stays in the Backend install domain rather than retaining the protobuf
+/// carrier after native decoding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BackendFrontendFeedbackPublication {
+    publisher_owner: BackendMaterializationOwner,
+    contract_digest: [u8; 32],
+    max_encoded_domain_bytes: usize,
+}
+
+impl BackendFrontendFeedbackPublication {
+    pub(crate) fn new(
+        publisher_owner: BackendMaterializationOwner,
+        contract_digest: [u8; 32],
+        max_encoded_domain_bytes: usize,
+    ) -> Result<Self, BackendParticipantInstallError> {
+        if max_encoded_domain_bytes == 0 || max_encoded_domain_bytes > 64 * 1024 {
+            return Err(BackendParticipantInstallError::InvalidFeedbackPublication);
+        }
+        Ok(Self {
+            publisher_owner,
+            contract_digest,
+            max_encoded_domain_bytes,
+        })
+    }
+
+    pub(crate) const fn publisher_owner(&self) -> BackendMaterializationOwner {
+        self.publisher_owner
+    }
+
+    pub(crate) const fn contract_digest(&self) -> [u8; 32] {
+        self.contract_digest
+    }
+
+    pub(crate) const fn max_encoded_domain_bytes(&self) -> usize {
+        self.max_encoded_domain_bytes
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BackendMaterializationPolicy {
     bloom_bits_per_key: u32,
@@ -72,6 +111,7 @@ pub(crate) enum BackendParticipantInstallError {
     DuplicateConsumerRoute,
     EmptyExpectedInstances,
     EmptyConsumerRoutes,
+    InvalidFeedbackPublication,
 }
 
 impl fmt::Display for BackendParticipantInstallError {
@@ -316,6 +356,7 @@ pub(crate) struct BackendChannelInstall {
     consumers: BTreeMap<RuntimeFilterBindingId, BackendConsumerInstall>,
     outbound_materialization_groups:
         BTreeMap<ConsumerProfileId, BackendOutboundMaterializationGroup>,
+    frontend_feedback_publication: Option<BackendFrontendFeedbackPublication>,
 }
 
 impl BackendChannelInstall {
@@ -380,7 +421,29 @@ impl BackendChannelInstall {
             producers: producer_map,
             consumers: consumer_map,
             outbound_materialization_groups: groups,
+            frontend_feedback_publication: None,
         })
+    }
+
+    pub(crate) fn with_frontend_feedback_publication(
+        mut self,
+        publication: BackendFrontendFeedbackPublication,
+    ) -> Result<Self, BackendParticipantInstallError> {
+        let RuntimeFilterExecutionContract::Membership(schema) = &self.execution_contract else {
+            return Err(BackendParticipantInstallError::InvalidFeedbackPublication);
+        };
+        if self.lifecycle != BackendChannelLifecycle::CompleteOnce
+            || self.producers.is_empty()
+            || schema.digest() != publication.contract_digest()
+            || !self
+                .outbound_materialization_groups
+                .values()
+                .any(|group| group.owner() == publication.publisher_owner())
+        {
+            return Err(BackendParticipantInstallError::InvalidFeedbackPublication);
+        }
+        self.frontend_feedback_publication = Some(publication);
+        Ok(self)
     }
 
     pub(crate) const fn channel_id(&self) -> RuntimeFilterChannelId {
@@ -426,6 +489,11 @@ impl BackendChannelInstall {
     ) -> &BTreeMap<ConsumerProfileId, BackendOutboundMaterializationGroup> {
         &self.outbound_materialization_groups
     }
+    pub(crate) const fn frontend_feedback_publication(
+        &self,
+    ) -> Option<&BackendFrontendFeedbackPublication> {
+        self.frontend_feedback_publication.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -460,6 +528,7 @@ impl BackendParticipantInstall {
     pub(crate) const fn participant(&self) -> BackendParticipantIdentity {
         self.participant
     }
+
     pub(crate) const fn local_participant_id(&self) -> u32 {
         self.local_participant_id
     }

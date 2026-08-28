@@ -216,6 +216,9 @@ impl QueryControlEvent {
             Some(Event::FragmentObservation(observation)) => {
                 FragmentLiveObservation::parse(observation.clone())?;
             }
+            Some(Event::RuntimeFilterFeedback(feedback)) => {
+                RuntimeFilterFeedbackEvent::parse(feedback.clone())?;
+            }
             Some(Event::LocalFailure(_)) => {
                 return Err(invalid(
                     FieldPath::root("query_control_response")
@@ -235,6 +238,86 @@ impl QueryControlEvent {
     }
 
     pub const fn as_proto(&self) -> &novarocks::QueryControlResponse {
+        &self.raw
+    }
+}
+
+/// A structurally validated terminal runtime-filter feedback event. Semantic
+/// authorization against the frozen deployment remains FE application work.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuntimeFilterFeedbackEvent {
+    raw: novarocks::RuntimeFilterFeedbackEvent,
+}
+
+impl RuntimeFilterFeedbackEvent {
+    pub fn parse(raw: novarocks::RuntimeFilterFeedbackEvent) -> Result<Self, ProtocolError> {
+        use novarocks::runtime_filter_feedback_event::TerminalOutcome;
+
+        required_execution_id(&raw.execution_id, "query execution id is required")?;
+        manifest_digest(&raw.init_digest)?;
+        required_backend(&raw.backend, "feedback backend identity is required")?;
+        if raw.participant_id == 0 {
+            return Err(invalid(
+                FieldPath::root("runtime_filter_feedback_event").field("participant_id"),
+                "feedback participant id must be nonzero",
+            ));
+        }
+        if raw.deployment_epoch == 0 {
+            return Err(invalid(
+                FieldPath::root("runtime_filter_feedback_event").field("deployment_epoch"),
+                "feedback deployment epoch must be nonzero",
+            ));
+        }
+        if raw.channel_id == 0 {
+            return Err(invalid(
+                FieldPath::root("runtime_filter_feedback_event").field("channel_id"),
+                "feedback channel id must be nonzero",
+            ));
+        }
+        digest_array(
+            &raw.contract_digest,
+            "feedback contract digest must be 32 bytes",
+        )?;
+        match raw.terminal_outcome.as_ref() {
+            Some(TerminalOutcome::CanonicalDomain(domain))
+                if !domain.is_empty() && domain.len() <= 64 * 1024 => {}
+            Some(TerminalOutcome::UnavailableReason(reason))
+                if matches!(
+                    novarocks::RuntimeFilterFeedbackUnavailableReason::try_from(*reason),
+                    Ok(
+                        novarocks::RuntimeFilterFeedbackUnavailableReason::DomainBudget
+                            | novarocks::RuntimeFilterFeedbackUnavailableReason::TypeUnsupported
+                            | novarocks::RuntimeFilterFeedbackUnavailableReason::ReductionUnavailable
+                            | novarocks::RuntimeFilterFeedbackUnavailableReason::ProducerUnavailable
+                    )
+                ) => {}
+            Some(TerminalOutcome::CanonicalDomain(_)) => {
+                return Err(invalid(
+                    FieldPath::root("runtime_filter_feedback_event")
+                        .field("terminal_outcome")
+                        .field("canonical_domain"),
+                    "feedback domain must be nonempty and at most 65536 bytes",
+                ));
+            }
+            Some(TerminalOutcome::UnavailableReason(reason)) => {
+                return Err(invalid(
+                    FieldPath::root("runtime_filter_feedback_event")
+                        .field("terminal_outcome")
+                        .field("unavailable_reason"),
+                    format!("unknown runtime filter feedback unavailable reason {reason}"),
+                ));
+            }
+            None => {
+                return Err(missing(
+                    FieldPath::root("runtime_filter_feedback_event").field("terminal_outcome"),
+                    "feedback terminal outcome is required",
+                ));
+            }
+        }
+        Ok(Self { raw })
+    }
+
+    pub const fn as_proto(&self) -> &novarocks::RuntimeFilterFeedbackEvent {
         &self.raw
     }
 }
@@ -781,6 +864,56 @@ mod tests {
             error.detail(),
             "local failure code and detail must not be empty"
         );
+    }
+
+    #[test]
+    fn validates_terminal_runtime_filter_feedback_shape() {
+        let event = QueryControlEvent::parse(novarocks::QueryControlResponse {
+            event: Some(
+                novarocks::query_control_response::Event::RuntimeFilterFeedback(
+                    novarocks::RuntimeFilterFeedbackEvent {
+                        execution_id: Some(execution_id()),
+                        init_digest: manifest_digest(),
+                        backend: manifest().backend,
+                        participant_id: 1,
+                        deployment_epoch: 1,
+                        channel_id: 1,
+                        contract_digest: vec![9; 32],
+                        terminal_outcome: Some(
+                            novarocks::runtime_filter_feedback_event::TerminalOutcome::CanonicalDomain(
+                                b"NRFF\x01\x03".to_vec(),
+                            ),
+                        ),
+                    },
+                ),
+            ),
+        })
+        .expect("valid feedback event");
+        assert!(matches!(
+            event.as_proto().event,
+            Some(novarocks::query_control_response::Event::RuntimeFilterFeedback(_))
+        ));
+
+        let error = QueryControlEvent::parse(novarocks::QueryControlResponse {
+            event: Some(
+                novarocks::query_control_response::Event::RuntimeFilterFeedback(
+                    novarocks::RuntimeFilterFeedbackEvent {
+                        execution_id: Some(execution_id()),
+                        init_digest: manifest_digest(),
+                        backend: manifest().backend,
+                        participant_id: 1,
+                        deployment_epoch: 1,
+                        channel_id: 1,
+                        contract_digest: vec![9; 31],
+                        terminal_outcome: Some(
+                            novarocks::runtime_filter_feedback_event::TerminalOutcome::UnavailableReason(0),
+                        ),
+                    },
+                ),
+            ),
+        })
+        .expect_err("invalid feedback is rejected at the protocol boundary");
+        assert_eq!(error.detail(), "feedback contract digest must be 32 bytes");
     }
 
     #[test]

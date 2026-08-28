@@ -26,6 +26,7 @@ use crate::query_execution::outcome::FragmentProfileSet;
 use crate::query_execution::terminal_codec::decode_runtime_profile_tree;
 use novarocks_proto_codec::lifecycle::{QueryTerminalProfileContributionV1, QueryTerminalSnapshot};
 use novarocks_proto_models::novarocks;
+use novarocks_spi::connector::read_stack::SplitSourceProfile;
 
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
 const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
@@ -111,6 +112,23 @@ impl ProfileTerminalBuilder {
 
     pub fn finish(self) -> FragmentProfileSet {
         FragmentProfileSet::new(self.profiles)
+    }
+
+    pub(crate) fn apply_split_assignment_profile(&mut self, profile: SplitSourceProfile) {
+        if profile == SplitSourceProfile::default() {
+            return;
+        }
+        let node = RuntimeProfile::new("FrontendSplitAssignment".to_string());
+        let common = node.child(COMMON_METRICS);
+        for (name, value) in [
+            ("ConnectorFilesConsidered", profile.files_considered),
+            ("ConnectorWholeFilesPruned", profile.files_pruned),
+            ("ConnectorFilesExpanded", profile.files_expanded),
+            ("ConnectorSplitsEmitted", profile.splits_emitted),
+        ] {
+            common.counter_set(name, ProfileUnit::Unit, value.min(i64::MAX as u64) as i64);
+        }
+        self.profiles.push(node.to_native_tree());
     }
 }
 
@@ -1098,12 +1116,13 @@ mod tests {
         collect_actuals_by_plan_node_id, collect_actuals_by_plan_node_id_from_profile_trees,
         collect_actuals_by_plan_node_id_multi,
         collect_distributed_profile_summary_from_profile_trees,
-        collect_per_fragment_profile_summaries, merge_actual_metrics,
+        collect_per_fragment_profile_summaries, merge_actual_metrics, native_counter,
     };
     use crate::query_execution::contract::QueryId;
     use novarocks_execution::runtime::profile::{ProfileUnit, Profiler};
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
     use novarocks_proto_models::{common, novarocks};
+    use novarocks_spi::connector::read_stack::SplitSourceProfile;
 
     fn test_backend_process_id(participant_seed: u64) -> novarocks::BackendProcessId {
         let mut value = vec![
@@ -1280,6 +1299,31 @@ mod tests {
             .expect("empty contribution is valid");
 
         assert!(builder.finish().into_profiles().is_empty());
+    }
+
+    #[test]
+    fn profile_terminal_builder_adds_connector_split_assignment_facts() {
+        let mut builder = ProfileTerminalBuilder::new();
+        builder.apply_split_assignment_profile(SplitSourceProfile {
+            files_considered: 7,
+            files_pruned: 3,
+            files_expanded: 4,
+            splits_emitted: 11,
+        });
+
+        let profiles = builder.finish().into_profiles();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].root.name, "FrontendSplitAssignment");
+        let common = profiles[0]
+            .root
+            .children
+            .iter()
+            .find(|node| node.name == COMMON_METRICS)
+            .expect("common metrics");
+        assert_eq!(native_counter(common, "ConnectorFilesConsidered"), 7);
+        assert_eq!(native_counter(common, "ConnectorWholeFilesPruned"), 3);
+        assert_eq!(native_counter(common, "ConnectorFilesExpanded"), 4);
+        assert_eq!(native_counter(common, "ConnectorSplitsEmitted"), 11);
     }
 
     #[test]

@@ -29,6 +29,7 @@ use prost::Message;
 
 use super::stage::StartGate;
 use super::{QueryLifecycleError, QueryLifecycleErrorCode};
+use crate::runtime_filter::domain::BackendFrontendFeedbackSink;
 use crate::runtime_filter::participant::RuntimeFilterParticipant;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -136,6 +137,9 @@ pub(crate) struct QueryLifecycleEntryState {
     pub(crate) last_heartbeat: Option<Instant>,
     pub(crate) frontend_owner_epoch: Option<u64>,
     pub(crate) events: Option<tokio::sync::mpsc::Sender<QueryControlEvent>>,
+    /// Best-effort terminal runtime-filter feedback has its own bounded queue
+    /// and is retained only by the attached attempt, never by the participant.
+    pub(crate) frontend_feedback_sink: Option<Arc<dyn BackendFrontendFeedbackSink>>,
     /// Latest-only telemetry slot, intentionally independent from correctness
     /// delivery permits. `watch` replaces an unread observation without making
     /// a fragment producer wait for the control-stream consumer.
@@ -197,6 +201,7 @@ impl QueryLifecycleEntry {
                 last_heartbeat: None,
                 frontend_owner_epoch: None,
                 events: None,
+                frontend_feedback_sink: None,
                 observations: None,
                 observation_sequences: BTreeMap::new(),
                 local_drained_event_permit: None,

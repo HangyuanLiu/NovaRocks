@@ -41,6 +41,9 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(AcceptedAfterAckDrop),
         Box::new(CancelWithTerminalAckReplay),
+        Box::new(Ncp5FeedbackContractDigestCorrupt),
+        Box::new(Ncp5FeedbackUnavailable),
+        Box::new(Ncp5PartitionedFeedbackPruning),
     ]
 }
 
@@ -86,6 +89,42 @@ impl Scenario for CancelWithTerminalAckReplay {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         run_cancel_with_terminal_ack_replay(context)
+    }
+}
+
+struct Ncp5PartitionedFeedbackPruning;
+
+impl Scenario for Ncp5PartitionedFeedbackPruning {
+    fn name(&self) -> &'static str {
+        "runtime-filter/ncp-5-partitioned-feedback-pruning"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_ncp5_partitioned_feedback_pruning(context)
+    }
+}
+
+struct Ncp5FeedbackContractDigestCorrupt;
+
+impl Scenario for Ncp5FeedbackContractDigestCorrupt {
+    fn name(&self) -> &'static str {
+        "runtime-filter/ncp-5-feedback-contract-digest-corrupt"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_ncp5_feedback_contract_digest_corrupt(context)
+    }
+}
+
+struct Ncp5FeedbackUnavailable;
+
+impl Scenario for Ncp5FeedbackUnavailable {
+    fn name(&self) -> &'static str {
+        "runtime-filter/ncp-5-feedback-unavailable"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_ncp5_feedback_unavailable(context)
     }
 }
 
@@ -228,6 +267,129 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
     Ok(())
 }
 
+fn run_ncp5_partitioned_feedback_pruning(context: &mut ScenarioContext) -> Result<()> {
+    require_three_backends(context)?;
+    let mut control = connect_control(context, "connect NCP-5 profile control session")?;
+    let tables = create_ncp5_pruning_tables(context, &mut control)?;
+    configure_partitioned_runtime_filter(&mut control)?;
+    assert_partitioned_runtime_filter_plan(&mut control, &tables)?;
+    let query = runtime_filter_count_query(&tables);
+
+    control
+        .query_drop("SET enable_global_runtime_filter = false")
+        .context("disable Runtime Filter for NCP-5 baseline")?;
+    let disabled: Vec<i64> = control
+        .query(&query)
+        .context("execute NCP-5 Runtime Filter disabled baseline")?;
+
+    control
+        .query_drop("SET enable_global_runtime_filter = true")
+        .context("enable Runtime Filter for NCP-5 candidate")?;
+    let enabled: Vec<i64> = control
+        .query(&query)
+        .context("execute NCP-5 Runtime Filter candidate")?;
+    ensure!(
+        enabled == disabled && enabled == [1000],
+        "NCP-5 Runtime Filter changed query correctness: disabled={disabled:?}, enabled={enabled:?}"
+    );
+    context.action("proved Runtime Filter on/off row fingerprint equivalence");
+
+    // PARTITIONED coverage above is the aggregation/correctness gate. Its
+    // blocking wait graph may deliberately reject an FE source wait, so use
+    // the direct-source BROADCAST phase to prove the bounded-wait pruning
+    // optimization without weakening cycle safety.
+    configure_broadcast_runtime_filter(&mut control)?;
+    let profile: Vec<String> = control
+        .query(format!("EXPLAIN ANALYZE {query}"))
+        .context("collect NCP-5 broadcast feedback profile")?;
+    let profile = profile.join("\n");
+    assert_positive_profile_counter(&profile, "ConnectorFilesConsidered")?;
+    assert_positive_profile_counter(&profile, "ConnectorWholeFilesPruned")?;
+    assert_positive_profile_counter(&profile, "ConnectorFileRowGroupsPruned")?;
+    context.action(
+        "EXPLAIN ANALYZE proved broadcast FE feedback reached Iceberg whole-file dynamic pruning",
+    );
+    Ok(())
+}
+
+fn run_ncp5_feedback_contract_digest_corrupt(context: &mut ScenarioContext) -> Result<()> {
+    require_three_backends(context)?;
+    let mut control = connect_control(context, "connect NCP-5 corrupt-feedback control session")?;
+    let tables = create_ncp5_pruning_tables(context, &mut control)?;
+    configure_broadcast_runtime_filter(&mut control)?;
+    let baseline = resource_snapshot(context)?;
+    for backend_index in 0..REQUIRED_BACKENDS {
+        context
+            .handle()
+            .arm_query_lifecycle_fault(
+                backend_index,
+                "runtime-filter-feedback-contract-digest-corrupt",
+            )
+            .with_context(|| {
+                format!("arm feedback contract-digest corruption fault for BE[{backend_index}]")
+            })?;
+    }
+    context
+        .action("armed an active-attempt Runtime Filter feedback contract-digest corruption fault");
+
+    let error = control
+        .query::<String, _>(format!(
+            "EXPLAIN ANALYZE {}",
+            runtime_filter_count_query(&tables)
+        ))
+        .expect_err("active-attempt feedback contract corruption must fail the query closed");
+    context.action(format!(
+        "public MySQL query failed closed after invalid Runtime Filter feedback: {error}"
+    ));
+    context
+        .handle()
+        .clear_query_lifecycle_faults()
+        .context("clear feedback contract-digest corruption fault token")?;
+    let deadline = context.deadline();
+    context
+        .handle()
+        .await_query_execution_resource_convergence(&baseline, true, deadline)
+        .context("await resource convergence after fail-closed feedback rejection")?;
+    context.action("typed resource oracle confirmed fail-closed feedback cleanup converged");
+    Ok(())
+}
+
+fn run_ncp5_feedback_unavailable(context: &mut ScenarioContext) -> Result<()> {
+    require_three_backends(context)?;
+    let mut control = connect_control(
+        context,
+        "connect NCP-5 unavailable-feedback control session",
+    )?;
+    let tables = create_ncp5_pruning_tables(context, &mut control)?;
+    configure_broadcast_runtime_filter(&mut control)?;
+    for backend_index in 0..REQUIRED_BACKENDS {
+        context
+            .handle()
+            .arm_query_lifecycle_fault(backend_index, "runtime-filter-feedback-unavailable")
+            .with_context(|| format!("arm feedback unavailable fault for BE[{backend_index}]"))?;
+    }
+    let profile: Vec<String> = control
+        .query(format!(
+            "EXPLAIN ANALYZE {}",
+            runtime_filter_count_query(&tables)
+        ))
+        .context("typed unavailable feedback must remain query-correct")?;
+    let profile = profile.join("\n");
+    assert_positive_profile_counter(&profile, "ConnectorFilesConsidered")?;
+    ensure!(
+        profile.contains("ConnectorWholeFilesPruned=0"),
+        "typed unavailable must fail open for FE whole-file pruning; profile={profile}"
+    );
+    context
+        .handle()
+        .clear_query_lifecycle_faults()
+        .context("clear feedback unavailable fault tokens")?;
+    context.action(
+        "typed unavailable feedback preserved correctness and disabled FE whole-file pruning",
+    );
+    Ok(())
+}
+
 #[derive(Clone)]
 struct RuntimeFilterTables {
     catalog: String,
@@ -321,6 +483,83 @@ fn create_runtime_filter_tables(
     Ok(tables)
 }
 
+/// Write three disjoint `k` ranges as separate Iceberg commits. The build
+/// side exposes only `k = 3`, so a completed feedback domain can retain the
+/// first range and prove the other two whole files impossible from manifest
+/// statistics before they are expanded into splits.
+fn create_ncp5_pruning_tables(
+    context: &mut ScenarioContext,
+    control: &mut mysql::Conn,
+) -> Result<RuntimeFilterTables> {
+    let warehouse = context.runtime_dir().join("warehouses").join("ncp-5");
+    std::fs::create_dir_all(&warehouse)
+        .with_context(|| format!("create NCP-5 warehouse {}", warehouse.display()))?;
+    let tables = RuntimeFilterTables {
+        catalog: "rf_ncp5_catalog".to_string(),
+        database: "rf_ncp5_db".to_string(),
+        probe: "probe".to_string(),
+        build: "build".to_string(),
+    };
+    create_hadoop_catalog(control, &tables.catalog, &warehouse)?;
+    control
+        .query_drop(format!(
+            "CREATE DATABASE {}.{}",
+            tables.catalog, tables.database
+        ))
+        .context("create NCP-5 database")?;
+    control
+        .query_drop(format!(
+            "CREATE TABLE {}.{}.{} (id INT NOT NULL, k INT)",
+            tables.catalog, tables.database, tables.probe
+        ))
+        .context("create NCP-5 probe table")?;
+    control
+        .query_drop(format!(
+            "ALTER TABLE {}.{}.{} SET TBLPROPERTIES ('write.parquet.row-group-size-bytes'='1024')",
+            tables.catalog, tables.database, tables.probe
+        ))
+        .context("set NCP-5 probe row-group size")?;
+    control
+        .query_drop(format!(
+            "CREATE TABLE {}.{}.{} (k INT, flag VARCHAR(8))",
+            tables.catalog, tables.database, tables.build
+        ))
+        .context("create NCP-5 build table")?;
+    for range in 0..REQUIRED_BACKENDS {
+        let lower = range * 200;
+        control
+            .query_drop(format!(
+                "INSERT INTO {}.{}.{} SELECT {} + generate_series, {} + FLOOR((generate_series - 1) / 1000) FROM TABLE(generate_series(1, 200000))",
+                tables.catalog,
+                tables.database,
+                tables.probe,
+                range * 10_000,
+                lower,
+            ))
+            .with_context(|| format!("write NCP-5 probe range {range}"))?;
+    }
+    control
+        .query_drop(format!(
+            "INSERT INTO {}.{}.{} VALUES (3, 'Y'), (3, 'N'), (4, 'N')",
+            tables.catalog, tables.database, tables.build
+        ))
+        .context("write NCP-5 selective build rows")?;
+    control
+        .query_drop(format!(
+            "ANALYZE TABLE {}.{}.{}",
+            tables.catalog, tables.database, tables.probe
+        ))
+        .context("analyze NCP-5 probe table")?;
+    control
+        .query_drop(format!(
+            "ANALYZE TABLE {}.{}.{}",
+            tables.catalog, tables.database, tables.build
+        ))
+        .context("analyze NCP-5 build table")?;
+    context.action("created three disjoint Iceberg probe ranges for NCP-5 whole-file pruning");
+    Ok(tables)
+}
+
 fn create_hadoop_catalog(control: &mut mysql::Conn, catalog: &str, warehouse: &Path) -> Result<()> {
     let warehouse = warehouse.to_string_lossy().replace('"', "\\\"");
     control
@@ -387,6 +626,28 @@ fn assert_partitioned_runtime_filter_plan(
     ensure!(
         explain.contains("producer binding") && explain.contains("consumer binding"),
         "Runtime Filter candidate did not expose producer and consumer bindings: {explain}"
+    );
+    Ok(())
+}
+
+fn assert_positive_profile_counter(profile: &str, name: &str) -> Result<()> {
+    let marker = format!("{name}=");
+    let value = profile
+        .split(&marker)
+        .nth(1)
+        .and_then(|tail| {
+            tail.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u64>()
+                .ok()
+        })
+        .context(format!(
+            "NCP-5 profile is missing {marker}; profile={profile}"
+        ))?;
+    ensure!(
+        value > 0,
+        "NCP-5 profile counter {name} must be positive; profile={profile}"
     );
     Ok(())
 }

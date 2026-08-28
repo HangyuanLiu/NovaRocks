@@ -485,6 +485,43 @@ pub fn finalize_runtime_filter_facts(
             data_type: resolution.data_type.clone(),
             nullable: resolution.nullable,
         });
+        // Deployment compilation reads the graph-wide binding facts rather
+        // than the per-fragment wire table. Keep that second projection in
+        // lockstep with the pinned carrier resolution; otherwise the BE gets
+        // the binding while FE feedback declaration silently sees an
+        // unqualified source boundary and cannot wait or prune files.
+        let deployment_binding = draft
+            .deployment_bindings
+            .iter_mut()
+            .find(|binding| binding.binding_id == request.binding_id)
+            .ok_or_else(|| {
+                format!(
+                    "runtime filter deployment binding id={} disappeared from projected facts",
+                    request.binding_id
+                )
+            })?;
+        if deployment_binding.fragment_id != request.fragment_id
+            || deployment_binding.node_id != request.node_id
+        {
+            return Err(format!(
+                "runtime filter deployment binding id={} location drifted from its pinned scan-domain request",
+                request.binding_id
+            ));
+        }
+        let SqlRuntimeFilterBindingRoleFacts::Consumer {
+            target: SqlRuntimeFilterConsumerTarget::SourceBoundary { scan_domain },
+            ..
+        } = &mut deployment_binding.role
+        else {
+            return Err(format!(
+                "runtime filter deployment binding id={} has inconsistent source scan target",
+                request.binding_id
+            ));
+        };
+        *scan_domain = Some(SqlRuntimeFilterScanDomainTarget {
+            data_type: resolution.data_type.clone(),
+            nullable: resolution.nullable,
+        });
     }
     if resolutions.len() != draft.source_requests.len() {
         return Err(
@@ -1043,6 +1080,14 @@ mod tests {
             .unwrap();
         assert!(
             matches!(&consumer.role, SqlRuntimeFilterBindingRoleFacts::Consumer { target: SqlRuntimeFilterConsumerTarget::SourceBoundary { scan_domain: Some(target) }, .. } if target.data_type == DataType::Int64 && !target.nullable)
+        );
+        let deployment_consumer = facts
+            .deployment_bindings()
+            .iter()
+            .find(|binding| binding.binding_id == 3)
+            .expect("consumer deployment binding");
+        assert!(
+            matches!(&deployment_consumer.role, SqlRuntimeFilterBindingRoleFacts::Consumer { target: SqlRuntimeFilterConsumerTarget::SourceBoundary { scan_domain: Some(target) }, .. } if target.data_type == DataType::Int64 && !target.nullable)
         );
     }
 }

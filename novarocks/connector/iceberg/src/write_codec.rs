@@ -68,6 +68,8 @@ pub struct IcebergWriteHandleInput {
     pub partition_column_names: Vec<String>,
     pub transform_exprs: Vec<String>,
     pub data_input_schema: Option<IcebergSchemaDef>,
+    /// FE-validated Parquet write setting required by the BE DATA writer.
+    pub parquet_row_group_size_bytes: Option<u64>,
     pub position_delete_binding: Option<IcebergPositionDeleteBinding>,
     pub position_delete_partitions: Vec<IcebergPositionDeletePartitionInput>,
 }
@@ -105,6 +107,7 @@ pub struct IcebergDecodedWriteHandle {
     pub partition_column_names: Vec<String>,
     pub transform_exprs: Vec<String>,
     pub data_input_schema: Option<IcebergSchemaDef>,
+    pub parquet_row_group_size_bytes: Option<u64>,
     pub position_delete_binding: Option<IcebergPositionDeleteBinding>,
     pub position_delete_partitions: BTreeMap<String, IcebergPositionDeletePartition>,
 }
@@ -199,6 +202,8 @@ struct HandleV1 {
     transform_exprs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     data_input_schema: Option<Vec<SchemaFieldV1>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parquet_row_group_size_bytes: Option<u64>,
     position_delete_binding: Option<PositionDeleteBindingV1>,
     position_delete_partitions: Vec<PositionDeletePartitionV1>,
 }
@@ -347,6 +352,7 @@ pub fn encode_write_handle(input: &IcebergWriteHandleInput) -> Result<Bytes, Str
             .data_input_schema
             .as_ref()
             .map(|schema| schema.fields.iter().map(SchemaFieldV1::from).collect()),
+        parquet_row_group_size_bytes: input.parquet_row_group_size_bytes,
         position_delete_binding: input.position_delete_binding.as_ref().map(|binding| {
             PositionDeleteBindingV1 {
                 output_column_names: binding.output_column_names.clone(),
@@ -438,6 +444,7 @@ pub fn decode_write_handle(bytes: &[u8]) -> Result<IcebergDecodedWriteHandle, St
         data_input_schema: payload.data_input_schema.map(|fields| IcebergSchemaDef {
             fields: fields.iter().map(IcebergSchemaFieldDef::from).collect(),
         }),
+        parquet_row_group_size_bytes: payload.parquet_row_group_size_bytes,
         position_delete_binding: payload.position_delete_binding.map(|binding| {
             IcebergPositionDeleteBinding {
                 output_column_names: binding.output_column_names,
@@ -659,6 +666,7 @@ mod handle_tests {
             partition_column_names: Vec::new(),
             transform_exprs: Vec::new(),
             data_input_schema: None,
+            parquet_row_group_size_bytes: None,
             position_delete_binding: None,
             position_delete_partitions: Vec::new(),
         }
@@ -666,12 +674,15 @@ mod handle_tests {
 
     #[test]
     fn handle_is_canonical_and_round_trips() {
-        let first = encode_write_handle(&data_handle()).expect("encode first");
-        let second = encode_write_handle(&data_handle()).expect("encode second");
+        let mut input = data_handle();
+        input.parquet_row_group_size_bytes = Some(2_048);
+        let first = encode_write_handle(&input).expect("encode first");
+        let second = encode_write_handle(&input).expect("encode second");
         assert_eq!(first, second);
         let decoded = decode_write_handle(&first).expect("decode");
         assert_eq!(decoded.mode, IcebergWriteHandleMode::Data);
         assert_eq!(decoded.target_snapshot_id, Some(7));
+        assert_eq!(decoded.parquet_row_group_size_bytes, Some(2_048));
         assert!(decode_write_handle(br#"{\"version\":1}"#).is_err());
     }
 

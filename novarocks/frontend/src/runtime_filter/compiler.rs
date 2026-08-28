@@ -17,11 +17,16 @@ use crate::query_execution::{
     RuntimeFilterDeploymentLifecycleFacts, RuntimeFilterLateApplyGranularity,
 };
 use novarocks_proto_models::{common, filter, plan};
-use novarocks_types::UniqueId;
+use novarocks_types::{BackendProcessId, UniqueId};
 use sha2::{Digest, Sha256};
 
 use super::deployment::{RuntimeFilterWaitEdge, RuntimeFilterWaitGraph};
-use super::install_encoder::{EncodedRuntimeFilterDeployment, encode_install_contributions};
+use super::install_encoder::{
+    EncodedRuntimeFilterDeployment, FrontendRuntimeFilterFeedbackChannel,
+    FrontendRuntimeFilterFeedbackDeclaration, FrontendRuntimeFilterFeedbackPublisherOwner,
+    FrontendRuntimeFilterFeedbackPublisherSlot, FrontendRuntimeFilterFeedbackScanBinding,
+    FrontendRuntimeFilterFeedbackWaitEligibility, encode_install_contributions,
+};
 use super::model::{
     FrontendRuntimeFilterDeployment, FrontendRuntimeFilterDeploymentPolicy,
     FrontendRuntimeFilterLifecycle, FrontendRuntimeFilterParticipant, RuntimeFilterChannelPolicy,
@@ -94,7 +99,10 @@ pub(crate) fn compile_scheduled_runtime_filter_deployment(
     )
     .map_err(|error| compilation_error(error.to_string()))?;
     debug_assert!(deployment.is_empty());
-    encode_install_contributions(&deployment)
+    encode_install_contributions(
+        &deployment,
+        FrontendRuntimeFilterFeedbackDeclaration::default(),
+    )
 }
 
 #[derive(Clone)]
@@ -118,6 +126,12 @@ struct BindingSpec {
     node_id: i32,
     witness: Option<u32>,
     role: BindingRole,
+}
+
+#[derive(Clone)]
+struct ScanDomainBindingSpec {
+    data_type: arrow::datatypes::DataType,
+    nullable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -145,7 +159,20 @@ enum BindingRole {
     Consumer {
         capabilities: BTreeSet<Capability>,
         activation: plan::RuntimeFilterConsumerActivation,
+        scan_domain: Option<ScanDomainBindingSpec>,
     },
+}
+
+#[derive(Clone)]
+struct ParticipantTopology {
+    endpoint: String,
+    process_id: BackendProcessId,
+}
+
+struct FeedbackCompilation {
+    declaration: FrontendRuntimeFilterFeedbackDeclaration,
+    publications: BTreeMap<(u32, u32), filter::RuntimeFilterFrontendFeedbackPublication>,
+    wait_graph: RuntimeFilterWaitGraph,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -192,7 +219,7 @@ type Instances = BTreeMap<(u32, u32, u32), BTreeSet<UniqueId>>;
 /// Frontend-private, immutable deployment input copied from the sealed Core
 /// view before placement, routing and liveness compilation begins.
 struct DeploymentInput {
-    topology: BTreeMap<usize, String>,
+    topology: BTreeMap<usize, ParticipantTopology>,
     fragment_edges: Vec<FragmentEdgeSpec>,
     join_progress: BTreeMap<(u32, u32, u32), JoinProgressProof>,
     channels: BTreeMap<u32, ChannelSpec>,
@@ -280,8 +307,15 @@ fn compile_nonempty_deployment(
         &input.instances,
         input.topology.len(),
     )?;
-    let wait_graph =
-        build_wait_graph(&input.bindings, &input.fragment_edges, &input.join_progress)?;
+    let wait_edges =
+        build_wait_edges(&input.bindings, &input.fragment_edges, &input.join_progress)?;
+    let feedback = compile_feedback_declaration(
+        &input.channels,
+        &input.bindings,
+        &roles,
+        &input.topology,
+        wait_edges,
+    )?;
 
     let lifecycle_input = config.lifecycle.to_wire();
     let deployment_policy = FrontendRuntimeFilterDeploymentPolicy::derive(
@@ -304,6 +338,7 @@ fn compile_nonempty_deployment(
             &roles,
             &input.topology,
             deployment_policy,
+            &feedback.publications,
         )?;
         let participant =
             if install.core_channels.is_empty() && install.routing_channels.is_empty() {
@@ -321,20 +356,26 @@ fn compile_nonempty_deployment(
         deployment_policy.lifecycle,
         input.topology.keys().copied(),
         participants,
-        &wait_graph,
+        &feedback.wait_graph,
     )
     .map_err(|error| compilation_error(error.to_string()))?;
-    encode_install_contributions(&deployment)
+    encode_install_contributions(&deployment, feedback.declaration)
 }
 
 fn sealed_topology(
     view: RuntimeFilterScheduledView<'_>,
-) -> Result<BTreeMap<usize, String>, DistributedQueryError> {
+) -> Result<BTreeMap<usize, ParticipantTopology>, DistributedQueryError> {
     let mut topology = BTreeMap::new();
     for entry in view.clone().frozen_live_backends() {
-        let _process_id = entry.process_id();
+        let process_id = entry.process_id();
         if topology
-            .insert(entry.backend_idx(), entry.endpoint().to_string())
+            .insert(
+                entry.backend_idx(),
+                ParticipantTopology {
+                    endpoint: entry.endpoint().to_string(),
+                    process_id,
+                },
+            )
             .is_some()
         {
             return Err(compilation_error(format!(
@@ -425,7 +466,7 @@ fn materialize_channels(
 fn materialize_bindings(
     facts: RuntimeFilterDeploymentFactsView<'_>,
     channels: &BTreeMap<u32, ChannelSpec>,
-    topology: &BTreeMap<usize, String>,
+    topology: &BTreeMap<usize, ParticipantTopology>,
 ) -> Result<(BTreeMap<u32, BindingSpec>, Instances), DistributedQueryError> {
     let mut placements: BTreeMap<u32, Vec<(usize, UniqueId)>> = BTreeMap::new();
     for placement in facts.placements() {
@@ -487,7 +528,7 @@ fn materialize_bindings(
             RuntimeFilterDeploymentBindingRoleFacts::Consumer {
                 capabilities,
                 activation,
-                ..
+                target,
             } => {
                 if fact.coverage_witness_id().is_some() {
                     return Err(compilation_error(format!(
@@ -497,6 +538,20 @@ fn materialize_bindings(
                 BindingRole::Consumer {
                     capabilities: unique_capabilities(capabilities)?,
                     activation: activation_wire(activation),
+                    scan_domain: match target {
+                        crate::query_execution::RuntimeFilterConsumerTarget::SourceBoundary {
+                            scan_domain_target: Some(target),
+                        } => Some(ScanDomainBindingSpec {
+                            data_type: target.data_type,
+                            nullable: target.nullable,
+                        }),
+                        crate::query_execution::RuntimeFilterConsumerTarget::SourceBoundary {
+                            scan_domain_target: None,
+                        }
+                        | crate::query_execution::RuntimeFilterConsumerTarget::DirectInputOrdinal(
+                            _,
+                        ) => None,
+                    },
                 }
             }
         };
@@ -728,14 +783,263 @@ fn build_roles(
     Ok(all)
 }
 
+/// Project the sealed deployment into one immutable FE declaration and the
+/// matching participant-local publication fields.  This is intentionally one
+/// compilation step so later admission cannot authorize a publisher the BE
+/// install did not receive.
+fn compile_feedback_declaration(
+    channels: &BTreeMap<u32, ChannelSpec>,
+    bindings: &BTreeMap<u32, BindingSpec>,
+    roles: &BTreeMap<u32, RoleChannel>,
+    topology: &BTreeMap<usize, ParticipantTopology>,
+    base_wait_edges: Vec<RuntimeFilterWaitEdge>,
+) -> Result<FeedbackCompilation, DistributedQueryError> {
+    let base_wait_graph = RuntimeFilterWaitGraph::new(base_wait_edges.clone());
+    base_wait_graph
+        .validate()
+        .map_err(|error| compilation_error(error.to_string()))?;
+
+    let mut accepted_wait_edges = base_wait_edges;
+    let mut declarations = Vec::new();
+    let mut publications = BTreeMap::new();
+    for (&channel_id, channel) in channels {
+        let Some(contract_digest) = membership_feedback_contract_digest(channel)? else {
+            continue;
+        };
+        if channel.lifecycle != filter::RuntimeFilterLifecycle::CompleteOnce as i32 {
+            continue;
+        }
+        let Some((owner, participants)) = feedback_publishers(channel, roles.get(&channel_id))?
+        else {
+            continue;
+        };
+        let scan_bindings = bindings
+            .values()
+            .filter(|binding| binding.channel_id == channel_id)
+            .filter_map(|binding| match &binding.role {
+                BindingRole::Consumer {
+                    scan_domain: Some(scan_domain),
+                    ..
+                } => Some(FrontendRuntimeFilterFeedbackScanBinding {
+                    fragment_id: binding.fragment_id,
+                    plan_node_id: binding.node_id,
+                    binding_id: binding.binding_id,
+                    data_type: scan_domain.data_type.clone(),
+                    nullable: scan_domain.nullable,
+                }),
+                BindingRole::Consumer {
+                    scan_domain: None, ..
+                }
+                | BindingRole::Producer { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if scan_bindings.is_empty()
+            || scan_bindings
+                .iter()
+                .any(|binding| !feedback_value_type_supported(&binding.data_type))
+        {
+            continue;
+        }
+
+        let max_encoded_domain_bytes = channel.policy.max_contribution_bytes.min(64 * 1024);
+        if max_encoded_domain_bytes == 0 {
+            return Err(compilation_error(format!(
+                "runtime filter channel {channel_id} feedback domain budget is zero"
+            )));
+        }
+
+        let mut publisher_slots = Vec::new();
+        for participant_id in participants {
+            let backend_idx = usize::try_from(participant_id - 1).map_err(|_| {
+                compilation_error("runtime filter feedback publisher cannot map to a backend")
+            })?;
+            let backend = topology.get(&backend_idx).ok_or_else(|| {
+                compilation_error(format!(
+                    "runtime filter feedback publisher references non-live participant {participant_id}"
+                ))
+            })?;
+            publisher_slots.push(FrontendRuntimeFilterFeedbackPublisherSlot {
+                participant_id,
+                backend_process_id: backend.process_id,
+                owner,
+            });
+            let publisher_owner = match owner {
+                FrontendRuntimeFilterFeedbackPublisherOwner::DirectSource => {
+                    filter::RuntimeFilterOutboundMaterializationOwner::DirectSource as i32
+                }
+                FrontendRuntimeFilterFeedbackPublisherOwner::Aggregator => {
+                    filter::RuntimeFilterOutboundMaterializationOwner::Aggregator as i32
+                }
+            };
+            if publications
+                .insert(
+                    (participant_id, channel_id),
+                    filter::RuntimeFilterFrontendFeedbackPublication {
+                        publisher_owner,
+                        contract_digest: contract_digest.to_vec(),
+                        max_encoded_domain_bytes,
+                    },
+                )
+                .is_some()
+            {
+                return Err(compilation_error(format!(
+                    "runtime filter channel {channel_id} repeats feedback publisher {participant_id}"
+                )));
+            }
+        }
+
+        let mut candidate_edges = Vec::new();
+        for scan in &scan_bindings {
+            for producer in bindings.values().filter(|binding| {
+                binding.channel_id == channel_id
+                    && matches!(binding.role, BindingRole::Producer { .. })
+            }) {
+                // A split round pumps typed sources independently.  When a
+                // producer and its probe scan share a fragment, withholding
+                // that one probe source still leaves the build-side source
+                // runnable; treating the fragment-local relationship as a
+                // graph self-edge would reject a safe bounded wait and force
+                // every file to expand before direct-source feedback arrives.
+                // Cross-fragment edges remain subject to the existing full
+                // cycle validation below.
+                if producer.fragment_id == scan.fragment_id {
+                    continue;
+                }
+                candidate_edges.push((
+                    (scan.fragment_id, scan.plan_node_id, channel_id),
+                    RuntimeFilterWaitEdge::new(producer.fragment_id, scan.fragment_id, true),
+                ));
+            }
+        }
+        candidate_edges.sort_by_key(|(key, _)| *key);
+        let mut proposed_edges = accepted_wait_edges.clone();
+        proposed_edges.extend(candidate_edges.into_iter().map(|(_, edge)| edge));
+        let wait_eligibility = match RuntimeFilterWaitGraph::new(proposed_edges.clone()).validate() {
+            Ok(()) => {
+                accepted_wait_edges = proposed_edges;
+                FrontendRuntimeFilterFeedbackWaitEligibility::Eligible
+            }
+            Err(crate::runtime_filter::deployment::RuntimeFilterLivenessError::BlockingFeedbackCycle { witness }) => {
+                FrontendRuntimeFilterFeedbackWaitEligibility::IneligibleCycle { witness }
+            }
+        };
+        declarations.push(FrontendRuntimeFilterFeedbackChannel {
+            channel_id,
+            contract_digest,
+            max_encoded_domain_bytes,
+            publishers: publisher_slots,
+            scan_bindings,
+            wait_eligibility,
+        });
+    }
+    Ok(FeedbackCompilation {
+        declaration: FrontendRuntimeFilterFeedbackDeclaration::new(declarations)?,
+        publications,
+        wait_graph: RuntimeFilterWaitGraph::new(accepted_wait_edges),
+    })
+}
+
+fn membership_feedback_contract_digest(
+    channel: &ChannelSpec,
+) -> Result<Option<[u8; 32]>, DistributedQueryError> {
+    let Some(plan::runtime_filter_contract::Kind::Membership(contract)) = channel
+        .logical_domain
+        .contract
+        .as_ref()
+        .and_then(|contract| contract.kind.as_ref())
+    else {
+        return Ok(None);
+    };
+    contract
+        .schema_digest
+        .clone()
+        .try_into()
+        .map(Some)
+        .map_err(|_| {
+            compilation_error(format!(
+                "runtime filter channel {} membership schema digest must be 32 bytes",
+                channel.channel_id
+            ))
+        })
+}
+
+fn feedback_publishers(
+    channel: &ChannelSpec,
+    role: Option<&RoleChannel>,
+) -> Result<Option<(FrontendRuntimeFilterFeedbackPublisherOwner, Vec<u32>)>, DistributedQueryError>
+{
+    let Some(role) = role else {
+        return Ok(None);
+    };
+    match channel.terminal_coverage.kind.as_ref() {
+        Some(filter::runtime_filter_coverage::Kind::AllOf(_)) => {
+            let Some(aggregator) = role.aggregator else {
+                return Ok(None);
+            };
+            if !role.routes.iter().any(|route| {
+                route.from_participant == aggregator
+                    && matches!(route.kind, RouteKind::FromAggregator)
+            }) {
+                return Ok(None);
+            }
+            Ok(Some((
+                FrontendRuntimeFilterFeedbackPublisherOwner::Aggregator,
+                vec![aggregator],
+            )))
+        }
+        Some(filter::runtime_filter_coverage::Kind::AnyOf(_)) => {
+            if role.aggregator.is_some() {
+                return Ok(None);
+            }
+            let publishers = role
+                .routes
+                .iter()
+                .filter(|route| matches!(route.kind, RouteKind::Direct))
+                .map(|route| route.from_participant)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if publishers.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some((
+                FrontendRuntimeFilterFeedbackPublisherOwner::DirectSource,
+                publishers,
+            )))
+        }
+        Some(filter::runtime_filter_coverage::Kind::LeafWitnessId(_)) | None => Ok(None),
+    }
+}
+
+fn feedback_value_type_supported(value: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType;
+
+    matches!(
+        value,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Date32
+            | DataType::Decimal128(_, _)
+            | DataType::FixedSizeBinary(_)
+            | DataType::Timestamp(_, _)
+    )
+}
+
 fn participant_install(
     participant: u32,
     channels: &BTreeMap<u32, ChannelSpec>,
     bindings: &BTreeMap<u32, BindingSpec>,
     instances: &Instances,
     roles: &BTreeMap<u32, RoleChannel>,
-    topology: &BTreeMap<usize, String>,
+    topology: &BTreeMap<usize, ParticipantTopology>,
     deployment_policy: FrontendRuntimeFilterDeploymentPolicy,
+    publications: &BTreeMap<(u32, u32), filter::RuntimeFilterFrontendFeedbackPublication>,
 ) -> Result<filter::RuntimeFilterParticipantInstall, DistributedQueryError> {
     let mut core_channels = Vec::new();
     let mut routing_channels = Vec::new();
@@ -762,6 +1066,7 @@ fn participant_install(
                 instances,
                 role,
                 deployment_policy,
+                publications.get(&(participant, channel_id)),
             )?);
         }
         if !local_producers.is_empty() || !local_consumers.is_empty() || has_aggregator {
@@ -787,6 +1092,7 @@ fn core_channel(
     instances: &Instances,
     role: &RoleChannel,
     policy: FrontendRuntimeFilterDeploymentPolicy,
+    frontend_feedback_publication: Option<&filter::RuntimeFilterFrontendFeedbackPublication>,
 ) -> Result<filter::RuntimeFilterChannelDeployment, DistributedQueryError> {
     let mut producer_ids = role
         .producers
@@ -851,6 +1157,7 @@ fn core_channel(
         let BindingRole::Consumer {
             capabilities,
             activation,
+            ..
         } = &binding.role
         else {
             return Err(compilation_error(
@@ -988,6 +1295,7 @@ fn core_channel(
                 }
             })
             .collect(),
+        frontend_feedback_publication: frontend_feedback_publication.cloned(),
     })
 }
 
@@ -996,7 +1304,7 @@ fn routing_channel(
     channel_id: u32,
     instances: &Instances,
     role: &RoleChannel,
-    topology: &BTreeMap<usize, String>,
+    topology: &BTreeMap<usize, ParticipantTopology>,
 ) -> Result<filter::RuntimeFilterChannelRoutingView, DistributedQueryError> {
     let mut local_roles = BTreeSet::new();
     local_roles.extend(
@@ -1071,7 +1379,7 @@ fn routing_channel(
 fn routing_edge(
     route: &Route,
     outbound: bool,
-    topology: &BTreeMap<usize, String>,
+    topology: &BTreeMap<usize, ParticipantTopology>,
 ) -> Result<filter::RuntimeFilterRoutingEdgeView, DistributedQueryError> {
     let (source_role, target_role, allowed_kinds) = match route.kind {
         RouteKind::Direct => (
@@ -1117,7 +1425,7 @@ fn routing_edge(
             peer: Some(filter::runtime_filter_route_peer::Peer::Remote(
                 filter::RuntimeFilterRemotePeer {
                     participant_id: remote,
-                    endpoint: endpoint.clone(),
+                    endpoint: endpoint.endpoint.clone(),
                 },
             )),
         }
@@ -1131,11 +1439,11 @@ fn routing_edge(
     })
 }
 
-fn build_wait_graph(
+fn build_wait_edges(
     bindings: &BTreeMap<u32, BindingSpec>,
     fragment_edges: &[FragmentEdgeSpec],
     join_progress: &BTreeMap<(u32, u32, u32), JoinProgressProof>,
-) -> Result<RuntimeFilterWaitGraph, DistributedQueryError> {
+) -> Result<Vec<RuntimeFilterWaitEdge>, DistributedQueryError> {
     let dependencies = fragment_dependencies(fragment_edges)?;
     let mut edges = fragment_edges
         .iter()
@@ -1259,7 +1567,15 @@ fn build_wait_graph(
             }
         }
     }
-    Ok(RuntimeFilterWaitGraph::new(edges))
+    Ok(edges)
+}
+
+fn build_wait_graph(
+    bindings: &BTreeMap<u32, BindingSpec>,
+    fragment_edges: &[FragmentEdgeSpec],
+    join_progress: &BTreeMap<(u32, u32, u32), JoinProgressProof>,
+) -> Result<RuntimeFilterWaitGraph, DistributedQueryError> {
+    build_wait_edges(bindings, fragment_edges, join_progress).map(RuntimeFilterWaitGraph::new)
 }
 
 fn fragment_dependencies(
@@ -1707,6 +2023,7 @@ mod tests {
             role: BindingRole::Consumer {
                 capabilities: BTreeSet::from([Capability::Membership]),
                 activation: plan::RuntimeFilterConsumerActivation { kind: Some(kind) },
+                scan_domain: None,
             },
         }
     }

@@ -210,6 +210,15 @@ message RuntimeFilterOutboundMaterializationGroup {
   repeated uint32 route_edge_ids = 3;
 }
 
+// A sealed participant may publish one terminal, logical membership outcome
+// back to the owning Frontend. This is deliberately separate from physical
+// artifact materialization: the Frontend never receives bloom/filter bytes.
+message RuntimeFilterFrontendFeedbackPublication {
+  RuntimeFilterOutboundMaterializationOwner publisher_owner = 1;
+  bytes contract_digest = 2;
+  uint64 max_encoded_domain_bytes = 3;
+}
+
 // The TypeDesc supplies the expression/value type required by the shared plan
 // contract decoder; the contract remains the canonical typed logical-domain
 // authority and cross-checks this type.
@@ -233,6 +242,7 @@ message RuntimeFilterChannelDeployment {
   repeated RuntimeFilterProducerDeployment producers = 12;
   repeated RuntimeFilterConsumerDeployment consumers = 13;
   repeated RuntimeFilterOutboundMaterializationGroup outbound_materialization_groups = 14;
+  RuntimeFilterFrontendFeedbackPublication frontend_feedback_publication = 15;
 }
 
 message RuntimeFilterRouteRole {

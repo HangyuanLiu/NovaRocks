@@ -49,8 +49,9 @@ use novarocks_spi::connector::read_stack::adapter::{
 use novarocks_spi::connector::read_stack::{
     Assignment, Bound, ConnectorExpression, ConnectorReadChangeWindow,
     ConnectorReadRelationVersion, ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource,
-    ConnectorTableHandle as _, ConnectorValue, Constraint, Domain, DynamicFilterSnapshot,
-    OrderedAssignments, SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
+    ConnectorTableHandle as _, ConnectorValue, ConnectorValueType, Constraint, Domain,
+    DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName, SplitWeight,
+    SystemTableDistribution, TupleDomain, ValueSet,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
@@ -60,8 +61,8 @@ use novarocks_spi::connector::{
 use crate::file_pruning::file_may_satisfy_physical_predicates;
 use crate::iceberg::spec::{
     DataContentType, DataFileFormat, Datum, FormatVersion, Literal, ManifestFile, ManifestStatus,
-    NestedField, PartitionSpec, PrimitiveLiteral, Schema, SchemaRef, StructType, TableMetadata,
-    Type,
+    NestedField, PartitionSpec, PrimitiveLiteral, PrimitiveType, Schema, SchemaRef, Struct,
+    StructType, TableMetadata, Transform, Type,
 };
 use crate::iceberg::table::Table;
 use crate::loaded_table::IcebergPhysicalTable;
@@ -287,6 +288,7 @@ impl IcebergTypedBoundary {
         snapshot_id: i64,
     ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
         let table = table.clone();
+        let schema = table.metadata().current_schema().clone();
         let (read_snapshot, facts) = self
             .runtime
             .resources()
@@ -297,7 +299,9 @@ impl IcebergTypedBoundary {
         read_snapshot
             .files
             .into_iter()
-            .map(|read_file| planned_data_file(read_file, &facts))
+            .map(|read_file| {
+                planned_data_file(read_file, &facts, schema.as_ref(), None, &BTreeSet::new())
+            })
             .collect()
     }
 
@@ -427,6 +431,9 @@ fn rewrite_position_delete_file(
 fn planned_data_file(
     read_file: IcebergReadFile,
     facts: &ManifestFacts,
+    schema: &Schema,
+    partition_spec: Option<&PartitionSpec>,
+    dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
 ) -> Result<IcebergPlannedDataFile, ConnectorError> {
     let data_facts = facts.data.get(&read_file.path).ok_or_else(|| {
         corrupt(format!(
@@ -448,12 +455,17 @@ fn planned_data_file(
         file_format: IcebergFileFormat::from_data_file_format(data_facts.file_format)?,
         split_offsets: data_facts.split_offsets.clone(),
         key_metadata: data_facts.key_metadata.clone(),
-        // This boundary proves no per-file value bound of its own.
-        // Coordinator-side pruning already used the manifest facts in their
-        // native, untyped form; re-encoding those bytes as typed domain values
-        // would invent a type the manifest never recorded, so the truthful
-        // statistics domain here is "all".
-        file_statistics_domain: TupleDomain::all(),
+        // File statistics are reconstructed at the pinned-manifest boundary
+        // from field IDs and the frozen current schema.  Only declared dynamic
+        // filter columns are materialized: carrying every file metric to each
+        // BE would turn an optimization hint into unbounded split payload.
+        file_statistics_domain: manifest_statistics_domain(
+            schema,
+            partition_spec,
+            &read_file,
+            data_facts,
+            dynamic_filter_columns,
+        )?,
         decryption_data: None,
         delete_facts,
         read_file,
@@ -873,7 +885,7 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
         _session: &ConnectorSession,
         table: &Self::Table,
         columns: &[Assignment<IcebergColumnHandle>],
-        _dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
+        dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
         constraint: &Constraint<IcebergColumnHandle>,
     ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
         match table {
@@ -898,17 +910,24 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
                 };
                 let files = match handle.snapshot_id() {
                     None => Vec::new(),
-                    Some(snapshot_id) => {
-                        self.planned_files_runtime(handle, snapshot_id, constraint)?
-                    }
+                    Some(snapshot_id) => self.planned_files_runtime(
+                        handle,
+                        snapshot_id,
+                        constraint,
+                        dynamic_filter_columns,
+                    )?,
                 };
-                return Ok(Box::new(IcebergRuntimeSplitSource::new(
-                    IcebergSplitSource::try_new(
+                let initial_dynamic_filter_wait = (!dynamic_filter_columns.is_empty())
+                    .then_some(std::time::Duration::from_secs(1))
+                    .unwrap_or_default();
+                return Ok(Box::new(
+                    IcebergRuntimeSplitSource::new(IcebergSplitSource::try_new(
                         &enumeration_handle,
                         files,
                         self.split_source_options,
-                    )?,
-                )));
+                    )?)
+                    .with_initial_dynamic_filter_wait(initial_dynamic_filter_wait),
+                ));
             }
             crate::typed_read::IcebergRuntimeRelation::TableFunction(_) => {
                 return Err(unsupported(
@@ -930,6 +949,7 @@ impl IcebergTypedBoundary {
         handle: &IcebergTableHandle,
         snapshot_id: i64,
         constraint: &Constraint<IcebergColumnHandle>,
+        dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
     ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
         let schema = handle.parse_table_schema()?;
         let pinned = handle.pinned_data_files();
@@ -969,7 +989,17 @@ impl IcebergTypedBoundary {
             {
                 continue;
             }
-            planned.push(planned_data_file(read_file, &facts)?);
+            let partition_spec = read_file
+                .partition_spec_id
+                .map(|spec_id| handle.parse_partition_spec(spec_id))
+                .transpose()?;
+            planned.push(planned_data_file(
+                read_file,
+                &facts,
+                &schema,
+                partition_spec.as_ref(),
+                dynamic_filter_columns,
+            )?);
         }
         if let Some(pinned) = pinned
             && pinned_seen != pinned.len()
@@ -994,6 +1024,7 @@ impl IcebergTypedBoundary {
 struct IcebergRuntimeSplitSource<S> {
     inner: S,
     closed: bool,
+    initial_dynamic_filter_wait: std::time::Duration,
 }
 
 impl<S> IcebergRuntimeSplitSource<S> {
@@ -1001,7 +1032,13 @@ impl<S> IcebergRuntimeSplitSource<S> {
         Self {
             inner,
             closed: false,
+            initial_dynamic_filter_wait: std::time::Duration::ZERO,
         }
+    }
+
+    fn with_initial_dynamic_filter_wait(mut self, wait: std::time::Duration) -> Self {
+        self.initial_dynamic_filter_wait = wait;
+        self
     }
 }
 
@@ -1010,6 +1047,14 @@ where
     S: ConnectorSplitSource<Column = IcebergColumnHandle> + Send,
     S::Split: IntoIcebergRuntimeSplit,
 {
+    fn profile_snapshot(&self) -> novarocks_spi::connector::read_stack::SplitSourceProfile {
+        self.inner.profile_snapshot()
+    }
+
+    fn initial_dynamic_filter_wait_request(&self) -> std::time::Duration {
+        self.initial_dynamic_filter_wait
+    }
+
     fn next_batch(
         &mut self,
         max_size: usize,
@@ -1683,6 +1728,11 @@ struct DataFileManifestFacts {
     file_format: DataFileFormat,
     split_offsets: Vec<i64>,
     key_metadata: Vec<u8>,
+    value_counts: HashMap<i32, u64>,
+    null_value_counts: HashMap<i32, u64>,
+    nan_value_counts: HashMap<i32, u64>,
+    lower_bounds: HashMap<i32, Datum>,
+    upper_bounds: HashMap<i32, Datum>,
 }
 
 /// Everything one manifest walk contributes beyond the read view.
@@ -1773,6 +1823,11 @@ async fn collect_manifest_facts(table: &Table, snapshot_id: i64) -> Result<Manif
                                 .key_metadata()
                                 .map(<[u8]>::to_vec)
                                 .unwrap_or_default(),
+                            value_counts: data_file.value_counts().clone(),
+                            null_value_counts: data_file.null_value_counts().clone(),
+                            nan_value_counts: data_file.nan_value_counts().clone(),
+                            lower_bounds: data_file.lower_bounds().clone(),
+                            upper_bounds: data_file.upper_bounds().clone(),
                         },
                     );
                 }
@@ -1807,6 +1862,297 @@ async fn collect_manifest_facts(table: &Table, snapshot_id: i64) -> Result<Manif
         }
     }
     Ok(facts)
+}
+
+/// Reconstruct the file-local dynamic-filter domain from one pinned manifest
+/// entry.  Manifest metrics are keyed by Iceberg field ID, while the read
+/// stack is keyed by frozen column handles; binding through the current schema
+/// is what makes a rename or a reordered schema unable to retarget a bound.
+///
+/// An absent, unsupported, or non-total metric is deliberately omitted.  That
+/// widens the domain to `ALL` and keeps the file.  In contrast, mutually
+/// impossible metrics are corruption: accepting them as a pruning proof could
+/// silently discard rows, so the query must fail rather than guess.
+fn manifest_statistics_domain(
+    schema: &Schema,
+    partition_spec: Option<&PartitionSpec>,
+    read_file: &IcebergReadFile,
+    facts: &DataFileManifestFacts,
+    dynamic_filter_columns: &BTreeSet<IcebergColumnHandle>,
+) -> Result<TupleDomain<IcebergColumnHandle>, ConnectorError> {
+    let mut domains = BTreeMap::new();
+    for column in dynamic_filter_columns {
+        // Manifest metrics and partition constants describe whole top-level
+        // fields.  A nested path has no independently addressable metric.
+        if !column.is_base_column() {
+            continue;
+        }
+        let Some(field) = schema.field_by_id(column.base_field_id()) else {
+            continue;
+        };
+        let Type::Primitive(primitive) = field.field_type.as_ref() else {
+            continue;
+        };
+        let Some(value_type) = connector_value_type(primitive) else {
+            continue;
+        };
+
+        let metric_domain = manifest_metric_domain(
+            column.base_field_id(),
+            primitive,
+            value_type,
+            read_file.record_count,
+            facts,
+        )?;
+        let partition_domain = identity_partition_domain(
+            column.base_field_id(),
+            primitive,
+            value_type,
+            partition_spec,
+            read_file.partition_values.as_ref(),
+        )?;
+        let domain = match (metric_domain, partition_domain) {
+            (Some(metrics), Some(partition)) => {
+                let intersection = metrics.intersect(&partition)?;
+                if intersection.is_none() {
+                    return Err(corrupt(format!(
+                        "iceberg data file {} has contradictory metric and identity-partition facts for field id {}",
+                        read_file.path,
+                        column.base_field_id()
+                    )));
+                }
+                intersection
+            }
+            (Some(domain), None) | (None, Some(domain)) => domain,
+            (None, None) => Domain::all(value_type),
+        };
+        if !domain.is_all() {
+            domains.insert(column.clone(), domain);
+        }
+    }
+    TupleDomain::with_column_domains(domains)
+}
+
+/// A domain from a data-file metric. `None` means the metric cannot safely
+/// prove anything and must be treated as `ALL` by the caller.
+fn manifest_metric_domain(
+    field_id: i32,
+    primitive: &PrimitiveType,
+    value_type: ConnectorValueType,
+    file_record_count: Option<i64>,
+    facts: &DataFileManifestFacts,
+) -> Result<Option<Domain>, ConnectorError> {
+    let value_count = facts.value_counts.get(&field_id).copied();
+    let null_count = facts.null_value_counts.get(&field_id).copied().unwrap_or(0);
+    let nan_count = facts.nan_value_counts.get(&field_id).copied().unwrap_or(0);
+
+    if let Some(record_count) = file_record_count {
+        let record_count = u64::try_from(record_count).map_err(|_| {
+            corrupt("iceberg data file record count is negative while decoding manifest metrics")
+        })?;
+        if value_count.is_some_and(|count| count > record_count) {
+            return Err(corrupt(format!(
+                "iceberg manifest value count for field id {field_id} exceeds the data-file record count"
+            )));
+        }
+    }
+    if let Some(value_count) = value_count
+        && (null_count > value_count
+            || nan_count > value_count
+            || null_count + nan_count > value_count)
+    {
+        return Err(corrupt(format!(
+            "iceberg manifest null or NaN count for field id {field_id} exceeds its value count"
+        )));
+    }
+
+    // A complete null count is a stronger proof than bounds, including the
+    // all-null case where writers correctly omit both bounds.
+    if value_count.is_some_and(|count| count == null_count) {
+        return Ok(Some(Domain::only_null(value_type)));
+    }
+    // NaN deliberately has no position in ConnectorValue ordering.  A metric
+    // carrying it can still be read, but cannot be used to eliminate a file.
+    if nan_count > 0 {
+        return Ok(None);
+    }
+
+    let (Some(lower), Some(upper)) = (
+        facts.lower_bounds.get(&field_id),
+        facts.upper_bounds.get(&field_id),
+    ) else {
+        return Ok(None);
+    };
+    let (Some(lower), Some(upper)) = (
+        datum_as_connector_value(lower, primitive),
+        datum_as_connector_value(upper, primitive),
+    ) else {
+        return Ok(None);
+    };
+    let Some(ordering) = lower.try_compare_same_type(&upper) else {
+        return Ok(None);
+    };
+    if ordering.is_gt() {
+        return Err(corrupt(format!(
+            "iceberg manifest lower bound is above upper bound for field id {field_id}"
+        )));
+    }
+    // Boolean only admits an equality range. A false-to-true metric is sound
+    // but not expressible in the shared algebra, so it remains fail-open.
+    if !value_type.is_orderable() && ordering.is_ne() {
+        return Ok(None);
+    }
+    let range = Range::try_new(value_type, Bound::Inclusive(lower), Bound::Inclusive(upper))
+        .map_err(|error| {
+            corrupt(format!(
+                "iceberg manifest bounds for field id {field_id} cannot form a typed range: {error}"
+            ))
+        })?;
+    Ok(Some(Domain::new(
+        ValueSet::of_ranges(value_type, vec![range])?,
+        // A missing value count cannot prove that nulls are absent.
+        value_count.is_none_or(|_| null_count > 0),
+    )))
+}
+
+/// A singleton domain from an identity partition value.  As with manifest
+/// metrics, a missing or unsupported value is not an error: it simply cannot
+/// prune this file.
+fn identity_partition_domain(
+    field_id: i32,
+    primitive: &PrimitiveType,
+    value_type: ConnectorValueType,
+    partition_spec: Option<&PartitionSpec>,
+    partition_values: Option<&Struct>,
+) -> Result<Option<Domain>, ConnectorError> {
+    let (Some(spec), Some(values)) = (partition_spec, partition_values) else {
+        return Ok(None);
+    };
+    let Some((index, _)) =
+        spec.fields().iter().enumerate().find(|(_, field)| {
+            field.source_id == field_id && field.transform == Transform::Identity
+        })
+    else {
+        return Ok(None);
+    };
+    let Some(value) = values.fields().get(index) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_ref() else {
+        return Ok(Some(Domain::only_null(value_type)));
+    };
+    let Literal::Primitive(value) = value else {
+        return Ok(None);
+    };
+    let Some(value) = primitive_literal_as_connector_value(value, primitive) else {
+        return Ok(None);
+    };
+    Ok(Some(Domain::single_value(value)?))
+}
+
+fn connector_value_type(primitive: &PrimitiveType) -> Option<ConnectorValueType> {
+    Some(match primitive {
+        PrimitiveType::Boolean => ConnectorValueType::Boolean,
+        PrimitiveType::Int => ConnectorValueType::Integer,
+        PrimitiveType::Long => ConnectorValueType::BigInt,
+        PrimitiveType::Float => ConnectorValueType::Real,
+        PrimitiveType::Double => ConnectorValueType::Double,
+        PrimitiveType::Decimal { precision, scale }
+            if *precision <= 38 && *scale <= *precision && *scale <= u32::from(i8::MAX as u8) =>
+        {
+            ConnectorValueType::Decimal {
+                precision: u8::try_from(*precision).ok()?,
+                scale: i8::try_from(*scale).ok()?,
+            }
+        }
+        PrimitiveType::Date => ConnectorValueType::Date,
+        PrimitiveType::Time => ConnectorValueType::TimeMicros,
+        PrimitiveType::Timestamp => ConnectorValueType::TimestampMicros,
+        PrimitiveType::Timestamptz => ConnectorValueType::TimestampTzMicros,
+        PrimitiveType::TimestampNs => ConnectorValueType::TimestampNanos,
+        PrimitiveType::TimestamptzNs => ConnectorValueType::TimestampTzNanos,
+        PrimitiveType::String => ConnectorValueType::Varchar,
+        PrimitiveType::Uuid => ConnectorValueType::Uuid,
+        PrimitiveType::Fixed(length) if *length <= u64::from(u32::MAX) => {
+            ConnectorValueType::Fixed {
+                length: u32::try_from(*length).ok()?,
+            }
+        }
+        PrimitiveType::Binary => ConnectorValueType::Varbinary,
+        PrimitiveType::Variant | PrimitiveType::Decimal { .. } | PrimitiveType::Fixed(_) => {
+            return None;
+        }
+    })
+}
+
+/// Decode a metric under the current schema type, rather than trusting the
+/// historical type that happened to be attached while its manifest was read.
+/// This makes legal Iceberg type promotion explicit and rejects a metric that
+/// cannot be interpreted under the scan's frozen schema.
+fn datum_as_connector_value(datum: &Datum, primitive: &PrimitiveType) -> Option<ConnectorValue> {
+    let bytes = datum.to_bytes().ok()?;
+    let decoded = Datum::try_from_bytes(bytes.as_ref(), primitive.clone()).ok()?;
+    primitive_literal_as_connector_value(decoded.literal(), primitive)
+}
+
+fn primitive_literal_as_connector_value(
+    literal: &PrimitiveLiteral,
+    primitive: &PrimitiveType,
+) -> Option<ConnectorValue> {
+    match (primitive, literal) {
+        (PrimitiveType::Boolean, PrimitiveLiteral::Boolean(value)) => {
+            Some(ConnectorValue::Boolean(*value))
+        }
+        (PrimitiveType::Int, PrimitiveLiteral::Int(value)) => Some(ConnectorValue::Integer(*value)),
+        (PrimitiveType::Long, PrimitiveLiteral::Long(value)) => {
+            Some(ConnectorValue::BigInt(*value))
+        }
+        (PrimitiveType::Float, PrimitiveLiteral::Float(value)) if !value.is_nan() => {
+            Some(ConnectorValue::Real(value.0))
+        }
+        (PrimitiveType::Double, PrimitiveLiteral::Double(value)) if !value.is_nan() => {
+            Some(ConnectorValue::Double(value.0))
+        }
+        (PrimitiveType::Decimal { precision, scale }, PrimitiveLiteral::Int128(value)) => {
+            ConnectorValue::try_decimal(
+                *value,
+                u8::try_from(*precision).ok()?,
+                i8::try_from(*scale).ok()?,
+            )
+            .ok()
+        }
+        (PrimitiveType::Date, PrimitiveLiteral::Int(value)) => Some(ConnectorValue::Date(*value)),
+        (PrimitiveType::Time, PrimitiveLiteral::Long(value)) => {
+            Some(ConnectorValue::TimeMicros(*value))
+        }
+        (PrimitiveType::Timestamp, PrimitiveLiteral::Long(value)) => {
+            Some(ConnectorValue::TimestampMicros(*value))
+        }
+        (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(value)) => {
+            Some(ConnectorValue::TimestampTzMicros(*value))
+        }
+        (PrimitiveType::TimestampNs, PrimitiveLiteral::Long(value)) => {
+            Some(ConnectorValue::TimestampNanos(*value))
+        }
+        (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(value)) => {
+            Some(ConnectorValue::TimestampTzNanos(*value))
+        }
+        (PrimitiveType::String, PrimitiveLiteral::String(value)) => {
+            Some(ConnectorValue::Varchar(value.clone().into()))
+        }
+        (PrimitiveType::Uuid, PrimitiveLiteral::UInt128(value)) => {
+            Some(ConnectorValue::Uuid(value.to_be_bytes()))
+        }
+        (PrimitiveType::Fixed(expected), PrimitiveLiteral::Binary(value))
+            if usize::try_from(*expected).ok() == Some(value.len()) =>
+        {
+            Some(ConnectorValue::Fixed(value.clone().into()))
+        }
+        (PrimitiveType::Binary, PrimitiveLiteral::Binary(value)) => {
+            Some(ConnectorValue::Varbinary(value.clone().into()))
+        }
+        _ => None,
+    }
 }
 
 /// The row-position bound a position-delete file publishes for `pos`.
@@ -2037,4 +2383,90 @@ fn not_found(message: impl Into<String>) -> ConnectorError {
 
 fn unavailable(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unavailable, message)
+}
+
+#[cfg(test)]
+mod manifest_statistics_tests {
+    use super::*;
+
+    fn facts_for_int_bounds(lower: i32, upper: i32) -> DataFileManifestFacts {
+        DataFileManifestFacts {
+            file_format: DataFileFormat::Parquet,
+            split_offsets: Vec::new(),
+            key_metadata: Vec::new(),
+            value_counts: HashMap::from([(1, 10)]),
+            null_value_counts: HashMap::from([(1, 0)]),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::from([(1, Datum::int(lower))]),
+            upper_bounds: HashMap::from([(1, Datum::int(upper))]),
+        }
+    }
+
+    #[test]
+    fn manifest_metric_reconstructs_a_non_null_current_schema_range() {
+        let domain = manifest_metric_domain(
+            1,
+            &PrimitiveType::Int,
+            ConnectorValueType::Integer,
+            Some(10),
+            &facts_for_int_bounds(10, 20),
+        )
+        .expect("valid metrics")
+        .expect("metrics are usable");
+
+        assert!(!domain.null_allowed());
+        assert_eq!(
+            domain.values().ranges(),
+            &[Range::try_new(
+                ConnectorValueType::Integer,
+                Bound::Inclusive(ConnectorValue::Integer(10)),
+                Bound::Inclusive(ConnectorValue::Integer(20)),
+            )
+            .expect("range")]
+        );
+    }
+
+    #[test]
+    fn manifest_nan_or_missing_bounds_do_not_claim_a_pruning_proof() {
+        let mut nan = facts_for_int_bounds(10, 20);
+        nan.nan_value_counts.insert(1, 1);
+        assert!(
+            manifest_metric_domain(
+                1,
+                &PrimitiveType::Int,
+                ConnectorValueType::Integer,
+                Some(10),
+                &nan,
+            )
+            .expect("NaN is fail-open")
+            .is_none()
+        );
+
+        let mut missing = facts_for_int_bounds(10, 20);
+        missing.upper_bounds.clear();
+        assert!(
+            manifest_metric_domain(
+                1,
+                &PrimitiveType::Int,
+                ConnectorValueType::Integer,
+                Some(10),
+                &missing,
+            )
+            .expect("missing bound is fail-open")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn contradictory_manifest_bounds_fail_the_query() {
+        let error = manifest_metric_domain(
+            1,
+            &PrimitiveType::Int,
+            ConnectorValueType::Integer,
+            Some(10),
+            &facts_for_int_bounds(20, 10),
+        )
+        .expect_err("inverted bounds are corruption");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+    }
 }

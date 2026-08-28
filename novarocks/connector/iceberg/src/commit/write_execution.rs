@@ -149,6 +149,7 @@ impl IcebergDataWriteExecution {
                     "Iceberg DATA handle is missing its frozen field-ID schema",
                 )
             })?,
+            parquet_row_group_size_bytes: handle.parquet_row_group_size_bytes,
         };
         let report_file_format = handle.report_file_format;
         let row_lineage_data = handle.row_lineage_data;

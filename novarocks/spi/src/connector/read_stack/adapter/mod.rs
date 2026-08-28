@@ -253,6 +253,14 @@ pub trait ProviderReadMetadata: ProviderReadRuntime {
 }
 
 pub trait ProviderReadSplitSource<P: ProviderReadRuntime>: Send {
+    fn profile_snapshot(&self) -> super::SplitSourceProfile {
+        super::SplitSourceProfile::default()
+    }
+
+    fn initial_dynamic_filter_wait_request(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
     fn next_batch(
         &mut self,
         max_size: usize,
@@ -662,6 +670,14 @@ struct AdapterSplitSource<P: ProviderReadRuntime> {
 }
 
 impl<P: ProviderReadRuntime> ConnectorReadSplitSource for AdapterSplitSource<P> {
+    fn profile_snapshot(&self) -> super::SplitSourceProfile {
+        self.source.profile_snapshot()
+    }
+
+    fn initial_dynamic_filter_wait_request(&self) -> std::time::Duration {
+        self.source.initial_dynamic_filter_wait_request()
+    }
+
     fn next_batch(
         &mut self,
         max_size: usize,

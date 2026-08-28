@@ -32,8 +32,8 @@ pub(crate) use driver::{
     SplitSourceHandle,
 };
 pub(crate) use round::{
-    DEFAULT_PUMP_BATCH_SIZE, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitSource,
-    emit_split_source_close_marker,
+    DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP, DEFAULT_PUMP_BATCH_SIZE, RoundSplitAssignment,
+    RoundSplitAssignmentStop, RoundSplitSource, emit_split_source_close_marker,
 };
 pub(crate) use transport::{
     AcceptedPlanNode, TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError,

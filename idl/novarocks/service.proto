@@ -361,6 +361,31 @@ message FragmentLiveObservation {
   optional RuntimeProfileTree profile = 9;
 }
 
+enum RuntimeFilterFeedbackUnavailableReason {
+  RUNTIME_FILTER_FEEDBACK_UNAVAILABLE_REASON_UNSPECIFIED = 0;
+  RUNTIME_FILTER_FEEDBACK_UNAVAILABLE_REASON_DOMAIN_BUDGET = 1;
+  RUNTIME_FILTER_FEEDBACK_UNAVAILABLE_REASON_TYPE_UNSUPPORTED = 2;
+  RUNTIME_FILTER_FEEDBACK_UNAVAILABLE_REASON_REDUCTION_UNAVAILABLE = 3;
+  RUNTIME_FILTER_FEEDBACK_UNAVAILABLE_REASON_PRODUCER_UNAVAILABLE = 4;
+}
+
+// Best-effort, terminal logical runtime-filter feedback. The active control
+// stream already authenticates the participant; the Frontend additionally
+// fences this message with the frozen execution/deployment/channel contract.
+message RuntimeFilterFeedbackEvent {
+  QueryExecutionId execution_id = 1;
+  bytes init_digest = 2;
+  ParticipantBackendIdentity backend = 3;
+  uint32 participant_id = 4;
+  uint64 deployment_epoch = 5;
+  uint32 channel_id = 6;
+  bytes contract_digest = 7;
+  oneof terminal_outcome {
+    bytes canonical_domain = 8;
+    RuntimeFilterFeedbackUnavailableReason unavailable_reason = 9;
+  }
+}
+
 message QueryControlResponse {
   oneof event {
     QueryControlReady control_ready = 1;
@@ -370,6 +395,7 @@ message QueryControlResponse {
     QueryControlLocalDrained local_drained = 5;
     ParticipantTerminalOutcome terminal_outcome = 6;
     FragmentLiveObservation fragment_observation = 7;
+    RuntimeFilterFeedbackEvent runtime_filter_feedback = 8;
   }
 }
 

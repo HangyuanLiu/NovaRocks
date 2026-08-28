@@ -24,10 +24,13 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use novarocks_proto_codec::connector_read::ConnectorReadCodec;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_spi::connector::read_stack::ConnectorReadColumnHandle;
 use novarocks_spi::connector::read_stack::ConnectorReadSplitSource;
+use novarocks_spi::connector::read_stack::SplitSourceProfile;
 
 use super::super::connector_domain::CatalogHandle;
 use super::driver::{
@@ -35,6 +38,7 @@ use super::driver::{
     TaskUpdateRetryPolicy,
 };
 use super::transport::TaskUpdateTransport;
+use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 
 /// How many splits one batch pulls from a source.
 ///
@@ -44,12 +48,21 @@ pub(crate) const DEFAULT_PUMP_BATCH_SIZE: usize = 256;
 
 /// How long the pump waits when no source could make progress.
 const IDLE_PUMP_BACKOFF: std::time::Duration = std::time::Duration::from_millis(2);
+pub(crate) const DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP: Duration = Duration::from_secs(1);
 
 /// One typed scan's split source, with the plan node it feeds.
 pub(crate) struct RoundSplitSource {
     pub(crate) plan_node_id: i32,
     pub(crate) source: Box<dyn ConnectorReadSplitSource>,
     pub(crate) codec: Arc<dyn ConnectorReadCodec>,
+    /// FE admission state is query-attempt local and shared only with this
+    /// attempt's control readers.  The source observes it afresh for every
+    /// batch; already emitted splits are never revisited.
+    pub(crate) feedback: Arc<RuntimeFilterFeedbackState>,
+    /// Exact carrier binding -> opaque connector column mapping frozen by the
+    /// prepared scan.  A feedback channel can constrain no other column.
+    pub(crate) feedback_bindings: Vec<(u32, ConnectorReadColumnHandle)>,
+    pub(crate) initial_wait_deadline: Option<Instant>,
 }
 
 /// The per-round owner of every split source and the driver that drains them.
@@ -64,6 +77,19 @@ pub(crate) struct RoundSplitAssignment {
 }
 
 impl RoundSplitAssignment {
+    pub(crate) fn profile_snapshot(&self) -> SplitSourceProfile {
+        self.sources
+            .iter()
+            .fold(SplitSourceProfile::default(), |mut total, source| {
+                let next = source.source.profile_snapshot();
+                total.files_considered =
+                    total.files_considered.saturating_add(next.files_considered);
+                total.files_pruned = total.files_pruned.saturating_add(next.files_pruned);
+                total.files_expanded = total.files_expanded.saturating_add(next.files_expanded);
+                total.splits_emitted = total.splits_emitted.saturating_add(next.splits_emitted);
+                total
+            })
+    }
     pub(crate) fn new(
         execution_id: QueryExecutionId,
         transport: Arc<dyn TaskUpdateTransport>,
@@ -71,8 +97,18 @@ impl RoundSplitAssignment {
         max_queued_splits_per_task: u64,
         sources: Vec<RoundSplitSource>,
         retry_policy: TaskUpdateRetryPolicy,
+        initial_dynamic_filter_wait_cap: Duration,
     ) -> Self {
         let stop = SplitAssignmentStop::default();
+        let started_at = Instant::now();
+        let mut sources = sources;
+        for source in &mut sources {
+            let requested = source
+                .source
+                .initial_dynamic_filter_wait_request()
+                .min(initial_dynamic_filter_wait_cap);
+            source.initial_wait_deadline = (!requested.is_zero()).then(|| started_at + requested);
+        }
         Self {
             driver: SplitAssignmentDriver::new(
                 execution_id,
@@ -105,10 +141,13 @@ impl RoundSplitAssignment {
     ///
     /// A source that yields nothing right now is retried after the other
     /// sources get a turn, so one slow enumeration cannot starve the rest.
-    pub(crate) fn pump_to_completion(&mut self) -> Result<(), SplitAssignmentDriverError> {
+    pub(crate) fn pump_to_completion(
+        &mut self,
+    ) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
         while !self.stop.is_stopped() {
             let mut progressed = false;
             let mut pending = false;
+            let mut feedback_wait_deadline = None;
             for index in 0..self.sources.len() {
                 if self.stop.is_stopped() {
                     break;
@@ -121,16 +160,39 @@ impl RoundSplitAssignment {
                 if self.driver.is_backpressured(plan_node_id) {
                     continue;
                 }
+                let dynamic_filter = self.sources[index]
+                    .feedback
+                    .snapshot_for_scan(plan_node_id, &self.sources[index].feedback_bindings);
+                if let Some(deadline) = self.sources[index].initial_wait_deadline {
+                    if Instant::now() < deadline
+                        && self.sources[index].feedback.is_initial_wait_blocked(
+                            plan_node_id,
+                            self.sources[index]
+                                .feedback_bindings
+                                .iter()
+                                .map(|(binding_id, _)| *binding_id),
+                        )
+                    {
+                        feedback_wait_deadline = Some(
+                            feedback_wait_deadline
+                                .map_or(deadline, |current: Instant| current.min(deadline)),
+                        );
+                        continue;
+                    }
+                    self.sources[index].initial_wait_deadline = None;
+                }
                 let source = self.sources[index].source.as_mut();
-                if self
-                    .driver
-                    .pump(plan_node_id, source, DEFAULT_PUMP_BATCH_SIZE)?
-                {
+                if self.driver.pump(
+                    plan_node_id,
+                    source,
+                    DEFAULT_PUMP_BATCH_SIZE,
+                    &dynamic_filter,
+                )? {
                     progressed = true;
                 }
             }
             if !pending {
-                return Ok(());
+                return Ok(self.profile_snapshot());
             }
             if !progressed {
                 // Either every remaining task is at its queue ceiling, or every
@@ -140,10 +202,20 @@ impl RoundSplitAssignment {
                 // progresses; this loop deliberately has no deadline of its
                 // own, because inventing one would cancel a legitimately slow
                 // enumeration.
-                std::thread::sleep(IDLE_PUMP_BACKOFF);
+                if let Some(deadline) = feedback_wait_deadline {
+                    let budget = deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(IDLE_PUMP_BACKOFF);
+                    if let Some(source) = self.sources.first() {
+                        let generation = source.feedback.generation();
+                        source.feedback.wait_for_change(generation, budget);
+                    }
+                } else if self.stop.wait_backoff(IDLE_PUMP_BACKOFF) {
+                    break;
+                }
             }
         }
-        Ok(())
+        Ok(self.profile_snapshot())
     }
 
     /// Idempotent. Closes the driver and every source exactly once.
@@ -345,8 +417,15 @@ mod tests {
                 plan_node_id: 7,
                 source: Box::new(CloseCountingSource { close_calls }),
                 codec: Arc::new(InertCodec),
+                feedback: Arc::new(
+                    RuntimeFilterFeedbackState::new(execution_id, Default::default())
+                        .expect("empty feedback declaration"),
+                ),
+                feedback_bindings: Vec::new(),
+                initial_wait_deadline: None,
             }],
             TaskUpdateRetryPolicy::default(),
+            DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
         )
     }
 

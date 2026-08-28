@@ -43,6 +43,8 @@ use super::manifest::{MaterializedParticipant, materialize};
 use crate::coordinator::query_registry::{
     ActiveQueryAttemptBinding, ActiveQueryAttemptControl, FrontendQueryRegistry,
 };
+use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
+use crate::runtime_filter::install_encoder::FrontendRuntimeFilterFeedbackDeclaration;
 
 #[derive(Clone, Copy)]
 pub(crate) struct FrontendQueryLifecycleConfig {
@@ -173,6 +175,8 @@ pub(crate) struct FrontendQueryLifecycleBarrier {
     config: FrontendQueryLifecycleConfig,
     metrics: Arc<FrontendLifecycleMetrics>,
     cancellation: Option<QueryCancellationView>,
+    feedback_declaration: FrontendRuntimeFilterFeedbackDeclaration,
+    feedback_state: Option<Arc<RuntimeFilterFeedbackState>>,
 }
 
 pub(super) struct PreReadyAttemptGuard {
@@ -253,11 +257,29 @@ impl FrontendQueryLifecycleBarrier {
             #[cfg(not(test))]
             metrics: FrontendLifecycleMetrics::process_shared(),
             cancellation: None,
+            feedback_declaration: FrontendRuntimeFilterFeedbackDeclaration::default(),
+            feedback_state: None,
         }
     }
 
     pub(crate) fn with_cancellation(mut self, cancellation: QueryCancellationView) -> Self {
         self.cancellation = Some(cancellation);
+        self
+    }
+
+    pub(crate) fn with_runtime_filter_feedback(
+        mut self,
+        declaration: FrontendRuntimeFilterFeedbackDeclaration,
+    ) -> Self {
+        self.feedback_declaration = declaration;
+        self
+    }
+
+    pub(crate) fn with_runtime_filter_feedback_state(
+        mut self,
+        state: Arc<RuntimeFilterFeedbackState>,
+    ) -> Self {
+        self.feedback_state = Some(state);
         self
     }
 
@@ -304,6 +326,11 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             self.config,
             Arc::clone(&self.metrics),
         );
+        if let Some(state) = &self.feedback_state {
+            control.install_runtime_filter_feedback_state(Arc::clone(state));
+        } else {
+            control.configure_runtime_filter_feedback(self.feedback_declaration.clone())?;
+        }
         let ownership = materialized
             .participants
             .iter()

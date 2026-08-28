@@ -24,7 +24,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter::{
@@ -40,10 +41,10 @@ use novarocks_types::UniqueId;
 
 use super::{
     BackendChannelIdentity, BackendChannelInstall, BackendConsumerInstall, BackendCoverageProgress,
-    BackendCoverageState, BackendInstallPolicy, BackendInstallPolicyError,
-    BackendParticipantIdentity, BackendProducerInstall, BackendProducerStreamIdentity,
-    BackendReducedLogicalDomain, BackendReducedLogicalSnapshot, BackendReductionApply,
-    BackendReductionState, BackendReductionStateError, BackendRouteEdgeId,
+    BackendCoverageState, BackendFrontendFeedbackPublication, BackendInstallPolicy,
+    BackendInstallPolicyError, BackendParticipantIdentity, BackendProducerInstall,
+    BackendProducerStreamIdentity, BackendReducedLogicalDomain, BackendReducedLogicalSnapshot,
+    BackendReductionApply, BackendReductionState, BackendReductionStateError, BackendRouteEdgeId,
     BackendRuntimeFilterEvent, BackendRuntimeFilterEventObserver, BackendSubscriptionError,
     BackendSubscriptionGroup, MAX_RUNTIME_FILTER_PRODUCER_PARTITIONS_PER_INSTANCE,
 };
@@ -107,6 +108,29 @@ pub(crate) trait BackendMaterializedDeliverySink: Send + Sync {
         &self,
         delivery: BackendMaterializedDelivery,
     ) -> Result<(), RuntimeFilterContractViolation>;
+}
+
+/// The terminal feedback path is intentionally independent from physical
+/// artifact routing.  Its implementation belongs to the attempt-local query
+/// lifecycle owner, which may drop it at cancellation without retaining this
+/// runtime-filter session.
+pub(crate) trait BackendFrontendFeedbackSink: Send + Sync {
+    fn try_publish(
+        &self,
+        channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
+        deployment_epoch: u64,
+        publication: &BackendFrontendFeedbackPublication,
+        outcome: BackendFrontendFeedbackOutcome,
+    );
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BackendFrontendFeedbackOutcome {
+    CanonicalDomain(Arc<[u8]>),
+    DomainBudget,
+    TypeUnsupported,
+    ReductionUnavailable,
+    ProducerUnavailable,
 }
 
 #[derive(Debug)]
@@ -220,6 +244,8 @@ pub(crate) struct BackendRuntimeFilterSession {
     availability: Option<Mutex<BackendCoverageState>>,
     terminal: Option<Mutex<BackendCoverageState>>,
     materialized_delivery_sink: Mutex<Option<Arc<dyn BackendMaterializedDeliverySink>>>,
+    frontend_feedback_sink: Mutex<Option<Weak<dyn BackendFrontendFeedbackSink>>>,
+    frontend_feedback_published: AtomicBool,
     events: Arc<dyn BackendRuntimeFilterEventObserver>,
 }
 
@@ -310,6 +336,8 @@ impl BackendRuntimeFilterSession {
             availability,
             terminal,
             materialized_delivery_sink: Mutex::new(None),
+            frontend_feedback_sink: Mutex::new(None),
+            frontend_feedback_published: AtomicBool::new(false),
             events,
         })
     }
@@ -322,6 +350,20 @@ impl BackendRuntimeFilterSession {
             .materialized_delivery_sink
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(sink);
+    }
+
+    pub(crate) fn set_frontend_feedback_sink(&self, sink: Weak<dyn BackendFrontendFeedbackSink>) {
+        *self
+            .frontend_feedback_sink
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(sink);
+    }
+
+    pub(crate) fn clear_frontend_feedback_sink(&self) {
+        *self
+            .frontend_feedback_sink
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     pub(crate) const fn policy(&self) -> &BackendInstallPolicy {
@@ -539,6 +581,9 @@ impl BackendRuntimeFilterSession {
                         RuntimeFilterSubmitOutcome::PendingFinalSnapshot
                     }
                     None => {
+                        self.publish_frontend_feedback(
+                            BackendFrontendFeedbackOutcome::ReductionUnavailable,
+                        );
                         self.publish_terminal(LiveTerminal::CompletedWithoutArtifact)?;
                         RuntimeFilterSubmitOutcome::CompletedWithoutArtifact
                     }
@@ -587,6 +632,7 @@ impl BackendRuntimeFilterSession {
             channel,
             reason: UnavailableReason::ProducerFailed,
         });
+        self.publish_frontend_feedback(BackendFrontendFeedbackOutcome::ProducerUnavailable);
         for consumer in self.consumers.values() {
             for route in &consumer.routes {
                 consumer
@@ -658,6 +704,9 @@ impl BackendRuntimeFilterSession {
         snapshot: &BackendReducedLogicalSnapshot,
         terminal: Option<LiveTerminal>,
     ) -> Result<(), RuntimeFilterContractViolation> {
+        if terminal == Some(LiveTerminal::Completed) {
+            self.publish_frontend_feedback_for_snapshot(snapshot);
+        }
         let logical_version = self.materialized_logical_version(snapshot);
         self.record_channel_event(
             |channel| BackendRuntimeFilterEvent::LogicalVersionPublished {
@@ -853,6 +902,64 @@ impl BackendRuntimeFilterSession {
             super::BackendChannelLifecycle::CompleteOnce => LogicalVersion::FIRST,
             super::BackendChannelLifecycle::MonotonicUpdates => snapshot.logical_version(),
         }
+    }
+
+    /// Attempts exactly one terminal feedback publication.  The receiver is
+    /// deliberately weak and `try_publish` is nonblocking: losing this frame
+    /// widens the Frontend's pruning decision but cannot affect query output.
+    fn publish_frontend_feedback(&self, outcome: BackendFrontendFeedbackOutcome) {
+        let Some(publication) = self.channel.frontend_feedback_publication() else {
+            return;
+        };
+        if self
+            .frontend_feedback_published
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let sink = self
+            .frontend_feedback_sink
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(Weak::upgrade);
+        if let Some(sink) = sink {
+            sink.try_publish(
+                self.channel.channel_id(),
+                self.participant.deployment_epoch(),
+                publication,
+                outcome,
+            );
+        }
+    }
+
+    fn publish_frontend_feedback_for_snapshot(&self, snapshot: &BackendReducedLogicalSnapshot) {
+        let Some(publication) = self.channel.frontend_feedback_publication() else {
+            return;
+        };
+        let outcome = match snapshot.domain() {
+            BackendReducedLogicalDomain::Membership(domain) => {
+                match novarocks_execution::runtime_filter::feedback_domain::RuntimeFilterFeedbackDomain::project(
+                    domain,
+                    publication.max_encoded_domain_bytes(),
+                )
+                .and_then(|domain| domain.encode(publication.max_encoded_domain_bytes()))
+                {
+                    Ok(encoded) => {
+                        BackendFrontendFeedbackOutcome::CanonicalDomain(Arc::from(encoded))
+                    }
+                    Err(
+                        novarocks_execution::runtime_filter::feedback_domain::RuntimeFilterFeedbackDomainError::ResourceLimit,
+                    ) => BackendFrontendFeedbackOutcome::DomainBudget,
+                    Err(_) => BackendFrontendFeedbackOutcome::TypeUnsupported,
+                }
+            }
+            BackendReducedLogicalDomain::OrderedBound(_) => {
+                BackendFrontendFeedbackOutcome::TypeUnsupported
+            }
+        };
+        self.publish_frontend_feedback(outcome);
     }
 
     fn dispatch_outbound_snapshot(

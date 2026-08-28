@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_spi::connector::read_stack::SplitSourceProfile;
 
 use crate::query_execution::artifact::ValidatedFragmentSchedule;
 use crate::query_execution::split_assignment::{
@@ -95,6 +96,7 @@ pub(crate) struct RoundSplitAssignmentPlan {
     targets: BTreeMap<i32, Vec<AssignmentTarget>>,
     sources: Vec<RoundSplitSource>,
     retry_policy: TaskUpdateRetryPolicy,
+    initial_dynamic_filter_wait_cap: std::time::Duration,
 }
 
 impl RoundSplitAssignmentPlan {
@@ -103,12 +105,14 @@ impl RoundSplitAssignmentPlan {
         targets: BTreeMap<i32, Vec<AssignmentTarget>>,
         sources: Vec<RoundSplitSource>,
         retry_policy: TaskUpdateRetryPolicy,
+        initial_dynamic_filter_wait_cap: std::time::Duration,
     ) -> Self {
         Self {
             transport,
             targets,
             sources,
             retry_policy,
+            initial_dynamic_filter_wait_cap,
         }
     }
 
@@ -141,7 +145,7 @@ impl Drop for RoundSplitAssignmentPlan {
 /// remember to.
 pub(crate) struct SplitAssignmentRoundGuard {
     stop: RoundSplitAssignmentStop,
-    worker: Option<std::thread::JoinHandle<Result<(), SplitAssignmentDriverError>>>,
+    worker: Option<std::thread::JoinHandle<Result<SplitSourceProfile, SplitAssignmentDriverError>>>,
 }
 
 impl SplitAssignmentRoundGuard {
@@ -166,6 +170,7 @@ impl SplitAssignmentRoundGuard {
             DEFAULT_MAX_QUEUED_SPLITS_PER_TASK,
             sources,
             plan.retry_policy,
+            plan.initial_dynamic_filter_wait_cap,
         );
         let stop = assignment.stop_handle();
         let worker = std::thread::Builder::new()
@@ -197,10 +202,10 @@ impl SplitAssignmentRoundGuard {
     /// therefore not stop the worker: doing so would discard an accepted but
     /// unconfirmed immutable assignment. Cancellation and unwinding still use
     /// `Drop`, which signals stop before joining.
-    pub(crate) fn finish(mut self) -> Result<(), SplitAssignmentDriverError> {
+    pub(crate) fn finish(mut self) -> Result<SplitSourceProfile, SplitAssignmentDriverError> {
         match self.worker.take() {
-            Some(worker) => worker.join().unwrap_or(Ok(())),
-            None => Ok(()),
+            Some(worker) => worker.join().unwrap_or(Ok(SplitSourceProfile::default())),
+            None => Ok(SplitSourceProfile::default()),
         }
     }
 }
@@ -255,6 +260,7 @@ mod tests {
                     BTreeMap::new(),
                     Vec::new(),
                     TaskUpdateRetryPolicy::default(),
+                    std::time::Duration::ZERO,
                 ),
             )
             .is_none()
@@ -272,7 +278,7 @@ mod tests {
             worker: Some(std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(10));
                 worker_observed_stop.store(worker_stop.is_stopped(), Ordering::SeqCst);
-                Ok(())
+                Ok(SplitSourceProfile::default())
             })),
         };
 

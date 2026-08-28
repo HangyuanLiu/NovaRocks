@@ -45,6 +45,8 @@ use crate::query_execution::contract::{
 #[cfg(test)]
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use crate::query_execution::lifecycle_plan::{QueryInitOptions, QueryLifecycleLease};
+#[cfg(test)]
+use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
 use crate::query_execution::split_assignment::RoundSplitSource;
 use crate::query_execution::write::WriteTerminalBuilder;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
@@ -87,6 +89,7 @@ use crate::native::transport::{
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
+use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 #[cfg(test)]
 use novarocks_proto_codec::lifecycle::{
@@ -677,6 +680,7 @@ pub struct FrontendDistributedQueryCoordinator {
     lifecycle_config: FrontendQueryLifecycleConfig,
     pre_start_timeout: Duration,
     task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
+    connector_split_initial_dynamic_filter_wait_cap: Duration,
     native_compatibility_id: NativeCompatibilityId,
 }
 
@@ -711,6 +715,7 @@ impl FrontendDistributedQueryCoordinator {
         native_compatibility_id: NativeCompatibilityId,
         query_control_timeouts: crate::application::FrontendQueryControlTimeouts,
         task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
+        connector_split_initial_dynamic_filter_wait_cap: Duration,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
         connector_control: Arc<ConnectorControlHost>,
         data_runtime: FrontendDataRuntime,
@@ -750,6 +755,7 @@ impl FrontendDistributedQueryCoordinator {
             lifecycle_config,
             pre_start_timeout: Duration::from_millis(query_control_timeouts.pre_start_timeout_ms),
             task_update_retry_policy,
+            connector_split_initial_dynamic_filter_wait_cap,
             native_compatibility_id,
         })
     }
@@ -826,6 +832,8 @@ impl FrontendDistributedQueryCoordinator {
             pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
             task_update_retry_policy:
                 crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
+            connector_split_initial_dynamic_filter_wait_cap:
+                DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),
         }
     }
@@ -901,6 +909,8 @@ impl FrontendDistributedQueryCoordinator {
             pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
             task_update_retry_policy:
                 crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
+            connector_split_initial_dynamic_filter_wait_cap:
+                DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),
         }
     }
@@ -1032,15 +1042,20 @@ impl FrontendDistributedQueryCoordinator {
             .map_err(pre_ready_topology_validation_error)?;
         self.registry
             .set_scheduled_backend_ownership(query_id, &scheduled_backend_ownership)?;
-        // Runtime split assignment is a round-owned resource: its sources, its
-        // task set and its transport are all derived from this schedule. They
-        // are built here, while the schedule and the prepared scans are both
-        // still in hand, and started only once the tasks can accept work.
+        // Split sources and the lifecycle barrier share this one stable,
+        // attempt-local feedback object.  It is populated from the sealed
+        // deployment below, before either control readers or the pump starts.
+        let feedback_state = Arc::new(
+            RuntimeFilterFeedbackState::new(execution_id, Default::default())
+                .expect("empty runtime filter feedback declaration is valid"),
+        );
         let split_assignment_plan = prepare_round_split_assignment(
             &parts.artifacts,
             &schedule,
             self.data_runtime.clone(),
             self.task_update_retry_policy,
+            Arc::clone(&feedback_state),
+            self.connector_split_initial_dynamic_filter_wait_cap,
         )?;
         let binding_attachment =
             encode_binding_attachment(parts.artifacts.runtime_filter_binding_view())?;
@@ -1088,6 +1103,12 @@ impl FrontendDistributedQueryCoordinator {
                 self.runtime_filter_worker_count.get(),
             )?,
         )?;
+        let feedback_declaration = deployment.feedback_declaration().clone();
+        feedback_state
+            .configure(feedback_declaration.clone())
+            .map_err(|error| {
+                DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+            })?;
         let runtime_filter_attachment =
             scheduled.seal_runtime_filter_deployment(deployment.contributions())?;
         let runtime_filter_ready =
@@ -1122,7 +1143,9 @@ impl FrontendDistributedQueryCoordinator {
             Arc::clone(&self.registry),
             self.lifecycle_config,
         )
-        .with_cancellation(parts.cancellation.clone());
+        .with_cancellation(parts.cancellation.clone())
+        .with_runtime_filter_feedback(feedback_declaration)
+        .with_runtime_filter_feedback_state(feedback_state);
         let init_options = QueryInitOptions::new(
             execution_id,
             self.native_compatibility_id,
@@ -1182,7 +1205,7 @@ impl FrontendDistributedQueryCoordinator {
         // Started only after Start: a backend admits a task update only while
         // its attempt is staged or running. The guard owns the pump thread, so
         // every exit path below closes the sources by dropping it.
-        let split_assignment = split_assignment_plan
+        let mut split_assignment = split_assignment_plan
             .and_then(|plan| SplitAssignmentRoundGuard::start(execution_id, plan));
         let RunningNativeExecutionParts {
             root_fetch,
@@ -1268,6 +1291,26 @@ impl FrontendDistributedQueryCoordinator {
             let message = abort_query_lifecycle(&mut query_lifecycle_lease, message);
             return Err(failed(message));
         }
+
+        // A successful query must not construct its terminal/profile outcome
+        // while this attempt still owns an unconfirmed TaskUpdate.  On error
+        // the guard's Drop path stops and closes the sources; on success we
+        // join explicitly so every immutable split assignment is either
+        // confirmed or reported as the query failure.
+        let split_assignment_profile = if let Some(assignment) = split_assignment.take() {
+            match assignment.finish() {
+                Ok(profile) => profile,
+                Err(error) => {
+                    return Err(self.fail_cancel_then_abort_query_lifecycle(
+                        query_id,
+                        &mut query_lifecycle_lease,
+                        format!("split assignment did not finish: {error}"),
+                    ));
+                }
+            }
+        } else {
+            novarocks_spi::connector::read_stack::SplitSourceProfile::default()
+        };
 
         let terminal_set = query_lifecycle_lease
             .take()
@@ -1357,6 +1400,7 @@ impl FrontendDistributedQueryCoordinator {
                         builder.apply_terminal(fragment.as_proto())?;
                     }
                 }
+                builder.apply_split_assignment_profile(split_assignment_profile);
                 parts.completion.profile(result, builder.finish())
             }
             DistributedQueryIntent::Statistics => {
@@ -2496,6 +2540,8 @@ fn prepare_round_split_assignment(
     schedule: &ValidatedFragmentSchedule,
     data_runtime: FrontendDataRuntime,
     retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
+    feedback: Arc<RuntimeFilterFeedbackState>,
+    initial_dynamic_filter_wait_cap: Duration,
 ) -> Result<Option<RoundSplitAssignmentPlan>, DistributedQueryError> {
     let scan_nodes = artifacts
         .typed_scans()
@@ -2527,6 +2573,9 @@ fn prepare_round_split_assignment(
             plan_node_id,
             source,
             codec: Arc::clone(&scan.prepared.codec),
+            feedback: Arc::clone(&feedback),
+            feedback_bindings: feedback_bindings(table_scan),
+            initial_wait_deadline: None,
         });
     }
     let targets = assignment_targets(schedule, &scan_nodes);
@@ -2549,5 +2598,25 @@ fn prepare_round_split_assignment(
         targets,
         sources,
         retry_policy,
+        initial_dynamic_filter_wait_cap,
     )))
+}
+
+fn feedback_bindings(
+    table_scan: &crate::query_execution::connector_domain::TableScanNode,
+) -> Vec<(
+    u32,
+    novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+)> {
+    table_scan
+        .dynamic_filters()
+        .iter()
+        .filter_map(|binding| {
+            table_scan
+                .assignments()
+                .iter()
+                .find(|assignment| assignment.variable() == binding.variable())
+                .map(|assignment| (binding.filter_id(), assignment.column().clone()))
+        })
+        .collect()
 }

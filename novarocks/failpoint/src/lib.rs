@@ -59,11 +59,13 @@ pub enum QueryLifecycleFaultKind {
     TerminalAttestationStreamDrop,
     TerminalOutcomeSuppress,
     RuntimeFilterContributionAckDrop,
+    RuntimeFilterFeedbackContractDigestCorrupt,
+    RuntimeFilterFeedbackUnavailable,
     TaskUpdateTerminalAckDrop,
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 24] = [
         Self::InitAckDrop,
         Self::StageAckDrop,
         Self::StartAckDrop,
@@ -85,6 +87,8 @@ impl QueryLifecycleFaultKind {
         Self::TerminalAttestationStreamDrop,
         Self::TerminalOutcomeSuppress,
         Self::RuntimeFilterContributionAckDrop,
+        Self::RuntimeFilterFeedbackContractDigestCorrupt,
+        Self::RuntimeFilterFeedbackUnavailable,
         Self::TaskUpdateTerminalAckDrop,
     ];
 
@@ -111,6 +115,10 @@ impl QueryLifecycleFaultKind {
             Self::TerminalAttestationStreamDrop => "terminal-attestation-stream-drop",
             Self::TerminalOutcomeSuppress => "terminal-outcome-suppress",
             Self::RuntimeFilterContributionAckDrop => "runtime-filter-contribution-ack-drop",
+            Self::RuntimeFilterFeedbackContractDigestCorrupt => {
+                "runtime-filter-feedback-contract-digest-corrupt"
+            }
+            Self::RuntimeFilterFeedbackUnavailable => "runtime-filter-feedback-unavailable",
             Self::TaskUpdateTerminalAckDrop => "task-update-terminal-ack-drop",
         }
     }
@@ -127,7 +135,7 @@ impl QueryLifecycleFaultKind {
 /// The runner can request only the explicitly allowlisted closeout fault
 /// subset, never a generic lifecycle hook. This is intentionally a separate
 /// parsing surface.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 12] = [
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 14] = [
     QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
     QueryLifecycleFaultKind::ObservationP2BudgetPressure,
     QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
@@ -139,6 +147,8 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 12] = [
     QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
     QueryLifecycleFaultKind::TerminalOutcomeSuppress,
     QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
+    QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
+    QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
     QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
 ];
 
@@ -582,14 +592,14 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 22);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 24);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 12);
+        assert_eq!(RUNNER_RFO_KINDS.len(), 14);
         assert_eq!(
             parse_runner_rfo_kind("terminal-outcome-suppress"),
             Some(QueryLifecycleFaultKind::TerminalOutcomeSuppress)

@@ -14,7 +14,7 @@ pub use control::{
     FragmentLiveObservation, QueryAbortRequest, QueryControlAttach, QueryControlCommand,
     QueryControlEvent, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryTerminalAck,
     QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminationAck,
-    QueryTerminationReason,
+    QueryTerminationReason, RuntimeFilterFeedbackEvent,
 };
 pub use identity::{
     AttemptId, QueryExecutionId, decode_query_execution_id, encode_query_execution_id,

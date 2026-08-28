@@ -131,7 +131,7 @@ impl SplitAssignmentStop {
         self.stopped.load(Ordering::Acquire)
     }
 
-    fn wait_backoff(&self, duration: Duration) -> bool {
+    pub(crate) fn wait_backoff(&self, duration: Duration) -> bool {
         if self.is_stopped() {
             return true;
         }
@@ -540,6 +540,7 @@ impl SplitAssignmentDriver {
         plan_node_id: i32,
         source: &mut dyn ConnectorReadSplitSource,
         batch_size: usize,
+        dynamic_filter: &ConnectorReadDynamicFilterSnapshot,
     ) -> Result<bool, SplitAssignmentDriverError> {
         if self.closed {
             return Err(SplitAssignmentDriverError::Closed);
@@ -547,14 +548,8 @@ impl SplitAssignmentDriver {
         if self.is_backpressured(plan_node_id) {
             return Ok(false);
         }
-        // The frontend produces no runtime feedback today, so the snapshot it
-        // offers is honestly unconstrained and final rather than a fabricated
-        // pending filter.
         let batch = source
-            .next_batch(
-                batch_size.clamp(1, MAX_SPLITS_PER_UPDATE),
-                &ConnectorReadDynamicFilterSnapshot::all_complete(),
-            )
+            .next_batch(batch_size.clamp(1, MAX_SPLITS_PER_UPDATE), dynamic_filter)
             .map_err(|error| SplitAssignmentDriverError::SplitSource {
                 plan_node_id,
                 detail: error.to_string(),

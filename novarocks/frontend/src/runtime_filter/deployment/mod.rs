@@ -5,4 +5,6 @@
 //! not interpret this policy or wait graph.
 
 mod liveness;
-pub(crate) use liveness::{RuntimeFilterWaitEdge, RuntimeFilterWaitGraph};
+pub(crate) use liveness::{
+    RuntimeFilterLivenessError, RuntimeFilterWaitEdge, RuntimeFilterWaitGraph,
+};

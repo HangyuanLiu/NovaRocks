@@ -28,7 +28,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use novarocks_proto_codec::connector_read::MAX_SPLITS_PER_ASSIGNMENT;
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
-    ConnectorSplitBatch, ConnectorSplitSource, DynamicFilterSnapshot, TupleDomain,
+    ConnectorSplitBatch, ConnectorSplitSource, DynamicFilterSnapshot, SplitSourceProfile,
+    TupleDomain,
 };
 
 use crate::iceberg::spec::{Literal, Schema, StructType, Type};
@@ -126,6 +127,14 @@ pub struct IcebergSplitSource {
     target_split_size: i64,
     merge_adjacent_split_offsets: bool,
     weight_parameters: IcebergSplitWeightParameters,
+    profile: SplitSourceProfile,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FilePruningDecision {
+    Keep,
+    Static,
+    Dynamic,
 }
 
 impl IcebergSplitSource {
@@ -191,17 +200,32 @@ impl IcebergSplitSource {
             target_split_size: i64::try_from(target_split_size).unwrap_or(i64::MAX),
             merge_adjacent_split_offsets: options.merge_adjacent_split_offsets,
             weight_parameters,
+            profile: SplitSourceProfile::default(),
         })
     }
 
-    /// Whether a file's frozen statistics prove it cannot satisfy the static
-    /// predicate. Statistics bound the values a file holds, so a disjoint
-    /// intersection is a proof, never a guess.
-    fn file_is_pruned(&self, file: &IcebergPlannedDataFile) -> Result<bool, ConnectorError> {
-        Ok(self
+    /// Decide whether frozen file statistics exclude a file, and distinguish
+    /// the dynamic-filter contribution from ordinary static pruning. This is
+    /// called only before `splits_for_file`, so no pending/returned split is
+    /// ever retracted.
+    fn file_pruning_decision(
+        &self,
+        file: &IcebergPlannedDataFile,
+        dynamic_filter: &DynamicFilterSnapshot<IcebergColumnHandle>,
+    ) -> Result<FilePruningDecision, ConnectorError> {
+        let static_file_domain = self
             .effective_predicate
-            .intersect(&file.file_statistics_domain)?
-            .is_none())
+            .intersect(&file.file_statistics_domain)?;
+        if static_file_domain.is_none() {
+            return Ok(FilePruningDecision::Static);
+        }
+        if static_file_domain
+            .intersect(dynamic_filter.current_predicate())?
+            .is_none()
+        {
+            return Ok(FilePruningDecision::Dynamic);
+        }
+        Ok(FilePruningDecision::Keep)
     }
 
     fn splits_for_file(
@@ -545,6 +569,10 @@ impl ConnectorSplitSource for IcebergSplitSource {
     type Split = IcebergSplit;
     type Column = IcebergColumnHandle;
 
+    fn profile_snapshot(&self) -> SplitSourceProfile {
+        self.profile
+    }
+
     fn next_batch(
         &mut self,
         max_size: usize,
@@ -556,10 +584,8 @@ impl ConnectorSplitSource for IcebergSplitSource {
         if self.closed || self.exhausted {
             return Ok(ConnectorSplitBatch::finished());
         }
-        // The frontend produces no runtime-filter feedback yet, so this
-        // snapshot is always the complete, unconstrained one. The only thing
-        // worth acting on is an unsatisfiable predicate, which needs no
-        // statistics to decide; whole-file dynamic pruning is NCP-5's.
+        // An unsatisfiable snapshot finishes immediately. Otherwise each
+        // unexpanded file observes this batch's immutable snapshot below.
         if dynamic_filter.current_predicate().is_none() {
             self.exhausted = true;
             return Ok(ConnectorSplitBatch::finished());
@@ -577,17 +603,28 @@ impl ConnectorSplitSource for IcebergSplitSource {
                 break;
             }
             self.next_file += 1;
+            self.profile.files_considered = self.profile.files_considered.saturating_add(1);
             let splits = {
                 let file = &self.files[index];
-                if self.file_is_pruned(file)? {
-                    continue;
+                match self.file_pruning_decision(file, dynamic_filter)? {
+                    FilePruningDecision::Static => continue,
+                    FilePruningDecision::Dynamic => {
+                        self.profile.files_pruned = self.profile.files_pruned.saturating_add(1);
+                        continue;
+                    }
+                    FilePruningDecision::Keep => {}
                 }
+                self.profile.files_expanded = self.profile.files_expanded.saturating_add(1);
                 self.splits_for_file(file)?
             };
             self.pending.extend(splits);
         }
 
         let no_more_splits = self.pending.is_empty() && self.next_file >= self.files.len();
+        self.profile.splits_emitted = self
+            .profile
+            .splits_emitted
+            .saturating_add(u64::try_from(produced.len()).unwrap_or(u64::MAX));
         Ok(ConnectorSplitBatch::new(produced, no_more_splits))
     }
 
@@ -1521,6 +1558,64 @@ mod tests {
         let splits = all_splits(&mut source, 8);
         assert_eq!(splits.len(), 1);
         assert_eq!(splits[0].path(), "b.parquet");
+        assert_eq!(
+            source.profile_snapshot(),
+            SplitSourceProfile {
+                files_considered: 2,
+                files_pruned: 0,
+                files_expanded: 1,
+                splits_emitted: 1,
+            },
+            "static pruning must not be reported as runtime-filter avoided work"
+        );
+    }
+
+    #[test]
+    fn a_completed_dynamic_filter_prunes_a_file_before_split_expansion() {
+        let handle = handle_with(Some(100), BTreeSet::from([amount_column()]));
+        let amount = amount_column();
+        let mut disjoint = planned(read_file("a.parquet", 100, 10));
+        disjoint.file_statistics_domain = TupleDomain::with_column_domains(BTreeMap::from([(
+            amount.clone(),
+            Domain::new(
+                ValueSet::of_values(
+                    ConnectorValueType::BigInt,
+                    vec![ConnectorValue::BigInt(100)],
+                )
+                .expect("value set"),
+                false,
+            ),
+        )]))
+        .expect("statistics");
+        let mut source = split_source_for(&handle, vec![disjoint]);
+        let filter = DynamicFilterSnapshot::new(
+            TupleDomain::with_column_domains(BTreeMap::from([(
+                amount,
+                Domain::new(
+                    ValueSet::of_values(
+                        ConnectorValueType::BigInt,
+                        vec![ConnectorValue::BigInt(5)],
+                    )
+                    .expect("value set"),
+                    false,
+                ),
+            )]))
+            .expect("dynamic predicate"),
+            true,
+        );
+
+        let batch = source.next_batch(8, &filter).expect("batch");
+        assert!(batch.is_empty());
+        assert!(batch.no_more_splits());
+        assert_eq!(
+            source.profile_snapshot(),
+            SplitSourceProfile {
+                files_considered: 1,
+                files_pruned: 1,
+                files_expanded: 0,
+                splits_emitted: 0,
+            }
+        );
     }
 
     #[test]

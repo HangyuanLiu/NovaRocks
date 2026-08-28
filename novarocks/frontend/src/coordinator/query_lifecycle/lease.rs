@@ -45,6 +45,7 @@ use crate::coordinator::query_registry::{
     QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
     RuntimeFilterTerminalRollupUnavailable,
 };
+use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 
 const ACTIVE: u8 = 0;
 const ABORTED: u8 = 1;
@@ -364,6 +365,7 @@ pub(super) struct AttemptControl {
     stop: (Mutex<bool>, Condvar),
     terminal: (Mutex<TerminalState>, Condvar),
     observations: Mutex<FragmentObservationState>,
+    feedback: Mutex<Arc<RuntimeFilterFeedbackState>>,
     readers: Mutex<Vec<JoinHandle<()>>>,
     metrics: Arc<FrontendLifecycleMetrics>,
 }
@@ -394,6 +396,10 @@ impl AttemptControl {
             stop: (Mutex::new(false), Condvar::new()),
             terminal: (Mutex::new(TerminalState::default()), Condvar::new()),
             observations: Mutex::new(FragmentObservationState::default()),
+            feedback: Mutex::new(Arc::new(
+                RuntimeFilterFeedbackState::new(execution_id, Default::default())
+                    .expect("empty runtime filter feedback declaration is valid"),
+            )),
             readers: Mutex::new(Vec::new()),
             metrics,
         })
@@ -405,6 +411,27 @@ impl AttemptControl {
 
     pub(super) const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
+    }
+
+    pub(crate) fn configure_runtime_filter_feedback(
+        &self,
+        declaration: crate::runtime_filter::install_encoder::FrontendRuntimeFilterFeedbackDeclaration,
+    ) -> Result<(), DistributedQueryError> {
+        let state =
+            RuntimeFilterFeedbackState::new(self.execution_id, declaration).map_err(|error| {
+                DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+            })?;
+        *self.feedback.lock().expect("runtime filter feedback state") = Arc::new(state);
+        Ok(())
+    }
+
+    pub(crate) fn install_runtime_filter_feedback_state(
+        &self,
+        state: Arc<RuntimeFilterFeedbackState>,
+    ) {
+        let mut current = self.feedback.lock().expect("runtime filter feedback state");
+        current.close();
+        *current = state;
     }
 
     pub(super) fn set_planned(&self, participants: &[MaterializedParticipant]) {
@@ -901,6 +928,10 @@ impl AttemptControl {
             .primary_error
             .lock()
             .expect("query lifecycle primary error") = Some(primary_error.clone());
+        self.feedback
+            .lock()
+            .expect("runtime filter feedback state")
+            .close();
         self.terminal.1.notify_all();
         self.stop_supervisor();
         self.metrics.attempt_terminated();
@@ -1412,6 +1443,10 @@ impl AttemptControl {
                         // outcome that determined the SQL failure.
                         self.retain_terminal_ingress.store(true, Ordering::Release);
                         self.state.store(ABORTED, Ordering::Release);
+                        self.feedback
+                            .lock()
+                            .expect("runtime filter feedback state")
+                            .close();
                         let decision = failure.into_decision();
                         let primary = format!(
                             "query lifecycle terminal finalization failed: {}",
@@ -1442,6 +1477,10 @@ impl AttemptControl {
                     }
                 };
             self.state.store(FINALIZED, Ordering::Release);
+            self.feedback
+                .lock()
+                .expect("runtime filter feedback state")
+                .close();
             tracing::info!(
                 query_id_high = self.execution_id.query_id().high(),
                 query_id_low = self.execution_id.query_id().low(),
@@ -1452,6 +1491,10 @@ impl AttemptControl {
         } else {
             self.metrics.terminal_finalize_failure();
             self.state.store(ABORTED, Ordering::Release);
+            self.feedback
+                .lock()
+                .expect("runtime filter feedback state")
+                .close();
             let primary = format!("query lifecycle finalize failed: {}", errors.join("; "));
             let cleanup = self.abort_targets(true, &primary);
             let message = if cleanup.is_empty() {
@@ -1630,6 +1673,15 @@ impl AttemptControl {
                 let _ = self.store_fragment_observation(session, observation);
                 Ok(())
             }
+            Some(
+                novarocks_proto_models::novarocks::query_control_response::Event::RuntimeFilterFeedback(
+                    _,
+                ),
+            ) => self
+                .feedback
+                .lock()
+                .expect("runtime filter feedback state")
+                .admit(&event, session.target.process_id(), session.digest.as_bytes()),
             Some(novarocks_proto_models::novarocks::query_control_response::Event::TerminalOutcome(
                 outcome,
             )) => {
