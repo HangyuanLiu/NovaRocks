@@ -22,7 +22,6 @@ use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use novarocks_proto_codec::lifecycle::{QueryExecutionId, QueryTerminationReason};
 use novarocks_types::UniqueId;
 
-use crate::ConnectorExecutionHost;
 use crate::fragment::control::FragmentControlRegistry;
 
 use super::registry::QueryLifecycleLocalRuntime;
@@ -30,18 +29,13 @@ use super::registry::QueryLifecycleLocalRuntime;
 pub(crate) struct NativeQueryLifecycleLocalRuntime {
     runtime: NativeFragmentQueryRuntime,
     controls: Arc<FragmentControlRegistry>,
-    execution_host: Arc<ConnectorExecutionHost>,
 }
 
 impl NativeQueryLifecycleLocalRuntime {
-    pub(crate) fn new(
-        controls: Arc<FragmentControlRegistry>,
-        execution_host: Arc<ConnectorExecutionHost>,
-    ) -> Self {
+    pub(crate) fn new(controls: Arc<FragmentControlRegistry>) -> Self {
         Self {
             runtime: NativeFragmentQueryRuntime::global(),
             controls,
-            execution_host,
         }
     }
 }
@@ -75,10 +69,9 @@ impl QueryLifecycleLocalRuntime for NativeQueryLifecycleLocalRuntime {
     }
 
     fn release_query_resources(&self, execution_id: QueryExecutionId) {
-        // Query lifecycle is the sole terminal authority for execution
-        // leases. Capture of the immutable participant contribution must have
-        // completed before this release can destroy connector-owned state.
-        let _ = self.execution_host.release_query(execution_id);
+        // QueryLifecycleRegistry releases this attempt's exact catalog lease
+        // after outcome freeze. There is no parallel execution-host lease.
+        let _ = execution_id;
     }
 }
 

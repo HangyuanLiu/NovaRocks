@@ -470,7 +470,6 @@ pub fn compose_backend_server_config(
         )
         .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
-        execution_installers: compose_backend_execution_installers(config, runtime.clone())?,
         catalog_runtime_materializers: compose_backend_catalog_runtime_materializers(
             config,
             runtime.clone(),

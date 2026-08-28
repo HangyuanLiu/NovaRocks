@@ -47,7 +47,6 @@ use super::failure_injection::start_with_configured_fragment_failure_trigger;
 use super::failure_injection::{
     FRAGMENT_EXECUTOR_FAILURE_MESSAGE, claim_configured_fragment_failure_trigger,
 };
-use crate::ConnectorExecutionHost;
 use crate::fragment::decode::request::NativeFragmentRequest;
 use crate::fragment::ingress::{
     NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
@@ -66,6 +65,27 @@ pub(super) enum NativeFragmentLifecycleEvent {
 }
 
 type LifecycleObserver = Arc<dyn Fn(NativeFragmentLifecycleEvent) + Send + Sync>;
+
+/// The opaque `ConnectorReadSource` carrier has no FE encoder after the
+/// CatalogHandle cutover. Keep decoding fail-closed while old wire fields are
+/// removed in the next protocol-compatibility revision; it must never regain
+/// a process-wide execution-host lookup path.
+struct RejectLegacyConnectorExecutionResolver;
+
+impl novarocks_spi::connector::ConnectorExecutionResolver for RejectLegacyConnectorExecutionResolver {
+    fn resolve(
+        &self,
+        _key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+    ) -> Result<
+        Arc<novarocks_spi::connector::ConnectorExecutionBinding>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        Err(novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+            "opaque ConnectorReadSource is retired; use typed_connector_read",
+        ))
+    }
+}
 
 /// The native task-update protocol owns this ceiling.  Execution receives the
 /// value as configuration and therefore does not depend on ProtoCodec.
@@ -146,7 +166,6 @@ pub struct NativeFragmentService {
     lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
     connector_registry: Arc<ConnectorRegistry>,
-    execution_host: Arc<ConnectorExecutionHost>,
     execution_runtime: Arc<ExecutionRuntime>,
     commit_port: Arc<dyn FragmentCommitPort>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
@@ -199,7 +218,6 @@ impl NativeFragmentService {
             Arc::new(FragmentControlRegistry::default()),
             lifecycle,
             connector_registry,
-            Arc::new(ConnectorExecutionHost::empty_for_tests()),
             test_execution_runtime(),
         )
     }
@@ -215,7 +233,6 @@ impl NativeFragmentService {
         controls: Arc<FragmentControlRegistry>,
         lifecycle: Arc<QueryLifecycleRegistry>,
         connector_registry: Arc<ConnectorRegistry>,
-        execution_host: Arc<ConnectorExecutionHost>,
         execution_runtime: Arc<ExecutionRuntime>,
     ) -> Self {
         Self {
@@ -226,7 +243,6 @@ impl NativeFragmentService {
             lookup_client,
             result_writer,
             connector_registry,
-            execution_host,
             execution_runtime,
             commit_port: Arc::new(BackendSinkCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
@@ -275,7 +291,6 @@ impl NativeFragmentService {
             controls,
             lifecycle,
             Arc::new(ConnectorRegistry::new()),
-            Arc::new(ConnectorExecutionHost::empty_for_tests()),
             test_execution_runtime(),
         );
         service.lifecycle_observer = Some(Arc::new(observer));
@@ -597,7 +612,7 @@ impl NativeFragmentService {
                 fragment.plan().clone(),
                 fragment.instance_params().clone(),
                 Arc::clone(&self.connector_registry),
-                Arc::new(self.execution_host.resolver_for(execution_id)),
+                Arc::new(RejectLegacyConnectorExecutionResolver),
                 self.queries
                     .connector_cancellation_for_execution(execution_id),
                 std::time::Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
@@ -1212,7 +1227,6 @@ fn test_lifecycle_registry(controls: Arc<FragmentControlRegistry>) -> Arc<QueryL
         Arc::new(
             crate::query_lifecycle::NativeQueryLifecycleLocalRuntime::new(
                 controls,
-                Arc::new(ConnectorExecutionHost::empty_for_tests()),
             ),
         ),
         crate::query_lifecycle::QueryLifecycleRegistryConfig::new(

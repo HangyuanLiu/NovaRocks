@@ -16,7 +16,7 @@ use novarocks_proto_codec::membership::BackendProcessDescriptor;
 use novarocks_proto_codec::membership::{
     BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
 };
-use novarocks_spi::connector::{CatalogRuntimeMaterializer, ConnectorExecutionInstaller};
+use novarocks_spi::connector::CatalogRuntimeMaterializer;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 
 use crate::BackendDataRuntime;
@@ -65,11 +65,6 @@ pub struct BackendServerConfig {
     /// Server-resolved per-fragment terminal write evidence budget.
     pub write_commit_evidence_limits: WriteCommitEvidenceLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
-    /// Provider-owned execution installers composed by the server role.
-    ///
-    /// Backend only owns registration and lifecycle of these contributions; it
-    /// never constructs a provider-specific installer or catalog binding.
-    pub execution_installers: Vec<Arc<dyn ConnectorExecutionInstaller>>,
     /// Provider-owned materializers for immutable catalog properties. The set
     /// is sealed before query lifecycle admission and contains all local
     /// credential and client construction authority.
@@ -139,7 +134,6 @@ pub struct BackendApplicationHost {
     grpc_server: BackendRpcServerHandle,
     _native_fragment_service: Arc<NativeFragmentService>,
     _query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
-    execution_host: Arc<crate::ConnectorExecutionHost>,
     _execution_runtime: Arc<ExecutionRuntime>,
     query_lifecycle_sweep: QueryLifecycleSweepTask,
     metrics_http_server: MetricsHttpServer,
@@ -291,7 +285,6 @@ impl fmt::Debug for BackendApplicationHost {
 struct BackendApplicationServices {
     native_fragment_service: Arc<NativeFragmentService>,
     query_lifecycle_registry: Arc<QueryLifecycleRegistry>,
-    execution_host: Arc<crate::ConnectorExecutionHost>,
     execution_runtime: Arc<ExecutionRuntime>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
@@ -488,7 +481,6 @@ fn compose_backend_application_services(
     query_lifecycle_config: QueryLifecycleRegistryConfig,
     native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
-    execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
     catalog_runtime_materializers: &[Arc<dyn CatalogRuntimeMaterializer>],
     read_execution_bundle_factories: &[(
         novarocks_spi::connector::ConnectorExecutionProviderKind,
@@ -506,11 +498,7 @@ fn compose_backend_application_services(
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
         BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
     );
-    let execution_host = seal_connector_execution_host(execution_installers)?;
-    let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(
-        Arc::clone(&controls),
-        Arc::clone(&execution_host),
-    ));
+    let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(Arc::clone(&controls)));
     let catalog_runtime_materializers = Arc::new(
         crate::connector::catalog_manager::CatalogRuntimeMaterializerSet::try_new_with_execution_factories(
             catalog_runtime_materializers.iter().cloned(),
@@ -545,7 +533,6 @@ fn compose_backend_application_services(
             Arc::clone(&controls),
             Arc::clone(&query_lifecycle_registry),
             connector_registry,
-            Arc::clone(&execution_host),
             Arc::clone(&execution_runtime),
         )
         .with_write_commit_evidence_limits(write_commit_evidence_limits)
@@ -555,7 +542,6 @@ fn compose_backend_application_services(
         native_fragment_service.clone();
     query_lifecycle_registry.install_terminal_cleanup(Arc::downgrade(&terminal_cleanup));
     controls.publish_resource_snapshot();
-    execution_host.publish_resource_snapshot();
     crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global()
         .publish_resource_snapshot();
     let query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress> =
@@ -566,7 +552,6 @@ fn compose_backend_application_services(
     Ok(BackendApplicationServices {
         native_fragment_service,
         query_lifecycle_registry,
-        execution_host,
         execution_runtime,
         exchange_receiver_port,
         query_lifecycle_ingress,
@@ -584,25 +569,6 @@ fn catalog_provider_kind(
             novarocks_spi::connector::CatalogProviderKind::StarRocks
         }
     }
-}
-
-fn seal_connector_execution_host(
-    execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
-) -> Result<Arc<crate::ConnectorExecutionHost>, BackendApplicationError> {
-    #[cfg(test)]
-    if execution_installers.is_empty() {
-        // Application tests exercise lifecycle wiring without a provider
-        // composition root. Production startup never takes this branch.
-        return Ok(Arc::new(crate::ConnectorExecutionHost::empty_for_tests()));
-    }
-    crate::ConnectorExecutionHost::try_new(execution_installers.iter().cloned())
-        .map(Arc::new)
-        .map_err(|error| {
-            BackendApplicationError::new(
-                BackendApplicationErrorKind::Configuration,
-                format!("seal connector execution installer set: {error}"),
-            )
-        })
 }
 
 impl BackendApplicationHost {
@@ -678,15 +644,10 @@ impl BackendApplicationHost {
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
         self.announce_task.stop();
         let listener_shutdown = self.grpc_server.stop();
-        let execution_shutdown = self
-            .execution_host
-            .shutdown()
-            .map_err(|error| error.to_string());
         let sweep_result = self.query_lifecycle_sweep.stop();
         let metrics_result = self.metrics_http_server.stop();
         combine_shutdown_results(listener_shutdown, sweep_result)
             .and(metrics_result)
-            .and(execution_shutdown)
             .map_err(|error| {
                 BackendApplicationError::new(BackendApplicationErrorKind::Shutdown, error)
             })
@@ -713,7 +674,6 @@ impl BackendApplicationHost {
             query_lifecycle_config,
             write_commit_evidence_limits,
             execution_runtime_config,
-            execution_installers,
             catalog_runtime_materializers,
             read_execution_bundle_factories,
             write_execution_bundle_factories,
@@ -733,7 +693,6 @@ impl BackendApplicationHost {
             query_lifecycle_config,
             native_compatibility_id,
             write_commit_evidence_limits,
-            &execution_installers,
             &catalog_runtime_materializers,
             &read_execution_bundle_factories,
             &write_execution_bundle_factories,
@@ -844,7 +803,6 @@ impl BackendApplicationHost {
             grpc_server,
             _native_fragment_service: native_fragment_service,
             _query_lifecycle_registry: services.query_lifecycle_registry,
-            execution_host: services.execution_host,
             _execution_runtime: services.execution_runtime,
             query_lifecycle_sweep,
             metrics_http_server,
@@ -1154,7 +1112,6 @@ mod tests {
             query_lifecycle_config: query_lifecycle_registry_config(Duration::from_millis(5_000)),
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
             execution_runtime_config: execution_runtime_config(),
-            execution_installers: Vec::new(),
             catalog_runtime_materializers: Vec::new(),
             read_execution_bundle_factories: Vec::new(),
             write_execution_bundle_factories: Vec::new(),
@@ -1297,7 +1254,6 @@ mod tests {
             query_lifecycle_registry_config(Duration::from_millis(5_000)),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             WriteCommitEvidenceLimits::default(),
-            &[],
             &[],
             &[],
             &[],
