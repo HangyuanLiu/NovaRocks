@@ -1659,8 +1659,8 @@ mod tests {
     }
 
     #[test]
-    fn delivered_splits_reach_the_queue_the_decode_context_opens() {
-        // Delivery and decode derive the task key independently. If they ever
+    fn delivered_splits_reach_the_staged_decode_context_queue() {
+        // Stage and delivery derive the task key independently. If they ever
         // disagreed, a task would block forever on a queue nobody fills.
         let _service_guard = SERVICE_TEST_LOCK.lock().expect("service test lock");
         let service = NativeFragmentService::new(
@@ -1681,6 +1681,27 @@ mod tests {
         )
         .expect("execution id");
         let fragment_instance_id = novarocks_types::UniqueId::new(77, 9);
+        let attempt_key =
+            novarocks_execution::connector::TaskAttemptKey::new(execution_id, fragment_instance_id);
+        let mut provisional_read_context = super::ProvisionalTypedReadContext::new(
+            Arc::clone(&service.read_contexts),
+            attempt_key,
+        );
+        let params = novarocks_proto_models::novarocks::InstanceParams {
+            fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
+                hi: fragment_instance_id.high(),
+                lo: fragment_instance_id.low(),
+            }),
+            ..Default::default()
+        };
+        let runtime = service.typed_scan_runtime(execution_id, &params);
+        runtime
+            .register_read_execution(
+                3,
+                crate::connector::typed_runtime::test_support::installed_read_execution(),
+            )
+            .expect("stage registers the typed read execution");
+        provisional_read_context.publish();
 
         let raw = novarocks_proto_models::connector_read::SplitAssignment {
             plan_node_id: 3,
@@ -1705,14 +1726,6 @@ mod tests {
             crate::query_lifecycle::task_update::TaskUpdateAck::Accepted(_)
         ));
 
-        let params = novarocks_proto_models::novarocks::InstanceParams {
-            fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
-                hi: fragment_instance_id.high(),
-                lo: fragment_instance_id.low(),
-            }),
-            ..Default::default()
-        };
-        let runtime = service.typed_scan_runtime(execution_id, &params);
         let queue = runtime
             .queues()
             .existing_queue(3)

@@ -45,14 +45,15 @@ use arrow::array::{
 use arrow::datatypes::{Field, FieldRef, Schema as ArrowSchema};
 use novarocks_fs::{
     FileBatchReader, FileIdentity, FileProjection, FileReadBudget, FileReadContext, FileReadRange,
-    FileReadRequest, FileReaderOptions, FsAccessHandle, ParquetMetadataInspection,
-    ParquetPhysicalType, ParquetStatisticsSortOrder, ParquetStatisticsValue, PhysicalPruning,
-    inspect_parquet_metadata, open_file_reader,
+    FileReadRequest, FileReaderOptions, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue,
+    ParquetMetadataInspection, ParquetPhysicalType, ParquetStatisticsSortOrder,
+    ParquetStatisticsValue, PhysicalPruning, ScanPredicate, ScanPredicateDomain,
+    ScanPredicateSource, inspect_parquet_metadata, open_file_reader,
 };
 use novarocks_spi::connector::read_stack::DynamicFilter;
 use novarocks_spi::connector::read_stack::{
-    BoundsMatch, ColumnValueBounds, ConnectorPageSource, ConnectorSplit, ConnectorValue,
-    ConnectorValueType, Domain, PageSourceMetrics, SourcePage, TupleDomain,
+    Bound, BoundsMatch, ColumnValueBounds, ConnectorPageSource, ConnectorSplit, ConnectorValue,
+    ConnectorValueType, Domain, PageSourceFileMetrics, PageSourceMetrics, SourcePage, TupleDomain,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
@@ -66,6 +67,136 @@ use super::change_window::IcebergChangeWindowHandle;
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, parse_type, unsupported};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager, SplitDeleteFilter};
 pub(super) type IcebergDynamicFilter = dyn DynamicFilter<IcebergColumnHandle>;
+
+/// Lower the exact, non-null part of the typed Iceberg predicate into the
+/// connector-neutral file predicate vocabulary.
+///
+/// This is an optional pruning optimization. The page source still evaluates
+/// the complete typed domain row by row, so any shape that cannot be expressed
+/// exactly here is deliberately omitted instead of being approximated. In
+/// particular, nullable domains and nested columns stay residual: pruning
+/// either with a physical min/max statistic could discard a matching NULL or
+/// bind an incomplete Parquet path.
+fn static_file_predicates(predicate: &TupleDomain<IcebergColumnHandle>) -> Vec<ScanPredicate> {
+    let Some(domains) = predicate.domains() else {
+        return Vec::new();
+    };
+    let mut predicates = Vec::new();
+    for (column, domain) in domains {
+        if domain.null_allowed() || !column.is_base_column() {
+            continue;
+        }
+        let values = domain.values();
+        if let Some(discrete) = values.discrete_values() {
+            let Some(values) = discrete
+                .into_iter()
+                .map(file_predicate_value)
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            let (Some(min), Some(max)) = (values.first().cloned(), values.last().cloned()) else {
+                continue;
+            };
+            predicates.push(file_predicate(
+                column,
+                ScanPredicateDomain::DiscreteSet { values, min, max },
+            ));
+            continue;
+        }
+
+        let [range] = values.ranges() else {
+            // Multiple non-discrete ranges form a union, while multiple file
+            // predicates form a conjunction. Keep that shape residual.
+            continue;
+        };
+        if let Some(value) = range.single_value() {
+            let Some(value) = file_predicate_value(value) else {
+                continue;
+            };
+            predicates.push(file_predicate(
+                column,
+                ScanPredicateDomain::Range {
+                    op: MinMaxPredicateOp::Eq,
+                    value,
+                },
+            ));
+            continue;
+        }
+        let Some(low) = file_bound_predicate(range.low(), true) else {
+            continue;
+        };
+        let Some(high) = file_bound_predicate(range.high(), false) else {
+            continue;
+        };
+        for (op, value) in low.into_iter().chain(high) {
+            predicates.push(file_predicate(
+                column,
+                ScanPredicateDomain::Range { op, value },
+            ));
+        }
+    }
+    predicates
+}
+
+fn file_predicate(column: &IcebergColumnHandle, domain: ScanPredicateDomain) -> ScanPredicate {
+    ScanPredicate::new(
+        column.base_column_identity().name(),
+        domain,
+        ScanPredicateSource::Static,
+    )
+    .with_physical_field_id(column.base_field_id())
+}
+
+/// `None` means the bound's value has no exact physical min/max carrier;
+/// `Some(None)` means the bound is unbounded.
+fn file_bound_predicate(
+    bound: &Bound,
+    lower: bool,
+) -> Option<Option<(MinMaxPredicateOp, MinMaxPredicateValue)>> {
+    match bound {
+        Bound::Unbounded => Some(None),
+        Bound::Inclusive(value) => Some(Some((
+            if lower {
+                MinMaxPredicateOp::Ge
+            } else {
+                MinMaxPredicateOp::Le
+            },
+            file_predicate_value(value)?,
+        ))),
+        Bound::Exclusive(value) => Some(Some((
+            if lower {
+                MinMaxPredicateOp::Gt
+            } else {
+                MinMaxPredicateOp::Lt
+            },
+            file_predicate_value(value)?,
+        ))),
+    }
+}
+
+fn file_predicate_value(value: &ConnectorValue) -> Option<MinMaxPredicateValue> {
+    match value {
+        ConnectorValue::Boolean(value) => Some(MinMaxPredicateValue::Boolean(*value)),
+        ConnectorValue::Integer(value) => Some(MinMaxPredicateValue::Int32(*value)),
+        ConnectorValue::BigInt(value) => Some(MinMaxPredicateValue::Int64(*value)),
+        // Parquet exposes DATE statistics and page indexes as physical INT32.
+        ConnectorValue::Date(value) => Some(MinMaxPredicateValue::Int32(*value)),
+        ConnectorValue::TimeMicros(value)
+        | ConnectorValue::TimestampMicros(value)
+        | ConnectorValue::TimestampTzMicros(value)
+        | ConnectorValue::TimestampNanos(value)
+        | ConnectorValue::TimestampTzNanos(value) => Some(MinMaxPredicateValue::Int64(*value)),
+        ConnectorValue::TinyInt(_)
+        | ConnectorValue::Real(_)
+        | ConnectorValue::Double(_)
+        | ConnectorValue::Decimal { .. }
+        | ConnectorValue::Varchar(_)
+        | ConnectorValue::Varbinary(_)
+        | ConnectorValue::Uuid(_)
+        | ConnectorValue::Fixed(_) => None,
+    }
+}
 
 use super::schema_binding::{
     FileFieldIdCoverage, IcebergColumnSource, IcebergSchemaBinding, IcebergSchemaBindingRequest,
@@ -722,6 +853,8 @@ pub fn create_iceberg_page_source(
         row_window: ReaderPageSourceWithRowPositions::default(),
         retired_bytes: 0,
         completed_bytes: 0,
+        retired_file_metrics: Default::default(),
+        file_metrics: Default::default(),
         completed_positions: 0,
         read_time_nanos: 0,
         retained_bytes: split.retained_size_in_bytes(),
@@ -917,6 +1050,7 @@ impl ConnectorPageSource for IcebergPartitionOnlyPageSource {
             completed_bytes: 0,
             completed_positions: self.emitted_rows,
             read_time_nanos: 0,
+            ..Default::default()
         }
     }
 
@@ -1046,6 +1180,10 @@ pub struct IcebergParquetPageSource {
     /// group still reports one monotonic total.
     retired_bytes: u64,
     completed_bytes: u64,
+    /// File counters from readers already retired by this split.
+    retired_file_metrics: novarocks_fs::FileMetricsSnapshot,
+    /// Monotonic total including the currently open reader.
+    file_metrics: novarocks_fs::FileMetricsSnapshot,
     completed_positions: u64,
     read_time_nanos: u64,
     retained_bytes: u64,
@@ -1325,7 +1463,7 @@ impl IcebergParquetPageSource {
             range,
             projection,
             budget: self.budget,
-            predicates: Vec::new(),
+            predicates: static_file_predicates(&self.effective_predicate),
             pruning: PhysicalPruning {
                 row_groups: row_groups.map(|ordinals| {
                     ordinals
@@ -1403,6 +1541,7 @@ impl ConnectorPageSource for IcebergParquetPageSource {
             completed_bytes: self.completed_bytes,
             completed_positions: self.completed_positions,
             read_time_nanos: self.read_time_nanos,
+            file: page_source_file_metrics(self.file_metrics),
         }
     }
 
@@ -1428,9 +1567,9 @@ impl ConnectorPageSource for IcebergParquetPageSource {
             ..
         } = state
         {
-            self.completed_bytes = self
-                .retired_bytes
-                .saturating_add(reader.metrics_snapshot().bytes_read);
+            self.file_metrics =
+                file_metrics_saturating_add(self.retired_file_metrics, reader.metrics_snapshot());
+            self.completed_bytes = self.file_metrics.bytes_read;
             reader.close().map_err(map_file_error)?;
         }
         Ok(())
@@ -1466,14 +1605,17 @@ impl IcebergParquetPageSource {
                 return Ok(None);
             };
 
-            let next = reader.next_batch().map_err(map_file_error)?;
-            let bytes_read = reader.metrics_snapshot().bytes_read;
-            self.completed_bytes = self.retired_bytes.saturating_add(bytes_read);
+            let next = reader.next_batch();
+            self.file_metrics =
+                file_metrics_saturating_add(self.retired_file_metrics, reader.metrics_snapshot());
+            self.completed_bytes = self.file_metrics.bytes_read;
+            let next = next.map_err(map_file_error)?;
             let Some(file_batch) = next else {
                 // This run is drained. Retire its byte counter and let the plan
                 // decide, against the filter as it now stands, what comes next.
                 let exhausted = plan.is_exhausted();
                 self.retired_bytes = self.completed_bytes;
+                self.retired_file_metrics = self.file_metrics;
                 let ReaderState::Open { reader, .. } = &mut self.state else {
                     self.finished = true;
                     return Ok(None);
@@ -1575,6 +1717,63 @@ impl IcebergParquetPageSource {
                 .saturating_add(page.position_count() as u64);
             return Ok(Some(page));
         }
+    }
+}
+
+fn file_metrics_saturating_add(
+    left: novarocks_fs::FileMetricsSnapshot,
+    right: novarocks_fs::FileMetricsSnapshot,
+) -> novarocks_fs::FileMetricsSnapshot {
+    novarocks_fs::FileMetricsSnapshot {
+        bytes_read: left.bytes_read.saturating_add(right.bytes_read),
+        read_requests: left.read_requests.saturating_add(right.read_requests),
+        rows_decoded: left.rows_decoded.saturating_add(right.rows_decoded),
+        batches_delivered: left
+            .batches_delivered
+            .saturating_add(right.batches_delivered),
+        cache_hits: left.cache_hits.saturating_add(right.cache_hits),
+        cache_misses: left.cache_misses.saturating_add(right.cache_misses),
+        io_time_ns: left.io_time_ns.saturating_add(right.io_time_ns),
+        decode_time_ns: left.decode_time_ns.saturating_add(right.decode_time_ns),
+        row_groups_read: left.row_groups_read.saturating_add(right.row_groups_read),
+        row_groups_pruned: left
+            .row_groups_pruned
+            .saturating_add(right.row_groups_pruned),
+        delayed_materialization_ranges: left
+            .delayed_materialization_ranges
+            .saturating_add(right.delayed_materialization_ranges),
+        page_index_attempts: left
+            .page_index_attempts
+            .saturating_add(right.page_index_attempts),
+        page_index_fallbacks: left
+            .page_index_fallbacks
+            .saturating_add(right.page_index_fallbacks),
+        page_index_rows_considered: left
+            .page_index_rows_considered
+            .saturating_add(right.page_index_rows_considered),
+        page_index_rows_pruned: left
+            .page_index_rows_pruned
+            .saturating_add(right.page_index_rows_pruned),
+    }
+}
+
+fn page_source_file_metrics(metrics: novarocks_fs::FileMetricsSnapshot) -> PageSourceFileMetrics {
+    PageSourceFileMetrics {
+        bytes_read: metrics.bytes_read,
+        read_requests: metrics.read_requests,
+        rows_decoded: metrics.rows_decoded,
+        batches_delivered: metrics.batches_delivered,
+        cache_hits: metrics.cache_hits,
+        cache_misses: metrics.cache_misses,
+        io_time_ns: metrics.io_time_ns,
+        decode_time_ns: metrics.decode_time_ns,
+        row_groups_read: metrics.row_groups_read,
+        row_groups_pruned: metrics.row_groups_pruned,
+        delayed_materialization_ranges: metrics.delayed_materialization_ranges,
+        page_index_attempts: metrics.page_index_attempts,
+        page_index_fallbacks: metrics.page_index_fallbacks,
+        page_index_rows_considered: metrics.page_index_rows_considered,
+        page_index_rows_pruned: metrics.page_index_rows_pruned,
     }
 }
 
@@ -1780,6 +1979,60 @@ mod tests {
             ])
             .build()
             .expect("frozen table schema")
+    }
+
+    #[test]
+    fn typed_bigint_lower_bound_becomes_a_physical_file_predicate() {
+        let schema = iceberg_schema();
+        let column = IcebergColumnHandle::base_column_of(&schema, 1).expect("id handle");
+        let range = novarocks_spi::connector::read_stack::Range::try_new(
+            ConnectorValueType::BigInt,
+            Bound::Inclusive(ConnectorValue::BigInt(199_000)),
+            Bound::Unbounded,
+        )
+        .expect("lower bound");
+        let domain = Domain::new(
+            novarocks_spi::connector::read_stack::ValueSet::of_ranges(
+                ConnectorValueType::BigInt,
+                vec![range],
+            )
+            .expect("value set"),
+            false,
+        );
+        let predicate = TupleDomain::with_column_domains([(column, domain)].into_iter().collect())
+            .expect("tuple domain");
+
+        let predicates = static_file_predicates(&predicate);
+
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].column(), "id");
+        assert_eq!(predicates[0].physical_field_id(), Some(1));
+        assert_eq!(predicates[0].source(), ScanPredicateSource::Static);
+        assert_eq!(
+            predicates[0].domain(),
+            &ScanPredicateDomain::Range {
+                op: MinMaxPredicateOp::Ge,
+                value: MinMaxPredicateValue::Int64(199_000),
+            }
+        );
+    }
+
+    #[test]
+    fn nullable_typed_domain_stays_residual() {
+        let schema = iceberg_schema();
+        let column = IcebergColumnHandle::base_column_of(&schema, 1).expect("id handle");
+        let domain = Domain::new(
+            novarocks_spi::connector::read_stack::ValueSet::of_values(
+                ConnectorValueType::BigInt,
+                vec![ConnectorValue::BigInt(7)],
+            )
+            .expect("value set"),
+            true,
+        );
+        let predicate = TupleDomain::with_column_domains([(column, domain)].into_iter().collect())
+            .expect("tuple domain");
+
+        assert!(static_file_predicates(&predicate).is_empty());
     }
 
     fn arrow_file_schema() -> Arc<ArrowSchema> {

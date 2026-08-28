@@ -305,6 +305,7 @@ pub trait ProviderReadFactory<P: ProviderReadRuntime>: Send + Sync {
     fn create_page_source_provider(
         &self,
         request: &ConnectorRequestContext,
+        options: super::ConnectorPageSourceProviderOptions,
     ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError>;
 
     fn create_system_table_provider(
@@ -911,9 +912,10 @@ impl<P: ProviderReadRuntime, F: ProviderReadFactory<P>> ConnectorReadProviderFac
     fn create_page_source_provider(
         &self,
         request: &ConnectorRequestContext,
+        options: super::ConnectorPageSourceProviderOptions,
     ) -> Result<Arc<dyn ConnectorReadPageSourceProvider>, ConnectorError> {
         Ok(Arc::new(AdapterPageSourceProvider {
-            provider: self.factory.create_page_source_provider(request)?,
+            provider: self.factory.create_page_source_provider(request, options)?,
             adapter: ReadRuntimeAdapter::clone(&self.adapter),
         }))
     }

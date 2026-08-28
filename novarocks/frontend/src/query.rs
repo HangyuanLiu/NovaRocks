@@ -1239,9 +1239,20 @@ impl FrontendQuerySession {
                     result = &mut worker => break result.map_err(|error| internal_error(error.to_string()))?,
                     _ = tokio::time::sleep(Duration::from_millis(10)) => {
                         if cancellation.is_cancelled() {
-                            return Err(cancellation_error(
-                                cancellation.reason().expect("cancelled statement has a reason"),
-                            ));
+                            let reason = cancellation
+                                .reason()
+                                .expect("cancelled statement has a reason");
+                            if cancellation_requires_statement_fence(&reason) {
+                                // KILL QUERY keeps the client connection alive.
+                                // Do not return its interrupt until the worker
+                                // has released the exact statement generation,
+                                // otherwise the next command races that lease
+                                // and is rejected as StatementBusy.
+                                break (&mut worker)
+                                    .await
+                                    .map_err(|error| internal_error(error.to_string()))?;
+                            }
+                            return Err(cancellation_error(reason));
                         }
                     }
                 }
@@ -2097,6 +2108,16 @@ fn cancellation_error(reason: QueryCancellationReason) -> QueryServiceError {
     QueryServiceError::new(kind, message)
 }
 
+/// Whether cancellation must release the current statement before the
+/// protocol may answer the client.
+///
+/// Only KILL QUERY preserves the same connection for another command. The
+/// disconnect and shutdown forms deliberately retain their bounded-return
+/// behavior because no successor statement may be admitted on that session.
+fn cancellation_requires_statement_fence(reason: &QueryCancellationReason) -> bool {
+    matches!(reason, QueryCancellationReason::ExplicitKill { .. })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2827,6 +2848,25 @@ mod tests {
             .kind(),
             QueryServiceErrorKind::Interrupted
         );
+    }
+
+    #[test]
+    fn only_kill_query_fences_the_successor_statement() {
+        assert!(cancellation_requires_statement_fence(
+            &QueryCancellationReason::ExplicitKill {
+                requester_connection_id: 8,
+            }
+        ));
+        for reason in [
+            QueryCancellationReason::ExplicitKillConnection {
+                requester_connection_id: 8,
+            },
+            QueryCancellationReason::ClientDisconnected,
+            QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms: 10 },
+            QueryCancellationReason::ServerShutdown,
+        ] {
+            assert!(!cancellation_requires_statement_fence(&reason));
+        }
     }
 
     #[test]

@@ -479,13 +479,24 @@ fn assert_idle_session_statement_is_rejected(connection: &mut mysql::Conn) -> Re
 }
 
 fn static_snapshot_launch_config(snapshot: &Path) -> ScenarioLaunchConfig {
+    let object_store = r#"
+[connector.object_store]
+endpoint = "${ENV:AWS_S3_ENDPOINT}"
+access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"
+access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
+region = "us-east-1"
+enable_path_style_access = true
+"#;
     ScenarioLaunchConfig {
         config_overlay: CrossProcessConfigOverlay {
             fe: Some(format!(
-                "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n",
-                snapshot.display()
+                "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n{object_store}",
+                snapshot.display(),
             )),
-            be: None,
+            // The StaticFile catalog points at a REST warehouse on S3. Both
+            // application roles resolve that process-local binding; no
+            // credential may cross the native plan boundary.
+            be: Some(object_store.to_string()),
         },
         ..Default::default()
     }

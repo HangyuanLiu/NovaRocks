@@ -604,7 +604,6 @@ pub(super) mod test_support {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
 
@@ -618,7 +617,7 @@ mod tests {
         );
         assert_eq!(connector_value_type(&DataType::Int16), None);
         assert_eq!(
-            scan_output_value_type(&DataType::LargeUtf8),
+            scan_output_value_type(&DataType::LargeBinary),
             Some(ConnectorValueType::NonComparable)
         );
     }

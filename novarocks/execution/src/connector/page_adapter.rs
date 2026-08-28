@@ -218,14 +218,16 @@ impl ConnectorPageAdapter {
         let Some(source) = self.source.as_mut() else {
             return Ok(PageConversion::Finished);
         };
-        let page = source
-            .next_source_page()
-            .map_err(|error| PageAdapterError::from_connector(error, "connector page source"))?;
+        let page = source.next_source_page();
         // Counters are refreshed on every pull, including an empty one: an idle
-        // source still reports the time it spent waiting.
+        // source still reports the time it spent waiting. Refresh before
+        // propagating an error as well, because failed I/O may have advanced
+        // physical reader counters.
         self.metrics = source.metrics();
         self.source_memory_usage_bytes = source.memory_usage_bytes();
         let finished = source.is_finished();
+        let page =
+            page.map_err(|error| PageAdapterError::from_connector(error, "connector page source"))?;
 
         match page {
             Some(page) => {
@@ -249,8 +251,12 @@ impl ConnectorPageAdapter {
         let Some(mut source) = self.source.take() else {
             return Ok(());
         };
-        source
-            .close()
+        let result = source.close();
+        // Close may retire the final underlying file reader, so its terminal
+        // snapshot is authoritative even when close itself reports an error.
+        self.metrics = source.metrics();
+        self.source_memory_usage_bytes = source.memory_usage_bytes();
+        result
             .map_err(|error| PageAdapterError::from_connector(error, "connector page source close"))
     }
 
