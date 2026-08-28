@@ -25,9 +25,9 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
-    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
+    ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorMetadata, ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
     ExternalMutationEvidence, ExternalMutationOutcome,
 };
 
@@ -969,14 +969,15 @@ pub trait ConnectorDataMutationResolver: Send + Sync {
 
     fn acquire_exact_data_mutation(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorDataMutationLease, ConnectorError>;
 }
 
 #[derive(Clone)]
 pub struct ConnectorDataMutationLease {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    control_runtime_id: ConnectorControlRuntimeId,
+    provider_binding_key: ConnectorExecutionBindingKey,
     metadata: Arc<dyn ConnectorMetadata>,
     mutation: Arc<dyn ConnectorDataMutation>,
     _release: Arc<DataMutationLeaseRelease>,
@@ -991,15 +992,19 @@ struct DataMutationLeaseRelease {
 impl ConnectorDataMutationLease {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
-        key: ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
+        provider_incarnation: ConnectorInstanceIncarnation,
         metadata: Arc<dyn ConnectorMetadata>,
         mutation: Arc<dyn ConnectorDataMutation>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
-        if descriptor.instance_id != key.instance_id
-            || metadata.instance_id() != &descriptor.instance_id
+        let provider_binding_key = ConnectorExecutionBindingKey {
+            instance_id: descriptor.instance_id.clone(),
+            incarnation: provider_incarnation,
+        };
+        if metadata.instance_id() != &descriptor.instance_id
             || mutation.descriptor() != &descriptor
-            || mutation.binding_key() != &key
+            || mutation.binding_key() != &provider_binding_key
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -1008,7 +1013,8 @@ impl ConnectorDataMutationLease {
         }
         Ok(Self {
             descriptor,
-            key,
+            control_runtime_id,
+            provider_binding_key,
             metadata,
             mutation,
             _release: Arc::new(DataMutationLeaseRelease {
@@ -1021,12 +1027,30 @@ impl ConnectorDataMutationLease {
         &self.descriptor
     }
 
-    pub fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-        &self.key
+    pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
+        self.control_runtime_id
     }
 
     pub fn metadata(&self) -> &Arc<dyn ConnectorMetadata> {
         &self.metadata
+    }
+
+    /// Builds and validates a provider request behind the FE-owned runtime
+    /// lease. The provider's legacy generation fence remains private to this
+    /// capability boundary; callers retain only the control-runtime owner.
+    pub fn plan_operation(
+        &self,
+        operation_id: ConnectorMutationOperationId,
+        operation: ConnectorDataMutationOperation,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorDataMutationPlan, ConnectorError> {
+        let request = ConnectorDataMutationPlanningRequest::try_new(
+            operation_id,
+            self.provider_binding_key.clone(),
+            operation,
+            context,
+        )?;
+        self.plan_mutation(request)
     }
 
     pub fn plan_mutation(
@@ -1036,7 +1060,7 @@ impl ConnectorDataMutationLease {
         self.validate_planning_request(&request)?;
         let plan = self.mutation.plan_mutation(request.clone())?;
         plan.validate()?;
-        if plan.owner != self.key
+        if plan.owner != self.provider_binding_key
             || plan.operation_id != request.operation_id
             || plan.operation_kind.as_ref() != request.operation.kind()
             || plan.request_digest != request.request_digest
@@ -1075,7 +1099,7 @@ impl ConnectorDataMutationLease {
         request: &ConnectorDataMutationPlanningRequest,
     ) -> Result<(), ConnectorError> {
         request.validate()?;
-        if request.owner != self.key {
+        if request.owner != self.provider_binding_key {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector data mutation request does not match its lease generation",
@@ -1086,7 +1110,7 @@ impl ConnectorDataMutationLease {
 
     fn validate_plan(&self, plan: &ConnectorDataMutationPlan) -> Result<(), ConnectorError> {
         plan.validate()?;
-        if plan.owner != self.key {
+        if plan.owner != self.provider_binding_key {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector data mutation plan does not match its lease generation",
@@ -1100,9 +1124,9 @@ impl ConnectorDataMutationLease {
         request: &ConnectorDataMutationReconcileRequest,
     ) -> Result<(), ConnectorError> {
         validate_operation_kind(&request.operation_kind)?;
-        if request.owner != self.key
+        if request.owner != self.provider_binding_key
             || request.evidence.descriptor() != &self.descriptor
-            || request.evidence.incarnation() != self.key.incarnation
+            || request.evidence.incarnation() != self.provider_binding_key.incarnation
             || request.evidence.operation_id() != request.operation_id
             || request.evidence.operation_kind() != request.operation_kind.as_ref()
         {
@@ -1170,7 +1194,7 @@ impl ConnectorDataMutationLease {
         receipt: &ConnectorDataMutationReceipt,
     ) -> Result<(), ConnectorError> {
         if receipt.descriptor != self.descriptor
-            || receipt.incarnation != self.key.incarnation
+            || receipt.incarnation != self.provider_binding_key.incarnation
             || receipt.operation_id != operation_id
             || receipt.operation_kind.as_ref() != operation_kind
             || receipt.request_digest != request_digest
@@ -1192,7 +1216,7 @@ impl ConnectorDataMutationLease {
         evidence: &ExternalMutationEvidence,
     ) -> Result<(), ConnectorError> {
         if evidence.descriptor() != &self.descriptor
-            || evidence.incarnation() != self.key.incarnation
+            || evidence.incarnation() != self.provider_binding_key.incarnation
             || evidence.operation_id() != operation_id
             || evidence.operation_kind() != operation_kind
         {

@@ -384,34 +384,44 @@ impl ConnectorControlHost {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorDataMutationLease, ConnectorError> {
-        let legacy_key = {
+        let control_runtime_id = {
             let state = self.lock_state()?;
-            state.active_legacy_effect(instance_id)?
+            state.active.get(instance_id).copied().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
+                )
+            })?
         };
-        self.acquire_data_mutation(&legacy_key, true)
+        self.acquire_data_mutation(control_runtime_id, true)
     }
 
     fn acquire_exact_data_mutation(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorDataMutationLease, ConnectorError> {
-        self.acquire_data_mutation(key, false)
+        self.acquire_data_mutation(control_runtime_id, false)
     }
 
     fn acquire_data_mutation(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
         require_active: bool,
     ) -> Result<ConnectorDataMutationLease, ConnectorError> {
-        let (descriptor, metadata, mutation, runtime_id) = {
+        let (descriptor, provider_incarnation, metadata, mutation) = {
             let mut state = self.lock_state()?;
-            let runtime_id = state.runtime_for_legacy_effect(key)?;
-            let generation = state.generations.get_mut(&runtime_id).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "connector control generation is missing",
-                )
-            })?;
+            let generation = state
+                .generations
+                .get_mut(&control_runtime_id)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "connector control runtime is not registered",
+                    )
+                })?;
             if require_active && generation.state != ControlGenerationState::Active {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Unavailable,
@@ -427,16 +437,20 @@ impl ConnectorControlHost {
             generation.data_mutation_leases = generation.data_mutation_leases.saturating_add(1);
             (
                 generation.binding.descriptor().clone(),
+                generation.binding.incarnation(),
                 Arc::clone(generation.binding.metadata()),
                 mutation,
-                runtime_id,
             )
         };
         let state = Arc::downgrade(&self.state);
-        let lease_runtime_id = runtime_id;
-        ConnectorDataMutationLease::new(descriptor, key.clone(), metadata, mutation, move || {
-            release_lease(&state, lease_runtime_id, LeaseKind::DataMutation);
-        })
+        ConnectorDataMutationLease::new(
+            descriptor,
+            control_runtime_id,
+            provider_incarnation,
+            metadata,
+            mutation,
+            move || release_lease(&state, control_runtime_id, LeaseKind::DataMutation),
+        )
     }
 
     fn acquire_current_metadata_maintenance(
@@ -789,7 +803,6 @@ impl ConnectorControlHost {
             )
         })
     }
-
 }
 impl ConnectorControlResolver for ConnectorControlHost {
     fn observe_current_binding(
@@ -907,9 +920,9 @@ impl ConnectorDataMutationResolver for ConnectorControlHost {
 
     fn acquire_exact_data_mutation(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorDataMutationLease, ConnectorError> {
-        Self::acquire_exact_data_mutation(self, key)
+        Self::acquire_exact_data_mutation(self, control_runtime_id)
     }
 }
 

@@ -23,18 +23,19 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorDataMutation, ConnectorDataMutationExecuteRequest,
-    ConnectorDataMutationLease, ConnectorDataMutationOperation, ConnectorDataMutationPlan,
-    ConnectorDataMutationPlanSummary, ConnectorDataMutationPlanningRequest,
-    ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest,
-    ConnectorDataMutationSourceScope, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
-    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ConnectorNamespaceRequest, ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    MAX_CONNECTOR_DATA_MUTATION_FILES, MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
+    ConnectorCancellation, ConnectorControlRuntimeId, ConnectorDataMutation,
+    ConnectorDataMutationExecuteRequest, ConnectorDataMutationLease,
+    ConnectorDataMutationOperation, ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
+    ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
+    ConnectorDataMutationReconcileRequest, ConnectorDataMutationSourceScope, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
+    ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorMutationOperationId, ConnectorNamespaceRequest, ConnectorProviderId,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableRequest, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_DATA_MUTATION_FILES,
+    MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
 };
 
 struct NeverCancelled;
@@ -124,7 +125,8 @@ impl FakeDataMutation {
     fn lease(self: &Arc<Self>) -> ConnectorDataMutationLease {
         ConnectorDataMutationLease::new(
             self.descriptor.clone(),
-            self.key.clone(),
+            ConnectorControlRuntimeId::from_bytes([1; 16]),
+            self.key.incarnation,
             Arc::new(FakeMetadata {
                 instance_id: self.key.instance_id.clone(),
             }),
@@ -397,14 +399,11 @@ fn bounds_and_exact_generation_fail_closed() {
         ConnectorErrorKind::ResourceExhausted
     );
 
-    let wrong_key = ConnectorExecutionBindingKey {
-        instance_id: fake.key.instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
-    };
     assert_eq!(
         ConnectorDataMutationLease::new(
             fake.descriptor.clone(),
-            wrong_key,
+            ConnectorControlRuntimeId::from_bytes([2; 16]),
+            ConnectorInstanceIncarnation::from_bytes([9; 16]),
             Arc::new(FakeMetadata {
                 instance_id: fake.key.instance_id.clone(),
             }),
