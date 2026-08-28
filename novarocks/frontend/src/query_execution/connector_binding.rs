@@ -26,8 +26,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceId,
-    ConnectorWriteCohortId,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorWriteCohortId,
 };
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
@@ -38,10 +37,6 @@ use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_proto_codec::provider::{
     EnsureConnectorExecutionBindingRejection, RetireConnectorExecutionBindingOutcome,
 };
-
-fn contract_error(message: impl Into<String>) -> DistributedQueryError {
-    DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
-}
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
@@ -214,87 +209,16 @@ pub trait ConnectorBindingInstallBarrier: Send + Sync + 'static {
 /// and readiness is reported on that same control stream, so adding them here
 /// would impose a second warm-path RPC barrier.
 pub(crate) fn compile_install_plan(
-    schedule: &SchedulingPlan,
-    connector_write_plans: &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
+    _schedule: &SchedulingPlan,
+    _connector_write_plans: &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 ) -> Result<ConnectorBindingInstallPlan, DistributedQueryError> {
-    let mut by_backend: BTreeMap<
-        usize,
-        (
-            RuntimeEndpoint,
-            BTreeMap<ConnectorInstanceId, ConnectorExecutionDeclaration>,
-        ),
-    > = BTreeMap::new();
-
-    for attachment in connector_write_plans.values() {
-        let declaration = attachment.execution_declaration();
-        let instance_id = declaration.binding_key().instance_id.clone();
-        for writer in attachment.manifest().writers() {
-            let fragment_id = u32::try_from(writer.fragment_id()).map_err(|_| {
-                contract_error("connector writer manifest contains a negative fragment ID")
-            })?;
-            let placements = schedule.by_fragment.get(&fragment_id).ok_or_else(|| {
-                contract_error(format!(
-                    "connector writer manifest references absent fragment {fragment_id}"
-                ))
-            })?;
-            let placement = placements
-                .iter()
-                .find(|placement| {
-                    i32::try_from(placement.instance_index).ok() == Some(writer.backend_num())
-                        && writer.fragment_instance_id()
-                            == connector_writer_fragment_instance_bytes(placement.finst_id)
-                })
-                .ok_or_else(|| {
-                    contract_error(format!(
-                        "connector writer manifest does not match a scheduled placement for fragment {fragment_id} backend {}",
-                        writer.backend_num()
-                    ))
-                })?;
-            let endpoint = placement.endpoint.clone();
-            let entry = by_backend
-                .entry(placement.backend_idx)
-                .or_insert_with(|| (endpoint.clone(), BTreeMap::new()));
-            if entry.0 != endpoint {
-                return Err(contract_error(format!(
-                    "connector binding writer schedule assigns backend {} to conflicting endpoints {} and {}",
-                    placement.backend_idx, entry.0, endpoint
-                )));
-            }
-            match entry.1.get(&instance_id) {
-                Some(existing) if existing != declaration => {
-                    return Err(contract_error(format!(
-                        "connector instance '{}' has conflicting read/write declarations for backend {}",
-                        instance_id.as_str(),
-                        placement.backend_idx
-                    )));
-                }
-                Some(_) => {}
-                None => {
-                    entry.1.insert(instance_id.clone(), declaration.clone());
-                }
-            }
-        }
-    }
-
+    // CatalogSet is attached during Init and both reads and writes resolve
+    // their exact runtime through that query lease. Retaining this empty plan
+    // preserves the coordinator handoff type until the old Ensure RPC types
+    // are deleted, but it must never cause a post-ControlReady RPC.
     Ok(ConnectorBindingInstallPlan {
-        backends: by_backend
-            .into_iter()
-            .map(
-                |(backend_idx, (endpoint, declarations))| ConnectorBindingBackendInstallPlan {
-                    backend_idx,
-                    endpoint,
-                    declarations: declarations.into_values().collect(),
-                },
-            )
-            .collect(),
+        backends: Vec::new(),
     })
-}
-
-fn connector_writer_fragment_instance_bytes(value: novarocks_types::UniqueId) -> [u8; 16] {
-    let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&value.high().to_be_bytes());
-    bytes[8..].copy_from_slice(&value.low().to_be_bytes());
-    bytes
 }
 
 /// Serial barrier implementation shared by production and focused tests.

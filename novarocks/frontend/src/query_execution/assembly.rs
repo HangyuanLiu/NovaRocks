@@ -1005,6 +1005,10 @@ mod tests {
             i32::try_from(fragment_id).expect("test fragment fits i32"),
             0,
             0,
+            novarocks_spi::connector::CatalogHandle::new(
+                owner.instance_id.clone(),
+                novarocks_spi::connector::CatalogVersion::from_bytes([1; 32]),
+            ),
             owner.clone(),
         );
         ConnectorWriterHandle::try_new(owner, writer, 1, Bytes::from_static(b"opaque"))

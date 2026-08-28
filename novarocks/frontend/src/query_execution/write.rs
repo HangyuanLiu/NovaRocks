@@ -913,6 +913,10 @@ mod tests {
                 sink_ordinal: 0,
                 connector_instance_id: "unit".to_string(),
                 connector_incarnation: vec![2; 16],
+                catalog_handle: Some(novarocks_proto_models::catalog::CatalogHandle {
+                    catalog_name: "unit".to_string(),
+                    version: vec![4; 32],
+                }),
             }),
             terminal_state: CONNECTOR_WRITER_TERMINAL_STAGED,
             input_rows: 37,

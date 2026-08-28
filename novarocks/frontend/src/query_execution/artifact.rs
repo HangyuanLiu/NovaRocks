@@ -2370,6 +2370,10 @@ mod tests {
             fragment_ids,
             operation_id,
             cohort_id,
+            novarocks_spi::connector::CatalogHandle::new(
+                owner.instance_id.clone(),
+                novarocks_spi::connector::CatalogVersion::from_bytes([3; 32]),
+            ),
             owner.clone(),
             execution_id,
         )

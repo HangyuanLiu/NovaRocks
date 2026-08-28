@@ -1050,6 +1050,13 @@ mod tests {
         .expect("query execution ID")
     }
 
+    fn catalog_handle() -> novarocks_spi::connector::CatalogHandle {
+        novarocks_spi::connector::CatalogHandle::new(
+            owner().instance_id,
+            novarocks_spi::connector::CatalogVersion::from_bytes([1; 32]),
+        )
+    }
+
     fn schedule(fragment_instance: UniqueId) -> SchedulingPlan {
         let placement = FragmentInstancePlacement {
             fragment_id: 3,
@@ -1080,6 +1087,7 @@ mod tests {
             &BTreeSet::from([3]),
             operation_id,
             cohort_id,
+            catalog_handle(),
             owner(),
             execution(attempt),
         )
@@ -1133,6 +1141,7 @@ mod tests {
             fragments,
             operation_id,
             cohort_id,
+            catalog_handle(),
             owner(),
             execution(3),
         )
@@ -1194,6 +1203,7 @@ mod tests {
             3,
             8,
             0,
+            catalog_handle(),
             owner(),
         );
         let report = ConnectorStagedReport::try_new(

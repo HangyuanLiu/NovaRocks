@@ -28,8 +28,8 @@ use std::collections::BTreeSet;
 
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorWriteCohortDescriptor,
-    ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlan,
+    ConnectorExecutionBindingKey, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
+    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlan,
     ConnectorWritePlanningRequest, ConnectorWriterIdentity,
 };
 use sha2::{Digest, Sha256};
@@ -173,7 +173,6 @@ impl ConnectorWriteManifest {
         // extend a write past its planning deadline or swap cancellation
         // state while retaining an otherwise exact generation lease.
         let context = request.context.clone();
-        let execution_declaration = lease.execution_declaration(&context)?;
         let catalog_properties = lease.catalog_properties().cloned();
         let plan = lease.control().plan_write(request)?;
         validate_returned_plan(self, &plan)?;
@@ -181,7 +180,6 @@ impl ConnectorWriteManifest {
             manifest: self.clone(),
             plan,
             context,
-            execution_declaration,
             catalog_properties,
             descriptor,
             _lease: lease,
@@ -231,7 +229,6 @@ pub struct ConnectorWritePlanAttachment {
     manifest: ConnectorWriteManifest,
     plan: ConnectorWritePlan,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    execution_declaration: ConnectorExecutionDeclaration,
     catalog_properties: Option<CatalogProperties>,
     descriptor: ConnectorWriteCohortDescriptor,
     _lease: ConnectorWriteLease,
@@ -250,12 +247,6 @@ impl ConnectorWritePlanAttachment {
     /// control calls must reuse this context with the exact retained lease.
     pub fn context(&self) -> &novarocks_spi::connector::ConnectorRequestContext {
         &self.context
-    }
-
-    /// Bounded exact-generation declaration to install on each BE that owns a
-    /// writer in this placement-frozen manifest.
-    pub fn execution_declaration(&self) -> &ConnectorExecutionDeclaration {
-        &self.execution_declaration
     }
 
     /// The exact catalog runtime contribution for this write, when the source
@@ -388,6 +379,13 @@ mod tests {
         }
     }
 
+    fn catalog_handle() -> CatalogHandle {
+        CatalogHandle::new(
+            owner().instance_id,
+            novarocks_spi::connector::CatalogVersion::from_bytes([1; 32]),
+        )
+    }
+
     fn execution() -> QueryExecutionId {
         QueryExecutionId::new(
             crate::query_execution::contract::QueryId::new(13, 17),
@@ -420,6 +418,7 @@ mod tests {
             &terminal,
             operation_id,
             ConnectorWriteCohortId::primary(operation_id),
+            catalog_handle(),
             owner(),
             execution(),
         )
@@ -451,6 +450,7 @@ mod tests {
             &terminal,
             operation_id,
             other_cohort,
+            catalog_handle(),
             owner(),
             execution(),
         )
@@ -472,6 +472,7 @@ mod tests {
             &BTreeSet::from([3]),
             operation_id,
             ConnectorWriteCohortId::primary(operation_id),
+            catalog_handle(),
             owner(),
             execution(),
         )
