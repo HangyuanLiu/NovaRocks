@@ -529,6 +529,43 @@ mod tests {
         .expect("valid event")
     }
 
+    fn unavailable_event(
+        execution_id: QueryExecutionId,
+        process: BackendProcessId,
+        participant_id: u32,
+    ) -> QueryControlEvent {
+        QueryControlEvent::parse(novarocks::QueryControlResponse {
+            event: Some(
+                novarocks::query_control_response::Event::RuntimeFilterFeedback(
+                    novarocks::RuntimeFilterFeedbackEvent {
+                        execution_id: Some(encode_query_execution_id(execution_id)),
+                        init_digest: vec![4; 32],
+                        backend: Some(novarocks::ParticipantBackendIdentity {
+                            endpoint: Some(novarocks::QueryControlEndpoint {
+                                host: "127.0.0.1".into(),
+                                port: 9030,
+                            }),
+                            process_id: Some(novarocks::BackendProcessId {
+                                value: process.to_bytes().to_vec(),
+                            }),
+                        }),
+                        participant_id,
+                        deployment_epoch: execution_id.attempt_id().get(),
+                        channel_id: 7,
+                        contract_digest: vec![9; 32],
+                        terminal_outcome: Some(
+                            novarocks::runtime_filter_feedback_event::TerminalOutcome::UnavailableReason(
+                                novarocks::RuntimeFilterFeedbackUnavailableReason::DomainBudget
+                                    as i32,
+                            ),
+                        ),
+                    },
+                ),
+            ),
+        })
+        .expect("valid unavailable event")
+    }
+
     fn exact(value: i64) -> Vec<u8> {
         RuntimeFilterFeedbackDomain::Exact(ValueDomainDelta::new(
             MembershipValues::int64([value]),
@@ -586,6 +623,71 @@ mod tests {
             .admit(&event(retired, process, exact(41)), process, &[4; 32])
             .expect("retired event is ignored");
         let state = state.state.0.lock().expect("feedback state");
+        assert!(state.channels[&7].winner.is_none());
+    }
+
+    #[test]
+    fn unavailable_is_fail_open_only_after_all_anyof_publishers_close() {
+        let execution_id = execution_id();
+        let first = BackendProcessId::new_v7();
+        let second = BackendProcessId::new_v7();
+        let declaration =
+            FrontendRuntimeFilterFeedbackDeclaration::new([FrontendRuntimeFilterFeedbackChannel {
+                channel_id: 7,
+                contract_digest: [9; 32],
+                max_encoded_domain_bytes: 64 * 1024,
+                publishers: vec![
+                    FrontendRuntimeFilterFeedbackPublisherSlot {
+                        participant_id: 5,
+                        backend_process_id: first,
+                        owner: FrontendRuntimeFilterFeedbackPublisherOwner::DirectSource,
+                    },
+                    FrontendRuntimeFilterFeedbackPublisherSlot {
+                        participant_id: 6,
+                        backend_process_id: second,
+                        owner: FrontendRuntimeFilterFeedbackPublisherOwner::DirectSource,
+                    },
+                ],
+                scan_bindings: vec![FrontendRuntimeFilterFeedbackScanBinding {
+                    fragment_id: 2,
+                    plan_node_id: 17,
+                    binding_id: 7,
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }],
+                wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
+            }])
+            .expect("valid declaration");
+        let state = RuntimeFilterFeedbackState::new(execution_id, declaration).expect("state");
+
+        state
+            .admit(&unavailable_event(execution_id, first, 5), first, &[4; 32])
+            .expect("first unavailable is admitted");
+        assert!(!state.state.0.lock().expect("state").channels[&7].is_terminal());
+        state
+            .admit(
+                &unavailable_event(execution_id, second, 6),
+                second,
+                &[4; 32],
+            )
+            .expect("second unavailable is admitted");
+        let state = state.state.0.lock().expect("state");
+        assert!(state.channels[&7].winner.is_none());
+        assert!(state.channels[&7].is_terminal());
+    }
+
+    #[test]
+    fn close_suppresses_late_active_feedback_without_reopening_the_channel() {
+        let execution_id = execution_id();
+        let process = BackendProcessId::new_v7();
+        let state = RuntimeFilterFeedbackState::new(execution_id, declaration(process))
+            .expect("feedback state");
+        state.close();
+        state
+            .admit(&event(execution_id, process, exact(41)), process, &[4; 32])
+            .expect("closed state drops late feedback");
+        let state = state.state.0.lock().expect("feedback state");
+        assert!(state.closed);
         assert!(state.channels[&7].winner.is_none());
     }
 }
