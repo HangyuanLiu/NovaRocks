@@ -24,7 +24,8 @@ use novarocks_proto_models::catalog as wire;
 use novarocks_spi::connector::{
     CATALOG_VERSION_BYTES, CatalogCredentialReference, CatalogHandle, CatalogProperties,
     CatalogProperty, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
-    MAX_CATALOG_SET_BYTES, MAX_CATALOGS_PER_QUERY,
+    MAX_CATALOG_SET_BYTES, MAX_CATALOGS_PER_QUERY, MAX_PRUNE_CATALOG_SET_BYTES,
+    MAX_REACHABLE_CATALOGS_PER_PRUNE,
 };
 
 /// One exact, validated query-wide catalog contribution.
@@ -114,7 +115,7 @@ impl CatalogSet {
     }
 
     pub fn parse(raw: wire::CatalogSet) -> Result<Self, ProtocolError> {
-        if raw.encoded_len() > MAX_CATALOG_SET_BYTES {
+        if raw.encoded_len() > MAX_PRUNE_CATALOG_SET_BYTES {
             return Err(resource_exhausted(
                 FieldPath::root("catalog_set"),
                 "encoded catalog set exceeds 1 MiB",
@@ -189,13 +190,13 @@ impl PruneCatalogsRequest {
         if raw.encoded_len() > MAX_CATALOG_SET_BYTES {
             return Err(resource_exhausted(
                 FieldPath::root("prune_catalogs_request"),
-                "encoded reachable catalog snapshot exceeds 1 MiB",
+                "encoded reachable catalog snapshot exceeds 8 MiB",
             ));
         }
-        if raw.reachable_catalogs.len() > MAX_CATALOGS_PER_QUERY {
+        if raw.reachable_catalogs.len() > MAX_REACHABLE_CATALOGS_PER_PRUNE {
             return Err(resource_exhausted(
                 FieldPath::root("prune_catalogs_request").field("reachable_catalogs"),
-                "reachable catalog snapshot exceeds 256 entries",
+                "reachable catalog snapshot exceeds 65536 entries",
             ));
         }
 

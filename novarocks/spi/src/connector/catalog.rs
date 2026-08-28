@@ -31,6 +31,10 @@ use super::{ConnectorError, ConnectorErrorKind, ConnectorInstanceId};
 pub const CATALOG_VERSION_BYTES: usize = 32;
 pub const MAX_CATALOGS_PER_QUERY: usize = 256;
 pub const MAX_CATALOG_SET_BYTES: usize = 1024 * 1024;
+/// A periodic prune is a cluster reachability snapshot, rather than one
+/// query's dependency set, so it has a separately bounded larger envelope.
+pub const MAX_REACHABLE_CATALOGS_PER_PRUNE: usize = 65_536;
+pub const MAX_PRUNE_CATALOG_SET_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CATALOG_PROPERTIES: usize = 128;
 pub const MAX_CATALOG_PROPERTY_KEY_BYTES: usize = 256;
 pub const MAX_CATALOG_PROPERTY_VALUE_BYTES: usize = 4 * 1024;
