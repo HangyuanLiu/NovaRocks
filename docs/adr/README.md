@@ -156,6 +156,7 @@ code-anchors:
 - ADR-0114 — participant 分类为何以载荷为唯一权威表示，删除自证式派生的 participant_roles 字段（active）
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active）
+- ADR-0124 — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active）
 
 #### 历史
 
@@ -204,6 +205,7 @@ normalizer、AST mutation或printer生成的内部表示。运行期可以按请
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 - ADR-0121 — FE serving lifecycle 为何用单向 admission drain、而不是 connection shutdown 或远程 management mutation（active）
+- ADR-0124 — Native compatibility island 与 ingress admission 为何保持 role-local、无 all-in-one 旁路（active）
 
 #### 历史
 
@@ -237,6 +239,7 @@ fencing/takeover 仍须单独裁决。
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（active）
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 - ADR-0111 — Backend 为何以自注册、精确 heartbeat 与 pre-ready 完整重规划取代 durable membership（active）
+- ADR-0124 — Backend compatibility island 为何以 exact identity 派生 eligibility，而不持久化升级 membership（active）
 
 #### 历史
 
