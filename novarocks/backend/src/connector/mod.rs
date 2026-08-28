@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod binding_decode;
 pub mod catalog_manager;
 mod execution_host;
 pub(crate) mod runtime;
