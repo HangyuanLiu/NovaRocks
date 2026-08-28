@@ -1042,6 +1042,7 @@ fn observation_control(
     control.set_init_attempted(&materialized.participants);
     for participant in &materialized.participants {
         control.mark_control_ready(participant.target.backend_idx());
+        control.mark_catalog_ready(participant.target.backend_idx());
     }
     control
         .freeze_admitted()

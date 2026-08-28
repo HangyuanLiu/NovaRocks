@@ -32,7 +32,7 @@ use novarocks_proto_codec::lifecycle::{
     AttemptId as CoreAttemptId, AttemptId as ProtocolAttemptId, QueryControlAttach,
     QueryExecutionId, QueryInitOutcome, QueryStageAck, QueryStartAck, QueryStartRequest,
 };
-use novarocks_proto_models::novarocks as protocol_wire;
+use novarocks_proto_models::{catalog as catalog_wire, novarocks as protocol_wire};
 
 use super::QueryLifecycleTransport;
 use super::lease::{
@@ -1018,9 +1018,12 @@ pub(super) fn attach_all(
                         "frontend query lifecycle control attach completed"
                     );
                     match &outcome {
-                        Ok(session) => {
+                        Ok((session, catalog_ready)) => {
                             control.add_session(session.clone());
                             control.mark_control_ready(participant.target.backend_idx());
+                            if *catalog_ready {
+                                control.mark_catalog_ready(participant.target.backend_idx());
+                            }
                         }
                         Err((Some(session), _)) => control.add_session(session.clone()),
                         Err((None, _)) => {}
@@ -1060,7 +1063,7 @@ fn attach_one(
     participant: &MaterializedParticipant,
     frontend_owner_epoch: u64,
     config: FrontendQueryLifecycleConfig,
-) -> Result<ActiveSession, (Option<ActiveSession>, String)> {
+) -> Result<(ActiveSession, bool), (Option<ActiveSession>, String)> {
     let attach = QueryControlAttach::parse(protocol_wire::QueryControlAttach {
         execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             participant_execution_id(participant),
@@ -1090,10 +1093,45 @@ fn attach_one(
                 ))
             ) =>
         {
+            let Some(protocol_wire::query_control_response::Event::ControlReady(ready)) =
+                event.as_proto().event.as_ref()
+            else {
+                unreachable!("matches guard retains ControlReady");
+            };
+            let catalog_ready = match ready
+                .catalog_load_state
+                .as_ref()
+                .and_then(|state| state.state.as_ref())
+            {
+                Some(catalog_wire::catalog_load_state::State::Ready(_)) => true,
+                Some(catalog_wire::catalog_load_state::State::Loading(_)) => {
+                    wait_for_catalog_ready(&active, participant, config.attach_timeout())?
+                }
+                Some(catalog_wire::catalog_load_state::State::Failed(failure)) => {
+                    return Err((
+                        Some(active),
+                        format!(
+                            "backend {} reported catalog load failure in ControlReady ({}): {}",
+                            participant.target.backend_idx(),
+                            failure.reason,
+                            failure.safe_detail
+                        ),
+                    ));
+                }
+                None => {
+                    return Err((
+                        Some(active),
+                        format!(
+                            "backend {} ControlReady omitted catalog load state",
+                            participant.target.backend_idx()
+                        ),
+                    ));
+                }
+            };
             if let Err(error) = record_control_ready_marker(participant) {
                 return Err((Some(active), error));
             }
-            Ok(active)
+            Ok((active, catalog_ready))
         }
         Ok(event) => Err((
             Some(active),
@@ -1106,6 +1144,43 @@ fn attach_one(
             Some(active),
             format!(
                 "backend {} ControlReady failed: {error}",
+                participant.target.backend_idx()
+            ),
+        )),
+    }
+}
+
+fn wait_for_catalog_ready(
+    active: &ActiveSession,
+    participant: &MaterializedParticipant,
+    timeout: Duration,
+) -> Result<bool, (Option<ActiveSession>, String)> {
+    match active.recv(timeout) {
+        Ok(event) => match event.as_proto().event.as_ref() {
+            Some(protocol_wire::query_control_response::Event::CatalogReady(_)) => Ok(true),
+            Some(protocol_wire::query_control_response::Event::CatalogLoadFailed(failure)) => {
+                Err((
+                    Some(active.clone()),
+                    format!(
+                        "backend {} reported catalog load failure ({}): {}",
+                        participant.target.backend_idx(),
+                        failure.reason,
+                        failure.safe_detail
+                    ),
+                ))
+            }
+            _ => Err((
+                Some(active.clone()),
+                format!(
+                    "backend {} returned a non-catalog event while catalog loading",
+                    participant.target.backend_idx()
+                ),
+            )),
+        },
+        Err(error) => Err((
+            Some(active.clone()),
+            format!(
+                "backend {} CatalogReady failed: {error}",
                 participant.target.backend_idx()
             ),
         )),
