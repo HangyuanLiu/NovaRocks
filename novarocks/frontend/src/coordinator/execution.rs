@@ -1053,7 +1053,6 @@ impl FrontendDistributedQueryCoordinator {
             writer_registrations,
             expected_output,
             query_lifecycle_lease,
-            connector_binding_lease: _connector_binding_lease,
             connector_write_plans,
         } = execution.into_parts();
         let mut query_lifecycle_lease = Some(query_lifecycle_lease);

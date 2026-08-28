@@ -363,7 +363,6 @@ fn query_control_typestate_initializes_before_native_assembly() {
         .query_lifecycle_lease
         .finalize()
         .expect("finalize lifecycle");
-    execution.connector_binding_lease.release();
     assert_eq!(finalizes.load(Ordering::SeqCst), 1);
 }
 

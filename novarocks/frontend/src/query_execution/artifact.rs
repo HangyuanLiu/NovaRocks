@@ -63,11 +63,6 @@ use novarocks_proto_models::{common, novarocks};
 use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
 use novarocks_types::{BackendProcessId, SlotId, UniqueId};
 
-pub use crate::query_execution::connector_binding::{
-    ConnectorBindingBackendInstallPlan, ConnectorBindingDispatcher, ConnectorBindingInstallBarrier,
-    ConnectorBindingInstallLease, ConnectorBindingInstallObserver, ConnectorBindingInstallPlan,
-    DispatchingConnectorBindingBarrier, NoopConnectorBindingInstallObserver,
-};
 pub type FragmentId = u32;
 pub type PlanNodeId = i32;
 
@@ -789,8 +784,7 @@ fn attach_connector_write_plans(
     Ok(())
 }
 
-/// Query lifecycle is ready. The retained compatibility handoff no longer
-/// installs connector instances: CatalogSet readiness was established during
+/// Query lifecycle is ready and the complete CatalogSet was established during
 /// Init, before Stage becomes admissible.
 pub struct ControlReadyDistributedQuery {
     handoff_id: u64,
@@ -804,18 +798,14 @@ pub struct ControlReadyDistributedQuery {
 }
 
 impl ControlReadyDistributedQuery {
-    pub fn catalog_ready(self) -> ConnectorBindingReadyDistributedQuery {
-        ConnectorBindingReadyDistributedQuery {
+    pub fn catalog_ready(self) -> CatalogReadyDistributedQuery {
+        CatalogReadyDistributedQuery {
             handoff_id: self.handoff_id,
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule: self.schedule,
             options: self.options,
             query_lifecycle_lease: self.query_lifecycle_lease,
-            // Catalog readiness is owned by Init and its control stream.  This
-            // compatibility-only lease has no remote action and will be
-            // removed together with the legacy typestate names.
-            connector_binding_lease: ConnectorBindingInstallLease,
             stage_bindings: self.stage_bindings,
             connector_write_plans: self.connector_write_plans,
         }
@@ -823,21 +813,20 @@ impl ControlReadyDistributedQuery {
 }
 
 /// The only typestate that can prepare native Stage batches. In particular,
-/// it is impossible to create a submission before every selected BE has ACKed
-/// the connector declarations it will resolve by instance id.
-pub struct ConnectorBindingReadyDistributedQuery {
+/// it is impossible to create a submission before every selected BE has
+/// reported its Init-carried catalog set ready.
+pub struct CatalogReadyDistributedQuery {
     handoff_id: u64,
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
     options: QueryInitOptions,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_binding_lease: ConnectorBindingInstallLease,
     stage_bindings: Vec<StageParticipantBinding>,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
-impl ConnectorBindingReadyDistributedQuery {
+impl CatalogReadyDistributedQuery {
     pub fn connector_write_plans(
         &self,
     ) -> &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment> {
@@ -868,14 +857,13 @@ impl ConnectorBindingReadyDistributedQuery {
         self,
         attachment: NativeSubmissionAttachment,
     ) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
-        let ConnectorBindingReadyDistributedQuery {
+        let CatalogReadyDistributedQuery {
             handoff_id,
             prepared,
             native_bundle: _,
             schedule,
             options: _,
             query_lifecycle_lease,
-            connector_binding_lease,
             stage_bindings,
             connector_write_plans,
         } = self;
@@ -885,7 +873,6 @@ impl ConnectorBindingReadyDistributedQuery {
             schedule.execution_id,
             stage_bindings,
             query_lifecycle_lease,
-            connector_binding_lease,
             connector_write_plans,
         )
     }
@@ -1709,7 +1696,6 @@ pub struct StagePreparedDistributedQuery {
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
@@ -1778,7 +1764,6 @@ fn finish_sealed_native_submission(
     execution_id: QueryExecutionId,
     stage_bindings: Vec<StageParticipantBinding>,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 ) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
     if !attachment.matches(handoff_id, execution_id) {
@@ -1786,7 +1771,6 @@ fn finish_sealed_native_submission(
             contract_error("native submission attachment does not match the sealed query handoff");
         let kind = error.kind();
         let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-        let message = connector_binding_lease.abort_preserving(message);
         return Err(DistributedQueryError::new(kind, message));
     }
     let (submissions, root_fetch, writer_registrations, expected_output) = attachment.into_parts();
@@ -1797,7 +1781,6 @@ fn finish_sealed_native_submission(
             Err(error) => {
                 let kind = error.kind();
                 let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-                let message = connector_binding_lease.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
@@ -1816,7 +1799,6 @@ fn finish_sealed_native_submission(
             Err(error) => {
                 let kind = error.kind();
                 let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-                let message = connector_binding_lease.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
@@ -1826,7 +1808,6 @@ fn finish_sealed_native_submission(
                 let error = contract_error(error.to_string());
                 let kind = error.kind();
                 let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-                let message = connector_binding_lease.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
@@ -1839,7 +1820,6 @@ fn finish_sealed_native_submission(
         ));
         let kind = error.kind();
         let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-        let message = connector_binding_lease.abort_preserving(message);
         return Err(DistributedQueryError::new(kind, message));
     }
     Ok(StagePreparedDistributedQuery {
@@ -1848,7 +1828,6 @@ fn finish_sealed_native_submission(
         writer_registrations,
         expected_output,
         query_lifecycle_lease,
-        connector_binding_lease,
         connector_write_plans,
     })
 }
@@ -1895,7 +1874,6 @@ impl StagePreparedDistributedQuery {
             let message = self
                 .query_lifecycle_lease
                 .abort_preserving(error.message().to_string());
-            let message = self.connector_binding_lease.abort_preserving(message);
             return Err(DistributedQueryError::new(kind, message));
         }
         Ok(StagedDistributedQuery {
@@ -1904,7 +1882,6 @@ impl StagePreparedDistributedQuery {
             writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
-            connector_binding_lease: self.connector_binding_lease,
             connector_write_plans: self.connector_write_plans,
         })
     }
@@ -1933,7 +1910,6 @@ pub struct StagedDistributedQuery {
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
@@ -1951,7 +1927,6 @@ impl StagedDistributedQuery {
             let message = self
                 .query_lifecycle_lease
                 .abort_preserving(error.message().to_string());
-            let message = self.connector_binding_lease.abort_preserving(message);
             return Err(DistributedQueryError::new(kind, message));
         }
         Ok(RunningDistributedQuery {
@@ -1959,7 +1934,6 @@ impl StagedDistributedQuery {
             writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
-            connector_binding_lease: self.connector_binding_lease,
             connector_write_plans: self.connector_write_plans,
         })
     }
@@ -1972,7 +1946,6 @@ pub struct RunningDistributedQuery {
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
@@ -1983,7 +1956,6 @@ impl RunningDistributedQuery {
             writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
-            connector_binding_lease: self.connector_binding_lease,
             connector_write_plans: self.connector_write_plans,
         }
     }
@@ -1994,7 +1966,6 @@ pub struct RunningNativeExecutionParts {
     pub writer_registrations: WriterRegistrationSet,
     pub expected_output: ExpectedOutputSchema,
     pub query_lifecycle_lease: QueryLifecycleLease,
-    pub connector_binding_lease: ConnectorBindingInstallLease,
     pub connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 

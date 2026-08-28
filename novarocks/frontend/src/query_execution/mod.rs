@@ -21,7 +21,6 @@ pub mod artifact;
 pub mod assembly;
 pub mod backend_command;
 pub mod completion;
-pub(crate) mod connector_binding;
 // MIGRATION: the typed-scan lowering that consumes these lands in the same PR.
 #[allow(
     dead_code,
