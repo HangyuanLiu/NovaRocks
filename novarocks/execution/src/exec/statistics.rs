@@ -40,9 +40,12 @@ use novarocks_spi::connector::{
 use sha2::{Digest, Sha256};
 
 pub const MAX_STATISTICS_THETA_RETAINED_HASHES: usize = 1 << 12;
+const MIN_STATISTICS_THETA_LG_K: u8 = 5;
+const MAX_STATISTICS_THETA_LG_K: u8 = 12;
 const THETA_PARTIAL_WIRE_VERSION: u8 = 1;
 const THETA_PARTIAL_WIRE_HEADER_BYTES: usize = 1 + 1 + 8 + 4;
 const STATISTICS_FRAGMENT_PAYLOAD_VERSION: u8 = 2;
+const STATISTICS_SCALAR_PARTIAL_MAX_WIRE_BYTES: usize = 8 + 8 + 8 + (1 + 16) * 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsFragmentError {
@@ -165,6 +168,7 @@ impl StatisticsBatchCollector {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
+        let theta_lg_k = statistics_theta_lg_k(&scalar_columns, &theta_columns)?;
         Ok(Self {
             schema,
             metrics,
@@ -176,7 +180,7 @@ impl StatisticsBatchCollector {
                 .collect(),
             theta: theta_columns
                 .into_iter()
-                .map(|column| (column, StatisticsThetaAccumulator::new(12)))
+                .map(|column| (column, StatisticsThetaAccumulator::new(theta_lg_k)))
                 .collect(),
         })
     }
@@ -391,7 +395,7 @@ impl StatisticsScalarAccumulator {
 
 impl StatisticsThetaAccumulator {
     fn new(lg_k: u8) -> Self {
-        debug_assert!((5..=12).contains(&lg_k));
+        debug_assert!((MIN_STATISTICS_THETA_LG_K..=MAX_STATISTICS_THETA_LG_K).contains(&lg_k));
         Self {
             sketch: ThetaSketch::builder().lg_k(lg_k).build(),
         }
@@ -407,6 +411,65 @@ impl StatisticsThetaAccumulator {
     fn finish(self) -> Result<ThetaSketchPartial, StatisticsFragmentError> {
         ThetaSketchPartial::try_from_sketch(self.sketch)
     }
+}
+
+fn statistics_theta_lg_k(
+    scalar_columns: &BTreeSet<Arc<str>>,
+    theta_columns: &BTreeSet<Arc<str>>,
+) -> Result<u8, StatisticsFragmentError> {
+    if theta_columns.is_empty() {
+        return Ok(MAX_STATISTICS_THETA_LG_K);
+    }
+
+    // Reserve the exact fixed framing plus the worst-case scalar bounds before
+    // dividing the remaining SPI payload budget among the requested sketches.
+    // Choosing lg_k per request keeps one terminal fragment report bounded
+    // without weakening the connector-wide 64 KiB contract.
+    let mut fixed_bytes = 1usize // fragment payload version
+        + 1 // table partial flag
+        + STATISTICS_SCALAR_PARTIAL_MAX_WIRE_BYTES
+        + 2 // scalar partial count
+        + 2; // Theta partial count
+    for column in scalar_columns {
+        fixed_bytes = fixed_bytes
+            .checked_add(2 + column.len() + STATISTICS_SCALAR_PARTIAL_MAX_WIRE_BYTES)
+            .ok_or_else(|| {
+                StatisticsFragmentError::exhausted(
+                    "statistics fragment report size accounting overflow",
+                )
+            })?;
+    }
+    for column in theta_columns {
+        fixed_bytes = fixed_bytes
+            .checked_add(2 + column.len() + 4 + THETA_PARTIAL_WIRE_HEADER_BYTES)
+            .ok_or_else(|| {
+                StatisticsFragmentError::exhausted(
+                    "statistics fragment report size accounting overflow",
+                )
+            })?;
+    }
+    let remaining = MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES
+        .checked_sub(fixed_bytes)
+        .ok_or_else(|| {
+            StatisticsFragmentError::exhausted(
+                "statistics metrics cannot fit in one bounded fragment report",
+            )
+        })?;
+    let hashes_per_sketch = remaining / theta_columns.len() / std::mem::size_of::<u64>();
+    let lg_k = hashes_per_sketch
+        .checked_ilog2()
+        .map(|value| value.min(u32::from(MAX_STATISTICS_THETA_LG_K)) as u8)
+        .ok_or_else(|| {
+            StatisticsFragmentError::exhausted(
+                "statistics metrics leave no room for a bounded Theta sketch",
+            )
+        })?;
+    if lg_k < MIN_STATISTICS_THETA_LG_K {
+        return Err(StatisticsFragmentError::exhausted(
+            "statistics metrics leave insufficient room for a bounded Theta sketch",
+        ));
+    }
+    Ok(lg_k)
 }
 
 impl StatisticsScalarBound {
@@ -468,7 +531,7 @@ impl ThetaSketchPartial {
             ));
         }
         let lg_k = bytes[1];
-        if !(5..=12).contains(&lg_k) {
+        if !(MIN_STATISTICS_THETA_LG_K..=MAX_STATISTICS_THETA_LG_K).contains(&lg_k) {
             return Err(StatisticsFragmentError::contract(
                 "statistics Theta wire state has an invalid lg_k",
             ));
@@ -1068,6 +1131,42 @@ mod tests {
             "Theta NDV must deduplicate equal Decimal128 values"
         );
         assert_eq!(payload, partial.to_payload().expect("re-encode payload"));
+    }
+
+    #[test]
+    fn fragment_payload_budgets_multiple_theta_sketches_within_spi_limit() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("left_key", DataType::Int64, false),
+            Field::new("right_key", DataType::Int64, false),
+        ]));
+        let metrics = StatisticsMetricRequest::try_new(vec![
+            StatisticsMetric::RowCount,
+            StatisticsMetric::ThetaNdv {
+                column: "left_key".into(),
+            },
+            StatisticsMetric::ThetaNdv {
+                column: "right_key".into(),
+            },
+        ])
+        .expect("metrics");
+        let values = (0_i64..5_000).collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(values.clone())),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .expect("batch");
+
+        let mut collector = StatisticsBatchCollector::try_new(schema, metrics).expect("collector");
+        collector.push_batch(&batch).expect("push batch");
+        let payload = collector.finish_fragment_payload().expect("payload");
+        assert!(payload.len() <= novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES);
+        let partial =
+            StatisticsFragmentPartial::try_from_payload(&payload).expect("decode payload");
+        assert_eq!(partial.theta["left_key"].lg_k, 11);
+        assert_eq!(partial.theta["right_key"].lg_k, 11);
     }
 
     #[test]
