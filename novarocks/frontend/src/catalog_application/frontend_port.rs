@@ -29,7 +29,7 @@
 //! A registration failure therefore leaves the source's truth intact and is
 //! reported as `Unavailable`; reconciliation can retry installation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -45,8 +45,8 @@ use super::{
 };
 use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use novarocks_spi::connector::{
-    ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlResolver,
-    ConnectorInstanceId, ConnectorProviderId,
+    CatalogHandle, ConnectorControlFactoryRequest, ConnectorControlFactoryResolver,
+    ConnectorControlResolver, ConnectorInstanceId, ConnectorProviderId,
 };
 use tokio::runtime::{Handle, RuntimeFlavor};
 use uuid::Uuid;
@@ -110,6 +110,7 @@ pub struct FrontendCatalogApplicationPort {
     runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
     runtime: Handle,
     projections: Mutex<BTreeMap<ConnectorInstanceId, LocalProjection>>,
+    complete_reachable_catalogs: Mutex<Option<BTreeSet<CatalogHandle>>>,
     next_generation: AtomicU64,
 }
 
@@ -125,6 +126,7 @@ impl FrontendCatalogApplicationPort {
             runtime_publisher,
             runtime,
             projections: Mutex::new(BTreeMap::new()),
+            complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
         }
     }
@@ -141,6 +143,7 @@ impl FrontendCatalogApplicationPort {
             runtime_publisher,
             runtime,
             projections: Mutex::new(BTreeMap::new()),
+            complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
         }
     }
@@ -152,6 +155,16 @@ impl FrontendCatalogApplicationPort {
                 "this frontend has no configured catalog desired-state source",
             )
         })
+    }
+
+    /// A trustworthy desired-state set plus every still-draining local control
+    /// generation. `None` means this FE has never completed a source
+    /// enumeration, so a prune sender must skip its round rather than send an
+    /// empty or partial snapshot.
+    pub(crate) fn reachable_catalog_handles(&self) -> Option<BTreeSet<CatalogHandle>> {
+        let mut reachable = self.complete_reachable_catalogs.lock().ok()?.clone()?;
+        reachable.extend(self.control.reachable_catalog_handles().ok()?);
+        Some(reachable)
     }
 
     /// The authority a SQL `CREATE`/`DROP CATALOG` writes through.
@@ -376,12 +389,23 @@ impl FrontendCatalogApplicationPort {
         }
         let source = self.source()?;
         let snapshot = source.enumerate(page_size).await?;
+        let reachable = snapshot
+            .catalog_properties()?
+            .into_iter()
+            .map(|properties| properties.handle().clone())
+            .collect::<BTreeSet<_>>();
         tracing::debug!(
             source_mode = snapshot.mode().as_str(),
             snapshot = snapshot.identity().short_digest(),
             catalogs = snapshot.identity().catalog_count(),
             "catalog desired-state snapshot enumerated"
         );
+        *self.complete_reachable_catalogs.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog reachable snapshot lock is poisoned",
+            )
+        })? = Some(reachable);
         self.retire_projections_absent_from(source, &snapshot)
             .await?;
 
@@ -832,5 +856,26 @@ mod tests {
                 .as_str(),
             "iceberg"
         );
+    }
+
+    #[tokio::test]
+    async fn prune_reachability_requires_a_complete_snapshot_but_allows_complete_empty() {
+        let projection = crate::catalog_application::CatalogRuntimeProjection::new();
+        let port = Arc::new(FrontendCatalogApplicationPort::new(
+            CatalogDesiredStateSource::static_file(
+                CatalogDesiredStateSnapshot::try_new(CatalogDesiredStateSourceMode::StaticFile, [])
+                    .expect("empty static snapshot"),
+            )
+            .expect("static desired-state source"),
+            Arc::new(ConnectorControlHost::new()),
+            projection.publisher(),
+            Handle::current(),
+        ));
+
+        assert_eq!(port.reachable_catalog_handles(), None);
+        port.reconcile_snapshot_with_page_size(1, 1)
+            .await
+            .expect("complete empty snapshot reconciles");
+        assert_eq!(port.reachable_catalog_handles(), Some(BTreeSet::new()));
     }
 }

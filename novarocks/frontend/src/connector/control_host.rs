@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver,
+    CatalogHandle, ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver,
     ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver, ConnectorControlBinding,
     ConnectorControlFactory, ConnectorControlFactoryRequest, ConnectorControlFactoryResolver,
     ConnectorControlPlanningLease, ConnectorControlRegistry, ConnectorControlResolver,
@@ -192,6 +192,22 @@ impl ConnectorControlHost {
         for retirement in ready {
             sink.retire(retirement);
         }
+    }
+
+    /// Every exact catalog handle still protected by this FE process.
+    ///
+    /// Retiring generations remain present until their last planning or effect
+    /// lease drains. Callers combine this with one complete desired-state
+    /// snapshot before issuing a best-effort BE prune.
+    pub(crate) fn reachable_catalog_handles(
+        &self,
+    ) -> Result<BTreeSet<CatalogHandle>, ConnectorError> {
+        let state = self.lock_state()?;
+        Ok(state
+            .generations
+            .values()
+            .filter_map(|generation| generation.binding.catalog_handle().ok().cloned())
+            .collect())
     }
 
     pub fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError> {
