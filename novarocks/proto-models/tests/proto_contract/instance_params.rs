@@ -129,6 +129,9 @@ fn destination() -> novarocks::Destination {
     novarocks::Destination {
         finst_id: Some(id(3, 4)),
         endpoint: "10.0.0.8:8060".to_string(),
+        source_finst_id: Some(id(5, 6)),
+        sender_ordinal: 0,
+        sender_count: 1,
     }
 }
 
@@ -206,8 +209,8 @@ fn runtime_endpoint_fields_use_native_endpoint_names_and_tags() {
     destination_fields.sort_unstable();
     assert_eq!(
         destination_fields,
-        vec![1, 2],
-        "Destination must keep finst_id=1 and endpoint=2"
+        vec![1, 2, 3, 5],
+        "Destination must retain finst_id=1, endpoint=2, source_finst_id=3, sender_ordinal=4, and sender_count=5"
     );
 
     let params = novarocks::InstanceParams {
