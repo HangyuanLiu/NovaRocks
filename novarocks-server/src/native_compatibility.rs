@@ -25,7 +25,9 @@ use novarocks_version::{
     derive_repository_native_compatibility_material,
 };
 
-const NATIVE_CARRIER_MANIFEST: [(&str, u64); 2] = [("iceberg", 1), ("starrocks", 1)];
+// Iceberg revision 2 adds `CatalogHandle` to the provider-private distributed
+// rewrite attempt artifact. This cannot be inferred from the native IDL.
+const NATIVE_CARRIER_MANIFEST: [(&str, u64); 2] = [("iceberg", 2), ("starrocks", 1)];
 
 /// Builds the one closed carrier manifest for this server binary.
 ///
@@ -85,6 +87,13 @@ mod tests {
             .map(|kind| kind.provider_id())
             .to_vec();
         assert_eq!(declared, expected);
+        assert_eq!(
+            declarations
+                .iter()
+                .map(|declaration| (declaration.provider_id(), declaration.contract_revision()))
+                .collect::<Vec<_>>(),
+            vec![("iceberg", 2), ("starrocks", 1)]
+        );
 
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let config = crate::app_config::NovaRocksConfig::default();

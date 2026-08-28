@@ -70,7 +70,7 @@ pub(crate) const REWRITE_ARTIFACT_MAX_PART_BYTES: usize = 1024 * 1024;
 pub(crate) const REWRITE_ARTIFACT_MAX_ROOT_BYTES: usize = 64 * 1024;
 
 const ATTEMPT_ARTIFACT_MAGIC: &[u8; 8] = b"NRRWAT01";
-const ATTEMPT_ARTIFACT_VERSION: u16 = 1;
+const ATTEMPT_ARTIFACT_VERSION: u16 = 2;
 const GROUP_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.group.v1\0";
 const STATE_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.state.v1\0";
 

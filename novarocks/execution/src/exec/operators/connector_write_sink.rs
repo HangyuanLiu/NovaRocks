@@ -293,6 +293,7 @@ mod tests {
 
     use super::*;
     use crate::exec::chunk::ChunkSchema;
+    use crate::exec::fragment::error::ExecPlanBuildError;
     use novarocks_types::SlotId;
 
     #[derive(Default)]
@@ -366,7 +367,10 @@ mod tests {
         }
     }
 
-    fn test_program(stats: Arc<WriterStats>) -> ConnectorWriteSinkProgram {
+    fn test_program_with_execution_catalog_version(
+        stats: Arc<WriterStats>,
+        execution_catalog_version: [u8; 32],
+    ) -> Result<ConnectorWriteSinkProgram, ExecPlanBuildError> {
         let key = ConnectorExecutionBindingKey {
             instance_id: ConnectorInstanceId::parse("test.connector").expect("instance"),
             incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
@@ -390,7 +394,10 @@ mod tests {
         let handle =
             ConnectorWriterHandle::try_new(key.clone(), writer, 1, Bytes::new()).expect("handle");
         let execution = Arc::new(TestWriteExecution {
-            catalog_handle,
+            catalog_handle: novarocks_spi::connector::CatalogHandle::new(
+                key.instance_id.clone(),
+                novarocks_spi::connector::CatalogVersion::from_bytes(execution_catalog_version),
+            ),
             stats,
         });
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
@@ -411,7 +418,22 @@ mod tests {
             1,
             None,
         )
-        .expect("program")
+    }
+
+    fn test_program(stats: Arc<WriterStats>) -> ConnectorWriteSinkProgram {
+        test_program_with_execution_catalog_version(stats, [9; 32]).expect("program")
+    }
+
+    #[test]
+    fn catalog_writer_runtime_must_match_the_frozen_writer_handle() {
+        let error =
+            test_program_with_execution_catalog_version(Arc::new(WriterStats::default()), [8; 32])
+                .expect_err("foreign catalog runtime must be rejected before the writer opens");
+        assert!(
+            error
+                .to_string()
+                .contains("catalog handle does not match query-leased write execution")
+        );
     }
 
     fn int_chunk(values: Vec<i32>) -> Chunk {
