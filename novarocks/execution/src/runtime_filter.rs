@@ -27,6 +27,7 @@ use sha2::{Digest, Sha256};
 
 pub mod contribution;
 pub mod evaluator;
+pub mod feedback_domain;
 pub mod row_group_domain;
 pub mod scan_domain;
 
