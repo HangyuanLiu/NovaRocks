@@ -195,6 +195,16 @@ impl QueryInitOptions {
         let mut endpoints = BTreeSet::new();
         for target in &live_backends {
             target.process_id().map_err(protocol_contract_error)?;
+            let backend_compatibility_id = target
+                .descriptor()
+                .native_compatibility_id()
+                .map_err(protocol_contract_error)?;
+            if backend_compatibility_id != native_compatibility_id {
+                return Err(contract_error(format!(
+                    "query initialization live snapshot contains backend {} from another compatibility island",
+                    target.backend_idx()
+                )));
+            }
             if !backend_indices.insert(target.backend_idx()) {
                 return Err(contract_error(format!(
                     "query initialization live snapshot repeats backend {}",
@@ -823,6 +833,44 @@ mod tests {
             error
                 .message()
                 .contains("frozen schedule topology differs from query initialization snapshot")
+        );
+    }
+
+    #[test]
+    fn query_init_options_reject_other_island_target_before_manifest_construction() {
+        let resolved = ResolvedQueryOptions::from_upstream(None);
+        let other_island = LiveBackendTarget::new(
+            0,
+            BackendProcessDescriptor::new(
+                BackendProcessId::new_v7(),
+                novarocks_proto_codec::lifecycle::QueryControlEndpoint::new("127.0.0.1", 19040)
+                    .expect("valid endpoint"),
+                "test-deployment",
+                "different-build",
+                novarocks_types::NativeCompatibilityId::new([0x72; 32]),
+            )
+            .expect("valid descriptor"),
+        );
+
+        let error = match QueryInitOptions::new(
+            execution_id(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            vec![other_island],
+            &resolved,
+            wire_query_options(),
+            1_000,
+            Duration::from_secs(30),
+            CoordinatorReportEndpoint::from_socket_addr(
+                "127.0.0.1:19030".parse().expect("valid report endpoint"),
+            ),
+        ) {
+            Ok(_) => panic!("other-island target must not produce a participant manifest"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.message().contains("another compatibility island"),
+            "{error}"
         );
     }
 

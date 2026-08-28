@@ -1866,6 +1866,43 @@ fn frontend_query_lifecycle_draining_rejection_preserves_typed_pre_ready_evidenc
 }
 
 #[test]
+fn frontend_query_lifecycle_compatibility_rejection_preserves_typed_pre_ready_evidence() {
+    let plan = query_init_plan(None);
+    let participant = plan.participant(1).expect("participant one");
+    let backend_idx = participant.backend_idx();
+    let process_id = participant
+        .backend()
+        .process_id()
+        .expect("validated participant process identity");
+    let digest = participant.digest();
+    let execution_id = plan.execution_id();
+    let (transport, _) = RecordingTransport::ready(&plan);
+    transport.state.lock().unwrap().init_results.insert(
+        1,
+        VecDeque::from([Ok(QueryInitAck::new(
+            execution_id,
+            digest,
+            QueryInitOutcome::QueryInitRejectedCompatibilityMismatch,
+        ))]),
+    );
+    let (registry, _query) = registry_for(&plan);
+    let barrier = FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, config());
+
+    let error = match barrier.initialize_all(plan) {
+        Ok(_) => panic!("a compatibility mismatch must reject InitQuery before ControlReady"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.pre_ready_topology_outcome(),
+        Some(PreReadyTopologyOutcome::CompatibilityMismatch {
+            backend_idx,
+            process_id,
+        })
+    );
+}
+
+#[test]
 fn frontend_query_lifecycle_manifest_conflict_is_classified() {
     let plan = query_init_plan(None);
     let digest = plan.participant(1).unwrap().digest();

@@ -1587,6 +1587,7 @@ fn pre_ready_topology_reason(outcome: PreReadyTopologyOutcome) -> &'static str {
         PreReadyTopologyOutcome::BackendDraining { .. } => "backend_draining",
         PreReadyTopologyOutcome::BackendProcessMismatch { .. } => "backend_process_mismatch",
         PreReadyTopologyOutcome::BackendNotEligible { .. } => "backend_not_eligible",
+        PreReadyTopologyOutcome::CompatibilityMismatch { .. } => "compatibility_mismatch",
     }
 }
 

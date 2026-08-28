@@ -835,6 +835,13 @@ pub(crate) enum PreReadyTopologyOutcome {
         backend_idx: usize,
         process_id: BackendProcessId,
     },
+    /// The backend rejected the FE's exact native compatibility identity
+    /// before ControlReady. This is retryable only through the existing
+    /// effect-gated whole-round controller.
+    CompatibilityMismatch {
+        backend_idx: usize,
+        process_id: BackendProcessId,
+    },
 }
 
 /// A coordinator failure that core can surface without naming a coordinator
