@@ -24,9 +24,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use novarocks_proto_codec::connector_read::ConnectorReadCodec;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_spi::connector::read_stack::ConnectorReadColumnHandle;
 use novarocks_spi::connector::read_stack::ConnectorReadSplitSource;
 
 use super::super::connector_domain::CatalogHandle;
@@ -35,6 +37,7 @@ use super::driver::{
     TaskUpdateRetryPolicy,
 };
 use super::transport::TaskUpdateTransport;
+use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 
 /// How many splits one batch pulls from a source.
 ///
@@ -44,12 +47,23 @@ pub(crate) const DEFAULT_PUMP_BATCH_SIZE: usize = 256;
 
 /// How long the pump waits when no source could make progress.
 const IDLE_PUMP_BACKOFF: std::time::Duration = std::time::Duration::from_millis(2);
+/// Until the server configuration surface is wired, this is the documented
+/// default and hard safety ceiling for a connector's optional request.
+const DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP: Duration = Duration::from_secs(1);
 
 /// One typed scan's split source, with the plan node it feeds.
 pub(crate) struct RoundSplitSource {
     pub(crate) plan_node_id: i32,
     pub(crate) source: Box<dyn ConnectorReadSplitSource>,
     pub(crate) codec: Arc<dyn ConnectorReadCodec>,
+    /// FE admission state is query-attempt local and shared only with this
+    /// attempt's control readers.  The source observes it afresh for every
+    /// batch; already emitted splits are never revisited.
+    pub(crate) feedback: Arc<RuntimeFilterFeedbackState>,
+    /// Exact carrier binding -> opaque connector column mapping frozen by the
+    /// prepared scan.  A feedback channel can constrain no other column.
+    pub(crate) feedback_bindings: Vec<(u32, ConnectorReadColumnHandle)>,
+    pub(crate) initial_wait_deadline: Option<Instant>,
 }
 
 /// The per-round owner of every split source and the driver that drains them.
@@ -73,6 +87,15 @@ impl RoundSplitAssignment {
         retry_policy: TaskUpdateRetryPolicy,
     ) -> Self {
         let stop = SplitAssignmentStop::default();
+        let started_at = Instant::now();
+        let mut sources = sources;
+        for source in &mut sources {
+            let requested = source
+                .source
+                .initial_dynamic_filter_wait_request()
+                .min(DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP);
+            source.initial_wait_deadline = (!requested.is_zero()).then(|| started_at + requested);
+        }
         Self {
             driver: SplitAssignmentDriver::new(
                 execution_id,
@@ -121,11 +144,28 @@ impl RoundSplitAssignment {
                 if self.driver.is_backpressured(plan_node_id) {
                     continue;
                 }
+                let dynamic_filter = self.sources[index]
+                    .feedback
+                    .snapshot_for_scan(plan_node_id, &self.sources[index].feedback_bindings);
+                if let Some(deadline) = self.sources[index].initial_wait_deadline {
+                    if !dynamic_filter.is_complete()
+                        && Instant::now() < deadline
+                        && self.sources[index].feedback.is_initial_wait_eligible(
+                            plan_node_id,
+                            &self.sources[index].feedback_bindings,
+                        )
+                    {
+                        continue;
+                    }
+                    self.sources[index].initial_wait_deadline = None;
+                }
                 let source = self.sources[index].source.as_mut();
-                if self
-                    .driver
-                    .pump(plan_node_id, source, DEFAULT_PUMP_BATCH_SIZE)?
-                {
+                if self.driver.pump(
+                    plan_node_id,
+                    source,
+                    DEFAULT_PUMP_BATCH_SIZE,
+                    &dynamic_filter,
+                )? {
                     progressed = true;
                 }
             }
@@ -345,6 +385,12 @@ mod tests {
                 plan_node_id: 7,
                 source: Box::new(CloseCountingSource { close_calls }),
                 codec: Arc::new(InertCodec),
+                feedback: Arc::new(
+                    RuntimeFilterFeedbackState::new(execution_id, Default::default())
+                        .expect("empty feedback declaration"),
+                ),
+                feedback_bindings: Vec::new(),
+                initial_wait_deadline: None,
             }],
             TaskUpdateRetryPolicy::default(),
         )

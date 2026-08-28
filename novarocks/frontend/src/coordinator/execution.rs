@@ -87,6 +87,7 @@ use crate::native::transport::{
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
+use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 #[cfg(test)]
 use novarocks_proto_codec::lifecycle::{
@@ -1032,15 +1033,19 @@ impl FrontendDistributedQueryCoordinator {
             .map_err(pre_ready_topology_validation_error)?;
         self.registry
             .set_scheduled_backend_ownership(query_id, &scheduled_backend_ownership)?;
-        // Runtime split assignment is a round-owned resource: its sources, its
-        // task set and its transport are all derived from this schedule. They
-        // are built here, while the schedule and the prepared scans are both
-        // still in hand, and started only once the tasks can accept work.
+        // Split sources and the lifecycle barrier share this one stable,
+        // attempt-local feedback object.  It is populated from the sealed
+        // deployment below, before either control readers or the pump starts.
+        let feedback_state = Arc::new(
+            RuntimeFilterFeedbackState::new(execution_id, Default::default())
+                .expect("empty runtime filter feedback declaration is valid"),
+        );
         let split_assignment_plan = prepare_round_split_assignment(
             &parts.artifacts,
             &schedule,
             self.data_runtime.clone(),
             self.task_update_retry_policy,
+            Arc::clone(&feedback_state),
         )?;
         let binding_attachment =
             encode_binding_attachment(parts.artifacts.runtime_filter_binding_view())?;
@@ -1089,6 +1094,11 @@ impl FrontendDistributedQueryCoordinator {
             )?,
         )?;
         let feedback_declaration = deployment.feedback_declaration().clone();
+        feedback_state
+            .configure(feedback_declaration.clone())
+            .map_err(|error| {
+                DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+            })?;
         let runtime_filter_attachment =
             scheduled.seal_runtime_filter_deployment(deployment.contributions())?;
         let runtime_filter_ready =
@@ -1124,7 +1134,8 @@ impl FrontendDistributedQueryCoordinator {
             self.lifecycle_config,
         )
         .with_cancellation(parts.cancellation.clone())
-        .with_runtime_filter_feedback(feedback_declaration);
+        .with_runtime_filter_feedback(feedback_declaration)
+        .with_runtime_filter_feedback_state(feedback_state);
         let init_options = QueryInitOptions::new(
             execution_id,
             self.native_compatibility_id,
@@ -2498,6 +2509,7 @@ fn prepare_round_split_assignment(
     schedule: &ValidatedFragmentSchedule,
     data_runtime: FrontendDataRuntime,
     retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
+    feedback: Arc<RuntimeFilterFeedbackState>,
 ) -> Result<Option<RoundSplitAssignmentPlan>, DistributedQueryError> {
     let scan_nodes = artifacts
         .typed_scans()
@@ -2529,6 +2541,9 @@ fn prepare_round_split_assignment(
             plan_node_id,
             source,
             codec: Arc::clone(&scan.prepared.codec),
+            feedback: Arc::clone(&feedback),
+            feedback_bindings: feedback_bindings(table_scan),
+            initial_wait_deadline: None,
         });
     }
     let targets = assignment_targets(schedule, &scan_nodes);
@@ -2552,4 +2567,23 @@ fn prepare_round_split_assignment(
         sources,
         retry_policy,
     )))
+}
+
+fn feedback_bindings(
+    table_scan: &crate::query_execution::connector_domain::TableScanNode,
+) -> Vec<(
+    u32,
+    novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+)> {
+    table_scan
+        .dynamic_filters()
+        .iter()
+        .filter_map(|binding| {
+            table_scan
+                .assignments()
+                .iter()
+                .find(|assignment| assignment.variable() == binding.variable())
+                .map(|assignment| (binding.filter_id(), assignment.column().clone()))
+        })
+        .collect()
 }

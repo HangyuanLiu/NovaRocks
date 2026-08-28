@@ -195,11 +195,16 @@ impl IcebergSplitSource {
     }
 
     /// Whether a file's frozen statistics prove it cannot satisfy the static
-    /// predicate. Statistics bound the values a file holds, so a disjoint
-    /// intersection is a proof, never a guess.
-    fn file_is_pruned(&self, file: &IcebergPlannedDataFile) -> Result<bool, ConnectorError> {
+    /// and currently completed dynamic predicates. This is called only before
+    /// `splits_for_file`, so no pending/returned split is ever retracted.
+    fn file_is_pruned(
+        &self,
+        file: &IcebergPlannedDataFile,
+        dynamic_filter: &DynamicFilterSnapshot<IcebergColumnHandle>,
+    ) -> Result<bool, ConnectorError> {
         Ok(self
             .effective_predicate
+            .intersect(dynamic_filter.current_predicate())?
             .intersect(&file.file_statistics_domain)?
             .is_none())
     }
@@ -556,10 +561,8 @@ impl ConnectorSplitSource for IcebergSplitSource {
         if self.closed || self.exhausted {
             return Ok(ConnectorSplitBatch::finished());
         }
-        // The frontend produces no runtime-filter feedback yet, so this
-        // snapshot is always the complete, unconstrained one. The only thing
-        // worth acting on is an unsatisfiable predicate, which needs no
-        // statistics to decide; whole-file dynamic pruning is NCP-5's.
+        // An unsatisfiable snapshot finishes immediately. Otherwise each
+        // unexpanded file observes this batch's immutable snapshot below.
         if dynamic_filter.current_predicate().is_none() {
             self.exhausted = true;
             return Ok(ConnectorSplitBatch::finished());
@@ -579,7 +582,7 @@ impl ConnectorSplitSource for IcebergSplitSource {
             self.next_file += 1;
             let splits = {
                 let file = &self.files[index];
-                if self.file_is_pruned(file)? {
+                if self.file_is_pruned(file, dynamic_filter)? {
                     continue;
                 }
                 self.splits_for_file(file)?

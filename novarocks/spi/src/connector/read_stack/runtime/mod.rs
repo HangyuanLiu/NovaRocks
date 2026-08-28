@@ -607,6 +607,14 @@ pub trait ConnectorReadMetadata: Send + Sync {
 }
 
 pub trait ConnectorReadSplitSource: Send {
+    /// A connector may ask the coordinator to wait briefly for an initial
+    /// dynamic-filter snapshot before it expands its first file.  The
+    /// coordinator owns the actual cap and fairness policy; zero means this
+    /// source must start immediately.
+    fn initial_dynamic_filter_wait_request(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
     fn next_batch(
         &mut self,
         max_size: usize,

@@ -425,6 +425,15 @@ impl AttemptControl {
         Ok(())
     }
 
+    pub(crate) fn install_runtime_filter_feedback_state(
+        &self,
+        state: Arc<RuntimeFilterFeedbackState>,
+    ) {
+        let mut current = self.feedback.lock().expect("runtime filter feedback state");
+        current.close();
+        *current = state;
+    }
+
     pub(super) fn set_planned(&self, participants: &[MaterializedParticipant]) {
         let mut planned = self.planned.lock().expect("planned participant set");
         debug_assert!(planned.is_empty(), "planned participant set is immutable");
@@ -919,6 +928,10 @@ impl AttemptControl {
             .primary_error
             .lock()
             .expect("query lifecycle primary error") = Some(primary_error.clone());
+        self.feedback
+            .lock()
+            .expect("runtime filter feedback state")
+            .close();
         self.terminal.1.notify_all();
         self.stop_supervisor();
         self.metrics.attempt_terminated();
@@ -1430,6 +1443,10 @@ impl AttemptControl {
                         // outcome that determined the SQL failure.
                         self.retain_terminal_ingress.store(true, Ordering::Release);
                         self.state.store(ABORTED, Ordering::Release);
+                        self.feedback
+                            .lock()
+                            .expect("runtime filter feedback state")
+                            .close();
                         let decision = failure.into_decision();
                         let primary = format!(
                             "query lifecycle terminal finalization failed: {}",
@@ -1460,6 +1477,10 @@ impl AttemptControl {
                     }
                 };
             self.state.store(FINALIZED, Ordering::Release);
+            self.feedback
+                .lock()
+                .expect("runtime filter feedback state")
+                .close();
             tracing::info!(
                 query_id_high = self.execution_id.query_id().high(),
                 query_id_low = self.execution_id.query_id().low(),
@@ -1470,6 +1491,10 @@ impl AttemptControl {
         } else {
             self.metrics.terminal_finalize_failure();
             self.state.store(ABORTED, Ordering::Release);
+            self.feedback
+                .lock()
+                .expect("runtime filter feedback state")
+                .close();
             let primary = format!("query lifecycle finalize failed: {}", errors.join("; "));
             let cleanup = self.abort_targets(true, &primary);
             let message = if cleanup.is_empty() {

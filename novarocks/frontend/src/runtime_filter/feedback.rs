@@ -1,15 +1,21 @@
 //! FE attempt-local admission state for terminal runtime-filter feedback.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Condvar, Mutex};
 
+use novarocks_execution::runtime_filter::contribution::MembershipValues;
 use novarocks_execution::runtime_filter::feedback_domain::RuntimeFilterFeedbackDomain;
 use novarocks_proto_codec::lifecycle::{
     QueryControlEvent, QueryExecutionId, encode_query_execution_id,
 };
+use novarocks_spi::connector::read_stack::{
+    Bound, ConnectorReadColumnHandle, ConnectorReadDynamicFilterSnapshot, ConnectorValue, Domain,
+    Range, TupleDomain, ValueSet,
+};
 
 use super::install_encoder::{
     FrontendRuntimeFilterFeedbackDeclaration, FrontendRuntimeFilterFeedbackPublisherSlot,
+    FrontendRuntimeFilterFeedbackWaitEligibility,
 };
 
 #[derive(Default)]
@@ -23,6 +29,8 @@ struct ChannelState {
     max_encoded_domain_bytes: usize,
     data_type: arrow::datatypes::DataType,
     publishers: BTreeMap<u32, FrontendRuntimeFilterFeedbackPublisherSlot>,
+    scan_bindings: BTreeSet<(i32, u32)>,
+    wait_eligible: bool,
     unavailable: BTreeMap<u32, i32>,
     winner: Option<Vec<u8>>,
 }
@@ -39,56 +47,114 @@ impl RuntimeFilterFeedbackState {
         execution_id: QueryExecutionId,
         declaration: FrontendRuntimeFilterFeedbackDeclaration,
     ) -> Result<Self, String> {
-        let mut channels = BTreeMap::new();
-        for channel in declaration.channels() {
-            let Some(binding) = channel.scan_bindings().first() else {
-                return Err("runtime filter feedback declaration has no scan binding".into());
-            };
-            if channel
-                .scan_bindings()
-                .iter()
-                .any(|candidate| candidate.data_type != binding.data_type)
-            {
-                return Err(
-                    "runtime filter feedback channel binds incompatible scan value types".into(),
-                );
-            }
-            channels.insert(
-                channel.channel_id(),
-                ChannelState {
-                    contract_digest: channel.contract_digest(),
-                    max_encoded_domain_bytes: usize::try_from(channel.max_encoded_domain_bytes())
-                        .map_err(
-                        |_| "runtime filter feedback domain budget exceeds usize",
-                    )?,
-                    data_type: binding.data_type.clone(),
-                    publishers: channel
-                        .publishers()
-                        .iter()
-                        .copied()
-                        .map(|slot| (slot.participant_id, slot))
-                        .collect(),
-                    unavailable: BTreeMap::new(),
-                    winner: None,
-                },
-            );
-        }
         Ok(Self {
             execution_id,
             state: (
                 Mutex::new(FeedbackState {
                     closed: false,
-                    channels,
+                    channels: channel_states(declaration)?,
                 }),
                 Condvar::new(),
             ),
         })
     }
 
+    /// The declaration is installed before the attempt's readers and split
+    /// pump start.  Keeping the state object stable lets both owners share
+    /// one attempt-local admission domain without any process-global lookup.
+    pub(crate) fn configure(
+        &self,
+        declaration: FrontendRuntimeFilterFeedbackDeclaration,
+    ) -> Result<(), String> {
+        let mut state = self.state.0.lock().expect("runtime filter feedback state");
+        if state.closed {
+            return Err("cannot configure closed runtime filter feedback state".into());
+        }
+        state.channels = channel_states(declaration)?;
+        self.state.1.notify_all();
+        Ok(())
+    }
+
     pub(crate) fn close(&self) {
         let mut state = self.state.0.lock().expect("runtime filter feedback state");
         state.closed = true;
         self.state.1.notify_all();
+    }
+
+    /// Snapshot the currently admitted domains for one connector scan.  A
+    /// channel that is still pending (or that reported unavailable) widens to
+    /// `all`; therefore this method is an optimization boundary and can never
+    /// make a source omit a file merely because feedback was delayed.
+    pub(crate) fn snapshot_for_scan(
+        &self,
+        plan_node_id: i32,
+        bindings: &[(u32, ConnectorReadColumnHandle)],
+    ) -> ConnectorReadDynamicFilterSnapshot {
+        let state = self.state.0.lock().expect("runtime filter feedback state");
+        if state.closed {
+            return ConnectorReadDynamicFilterSnapshot::all_complete();
+        }
+
+        let mut domains: BTreeMap<ConnectorReadColumnHandle, Domain> = BTreeMap::new();
+        let mut complete = true;
+        for (binding_id, column) in bindings {
+            let Some(channel) = state
+                .channels
+                .values()
+                .find(|channel| channel.scan_bindings.contains(&(plan_node_id, *binding_id)))
+            else {
+                continue;
+            };
+            complete &= channel.is_terminal();
+            let Some(encoded) = channel.winner.as_deref() else {
+                continue;
+            };
+            let Ok(domain) = RuntimeFilterFeedbackDomain::decode(
+                encoded,
+                &channel.data_type,
+                channel.max_encoded_domain_bytes,
+            ) else {
+                // Admission already rejects malformed feedback.  Retaining a
+                // fail-open guard here keeps a future codec extension from
+                // turning a split-planning optimization into a correctness
+                // risk.
+                continue;
+            };
+            let Some(domain) = connector_domain(&domain) else {
+                continue;
+            };
+            match domains.remove(column) {
+                Some(existing) => match existing.intersect(&domain) {
+                    Ok(intersection) => {
+                        domains.insert(column.clone(), intersection);
+                    }
+                    Err(_) => {
+                        // A type mismatch cannot be a pruning authority.
+                    }
+                },
+                None => {
+                    domains.insert(column.clone(), domain);
+                }
+            }
+        }
+        let predicate = TupleDomain::with_column_domains(domains)
+            .expect("feedback declarations bind at most the connector tuple-domain limit");
+        ConnectorReadDynamicFilterSnapshot::new(predicate, complete)
+    }
+
+    pub(crate) fn is_initial_wait_eligible(
+        &self,
+        plan_node_id: i32,
+        bindings: &[(u32, ConnectorReadColumnHandle)],
+    ) -> bool {
+        let state = self.state.0.lock().expect("runtime filter feedback state");
+        bindings.iter().any(|(binding_id, _)| {
+            state.channels.values().any(|channel| {
+                channel.scan_bindings.contains(&(plan_node_id, *binding_id))
+                    && channel.wait_eligible
+                    && !channel.is_terminal()
+            })
+        })
     }
 
     /// Validates and admits one active-stream event. A foreign/retired event
@@ -178,4 +244,207 @@ impl RuntimeFilterFeedbackState {
             None => Err("runtime filter feedback terminal outcome is absent".into()),
         }
     }
+}
+
+fn channel_states(
+    declaration: FrontendRuntimeFilterFeedbackDeclaration,
+) -> Result<BTreeMap<u32, ChannelState>, String> {
+    let mut channels = BTreeMap::new();
+    for channel in declaration.channels() {
+        let Some(binding) = channel.scan_bindings().first() else {
+            return Err("runtime filter feedback declaration has no scan binding".into());
+        };
+        if channel
+            .scan_bindings()
+            .iter()
+            .any(|candidate| candidate.data_type != binding.data_type)
+        {
+            return Err(
+                "runtime filter feedback channel binds incompatible scan value types".into(),
+            );
+        }
+        channels.insert(
+            channel.channel_id(),
+            ChannelState {
+                contract_digest: channel.contract_digest(),
+                max_encoded_domain_bytes: usize::try_from(channel.max_encoded_domain_bytes())
+                    .map_err(|_| "runtime filter feedback domain budget exceeds usize")?,
+                data_type: binding.data_type.clone(),
+                publishers: channel
+                    .publishers()
+                    .iter()
+                    .copied()
+                    .map(|slot| (slot.participant_id, slot))
+                    .collect(),
+                scan_bindings: channel
+                    .scan_bindings()
+                    .iter()
+                    .map(|binding| (binding.plan_node_id, binding.binding_id))
+                    .collect(),
+                wait_eligible: matches!(
+                    channel.wait_eligibility(),
+                    FrontendRuntimeFilterFeedbackWaitEligibility::Eligible
+                ),
+                unavailable: BTreeMap::new(),
+                winner: None,
+            },
+        );
+    }
+    Ok(channels)
+}
+
+impl ChannelState {
+    fn is_terminal(&self) -> bool {
+        self.winner.is_some() || self.unavailable.len() == self.publishers.len()
+    }
+}
+
+/// Convert only exact, lossless representations into the Trino-style SPI
+/// domain.  Any unsupported value, range, or resource shape becomes `None`,
+/// which the caller treats as unconstrained.
+fn connector_domain(feedback: &RuntimeFilterFeedbackDomain) -> Option<Domain> {
+    match feedback {
+        RuntimeFilterFeedbackDomain::All => None,
+        RuntimeFilterFeedbackDomain::Exact(values) => {
+            let values = connector_values(values)?;
+            let value_type = values.first()?.value_type();
+            let values = ValueSet::of_values(value_type, values).ok()?;
+            Some(Domain::new(values, values_contains_null(feedback)))
+        }
+        RuntimeFilterFeedbackDomain::EnclosingRange {
+            lower,
+            upper,
+            contains_null,
+        } => {
+            let mut lower = connector_values(lower)?;
+            let mut upper = connector_values(upper)?;
+            let [lower] = lower.as_mut_slice() else {
+                return None;
+            };
+            let [upper] = upper.as_mut_slice() else {
+                return None;
+            };
+            if lower.value_type() != upper.value_type() {
+                return None;
+            }
+            let value_type = lower.value_type();
+            let range = Range::try_new(
+                value_type,
+                Bound::Inclusive(lower.clone()),
+                Bound::Inclusive(upper.clone()),
+            )
+            .ok()?;
+            let values = ValueSet::of_ranges(value_type, vec![range]).ok()?;
+            Some(Domain::new(values, *contains_null))
+        }
+    }
+}
+
+fn values_contains_null(feedback: &RuntimeFilterFeedbackDomain) -> bool {
+    match feedback {
+        RuntimeFilterFeedbackDomain::Exact(values) => values.contains_null(),
+        RuntimeFilterFeedbackDomain::EnclosingRange { contains_null, .. } => *contains_null,
+        RuntimeFilterFeedbackDomain::All => true,
+    }
+}
+
+fn connector_values(
+    values: &novarocks_execution::runtime_filter::contribution::ValueDomainDelta,
+) -> Option<Vec<ConnectorValue>> {
+    let values = match values.values() {
+        MembershipValues::Boolean(values) => values
+            .iter()
+            .copied()
+            .map(ConnectorValue::Boolean)
+            .collect(),
+        MembershipValues::Int8(values) => values
+            .iter()
+            .copied()
+            .map(ConnectorValue::TinyInt)
+            .collect(),
+        MembershipValues::Int32(values) => values
+            .iter()
+            .copied()
+            .map(ConnectorValue::Integer)
+            .collect(),
+        MembershipValues::Int64(values) => {
+            values.iter().copied().map(ConnectorValue::BigInt).collect()
+        }
+        MembershipValues::Float32(values) => values
+            .iter()
+            .map(|value| f32::from_bits(value.bits()))
+            .map(ConnectorValue::Real)
+            .collect(),
+        MembershipValues::Float64(values) => values
+            .iter()
+            .map(|value| f64::from_bits(value.bits()))
+            .map(ConnectorValue::Double)
+            .collect(),
+        MembershipValues::Utf8(values) => values
+            .iter()
+            .cloned()
+            .map(Into::into)
+            .map(ConnectorValue::Varchar)
+            .collect(),
+        MembershipValues::Date32(values) => {
+            values.iter().copied().map(ConnectorValue::Date).collect()
+        }
+        MembershipValues::Timestamp {
+            unit,
+            timezone,
+            values,
+        } => match (unit, timezone.as_deref()) {
+            (arrow::datatypes::TimeUnit::Microsecond, None) => values
+                .iter()
+                .copied()
+                .map(ConnectorValue::TimestampMicros)
+                .collect(),
+            (arrow::datatypes::TimeUnit::Nanosecond, None) => values
+                .iter()
+                .copied()
+                .map(ConnectorValue::TimestampNanos)
+                .collect(),
+            (arrow::datatypes::TimeUnit::Microsecond, Some(zone))
+                if zone.eq_ignore_ascii_case("UTC") =>
+            {
+                values
+                    .iter()
+                    .copied()
+                    .map(ConnectorValue::TimestampTzMicros)
+                    .collect()
+            }
+            (arrow::datatypes::TimeUnit::Nanosecond, Some(zone))
+                if zone.eq_ignore_ascii_case("UTC") =>
+            {
+                values
+                    .iter()
+                    .copied()
+                    .map(ConnectorValue::TimestampTzNanos)
+                    .collect()
+            }
+            _ => return None,
+        },
+        MembershipValues::Decimal128 {
+            precision,
+            scale,
+            values,
+        } => values
+            .iter()
+            .map(|value| ConnectorValue::try_decimal(*value, *precision, *scale).ok())
+            .collect::<Option<Vec<_>>>()?,
+        MembershipValues::LargeInt(values) => values
+            .iter()
+            .map(|value| ConnectorValue::Fixed(value.to_be_bytes().into()))
+            .collect(),
+        // The declaration may support these FE values, but the connector SPI
+        // has no equal-width predicate representation for them.
+        MembershipValues::Int16(_) => return None,
+    };
+    if values.iter().any(|value| {
+        matches!(value, ConnectorValue::Real(value) if value.is_nan())
+            || matches!(value, ConnectorValue::Double(value) if value.is_nan())
+    }) {
+        return None;
+    }
+    Some(values)
 }

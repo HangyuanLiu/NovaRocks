@@ -917,13 +917,17 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
                         dynamic_filter_columns,
                     )?,
                 };
-                return Ok(Box::new(IcebergRuntimeSplitSource::new(
-                    IcebergSplitSource::try_new(
+                let initial_dynamic_filter_wait = (!dynamic_filter_columns.is_empty())
+                    .then_some(std::time::Duration::from_secs(1))
+                    .unwrap_or_default();
+                return Ok(Box::new(
+                    IcebergRuntimeSplitSource::new(IcebergSplitSource::try_new(
                         &enumeration_handle,
                         files,
                         self.split_source_options,
-                    )?,
-                )));
+                    )?)
+                    .with_initial_dynamic_filter_wait(initial_dynamic_filter_wait),
+                ));
             }
             crate::typed_read::IcebergRuntimeRelation::TableFunction(_) => {
                 return Err(unsupported(
@@ -1020,6 +1024,7 @@ impl IcebergTypedBoundary {
 struct IcebergRuntimeSplitSource<S> {
     inner: S,
     closed: bool,
+    initial_dynamic_filter_wait: std::time::Duration,
 }
 
 impl<S> IcebergRuntimeSplitSource<S> {
@@ -1027,7 +1032,13 @@ impl<S> IcebergRuntimeSplitSource<S> {
         Self {
             inner,
             closed: false,
+            initial_dynamic_filter_wait: std::time::Duration::ZERO,
         }
+    }
+
+    fn with_initial_dynamic_filter_wait(mut self, wait: std::time::Duration) -> Self {
+        self.initial_dynamic_filter_wait = wait;
+        self
     }
 }
 
@@ -1036,6 +1047,10 @@ where
     S: ConnectorSplitSource<Column = IcebergColumnHandle> + Send,
     S::Split: IntoIcebergRuntimeSplit,
 {
+    fn initial_dynamic_filter_wait_request(&self) -> std::time::Duration {
+        self.initial_dynamic_filter_wait
+    }
+
     fn next_batch(
         &mut self,
         max_size: usize,
