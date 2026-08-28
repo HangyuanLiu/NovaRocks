@@ -2,9 +2,9 @@
 id: ADR-0119
 title: "Connector read SPI runtime and wire codec separation"
 domain: [provider-spi, distributed-query-lifecycle]
-status: active
+status: superseded
 supersedes: [ADR-0114]
-superseded-by: null
+superseded-by: ADR-0123
 date: 2026-08-28
 provenance:
   - "discussion: 2026-08-27 connector read SPI/runtime and wire codec separation"

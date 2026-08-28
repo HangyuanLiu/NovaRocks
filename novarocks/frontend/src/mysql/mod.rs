@@ -133,7 +133,7 @@ pub fn resolve_mysql_listener_settings(
 /// sessions, stops accepting new connections, then waits for active protocol
 /// tasks to drain (or aborts them after the bounded drain timeout).
 // Design: ADR-0102 (docs/adr/ADR-0102-mysql-kill-connection-lifecycle-ownership.md)
-// Design: ADR-0119 (docs/adr/ADR-0119-frontend-serving-lifecycle-and-admission-drain.md)
+// Design: ADR-0121 (docs/adr/ADR-0121-frontend-serving-lifecycle-and-admission-drain.md)
 pub async fn run_mysql_server_until_shutdown<F>(
     settings: ResolvedMysqlListenerSettings,
     session_factory: Arc<dyn QuerySessionFactory>,

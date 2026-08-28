@@ -28,7 +28,7 @@
 //! predicate lowering exactly -- `col <op> literal`, `literal <op> col`,
 //! `col IS [NOT] NULL`, and non-negated `col IN (literals)` -- so the two
 //! producers cannot disagree about which conjuncts a connector may see.
-// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
+// Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

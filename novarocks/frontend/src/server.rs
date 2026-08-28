@@ -396,7 +396,7 @@ pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendA
     ))
 }
 
-// Design: ADR-0119 (docs/adr/ADR-0119-frontend-serving-lifecycle-and-admission-drain.md)
+// Design: ADR-0121 (docs/adr/ADR-0121-frontend-serving-lifecycle-and-admission-drain.md)
 pub async fn run_frontend_server_until_shutdown<F>(
     config: FrontendServerConfig,
     data_runtime: Handle,
