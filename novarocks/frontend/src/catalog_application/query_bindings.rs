@@ -460,7 +460,9 @@ impl QueryTableBindingStore {
                 material.push(0);
                 material.extend_from_slice(descriptor.instance_id.as_str().as_bytes());
                 material.push(0);
-                material.extend_from_slice(&lease.binding().incarnation().to_bytes());
+                // Prepared-artifact identity is fenced by the FE-local
+                // control runtime, never by the BE legacy execution key.
+                material.extend_from_slice(&lease.control_runtime_id().to_bytes());
             }
             material.push(0xff);
         }
