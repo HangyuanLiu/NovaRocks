@@ -1,9 +1,9 @@
 //! Validated carriers for runtime split assignment.
 //!
 //! Scheduling identity is the task-attempt-scoped sequence alone: there is no
-//! split digest and no self-attested content id. Canonical bytes exist only so
-//! an exact replay of one sequence can be recognized, and so the same sequence
-//! carrying different content is a conflict rather than a silent overwrite.
+//! split digest, self-attested content id, or retained replay payload. A
+//! receiver accepts a monotonically advancing sequence watermark; a sequence
+//! at or below that watermark is a duplicate regardless of payload.
 
 use std::collections::BTreeSet;
 
@@ -26,12 +26,11 @@ pub fn canonical_scheduled_split_bytes(split: &dto::ScheduledSplit) -> Vec<u8> {
     split.encode_to_vec()
 }
 
-/// One split placed in one task's plan-node queue.
+/// One structurally validated split placed in one task's plan-node queue.
 #[derive(Clone, Debug)]
 pub struct ScheduledSplit {
     raw: dto::ScheduledSplit,
     split: ValidatedConnectorSplit,
-    canonical: Vec<u8>,
 }
 
 impl ScheduledSplit {
@@ -50,12 +49,7 @@ impl ScheduledSplit {
         })?;
         let split = ValidatedConnectorSplit::parse(split, path.clone().field("split"))
             .map_err(|error| nest(path.field("split"), error))?;
-        let canonical = canonical_scheduled_split_bytes(&raw);
-        Ok(Self {
-            raw,
-            split,
-            canonical,
-        })
+        Ok(Self { raw, split })
     }
 
     pub const fn sequence_id(&self) -> u64 {
@@ -68,12 +62,6 @@ impl ScheduledSplit {
 
     pub const fn split(&self) -> &ValidatedConnectorSplit {
         &self.split
-    }
-
-    /// The bytes an exact replay must reproduce. Two scheduled splits with the
-    /// same sequence and different canonical bytes are a conflict.
-    pub fn canonical_bytes(&self) -> &[u8] {
-        &self.canonical
     }
 
     pub const fn as_proto(&self) -> &dto::ScheduledSplit {
@@ -132,8 +120,9 @@ impl SplitAssignment {
                     "assignment repeats a sequence id",
                 ));
             }
-            // Within one batch the sequence must advance, so a receiver can
-            // compare a replay position without re-sorting the batch.
+            // Within one batch the sequence must advance. This structural
+            // check remains necessary even when every older sequence is a
+            // duplicate under the receiver's watermark.
             if let Some(previous) = previous
                 && scheduled.sequence_id() <= previous
             {
@@ -206,4 +195,36 @@ pub fn parse_task_update_assignments(
         assignments.push(assignment);
     }
     Ok(assignments)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_malformed_duplicate_is_rejected_during_structural_validation() {
+        let error = SplitAssignment::parse(
+            dto::SplitAssignment {
+                plan_node_id: 7,
+                splits: vec![
+                    dto::ScheduledSplit {
+                        sequence_id: 3,
+                        plan_node_id: 7,
+                        split: None,
+                    },
+                    dto::ScheduledSplit {
+                        sequence_id: 3,
+                        plan_node_id: 7,
+                        split: None,
+                    },
+                ],
+                no_more_splits: false,
+            },
+            FieldPath::root("split_assignment"),
+        )
+        .expect_err("a malformed duplicate must not reach watermark classification");
+
+        assert_eq!(error.kind(), crate::ProtocolErrorKind::MissingField);
+        assert_eq!(error.path().to_string(), "split_assignment.splits[0].split");
+    }
 }

@@ -137,24 +137,21 @@ pub trait ConnectorReadExecutionBundleFactory: Send + Sync {
     ) -> Result<ConnectorReadExecutionBundle, ConnectorError>;
 }
 
-/// Immutable evidence retained by a role for exact TaskUpdate replay.
+/// Sequence facts carried beside a provider-private split after decoding.
 ///
-/// The bytes are the received validated message encoding. They are not rebuilt
-/// from a recovered provider split, because internal map order can differ from
-/// the frozen protocol's canonical order.
+/// They are scheduling metadata only. The receiver retains no payload evidence
+/// for retransmission: duplicate classification is solely the queue watermark.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReceivedScheduledSplitEvidence {
+pub struct ReceivedScheduledSplit {
     sequence_id: u64,
     plan_node_id: i32,
-    canonical_bytes: Arc<[u8]>,
 }
 
-impl ReceivedScheduledSplitEvidence {
+impl ReceivedScheduledSplit {
     pub fn from_scheduled(split: &ScheduledSplit) -> Self {
         Self {
             sequence_id: split.sequence_id(),
             plan_node_id: split.plan_node_id(),
-            canonical_bytes: Arc::from(split.canonical_bytes()),
         }
     }
 
@@ -165,33 +162,29 @@ impl ReceivedScheduledSplitEvidence {
     pub const fn plan_node_id(&self) -> i32 {
         self.plan_node_id
     }
-
-    pub fn canonical_bytes(&self) -> &[u8] {
-        &self.canonical_bytes
-    }
 }
 
 #[derive(Clone, Debug)]
 pub struct DecodedScheduledReadSplit {
-    evidence: ReceivedScheduledSplitEvidence,
+    received: ReceivedScheduledSplit,
     split: ConnectorReadSplit,
 }
 
 impl DecodedScheduledReadSplit {
-    pub const fn new(evidence: ReceivedScheduledSplitEvidence, split: ConnectorReadSplit) -> Self {
-        Self { evidence, split }
+    pub const fn new(received: ReceivedScheduledSplit, split: ConnectorReadSplit) -> Self {
+        Self { received, split }
     }
 
-    pub const fn evidence(&self) -> &ReceivedScheduledSplitEvidence {
-        &self.evidence
+    pub const fn received(&self) -> &ReceivedScheduledSplit {
+        &self.received
     }
 
     pub const fn split(&self) -> &ConnectorReadSplit {
         &self.split
     }
 
-    pub fn into_parts(self) -> (ReceivedScheduledSplitEvidence, ConnectorReadSplit) {
-        (self.evidence, self.split)
+    pub fn into_parts(self) -> (ReceivedScheduledSplit, ConnectorReadSplit) {
+        (self.received, self.split)
     }
 }
 
@@ -337,7 +330,7 @@ pub trait ConnectorReadCodec: Send + Sync {
         scheduled: &ScheduledSplit,
     ) -> Result<DecodedScheduledReadSplit, ConnectorReadCodecError> {
         Ok(DecodedScheduledReadSplit::new(
-            ReceivedScheduledSplitEvidence::from_scheduled(scheduled),
+            ReceivedScheduledSplit::from_scheduled(scheduled),
             self.decode_split(scheduled.split())?,
         ))
     }

@@ -30,20 +30,20 @@ use novarocks_spi::connector::ConnectorExecutionBindingKey;
 use novarocks_types::{QueryExecutionId, QueryId, UniqueId};
 
 /// A split received by this backend after the exact binding codec recovered
-/// its provider-private SPI payload.  Replay compares the separately retained
-/// received canonical bytes; it never re-encodes an internal split.
+/// its provider-private SPI payload. Scheduling retains only sequence and
+/// plan-node metadata; duplicate suppression never compares payload bytes.
 #[derive(Clone, Debug)]
 pub(crate) struct ReceivedReadSplit {
-    evidence: novarocks_proto_codec::connector_read::ReceivedScheduledSplitEvidence,
+    received: novarocks_proto_codec::connector_read::ReceivedScheduledSplit,
     split: novarocks_spi::connector::read_stack::ConnectorReadSplit,
 }
 
 impl ReceivedReadSplit {
     pub(crate) const fn new(
-        evidence: novarocks_proto_codec::connector_read::ReceivedScheduledSplitEvidence,
+        received: novarocks_proto_codec::connector_read::ReceivedScheduledSplit,
         split: novarocks_spi::connector::read_stack::ConnectorReadSplit,
     ) -> Self {
-        Self { evidence, split }
+        Self { received, split }
     }
 
     pub(crate) const fn split(&self) -> &novarocks_spi::connector::read_stack::ConnectorReadSplit {
@@ -53,22 +53,15 @@ impl ReceivedReadSplit {
 
 impl novarocks_execution::connector::ScheduledSplitFacts for ReceivedReadSplit {
     fn sequence_id(&self) -> u64 {
-        self.evidence.sequence_id()
+        self.received.sequence_id()
     }
 
     fn plan_node_id(&self) -> i32 {
-        self.evidence.plan_node_id()
-    }
-
-    fn canonical_bytes(&self) -> &[u8] {
-        self.evidence.canonical_bytes()
+        self.received.plan_node_id()
     }
 
     fn retained_size_in_bytes(&self) -> u64 {
-        self.split
-            .facts()
-            .retained_size_in_bytes()
-            .saturating_add(self.evidence.canonical_bytes().len() as u64)
+        self.split.facts().retained_size_in_bytes()
     }
 }
 

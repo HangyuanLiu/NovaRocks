@@ -71,8 +71,6 @@ type LifecycleObserver = Arc<dyn Fn(NativeFragmentLifecycleEvent) + Send + Sync>
 fn split_queue_config() -> novarocks_execution::connector::SplitQueueConfig {
     novarocks_execution::connector::SplitQueueConfig {
         max_queued_bytes: novarocks_proto_codec::connector_read::MAX_ASSIGNMENT_RETAINED_BYTES,
-        max_replay_record_bytes:
-            novarocks_proto_codec::connector_read::MAX_ASSIGNMENT_RETAINED_BYTES,
     }
 }
 
@@ -415,30 +413,28 @@ impl NativeFragmentService {
                     ),
                 );
             };
-            let evidence = assignment
+            let sequences = assignment
                 .splits()
                 .iter()
                 .map(|split| {
-                    novarocks_execution::connector::SplitReplayEvidence::new(
+                    novarocks_execution::connector::SplitSequenceEvidence::new(
                         split.sequence_id(),
                         split.plan_node_id(),
-                        split.canonical_bytes().to_vec(),
                     )
                 })
                 .collect::<Vec<_>>();
-            // Queue state decides whether this is a replay, a conflict, or a
-            // terminal update before a concrete binding attempts to recover a
-            // provider payload.  A later codec fills `ReceivedReadSplit` only
-            // for `new_sequences`; exact replay never depends on map order in
-            // a recovered provider value.
-            let preflight = match queue.preflight_replay(assignment.plan_node_id(), &evidence) {
+            // Closed-carrier validation precedes this point. Queue state then
+            // classifies duplicate sequence numbers before provider decoding,
+            // so an at-or-below-watermark retransmission never recovers a
+            // provider payload.
+            let preflight = match queue.preflight_sequences(assignment.plan_node_id(), &sequences) {
                 Ok(preflight) => preflight,
                 Err(error) => return split_queue_rejection(error),
             };
             let received = assignment
                 .splits()
                 .iter()
-                .filter(|split| !preflight.is_replay(split.sequence_id()))
+                .filter(|split| !preflight.is_duplicate(split.sequence_id()))
                 .map(|split| {
                     read_execution
                         .codec()
@@ -463,14 +459,13 @@ impl NativeFragmentService {
                 received,
                 assignment.no_more_splits(),
             ) {
-                Ok(mut outcome) => {
-                    outcome.replayed = preflight.replayed().to_vec();
+                Ok(outcome) => {
                     // Stable acceptance evidence for distributed acceptance
                     // runs: it proves a real remote assignment reached this
                     // task, which a single-process smoke cannot show.
                     if crate::config::debug_emit_connector_reader_marker() {
                         println!(
-                            "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED execution_id={}:{}:{} finst={:x}:{:x} plan_node={} enqueued={} replayed={} accepted_through={}",
+                            "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED execution_id={}:{}:{} finst={:x}:{:x} plan_node={} enqueued={} duplicate={} accepted_through={}",
                             execution_id.query_id().high(),
                             execution_id.query_id().low(),
                             execution_id.attempt_id().get(),
@@ -478,7 +473,7 @@ impl NativeFragmentService {
                             fragment_instance_id.low(),
                             assignment.plan_node_id(),
                             outcome.enqueued.len(),
-                            outcome.replayed.len(),
+                            preflight.duplicate_sequences().len(),
                             outcome.max_accepted_sequence.unwrap_or_default(),
                         );
                         if outcome.no_more_splits {

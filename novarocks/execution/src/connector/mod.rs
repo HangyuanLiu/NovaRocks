@@ -39,6 +39,6 @@ pub use page_adapter::{
 };
 pub use scan_queue::{
     ScheduledSplitFacts, SplitOfferOutcome, SplitPoll, SplitQueue, SplitQueueConfig,
-    SplitQueueError, SplitQueueErrorKind, SplitQueueRegistry, SplitQueueStats, SplitReplayEvidence,
-    SplitReplayPreflight, TaskAttemptKey, TaskAttemptSplitQueues,
+    SplitQueueError, SplitQueueErrorKind, SplitQueueRegistry, SplitQueueStats,
+    SplitSequenceEvidence, SplitSequencePreflight, TaskAttemptKey, TaskAttemptSplitQueues,
 };
