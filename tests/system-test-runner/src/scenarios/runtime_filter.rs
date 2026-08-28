@@ -42,6 +42,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(AcceptedAfterAckDrop),
         Box::new(CancelWithTerminalAckReplay),
         Box::new(Ncp5FeedbackContractDigestCorrupt),
+        Box::new(Ncp5FeedbackUnavailable),
         Box::new(Ncp5PartitionedFeedbackPruning),
     ]
 }
@@ -112,6 +113,18 @@ impl Scenario for Ncp5FeedbackContractDigestCorrupt {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         run_ncp5_feedback_contract_digest_corrupt(context)
+    }
+}
+
+struct Ncp5FeedbackUnavailable;
+
+impl Scenario for Ncp5FeedbackUnavailable {
+    fn name(&self) -> &'static str {
+        "runtime-filter/ncp-5-feedback-unavailable"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_ncp5_feedback_unavailable(context)
     }
 }
 
@@ -338,6 +351,42 @@ fn run_ncp5_feedback_contract_digest_corrupt(context: &mut ScenarioContext) -> R
         .await_query_execution_resource_convergence(&baseline, true, deadline)
         .context("await resource convergence after fail-closed feedback rejection")?;
     context.action("typed resource oracle confirmed fail-closed feedback cleanup converged");
+    Ok(())
+}
+
+fn run_ncp5_feedback_unavailable(context: &mut ScenarioContext) -> Result<()> {
+    require_three_backends(context)?;
+    let mut control = connect_control(
+        context,
+        "connect NCP-5 unavailable-feedback control session",
+    )?;
+    let tables = create_ncp5_pruning_tables(context, &mut control)?;
+    configure_broadcast_runtime_filter(&mut control)?;
+    for backend_index in 0..REQUIRED_BACKENDS {
+        context
+            .handle()
+            .arm_query_lifecycle_fault(backend_index, "runtime-filter-feedback-unavailable")
+            .with_context(|| format!("arm feedback unavailable fault for BE[{backend_index}]"))?;
+    }
+    let profile: Vec<String> = control
+        .query(format!(
+            "EXPLAIN ANALYZE {}",
+            runtime_filter_count_query(&tables)
+        ))
+        .context("typed unavailable feedback must remain query-correct")?;
+    let profile = profile.join("\n");
+    assert_positive_profile_counter(&profile, "ConnectorFilesConsidered")?;
+    ensure!(
+        profile.contains("ConnectorWholeFilesPruned=0"),
+        "typed unavailable must fail open for FE whole-file pruning; profile={profile}"
+    );
+    context
+        .handle()
+        .clear_query_lifecycle_faults()
+        .context("clear feedback unavailable fault tokens")?;
+    context.action(
+        "typed unavailable feedback preserved correctness and disabled FE whole-file pruning",
+    );
     Ok(())
 }
 

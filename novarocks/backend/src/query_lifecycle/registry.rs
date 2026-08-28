@@ -95,6 +95,9 @@ impl BackendFrontendFeedbackSink for RuntimeFilterFeedbackEgress {
     ) {
         use novarocks_proto_models::novarocks as wire;
 
+        #[cfg(debug_assertions)]
+        let outcome = force_feedback_unavailable(self.execution_id).unwrap_or(outcome);
+
         let terminal_outcome = match outcome {
             BackendFrontendFeedbackOutcome::CanonicalDomain(domain) => {
                 wire::runtime_filter_feedback_event::TerminalOutcome::CanonicalDomain(
@@ -161,6 +164,22 @@ fn corrupt_feedback_contract_digest(execution_id: QueryExecutionId) -> bool {
         ),
         Ok(Some(_))
     )
+}
+
+#[cfg(debug_assertions)]
+fn force_feedback_unavailable(
+    execution_id: QueryExecutionId,
+) -> Option<BackendFrontendFeedbackOutcome> {
+    let root = novarocks_failpoint::configured_root()?;
+    matches!(
+        novarocks_failpoint::claim_matching_receiver_agnostic_fault(
+            &root,
+            QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
+            execution_id,
+        ),
+        Ok(Some(_))
+    )
+    .then_some(BackendFrontendFeedbackOutcome::ProducerUnavailable)
 }
 
 fn protocol_contract_error(error: novarocks_proto_codec::ProtocolError) -> QueryLifecycleError {
