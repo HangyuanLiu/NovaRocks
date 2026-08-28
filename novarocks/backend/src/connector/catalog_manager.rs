@@ -27,11 +27,85 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex};
 
-use novarocks_spi::connector::{CatalogHandle, CatalogProperties};
+use novarocks_spi::connector::{
+    CatalogHandle, CatalogProperties, CatalogRuntime, CatalogRuntimeMaterializer,
+};
 use novarocks_types::QueryExecutionId;
 
 /// The bounded number of unleased materialized catalogs retained by default.
 pub const DEFAULT_MAX_RETAINED_CATALOGS: usize = 64;
+
+/// A BE-local provider runtime selected for one exact immutable catalog.
+///
+/// The wrapper keeps the trait object out of the generic lifecycle manager's
+/// public surface while preserving the provider runtime for the native decode
+/// resolver that will consume the same catalog lease.
+#[derive(Clone)]
+pub struct MaterializedCatalogRuntime {
+    runtime: Arc<dyn CatalogRuntime>,
+}
+
+impl MaterializedCatalogRuntime {
+    pub fn new(runtime: Arc<dyn CatalogRuntime>) -> Self {
+        Self { runtime }
+    }
+
+    pub fn runtime(&self) -> Arc<dyn CatalogRuntime> {
+        Arc::clone(&self.runtime)
+    }
+}
+
+/// Startup-sealed provider materializers keyed by the closed catalog family.
+#[derive(Clone)]
+pub struct CatalogRuntimeMaterializerSet {
+    materializers: Arc<
+        BTreeMap<
+            novarocks_spi::connector::CatalogProviderKind,
+            Arc<dyn CatalogRuntimeMaterializer>,
+        >,
+    >,
+}
+
+impl CatalogRuntimeMaterializerSet {
+    pub fn try_new(
+        materializers: impl IntoIterator<Item = Arc<dyn CatalogRuntimeMaterializer>>,
+    ) -> Result<Self, CatalogManagerError> {
+        let mut sealed = BTreeMap::new();
+        for materializer in materializers {
+            let provider_kind = materializer.provider_kind();
+            if sealed.insert(provider_kind, materializer).is_some() {
+                return Err(CatalogManagerError::InvalidConfiguration(
+                    "duplicate catalog runtime materializer provider kind",
+                ));
+            }
+        }
+        Ok(Self {
+            materializers: Arc::new(sealed),
+        })
+    }
+
+    pub fn materialize(
+        &self,
+        properties: &CatalogProperties,
+    ) -> Result<MaterializedCatalogRuntime, CatalogManagerError> {
+        let Some(materializer) = self.materializers.get(&properties.provider_kind()) else {
+            return Err(CatalogManagerError::materialization_failed(
+                "catalog runtime provider is not installed",
+            ));
+        };
+        let runtime = materializer
+            .materialize(properties)
+            .map_err(|error| CatalogManagerError::materialization_failed(error.to_string()))?;
+        if runtime.handle() != properties.handle()
+            || runtime.provider_kind() != properties.provider_kind()
+        {
+            return Err(CatalogManagerError::materialization_failed(
+                "catalog runtime materializer returned an incompatible runtime",
+            ));
+        }
+        Ok(MaterializedCatalogRuntime::new(runtime))
+    }
+}
 
 /// Catalog-manager configuration that is independent of any provider runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -489,14 +563,51 @@ mod tests {
     use std::thread;
 
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
+        CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogRuntime,
+        CatalogRuntimeMaterializer, CatalogVersion, ConnectorError, ConnectorInstanceId,
     };
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
 
     use super::{
         CatalogManager, CatalogManagerConfig, CatalogManagerError, CatalogPruneResult,
-        remove_ready_candidate_if_current,
+        CatalogRuntimeMaterializerSet, remove_ready_candidate_if_current,
     };
+
+    struct TestRuntime {
+        handle: CatalogHandle,
+        provider_kind: CatalogProviderKind,
+    }
+
+    impl CatalogRuntime for TestRuntime {
+        fn handle(&self) -> &CatalogHandle {
+            &self.handle
+        }
+
+        fn provider_kind(&self) -> CatalogProviderKind {
+            self.provider_kind
+        }
+    }
+
+    struct TestMaterializer {
+        provider_kind: CatalogProviderKind,
+        returned_kind: CatalogProviderKind,
+    }
+
+    impl CatalogRuntimeMaterializer for TestMaterializer {
+        fn provider_kind(&self) -> CatalogProviderKind {
+            self.provider_kind
+        }
+
+        fn materialize(
+            &self,
+            properties: &CatalogProperties,
+        ) -> Result<Arc<dyn CatalogRuntime>, ConnectorError> {
+            Ok(Arc::new(TestRuntime {
+                handle: properties.handle().clone(),
+                provider_kind: self.returned_kind,
+            }))
+        }
+    }
 
     fn query(value: i64) -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(7, value), AttemptId::new(1).expect("attempt"))
@@ -510,6 +621,36 @@ mod tests {
         );
         CatalogProperties::new(handle, CatalogProviderKind::Iceberg, 1, vec![], vec![])
             .expect("catalog properties")
+    }
+
+    #[test]
+    fn sealed_materializer_set_requires_the_exact_provider_and_runtime_identity() {
+        let properties = properties(1);
+        let set = CatalogRuntimeMaterializerSet::try_new([Arc::new(TestMaterializer {
+            provider_kind: CatalogProviderKind::Iceberg,
+            returned_kind: CatalogProviderKind::Iceberg,
+        })
+            as Arc<dyn CatalogRuntimeMaterializer>])
+        .expect("seal materializer set");
+        let runtime = set.materialize(&properties).expect("exact materialization");
+        assert_eq!(runtime.runtime().handle(), properties.handle());
+
+        let mismatched = CatalogRuntimeMaterializerSet::try_new([Arc::new(TestMaterializer {
+            provider_kind: CatalogProviderKind::Iceberg,
+            returned_kind: CatalogProviderKind::StarRocks,
+        })
+            as Arc<dyn CatalogRuntimeMaterializer>])
+        .expect("seal materializer set");
+        assert!(matches!(
+            mismatched.materialize(&properties),
+            Err(CatalogManagerError::MaterializationFailed { .. })
+        ));
+
+        let missing = CatalogRuntimeMaterializerSet::try_new([]).expect("empty set is valid");
+        assert!(matches!(
+            missing.materialize(&properties),
+            Err(CatalogManagerError::MaterializationFailed { .. })
+        ));
     }
 
     #[test]

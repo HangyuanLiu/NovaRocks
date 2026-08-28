@@ -26,11 +26,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
-    ConnectorExecutionProviderKind, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
-    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitSet, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorRequestContext, ConnectorSplit,
+    CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogRuntime,
+    CatalogRuntimeMaterializer, ConnectorBatchReader, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
+    ConnectorExecutionInstaller, ConnectorExecutionProviderKind, ConnectorOpenReaderRequest,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitSet,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext, ConnectorSplit,
 };
 
 use crate::domain::StarRocksLocalBindingRef;
@@ -38,6 +39,47 @@ use crate::{STARROCKS_PROVIDER_ID, starrocks_read_unsupported};
 
 pub struct StarRocksExecutionInstaller {
     provider_id: ConnectorProviderId,
+}
+
+/// Startup-composed materializer for the closed StarRocks catalog family.
+/// StarRocks read execution remains unsupported, but its catalog lifecycle is
+/// still explicit and keyed by the immutable catalog handle.
+#[derive(Default)]
+pub struct StarRocksCatalogRuntimeMaterializer;
+
+struct StarRocksCatalogRuntime {
+    handle: CatalogHandle,
+}
+
+impl CatalogRuntime for StarRocksCatalogRuntime {
+    fn handle(&self) -> &CatalogHandle {
+        &self.handle
+    }
+
+    fn provider_kind(&self) -> CatalogProviderKind {
+        CatalogProviderKind::StarRocks
+    }
+}
+
+impl CatalogRuntimeMaterializer for StarRocksCatalogRuntimeMaterializer {
+    fn provider_kind(&self) -> CatalogProviderKind {
+        CatalogProviderKind::StarRocks
+    }
+
+    fn materialize(
+        &self,
+        properties: &CatalogProperties,
+    ) -> Result<Arc<dyn CatalogRuntime>, ConnectorError> {
+        if properties.provider_kind() != CatalogProviderKind::StarRocks {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "StarRocks catalog materializer received another provider kind",
+            ));
+        }
+        Ok(Arc::new(StarRocksCatalogRuntime {
+            handle: properties.handle().clone(),
+        }))
+    }
 }
 
 impl StarRocksExecutionInstaller {

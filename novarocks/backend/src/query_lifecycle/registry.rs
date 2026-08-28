@@ -186,6 +186,14 @@ fn force_feedback_unavailable(
     .then_some(BackendFrontendFeedbackOutcome::ProducerUnavailable)
 }
 
+fn empty_catalog_runtime_materializers()
+-> Arc<crate::connector::catalog_manager::CatalogRuntimeMaterializerSet> {
+    Arc::new(
+        crate::connector::catalog_manager::CatalogRuntimeMaterializerSet::try_new([])
+            .expect("an empty catalog runtime materializer set is valid"),
+    )
+}
+
 fn protocol_contract_error(error: novarocks_proto_codec::ProtocolError) -> QueryLifecycleError {
     QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
 }
@@ -805,23 +813,6 @@ pub(crate) trait QueryLifecycleLocalRuntime: Send + Sync + 'static {
     fn release_query_resources(&self, execution_id: QueryExecutionId);
 }
 
-/// Startup-sealed provider bridge for a catalog lifecycle installation.
-///
-/// The query lifecycle owns when a frozen catalog is admitted and released;
-/// this narrow bridge owns only provider-local materialization.  In
-/// particular, it cannot create a second lifecycle or bypass the manifest.
-pub(crate) trait CatalogLifecycleMaterializer: Send + Sync + 'static {
-    fn materialize(&self, properties: &CatalogProperties) -> Result<(), String>;
-}
-
-struct RejectingCatalogLifecycleMaterializer;
-
-impl CatalogLifecycleMaterializer for RejectingCatalogLifecycleMaterializer {
-    fn materialize(&self, _properties: &CatalogProperties) -> Result<(), String> {
-        Err("catalog runtime materializer is not installed".to_owned())
-    }
-}
-
 /// Backend-local ingress state that remains useful until an attempt reaches
 /// its lifecycle tombstone. It is deliberately separate from execution
 /// resources: a late TaskUpdate must still be able to confirm an immutable
@@ -1054,8 +1045,12 @@ impl Drop for StageResourceReservation {
 pub(crate) struct QueryLifecycleRegistry {
     state: Mutex<QueryLifecycleRegistryState>,
     local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
-    catalog_manager: Arc<crate::connector::catalog_manager::CatalogManager<()>>,
-    catalog_materializer: Arc<dyn CatalogLifecycleMaterializer>,
+    catalog_manager: Arc<
+        crate::connector::catalog_manager::CatalogManager<
+            crate::connector::catalog_manager::MaterializedCatalogRuntime,
+        >,
+    >,
+    catalog_materializers: Arc<crate::connector::catalog_manager::CatalogRuntimeMaterializerSet>,
     runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
     config: QueryLifecycleRegistryConfig,
     local_process_id: BackendProcessId,
@@ -1320,6 +1315,7 @@ impl QueryLifecycleRegistry {
             metrics,
             terminal_fallback,
             NativeCompatibilityId::new([0x71; 32]),
+            empty_catalog_runtime_materializers(),
         )
     }
 
@@ -1346,6 +1342,7 @@ impl QueryLifecycleRegistry {
             terminal_fallback,
             runtime_filter_factory,
             NativeCompatibilityId::new([0x71; 32]),
+            empty_catalog_runtime_materializers(),
         )
     }
 
@@ -1365,6 +1362,7 @@ impl QueryLifecycleRegistry {
             Arc::new(PrometheusQueryLifecycleMetricsSink),
             Arc::new(GrpcQueryTerminalFallbackTransport { runtime }),
             NativeCompatibilityId::new([0x71; 32]),
+            empty_catalog_runtime_materializers(),
         )
     }
 
@@ -1373,6 +1371,24 @@ impl QueryLifecycleRegistry {
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
         native_compatibility_id: NativeCompatibilityId,
+    ) -> Arc<Self> {
+        Self::new_with_runtime_and_catalog_materializers(
+            runtime,
+            local_runtime,
+            config,
+            native_compatibility_id,
+            empty_catalog_runtime_materializers(),
+        )
+    }
+
+    pub(crate) fn new_with_runtime_and_catalog_materializers(
+        runtime: BackendDataRuntime,
+        local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
+        config: QueryLifecycleRegistryConfig,
+        native_compatibility_id: NativeCompatibilityId,
+        catalog_materializers: Arc<
+            crate::connector::catalog_manager::CatalogRuntimeMaterializerSet,
+        >,
     ) -> Arc<Self> {
         Self::new_with_backend_identity(
             runtime.clone(),
@@ -1383,6 +1399,7 @@ impl QueryLifecycleRegistry {
             Arc::new(PrometheusQueryLifecycleMetricsSink),
             Arc::new(GrpcQueryTerminalFallbackTransport { runtime }),
             native_compatibility_id,
+            catalog_materializers,
         )
     }
 
@@ -1399,6 +1416,9 @@ impl QueryLifecycleRegistry {
         metrics: Arc<dyn QueryLifecycleMetricsSink>,
         terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
         native_compatibility_id: NativeCompatibilityId,
+        catalog_materializers: Arc<
+            crate::connector::catalog_manager::CatalogRuntimeMaterializerSet,
+        >,
     ) -> Arc<Self> {
         Self::new_with_backend_identity_and_runtime_filter_factory(
             local_process_id,
@@ -1409,6 +1429,7 @@ impl QueryLifecycleRegistry {
             terminal_fallback,
             Arc::new(BackendRuntimeFilterParticipantFactory::new(runtime)),
             native_compatibility_id,
+            catalog_materializers,
         )
     }
 
@@ -1425,6 +1446,9 @@ impl QueryLifecycleRegistry {
         terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
         runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
         native_compatibility_id: NativeCompatibilityId,
+        catalog_materializers: Arc<
+            crate::connector::catalog_manager::CatalogRuntimeMaterializerSet,
+        >,
     ) -> Arc<Self> {
         assert!(config.max_active_entries > 0);
         assert!(config.tombstone_capacity > 0);
@@ -1451,7 +1475,7 @@ impl QueryLifecycleRegistry {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
             catalog_manager: Arc::new(crate::connector::catalog_manager::CatalogManager::default()),
-            catalog_materializer: Arc::new(RejectingCatalogLifecycleMaterializer),
+            catalog_materializers,
             runtime_filter_factory,
             config,
             local_process_id,
@@ -1686,13 +1710,11 @@ impl QueryLifecycleRegistry {
             .name("catalog-lifecycle-install".to_owned())
             .spawn(move || {
                 let result = catalogs.into_iter().try_for_each(|properties| {
-                    let materializer = Arc::clone(&registry.catalog_materializer);
+                    let materializers = Arc::clone(&registry.catalog_materializers);
                     registry
                         .catalog_manager
                         .ensure(execution_id, properties, move |properties| {
-                            materializer
-                                .materialize(properties)
-                                .map_err(crate::connector::catalog_manager::CatalogManagerError::materialization_failed)
+                            materializers.materialize(properties)
                         })
                         .map(|_| ())
                 });

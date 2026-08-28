@@ -25,14 +25,18 @@ use crate::state_store_limits::resolve_state_store_limits;
 use novarocks_backend::{BackendServerConfig, QueryLifecycleRegistryConfig};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::connector_factory::IcebergConnectorFactory;
-use novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller;
+use novarocks_connector_iceberg::file_reader::execution_installer::{
+    IcebergCatalogRuntimeMaterializer, IcebergConnectorInstaller,
+};
 use novarocks_connector_iceberg::resources::{IcebergExecutionResources, IcebergMetadataResources};
 use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStorageLakePublication,
     IcebergStorageLakeTargetSnapshotObservation, IcebergStoragePartitionTransform,
     IcebergStorageRefreshTechnique,
 };
-use novarocks_connector_starrocks::StarRocksExecutionInstaller;
+use novarocks_connector_starrocks::{
+    StarRocksCatalogRuntimeMaterializer, StarRocksExecutionInstaller,
+};
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
@@ -466,10 +470,28 @@ pub fn compose_backend_server_config(
         .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
         execution_installers: compose_backend_execution_installers(config, runtime.clone())?,
+        catalog_runtime_materializers: compose_backend_catalog_runtime_materializers(
+            config,
+            runtime.clone(),
+        )?,
         read_execution_bundle_factories: compose_backend_read_execution_bundle_factories(
             config, runtime,
         )?,
     })
+}
+
+/// Assemble provider-local materializers for immutable CatalogSet entries.
+/// The materializers receive only credential-free frontend properties; all
+/// credentials and I/O resources remain in this startup composition path.
+pub fn compose_backend_catalog_runtime_materializers(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<Vec<std::sync::Arc<dyn novarocks_spi::connector::CatalogRuntimeMaterializer>>> {
+    let iceberg_resources = compose_iceberg_execution_resources(config, runtime)?;
+    Ok(vec![
+        std::sync::Arc::new(StarRocksCatalogRuntimeMaterializer),
+        std::sync::Arc::new(IcebergCatalogRuntimeMaterializer::new(iceberg_resources)),
+    ])
 }
 
 /// Resolve every Frontend startup input from the application wire configuration.

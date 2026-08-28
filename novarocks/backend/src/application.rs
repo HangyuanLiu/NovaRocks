@@ -16,7 +16,7 @@ use novarocks_proto_codec::membership::BackendProcessDescriptor;
 use novarocks_proto_codec::membership::{
     BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
 };
-use novarocks_spi::connector::ConnectorExecutionInstaller;
+use novarocks_spi::connector::{CatalogRuntimeMaterializer, ConnectorExecutionInstaller};
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 
 use crate::BackendDataRuntime;
@@ -70,6 +70,10 @@ pub struct BackendServerConfig {
     /// Backend only owns registration and lifecycle of these contributions; it
     /// never constructs a provider-specific installer or catalog binding.
     pub execution_installers: Vec<Arc<dyn ConnectorExecutionInstaller>>,
+    /// Provider-owned materializers for immutable catalog properties. The set
+    /// is sealed before query lifecycle admission and contains all local
+    /// credential and client construction authority.
+    pub catalog_runtime_materializers: Vec<Arc<dyn CatalogRuntimeMaterializer>>,
     /// Provider-owned constructors for complete worker read bundles, one per
     /// provider kind. The Host installs factory and matching codec atomically
     /// for each exact admitted binding generation.
@@ -477,6 +481,7 @@ fn compose_backend_application_services(
     native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
+    catalog_runtime_materializers: &[Arc<dyn CatalogRuntimeMaterializer>],
     read_execution_bundle_factories: &[(
         novarocks_spi::connector::ConnectorExecutionProviderKind,
         Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
@@ -502,12 +507,25 @@ fn compose_backend_application_services(
         Arc::clone(&controls),
         Arc::clone(&execution_host),
     ));
-    let query_lifecycle_registry = QueryLifecycleRegistry::new_with_runtime(
-        data_runtime.clone(),
-        local_runtime,
-        query_lifecycle_config,
-        native_compatibility_id,
+    let catalog_runtime_materializers = Arc::new(
+        crate::connector::catalog_manager::CatalogRuntimeMaterializerSet::try_new(
+            catalog_runtime_materializers.iter().cloned(),
+        )
+        .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("seal catalog runtime materializer set: {error}"),
+            )
+        })?,
     );
+    let query_lifecycle_registry =
+        QueryLifecycleRegistry::new_with_runtime_and_catalog_materializers(
+            data_runtime.clone(),
+            local_runtime,
+            query_lifecycle_config,
+            native_compatibility_id,
+            catalog_runtime_materializers,
+        );
     let connector_registry = Arc::new(ConnectorRegistry::new());
     let native_fragment_service = Arc::new(
         NativeFragmentService::new_with_controls(
@@ -682,6 +700,7 @@ impl BackendApplicationHost {
             write_commit_evidence_limits,
             execution_runtime_config,
             execution_installers,
+            catalog_runtime_materializers,
             read_execution_bundle_factories,
         } = config;
         let readiness_endpoint =
@@ -700,6 +719,7 @@ impl BackendApplicationHost {
             native_compatibility_id,
             write_commit_evidence_limits,
             &execution_installers,
+            &catalog_runtime_materializers,
             &read_execution_bundle_factories,
         )?;
         let process_descriptor = BackendProcessDescriptor::new(
@@ -1120,6 +1140,7 @@ mod tests {
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
             execution_runtime_config: execution_runtime_config(),
             execution_installers: Vec::new(),
+            catalog_runtime_materializers: Vec::new(),
             read_execution_bundle_factories: Vec::new(),
         }
     }
@@ -1260,6 +1281,7 @@ mod tests {
             query_lifecycle_registry_config(Duration::from_millis(5_000)),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             WriteCommitEvidenceLimits::default(),
+            &[],
             &[],
             &[],
         )
