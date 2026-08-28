@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Design: ADR-0125 (docs/adr/ADR-0125-query-leased-catalog-runtime-and-provider-binding-evidence.md)
 use std::sync::Arc;
 
 use super::{ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ProviderBindingEpoch};

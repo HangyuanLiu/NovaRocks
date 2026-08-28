@@ -2,9 +2,9 @@
 id: ADR-0120
 title: "Connector Binding Restart Reconciliation"
 domain: [provider-spi, distributed-query-lifecycle]
-status: active
+status: superseded
 supersedes: [ADR-0104]
-superseded-by: null
+superseded-by: ADR-0125
 date: 2026-08-27
 provenance:
   - "PR: pending local implementation"
