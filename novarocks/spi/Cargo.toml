@@ -13,6 +13,7 @@ bytes = "1"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", optional = true, features = ["macros", "rt", "sync", "time"] }
+url = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
 
 [dev-dependencies]

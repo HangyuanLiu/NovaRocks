@@ -32,8 +32,8 @@ pub const MAX_CATALOG_CREDENTIAL_BINDINGS: usize = 16;
 pub const MAX_CATALOG_NON_SECRET_PROPERTIES: usize = 128;
 pub const MAX_CATALOG_NON_SECRET_PROPERTY_KEY_BYTES: usize = 256;
 pub const MAX_CATALOG_NON_SECRET_PROPERTY_VALUE_BYTES: usize = 4 * 1024;
-pub const MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES: usize = 128;
-pub const MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES: usize = 4 * 1024;
+pub const MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES: usize = 64;
+pub const MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES: usize = 2 * 1024;
 
 const CREDENTIAL_BINDING_DOMAIN: &[u8] = b"novarocks.catalog.credential.bindings.v1\0";
 const STORAGE_ACCESS_DOMAIN: &[u8] = b"novarocks.storage.access-domain.v1\0";
@@ -204,6 +204,14 @@ impl CatalogNonSecretProperty {
         if value.is_empty() || value.len() > MAX_CATALOG_NON_SECRET_PROPERTY_VALUE_BYTES {
             return Err(invalid("catalog non-secret property value"));
         }
+        if let Ok(url) = url::Url::parse(value)
+            && (!url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some())
+        {
+            return Err(invalid("catalog non-secret property URL"));
+        }
         Ok(Self {
             key: Arc::from(key),
             value: Arc::from(value),
@@ -235,10 +243,17 @@ impl StorageCredentialScopePrefix {
         {
             return Err(invalid("normalized storage credential scope prefix"));
         }
-        let Some((scheme, location)) = value.split_once("://") else {
-            return Err(invalid("normalized storage credential scope prefix"));
-        };
-        if location.is_empty() || !is_normalized_scheme(scheme) {
+        let parsed = url::Url::parse(value)
+            .map_err(|_| invalid("normalized storage credential scope prefix"))?;
+        if parsed.scheme() != "s3"
+            || parsed.host_str().is_none_or(str::is_empty)
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.port().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || parsed.as_str() != value
+        {
             return Err(invalid("normalized storage credential scope prefix"));
         }
         Ok(Self(Arc::from(value)))
@@ -256,8 +271,23 @@ pub struct CatalogStorageAccessDomainInput {
     catalog_name: ConnectorInstanceId,
     config_format_version: u32,
     non_secret_properties: Vec<CatalogNonSecretProperty>,
-    object_store_binding: CatalogCredentialBinding,
-    vended_prefixes: Vec<StorageCredentialScopePrefix>,
+    storage_scope: StorageAccessScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CatalogUncredentialedStorageKind {
+    Local,
+    Hdfs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StorageAccessScope {
+    Static(StaticCredentialReference),
+    Vended(Vec<StorageCredentialScopePrefix>),
+    Uncredentialed {
+        kind: CatalogUncredentialedStorageKind,
+        authority: Option<Arc<str>>,
+    },
 }
 
 impl CatalogStorageAccessDomainInput {
@@ -265,17 +295,83 @@ impl CatalogStorageAccessDomainInput {
         provider_id: ConnectorProviderId,
         catalog_name: ConnectorInstanceId,
         config_format_version: u32,
-        mut non_secret_properties: Vec<CatalogNonSecretProperty>,
+        non_secret_properties: Vec<CatalogNonSecretProperty>,
         object_store_binding: CatalogCredentialBinding,
         mut vended_prefixes: Vec<StorageCredentialScopePrefix>,
     ) -> Result<Self, ConnectorError> {
-        if config_format_version == 0 {
-            return Err(invalid("catalog config format version"));
-        }
         if object_store_binding.purpose != CatalogCredentialPurpose::ObjectStoreData
             || object_store_binding.consumer_role != CredentialConsumerRole::Backend
         {
             return Err(invalid("object-store credential binding"));
+        }
+        if vended_prefixes.len() > MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES {
+            return Err(exhausted("storage credential scope prefix set"));
+        }
+        vended_prefixes.sort();
+        if vended_prefixes.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(invalid("duplicate storage credential scope prefix"));
+        }
+        let storage_scope = match object_store_binding.mode {
+            CatalogCredentialMode::Static(reference) if vended_prefixes.is_empty() => {
+                StorageAccessScope::Static(reference)
+            }
+            CatalogCredentialMode::Vended if !vended_prefixes.is_empty() => {
+                StorageAccessScope::Vended(vended_prefixes)
+            }
+            CatalogCredentialMode::Static(_) => {
+                return Err(invalid("static storage binding with vended prefix scope"));
+            }
+            CatalogCredentialMode::Vended => {
+                return Err(invalid("vended storage binding without prefix scope"));
+            }
+        };
+
+        let mut input = Self::try_new_common(
+            provider_id,
+            catalog_name,
+            config_format_version,
+            non_secret_properties,
+        )?;
+        input.storage_scope = storage_scope;
+        Ok(input)
+    }
+
+    pub fn try_new_uncredentialed(
+        provider_id: ConnectorProviderId,
+        catalog_name: ConnectorInstanceId,
+        config_format_version: u32,
+        non_secret_properties: Vec<CatalogNonSecretProperty>,
+        kind: CatalogUncredentialedStorageKind,
+        authority: Option<&str>,
+    ) -> Result<Self, ConnectorError> {
+        let authority = authority.map(parse_storage_authority).transpose()?;
+        match kind {
+            CatalogUncredentialedStorageKind::Local if authority.is_some() => {
+                return Err(invalid("local storage authority"));
+            }
+            CatalogUncredentialedStorageKind::Hdfs if authority.is_none() => {
+                return Err(invalid("HDFS storage authority"));
+            }
+            CatalogUncredentialedStorageKind::Local | CatalogUncredentialedStorageKind::Hdfs => {}
+        }
+        let mut input = Self::try_new_common(
+            provider_id,
+            catalog_name,
+            config_format_version,
+            non_secret_properties,
+        )?;
+        input.storage_scope = StorageAccessScope::Uncredentialed { kind, authority };
+        Ok(input)
+    }
+
+    fn try_new_common(
+        provider_id: ConnectorProviderId,
+        catalog_name: ConnectorInstanceId,
+        config_format_version: u32,
+        mut non_secret_properties: Vec<CatalogNonSecretProperty>,
+    ) -> Result<Self, ConnectorError> {
+        if config_format_version == 0 {
+            return Err(invalid("catalog config format version"));
         }
         if non_secret_properties.len() > MAX_CATALOG_NON_SECRET_PROPERTIES {
             return Err(exhausted("catalog non-secret property set"));
@@ -287,31 +383,15 @@ impl CatalogStorageAccessDomainInput {
         {
             return Err(invalid("duplicate catalog non-secret property key"));
         }
-
-        if vended_prefixes.len() > MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES {
-            return Err(exhausted("storage credential scope prefix set"));
-        }
-        vended_prefixes.sort();
-        if vended_prefixes.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(invalid("duplicate storage credential scope prefix"));
-        }
-        match &object_store_binding.mode {
-            CatalogCredentialMode::Static(_) if !vended_prefixes.is_empty() => {
-                return Err(invalid("static storage binding with vended prefix scope"));
-            }
-            CatalogCredentialMode::Vended if vended_prefixes.is_empty() => {
-                return Err(invalid("vended storage binding without prefix scope"));
-            }
-            CatalogCredentialMode::Static(_) | CatalogCredentialMode::Vended => {}
-        }
-
         Ok(Self {
             provider_id,
             catalog_name,
             config_format_version,
             non_secret_properties,
-            object_store_binding,
-            vended_prefixes,
+            storage_scope: StorageAccessScope::Uncredentialed {
+                kind: CatalogUncredentialedStorageKind::Local,
+                authority: None,
+            },
         })
     }
 
@@ -326,17 +406,30 @@ impl CatalogStorageAccessDomainInput {
             hash_bytes(&mut digest, property.key.as_bytes());
             hash_bytes(&mut digest, property.value.as_bytes());
         }
-        match &self.object_store_binding.mode {
-            CatalogCredentialMode::Static(reference) => {
+        match &self.storage_scope {
+            StorageAccessScope::Static(reference) => {
                 digest.update([0]);
                 hash_bytes(&mut digest, reference.name.as_bytes());
                 hash_bytes(&mut digest, reference.generation.as_bytes());
             }
-            CatalogCredentialMode::Vended => {
+            StorageAccessScope::Vended(prefixes) => {
                 digest.update([1]);
-                hash_count(&mut digest, self.vended_prefixes.len());
-                for prefix in &self.vended_prefixes {
+                hash_count(&mut digest, prefixes.len());
+                for prefix in prefixes {
                     hash_bytes(&mut digest, prefix.0.as_bytes());
+                }
+            }
+            StorageAccessScope::Uncredentialed { kind, authority } => {
+                digest.update([match kind {
+                    CatalogUncredentialedStorageKind::Local => 2,
+                    CatalogUncredentialedStorageKind::Hdfs => 3,
+                }]);
+                match authority {
+                    Some(authority) => {
+                        digest.update([1]);
+                        hash_bytes(&mut digest, authority.as_bytes());
+                    }
+                    None => digest.update([0]),
                 }
             }
         }
@@ -387,13 +480,18 @@ fn is_sensitive_property_key(value: &str) -> bool {
         .any(|marker| value.contains(marker))
 }
 
-fn is_normalized_scheme(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    !bytes.is_empty()
-        && bytes[0].is_ascii_lowercase()
-        && bytes[1..].iter().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.')
-        })
+fn parse_storage_authority(value: &str) -> Result<Arc<str>, ConnectorError> {
+    if value.is_empty()
+        || value.len() > MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES
+        || !value.is_ascii()
+        || value.bytes().any(|byte| byte.is_ascii_whitespace())
+        || value
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@'))
+    {
+        return Err(invalid("storage authority"));
+    }
+    Ok(Arc::from(value.to_ascii_lowercase()))
 }
 
 fn put_count(output: &mut Vec<u8>, count: usize) {
@@ -622,7 +720,63 @@ mod tests {
     fn secret_like_property_keys_and_unnormalized_prefixes_are_rejected() {
         assert!(CatalogNonSecretProperty::try_new("access_key_id", "not-allowed").is_err());
         assert!(CatalogNonSecretProperty::try_new("session_token", "not-allowed").is_err());
+        assert!(
+            CatalogNonSecretProperty::try_new(
+                "uri",
+                "https://user:secret@catalog.example/v1?token=leak"
+            )
+            .is_err()
+        );
         assert!(StorageCredentialScopePrefix::try_from_normalized("S3://bucket/").is_err());
         assert!(StorageCredentialScopePrefix::try_from_normalized("s3://bucket/?token=x").is_err());
+        assert!(
+            StorageCredentialScopePrefix::try_from_normalized("s3://user:secret@bucket/a/")
+                .is_err()
+        );
+        assert!(StorageCredentialScopePrefix::try_from_normalized("gs://bucket/a/").is_err());
+        assert!(StorageCredentialScopePrefix::try_from_normalized("s3://bucket/a/../b/").is_err());
+    }
+
+    #[test]
+    fn local_and_hdfs_catalogs_mint_explicit_binding_free_domains() {
+        let provider = ConnectorProviderId::parse("iceberg").unwrap();
+        let catalog = ConnectorInstanceId::try_from_canonical("analytics").unwrap();
+        let properties =
+            vec![CatalogNonSecretProperty::try_new("warehouse", "file:///warehouse").unwrap()];
+        let local = CatalogStorageAccessDomainInput::try_new_uncredentialed(
+            provider.clone(),
+            catalog.clone(),
+            2,
+            properties,
+            CatalogUncredentialedStorageKind::Local,
+            None,
+        )
+        .unwrap()
+        .derive_access_domain();
+        let hdfs = CatalogStorageAccessDomainInput::try_new_uncredentialed(
+            provider,
+            catalog,
+            2,
+            vec![
+                CatalogNonSecretProperty::try_new("warehouse", "hdfs://namenode:8020/warehouse")
+                    .unwrap(),
+            ],
+            CatalogUncredentialedStorageKind::Hdfs,
+            Some("NameNode:8020"),
+        )
+        .unwrap()
+        .derive_access_domain();
+        assert_ne!(local, hdfs);
+        assert!(
+            CatalogStorageAccessDomainInput::try_new_uncredentialed(
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                ConnectorInstanceId::try_from_canonical("analytics").unwrap(),
+                2,
+                vec![],
+                CatalogUncredentialedStorageKind::Hdfs,
+                None,
+            )
+            .is_err()
+        );
     }
 }
