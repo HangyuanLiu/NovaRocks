@@ -1,0 +1,628 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Secret-free catalog credential identity and storage authorization domains.
+//!
+//! Credential values are deliberately absent from this module. Catalog desired
+//! state and native wire contracts may carry these bounded identities, while
+//! role-local composition remains the only owner of long-lived secret material.
+
+use std::sync::Arc;
+
+use sha2::{Digest, Sha256};
+
+use super::{ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorProviderId};
+
+pub const MAX_CATALOG_CREDENTIAL_REFERENCE_BYTES: usize = 128;
+pub const MAX_CATALOG_CREDENTIAL_BINDINGS: usize = 16;
+pub const MAX_CATALOG_NON_SECRET_PROPERTIES: usize = 128;
+pub const MAX_CATALOG_NON_SECRET_PROPERTY_KEY_BYTES: usize = 256;
+pub const MAX_CATALOG_NON_SECRET_PROPERTY_VALUE_BYTES: usize = 4 * 1024;
+pub const MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES: usize = 128;
+pub const MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES: usize = 4 * 1024;
+
+const CREDENTIAL_BINDING_DOMAIN: &[u8] = b"novarocks.catalog.credential.bindings.v1\0";
+const STORAGE_ACCESS_DOMAIN: &[u8] = b"novarocks.storage.access-domain.v1\0";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CatalogCredentialPurpose {
+    CatalogControl,
+    ObjectStoreData,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CredentialConsumerRole {
+    Frontend,
+    Backend,
+}
+
+/// Immutable operator-managed identity for one role-local secret value.
+///
+/// The generation is part of catalog identity. Replacing the value behind the
+/// same `(name, generation)` is a deployment contract violation.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StaticCredentialReference {
+    name: Arc<str>,
+    generation: Arc<str>,
+}
+
+impl StaticCredentialReference {
+    pub fn try_new(name: &str, generation: &str) -> Result<Self, ConnectorError> {
+        Ok(Self {
+            name: parse_reference_component("catalog credential name", name)?,
+            generation: parse_reference_component("catalog credential generation", generation)?,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CatalogCredentialMode {
+    Static(StaticCredentialReference),
+    Vended,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CatalogCredentialBinding {
+    purpose: CatalogCredentialPurpose,
+    consumer_role: CredentialConsumerRole,
+    mode: CatalogCredentialMode,
+}
+
+impl CatalogCredentialBinding {
+    pub fn try_new(
+        purpose: CatalogCredentialPurpose,
+        consumer_role: CredentialConsumerRole,
+        mode: CatalogCredentialMode,
+    ) -> Result<Self, ConnectorError> {
+        let valid = matches!(
+            (&purpose, &consumer_role, &mode),
+            (
+                CatalogCredentialPurpose::CatalogControl,
+                CredentialConsumerRole::Frontend,
+                CatalogCredentialMode::Static(_)
+            ) | (
+                CatalogCredentialPurpose::ObjectStoreData,
+                CredentialConsumerRole::Backend,
+                CatalogCredentialMode::Static(_) | CatalogCredentialMode::Vended
+            )
+        );
+        if !valid {
+            return Err(invalid(
+                "catalog credential purpose, role, and mode combination",
+            ));
+        }
+        Ok(Self {
+            purpose,
+            consumer_role,
+            mode,
+        })
+    }
+
+    pub const fn purpose(&self) -> CatalogCredentialPurpose {
+        self.purpose
+    }
+
+    pub const fn consumer_role(&self) -> CredentialConsumerRole {
+        self.consumer_role
+    }
+
+    pub const fn mode(&self) -> &CatalogCredentialMode {
+        &self.mode
+    }
+
+    pub fn static_reference(&self) -> Option<&StaticCredentialReference> {
+        match &self.mode {
+            CatalogCredentialMode::Static(reference) => Some(reference),
+            CatalogCredentialMode::Vended => None,
+        }
+    }
+}
+
+/// Validate a complete binding set and return its unique canonical order.
+pub fn canonicalize_catalog_credential_bindings(
+    mut bindings: Vec<CatalogCredentialBinding>,
+) -> Result<Vec<CatalogCredentialBinding>, ConnectorError> {
+    if bindings.len() > MAX_CATALOG_CREDENTIAL_BINDINGS {
+        return Err(exhausted("catalog credential binding set"));
+    }
+    bindings.sort();
+    if bindings
+        .windows(2)
+        .any(|pair| pair[0].purpose == pair[1].purpose)
+    {
+        return Err(invalid("duplicate catalog credential purpose"));
+    }
+    Ok(bindings)
+}
+
+/// Stable bytes for catalog definition/version hashing and persistence fixtures.
+pub fn canonical_catalog_credential_binding_bytes(
+    bindings: &[CatalogCredentialBinding],
+) -> Result<Vec<u8>, ConnectorError> {
+    let bindings = canonicalize_catalog_credential_bindings(bindings.to_vec())?;
+    let mut output = Vec::with_capacity(CREDENTIAL_BINDING_DOMAIN.len() + bindings.len() * 32);
+    output.extend_from_slice(CREDENTIAL_BINDING_DOMAIN);
+    put_count(&mut output, bindings.len());
+    for binding in bindings {
+        output.push(match binding.purpose {
+            CatalogCredentialPurpose::CatalogControl => 0,
+            CatalogCredentialPurpose::ObjectStoreData => 1,
+        });
+        output.push(match binding.consumer_role {
+            CredentialConsumerRole::Frontend => 0,
+            CredentialConsumerRole::Backend => 1,
+        });
+        match binding.mode {
+            CatalogCredentialMode::Static(reference) => {
+                output.push(0);
+                put_bytes(&mut output, reference.name.as_bytes());
+                put_bytes(&mut output, reference.generation.as_bytes());
+            }
+            CatalogCredentialMode::Vended => output.push(1),
+        }
+    }
+    Ok(output)
+}
+
+/// Provider-declared catalog property that is safe to persist and hash.
+///
+/// The constructor deliberately accepts string slices rather than a generic
+/// string conversion, so redacted secret wrappers cannot be passed by accident.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CatalogNonSecretProperty {
+    key: Arc<str>,
+    value: Arc<str>,
+}
+
+impl CatalogNonSecretProperty {
+    pub fn try_new(key: &str, value: &str) -> Result<Self, ConnectorError> {
+        if !is_property_key(key) || is_sensitive_property_key(key) {
+            return Err(invalid("catalog non-secret property key"));
+        }
+        if value.is_empty() || value.len() > MAX_CATALOG_NON_SECRET_PROPERTY_VALUE_BYTES {
+            return Err(invalid("catalog non-secret property value"));
+        }
+        Ok(Self {
+            key: Arc::from(key),
+            value: Arc::from(value),
+        })
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+/// Provider-normalized non-secret prefix scope for a vended credential.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StorageCredentialScopePrefix(Arc<str>);
+
+impl StorageCredentialScopePrefix {
+    pub fn try_from_normalized(value: &str) -> Result<Self, ConnectorError> {
+        if value.is_empty()
+            || value.len() > MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES
+            || !value.is_ascii()
+            || value.bytes().any(|byte| byte.is_ascii_whitespace())
+            || value
+                .bytes()
+                .any(|byte| matches!(byte, b'?' | b'#' | b'\\'))
+        {
+            return Err(invalid("normalized storage credential scope prefix"));
+        }
+        let Some((scheme, location)) = value.split_once("://") else {
+            return Err(invalid("normalized storage credential scope prefix"));
+        };
+        if location.is_empty() || !is_normalized_scheme(scheme) {
+            return Err(invalid("normalized storage credential scope prefix"));
+        }
+        Ok(Self(Arc::from(value)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Complete, source-neutral input for one stable storage authorization domain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogStorageAccessDomainInput {
+    provider_id: ConnectorProviderId,
+    catalog_name: ConnectorInstanceId,
+    config_format_version: u32,
+    non_secret_properties: Vec<CatalogNonSecretProperty>,
+    object_store_binding: CatalogCredentialBinding,
+    vended_prefixes: Vec<StorageCredentialScopePrefix>,
+}
+
+impl CatalogStorageAccessDomainInput {
+    pub fn try_new(
+        provider_id: ConnectorProviderId,
+        catalog_name: ConnectorInstanceId,
+        config_format_version: u32,
+        mut non_secret_properties: Vec<CatalogNonSecretProperty>,
+        object_store_binding: CatalogCredentialBinding,
+        mut vended_prefixes: Vec<StorageCredentialScopePrefix>,
+    ) -> Result<Self, ConnectorError> {
+        if config_format_version == 0 {
+            return Err(invalid("catalog config format version"));
+        }
+        if object_store_binding.purpose != CatalogCredentialPurpose::ObjectStoreData
+            || object_store_binding.consumer_role != CredentialConsumerRole::Backend
+        {
+            return Err(invalid("object-store credential binding"));
+        }
+        if non_secret_properties.len() > MAX_CATALOG_NON_SECRET_PROPERTIES {
+            return Err(exhausted("catalog non-secret property set"));
+        }
+        non_secret_properties.sort();
+        if non_secret_properties
+            .windows(2)
+            .any(|pair| pair[0].key == pair[1].key)
+        {
+            return Err(invalid("duplicate catalog non-secret property key"));
+        }
+
+        if vended_prefixes.len() > MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES {
+            return Err(exhausted("storage credential scope prefix set"));
+        }
+        vended_prefixes.sort();
+        if vended_prefixes.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(invalid("duplicate storage credential scope prefix"));
+        }
+        match &object_store_binding.mode {
+            CatalogCredentialMode::Static(_) if !vended_prefixes.is_empty() => {
+                return Err(invalid("static storage binding with vended prefix scope"));
+            }
+            CatalogCredentialMode::Vended if vended_prefixes.is_empty() => {
+                return Err(invalid("vended storage binding without prefix scope"));
+            }
+            CatalogCredentialMode::Static(_) | CatalogCredentialMode::Vended => {}
+        }
+
+        Ok(Self {
+            provider_id,
+            catalog_name,
+            config_format_version,
+            non_secret_properties,
+            object_store_binding,
+            vended_prefixes,
+        })
+    }
+
+    pub fn derive_access_domain(&self) -> StorageAccessDomainId {
+        let mut digest = Sha256::new();
+        digest.update(STORAGE_ACCESS_DOMAIN);
+        hash_bytes(&mut digest, self.provider_id.as_str().as_bytes());
+        hash_bytes(&mut digest, self.catalog_name.as_str().as_bytes());
+        digest.update(self.config_format_version.to_le_bytes());
+        hash_count(&mut digest, self.non_secret_properties.len());
+        for property in &self.non_secret_properties {
+            hash_bytes(&mut digest, property.key.as_bytes());
+            hash_bytes(&mut digest, property.value.as_bytes());
+        }
+        match &self.object_store_binding.mode {
+            CatalogCredentialMode::Static(reference) => {
+                digest.update([0]);
+                hash_bytes(&mut digest, reference.name.as_bytes());
+                hash_bytes(&mut digest, reference.generation.as_bytes());
+            }
+            CatalogCredentialMode::Vended => {
+                digest.update([1]);
+                hash_count(&mut digest, self.vended_prefixes.len());
+                for prefix in &self.vended_prefixes {
+                    hash_bytes(&mut digest, prefix.0.as_bytes());
+                }
+            }
+        }
+        StorageAccessDomainId(digest.finalize().into())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StorageAccessDomainId([u8; 32]);
+
+impl StorageAccessDomainId {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+fn parse_reference_component(subject: &str, value: &str) -> Result<Arc<str>, ConnectorError> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_CATALOG_CREDENTIAL_REFERENCE_BYTES
+        || !bytes[0].is_ascii_lowercase()
+        || !bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+    {
+        return Err(invalid(subject));
+    }
+    Ok(Arc::from(value))
+}
+
+fn is_property_key(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_CATALOG_NON_SECRET_PROPERTY_KEY_BYTES
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn is_sensitive_property_key(value: &str) -> bool {
+    ["secret", "password", "token", "credential", "access_key"]
+        .iter()
+        .any(|marker| value.contains(marker))
+}
+
+fn is_normalized_scheme(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.')
+        })
+}
+
+fn put_count(output: &mut Vec<u8>, count: usize) {
+    output.extend_from_slice(&(count as u32).to_le_bytes());
+}
+
+fn put_bytes(output: &mut Vec<u8>, value: &[u8]) {
+    put_count(output, value.len());
+    output.extend_from_slice(value);
+}
+
+fn hash_count(digest: &mut Sha256, count: usize) {
+    digest.update((count as u32).to_le_bytes());
+}
+
+fn hash_bytes(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u32).to_le_bytes());
+    digest.update(value);
+}
+
+fn invalid(subject: &str) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::InvalidRequest,
+        format!("invalid {subject}"),
+    )
+}
+
+fn exhausted(subject: &str) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::ResourceExhausted,
+        format!("{subject} exceeds configured bounds"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn static_reference(generation: &str) -> StaticCredentialReference {
+        StaticCredentialReference::try_new("warehouse-reader", generation).unwrap()
+    }
+
+    fn static_data_binding(generation: &str) -> CatalogCredentialBinding {
+        CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::ObjectStoreData,
+            CredentialConsumerRole::Backend,
+            CatalogCredentialMode::Static(static_reference(generation)),
+        )
+        .unwrap()
+    }
+
+    fn control_binding() -> CatalogCredentialBinding {
+        CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::CatalogControl,
+            CredentialConsumerRole::Frontend,
+            CatalogCredentialMode::Static(
+                StaticCredentialReference::try_new("rest-control", "blue").unwrap(),
+            ),
+        )
+        .unwrap()
+    }
+
+    fn access_input(
+        generation: &str,
+        properties: Vec<CatalogNonSecretProperty>,
+    ) -> CatalogStorageAccessDomainInput {
+        CatalogStorageAccessDomainInput::try_new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorInstanceId::try_from_canonical("analytics").unwrap(),
+            2,
+            properties,
+            static_data_binding(generation),
+            vec![],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reference_and_binding_matrix_is_closed() {
+        for invalid_value in ["", "Upper", "-leading", "x/y"] {
+            assert!(StaticCredentialReference::try_new(invalid_value, "one").is_err());
+            assert!(StaticCredentialReference::try_new("valid", invalid_value).is_err());
+        }
+        let oversized = "x".repeat(129);
+        assert!(StaticCredentialReference::try_new(&oversized, "one").is_err());
+        assert!(StaticCredentialReference::try_new("valid", &oversized).is_err());
+        assert!(
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::CatalogControl,
+                CredentialConsumerRole::Backend,
+                CatalogCredentialMode::Static(static_reference("one")),
+            )
+            .is_err()
+        );
+        assert!(
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::CatalogControl,
+                CredentialConsumerRole::Frontend,
+                CatalogCredentialMode::Vended,
+            )
+            .is_err()
+        );
+        assert!(
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::ObjectStoreData,
+                CredentialConsumerRole::Frontend,
+                CatalogCredentialMode::Static(static_reference("one")),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn whole_binding_set_is_bounded_unique_and_order_independent() {
+        let control = control_binding();
+        let data = static_data_binding("blue");
+        let left =
+            canonical_catalog_credential_binding_bytes(&[data.clone(), control.clone()]).unwrap();
+        let right =
+            canonical_catalog_credential_binding_bytes(&[control.clone(), data.clone()]).unwrap();
+        assert_eq!(left, right);
+        assert!(canonicalize_catalog_credential_bindings(vec![data.clone(), data]).is_err());
+        assert!(
+            canonicalize_catalog_credential_bindings(vec![
+                control;
+                MAX_CATALOG_CREDENTIAL_BINDINGS + 1
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn access_domain_is_order_independent_but_definition_and_generation_sensitive() {
+        let uri = CatalogNonSecretProperty::try_new("uri", "https://catalog.example/v1").unwrap();
+        let warehouse = CatalogNonSecretProperty::try_new("warehouse", "s3://warehouse").unwrap();
+        let first =
+            access_input("blue", vec![warehouse.clone(), uri.clone()]).derive_access_domain();
+        let reordered = access_input("blue", vec![uri, warehouse]).derive_access_domain();
+        let rotated = access_input(
+            "green",
+            vec![
+                CatalogNonSecretProperty::try_new("uri", "https://catalog.example/v1").unwrap(),
+                CatalogNonSecretProperty::try_new("warehouse", "s3://warehouse").unwrap(),
+            ],
+        )
+        .derive_access_domain();
+        let reformatted = CatalogStorageAccessDomainInput::try_new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorInstanceId::try_from_canonical("analytics").unwrap(),
+            3,
+            vec![
+                CatalogNonSecretProperty::try_new("uri", "https://catalog.example/v1").unwrap(),
+                CatalogNonSecretProperty::try_new("warehouse", "s3://warehouse").unwrap(),
+            ],
+            static_data_binding("blue"),
+            vec![],
+        )
+        .unwrap()
+        .derive_access_domain();
+        assert_eq!(first, reordered);
+        assert_ne!(first, rotated);
+        assert_ne!(first, reformatted);
+        assert_eq!(
+            first.as_bytes(),
+            &[
+                195, 64, 121, 50, 40, 163, 103, 75, 132, 126, 198, 210, 167, 135, 20, 34, 126, 200,
+                13, 121, 21, 91, 42, 163, 216, 17, 227, 65, 190, 123, 141, 81,
+            ]
+        );
+    }
+
+    #[test]
+    fn vended_scope_is_canonical_and_cannot_mix_with_static_mode() {
+        let first = StorageCredentialScopePrefix::try_from_normalized("s3://bucket/a/").unwrap();
+        let second = StorageCredentialScopePrefix::try_from_normalized("s3://bucket/b/").unwrap();
+        let vended = CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::ObjectStoreData,
+            CredentialConsumerRole::Backend,
+            CatalogCredentialMode::Vended,
+        )
+        .unwrap();
+        let input = CatalogStorageAccessDomainInput::try_new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorInstanceId::try_from_canonical("analytics").unwrap(),
+            2,
+            vec![],
+            vended,
+            vec![second, first],
+        )
+        .unwrap();
+        let reversed = CatalogStorageAccessDomainInput::try_new(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            ConnectorInstanceId::try_from_canonical("analytics").unwrap(),
+            2,
+            vec![],
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::ObjectStoreData,
+                CredentialConsumerRole::Backend,
+                CatalogCredentialMode::Vended,
+            )
+            .unwrap(),
+            vec![
+                StorageCredentialScopePrefix::try_from_normalized("s3://bucket/a/").unwrap(),
+                StorageCredentialScopePrefix::try_from_normalized("s3://bucket/b/").unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            input.derive_access_domain(),
+            reversed.derive_access_domain()
+        );
+        assert!(
+            CatalogStorageAccessDomainInput::try_new(
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                ConnectorInstanceId::try_from_canonical("analytics").unwrap(),
+                2,
+                vec![],
+                static_data_binding("blue"),
+                vec![StorageCredentialScopePrefix::try_from_normalized("s3://bucket/").unwrap()],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn secret_like_property_keys_and_unnormalized_prefixes_are_rejected() {
+        assert!(CatalogNonSecretProperty::try_new("access_key_id", "not-allowed").is_err());
+        assert!(CatalogNonSecretProperty::try_new("session_token", "not-allowed").is_err());
+        assert!(StorageCredentialScopePrefix::try_from_normalized("S3://bucket/").is_err());
+        assert!(StorageCredentialScopePrefix::try_from_normalized("s3://bucket/?token=x").is_err());
+    }
+}

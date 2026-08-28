@@ -20,6 +20,7 @@ mod catalog_runtime;
 mod cleanup_maintenance;
 mod context;
 mod control;
+mod credential;
 mod data_mutation;
 mod distributed_rewrite;
 mod distribution;
@@ -78,6 +79,14 @@ pub use control::{
     ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlPlanningLease,
     ConnectorControlRegistry, ConnectorControlResolver, ConnectorExecutionDistribution,
     ConnectorScanPlanning,
+};
+pub use credential::{
+    CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
+    CatalogNonSecretProperty, CatalogStorageAccessDomainInput, CredentialConsumerRole,
+    MAX_CATALOG_CREDENTIAL_BINDINGS, MAX_CATALOG_CREDENTIAL_REFERENCE_BYTES,
+    MAX_CATALOG_NON_SECRET_PROPERTIES, MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES,
+    StaticCredentialReference, StorageAccessDomainId, StorageCredentialScopePrefix,
+    canonical_catalog_credential_binding_bytes, canonicalize_catalog_credential_bindings,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,
