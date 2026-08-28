@@ -122,6 +122,11 @@ impl BackendFrontendFeedbackSink for RuntimeFilterFeedbackEgress {
                 )
             }
         };
+        let mut contract_digest = publication.contract_digest().to_vec();
+        #[cfg(debug_assertions)]
+        if corrupt_feedback_contract_digest(self.execution_id) {
+            contract_digest[0] ^= 1;
+        }
         let event =
             protocol_control_event(wire::query_control_response::Event::RuntimeFilterFeedback(
                 wire::RuntimeFilterFeedbackEvent {
@@ -135,12 +140,27 @@ impl BackendFrontendFeedbackSink for RuntimeFilterFeedbackEgress {
                     participant_id: self.participant_id,
                     deployment_epoch,
                     channel_id: channel_id.get(),
-                    contract_digest: publication.contract_digest().to_vec(),
+                    contract_digest,
                     terminal_outcome: Some(terminal_outcome),
                 },
             ));
         let _ = self.events.try_send(event);
     }
+}
+
+#[cfg(debug_assertions)]
+fn corrupt_feedback_contract_digest(execution_id: QueryExecutionId) -> bool {
+    let Some(root) = novarocks_failpoint::configured_root() else {
+        return false;
+    };
+    matches!(
+        novarocks_failpoint::claim_matching_receiver_agnostic_fault(
+            &root,
+            QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
+            execution_id,
+        ),
+        Ok(Some(_))
+    )
 }
 
 fn protocol_contract_error(error: novarocks_proto_codec::ProtocolError) -> QueryLifecycleError {

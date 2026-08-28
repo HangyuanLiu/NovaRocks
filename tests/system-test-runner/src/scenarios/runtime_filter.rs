@@ -41,6 +41,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(AcceptedAfterAckDrop),
         Box::new(CancelWithTerminalAckReplay),
+        Box::new(Ncp5FeedbackContractDigestCorrupt),
         Box::new(Ncp5PartitionedFeedbackPruning),
     ]
 }
@@ -99,6 +100,18 @@ impl Scenario for Ncp5PartitionedFeedbackPruning {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         run_ncp5_partitioned_feedback_pruning(context)
+    }
+}
+
+struct Ncp5FeedbackContractDigestCorrupt;
+
+impl Scenario for Ncp5FeedbackContractDigestCorrupt {
+    fn name(&self) -> &'static str {
+        "runtime-filter/ncp-5-feedback-contract-digest-corrupt"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_ncp5_feedback_contract_digest_corrupt(context)
     }
 }
 
@@ -283,6 +296,48 @@ fn run_ncp5_partitioned_feedback_pruning(context: &mut ScenarioContext) -> Resul
     context.action(
         "EXPLAIN ANALYZE proved broadcast FE feedback reached Iceberg whole-file dynamic pruning",
     );
+    Ok(())
+}
+
+fn run_ncp5_feedback_contract_digest_corrupt(context: &mut ScenarioContext) -> Result<()> {
+    require_three_backends(context)?;
+    let mut control = connect_control(context, "connect NCP-5 corrupt-feedback control session")?;
+    let tables = create_ncp5_pruning_tables(context, &mut control)?;
+    configure_broadcast_runtime_filter(&mut control)?;
+    let baseline = resource_snapshot(context)?;
+    for backend_index in 0..REQUIRED_BACKENDS {
+        context
+            .handle()
+            .arm_query_lifecycle_fault(
+                backend_index,
+                "runtime-filter-feedback-contract-digest-corrupt",
+            )
+            .with_context(|| {
+                format!("arm feedback contract-digest corruption fault for BE[{backend_index}]")
+            })?;
+    }
+    context
+        .action("armed an active-attempt Runtime Filter feedback contract-digest corruption fault");
+
+    let error = control
+        .query::<String, _>(format!(
+            "EXPLAIN ANALYZE {}",
+            runtime_filter_count_query(&tables)
+        ))
+        .expect_err("active-attempt feedback contract corruption must fail the query closed");
+    context.action(format!(
+        "public MySQL query failed closed after invalid Runtime Filter feedback: {error}"
+    ));
+    context
+        .handle()
+        .clear_query_lifecycle_faults()
+        .context("clear feedback contract-digest corruption fault token")?;
+    let deadline = context.deadline();
+    context
+        .handle()
+        .await_query_execution_resource_convergence(&baseline, true, deadline)
+        .context("await resource convergence after fail-closed feedback rejection")?;
+    context.action("typed resource oracle confirmed fail-closed feedback cleanup converged");
     Ok(())
 }
 
