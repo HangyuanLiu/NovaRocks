@@ -1399,6 +1399,15 @@ fn frontend_query_lifecycle_config_requires_three_heartbeat_intervals() {
 }
 
 #[test]
+fn frontend_query_lifecycle_config_rejects_zero_participant_fanout() {
+    let error = match config().with_participant_fanout_max_inflight(0) {
+        Ok(_) => panic!("zero participant fanout must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("participant fanout"));
+}
+
+#[test]
 fn query_control_barrier_initializes_every_participant() {
     let plan = query_init_plan(Some(2));
     let (transport, _) = RecordingTransport::ready(&plan);

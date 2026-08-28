@@ -710,7 +710,8 @@ fn build_lifecycle_config(
     .with_terminal_timeouts(
         Duration::from_millis(timeouts.terminal_drain_timeout_ms),
         Duration::from_millis(timeouts.terminal_ack_timeout_ms),
-    )
+    )?
+    .with_participant_fanout_max_inflight(timeouts.participant_fanout_max_inflight)
 }
 
 impl FrontendDistributedQueryCoordinator {

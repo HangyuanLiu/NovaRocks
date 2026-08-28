@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -46,10 +47,7 @@ use crate::coordinator::query_registry::{
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::install_encoder::FrontendRuntimeFilterFeedbackDeclaration;
 
-/// v1 participant fanout cap. The production config projection is introduced
-/// with the coordinator composition change; keeping the cap here already
-/// prevents one OS thread per participant during the transitional path.
-const PARTICIPANT_FANOUT_MAX_INFLIGHT: usize = 32;
+pub(crate) const DEFAULT_PARTICIPANT_FANOUT_MAX_INFLIGHT: usize = 32;
 
 #[derive(Clone, Copy)]
 pub(crate) struct FrontendQueryLifecycleConfig {
@@ -61,6 +59,7 @@ pub(crate) struct FrontendQueryLifecycleConfig {
     start_rpc_timeout: Duration,
     terminal_drain_timeout: Duration,
     terminal_ack_timeout: Duration,
+    participant_fanout_max_inflight: NonZeroUsize,
 }
 
 impl FrontendQueryLifecycleConfig {
@@ -96,6 +95,10 @@ impl FrontendQueryLifecycleConfig {
             start_rpc_timeout: Duration::from_secs(2),
             terminal_drain_timeout: attach_timeout,
             terminal_ack_timeout: attach_timeout,
+            participant_fanout_max_inflight: NonZeroUsize::new(
+                DEFAULT_PARTICIPANT_FANOUT_MAX_INFLIGHT,
+            )
+            .expect("default participant fanout is nonzero"),
         })
     }
 
@@ -127,6 +130,20 @@ impl FrontendQueryLifecycleConfig {
         self.terminal_drain_timeout = terminal_drain_timeout;
         self.terminal_ack_timeout = terminal_ack_timeout;
         Ok(self)
+    }
+
+    pub(crate) fn with_participant_fanout_max_inflight(
+        mut self,
+        participant_fanout_max_inflight: usize,
+    ) -> Result<Self, DistributedQueryError> {
+        self.participant_fanout_max_inflight =
+            NonZeroUsize::new(participant_fanout_max_inflight)
+                .ok_or_else(|| contract_error("frontend participant fanout must be nonzero"))?;
+        Ok(self)
+    }
+
+    pub(super) const fn participant_fanout_max_inflight(self) -> NonZeroUsize {
+        self.participant_fanout_max_inflight
     }
 
     pub(super) const fn heartbeat_interval(self) -> Duration {
@@ -743,7 +760,7 @@ fn init_all(
     metrics: &FrontendLifecycleMetrics,
 ) -> Vec<InitFailure> {
     let mut failures = Vec::new();
-    for participant_wave in participants.chunks(PARTICIPANT_FANOUT_MAX_INFLIGHT) {
+    for participant_wave in participants.chunks(config.participant_fanout_max_inflight().get()) {
         let wave_failures: Vec<InitFailure> = std::thread::scope(|scope| {
             let handles = participant_wave
                 .iter()
@@ -1008,7 +1025,7 @@ pub(super) fn attach_all(
     control: &Arc<AttemptControl>,
 ) -> Vec<String> {
     let mut outcomes = Vec::new();
-    for participant_wave in participants.chunks(PARTICIPANT_FANOUT_MAX_INFLIGHT) {
+    for participant_wave in participants.chunks(config.participant_fanout_max_inflight().get()) {
         let wave_outcomes: Vec<Result<(ActiveSession, bool), (Option<ActiveSession>, String)>> =
             std::thread::scope(|scope| {
                 let handles = participant_wave

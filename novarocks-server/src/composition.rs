@@ -518,6 +518,8 @@ pub fn compose_frontend_server_config(
         heartbeat_timeout_ms: runtime_config.query_control_heartbeat_timeout_ms,
         init_rpc_timeout_ms: runtime_config.query_control_init_rpc_timeout_ms,
         attach_timeout_ms: runtime_config.query_control_attach_timeout_ms,
+        participant_fanout_max_inflight: runtime_config
+            .query_control_participant_fanout_max_inflight,
         stage_rpc_timeout_ms: runtime_config.query_control_stage_rpc_timeout_ms,
         start_rpc_timeout_ms: runtime_config.query_control_start_rpc_timeout_ms,
         terminal_drain_timeout_ms: runtime_config.query_control_terminal_drain_timeout_ms,
