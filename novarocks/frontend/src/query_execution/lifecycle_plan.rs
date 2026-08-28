@@ -33,6 +33,7 @@ use novarocks_proto_codec::lifecycle::{
 use novarocks_proto_models::common;
 use novarocks_proto_models::novarocks;
 use novarocks_types::BackendProcessId;
+use novarocks_types::NativeCompatibilityId;
 
 use crate::query_execution::launch::StageParticipantBinding;
 use crate::query_execution::terminal_set::QueryTerminalSet;
@@ -152,6 +153,7 @@ impl QueryInitPlanHeader {
 
 pub struct QueryInitOptions {
     execution_id: QueryExecutionId,
+    native_compatibility_id: NativeCompatibilityId,
     live_backends: Vec<LiveBackendTarget>,
     /// Execution-owned options retained solely for sealed native fragment
     /// submission. They are not the lifecycle wire carrier.
@@ -166,6 +168,7 @@ impl QueryInitOptions {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         execution_id: QueryExecutionId,
+        native_compatibility_id: NativeCompatibilityId,
         live_backends: Vec<LiveBackendTarget>,
         native_submission_options: &ResolvedQueryOptions,
         query_options: ProtocolQueryOptions,
@@ -192,6 +195,16 @@ impl QueryInitOptions {
         let mut endpoints = BTreeSet::new();
         for target in &live_backends {
             target.process_id().map_err(protocol_contract_error)?;
+            let backend_compatibility_id = target
+                .descriptor()
+                .native_compatibility_id()
+                .map_err(protocol_contract_error)?;
+            if backend_compatibility_id != native_compatibility_id {
+                return Err(contract_error(format!(
+                    "query initialization live snapshot contains backend {} from another compatibility island",
+                    target.backend_idx()
+                )));
+            }
             if !backend_indices.insert(target.backend_idx()) {
                 return Err(contract_error(format!(
                     "query initialization live snapshot repeats backend {}",
@@ -213,6 +226,7 @@ impl QueryInitOptions {
         })?;
         Ok(Self {
             execution_id,
+            native_compatibility_id,
             live_backends,
             native_submission_options: native_submission_options.runtime_options().clone(),
             query_options,
@@ -224,6 +238,10 @@ impl QueryInitOptions {
 
     pub const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
+    }
+
+    pub const fn native_compatibility_id(&self) -> NativeCompatibilityId {
+        self.native_compatibility_id
     }
 
     pub fn live_backends(&self) -> &[LiveBackendTarget] {
@@ -573,6 +591,9 @@ pub(crate) fn compile_query_init_plan(
                 options.execution_id,
             )),
             backend: Some(backend.as_proto().clone()),
+            native_compatibility_id: Some(novarocks::NativeCompatibilityId {
+                value: options.native_compatibility_id.as_bytes().to_vec(),
+            }),
             expected_fragment_instance_ids: expected_instances
                 .into_iter()
                 .map(protocol_unique_id)
@@ -655,6 +676,7 @@ mod tests {
                 .expect("valid endpoint"),
                 "test-deployment",
                 "test-build",
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             )
             .expect("valid descriptor"),
         )
@@ -694,6 +716,7 @@ mod tests {
         let resolved = ResolvedQueryOptions::from_upstream(None);
         let options = QueryInitOptions::new(
             execution_id(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             vec![backend(0), backend(1), backend(2)],
             &resolved,
             wire_query_options(),
@@ -739,6 +762,7 @@ mod tests {
         let resolved = ResolvedQueryOptions::from_upstream(None);
         let options = QueryInitOptions::new(
             execution_id(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             vec![backend(2)],
             &resolved,
             wire_query_options(),
@@ -782,11 +806,13 @@ mod tests {
                     .expect("valid endpoint"),
                 "test-deployment",
                 "test-build",
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             )
             .expect("valid descriptor"),
         );
         let options = QueryInitOptions::new(
             execution_id(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             vec![restarted],
             &resolved,
             wire_query_options(),
@@ -811,6 +837,44 @@ mod tests {
     }
 
     #[test]
+    fn query_init_options_reject_other_island_target_before_manifest_construction() {
+        let resolved = ResolvedQueryOptions::from_upstream(None);
+        let other_island = LiveBackendTarget::new(
+            0,
+            BackendProcessDescriptor::new(
+                BackendProcessId::new_v7(),
+                novarocks_proto_codec::lifecycle::QueryControlEndpoint::new("127.0.0.1", 19040)
+                    .expect("valid endpoint"),
+                "test-deployment",
+                "different-build",
+                novarocks_types::NativeCompatibilityId::new([0x72; 32]),
+            )
+            .expect("valid descriptor"),
+        );
+
+        let error = match QueryInitOptions::new(
+            execution_id(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            vec![other_island],
+            &resolved,
+            wire_query_options(),
+            1_000,
+            Duration::from_secs(30),
+            CoordinatorReportEndpoint::from_socket_addr(
+                "127.0.0.1:19030".parse().expect("valid report endpoint"),
+            ),
+        ) {
+            Ok(_) => panic!("other-island target must not produce a participant manifest"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error.message().contains("another compatibility island"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn query_init_plan_rejects_duplicate_runtime_filter_backend() {
         let fragments =
             FragmentLifecycleProjection::new(BTreeMap::new(), BTreeMap::new(), Vec::new())
@@ -819,6 +883,7 @@ mod tests {
         let resolved = ResolvedQueryOptions::from_upstream(None);
         let options = QueryInitOptions::new(
             execution_id(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             vec![backend(1)],
             &resolved,
             wire_query_options(),
@@ -855,6 +920,7 @@ mod tests {
         let resolved = ResolvedQueryOptions::from_upstream(None);
         let options = QueryInitOptions::new(
             execution_id(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             vec![backend(2)],
             &resolved,
             wire_query_options(),
@@ -873,6 +939,7 @@ mod tests {
 
         let changed_deadline = QueryInitOptions::new(
             execution_id(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             vec![backend(2)],
             &resolved,
             wire_query_options(),

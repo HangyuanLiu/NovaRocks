@@ -938,6 +938,15 @@ fn init_one(
                     },
                 ))
             }
+            QueryInitOutcome::QueryInitRejectedCompatibilityMismatch => {
+                Err(InitFailure::pre_ready_topology(
+                    message,
+                    PreReadyTopologyOutcome::CompatibilityMismatch {
+                        backend_idx: participant.target.backend_idx(),
+                        process_id: participant.target.process_id(),
+                    },
+                ))
+            }
             QueryInitOutcome::QueryInitRejectedBackendDraining => {
                 Err(InitFailure::pre_ready_topology(
                     message,

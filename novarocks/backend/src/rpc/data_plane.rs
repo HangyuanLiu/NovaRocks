@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use novarocks_types::UniqueId;
 
 use super::data_plane_handlers;
+use crate::query_lifecycle::QueryLifecycleIngress;
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, UnavailableExchangeReceiverPort,
@@ -21,6 +22,7 @@ static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone)]
 pub struct BackendDataPlane {
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
+    query_lifecycle_ingress: Option<Arc<dyn QueryLifecycleIngress>>,
 }
 
 impl std::fmt::Debug for BackendDataPlane {
@@ -39,14 +41,19 @@ impl Default for BackendDataPlane {
 
 impl BackendDataPlane {
     pub fn query_scoped() -> Self {
-        Self::with_exchange_receiver_port(Arc::new(UnavailableExchangeReceiverPort))
+        Self {
+            exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
+            query_lifecycle_ingress: None,
+        }
     }
 
     pub fn with_exchange_receiver_port(
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
+        query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     ) -> Self {
         Self {
             exchange_receiver_port,
+            query_lifecycle_ingress: Some(query_lifecycle_ingress),
         }
     }
 
@@ -54,7 +61,11 @@ impl BackendDataPlane {
         &self,
         request: proto::novarocks::ExchangeRequest,
     ) -> proto::novarocks::ExchangeResponse {
-        data_plane_handlers::handle_transmit_chunk(self.exchange_receiver_port.as_ref(), request)
+        data_plane_handlers::handle_transmit_chunk(
+            self.exchange_receiver_port.as_ref(),
+            self.query_lifecycle_ingress.as_deref(),
+            request,
+        )
     }
 
     pub fn lookup(&self, request: proto::filter::LookupRequest) -> proto::filter::LookupResponse {

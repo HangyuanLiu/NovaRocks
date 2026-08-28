@@ -213,6 +213,9 @@ fn release_destination() -> novarocks::Destination {
     novarocks::Destination {
         finst_id: Some(id(3, 4)),
         endpoint: "10.0.0.8:8060".to_string(),
+        source_finst_id: Some(id(5, 6)),
+        sender_ordinal: 0,
+        sender_count: 1,
     }
 }
 

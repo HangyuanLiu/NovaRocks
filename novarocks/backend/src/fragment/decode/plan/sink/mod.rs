@@ -1026,6 +1026,12 @@ fn decode_stream_destination_list(
                     "native stream destination requires finst_id",
                 )
             })?;
+            let source_finst_id = destination.source_finst_id.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    destination_path.clone().field("source_finst_id"),
+                    "native stream destination requires source_finst_id",
+                )
+            })?;
             Ok(FragmentDestination::new(
                 novarocks_types::UniqueId::new(finst_id.hi, finst_id.lo),
                 RuntimeEndpoint::parse(&destination.endpoint).map_err(|error| {
@@ -1034,7 +1040,11 @@ fn decode_stream_destination_list(
                         error,
                     )
                 })?,
-            ))
+                novarocks_types::UniqueId::new(source_finst_id.hi, source_finst_id.lo),
+                destination.sender_ordinal,
+                destination.sender_count,
+            )
+            .map_err(|detail| NativeFragmentDecodeError::invalid_value(destination_path, detail))?)
         })
         .collect()
 }
@@ -1059,6 +1069,12 @@ fn decode_instance_destinations(
                     "native Destination requires finst_id",
                 )
             })?;
+            let source_finst_id = destination.source_finst_id.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    destination_path.clone().field("source_finst_id"),
+                    "native Destination requires source_finst_id",
+                )
+            })?;
             Ok(FragmentDestination::new(
                 novarocks_types::UniqueId::new(finst_id.hi, finst_id.lo),
                 RuntimeEndpoint::parse(&destination.endpoint).map_err(|error| {
@@ -1067,7 +1083,11 @@ fn decode_instance_destinations(
                         error,
                     )
                 })?,
-            ))
+                novarocks_types::UniqueId::new(source_finst_id.hi, source_finst_id.lo),
+                destination.sender_ordinal,
+                destination.sender_count,
+            )
+            .map_err(|detail| NativeFragmentDecodeError::invalid_value(destination_path, detail))?)
         })
         .collect()
 }
@@ -1242,6 +1262,9 @@ mod tests {
         plan::StreamDestination {
             finst_id: Some(common::UniqueId { hi: 1, lo: id }),
             endpoint: "127.0.0.1:8060".to_string(),
+            source_finst_id: Some(common::UniqueId { hi: 9, lo: 10 }),
+            sender_ordinal: 0,
+            sender_count: 1,
         }
     }
 
@@ -1249,6 +1272,9 @@ mod tests {
         proto::Destination {
             finst_id: Some(common::UniqueId { hi: 2, lo: id }),
             endpoint: "127.0.0.1:8061".to_string(),
+            source_finst_id: Some(common::UniqueId { hi: 9, lo: 10 }),
+            sender_ordinal: 0,
+            sender_count: 1,
         }
     }
 

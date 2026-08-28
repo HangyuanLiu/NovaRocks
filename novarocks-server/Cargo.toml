@@ -20,6 +20,7 @@ novarocks-secret = { path = "../novarocks/secret" }
 novarocks-spi = { path = "../novarocks/spi" }
 novarocks-state-store-sqlite = { path = "../novarocks/state-store/sqlite" }
 novarocks-types = { path = "../novarocks/types" }
+novarocks-version = { path = "../novarocks/version" }
 anyhow = "1"
 atty = "0.2"
 chrono = "0.4"
@@ -33,6 +34,7 @@ uuid = "1"
 
 [features]
 mv-first-refresh-staging-test-support = []
+native-compatibility-test-fixture = ["novarocks-version/native-compatibility-test-fixture"]
 
 [dev-dependencies]
 # `server_binary_smoke` spawns the real `novarocks` binary and drives it over

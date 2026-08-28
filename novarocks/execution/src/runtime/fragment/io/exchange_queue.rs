@@ -508,6 +508,8 @@ mod tests {
                 destination: RuntimeEndpoint::new("be-2", 9060).expect("destination"),
                 destination_fragment_instance_id: UniqueId::new(2, 3),
                 sender_fragment_instance_id: UniqueId::new(4, 5),
+                sender_ordinal: 0,
+                sender_count: 1,
                 destination_node_id: 6,
                 sender_id: 7,
                 backend_number: 8,

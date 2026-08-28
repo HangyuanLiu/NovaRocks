@@ -53,8 +53,8 @@ use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
 use novarocks_spi::connector::ConnectorWriteLease;
 use novarocks_types::{
-    AttemptId, LocalQuerySequence, QueryExecutionId, QueryId, QueryIdAttribution,
-    QueryProcessNamespace,
+    AttemptId, LocalQuerySequence, NativeCompatibilityId, QueryExecutionId, QueryId,
+    QueryIdAttribution, QueryProcessNamespace,
 };
 
 use super::query_lifecycle::{
@@ -677,6 +677,7 @@ pub struct FrontendDistributedQueryCoordinator {
     lifecycle_config: FrontendQueryLifecycleConfig,
     pre_start_timeout: Duration,
     task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
+    native_compatibility_id: NativeCompatibilityId,
 }
 
 fn build_lifecycle_config(
@@ -707,6 +708,7 @@ impl FrontendDistributedQueryCoordinator {
         advertised_report_host: String,
         configured_report_port: u16,
         runtime_filter_worker_count: NonZeroUsize,
+        native_compatibility_id: NativeCompatibilityId,
         query_control_timeouts: crate::application::FrontendQueryControlTimeouts,
         task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
@@ -748,6 +750,7 @@ impl FrontendDistributedQueryCoordinator {
             lifecycle_config,
             pre_start_timeout: Duration::from_millis(query_control_timeouts.pre_start_timeout_ms),
             task_update_retry_policy,
+            native_compatibility_id,
         })
     }
 
@@ -823,6 +826,7 @@ impl FrontendDistributedQueryCoordinator {
             pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
             task_update_retry_policy:
                 crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
+            native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),
         }
     }
 
@@ -897,6 +901,7 @@ impl FrontendDistributedQueryCoordinator {
             pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
             task_update_retry_policy:
                 crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
+            native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),
         }
     }
 
@@ -1120,6 +1125,7 @@ impl FrontendDistributedQueryCoordinator {
         .with_cancellation(parts.cancellation.clone());
         let init_options = QueryInitOptions::new(
             execution_id,
+            self.native_compatibility_id,
             backend_services.live_backends,
             &parts.options,
             ProtocolQueryOptions::parse(encode_query_options(parts.options.runtime_options()))
@@ -1581,6 +1587,7 @@ fn pre_ready_topology_reason(outcome: PreReadyTopologyOutcome) -> &'static str {
         PreReadyTopologyOutcome::BackendDraining { .. } => "backend_draining",
         PreReadyTopologyOutcome::BackendProcessMismatch { .. } => "backend_process_mismatch",
         PreReadyTopologyOutcome::BackendNotEligible { .. } => "backend_not_eligible",
+        PreReadyTopologyOutcome::CompatibilityMismatch { .. } => "compatibility_mismatch",
     }
 }
 
@@ -2183,6 +2190,7 @@ mod tests {
                 .expect("test endpoint"),
             "test-deployment",
             native_build_identity(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         )
         .expect("test descriptor")
     }

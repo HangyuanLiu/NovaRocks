@@ -407,7 +407,7 @@ where
 {
     let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
     let cleanup_timeout = config.frontend_cleanup_timeout;
-    let (serving_reader, convergence_reader, mut metrics_http_server) =
+    let (serving_reader, island_reader, convergence_reader, mut metrics_http_server) =
         start_early_management_server(&config)?;
     let host = match open_frontend_application_for_server(&config, data_runtime).await {
         Ok(host) => host,
@@ -428,6 +428,20 @@ where
         return combine_server_and_shutdown(
             Err(FrontendApplicationError::server(format!(
                 "install frontend serving reader after application open: {error}"
+            ))),
+            combine_server_and_shutdown(shutdown, cleanup),
+        );
+    }
+    if let Err(error) = island_reader.install(host.backend_island_snapshot_reader()) {
+        let shutdown = host
+            .shutdown_until(std::time::Instant::now() + cleanup_timeout)
+            .await;
+        let cleanup = metrics_http_server
+            .stop()
+            .map_err(FrontendApplicationError::server);
+        return combine_server_and_shutdown(
+            Err(FrontendApplicationError::server(format!(
+                "install frontend island reader after application open: {error}"
             ))),
             combine_server_and_shutdown(shutdown, cleanup),
         );
@@ -476,7 +490,7 @@ where
 {
     let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
     let cleanup_timeout = config.frontend_cleanup_timeout;
-    let (serving_reader, convergence_reader, mut metrics_http_server) =
+    let (serving_reader, island_reader, convergence_reader, mut metrics_http_server) =
         start_early_management_server(&config)?;
     let host = match open_frontend_application_for_server(&config, Handle::current()).await {
         Ok(host) => host,
@@ -497,6 +511,20 @@ where
         return combine_server_and_shutdown(
             Err(FrontendApplicationError::server(format!(
                 "install frontend serving reader after application open: {error}"
+            ))),
+            combine_server_and_shutdown(shutdown, cleanup),
+        );
+    }
+    if let Err(error) = island_reader.install(host.backend_island_snapshot_reader()) {
+        let shutdown = host
+            .shutdown_until(std::time::Instant::now() + cleanup_timeout)
+            .await;
+        let cleanup = metrics_http_server
+            .stop()
+            .map_err(FrontendApplicationError::server);
+        return combine_server_and_shutdown(
+            Err(FrontendApplicationError::server(format!(
+                "install frontend island reader after application open: {error}"
             ))),
             combine_server_and_shutdown(shutdown, cleanup),
         );
@@ -542,6 +570,7 @@ fn start_early_management_server(
 ) -> Result<
     (
         Arc<LateBoundFrontendServingSnapshotReader>,
+        Arc<crate::topology::LateBoundBackendIslandSnapshotReader>,
         Arc<crate::metrics::LateBoundQueryLifecycleConvergenceReader>,
         crate::metrics::MetricsHttpServer,
     ),
@@ -550,9 +579,14 @@ fn start_early_management_server(
     let metrics_registry =
         crate::metrics::FrontendMetricsRegistry::new().map_err(FrontendApplicationError::server)?;
     let serving_reader = Arc::new(LateBoundFrontendServingSnapshotReader::default());
+    let island_reader = Arc::new(crate::topology::LateBoundBackendIslandSnapshotReader::new(
+        config.backend_open.native_compatibility_id(),
+    ));
     let convergence_reader =
         Arc::new(crate::metrics::LateBoundQueryLifecycleConvergenceReader::default());
     let management_reader: Arc<dyn FrontendServingSnapshotReader> = serving_reader.clone();
+    let management_island_reader: Arc<dyn crate::topology::BackendIslandSnapshotReader> =
+        island_reader.clone();
     let management_convergence_reader: Arc<
         dyn crate::coordinator::QueryLifecycleConvergenceReader,
     > = convergence_reader.clone();
@@ -561,10 +595,16 @@ fn start_early_management_server(
         config.metrics_http_port,
         Arc::clone(&metrics_registry),
         management_reader,
+        management_island_reader,
         Some(management_convergence_reader),
     )
     .map_err(FrontendApplicationError::server)?;
-    Ok((serving_reader, convergence_reader, metrics_http_server))
+    Ok((
+        serving_reader,
+        island_reader,
+        convergence_reader,
+        metrics_http_server,
+    ))
 }
 
 async fn serve_ready_frontend_session_factory<F>(
@@ -948,6 +988,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             ),
             backend_open: frontend_backend_open_config(),
             report_bind_host: "127.0.0.1".to_string(),
@@ -974,6 +1015,7 @@ mod tests {
     fn frontend_backend_open_config() -> ClusterBackendOpenConfig {
         ClusterBackendOpenConfig::new(
             novarocks_types::ClusterRole::Fe,
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             Duration::from_secs(1),
             3,
             Duration::from_secs(1),
@@ -1028,6 +1070,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             )
             .with_catalog_desired_state_source(CatalogDesiredStateSourceInput::DynamicStateStore),
             frontend_backend_open_config(),
@@ -1124,7 +1167,12 @@ mod tests {
         let host = FrontendApplicationHost::open_with_factories_and_state_store_registry(
             Some(state_store),
             &registry,
-            FrontendExecutionConfig::new("127.0.0.1", 0, std::num::NonZeroUsize::new(1).unwrap()),
+            FrontendExecutionConfig::new(
+                "127.0.0.1",
+                0,
+                std::num::NonZeroUsize::new(1).unwrap(),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            ),
             frontend_backend_open_config(),
             Vec::new(),
             Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new()),
@@ -1174,6 +1222,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 std::num::NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             ),
             frontend_backend_open_config(),
             Vec::new(),

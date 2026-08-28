@@ -43,6 +43,9 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
             .exchange_unary(
                 frame.destination_fragment_instance_id,
                 frame.destination_node_id,
+                frame.sender_fragment_instance_id,
+                frame.sender_ordinal,
+                frame.sender_count,
                 frame.sender_id,
                 frame.backend_number,
                 frame.eos,

@@ -10,10 +10,10 @@ use std::time::Duration;
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
 use super::query_options::QueryOptions;
 use crate::canonical;
-use crate::membership::BackendProcessId;
+use crate::membership::{BackendProcessId, required_native_compatibility_id};
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, novarocks};
-use novarocks_types::BackendProcessId as DomainBackendProcessId;
+use novarocks_types::{BackendProcessId as DomainBackendProcessId, NativeCompatibilityId};
 
 const PARTICIPANT_MANIFEST_V1_DOMAIN: &[u8] =
     b"novarocks.query-lifecycle.participant-manifest.v1\0";
@@ -295,6 +295,7 @@ impl ParticipantManifest {
     pub fn new(
         execution_id: QueryExecutionId,
         backend: ParticipantBackendIdentity,
+        native_compatibility_id: NativeCompatibilityId,
         expected_fragment_instance_ids: impl IntoIterator<Item = common::UniqueId>,
         query_options: QueryOptions,
         query_deadline_unix_ms: u64,
@@ -312,6 +313,9 @@ impl ParticipantManifest {
         Self::parse(novarocks::ParticipantManifest {
             execution_id: Some(encode_query_execution_id(execution_id)),
             backend: Some(backend.as_proto().clone()),
+            native_compatibility_id: Some(novarocks::NativeCompatibilityId {
+                value: native_compatibility_id.as_bytes().to_vec(),
+            }),
             expected_fragment_instance_ids: expected_fragment_instance_ids.into_iter().collect(),
             query_options: Some(*query_options.as_proto()),
             query_deadline_unix_ms,
@@ -340,6 +344,10 @@ impl ParticipantManifest {
                 error,
             )
         })?;
+        required_native_compatibility_id(
+            &raw.native_compatibility_id,
+            FieldPath::root("participant_manifest").field("native_compatibility_id"),
+        )?;
 
         let mut fragment_ids = BTreeSet::new();
         for (index, fragment_id) in raw
@@ -460,6 +468,13 @@ impl ParticipantManifest {
 
     pub fn backend(&self) -> Result<ParticipantBackendIdentity, ProtocolError> {
         required_backend(&self.raw.backend)
+    }
+
+    pub fn native_compatibility_id(&self) -> Result<NativeCompatibilityId, ProtocolError> {
+        required_native_compatibility_id(
+            &self.raw.native_compatibility_id,
+            FieldPath::root("participant_manifest").field("native_compatibility_id"),
+        )
     }
 
     pub fn expected_fragment_instance_ids(&self) -> Vec<common::UniqueId> {
@@ -610,7 +625,7 @@ mod tests {
     };
     use crate::ProtocolErrorKind;
     use novarocks_proto_models::{common, novarocks};
-    use novarocks_types::QueryId;
+    use novarocks_types::{NativeCompatibilityId, QueryId};
 
     fn id(hi: i64, lo: i64) -> common::UniqueId {
         common::UniqueId { hi, lo }
@@ -663,6 +678,7 @@ mod tests {
         novarocks::ParticipantManifest {
             execution_id: Some(execution_id()),
             backend: Some(backend()),
+            native_compatibility_id: Some(novarocks::NativeCompatibilityId { value: vec![7; 32] }),
             expected_fragment_instance_ids: vec![id(11, 12)],
             query_options: Some(novarocks::QueryOptions::default()),
             query_deadline_unix_ms: 1_000,
@@ -702,6 +718,10 @@ mod tests {
             QueryId::new(5, 6)
         );
         assert!(parsed.backend().expect("backend").process_id().is_ok());
+        assert_eq!(
+            parsed.native_compatibility_id().expect("compatibility id"),
+            NativeCompatibilityId::new([7; 32])
+        );
         assert_eq!(parsed.expected_fragment_instance_ids(), vec![id(11, 12)]);
         assert_eq!(
             parsed.query_options().expect("options").as_proto(),
@@ -721,6 +741,29 @@ mod tests {
         let mut raw = manifest();
         raw.backend = None;
         assert_invalid(raw, "participant backend identity is required");
+
+        let mut raw = manifest();
+        raw.native_compatibility_id = None;
+        assert_invalid(raw, "native compatibility id is required");
+
+        for width in [31, 33] {
+            let mut raw = manifest();
+            raw.native_compatibility_id = Some(novarocks::NativeCompatibilityId {
+                value: vec![7; width],
+            });
+            let error = ParticipantManifest::parse(raw).expect_err("bad id rejects");
+            assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+            assert_eq!(
+                error.path().to_string(),
+                "participant_manifest.native_compatibility_id.value"
+            );
+            assert_eq!(
+                error.detail(),
+                format!(
+                    "native compatibility id must contain exactly 32 bytes: native compatibility id must be 32 bytes, got {width}"
+                )
+            );
+        }
 
         let mut raw = manifest();
         raw.query_options = None;

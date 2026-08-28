@@ -30,6 +30,7 @@ pub mod largeint;
 pub mod logical;
 pub mod mv_aggregate_layout;
 pub mod naming;
+pub mod native_compatibility;
 pub mod network;
 mod predicate;
 pub mod primitive;
@@ -54,6 +55,7 @@ pub use identity::{
     LocalQuerySequence, QueryExecutionId, QueryId, QueryIdAttribution, QueryProcessNamespace,
     UniqueId, format_uuid,
 };
+pub use native_compatibility::{NativeCompatibilityId, NativeCompatibilityIdError};
 pub use network::{
     AdvertiseEndpoint, CanonicalDnsName, NativeEndpoint, NativeReferenceHost, format_host_for_url,
 };

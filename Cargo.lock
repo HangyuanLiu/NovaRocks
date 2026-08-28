@@ -3455,6 +3455,7 @@ dependencies = [
  "novarocks-state-store-sqlite",
  "novarocks-test-support",
  "novarocks-types",
+ "novarocks-version",
  "serde",
  "tempfile",
  "tokio",
@@ -3569,8 +3570,11 @@ dependencies = [
  "novarocks-cluster-harness",
  "novarocks-connector-iceberg",
  "novarocks-native-trust",
+ "novarocks-proto-models",
  "novarocks-secret",
  "novarocks-types",
+ "novarocks-version",
+ "prost 0.13.5",
  "tokio",
  "tonic",
 ]
@@ -3606,6 +3610,11 @@ version = "0.1.0"
 [[package]]
 name = "novarocks-version"
 version = "0.1.0"
+dependencies = [
+ "novarocks-proto-models",
+ "novarocks-types",
+ "sha2",
+]
 
 [[package]]
 name = "nu-ansi-term"

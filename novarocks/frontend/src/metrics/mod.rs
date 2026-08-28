@@ -256,6 +256,22 @@ static FRONTEND_BASE_READY: Lazy<IntGauge> = Lazy::new(|| {
     .expect("register novarocks_frontend_base_ready")
 });
 
+static FRONTEND_ISLAND_READY: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(Opts::new(
+        "novarocks_frontend_island_ready",
+        "Whether this Frontend is base-ready and has at least one compatible eligible Backend.",
+    ))
+    .expect("register novarocks_frontend_island_ready")
+});
+
+static FRONTEND_COMPATIBLE_ELIGIBLE_BACKENDS: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(Opts::new(
+        "novarocks_frontend_compatible_eligible_backends",
+        "Number of compatible eligible Backends in this Frontend compatibility island.",
+    ))
+    .expect("register novarocks_frontend_compatible_eligible_backends")
+});
+
 static FRONTEND_CATALOG_SOURCE_MODE: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new(
@@ -387,6 +403,8 @@ impl FrontendMetricsRegistry {
             Box::new(NATIVE_TRUST_TRANSPORT_REJECTIONS.clone()),
             Box::new(FRONTEND_SERVING_STATE.clone()),
             Box::new(FRONTEND_BASE_READY.clone()),
+            Box::new(FRONTEND_ISLAND_READY.clone()),
+            Box::new(FRONTEND_COMPATIBLE_ELIGIBLE_BACKENDS.clone()),
             Box::new(FRONTEND_CATALOG_SOURCE_MODE.clone()),
             Box::new(FRONTEND_CATALOGS.clone()),
             Box::new(FRONTEND_WORKLOAD_ACTIVE.clone()),
@@ -515,6 +533,14 @@ pub(crate) fn publish_frontend_serving_metrics(snapshot: FrontendServingSnapshot
     FRONTEND_DRAIN_ELAPSED_SECONDS.set((snapshot.drain.elapsed_ms / 1_000) as i64);
 }
 
+/// Publishes the management-composed island readiness result. The scalar
+/// inputs deliberately contain no endpoint, build identity, or compatibility
+/// ID, so this observability surface cannot become a second topology owner.
+pub(crate) fn publish_frontend_island_metrics(ready: bool, compatible_eligible_backends: usize) {
+    FRONTEND_ISLAND_READY.set(ready as i64);
+    FRONTEND_COMPATIBLE_ELIGIBLE_BACKENDS.set(compatible_eligible_backends as i64);
+}
+
 pub(crate) fn record_backend_announce(outcome: &'static str) {
     BACKEND_ANNOUNCE_TOTAL.with_label_values(&[outcome]).inc();
 }
@@ -552,8 +578,8 @@ pub(crate) fn publish_backend_topology_metrics(
     reported_running: usize,
     reported_draining: usize,
     compatibility_compatible: usize,
-    compatibility_incompatible: usize,
-    compatibility_unknown: usize,
+    compatibility_other_island: usize,
+    compatibility_unknown_or_invalid: usize,
     endpoint_owned: usize,
     endpoint_unowned: usize,
     eligible: usize,
@@ -577,8 +603,8 @@ pub(crate) fn publish_backend_topology_metrics(
             &*BACKEND_COMPATIBILITY,
             [
                 ("compatible", compatibility_compatible),
-                ("incompatible", compatibility_incompatible),
-                ("unknown", compatibility_unknown),
+                ("other_island", compatibility_other_island),
+                ("unknown_or_invalid", compatibility_unknown_or_invalid),
             ],
         ),
         (
@@ -752,6 +778,8 @@ fn refresh_frontend_gauges() {
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_INIT);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_CONTROL);
     Lazy::force(&FRONTEND_QUERY_LIFECYCLE_LATENCY);
+    Lazy::force(&FRONTEND_ISLAND_READY);
+    Lazy::force(&FRONTEND_COMPATIBLE_ELIGIBLE_BACKENDS);
     dml_publication::ensure_label_families();
     ensure_frontend_metric_label_families();
 }
@@ -762,7 +790,7 @@ fn ensure_frontend_metric_label_families() {
     for state in ["running", "draining", "unspecified"] {
         let _ = BACKEND_REPORTED_STATE.get_metric_with_label_values(&[state]);
     }
-    for state in ["compatible", "incompatible", "unknown"] {
+    for state in ["compatible", "other_island", "unknown_or_invalid"] {
         let _ = BACKEND_COMPATIBILITY.get_metric_with_label_values(&[state]);
     }
     for state in ["owned", "unowned", "unknown"] {

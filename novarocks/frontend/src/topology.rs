@@ -23,7 +23,7 @@
 //! reconciliation path.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -32,8 +32,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
-use novarocks_types::{BackendProcessId, ClusterRole, NativeEndpoint};
-use novarocks_version::native_build_identity;
+use novarocks_types::{BackendProcessId, ClusterRole, NativeCompatibilityId, NativeEndpoint};
 use tokio::runtime::Handle;
 
 use crate::common::backend_topology::{
@@ -49,14 +48,114 @@ use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_
 #[derive(Clone, Debug)]
 pub struct ClusterBackendOpenConfig {
     role: ClusterRole,
+    native_compatibility_id: NativeCompatibilityId,
     heartbeat_interval: Duration,
     heartbeat_timeout_retries: u32,
     announce_lease_ttl: Duration,
 }
 
+/// Sanitized compatibility-island facts read from the topology authority.
+///
+/// The topology lock supplies the revision and all counts as one observation.
+/// Management owns how these facts are composed with FE-local serving state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackendIslandSnapshot {
+    native_compatibility_id: NativeCompatibilityId,
+    topology_revision: u64,
+    compatible_eligible_backend_count: usize,
+    other_island_backend_count: usize,
+    unknown_or_invalid_backend_count: usize,
+}
+
+impl BackendIslandSnapshot {
+    pub(crate) const fn new(
+        native_compatibility_id: NativeCompatibilityId,
+        topology_revision: u64,
+        compatible_eligible_backend_count: usize,
+        other_island_backend_count: usize,
+        unknown_or_invalid_backend_count: usize,
+    ) -> Self {
+        Self {
+            native_compatibility_id,
+            topology_revision,
+            compatible_eligible_backend_count,
+            other_island_backend_count,
+            unknown_or_invalid_backend_count,
+        }
+    }
+
+    pub const fn starting(native_compatibility_id: NativeCompatibilityId) -> Self {
+        Self::new(native_compatibility_id, 0, 0, 0, 0)
+    }
+
+    pub const fn native_compatibility_id(&self) -> NativeCompatibilityId {
+        self.native_compatibility_id
+    }
+
+    pub const fn topology_revision(&self) -> u64 {
+        self.topology_revision
+    }
+
+    pub const fn compatible_eligible_backend_count(&self) -> usize {
+        self.compatible_eligible_backend_count
+    }
+
+    pub const fn other_island_backend_count(&self) -> usize {
+        self.other_island_backend_count
+    }
+
+    pub const fn unknown_or_invalid_backend_count(&self) -> usize {
+        self.unknown_or_invalid_backend_count
+    }
+}
+
+/// Read-only topology capability used only by the Frontend management surface.
+pub trait BackendIslandSnapshotReader: Send + Sync {
+    fn backend_island_snapshot(&self) -> BackendIslandSnapshot;
+}
+
+/// Starts management observability with the Server-materialized local identity,
+/// then installs the topology owner exactly once after application open.
+pub struct LateBoundBackendIslandSnapshotReader {
+    starting: BackendIslandSnapshot,
+    reader: RwLock<Option<Arc<dyn BackendIslandSnapshotReader>>>,
+}
+
+impl LateBoundBackendIslandSnapshotReader {
+    pub fn new(native_compatibility_id: NativeCompatibilityId) -> Self {
+        Self {
+            starting: BackendIslandSnapshot::starting(native_compatibility_id),
+            reader: RwLock::new(None),
+        }
+    }
+
+    pub fn install(&self, reader: Arc<dyn BackendIslandSnapshotReader>) -> Result<(), String> {
+        let mut slot = self
+            .reader
+            .write()
+            .expect("frontend island reader lock poisoned");
+        if slot.is_some() {
+            return Err("frontend island snapshot reader is already installed".to_string());
+        }
+        *slot = Some(reader);
+        Ok(())
+    }
+}
+
+impl BackendIslandSnapshotReader for LateBoundBackendIslandSnapshotReader {
+    fn backend_island_snapshot(&self) -> BackendIslandSnapshot {
+        self.reader
+            .read()
+            .expect("frontend island reader lock poisoned")
+            .as_ref()
+            .map_or(self.starting, |reader| reader.backend_island_snapshot())
+    }
+}
+
 impl ClusterBackendOpenConfig {
     pub fn new(
         role: ClusterRole,
+        native_compatibility_id: NativeCompatibilityId,
         heartbeat_interval: Duration,
         heartbeat_timeout_retries: u32,
         announce_lease_ttl: Duration,
@@ -72,6 +171,7 @@ impl ClusterBackendOpenConfig {
         }
         Ok(Self {
             role,
+            native_compatibility_id,
             heartbeat_interval,
             heartbeat_timeout_retries,
             announce_lease_ttl,
@@ -79,6 +179,9 @@ impl ClusterBackendOpenConfig {
     }
     pub const fn role(&self) -> ClusterRole {
         self.role
+    }
+    pub const fn native_compatibility_id(&self) -> NativeCompatibilityId {
+        self.native_compatibility_id
     }
     pub const fn heartbeat_interval(&self) -> Duration {
         self.heartbeat_interval
@@ -98,17 +201,31 @@ type HeartbeatProbe =
 enum Compatibility {
     Unknown,
     Compatible,
+    /// The backend speaks a valid native protocol, but belongs to another
+    /// exact compatibility island. This is an expected rolling-upgrade state,
+    /// not a malformed deployment.
+    OtherIsland {
+        local: NativeCompatibilityId,
+        observed: NativeCompatibilityId,
+    },
     Incompatible(String),
 }
 impl Compatibility {
     fn is_compatible(&self) -> bool {
         matches!(self, Self::Compatible)
     }
-    fn detail(&self) -> &str {
+    fn detail(&self) -> String {
         match self {
-            Self::Unknown => "awaiting exact heartbeat",
-            Self::Compatible => "",
-            Self::Incompatible(detail) => detail,
+            Self::Unknown => "awaiting exact heartbeat".to_string(),
+            Self::Compatible => String::new(),
+            Self::OtherIsland { local, observed } => {
+                // Keep the full identities out of labels/metrics, but make
+                // the read-only topology surface useful for rollout triage.
+                // The IDs are fixed-width and validated by the protocol
+                // boundary before a descriptor reaches this owner.
+                format!("other compatibility island (local {local}, observed {observed})")
+            }
+            Self::Incompatible(detail) => detail.clone(),
         }
     }
 }
@@ -163,6 +280,7 @@ struct HeartbeatSignal {
 
 pub(crate) struct ClusterBackendService {
     state: Mutex<TopologyState>,
+    native_compatibility_id: NativeCompatibilityId,
     heartbeat_interval: Duration,
     announce_lease_ttl: Duration,
     heartbeat_probe: Arc<HeartbeatProbe>,
@@ -219,6 +337,7 @@ impl ClusterBackendService {
                 endpoint_owners: BTreeMap::new(),
                 pending_endpoint_owners: BTreeMap::new(),
             }),
+            native_compatibility_id: config.native_compatibility_id(),
             heartbeat_interval: config.heartbeat_interval(),
             announce_lease_ttl: config.announce_lease_ttl(),
             heartbeat_probe: Arc::new(probe),
@@ -240,6 +359,7 @@ impl ClusterBackendService {
     pub(crate) fn new_transient_for_test(timeout_retries: u32) -> Self {
         let config = ClusterBackendOpenConfig::new(
             ClusterRole::Fe,
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             Duration::from_millis(1),
             timeout_retries.max(1),
             Duration::from_secs(1),
@@ -327,7 +447,7 @@ impl ClusterBackendService {
             .state
             .lock()
             .map_err(|_| "lock frontend topology failed".to_string())?;
-        let before = eligible_members(&state);
+        let before = revision_members(&state);
         let old = state.processes.get(&process_id).cloned();
         if old.as_ref().is_some_and(|facts| facts.superseded) {
             return Err(format!(
@@ -380,7 +500,7 @@ impl ClusterBackendService {
         } else {
             state.pending_endpoint_owners.remove(&endpoint);
         }
-        let changed = advance_if_eligible_changed(&mut state, before)?;
+        let changed = advance_if_membership_changed(&mut state, before)?;
         drop(state);
         if changed {
             self.publish_snapshot();
@@ -533,7 +653,7 @@ impl ClusterBackendService {
     ) {
         self.refresh_expired_announce_leases(std::time::Instant::now());
         let mut state = self.state.lock().unwrap();
-        let before = eligible_members(&state);
+        let before = revision_members(&state);
         let Some(announced) = state.processes.get(&process_id).cloned() else {
             record_backend_heartbeat("unknown_process");
             return;
@@ -541,14 +661,19 @@ impl ClusterBackendService {
         let exact = descriptor.as_proto() == announced.descriptor.as_proto();
         let compatibility = if !exact {
             Compatibility::Incompatible("heartbeat descriptor does not match announce".to_string())
-        } else if descriptor.build_identity() != native_build_identity() {
-            Compatibility::Incompatible(format!(
-                "native build identity mismatch (expected {}, observed {})",
-                native_build_identity(),
-                descriptor.build_identity()
-            ))
         } else {
-            Compatibility::Compatible
+            match descriptor.native_compatibility_id() {
+                Ok(observed) if observed == self.native_compatibility_id => {
+                    Compatibility::Compatible
+                }
+                Ok(observed) => Compatibility::OtherIsland {
+                    local: self.native_compatibility_id,
+                    observed,
+                },
+                Err(error) => Compatibility::Incompatible(format!(
+                    "backend compatibility identity is invalid: {error}"
+                )),
+            }
         };
         let Ok(endpoint) = descriptor_runtime_endpoint(&announced.descriptor) else {
             return;
@@ -583,7 +708,7 @@ impl ClusterBackendService {
             facts.missed_heartbeats = 0;
             facts.last_err = None;
         }
-        let changed = advance_if_eligible_changed(&mut state, before).unwrap_or(false);
+        let changed = advance_if_membership_changed(&mut state, before).unwrap_or(false);
         drop(state);
         if replaced {
             (self.channel_invalidator)(endpoint.native_endpoint());
@@ -610,7 +735,7 @@ impl ClusterBackendService {
         record_backend_heartbeat("failed");
         self.refresh_expired_announce_leases(std::time::Instant::now());
         let mut state = self.state.lock().unwrap();
-        let before = eligible_members(&state);
+        let before = revision_members(&state);
         let timeout = state.timeout_retries;
         let Some(facts) = state.processes.get_mut(&process_id) else {
             return false;
@@ -620,7 +745,7 @@ impl ClusterBackendService {
         if facts.missed_heartbeats >= timeout {
             facts.exact_identity_verified = false;
         }
-        let changed = advance_if_eligible_changed(&mut state, before).unwrap_or(false);
+        let changed = advance_if_membership_changed(&mut state, before).unwrap_or(false);
         drop(state);
         // Loss affects future admission but is not a query failure event.
         if changed {
@@ -640,13 +765,13 @@ impl ClusterBackendService {
 
     fn refresh_expired_announce_leases(&self, now: std::time::Instant) -> bool {
         let mut state = self.state.lock().unwrap();
-        let before = eligible_members(&state);
+        let before = revision_members(&state);
         for facts in state.processes.values_mut() {
             if facts.announce_lease_valid && facts.announce_lease_expires_at <= now {
                 facts.announce_lease_valid = false;
             }
         }
-        let changed = advance_if_eligible_changed(&mut state, before).unwrap_or(false);
+        let changed = advance_if_membership_changed(&mut state, before).unwrap_or(false);
         drop(state);
         if changed {
             self.publish_snapshot();
@@ -667,6 +792,36 @@ impl ClusterBackendService {
             });
         }
         BackendTopologySnapshot::try_new(state.revision, live_targets(&state))
+    }
+
+    fn island_snapshot_inner(&self) -> BackendIslandSnapshot {
+        let state = self.state.lock().expect("frontend topology lock poisoned");
+        let mut snapshot = BackendIslandSnapshot {
+            native_compatibility_id: self.native_compatibility_id,
+            topology_revision: state.revision,
+            compatible_eligible_backend_count: 0,
+            other_island_backend_count: 0,
+            unknown_or_invalid_backend_count: 0,
+        };
+        for facts in state.processes.values() {
+            match facts.compatibility {
+                Compatibility::Compatible => {
+                    snapshot.compatible_eligible_backend_count += usize::from(facts.eligible());
+                }
+                Compatibility::OtherIsland { .. } => snapshot.other_island_backend_count += 1,
+                Compatibility::Unknown | Compatibility::Incompatible(_) => {
+                    snapshot.unknown_or_invalid_backend_count += 1;
+                }
+            }
+        }
+        snapshot
+    }
+}
+
+impl BackendIslandSnapshotReader for ClusterBackendService {
+    fn backend_island_snapshot(&self) -> BackendIslandSnapshot {
+        self.refresh_expired_announce_leases(std::time::Instant::now());
+        self.island_snapshot_inner()
     }
 }
 
@@ -799,6 +954,7 @@ impl BackendTopologyPort for ClusterBackendService {
             "LastAnnounceAt",
             "LastHeartbeatAt",
             "BuildIdentity",
+            "NativeCompatibilityId",
             "DiagnosticStatus",
             "StatusDetail",
         ];
@@ -820,8 +976,15 @@ impl BackendTopologyPort for ClusterBackendService {
             columns[9].push(facts.last_announce_ms.to_string());
             columns[10].push(facts.last_heartbeat_ms.to_string());
             columns[11].push(facts.descriptor.build_identity().to_string());
-            columns[12].push(diagnostic_status(facts));
-            columns[13].push(
+            columns[12].push(
+                facts
+                    .descriptor
+                    .native_compatibility_id()
+                    .map_err(|error| format!("invalid registered compatibility identity: {error}"))?
+                    .to_string(),
+            );
+            columns[13].push(diagnostic_status(facts));
+            columns[14].push(
                 facts
                     .last_err
                     .clone()
@@ -886,8 +1049,11 @@ fn diagnostic_status(facts: &BackendFacts) -> String {
     if facts.reported_state == BackendReportedState::Draining {
         states.push("Draining");
     }
-    if !facts.compatibility.is_compatible() {
-        states.push("Incompatible");
+    match facts.compatibility {
+        Compatibility::OtherIsland { .. } => states.push("OtherIsland"),
+        Compatibility::Unknown => states.push("CompatibilityUnknown"),
+        Compatibility::Incompatible(_) => states.push("Incompatible"),
+        Compatibility::Compatible => {}
     }
     if facts.superseded {
         states.push("Replaced");
@@ -907,22 +1073,6 @@ fn descriptor_runtime_endpoint(
         .map_err(|error| format!("announced backend endpoint is invalid: {error}"))?;
     RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port()))
         .map_err(|error| format!("announced backend endpoint is invalid: {error}"))
-}
-fn eligible_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, RuntimeEndpoint)> {
-    state
-        .processes
-        .iter()
-        .filter_map(|(id, facts)| {
-            facts
-                .eligible()
-                .then(|| {
-                    descriptor_runtime_endpoint(&facts.descriptor)
-                        .ok()
-                        .map(|endpoint| (*id, endpoint))
-                })
-                .flatten()
-        })
-        .collect()
 }
 fn live_targets(state: &TopologyState) -> Vec<LiveBackendTarget> {
     state
@@ -951,8 +1101,10 @@ fn metrics_snapshot(state: &TopologyState) -> BackendTopologyMetricsSnapshot {
         }
         match facts.compatibility {
             Compatibility::Compatible => metrics.compatibility_compatible += 1,
-            Compatibility::Incompatible(_) => metrics.compatibility_incompatible += 1,
-            Compatibility::Unknown => metrics.compatibility_unknown += 1,
+            Compatibility::OtherIsland { .. } => metrics.compatibility_other_island += 1,
+            Compatibility::Unknown | Compatibility::Incompatible(_) => {
+                metrics.compatibility_unknown_or_invalid += 1
+            }
         }
         metrics.endpoint_owned += usize::from(facts.endpoint_owned);
         metrics.endpoint_unowned += usize::from(!facts.endpoint_owned);
@@ -962,11 +1114,17 @@ fn metrics_snapshot(state: &TopologyState) -> BackendTopologyMetricsSnapshot {
     }
     metrics
 }
-fn advance_if_eligible_changed(
+/// A topology revision must make a captured execution snapshot stale whenever
+/// either its schedulable membership changes or an exact-heartbeat backend
+/// moves into/out of a different compatibility island.  The latter is not a
+/// target today, but publishing it makes a rolling-upgrade observation visible
+/// to the same immutable snapshot boundary without treating OtherIsland as an
+/// invalid deployment.
+fn advance_if_membership_changed(
     state: &mut TopologyState,
-    before: BTreeSet<(BackendProcessId, RuntimeEndpoint)>,
+    before: BTreeSet<(BackendProcessId, RuntimeEndpoint, u8)>,
 ) -> Result<bool, String> {
-    if before == eligible_members(state) {
+    if before == revision_members(state) {
         return Ok(false);
     }
     if let Some(message) = &state.terminal_error {
@@ -980,9 +1138,29 @@ fn advance_if_eligible_changed(
     Ok(true)
 }
 
+fn revision_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, RuntimeEndpoint, u8)> {
+    state
+        .processes
+        .iter()
+        .filter_map(|(id, facts)| {
+            if !facts.announce_lease_valid || !facts.exact_identity_verified {
+                return None;
+            }
+            let category = match facts.compatibility {
+                Compatibility::Compatible if facts.eligible() => 1,
+                Compatibility::OtherIsland { .. } => 2,
+                _ => return None,
+            };
+            descriptor_runtime_endpoint(&facts.descriptor)
+                .ok()
+                .map(|endpoint| (*id, endpoint, category))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::ClusterBackendService;
+    use super::{BackendIslandSnapshotReader, ClusterBackendService};
     use crate::common::backend_topology::BackendTopologyPort;
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
@@ -991,11 +1169,24 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
     fn descriptor(endpoint: SocketAddr) -> BackendProcessDescriptor {
+        descriptor_with(
+            endpoint,
+            native_build_identity(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+        )
+    }
+
+    fn descriptor_with(
+        endpoint: SocketAddr,
+        build_identity: impl Into<String>,
+        native_compatibility_id: novarocks_types::NativeCompatibilityId,
+    ) -> BackendProcessDescriptor {
         BackendProcessDescriptor::new(
             BackendProcessId::new_v7(),
             QueryControlEndpoint::new(endpoint.ip().to_string(), endpoint.port()).unwrap(),
             "test",
-            native_build_identity(),
+            build_identity,
+            native_compatibility_id,
         )
         .unwrap()
     }
@@ -1018,6 +1209,38 @@ mod tests {
         assert!(service.snapshot().unwrap().targets().is_empty());
         verify(&service, &descriptor);
         assert_eq!(service.snapshot().unwrap().targets().len(), 1);
+    }
+
+    #[test]
+    fn island_snapshot_counts_exact_eligible_and_other_island_from_one_revision() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let compatible = descriptor("127.0.0.1:9070".parse().unwrap());
+        let other = descriptor_with(
+            "127.0.0.1:9071".parse().unwrap(),
+            native_build_identity(),
+            novarocks_types::NativeCompatibilityId::new([0x72; 32]),
+        );
+        service
+            .record_announce(compatible.clone(), BackendReportedState::Running)
+            .expect("announce compatible backend");
+        service
+            .record_announce(other.clone(), BackendReportedState::Running)
+            .expect("announce other-island backend");
+        verify(&service, &compatible);
+        verify(&service, &other);
+
+        let snapshot = service.backend_island_snapshot();
+        assert_eq!(
+            snapshot.native_compatibility_id(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32])
+        );
+        assert_eq!(snapshot.compatible_eligible_backend_count(), 1);
+        assert_eq!(snapshot.other_island_backend_count(), 1);
+        assert_eq!(snapshot.unknown_or_invalid_backend_count(), 0);
+        assert_eq!(
+            snapshot.topology_revision(),
+            service.snapshot().unwrap().revision()
+        );
     }
 
     #[test]
@@ -1189,5 +1412,78 @@ mod tests {
         assert!(columns.contains(&"EndpointOwned".to_string()));
         assert!(columns.contains(&"Eligible".to_string()));
         assert!(columns.contains(&"DiagnosticStatus".to_string()));
+        assert!(columns.contains(&"NativeCompatibilityId".to_string()));
+    }
+
+    #[test]
+    fn same_island_different_build_identity_is_eligible() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let descriptor = descriptor_with(
+            "127.0.0.1:9070".parse().unwrap(),
+            "different-build-for-rollout-diagnostics",
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+        );
+        service
+            .record_announce(descriptor.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &descriptor);
+
+        assert_eq!(service.snapshot().unwrap().targets().len(), 1);
+        let state = service.state.lock().unwrap();
+        let facts = state.processes.values().next().expect("announced backend");
+        assert!(matches!(
+            &facts.compatibility,
+            super::Compatibility::Compatible
+        ));
+    }
+
+    #[test]
+    fn other_island_is_observable_but_never_eligible() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let descriptor = descriptor_with(
+            "127.0.0.1:9070".parse().unwrap(),
+            "other-island-build",
+            novarocks_types::NativeCompatibilityId::new([0x72; 32]),
+        );
+        service
+            .record_announce(descriptor.clone(), BackendReportedState::Running)
+            .unwrap();
+        let revision_before_heartbeat = service.snapshot().unwrap().revision();
+        verify(&service, &descriptor);
+
+        let snapshot = service.snapshot().unwrap();
+        assert!(snapshot.targets().is_empty());
+        assert!(snapshot.revision() > revision_before_heartbeat);
+        let state = service.state.lock().unwrap();
+        let facts = state.processes.values().next().expect("announced backend");
+        assert!(matches!(
+            &facts.compatibility,
+            super::Compatibility::OtherIsland { .. }
+        ));
+        assert_eq!(super::diagnostic_status(facts), "OtherIsland");
+        assert!(
+            facts
+                .compatibility
+                .detail()
+                .contains("other compatibility island")
+        );
+    }
+
+    #[test]
+    fn repeated_verified_other_island_heartbeat_does_not_advance_revision() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let descriptor = descriptor_with(
+            "127.0.0.1:9070".parse().unwrap(),
+            "other-island-build",
+            novarocks_types::NativeCompatibilityId::new([0x72; 32]),
+        );
+        service
+            .record_announce(descriptor.clone(), BackendReportedState::Running)
+            .unwrap();
+        verify(&service, &descriptor);
+        let revision = service.snapshot().unwrap().revision();
+
+        verify(&service, &descriptor);
+        assert_eq!(service.snapshot().unwrap().revision(), revision);
     }
 }

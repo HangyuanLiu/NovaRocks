@@ -537,7 +537,8 @@ fn parse_init_outcome(raw: i32) -> Result<QueryInitOutcome, ProtocolError> {
             | QueryInitOutcome::QueryInitRejectedInvalidManifest
             | QueryInitOutcome::QueryInitRejectedTerminated
             | QueryInitOutcome::QueryInitRejectedBackendDraining
-            | QueryInitOutcome::QueryInitRejectedBackendProcessMismatch),
+            | QueryInitOutcome::QueryInitRejectedBackendProcessMismatch
+            | QueryInitOutcome::QueryInitRejectedCompatibilityMismatch),
         ) => Ok(outcome),
         Ok(QueryInitOutcome::Unspecified) | Err(_) => Err(ProtocolError::new(
             FieldPath::root("init_query_response").field("outcome"),
@@ -632,6 +633,9 @@ mod tests {
             query_deadline_unix_ms: 1_000,
             pre_start_timeout_ms: 30_000,
             report_endpoint: Some(endpoint(9031)),
+            native_compatibility_id: Some(novarocks::NativeCompatibilityId {
+                value: vec![0x71; 32],
+            }),
             ..Default::default()
         }
     }

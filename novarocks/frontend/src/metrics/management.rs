@@ -24,9 +24,11 @@ use axum::response::IntoResponse;
 use axum::{Json, Router, routing::get};
 
 use crate::coordinator::QueryLifecycleConvergenceReader;
+use crate::topology::{BackendIslandSnapshot, BackendIslandSnapshotReader};
 use crate::workload_lifecycle::{
-    FrontendServingLifecycle, FrontendServingSnapshot, FrontendServingSnapshotReader,
-    FrontendServingState,
+    FrontendCatalogServingSnapshot, FrontendDrainServingSnapshot, FrontendServingLifecycle,
+    FrontendServingSnapshot, FrontendServingSnapshotReader, FrontendServingState,
+    FrontendWorkloadServingSnapshot,
 };
 
 use super::{FrontendMetricsRegistry, render_metrics, render_metrics_json};
@@ -35,6 +37,51 @@ use super::{FrontendMetricsRegistry, render_metrics, render_metrics_json};
 struct FrontendManagementState {
     registry: Arc<FrontendMetricsRegistry>,
     serving_reader: Arc<dyn FrontendServingSnapshotReader>,
+    island_reader: Arc<dyn BackendIslandSnapshotReader>,
+}
+
+/// Versioned management document composed from independent read-only owners.
+/// The serving lifecycle remains FE-local; topology remains the membership
+/// authority. This type only joins their already-sanitized observations.
+#[derive(serde::Serialize)]
+struct FrontendManagementSnapshot {
+    schema_version: u8,
+    serving_state: FrontendServingState,
+    catalog: FrontendCatalogServingSnapshot,
+    workload: FrontendWorkloadServingSnapshot,
+    drain: FrontendDrainServingSnapshot,
+    island: FrontendIslandManagementSnapshot,
+}
+
+#[derive(serde::Serialize)]
+struct FrontendIslandManagementSnapshot {
+    native_compatibility_id: String,
+    topology_revision: u64,
+    compatible_eligible_backend_count: usize,
+    other_island_backend_count: usize,
+    unknown_or_invalid_backend_count: usize,
+    ready: bool,
+}
+
+impl FrontendManagementSnapshot {
+    fn compose(serving: FrontendServingSnapshot, island: BackendIslandSnapshot) -> Self {
+        let ready = serving.base_ready() && island.compatible_eligible_backend_count() >= 1;
+        Self {
+            schema_version: 2,
+            serving_state: serving.serving_state,
+            catalog: serving.catalog,
+            workload: serving.workload,
+            drain: serving.drain,
+            island: FrontendIslandManagementSnapshot {
+                native_compatibility_id: island.native_compatibility_id().to_string(),
+                topology_revision: island.topology_revision(),
+                compatible_eligible_backend_count: island.compatible_eligible_backend_count(),
+                other_island_backend_count: island.other_island_backend_count(),
+                unknown_or_invalid_backend_count: island.unknown_or_invalid_backend_count(),
+                ready,
+            },
+        }
+    }
 }
 
 /// Builds the complete Frontend management HTTP surface. Native report gRPC
@@ -42,10 +89,12 @@ struct FrontendManagementState {
 pub(crate) fn frontend_management_router(
     registry: Arc<FrontendMetricsRegistry>,
     convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
+    island_reader: Arc<dyn BackendIslandSnapshotReader>,
 ) -> Router {
     frontend_management_router_with_readers(
         registry,
         Arc::new(FrontendServingLifecycle::new()),
+        island_reader,
         Some(convergence_reader),
         crate::native::report_server::lifecycle_convergence_debug_enabled(),
     )
@@ -56,17 +105,20 @@ pub(crate) fn frontend_management_router(
 pub(crate) fn frontend_management_router_with_readers(
     registry: Arc<FrontendMetricsRegistry>,
     serving_reader: Arc<dyn FrontendServingSnapshotReader>,
+    island_reader: Arc<dyn BackendIslandSnapshotReader>,
     convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
     debug_enabled: bool,
 ) -> Router {
     let state = FrontendManagementState {
         registry,
         serving_reader,
+        island_reader,
     };
     let router = Router::new()
         .route("/metrics", get(handle_management_metrics))
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
+        .route("/island-readyz", get(island_readyz))
         .route("/v1/frontend/state", get(frontend_state));
     let router = if debug_enabled && convergence_reader.is_some() {
         let convergence_reader = convergence_reader.expect("checked above");
@@ -84,6 +136,11 @@ async fn handle_management_metrics(
     State(state): State<FrontendManagementState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> axum::response::Response {
+    let snapshot = management_snapshot(&state);
+    super::publish_frontend_island_metrics(
+        snapshot.island.ready,
+        snapshot.island.compatible_eligible_backend_count,
+    );
     if params
         .get("type")
         .is_some_and(|value| value.eq_ignore_ascii_case("json"))
@@ -126,8 +183,28 @@ async fn readyz(State(state): State<FrontendManagementState>) -> axum::response:
 
 async fn frontend_state(
     State(state): State<FrontendManagementState>,
-) -> Json<FrontendServingSnapshot> {
-    Json(state.serving_reader.frontend_serving_snapshot())
+) -> Json<FrontendManagementSnapshot> {
+    Json(management_snapshot(&state))
+}
+
+async fn island_readyz(State(state): State<FrontendManagementState>) -> axum::response::Response {
+    let snapshot = management_snapshot(&state);
+    super::publish_frontend_island_metrics(
+        snapshot.island.ready,
+        snapshot.island.compatible_eligible_backend_count,
+    );
+    if snapshot.island.ready {
+        StatusCode::OK.into_response()
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
+    }
+}
+
+fn management_snapshot(state: &FrontendManagementState) -> FrontendManagementSnapshot {
+    FrontendManagementSnapshot::compose(
+        state.serving_reader.frontend_serving_snapshot(),
+        state.island_reader.backend_island_snapshot(),
+    )
 }
 
 async fn latest_lifecycle_convergence_snapshot(
@@ -141,7 +218,7 @@ async fn latest_lifecycle_convergence_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, RwLock};
 
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
@@ -149,6 +226,7 @@ mod tests {
 
     use super::{FrontendMetricsRegistry, frontend_management_router_with_readers};
     use crate::coordinator::{QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot};
+    use crate::topology::{BackendIslandSnapshot, BackendIslandSnapshotReader};
     use crate::workload_lifecycle::{
         FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,
         FrontendServingLifecycle,
@@ -162,10 +240,52 @@ mod tests {
         }
     }
 
-    fn router(debug_enabled: bool, lifecycle: Arc<FrontendServingLifecycle>) -> axum::Router {
+    struct TestIslandReader {
+        snapshot: RwLock<BackendIslandSnapshot>,
+    }
+
+    impl TestIslandReader {
+        fn new(snapshot: BackendIslandSnapshot) -> Self {
+            Self {
+                snapshot: RwLock::new(snapshot),
+            }
+        }
+
+        fn set(&self, snapshot: BackendIslandSnapshot) {
+            *self.snapshot.write().expect("test island reader lock") = snapshot;
+        }
+    }
+
+    impl BackendIslandSnapshotReader for TestIslandReader {
+        fn backend_island_snapshot(&self) -> BackendIslandSnapshot {
+            *self.snapshot.read().expect("test island reader lock")
+        }
+    }
+
+    fn island_snapshot(
+        revision: u64,
+        compatible_eligible: usize,
+        other_island: usize,
+        unknown_or_invalid: usize,
+    ) -> BackendIslandSnapshot {
+        BackendIslandSnapshot::new(
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            revision,
+            compatible_eligible,
+            other_island,
+            unknown_or_invalid,
+        )
+    }
+
+    fn router(
+        debug_enabled: bool,
+        lifecycle: Arc<FrontendServingLifecycle>,
+        island: Arc<TestIslandReader>,
+    ) -> axum::Router {
         frontend_management_router_with_readers(
             FrontendMetricsRegistry::new().expect("create frontend metrics registry"),
             lifecycle,
+            island,
             Some(Arc::new(EmptyConvergenceReader)),
             debug_enabled,
         )
@@ -174,7 +294,8 @@ mod tests {
     #[tokio::test]
     async fn management_router_serves_metrics_and_gates_lifecycle_debug_route() {
         let lifecycle = Arc::new(FrontendServingLifecycle::new());
-        let metrics = router(false, Arc::clone(&lifecycle))
+        let island = Arc::new(TestIslandReader::new(island_snapshot(0, 0, 0, 0)));
+        let metrics = router(false, Arc::clone(&lifecycle), Arc::clone(&island))
             .oneshot(
                 Request::builder()
                     .uri("/metrics")
@@ -185,7 +306,7 @@ mod tests {
             .expect("metrics response");
         assert_eq!(metrics.status(), StatusCode::OK);
 
-        let debug_off = router(false, Arc::clone(&lifecycle))
+        let debug_off = router(false, Arc::clone(&lifecycle), Arc::clone(&island))
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -197,7 +318,7 @@ mod tests {
             .expect("debug-off response");
         assert_eq!(debug_off.status(), StatusCode::NOT_FOUND);
 
-        let debug_on = router(true, lifecycle)
+        let debug_on = router(true, lifecycle, island)
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
@@ -213,6 +334,7 @@ mod tests {
     #[tokio::test]
     async fn management_routes_report_liveness_readiness_and_sanitized_state() {
         let lifecycle = Arc::new(FrontendServingLifecycle::new());
+        let island = Arc::new(TestIslandReader::new(island_snapshot(3, 0, 1, 2)));
         lifecycle.publish_catalog_bootstrap(
             FrontendCatalogSourceMode::StaticFile,
             true,
@@ -226,7 +348,7 @@ mod tests {
                 unavailable: 1,
             },
         );
-        let live = router(false, Arc::clone(&lifecycle))
+        let live = router(false, Arc::clone(&lifecycle), Arc::clone(&island))
             .oneshot(
                 Request::builder()
                     .uri("/livez")
@@ -236,7 +358,7 @@ mod tests {
             .await
             .expect("live response");
         assert_eq!(live.status(), StatusCode::OK);
-        let not_ready = router(false, Arc::clone(&lifecycle))
+        let not_ready = router(false, Arc::clone(&lifecycle), Arc::clone(&island))
             .oneshot(
                 Request::builder()
                     .uri("/readyz")
@@ -248,7 +370,7 @@ mod tests {
         assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         lifecycle.mark_ready().expect("mark ready");
-        let state = router(false, Arc::clone(&lifecycle))
+        let state = router(false, Arc::clone(&lifecycle), Arc::clone(&island))
             .oneshot(
                 Request::builder()
                     .uri("/v1/frontend/state")
@@ -262,12 +384,18 @@ mod tests {
             .await
             .expect("state body");
         let json: serde_json::Value = serde_json::from_slice(&body).expect("state json");
-        assert_eq!(json["schema_version"], 1);
+        assert_eq!(json["schema_version"], 2);
         assert_eq!(json["catalog"]["counts"]["desired"], 2);
         assert!(json.get("properties").is_none());
         assert!(json.to_string().contains("0123456789abcdef"));
+        assert_eq!(json["island"]["native_compatibility_id"], "71".repeat(32));
+        assert_eq!(json["island"]["topology_revision"], 3);
+        assert_eq!(json["island"]["compatible_eligible_backend_count"], 0);
+        assert_eq!(json["island"]["other_island_backend_count"], 1);
+        assert_eq!(json["island"]["unknown_or_invalid_backend_count"], 2);
+        assert_eq!(json["island"]["ready"], false);
 
-        let ready = router(false, lifecycle)
+        let ready = router(false, lifecycle, island)
             .oneshot(
                 Request::builder()
                     .uri("/readyz")
@@ -277,5 +405,63 @@ mod tests {
             .await
             .expect("ready response");
         assert_eq!(ready.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn island_readyz_requires_base_readiness_and_a_compatible_eligible_backend() {
+        let lifecycle = Arc::new(FrontendServingLifecycle::new());
+        let island = Arc::new(TestIslandReader::new(island_snapshot(0, 0, 0, 0)));
+        let base_false = router(false, Arc::clone(&lifecycle), Arc::clone(&island))
+            .oneshot(
+                Request::builder()
+                    .uri("/island-readyz")
+                    .body(Body::empty())
+                    .expect("island ready request"),
+            )
+            .await
+            .expect("island ready response");
+        assert_eq!(base_false.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        lifecycle.publish_catalog_bootstrap(
+            FrontendCatalogSourceMode::StaticFile,
+            true,
+            None,
+            FrontendCatalogCounts::default(),
+        );
+        lifecycle.mark_ready().expect("mark ready");
+        let no_backend = router(false, Arc::clone(&lifecycle), Arc::clone(&island))
+            .oneshot(
+                Request::builder()
+                    .uri("/island-readyz")
+                    .body(Body::empty())
+                    .expect("island ready request"),
+            )
+            .await
+            .expect("island ready response");
+        assert_eq!(no_backend.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        island.set(island_snapshot(1, 1, 0, 0));
+        let compatible_backend = router(false, Arc::clone(&lifecycle), Arc::clone(&island))
+            .oneshot(
+                Request::builder()
+                    .uri("/island-readyz")
+                    .body(Body::empty())
+                    .expect("island ready request"),
+            )
+            .await
+            .expect("island ready response");
+        assert_eq!(compatible_backend.status(), StatusCode::OK);
+
+        island.set(island_snapshot(2, 0, 1, 0));
+        let other_island_only = router(false, lifecycle, island)
+            .oneshot(
+                Request::builder()
+                    .uri("/island-readyz")
+                    .body(Body::empty())
+                    .expect("island ready request"),
+            )
+            .await
+            .expect("island ready response");
+        assert_eq!(other_island_only.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

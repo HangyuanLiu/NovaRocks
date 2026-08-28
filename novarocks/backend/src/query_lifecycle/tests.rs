@@ -23,7 +23,7 @@ use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
 use novarocks_proto_codec::lifecycle::{
-    AttemptId, ParticipantBackendIdentity, ParticipantManifest,
+    AttemptId, ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,
     ParticipantTerminalOutcome as ProtocolParticipantTerminalOutcome, QueryAbortRequest,
     QueryControlAttach, QueryControlEndpoint, QueryExecutionId, QueryInitOutcome, QueryInitRequest,
     QueryOptions, QueryStageOutcome, QueryStageRequest, QueryStartOutcome, QueryStartRequest,
@@ -632,6 +632,39 @@ fn init_requires_exact_backend_process_identity() {
 }
 
 #[test]
+fn init_compatibility_mismatch_has_no_lifecycle_side_effect() {
+    let runtime = RecordingLocalRuntime::default();
+    let registry = QueryLifecycleRegistry::new_with_process_id(
+        local_process_id(),
+        Arc::new(runtime.clone()),
+        registry_config(8),
+    );
+    let request = init_request_fixture(702, ATTEMPT_1, 10_000);
+    let mut raw = request.as_proto().clone();
+    raw.manifest
+        .as_mut()
+        .expect("fixture manifest")
+        .native_compatibility_id = Some(proto_novarocks::NativeCompatibilityId {
+        value: vec![0x72; 32],
+    });
+    let mismatch = QueryInitRequest::parse(raw).expect("valid mismatched manifest carrier");
+
+    assert_eq!(
+        registry
+            .init_query(mismatch)
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
+        QueryInitOutcome::QueryInitRejectedCompatibilityMismatch
+    );
+    let metrics = registry.metrics_snapshot();
+    assert_eq!(
+        metrics.initializing + metrics.initialized + metrics.control_attached,
+        0
+    );
+    assert_eq!(runtime.runtime_filter_install_calls(), 0);
+}
+
+#[test]
 fn attach_reserves_p0_before_control_ready_and_releases_on_terminal_cleanup() {
     let runtime = RecordingLocalRuntime::default();
     let mut config = registry_config(8);
@@ -826,6 +859,7 @@ fn init_request_fixture_for_process(
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
         )
         .expect("valid backend identity"),
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         [],
         default_query_options(),
         query_deadline_unix_ms,
@@ -847,6 +881,7 @@ fn fragment_init_request_fixture(query_low: i64, expected: &[UniqueId]) -> Query
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
         )
         .expect("valid backend identity"),
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         expected.iter().copied().map(protocol_unique_id),
         default_query_options(),
         10_000,
@@ -871,6 +906,7 @@ fn fragment_runtime_filter_init_request_fixture(
             QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
         )
         .expect("valid backend identity"),
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         expected.iter().copied().map(protocol_unique_id),
         default_query_options(),
         10_000,
@@ -1078,6 +1114,79 @@ fn stage_and_start_are_idempotent_after_control_ready() {
     assert_eq!(
         registry.start_prepared_query(start).outcome(),
         QueryStartOutcome::AlreadyStarted
+    );
+}
+
+#[test]
+fn exchange_route_becomes_authorized_only_after_stage_and_revokes_on_abort() {
+    let source = UniqueId::new(18, 1);
+    let destination = UniqueId::new(18, 2);
+    let execution_id = execution_id(1_803, ATTEMPT_1);
+    let manifest = ParticipantManifest::new(
+        execution_id,
+        ParticipantBackendIdentity::new(
+            local_process_id(),
+            QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
+        )
+        .expect("valid backend identity"),
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+        [protocol_unique_id(destination)],
+        default_query_options(),
+        10_000,
+        [ExchangeRouteManifest::new(
+            protocol_unique_id(source),
+            protocol_unique_id(destination),
+            77,
+            0,
+            1,
+        )
+        .expect("valid exchange route")],
+        None,
+        Duration::from_secs(30),
+        QueryControlEndpoint::new("127.0.0.1", 9031).expect("valid report endpoint"),
+    )
+    .expect("valid participant manifest");
+    let request = QueryInitRequest::from_manifest(manifest);
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+
+    assert_eq!(
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("init acknowledgement"),
+        QueryInitOutcome::QueryInitApplied
+    );
+    assert!(
+        registry
+            .authorize_exchange(destination, 77, source, 0, 1)
+            .is_err()
+    );
+
+    let _control = attach_control(&registry, &request);
+    let stage = stage_request(&request, 4, &[destination]);
+    assert_eq!(
+        registry.stage_fragments(stage).outcome(),
+        QueryStageOutcome::Applied
+    );
+    registry
+        .authorize_exchange(destination, 77, source, 0, 1)
+        .expect("staged route is authorized");
+
+    registry
+        .abort_query(QueryAbortRequest::new(
+            execution_id,
+            request
+                .manifest()
+                .expect("manifest")
+                .digest()
+                .expect("digest"),
+            "test abort",
+        ))
+        .expect("abort accepted");
+    assert!(
+        registry
+            .authorize_exchange(destination, 77, source, 0, 1)
+            .is_err()
     );
 }
 

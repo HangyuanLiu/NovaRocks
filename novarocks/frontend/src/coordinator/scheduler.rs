@@ -53,6 +53,7 @@ impl FrontendBackendSnapshot {
                     endpoint,
                     "scheduler-test",
                     "scheduler-test",
+                    novarocks_types::NativeCompatibilityId::new([0x71; 32]),
                 )
                 .map_err(|error| contract_error(error.to_string()))?;
                 Ok(LiveBackendTarget::new(backend_idx, descriptor))

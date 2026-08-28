@@ -6,6 +6,23 @@ use novarocks_cluster_harness::{
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScenarioBinary {
+    #[default]
+    Primary,
+    Compatible,
+    OtherIsland,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScenarioBinaryLayout {
+    /// `Primary` preserves the runner's primary binary for the frontend.
+    pub frontend: ScenarioBinary,
+    /// Empty preserves the runner's primary binary for every backend. When
+    /// populated, entries map one-to-one to backend indexes.
+    pub backends: Vec<ScenarioBinary>,
+}
+
 pub trait Scenario: Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -32,6 +49,9 @@ pub trait Scenario: Send + Sync {
 
 #[derive(Debug, Clone, Default)]
 pub struct ScenarioLaunchConfig {
+    pub binary_layout: ScenarioBinaryLayout,
+    /// `None` preserves the runner's full-cluster topology barrier.
+    pub expected_eligible_backend_count: Option<usize>,
     pub child_environment: CrossProcessChildEnvironment,
     pub config_overlay: CrossProcessConfigOverlay,
     pub native_trust_fixture: NativeTrustFixture,
@@ -44,6 +64,8 @@ pub struct ScenarioContext {
     deadline: Instant,
     actions: Vec<String>,
     binary: PathBuf,
+    compatible_binary: Option<PathBuf>,
+    other_island_binary: Option<PathBuf>,
     base_config_path: PathBuf,
     cluster_size: usize,
     startup_timeout: Duration,
@@ -56,6 +78,8 @@ impl ScenarioContext {
         scenario_root: PathBuf,
         timeout: Duration,
         binary: PathBuf,
+        compatible_binary: Option<PathBuf>,
+        other_island_binary: Option<PathBuf>,
         base_config_path: PathBuf,
         cluster_size: usize,
     ) -> Self {
@@ -66,6 +90,8 @@ impl ScenarioContext {
             deadline: Instant::now() + timeout,
             actions: Vec::new(),
             binary,
+            compatible_binary,
+            other_island_binary,
             base_config_path,
             cluster_size,
             startup_timeout: timeout,
@@ -120,6 +146,12 @@ impl ScenarioContext {
         self.handle.diagnostics()
     }
 
+    pub fn compatible_binary(&self) -> Result<PathBuf> {
+        self.compatible_binary
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("scenario requires --compatible-binary"))
+    }
+
     pub fn retain_artifacts(&mut self) {
         self.handle.retain_runtime_artifacts();
     }
@@ -139,6 +171,19 @@ impl ScenarioContext {
         let runtime_root = self.scenario_root.join(name);
         CrossProcessServerHandle::launch(novarocks_cluster_harness::CrossProcessClusterOptions {
             binary: self.binary.clone(),
+            fe_binary: resolve_binary(
+                launch_config.binary_layout.frontend,
+                self.compatible_binary.as_ref(),
+                self.other_island_binary.as_ref(),
+            )?,
+            be_binaries: resolve_backend_binaries(
+                &launch_config.binary_layout.backends,
+                &self.binary,
+                self.compatible_binary.as_ref(),
+                self.other_island_binary.as_ref(),
+                self.cluster_size,
+            )?,
+            expected_eligible_backend_count: launch_config.expected_eligible_backend_count,
             base_config_path: self.base_config_path.clone(),
             runtime_root,
             cluster_size: self.cluster_size,
@@ -150,4 +195,49 @@ impl ScenarioContext {
             native_trust_fixture: launch_config.native_trust_fixture,
         })
     }
+}
+
+pub(crate) fn resolve_binary(
+    selection: ScenarioBinary,
+    compatible: Option<&PathBuf>,
+    other_island: Option<&PathBuf>,
+) -> Result<Option<PathBuf>> {
+    match selection {
+        ScenarioBinary::Primary => Ok(None),
+        ScenarioBinary::Compatible => compatible.cloned().map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "scenario selected compatible binary, but --compatible-binary was not provided"
+            )
+        }),
+        ScenarioBinary::OtherIsland => other_island.cloned().map(Some).ok_or_else(|| {
+            anyhow::anyhow!(
+                "scenario selected other-island binary, but --other-island-binary was not provided"
+            )
+        }),
+    }
+}
+
+pub(crate) fn resolve_backend_binaries(
+    selections: &[ScenarioBinary],
+    primary: &Path,
+    compatible: Option<&PathBuf>,
+    other_island: Option<&PathBuf>,
+    cluster_size: usize,
+) -> Result<Vec<PathBuf>> {
+    if selections.is_empty() {
+        return Ok(Vec::new());
+    }
+    if selections.len() != cluster_size {
+        bail!(
+            "scenario selected {} backend binaries for cluster size {cluster_size}",
+            selections.len()
+        );
+    }
+    selections
+        .iter()
+        .map(|selection| {
+            resolve_binary(*selection, compatible, other_island)
+                .map(|binary| binary.unwrap_or_else(|| primary.to_path_buf()))
+        })
+        .collect()
 }

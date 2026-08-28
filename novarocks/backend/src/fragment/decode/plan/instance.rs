@@ -76,10 +76,20 @@ pub(crate) fn decode_destinations(
                     "native Destination requires finst_id",
                 )
             })?;
+            let source_finst_id = destination.source_finst_id.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    path.clone().field("source_finst_id"),
+                    "native Destination requires source_finst_id",
+                )
+            })?;
             Ok(FragmentDestination::new(
                 unique_id(finst_id),
                 decode_endpoint_at(&destination.endpoint, path.field("endpoint"))?,
-            ))
+                unique_id(source_finst_id),
+                destination.sender_ordinal,
+                destination.sender_count,
+            )
+            .map_err(|detail| NativeFragmentDecodeError::invalid_value(path, detail))?)
         })
         .collect()
 }
@@ -165,6 +175,9 @@ mod tests {
         let error = decode_destinations(&[native_proto::Destination {
             finst_id: None,
             endpoint: "127.0.0.1:9070".to_string(),
+            source_finst_id: None,
+            sender_ordinal: 0,
+            sender_count: 0,
         }])
         .expect_err("missing finst id");
         let protocol = error.protocol().expect("protocol error");

@@ -116,11 +116,21 @@ fn decode_instance_destinations(
                     "native Destination requires finst_id",
                 )
             })?;
+            let source_finst_id = destination.source_finst_id.as_ref().ok_or_else(|| {
+                missing(
+                    path.clone().field("source_finst_id"),
+                    "native Destination requires source_finst_id",
+                )
+            })?;
             Ok(FragmentDestination::new(
                 UniqueId::new(finst_id.hi, finst_id.lo),
                 RuntimeEndpoint::parse(&destination.endpoint)
                     .map_err(|error| invalid_value(path.field("endpoint"), error))?,
-            ))
+                UniqueId::new(source_finst_id.hi, source_finst_id.lo),
+                destination.sender_ordinal,
+                destination.sender_count,
+            )
+            .map_err(|error| invalid_value(path, error))?)
         })
         .collect()
 }
@@ -141,11 +151,21 @@ fn decode_stream_destination_list(
                     "native stream destination requires finst_id",
                 )
             })?;
+            let source_finst_id = destination.source_finst_id.as_ref().ok_or_else(|| {
+                missing(
+                    destination_path.clone().field("source_finst_id"),
+                    "native stream destination requires source_finst_id",
+                )
+            })?;
             Ok(FragmentDestination::new(
                 UniqueId::new(finst_id.hi, finst_id.lo),
                 RuntimeEndpoint::parse(&destination.endpoint)
                     .map_err(|error| invalid_value(destination_path.field("endpoint"), error))?,
-            ))
+                UniqueId::new(source_finst_id.hi, source_finst_id.lo),
+                destination.sender_ordinal,
+                destination.sender_count,
+            )
+            .map_err(|error| invalid_value(destination_path, error))?)
         })
         .collect()
 }

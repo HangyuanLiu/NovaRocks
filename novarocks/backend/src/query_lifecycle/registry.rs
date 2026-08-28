@@ -35,7 +35,8 @@ use novarocks_proto_codec::lifecycle::{
     QueryTerminationReason, StageDigest, StageDigestVersion, TerminalOutcomeContentId,
 };
 use novarocks_types::{
-    BackendProcessId, LocalQuerySequence, QueryIdAttribution, QueryProcessNamespace, UniqueId,
+    BackendProcessId, LocalQuerySequence, NativeCompatibilityId, QueryIdAttribution,
+    QueryProcessNamespace, UniqueId,
 };
 use prost::Message;
 use tracing::{info, warn};
@@ -872,6 +873,7 @@ pub(crate) struct QueryLifecycleRegistry {
     runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
     config: QueryLifecycleRegistryConfig,
     local_process_id: BackendProcessId,
+    native_compatibility_id: NativeCompatibilityId,
     clock: Arc<dyn MonotonicClock>,
     metrics: Arc<dyn QueryLifecycleMetricsSink>,
     stage_resources: Arc<Mutex<StageResourceLedger>>,
@@ -1131,6 +1133,7 @@ impl QueryLifecycleRegistry {
             clock,
             metrics,
             terminal_fallback,
+            NativeCompatibilityId::new([0x71; 32]),
         )
     }
 
@@ -1156,6 +1159,7 @@ impl QueryLifecycleRegistry {
             metrics,
             terminal_fallback,
             runtime_filter_factory,
+            NativeCompatibilityId::new([0x71; 32]),
         )
     }
 
@@ -1174,6 +1178,7 @@ impl QueryLifecycleRegistry {
             Arc::new(SystemMonotonicClock),
             Arc::new(PrometheusQueryLifecycleMetricsSink),
             Arc::new(GrpcQueryTerminalFallbackTransport { runtime }),
+            NativeCompatibilityId::new([0x71; 32]),
         )
     }
 
@@ -1181,6 +1186,7 @@ impl QueryLifecycleRegistry {
         runtime: BackendDataRuntime,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
+        native_compatibility_id: NativeCompatibilityId,
     ) -> Arc<Self> {
         Self::new_with_backend_identity(
             runtime.clone(),
@@ -1190,6 +1196,7 @@ impl QueryLifecycleRegistry {
             Arc::new(SystemMonotonicClock),
             Arc::new(PrometheusQueryLifecycleMetricsSink),
             Arc::new(GrpcQueryTerminalFallbackTransport { runtime }),
+            native_compatibility_id,
         )
     }
 
@@ -1205,6 +1212,7 @@ impl QueryLifecycleRegistry {
         clock: Arc<dyn MonotonicClock>,
         metrics: Arc<dyn QueryLifecycleMetricsSink>,
         terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
+        native_compatibility_id: NativeCompatibilityId,
     ) -> Arc<Self> {
         Self::new_with_backend_identity_and_runtime_filter_factory(
             local_process_id,
@@ -1214,6 +1222,7 @@ impl QueryLifecycleRegistry {
             metrics,
             terminal_fallback,
             Arc::new(BackendRuntimeFilterParticipantFactory::new(runtime)),
+            native_compatibility_id,
         )
     }
 
@@ -1229,6 +1238,7 @@ impl QueryLifecycleRegistry {
         metrics: Arc<dyn QueryLifecycleMetricsSink>,
         terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
         runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
+        native_compatibility_id: NativeCompatibilityId,
     ) -> Arc<Self> {
         assert!(config.max_active_entries > 0);
         assert!(config.tombstone_capacity > 0);
@@ -1257,6 +1267,7 @@ impl QueryLifecycleRegistry {
             runtime_filter_factory,
             config,
             local_process_id,
+            native_compatibility_id,
             clock,
             metrics,
             stage_resources: Arc::new(Mutex::new(StageResourceLedger::default())),
@@ -1313,9 +1324,66 @@ impl QueryLifecycleRegistry {
         state.draining && state.active_entries == 0
     }
 
+    /// Admission-derived authorization for the native exchange data plane.
+    /// Routes exist only while the owning lifecycle entry can still execute;
+    /// tombstone/terminal retention therefore automatically revokes frames.
+    pub(crate) fn authorize_exchange(
+        &self,
+        destination_fragment_instance_id: UniqueId,
+        destination_node_id: i32,
+        source_fragment_instance_id: UniqueId,
+        sender_ordinal: u32,
+        sender_count: u32,
+    ) -> Result<(), String> {
+        if sender_count == 0 || sender_ordinal >= sender_count {
+            return Err("exchange sender ordinal/count is invalid".to_string());
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "query lifecycle registry lock is poisoned".to_string())?;
+        for entry in state.entries.values() {
+            let phase = entry
+                .state
+                .lock()
+                .map_err(|_| "query lifecycle entry lock is poisoned".to_string())?
+                .phase;
+            if !matches!(
+                phase,
+                QueryLifecyclePhase::Staged | QueryLifecyclePhase::Running
+            ) {
+                continue;
+            }
+            for route in validated(entry.manifest.exchange_routes()) {
+                let source = validated(route.source_fragment_instance_id());
+                let destination = validated(route.destination_fragment_instance_id());
+                if UniqueId::new(source.hi, source.lo) == source_fragment_instance_id
+                    && UniqueId::new(destination.hi, destination.lo)
+                        == destination_fragment_instance_id
+                    && route.destination_node_id() == destination_node_id
+                    && route.sender_ordinal() == sender_ordinal
+                    && route.sender_count() == sender_count
+                {
+                    return Ok(());
+                }
+            }
+        }
+        Err("exchange route is absent from every active participant manifest".to_string())
+    }
+
     pub(crate) fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         let manifest = validated(request.manifest());
         let execution_id = validated(manifest.execution_id());
+        if validated(manifest.native_compatibility_id()) != self.native_compatibility_id {
+            let digest = validated(manifest.digest());
+            let ack = QueryInitAck::new(
+                execution_id,
+                digest,
+                QueryInitOutcome::QueryInitRejectedCompatibilityMismatch,
+            );
+            self.log_init(&ack);
+            return ack;
+        }
         // The admission boundary derives the manifest identity exactly once and
         // retains it on the entry; later comparisons read the retained value.
         let digest = validated(manifest.digest());
@@ -4672,6 +4740,24 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         QueryLifecycleRegistry::init_query(self, request)
+    }
+
+    fn authorize_exchange(
+        &self,
+        destination_fragment_instance_id: UniqueId,
+        destination_node_id: i32,
+        source_fragment_instance_id: UniqueId,
+        sender_ordinal: u32,
+        sender_count: u32,
+    ) -> Result<(), String> {
+        QueryLifecycleRegistry::authorize_exchange(
+            self,
+            destination_fragment_instance_id,
+            destination_node_id,
+            source_fragment_instance_id,
+            sender_ordinal,
+            sender_count,
+        )
     }
 
     fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {

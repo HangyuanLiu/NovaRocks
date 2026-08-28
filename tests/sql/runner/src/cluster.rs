@@ -62,6 +62,9 @@ pub(crate) fn launch_server(
         ClusterMode::CrossProcess => Ok(Box::new(CrossProcessServerHandle::launch(
             CrossProcessClusterOptions {
                 binary: discover_novarocks_binary(repo_root)?,
+                fe_binary: None,
+                be_binaries: Vec::new(),
+                expected_eligible_backend_count: None,
                 base_config_path: resolve_base_frontend_config_path(repo_root, runner_config)?,
                 runtime_root: repo_root.join("tests/sql/.runtime/cluster"),
                 cluster_size,

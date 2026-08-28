@@ -886,6 +886,7 @@ fn fixture_descriptor(endpoint: std::net::SocketAddr) -> BackendProcessDescripto
             .expect("fixture backend endpoint"),
         "test-deployment",
         "test-build",
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
     )
     .expect("fixture backend descriptor")
 }
@@ -948,6 +949,7 @@ fn manifest(
     ParticipantManifest::new(
         execution_id,
         backend,
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         fragments,
         QueryOptions::parse(proto::QueryOptions::default()).expect("fixture query options"),
         1_900_000_000_000,
@@ -1857,6 +1859,43 @@ fn frontend_query_lifecycle_draining_rejection_preserves_typed_pre_ready_evidenc
     assert_eq!(
         error.pre_ready_topology_outcome(),
         Some(PreReadyTopologyOutcome::BackendDraining {
+            backend_idx,
+            process_id,
+        })
+    );
+}
+
+#[test]
+fn frontend_query_lifecycle_compatibility_rejection_preserves_typed_pre_ready_evidence() {
+    let plan = query_init_plan(None);
+    let participant = plan.participant(1).expect("participant one");
+    let backend_idx = participant.backend_idx();
+    let process_id = participant
+        .backend()
+        .process_id()
+        .expect("validated participant process identity");
+    let digest = participant.digest();
+    let execution_id = plan.execution_id();
+    let (transport, _) = RecordingTransport::ready(&plan);
+    transport.state.lock().unwrap().init_results.insert(
+        1,
+        VecDeque::from([Ok(QueryInitAck::new(
+            execution_id,
+            digest,
+            QueryInitOutcome::QueryInitRejectedCompatibilityMismatch,
+        ))]),
+    );
+    let (registry, _query) = registry_for(&plan);
+    let barrier = FrontendQueryLifecycleBarrier::new(Arc::new(transport), registry, config());
+
+    let error = match barrier.initialize_all(plan) {
+        Ok(_) => panic!("a compatibility mismatch must reject InitQuery before ControlReady"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error.pre_ready_topology_outcome(),
+        Some(PreReadyTopologyOutcome::CompatibilityMismatch {
             backend_idx,
             process_id,
         })
@@ -3139,6 +3178,7 @@ fn live_init_request(
         ParticipantManifest::new(
             execution_id,
             protocol_backend_from_live(backend.clone()),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             [proto_id(UniqueId::new(finst_high, 1))],
             QueryOptions::parse(proto::QueryOptions::default()).expect("fixture query options"),
             1_900_000_000_000,

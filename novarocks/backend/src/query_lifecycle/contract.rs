@@ -30,7 +30,7 @@ use novarocks_proto_codec::lifecycle::{
     QueryTerminalAck, QueryTerminalReportAck, QueryTerminationAck, QueryTerminationReason,
     StageDigest,
 };
-use novarocks_types::BackendProcessId;
+use novarocks_types::{BackendProcessId, UniqueId};
 
 /// Backend-local lifecycle failure categories.
 ///
@@ -150,6 +150,19 @@ pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
     }
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck;
+
+    /// Authorizes one native exchange frame against an active participant
+    /// manifest. The data-plane never obtains authority from a receiver key.
+    fn authorize_exchange(
+        &self,
+        _destination_fragment_instance_id: UniqueId,
+        _destination_node_id: i32,
+        _source_fragment_instance_id: UniqueId,
+        _sender_ordinal: u32,
+        _sender_count: u32,
+    ) -> Result<(), String> {
+        Err("exchange route is not authorized by the query lifecycle ingress".to_string())
+    }
 
     /// Atomically records the participant-local stage contract. Fragment
     /// materialization remains a backend concern; this contract boundary only

@@ -27,6 +27,7 @@ use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProvider
 use novarocks_native_trust::NativeTrust;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
+use novarocks_types::NativeCompatibilityId;
 
 use crate::catalog_application::desired_state::{
     CatalogDesiredStateSource, CatalogDesiredStateSourceMode,
@@ -211,6 +212,7 @@ pub struct FrontendExecutionConfig {
     advertised_report_host: String,
     configured_report_port: u16,
     runtime_filter_worker_count: NonZeroUsize,
+    native_compatibility_id: NativeCompatibilityId,
     mv_scheduler: FrontendMvSchedulerConfig,
     mv_maintenance: MaintenanceCoordinatorConfig,
     /// Cost budget frozen from `[runtime]` and handed to statement admission.
@@ -238,11 +240,13 @@ impl FrontendExecutionConfig {
         advertised_report_host: impl Into<String>,
         configured_report_port: u16,
         runtime_filter_worker_count: NonZeroUsize,
+        native_compatibility_id: NativeCompatibilityId,
     ) -> Self {
         Self {
             advertised_report_host: advertised_report_host.into(),
             configured_report_port,
             runtime_filter_worker_count,
+            native_compatibility_id,
             mv_scheduler: FrontendMvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
@@ -264,6 +268,10 @@ impl FrontendExecutionConfig {
                     .expect("an empty static catalog snapshot is valid"),
             ),
         }
+    }
+
+    pub(crate) const fn native_compatibility_id(&self) -> NativeCompatibilityId {
+        self.native_compatibility_id
     }
 
     pub fn with_query_control_timeouts(mut self, timeouts: FrontendQueryControlTimeouts) -> Self {
@@ -918,6 +926,12 @@ impl FrontendApplicationHost {
         Arc::clone(self.topology())
     }
 
+    pub(crate) fn backend_island_snapshot_reader(
+        &self,
+    ) -> Arc<dyn crate::topology::BackendIslandSnapshotReader> {
+        Arc::clone(self.topology()) as Arc<dyn crate::topology::BackendIslandSnapshotReader>
+    }
+
     pub fn start_report_server(
         &self,
         bind_addr: std::net::SocketAddr,
@@ -1040,11 +1054,13 @@ impl FrontendApplicationHost {
         &mut self,
         execution: FrontendExecutionConfig,
     ) -> Result<(), FrontendApplicationError> {
+        let native_compatibility_id = execution.native_compatibility_id();
         let coordinator = Arc::new(
             FrontendDistributedQueryCoordinator::new(
                 execution.advertised_report_host,
                 execution.configured_report_port,
                 execution.runtime_filter_worker_count,
+                native_compatibility_id,
                 execution.query_control_timeouts,
                 execution.task_update_retry_policy,
                 self.backend_topology_port(),
@@ -1273,6 +1289,7 @@ mod tests {
         let registry = test_state_store_registry();
         let backend = crate::topology::ClusterBackendOpenConfig::new(
             novarocks_types::ClusterRole::Fe,
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             Duration::from_secs(1),
             1,
             Duration::from_secs(1),
@@ -1285,6 +1302,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             ),
             backend,
             Vec::new(),

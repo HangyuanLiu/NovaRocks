@@ -476,6 +476,9 @@ message DataStreamSink {
 message StreamDestination {
   novarocks.common.UniqueId finst_id = 1;
   string endpoint = 2;  // NovaRocks gRPC runtime endpoint host:port.
+  novarocks.common.UniqueId source_finst_id = 3;
+  uint32 sender_ordinal = 4;
+  uint32 sender_count = 5;
 }
 
 message StreamDestinationList {

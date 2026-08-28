@@ -161,8 +161,8 @@ pub struct BackendTopologyMetricsSnapshot {
     pub reported_running: usize,
     pub reported_draining: usize,
     pub compatibility_compatible: usize,
-    pub compatibility_incompatible: usize,
-    pub compatibility_unknown: usize,
+    pub compatibility_other_island: usize,
+    pub compatibility_unknown_or_invalid: usize,
     pub endpoint_owned: usize,
     pub endpoint_unowned: usize,
     pub eligible: usize,
@@ -184,8 +184,8 @@ pub fn publish_backend_topology_metrics(snapshot: BackendTopologyMetricsSnapshot
         snapshot.reported_running,
         snapshot.reported_draining,
         snapshot.compatibility_compatible,
-        snapshot.compatibility_incompatible,
-        snapshot.compatibility_unknown,
+        snapshot.compatibility_other_island,
+        snapshot.compatibility_unknown_or_invalid,
         snapshot.endpoint_owned,
         snapshot.endpoint_unowned,
         snapshot.eligible,
@@ -448,6 +448,7 @@ mod tests {
                 .expect("valid endpoint"),
             "test-deployment",
             "test-build",
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
         )
         .expect("valid descriptor")
     }

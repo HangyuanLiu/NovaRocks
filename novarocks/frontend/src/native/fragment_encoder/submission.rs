@@ -32,7 +32,6 @@ use crate::query_execution::artifact::{
 };
 use crate::query_execution::assembly;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
-use novarocks_execution::runtime::endpoint::FragmentDestination;
 use novarocks_spi::connector::ConnectorWriteCohortId;
 use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdgeKind, FragmentId};
 use novarocks_types::UniqueId;
@@ -104,20 +103,6 @@ pub(crate) fn encode_native_submission(
             }
         }
     }
-
-    let consumer_destinations = schedule
-        .by_fragment
-        .iter()
-        .map(|(fragment_id, placements)| {
-            let destinations = placements
-                .iter()
-                .map(|placement| {
-                    FragmentDestination::new(placement.finst_id, placement.endpoint.clone())
-                })
-                .collect();
-            (*fragment_id, destinations)
-        })
-        .collect::<BTreeMap<_, _>>();
 
     let mut native_by_fragment = view
         .native_fragments_in_id_order()
@@ -210,6 +195,7 @@ pub(crate) fn encode_native_submission(
                             fragment_id,
                             *router_group_id,
                             branch_edges,
+                            placement,
                             &schedule.by_fragment,
                         )?;
                     } else if let Some(cte_id) = facts.cte_id() {
@@ -219,7 +205,8 @@ pub(crate) fn encode_native_submission(
                             fragment_id,
                             cte_id,
                             &consumers,
-                            &consumer_destinations,
+                            placement,
+                            &schedule.by_fragment,
                         )?;
                     }
                 }
