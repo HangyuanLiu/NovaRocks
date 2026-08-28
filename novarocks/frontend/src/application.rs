@@ -172,6 +172,7 @@ pub struct FrontendApplicationHost {
 
 /// Matches the historical `[runtime] optimizer_query_mem_limit_bytes` default.
 const DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP: Duration = Duration::from_secs(1);
 
 /// Query-control timeouts frozen from `[runtime]` at startup.
 ///
@@ -224,6 +225,9 @@ pub struct FrontendExecutionConfig {
     /// coordinator, which validates them once at startup instead of per query.
     query_control_timeouts: FrontendQueryControlTimeouts,
     task_update_retry_policy: TaskUpdateRetryPolicy,
+    /// Connector split enumeration's bounded, server-owned initial feedback
+    /// wait. This is frozen at startup and deliberately has no SQL override.
+    connector_split_initial_dynamic_filter_wait_cap: Duration,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     catalog_projection: CatalogProjectionConfig,
     /// The deployment's catalog desired-state authority, selected and validated
@@ -252,6 +256,8 @@ impl FrontendExecutionConfig {
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             query_control_timeouts: FrontendQueryControlTimeouts::default(),
             task_update_retry_policy: TaskUpdateRetryPolicy::default(),
+            connector_split_initial_dynamic_filter_wait_cap:
+                DEFAULT_CONNECTOR_SPLIT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             lake_publication_runtime_policy: LakePublicationRuntimePolicy::try_new(
                 Duration::from_secs(30 * 60),
                 Duration::from_secs(45 * 60),
@@ -281,6 +287,11 @@ impl FrontendExecutionConfig {
 
     pub fn with_task_update_retry_policy(mut self, policy: TaskUpdateRetryPolicy) -> Self {
         self.task_update_retry_policy = policy;
+        self
+    }
+
+    pub fn with_connector_split_initial_dynamic_filter_wait_cap(mut self, cap: Duration) -> Self {
+        self.connector_split_initial_dynamic_filter_wait_cap = cap;
         self
     }
 
@@ -1063,6 +1074,7 @@ impl FrontendApplicationHost {
                 native_compatibility_id,
                 execution.query_control_timeouts,
                 execution.task_update_retry_policy,
+                execution.connector_split_initial_dynamic_filter_wait_cap,
                 self.backend_topology_port(),
                 Arc::clone(&self.connector_control),
                 self.data_runtime.clone(),

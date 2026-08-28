@@ -147,6 +147,7 @@ impl RoundSplitAssignment {
         while !self.stop.is_stopped() {
             let mut progressed = false;
             let mut pending = false;
+            let mut feedback_wait_deadline = None;
             for index in 0..self.sources.len() {
                 if self.stop.is_stopped() {
                     break;
@@ -163,13 +164,19 @@ impl RoundSplitAssignment {
                     .feedback
                     .snapshot_for_scan(plan_node_id, &self.sources[index].feedback_bindings);
                 if let Some(deadline) = self.sources[index].initial_wait_deadline {
-                    if !dynamic_filter.is_complete()
-                        && Instant::now() < deadline
-                        && self.sources[index].feedback.is_initial_wait_eligible(
+                    if Instant::now() < deadline
+                        && self.sources[index].feedback.is_initial_wait_blocked(
                             plan_node_id,
-                            &self.sources[index].feedback_bindings,
+                            self.sources[index]
+                                .feedback_bindings
+                                .iter()
+                                .map(|(binding_id, _)| *binding_id),
                         )
                     {
+                        feedback_wait_deadline = Some(
+                            feedback_wait_deadline
+                                .map_or(deadline, |current: Instant| current.min(deadline)),
+                        );
                         continue;
                     }
                     self.sources[index].initial_wait_deadline = None;
@@ -195,7 +202,17 @@ impl RoundSplitAssignment {
                 // progresses; this loop deliberately has no deadline of its
                 // own, because inventing one would cancel a legitimately slow
                 // enumeration.
-                std::thread::sleep(IDLE_PUMP_BACKOFF);
+                if let Some(deadline) = feedback_wait_deadline {
+                    let budget = deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(IDLE_PUMP_BACKOFF);
+                    if let Some(source) = self.sources.first() {
+                        let generation = source.feedback.generation();
+                        source.feedback.wait_for_change(generation, budget);
+                    }
+                } else if self.stop.wait_backoff(IDLE_PUMP_BACKOFF) {
+                    break;
+                }
             }
         }
         Ok(self.profile_snapshot())

@@ -510,6 +510,9 @@ pub fn compose_frontend_server_config(
         .map_err(|error| anyhow::anyhow!("construct lake publication runtime policy: {error}"))?,
     )
     .with_optimizer_query_mem_limit_bytes(runtime_config.optimizer_query_mem_limit_bytes)
+    .with_connector_split_initial_dynamic_filter_wait_cap(Duration::from_millis(
+        runtime_config.connector_split_initial_dynamic_filter_wait_cap_ms,
+    ))
     .with_query_control_timeouts(FrontendQueryControlTimeouts {
         heartbeat_interval_ms: runtime_config.query_control_heartbeat_interval_ms,
         heartbeat_timeout_ms: runtime_config.query_control_heartbeat_timeout_ms,

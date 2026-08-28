@@ -1012,6 +1012,10 @@ pub struct RuntimeConfig {
     pub be_mem_limit_bytes: u64,
     #[serde(default = "default_optimizer_query_mem_limit_bytes")]
     pub optimizer_query_mem_limit_bytes: u64,
+    /// Maximum time a connector split source may wait for its first usable
+    /// runtime-filter feedback domain. Zero disables this optimization wait.
+    #[serde(default = "default_connector_split_initial_dynamic_filter_wait_cap_ms")]
+    pub connector_split_initial_dynamic_filter_wait_cap_ms: u64,
     /// `0` means derive the backend count from the live BE registry (the normal path).
     #[serde(default = "default_optimizer_effective_backend_count")]
     pub optimizer_effective_backend_count: u64,
@@ -1521,6 +1525,10 @@ fn default_optimizer_query_mem_limit_bytes() -> u64 {
     2 * 1024 * 1024 * 1024
 }
 
+fn default_connector_split_initial_dynamic_filter_wait_cap_ms() -> u64 {
+    1_000
+}
+
 fn default_optimizer_effective_backend_count() -> u64 {
     0
 }
@@ -1711,6 +1719,8 @@ impl Default for RuntimeConfig {
             mem_limit: default_mem_limit(),
             be_mem_limit_bytes: default_be_mem_limit_bytes(),
             optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),
+            connector_split_initial_dynamic_filter_wait_cap_ms:
+                default_connector_split_initial_dynamic_filter_wait_cap_ms(),
             optimizer_effective_backend_count: default_optimizer_effective_backend_count(),
             local_exchange_buffer_mem_limit_per_driver:
                 default_local_exchange_buffer_mem_limit_per_driver(),
@@ -2028,6 +2038,11 @@ mod tests {
     #[test]
     fn query_control_config_defaults_are_fixed() {
         let runtime = RuntimeConfig::default();
+
+        assert_eq!(
+            runtime.connector_split_initial_dynamic_filter_wait_cap_ms,
+            1_000
+        );
 
         assert_eq!(runtime.query_control_heartbeat_interval_ms, 1_000);
         assert_eq!(runtime.query_control_heartbeat_timeout_ms, 5_000);

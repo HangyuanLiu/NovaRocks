@@ -21,6 +21,7 @@ use super::install_encoder::{
 #[derive(Default)]
 struct FeedbackState {
     closed: bool,
+    generation: u64,
     channels: BTreeMap<u32, ChannelState>,
 }
 
@@ -52,6 +53,7 @@ impl RuntimeFilterFeedbackState {
             state: (
                 Mutex::new(FeedbackState {
                     closed: false,
+                    generation: 0,
                     channels: channel_states(declaration)?,
                 }),
                 Condvar::new(),
@@ -71,6 +73,7 @@ impl RuntimeFilterFeedbackState {
             return Err("cannot configure closed runtime filter feedback state".into());
         }
         state.channels = channel_states(declaration)?;
+        state.generation = state.generation.saturating_add(1);
         self.state.1.notify_all();
         Ok(())
     }
@@ -78,7 +81,32 @@ impl RuntimeFilterFeedbackState {
     pub(crate) fn close(&self) {
         let mut state = self.state.0.lock().expect("runtime filter feedback state");
         state.closed = true;
+        state.generation = state.generation.saturating_add(1);
         self.state.1.notify_all();
+    }
+
+    /// Block the split-assignment worker until feedback changes or the small
+    /// scheduler-owned budget elapses. The caller always rechecks its stop
+    /// handle and its source deadline, so feedback is never a cancellation
+    /// authority and this method never sleeps a connector implementation.
+    pub(crate) fn wait_for_change(&self, observed_generation: u64, budget: std::time::Duration) {
+        let state = self.state.0.lock().expect("runtime filter feedback state");
+        if state.closed || state.generation != observed_generation || budget.is_zero() {
+            return;
+        }
+        let _ = self
+            .state
+            .1
+            .wait_timeout(state, budget)
+            .expect("runtime filter feedback condvar");
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.state
+            .0
+            .lock()
+            .expect("runtime filter feedback state")
+            .generation
     }
 
     /// Snapshot the currently admitted domains for one connector scan.  A
@@ -142,19 +170,45 @@ impl RuntimeFilterFeedbackState {
         ConnectorReadDynamicFilterSnapshot::new(predicate, complete)
     }
 
-    pub(crate) fn is_initial_wait_eligible(
+    /// Whether an initial source wait can still improve pruning. One usable
+    /// exact/range domain is enough to start enumeration immediately, even if
+    /// another channel remains pending; a terminal unavailable/`All` channel
+    /// never becomes a pruning authority.
+    pub(crate) fn is_initial_wait_blocked(
         &self,
         plan_node_id: i32,
-        bindings: &[(u32, ConnectorReadColumnHandle)],
+        bindings: impl IntoIterator<Item = u32>,
     ) -> bool {
         let state = self.state.0.lock().expect("runtime filter feedback state");
-        bindings.iter().any(|(binding_id, _)| {
-            state.channels.values().any(|channel| {
-                channel.scan_bindings.contains(&(plan_node_id, *binding_id))
-                    && channel.wait_eligible
-                    && !channel.is_terminal()
-            })
-        })
+        if state.closed {
+            return false;
+        }
+        let bindings = bindings.into_iter().collect::<BTreeSet<_>>();
+        let relevant = state.channels.values().filter(|channel| {
+            channel.wait_eligible
+                && bindings
+                    .iter()
+                    .any(|binding_id| channel.scan_bindings.contains(&(plan_node_id, *binding_id)))
+        });
+        let mut pending = false;
+        for channel in relevant {
+            pending |= !channel.is_terminal();
+            let Some(encoded) = channel.winner.as_deref() else {
+                continue;
+            };
+            if matches!(
+                RuntimeFilterFeedbackDomain::decode(
+                    encoded,
+                    &channel.data_type,
+                    channel.max_encoded_domain_bytes,
+                ),
+                Ok(RuntimeFilterFeedbackDomain::Exact(_)
+                    | RuntimeFilterFeedbackDomain::EnclosingRange { .. })
+            ) {
+                return false;
+            }
+        }
+        pending
     }
 
     /// Validates and admits one active-stream event. A foreign/retired event
@@ -229,6 +283,7 @@ impl RuntimeFilterFeedbackState {
                     ),
                     None => {
                         channel.winner = Some(encoded.clone());
+                        state.generation = state.generation.saturating_add(1);
                         self.state.1.notify_all();
                         Ok(())
                     }
@@ -237,6 +292,7 @@ impl RuntimeFilterFeedbackState {
             Some(TerminalOutcome::UnavailableReason(reason)) => {
                 if channel.winner.is_none() {
                     channel.unavailable.insert(feedback.participant_id, *reason);
+                    state.generation = state.generation.saturating_add(1);
                     self.state.1.notify_all();
                 }
                 Ok(())
@@ -689,5 +745,60 @@ mod tests {
         let state = state.state.0.lock().expect("feedback state");
         assert!(state.closed);
         assert!(state.channels[&7].winner.is_none());
+    }
+
+    #[test]
+    fn initial_wait_stops_at_the_first_usable_domain() {
+        let execution_id = execution_id();
+        let first = BackendProcessId::new_v7();
+        let second = BackendProcessId::new_v7();
+        let declaration = FrontendRuntimeFilterFeedbackDeclaration::new([
+            FrontendRuntimeFilterFeedbackChannel {
+                channel_id: 7,
+                contract_digest: [9; 32],
+                max_encoded_domain_bytes: 64 * 1024,
+                publishers: vec![FrontendRuntimeFilterFeedbackPublisherSlot {
+                    participant_id: 5,
+                    backend_process_id: first,
+                    owner: FrontendRuntimeFilterFeedbackPublisherOwner::Aggregator,
+                }],
+                scan_bindings: vec![FrontendRuntimeFilterFeedbackScanBinding {
+                    fragment_id: 2,
+                    plan_node_id: 17,
+                    binding_id: 7,
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }],
+                wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
+            },
+            FrontendRuntimeFilterFeedbackChannel {
+                channel_id: 8,
+                contract_digest: [8; 32],
+                max_encoded_domain_bytes: 64 * 1024,
+                publishers: vec![FrontendRuntimeFilterFeedbackPublisherSlot {
+                    participant_id: 6,
+                    backend_process_id: second,
+                    owner: FrontendRuntimeFilterFeedbackPublisherOwner::Aggregator,
+                }],
+                scan_bindings: vec![FrontendRuntimeFilterFeedbackScanBinding {
+                    fragment_id: 2,
+                    plan_node_id: 17,
+                    binding_id: 8,
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }],
+                wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
+            },
+        ])
+        .expect("valid declaration");
+        let state = RuntimeFilterFeedbackState::new(execution_id, declaration).expect("state");
+        assert!(state.is_initial_wait_blocked(17, [7, 8]));
+        state
+            .admit(&event(execution_id, first, exact(41)), first, &[4; 32])
+            .expect("usable domain");
+        assert!(
+            !state.is_initial_wait_blocked(17, [7, 8]),
+            "a later pending channel must not delay the first usable domain"
+        );
     }
 }

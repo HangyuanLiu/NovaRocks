@@ -131,7 +131,7 @@ impl SplitAssignmentStop {
         self.stopped.load(Ordering::Acquire)
     }
 
-    fn wait_backoff(&self, duration: Duration) -> bool {
+    pub(crate) fn wait_backoff(&self, duration: Duration) -> bool {
         if self.is_stopped() {
             return true;
         }

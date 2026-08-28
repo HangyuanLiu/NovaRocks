@@ -45,6 +45,7 @@ use crate::query_execution::contract::{
 #[cfg(test)]
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use crate::query_execution::lifecycle_plan::{QueryInitOptions, QueryLifecycleLease};
+#[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
 use crate::query_execution::split_assignment::RoundSplitSource;
 use crate::query_execution::write::WriteTerminalBuilder;
@@ -679,6 +680,7 @@ pub struct FrontendDistributedQueryCoordinator {
     lifecycle_config: FrontendQueryLifecycleConfig,
     pre_start_timeout: Duration,
     task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
+    connector_split_initial_dynamic_filter_wait_cap: Duration,
     native_compatibility_id: NativeCompatibilityId,
 }
 
@@ -713,6 +715,7 @@ impl FrontendDistributedQueryCoordinator {
         native_compatibility_id: NativeCompatibilityId,
         query_control_timeouts: crate::application::FrontendQueryControlTimeouts,
         task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
+        connector_split_initial_dynamic_filter_wait_cap: Duration,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
         connector_control: Arc<ConnectorControlHost>,
         data_runtime: FrontendDataRuntime,
@@ -752,6 +755,7 @@ impl FrontendDistributedQueryCoordinator {
             lifecycle_config,
             pre_start_timeout: Duration::from_millis(query_control_timeouts.pre_start_timeout_ms),
             task_update_retry_policy,
+            connector_split_initial_dynamic_filter_wait_cap,
             native_compatibility_id,
         })
     }
@@ -828,6 +832,8 @@ impl FrontendDistributedQueryCoordinator {
             pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
             task_update_retry_policy:
                 crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
+            connector_split_initial_dynamic_filter_wait_cap:
+                DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),
         }
     }
@@ -903,6 +909,8 @@ impl FrontendDistributedQueryCoordinator {
             pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
             task_update_retry_policy:
                 crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
+            connector_split_initial_dynamic_filter_wait_cap:
+                DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),
         }
     }
@@ -1041,20 +1049,13 @@ impl FrontendDistributedQueryCoordinator {
             RuntimeFilterFeedbackState::new(execution_id, Default::default())
                 .expect("empty runtime filter feedback declaration is valid"),
         );
-        let initial_dynamic_filter_wait_cap = parts
-            .options
-            .runtime_options()
-            .runtime_filter_scan_wait_time_ms()
-            .and_then(|millis| u64::try_from(millis).ok())
-            .map(Duration::from_millis)
-            .unwrap_or(DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP);
         let split_assignment_plan = prepare_round_split_assignment(
             &parts.artifacts,
             &schedule,
             self.data_runtime.clone(),
             self.task_update_retry_policy,
             Arc::clone(&feedback_state),
-            initial_dynamic_filter_wait_cap,
+            self.connector_split_initial_dynamic_filter_wait_cap,
         )?;
         let binding_attachment =
             encode_binding_attachment(parts.artifacts.runtime_filter_binding_view())?;
