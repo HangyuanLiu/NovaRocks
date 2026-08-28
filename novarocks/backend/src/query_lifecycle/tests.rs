@@ -632,6 +632,39 @@ fn init_requires_exact_backend_process_identity() {
 }
 
 #[test]
+fn init_compatibility_mismatch_has_no_lifecycle_side_effect() {
+    let runtime = RecordingLocalRuntime::default();
+    let registry = QueryLifecycleRegistry::new_with_process_id(
+        local_process_id(),
+        Arc::new(runtime.clone()),
+        registry_config(8),
+    );
+    let request = init_request_fixture(702, ATTEMPT_1, 10_000);
+    let mut raw = request.as_proto().clone();
+    raw.manifest
+        .as_mut()
+        .expect("fixture manifest")
+        .native_compatibility_id = Some(proto_novarocks::NativeCompatibilityId {
+        value: vec![0x72; 32],
+    });
+    let mismatch = QueryInitRequest::parse(raw).expect("valid mismatched manifest carrier");
+
+    assert_eq!(
+        registry
+            .init_query(mismatch)
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
+        QueryInitOutcome::QueryInitRejectedCompatibilityMismatch
+    );
+    let metrics = registry.metrics_snapshot();
+    assert_eq!(
+        metrics.initializing + metrics.initialized + metrics.control_attached,
+        0
+    );
+    assert_eq!(runtime.runtime_filter_install_calls(), 0);
+}
+
+#[test]
 fn attach_reserves_p0_before_control_ready_and_releases_on_terminal_cleanup() {
     let runtime = RecordingLocalRuntime::default();
     let mut config = registry_config(8);

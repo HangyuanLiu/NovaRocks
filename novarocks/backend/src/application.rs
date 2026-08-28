@@ -450,6 +450,7 @@ fn compose_backend_application_services(
     data_runtime: BackendDataRuntime,
     execution_runtime_config: ExecutionRuntimeConfig,
     query_lifecycle_config: QueryLifecycleRegistryConfig,
+    native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
     read_execution_bundle_factories: &[(
@@ -481,6 +482,7 @@ fn compose_backend_application_services(
         data_runtime.clone(),
         local_runtime,
         query_lifecycle_config,
+        native_compatibility_id,
     );
     let connector_registry = Arc::new(ConnectorRegistry::new());
     let native_fragment_service = Arc::new(
@@ -671,6 +673,7 @@ impl BackendApplicationHost {
             data_runtime,
             execution_runtime_config,
             query_lifecycle_config,
+            native_compatibility_id,
             write_commit_evidence_limits,
             &execution_installers,
             &read_execution_bundle_factories,
@@ -1231,6 +1234,7 @@ mod tests {
             test_data_runtime(),
             execution_runtime_config(),
             query_lifecycle_registry_config(Duration::from_millis(5_000)),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             WriteCommitEvidenceLimits::default(),
             &[],
             &[],
