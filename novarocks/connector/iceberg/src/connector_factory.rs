@@ -234,7 +234,6 @@ impl ConnectorControlFactory for IcebergConnectorFactory {
             .try_with_unanchored_ctas_cleanup(unanchored_ctas_cleanup.map(|capability| {
                 capability as Arc<dyn novarocks_spi::connector::ConnectorUnanchoredCtasCleanup>
             }))?
-            .try_with_staged_publication_recovery(Some(provider.clone()))?
             .try_with_view_metadata(Some(provider.clone()))?;
         // Desired state, not this FE-local control generation, owns the
         // immutable catalog version. Defer typed-read registration until that
@@ -666,14 +665,6 @@ mod tests {
         assert!(
             creation.binding().unanchored_ctas_cleanup().is_some(),
             "the sweeper attaches wherever its warehouse is usable"
-        );
-        let recovery = creation
-            .binding()
-            .staged_publication_recovery()
-            .expect("staged publication recovery");
-        assert_eq!(
-            recovery.binding_key().incarnation,
-            creation.binding().incarnation()
         );
         let views = creation.binding().view_metadata().expect("view metadata");
         assert_eq!(views.descriptor(), creation.binding().descriptor());

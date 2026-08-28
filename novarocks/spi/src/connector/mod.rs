@@ -40,7 +40,6 @@ mod read_session;
 mod row_mutation;
 mod scalar;
 mod staged_create;
-mod staged_publication_recovery;
 mod statistics;
 mod view_metadata;
 mod write;
@@ -248,16 +247,6 @@ pub use staged_create::{
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
     ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease,
 };
-pub use staged_publication_recovery::{
-    ConnectorHistoricalPublicationAction, ConnectorStagedPublicationBaseFact,
-    ConnectorStagedPublicationCleanupReceipt, ConnectorStagedPublicationCleanupRequest,
-    ConnectorStagedPublicationDescriptor, ConnectorStagedPublicationDisposition,
-    ConnectorStagedPublicationObservation, ConnectorStagedPublicationPhase,
-    ConnectorStagedPublicationPhaseState, ConnectorStagedPublicationProof,
-    ConnectorStagedPublicationRecovery, MAX_CONNECTOR_STAGED_PUBLICATION_BASE_FACTS,
-    MAX_CONNECTOR_STAGED_PUBLICATION_COHORTS, MAX_CONNECTOR_STAGED_PUBLICATION_LINEAGE_FACTS,
-    MAX_CONNECTOR_STAGED_PUBLICATION_PROOF_BYTES,
-};
 pub use statistics::{
     ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
     MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
@@ -285,24 +274,25 @@ pub use write::{
     ConnectorManagedPublicationIntent, ConnectorManagedPublicationTarget,
     ConnectorManagedPublicationTechnique, ConnectorOpenWriterRequest,
     ConnectorPreReadyWritePlanningProof, ConnectorPreReadyWritePlanningRequest,
-    ConnectorSealedWriteCohortSet, ConnectorStagedReport, ConnectorStagedReportFrame,
-    ConnectorStagedReportSummary, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
-    ConnectorWriteActivation, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
-    ConnectorWriteActivationSource, ConnectorWriteAdmissionPurpose,
-    ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion, ConnectorWriteCohortCompletion,
-    ConnectorWriteCohortDescriptor, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
-    ConnectorWriteControl, ConnectorWriteExecution, ConnectorWriteExecutionId,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
-    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
-    ConnectorWriteLease, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
-    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
-    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ConnectorWriteReceipt,
-    ConnectorWriteReconcileRequest, ConnectorWriteTargetRef, ConnectorWriterHandle,
-    ConnectorWriterIdentity, ConnectorWriterTerminalState, DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES,
-    DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES, MAX_CONNECTOR_MANAGED_DESCRIPTOR_PROPERTIES,
-    MAX_CONNECTOR_MANAGED_DESCRIPTOR_PROPERTY_BYTES, MAX_CONNECTOR_MANAGED_DESCRIPTOR_TOTAL_BYTES,
-    MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES, MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS,
-    MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES, MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES,
+    ConnectorSealedWriteCohortSet, ConnectorStagedPublicationBaseFact, ConnectorStagedReport,
+    ConnectorStagedReportFrame, ConnectorStagedReportSummary, ConnectorWriteAbortOutcome,
+    ConnectorWriteAbortRequest, ConnectorWriteActivation, ConnectorWriteActivationIntent,
+    ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
+    ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
+    ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteExecution,
+    ConnectorWriteExecutionId, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
+    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
+    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationCompletion,
+    ConnectorWriteOperationId, ConnectorWritePlan, ConnectorWritePlanningRequest,
+    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
+    ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ConnectorWriteTargetRef,
+    ConnectorWriterHandle, ConnectorWriterIdentity, ConnectorWriterTerminalState,
+    DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES, DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES,
+    MAX_CONNECTOR_MANAGED_DESCRIPTOR_PROPERTIES, MAX_CONNECTOR_MANAGED_DESCRIPTOR_PROPERTY_BYTES,
+    MAX_CONNECTOR_MANAGED_DESCRIPTOR_TOTAL_BYTES, MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES,
+    MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS, MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES,
+    MAX_CONNECTOR_STAGED_PUBLICATION_BASE_FACTS, MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES,
     MAX_CONNECTOR_STAGED_REPORT_PARTS, MAX_CONNECTOR_STAGED_REPORT_PAYLOAD_BYTES,
     MAX_CONNECTOR_WRITE_ACTIVATIONS, MAX_CONNECTOR_WRITE_COHORTS,
     MAX_CONNECTOR_WRITE_OPERATION_PAYLOAD_BYTES, MAX_CONNECTOR_WRITE_OPERATION_WRITERS,

@@ -28,10 +28,9 @@ use super::{
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorProviderId,
     ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
     ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
-    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsLease,
-    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorUnanchoredCtasCleanup,
-    ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata, ConnectorWriteControl,
-    ConnectorWriteLease,
+    ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
+    ConnectorTableHandle, ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease,
+    ConnectorViewMetadata, ConnectorWriteControl, ConnectorWriteLease,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -248,7 +247,6 @@ pub struct ConnectorControlBinding {
     unanchored_ctas_cleanup: Option<Arc<dyn ConnectorUnanchoredCtasCleanup>>,
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
-    staged_publication_recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
     view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
 }
 
@@ -436,7 +434,6 @@ impl ConnectorControlBinding {
             unanchored_ctas_cleanup: None,
             write,
             statistics,
-            staged_publication_recovery: None,
             view_metadata: None,
         })
     }
@@ -765,24 +762,6 @@ impl ConnectorControlBinding {
         Ok(self)
     }
 
-    /// Installs the provider-owned historical staged-publication inspector.
-    /// It is a builder to preserve existing control-binding constructors and
-    /// to keep recovery independent from ordinary write capability setup.
-    pub fn try_with_staged_publication_recovery(
-        mut self,
-        recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(recovery) = &recovery {
-            super::staged_publication_recovery::validate_staged_publication_recovery_owner(
-                &self.descriptor,
-                self.incarnation,
-                recovery.as_ref(),
-            )?;
-        }
-        self.staged_publication_recovery = recovery;
-        Ok(self)
-    }
-
     /// Attaches the catalog-wide CTAS staging-root collector to this exact
     /// generation. The capability is independent from table-owned cleanup:
     /// before a CREATE publishes its target, no table location can anchor the
@@ -802,12 +781,6 @@ impl ConnectorControlBinding {
         }
         self.unanchored_ctas_cleanup = capability;
         Ok(self)
-    }
-
-    pub fn staged_publication_recovery(
-        &self,
-    ) -> Option<&Arc<dyn ConnectorStagedPublicationRecovery>> {
-        self.staged_publication_recovery.as_ref()
     }
 
     pub fn execution_declaration(

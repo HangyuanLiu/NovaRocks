@@ -34,10 +34,10 @@ use super::{
     CatalogHandle, CatalogProperties, ConnectorCommittedVersion, ConnectorError,
     ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
     ConnectorExecutionDistribution, ConnectorMutationFailure, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationFamily,
-    LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableObjectId,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    LakePublicationFamily, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 
 pub const CONNECTOR_WRITE_CONTRACT_VERSION: u32 = 1;
@@ -58,6 +58,7 @@ pub const MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS: usize = 4096;
 pub const MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES: usize = 4096;
 pub const DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES: usize = 16_384;
+pub const MAX_CONNECTOR_STAGED_PUBLICATION_BASE_FACTS: usize = 4096;
 
 const CONNECTOR_WRITE_COHORT_ID_DOMAIN: &[u8] = b"novarocks.connector-write-cohort.v1\0";
 const CONNECTOR_WRITE_COHORT_SET_DOMAIN: &[u8] = b"novarocks.connector-write-cohort-set.v1\0";
@@ -69,6 +70,19 @@ const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_ID_DOMAIN: &[u8] =
     b"novarocks.connector-managed-partition-spec-replacement-id.v1\0";
 const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_DOMAIN: &[u8] =
     b"novarocks.connector-managed-partition-spec-replacement.v1\0";
+
+/// Provider-owned base-table provenance for a managed publication.
+///
+/// The distributed writer carries these value facts as part of its immutable
+/// publication intent. Only the provider that owns the on-lake provenance may
+/// render the opaque object identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorStagedPublicationBaseFact {
+    pub table: Arc<str>,
+    pub object_id: ConnectorTableObjectId,
+    pub from_version: Option<i64>,
+    pub to_version: i64,
+}
 
 /// Resolved per-fragment bounds for evidence returned by a distributed write.
 ///
@@ -1531,7 +1545,7 @@ pub struct ConnectorManagedPublicationIntent {
     publication_id: LakePublicationId,
     target: ConnectorManagedPublicationTarget,
     technique: ConnectorManagedPublicationTechnique,
-    bases: Vec<super::ConnectorStagedPublicationBaseFact>,
+    bases: Vec<ConnectorStagedPublicationBaseFact>,
     definition_fingerprint: Arc<str>,
     empty_input: ConnectorManagedPublicationEmptyInputDisposition,
     partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
@@ -1545,7 +1559,7 @@ impl ConnectorManagedPublicationIntent {
         publication_id: LakePublicationId,
         target: ConnectorManagedPublicationTarget,
         technique: ConnectorManagedPublicationTechnique,
-        bases: Vec<super::ConnectorStagedPublicationBaseFact>,
+        bases: Vec<ConnectorStagedPublicationBaseFact>,
         definition_fingerprint: impl Into<Arc<str>>,
         empty_input: ConnectorManagedPublicationEmptyInputDisposition,
         descriptor_properties: ConnectorManagedDescriptorProperties,
@@ -1568,7 +1582,7 @@ impl ConnectorManagedPublicationIntent {
         publication_id: LakePublicationId,
         target: ConnectorManagedPublicationTarget,
         technique: ConnectorManagedPublicationTechnique,
-        bases: Vec<super::ConnectorStagedPublicationBaseFact>,
+        bases: Vec<ConnectorStagedPublicationBaseFact>,
         definition_fingerprint: impl Into<Arc<str>>,
         empty_input: ConnectorManagedPublicationEmptyInputDisposition,
         partition_spec_replacement: ConnectorManagedPartitionSpecReplacement,
@@ -1593,7 +1607,7 @@ impl ConnectorManagedPublicationIntent {
         publication_id: LakePublicationId,
         target: ConnectorManagedPublicationTarget,
         technique: ConnectorManagedPublicationTechnique,
-        bases: Vec<super::ConnectorStagedPublicationBaseFact>,
+        bases: Vec<ConnectorStagedPublicationBaseFact>,
         definition_fingerprint: Arc<str>,
         empty_input: ConnectorManagedPublicationEmptyInputDisposition,
         partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
@@ -1602,7 +1616,7 @@ impl ConnectorManagedPublicationIntent {
     ) -> Result<Self, ConnectorError> {
         if definition_fingerprint.is_empty()
             || bases.is_empty()
-            || bases.len() > super::MAX_CONNECTOR_STAGED_PUBLICATION_BASE_FACTS
+            || bases.len() > MAX_CONNECTOR_STAGED_PUBLICATION_BASE_FACTS
             || definition_fingerprint.len() > MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES
             || bases.iter().any(|base| {
                 base.table.is_empty()
@@ -1666,7 +1680,7 @@ impl ConnectorManagedPublicationIntent {
     pub const fn technique(&self) -> ConnectorManagedPublicationTechnique {
         self.technique
     }
-    pub fn bases(&self) -> &[super::ConnectorStagedPublicationBaseFact] {
+    pub fn bases(&self) -> &[ConnectorStagedPublicationBaseFact] {
         &self.bases
     }
     pub fn definition_fingerprint(&self) -> &str {
@@ -4176,8 +4190,8 @@ mod tests {
         )
     }
 
-    fn base_facts() -> Vec<super::super::ConnectorStagedPublicationBaseFact> {
-        vec![super::super::ConnectorStagedPublicationBaseFact {
+    fn base_facts() -> Vec<super::ConnectorStagedPublicationBaseFact> {
+        vec![super::ConnectorStagedPublicationBaseFact {
             table: Arc::from("db.base"),
             object_id: ConnectorTableObjectId::try_new(Bytes::from_static(b"base-uuid"))
                 .expect("bounded base object ID"),

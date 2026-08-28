@@ -39,16 +39,13 @@ use novarocks_spi::connector::{
     ConnectorReadReferenceKind, ConnectorReadSelector, ConnectorReadSnapshotLogEntry,
     ConnectorScalarType, ConnectorScalarValue, ConnectorScan, ConnectorScanHandle,
     ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
-    ConnectorStagedPublicationCleanupReceipt, ConnectorStagedPublicationCleanupRequest,
-    ConnectorStagedPublicationDescriptor, ConnectorStagedPublicationObservation,
-    ConnectorStagedPublicationRecovery, ConnectorStaticComparisonOp, ConnectorStaticPredicate,
-    ConnectorStaticPredicateKind, ConnectorTableDefinitionFacts, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableObjectBinding,
-    ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
-    ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTablePlanningFacts,
-    ConnectorTableRequest, ConnectorTableResolution, ExternalMutationEvidence,
-    ExternalMutationOutcome, validate_static_predicates,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
+    ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableDefinitionFacts,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
+    ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
+    ConnectorTableObjectSelector, ConnectorTablePlanningFacts, ConnectorTableRequest,
+    ConnectorTableResolution, validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 
@@ -942,48 +939,6 @@ impl ConnectorScanPlanning for IcebergMetadata {
                 scan_units_planned,
             },
         )
-    }
-}
-
-impl ConnectorStagedPublicationRecovery for IcebergMetadata {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-        &self.binding_key
-    }
-
-    fn inspect(
-        &self,
-        _descriptor: ConnectorStagedPublicationDescriptor,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorStagedPublicationObservation, ConnectorError> {
-        self.validate_context(&context)?;
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg MV publication is crash-only; historical staged publication inspection is unavailable",
-        ))
-    }
-
-    fn cleanup(
-        &self,
-        _request: ConnectorStagedPublicationCleanupRequest,
-    ) -> Result<ExternalMutationOutcome<ConnectorStagedPublicationCleanupReceipt>, ConnectorError>
-    {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg MV publication remnants are retired only by generic age-gated GC",
-        ))
-    }
-
-    fn reconcile_cleanup(
-        &self,
-        _operation_id: ConnectorMutationOperationId,
-        _evidence: ExternalMutationEvidence,
-        _context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ExternalMutationOutcome<ConnectorStagedPublicationCleanupReceipt>, ConnectorError>
-    {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg MV cleanup is crash-only and cannot be reconciled",
-        ))
     }
 }
 
@@ -1986,170 +1941,6 @@ mod hidden_column_tests {
     #[test]
     fn a_plain_table_hides_nothing() {
         assert!(hidden_internal_columns(&HashMap::new()).is_empty());
-    }
-}
-
-#[cfg(test)]
-mod staged_publication_recovery_tests {
-    use std::collections::HashMap;
-    use std::time::Duration;
-
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
-    use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorHistoricalPublicationAction, ConnectorInstanceId,
-        ConnectorMutationOperationId, ConnectorProviderId, ConnectorRequestContext,
-        ConnectorStagedPublicationPhase, ConnectorStagedPublicationPhaseState,
-    };
-
-    use super::*;
-    use crate::access_binding::IcebergReadBinding;
-    use crate::catalog_control::IcebergCatalogControlState;
-    use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
-    use crate::iceberg::{NamespaceIdent, TableCreation};
-    use crate::resources::IcebergMetadataResources;
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
-    fn context() -> ConnectorRequestContext {
-        ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
-            64 * 1024,
-            256 * 1024,
-        )
-        .expect("request context")
-    }
-
-    fn provider_with_empty_table() -> (
-        tokio::runtime::Runtime,
-        tempfile::TempDir,
-        IcebergMetadata,
-        crate::iceberg::table::Table,
-    ) {
-        let executor = tokio::runtime::Runtime::new().expect("runtime");
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let configuration = crate::catalog_config::parse_catalog_configuration(
-            "ice",
-            &[(
-                "iceberg.catalog.warehouse".to_string(),
-                warehouse.path().display().to_string(),
-            )],
-        )
-        .expect("configuration");
-        let binding = IcebergReadBinding::new(
-            None,
-            FsAccessResolver::new(),
-            Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
-        );
-        let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
-        let runtime = Arc::new(
-            IcebergMetadataContext::try_new(
-                IcebergCatalogControlState::new(configuration),
-                resources,
-            )
-            .expect("control runtime"),
-        );
-        let descriptor = ConnectorInstanceDescriptor {
-            provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
-            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
-        };
-        let provider = IcebergMetadata::new(
-            descriptor,
-            ConnectorInstanceIncarnation::from_bytes([7; 16]),
-            Arc::clone(&runtime),
-        );
-        let catalog = runtime.novarocks_catalog().vendored_client();
-        let table = executor.block_on(async move {
-            let namespace = NamespaceIdent::new("db".to_string());
-            catalog
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .expect("create namespace");
-            let schema = Schema::builder()
-                .with_fields(vec![
-                    NestedField::optional(1, "value", Type::Primitive(PrimitiveType::Long)).into(),
-                ])
-                .build()
-                .expect("schema");
-            catalog
-                .create_table(
-                    &namespace,
-                    TableCreation::builder()
-                        .name("t".to_string())
-                        .schema(schema)
-                        .format_version(FormatVersion::V2)
-                        .build(),
-                )
-                .await
-                .expect("create table")
-        });
-        (executor, warehouse, provider, table)
-    }
-
-    fn historical_actions() -> Vec<ConnectorHistoricalPublicationAction> {
-        [
-            ConnectorStagedPublicationPhase::StagingCreate,
-            ConnectorStagedPublicationPhase::Write,
-            ConnectorStagedPublicationPhase::Publication,
-            ConnectorStagedPublicationPhase::StagingDrop,
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(ordinal, phase)| ConnectorHistoricalPublicationAction {
-            phase,
-            state: ConnectorStagedPublicationPhaseState::Prepared,
-            operation_id: ConnectorMutationOperationId::from_bytes([ordinal as u8 + 1; 16]),
-            committed_version: None,
-            evidence_digest: None,
-        })
-        .collect()
-    }
-
-    fn recovery_descriptor(
-        provider: &IcebergMetadata,
-        instance_id: ConnectorInstanceId,
-    ) -> ConnectorStagedPublicationDescriptor {
-        ConnectorStagedPublicationDescriptor::try_new(
-            provider.binding_key.clone(),
-            ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from("db"),
-                table: Arc::from("t"),
-            },
-            "__novarocks_staging_41",
-            "main",
-            None,
-            41,
-            7,
-            [8; 16],
-            "refresh-41",
-            vec![[9; 32]],
-            [10; 32],
-            historical_actions(),
-            Vec::new(),
-        )
-        .expect("recovery descriptor")
-    }
-
-    #[test]
-    fn staged_publication_recovery_is_crash_only_and_does_not_inspect_catalog() {
-        let (_executor, _warehouse, provider, _table) = provider_with_empty_table();
-        let descriptor = recovery_descriptor(&provider, provider.descriptor.instance_id.clone());
-        let error = provider
-            .inspect(descriptor, context())
-            .expect_err("staged recovery is retired");
-        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-        assert_eq!(
-            ConnectorStagedPublicationRecovery::binding_key(&provider),
-            &provider.binding_key
-        );
     }
 }
 
