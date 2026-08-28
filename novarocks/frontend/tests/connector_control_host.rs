@@ -954,12 +954,14 @@ fn distributed_rewrite_lease_requires_both_capabilities_and_fences_retirement() 
         .expect("retire rewrite-only generation");
     assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
 
-    host.register(binding_with_distributed_rewrite(9, true))
+    let complete = binding_with_distributed_rewrite(9, true);
+    let complete_control_runtime_id = complete.control_runtime_id();
+    host.register(complete)
         .expect("register complete generation");
     let lease = host
         .acquire_current_distributed_rewrite(&instance_id)
         .expect("distributed rewrite lease");
-    assert_eq!(lease.binding_key().incarnation.to_bytes(), [9; 16]);
+    assert_eq!(lease.control_runtime_id(), complete_control_runtime_id);
     assert_eq!(lease.metadata().instance_id(), &instance_id);
     let writer = lease.derive_write_lease().expect("derived write lease");
 
@@ -980,8 +982,9 @@ fn exact_distributed_rewrite_lease_never_uses_a_replacement_incarnation() {
         instance_id: instance_id.clone(),
         incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
     };
-    host.register(binding_with_distributed_rewrite(7, true))
-        .expect("register old generation");
+    let old = binding_with_distributed_rewrite(7, true);
+    let old_control_runtime_id = old.control_runtime_id();
+    host.register(old).expect("register old generation");
     let planning = host.acquire_current(&instance_id).expect("planning lease");
     host.retire_current(&instance_id)
         .expect("retire old generation");
@@ -992,24 +995,27 @@ fn exact_distributed_rewrite_lease_never_uses_a_replacement_incarnation() {
     };
     assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
 
-    host.register(binding_with_distributed_rewrite(8, true))
+    let replacement_binding = binding_with_distributed_rewrite(8, true);
+    let replacement_control_runtime_id = replacement_binding.control_runtime_id();
+    host.register(replacement_binding)
         .expect("register replacement generation");
     let replacement = host
         .acquire_current_distributed_rewrite(&instance_id)
         .expect("replacement distributed rewrite lease");
-    assert_eq!(replacement.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(
+        replacement.control_runtime_id(),
+        replacement_control_runtime_id
+    );
 
     let exact_old = host
-        .acquire_exact_distributed_rewrite(&old_key)
+        .acquire_exact_distributed_rewrite(old_control_runtime_id)
         .expect("exact retiring generation lease");
-    assert_eq!(exact_old.binding_key(), &old_key);
+    assert_eq!(exact_old.control_runtime_id(), old_control_runtime_id);
 
-    let unknown_key = ConnectorExecutionBindingKey {
-        instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
-    };
-    let error = match host.acquire_exact_distributed_rewrite(&unknown_key) {
-        Ok(_) => panic!("unknown incarnation must not use the replacement"),
+    let error = match host
+        .acquire_exact_distributed_rewrite(ConnectorControlRuntimeId::from_bytes([9; 16]))
+    {
+        Ok(_) => panic!("unknown control runtime must not use the replacement"),
         Err(error) => error,
     };
     assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
@@ -1021,7 +1027,7 @@ fn exact_distributed_rewrite_lease_never_uses_a_replacement_incarnation() {
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].key, old_key);
 
-    let error = match host.acquire_exact_distributed_rewrite(&old_key) {
+    let error = match host.acquire_exact_distributed_rewrite(old_control_runtime_id) {
         Ok(_) => panic!("retired generation must not be recreated"),
         Err(error) => error,
     };

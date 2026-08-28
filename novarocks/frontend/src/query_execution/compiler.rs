@@ -733,7 +733,7 @@ impl novarocks_spi::connector::ConnectorDistributedRewriteResolver
 
     fn acquire_exact_distributed_rewrite(
         &self,
-        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     ) -> Result<
         novarocks_spi::connector::ConnectorDistributedRewriteLease,
         novarocks_spi::connector::ConnectorError,
@@ -747,8 +747,8 @@ impl novarocks_spi::connector::ConnectorDistributedRewriteResolver
                     "test connector control registry lock poisoned",
                 )
             })?
-            .get(&key.instance_id)
-            .filter(|binding| binding.incarnation() == key.incarnation)
+            .values()
+            .find(|binding| binding.control_runtime_id() == control_runtime_id)
             .cloned()
             .ok_or_else(|| {
                 novarocks_spi::connector::ConnectorError::new(
@@ -779,13 +779,10 @@ fn test_distributed_rewrite_lease(
             "test connector control binding has no distributed write capability",
         )
     })?;
-    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
-        instance_id: binding.descriptor().instance_id.clone(),
-        incarnation: binding.incarnation(),
-    };
     novarocks_spi::connector::ConnectorDistributedRewriteLease::new(
         binding.descriptor().clone(),
-        key,
+        binding.control_runtime_id(),
+        binding.incarnation(),
         novarocks_spi::connector::ConnectorControlPlanningLease::new(binding.clone(), || {}),
         Arc::clone(binding.metadata()),
         Arc::clone(binding.planning()),

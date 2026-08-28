@@ -25,13 +25,14 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+    ConnectorControlPlanningLease, ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata, ConnectorPinnedFileSet,
-    ConnectorRequestContext, ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteActivation,
-    ConnectorWriteAttemptCompletion, ConnectorWriteCohortId, ConnectorWriteControl,
-    ConnectorWriteExecutionId, ConnectorWriteIntent, ConnectorWriteLease,
-    ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWriteReceipt,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorMetadata, ConnectorPinnedFileSet, ConnectorRequestContext, ConnectorScanPlanning,
+    ConnectorTableHandle, ConnectorWriteActivation, ConnectorWriteAttemptCompletion,
+    ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteIntent,
+    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
+    ConnectorWriteReceipt,
 };
 
 pub const CONNECTOR_DISTRIBUTED_REWRITE_CONTRACT_VERSION: u16 = 1;
@@ -695,14 +696,15 @@ pub trait ConnectorDistributedRewriteResolver: Send + Sync {
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError>;
     fn acquire_exact_distributed_rewrite(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError>;
 }
 
 #[derive(Clone)]
 pub struct ConnectorDistributedRewriteLease {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    control_runtime_id: ConnectorControlRuntimeId,
+    provider_binding_key: ConnectorExecutionBindingKey,
     planning_lease: ConnectorControlPlanningLease,
     metadata: Arc<dyn ConnectorMetadata>,
     planning: Arc<dyn ConnectorScanPlanning>,
@@ -719,7 +721,8 @@ impl ConnectorDistributedRewriteLease {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
-        key: ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
+        provider_incarnation: ConnectorInstanceIncarnation,
         planning_lease: ConnectorControlPlanningLease,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
@@ -728,14 +731,17 @@ impl ConnectorDistributedRewriteLease {
         distribution: Arc<dyn ConnectorExecutionDistribution>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
-        if descriptor.instance_id != key.instance_id
-            || planning_lease.binding().descriptor() != &descriptor
-            || planning_lease.binding().incarnation() != key.incarnation
-            || metadata.instance_id() != &key.instance_id
-            || planning.instance_id() != &key.instance_id
+        let provider_binding_key = ConnectorExecutionBindingKey {
+            instance_id: descriptor.instance_id.clone(),
+            incarnation: provider_incarnation,
+        };
+        if planning_lease.binding().descriptor() != &descriptor
+            || planning_lease.binding().incarnation() != provider_incarnation
+            || metadata.instance_id() != &descriptor.instance_id
+            || planning.instance_id() != &descriptor.instance_id
             || rewrite.descriptor() != &descriptor
-            || rewrite.binding_key() != &key
-            || write.binding_key() != &key
+            || rewrite.binding_key() != &provider_binding_key
+            || write.binding_key() != &provider_binding_key
         {
             return Err(invalid(
                 "distributed rewrite capabilities do not match lease generation",
@@ -743,7 +749,8 @@ impl ConnectorDistributedRewriteLease {
         }
         Ok(Self {
             descriptor,
-            key,
+            control_runtime_id,
+            provider_binding_key,
             planning_lease,
             metadata,
             planning,
@@ -758,8 +765,8 @@ impl ConnectorDistributedRewriteLease {
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
-    pub fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-        &self.key
+    pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
+        self.control_runtime_id
     }
     /// Retain the exact control generation through the generic execution
     /// binding barrier for a frozen rewrite read. This is derived from the
@@ -787,7 +794,7 @@ impl ConnectorDistributedRewriteLease {
         let key = declaration.binding_key();
         if declaration.provider_id() != self.descriptor.provider_id.as_str()
             || key.instance_id != self.descriptor.instance_id
-            || key.incarnation != self.key.incarnation
+            || key.incarnation != self.provider_binding_key.incarnation
         {
             return Err(invalid(
                 "distributed rewrite execution declaration does not match lease generation",
@@ -803,18 +810,34 @@ impl ConnectorDistributedRewriteLease {
         request: ConnectorDistributedRewritePlanningRequest,
     ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
         request.validate()?;
-        if request.owner != self.key {
+        if request.owner != self.provider_binding_key {
             return Err(invalid("distributed rewrite request does not match lease"));
         }
         let plan = self.rewrite.plan_rewrite(request.clone())?;
         plan.validate()?;
-        if plan.owner != self.key
+        if plan.owner != self.provider_binding_key
             || plan.operation_id != request.operation_id
             || plan.request_digest != request.request_digest
         {
             return Err(invalid("distributed rewrite plan does not match request"));
         }
         Ok(plan)
+    }
+    /// Builds the provider request behind the FE-owned runtime lease. The
+    /// legacy execution binding remains private to the provider plan fence.
+    pub fn plan_operation(
+        &self,
+        operation_id: ConnectorWriteOperationId,
+        operation: ConnectorDistributedRewriteOperation,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
+        let request = ConnectorDistributedRewritePlanningRequest::try_new(
+            operation_id,
+            self.provider_binding_key.clone(),
+            operation,
+            context,
+        )?;
+        self.plan_rewrite(request)
     }
     pub fn activate_rewrite(
         &self,
@@ -824,7 +847,9 @@ impl ConnectorDistributedRewriteLease {
         self.validate_plan(plan)?;
         let activation = self.rewrite.activate_rewrite(plan, context)?;
         activation.validate()?;
-        if activation.owner() != &self.key || activation.operation_id() != plan.operation_id() {
+        if activation.owner() != &self.provider_binding_key
+            || activation.operation_id() != plan.operation_id()
+        {
             return Err(invalid(
                 "distributed rewrite activation does not match exact lease generation",
             ));
@@ -895,7 +920,7 @@ impl ConnectorDistributedRewriteLease {
         let catalog_properties = self.planning_lease.binding().catalog_properties()?.clone();
         let retained = self.clone();
         ConnectorWriteLease::new_with_execution_distribution(
-            self.key.clone(),
+            self.provider_binding_key.clone(),
             self.write.clone(),
             self.descriptor.provider_id.clone(),
             self.distribution.clone(),
@@ -903,9 +928,12 @@ impl ConnectorDistributedRewriteLease {
         )
         .and_then(|lease| lease.with_catalog_properties(catalog_properties))
     }
-    fn validate_plan(&self, plan: &ConnectorDistributedRewritePlan) -> Result<(), ConnectorError> {
+    pub fn validate_plan(
+        &self,
+        plan: &ConnectorDistributedRewritePlan,
+    ) -> Result<(), ConnectorError> {
         plan.validate()?;
-        if plan.owner != self.key {
+        if plan.owner != self.provider_binding_key {
             return Err(invalid("distributed rewrite plan does not match lease"));
         }
         Ok(())
@@ -915,7 +943,7 @@ impl ConnectorDistributedRewriteLease {
         plan: &ConnectorDistributedRewritePlan,
         completion: &ConnectorWriteAttemptCompletion,
     ) -> Result<(), ConnectorError> {
-        if completion.owner() != &self.key
+        if completion.owner() != &self.provider_binding_key
             || completion.operation_id() != plan.operation_id
             || !plan
                 .cohorts

@@ -633,18 +633,26 @@ impl ConnectorControlHost {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
-        let legacy_key = {
+        let control_runtime_id = {
             let state = self.lock_state()?;
-            state.active_legacy_effect(instance_id)?
+            state.active.get(instance_id).copied().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
+                )
+            })?
         };
-        self.acquire_distributed_rewrite(&legacy_key, true)
+        self.acquire_distributed_rewrite(control_runtime_id, true)
     }
 
     fn acquire_exact_distributed_rewrite(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
-        self.acquire_distributed_rewrite(key, false)
+        self.acquire_distributed_rewrite(control_runtime_id, false)
     }
 
     /// Acquire the metadata, rewrite planning, write-control, and execution
@@ -654,18 +662,29 @@ impl ConnectorControlHost {
     /// separate current write generation.
     fn acquire_distributed_rewrite(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
         require_active: bool,
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
-        let (binding, descriptor, metadata, planning, rewrite, write, distribution, runtime_id) = {
+        let (
+            binding,
+            descriptor,
+            provider_incarnation,
+            metadata,
+            planning,
+            rewrite,
+            write,
+            distribution,
+        ) = {
             let mut state = self.lock_state()?;
-            let runtime_id = state.runtime_for_legacy_effect(key)?;
-            let generation = state.generations.get_mut(&runtime_id).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "connector control generation is missing",
-                )
-            })?;
+            let generation = state
+                .generations
+                .get_mut(&control_runtime_id)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "connector control runtime is not registered",
+                    )
+                })?;
             if require_active && generation.state != ControlGenerationState::Active {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Unavailable,
@@ -694,24 +713,24 @@ impl ConnectorControlHost {
             (
                 Arc::clone(&generation.binding),
                 generation.binding.descriptor().clone(),
+                generation.binding.incarnation(),
                 Arc::clone(generation.binding.metadata()),
                 Arc::clone(generation.binding.planning()),
                 rewrite,
                 write,
                 Arc::clone(generation.binding.execution_distribution()),
-                runtime_id,
             )
         };
         let state = Arc::downgrade(&self.state);
-        let lease_runtime_id = runtime_id;
         let planning_state = Arc::downgrade(&self.state);
-        let planning_runtime_id = runtime_id;
+        let planning_runtime_id = control_runtime_id;
         let planning_lease = ConnectorControlPlanningLease::new(binding, move || {
             release_lease(&planning_state, planning_runtime_id, LeaseKind::Planning);
         });
         ConnectorDistributedRewriteLease::new(
             descriptor,
-            key.clone(),
+            control_runtime_id,
+            provider_incarnation,
             planning_lease,
             metadata,
             planning,
@@ -719,7 +738,7 @@ impl ConnectorControlHost {
             write,
             distribution,
             move || {
-                release_lease(&state, lease_runtime_id, LeaseKind::DistributedRewrite);
+                release_lease(&state, control_runtime_id, LeaseKind::DistributedRewrite);
             },
         )
     }
@@ -1008,9 +1027,9 @@ impl ConnectorDistributedRewriteResolver for ConnectorControlHost {
 
     fn acquire_exact_distributed_rewrite(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
-        Self::acquire_exact_distributed_rewrite(self, key)
+        Self::acquire_exact_distributed_rewrite(self, control_runtime_id)
     }
 }
 

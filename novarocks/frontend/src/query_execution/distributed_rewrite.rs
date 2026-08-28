@@ -193,12 +193,7 @@ impl ConnectorDistributedRewriteSession {
         lease: ConnectorDistributedRewriteLease,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
-        plan.validate()?;
-        if plan.owner() != lease.binding_key() {
-            return Err(invalid(
-                "distributed rewrite plan does not belong to the exact rewrite lease",
-            ));
-        }
+        lease.validate_plan(&plan)?;
 
         let write_session = if plan.cohorts().is_empty() {
             None
@@ -807,7 +802,8 @@ mod tests {
         });
         let lease = ConnectorDistributedRewriteLease::new(
             descriptor.clone(),
-            key.clone(),
+            novarocks_spi::connector::ConnectorControlRuntimeId::from_bytes([7; 16]),
+            key.incarnation,
             novarocks_spi::connector::ConnectorControlPlanningLease::new(
                 Arc::new(
                     ConnectorControlBinding::try_new(
