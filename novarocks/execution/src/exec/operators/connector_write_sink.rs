@@ -350,7 +350,7 @@ mod tests {
             self.stats.finished.fetch_add(1, Ordering::Relaxed);
             ConnectorStagedReport::try_new(
                 self.writer.clone(),
-                1,
+                novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
                 ConnectorWriterTerminalState::Staged,
                 ConnectorStagedReportSummary {
                     input_rows: self.stats.appended_rows.load(Ordering::Relaxed) as u64,
@@ -389,10 +389,13 @@ mod tests {
             6,
             0,
             catalog_handle.clone(),
-            key.clone(),
         );
-        let handle =
-            ConnectorWriterHandle::try_new(key.clone(), writer, 1, Bytes::new()).expect("handle");
+        let handle = ConnectorWriterHandle::try_new(
+            writer,
+            novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
+            Bytes::new(),
+        )
+        .expect("handle");
         let execution = Arc::new(TestWriteExecution {
             catalog_handle: novarocks_spi::connector::CatalogHandle::new(
                 key.instance_id.clone(),

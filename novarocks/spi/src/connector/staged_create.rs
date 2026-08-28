@@ -1888,7 +1888,6 @@ mod tests {
                 owner.instance_id.clone(),
                 CatalogVersion::from_bytes([1; 32]),
             ),
-            owner.clone(),
         );
         let report = ConnectorStagedReport::try_new(
             writer,

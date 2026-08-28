@@ -89,7 +89,6 @@ impl ConnectorWriteManifest {
                     backend_num,
                     0,
                     catalog_handle.clone(),
-                    owner.clone(),
                 ));
             }
         }

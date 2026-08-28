@@ -693,7 +693,6 @@ impl ConnectorWriteOperationSession {
         let manifest = attachment.manifest();
         if manifest.owner() != &self.inner.owner
             || manifest.operation_id() != self.inner.operation_id
-            || input.owner() != &self.inner.owner
             || input.operation_id() != self.inner.operation_id
             || input.cohort_id() != manifest.cohort_id()
             || input.execution_id() != manifest.execution_id()
@@ -870,9 +869,8 @@ mod tests {
                 .into_iter()
                 .map(|writer| {
                     ConnectorWriterHandle::try_new(
-                        self.key.clone(),
                         writer,
-                        1,
+                        CONNECTOR_WRITE_CONTRACT_VERSION,
                         Bytes::from_static(b"session-test-handle"),
                     )
                 })
@@ -1206,7 +1204,6 @@ mod tests {
             8,
             0,
             catalog_handle(),
-            owner(),
         );
         let report = ConnectorStagedReport::try_new(
             writer,
@@ -1541,7 +1538,10 @@ mod tests {
             .writer
             .as_mut()
             .expect("writer identity")
-            .connector_instance_id = "foreign-session".to_string();
+            .catalog_handle
+            .as_mut()
+            .expect("catalog handle")
+            .catalog_name = "foreign-session".to_string();
         let error = match ConnectorWriteCompletion::from_write_commits(
             session.clone(),
             [

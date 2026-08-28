@@ -146,7 +146,6 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
                 binding: self.resources.binding().clone(),
             })),
             Some(Arc::new(IcebergDataWriteExecution::new(
-                key,
                 self.resources.binding().clone(),
                 self.resources.runtime().clone(),
             ))),

@@ -500,14 +500,14 @@ message ConnectorWriterIdentity {
   int32 fragment_id = 5;
   int32 backend_num = 6;
   uint32 sink_ordinal = 7;
-  string connector_instance_id = 8;
-  bytes connector_incarnation = 9;                // exact connector generation UUID bytes.
+  reserved 8, 9;
+  reserved "connector_instance_id", "connector_incarnation";
   bytes cohort_id = 10;                           // stable 32-byte semantic cohort identity.
   novarocks.catalog.CatalogHandle catalog_handle = 11; // exact query-leased BE runtime identity.
 }
 
 // Bounded opaque handle produced by FE control planning and consumed only by
-// the exact BE execution binding.
+// the exact query-leased BE catalog runtime.
 message ConnectorWriterHandleEnvelope {
   uint32 contract_version = 1;
   ConnectorWriterIdentity writer = 2;

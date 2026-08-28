@@ -316,16 +316,6 @@ fn patch_native_connector_write_sink_in_place(
                             fragment_id: writer.fragment_id(),
                             backend_num: writer.backend_num(),
                             sink_ordinal: writer.sink_ordinal(),
-                            connector_instance_id: writer
-                                .binding_key()
-                                .instance_id
-                                .as_str()
-                                .to_string(),
-                            connector_incarnation: writer
-                                .binding_key()
-                                .incarnation
-                                .to_bytes()
-                                .to_vec(),
                             catalog_handle: Some(
                                 novarocks_proto_codec::catalog::encode_catalog_handle(
                                     writer.catalog_handle(),
@@ -1009,10 +999,13 @@ mod tests {
                 owner.instance_id.clone(),
                 novarocks_spi::connector::CatalogVersion::from_bytes([1; 32]),
             ),
-            owner.clone(),
         );
-        ConnectorWriterHandle::try_new(owner, writer, 1, Bytes::from_static(b"opaque"))
-            .expect("valid connector handle")
+        ConnectorWriterHandle::try_new(
+            writer,
+            novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
+            Bytes::from_static(b"opaque"),
+        )
+        .expect("valid connector handle")
     }
 
     fn connector_writer_template_fragment(fragment_id: FragmentId) -> native_plan::PlanFragment {

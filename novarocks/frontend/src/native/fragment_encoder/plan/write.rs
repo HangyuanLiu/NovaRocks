@@ -25,7 +25,7 @@ use novarocks_sql::plan_read::{
 
 /// Encode the generic writer envelope without inspecting the provider payload.
 /// The payload is authenticated by its SPI digest and is interpreted only by
-/// the exact execution binding on the backend.
+/// the exact query-leased catalog runtime on the backend.
 pub(super) fn encode_connector_write_fragment_sink(
     src: &ConnectorWriteFragmentSink,
 ) -> plan::ConnectorWriteFragmentSink {
@@ -45,8 +45,6 @@ pub(super) fn encode_connector_write_fragment_sink(
                     fragment_id: writer.fragment_id(),
                     backend_num: writer.backend_num(),
                     sink_ordinal: writer.sink_ordinal(),
-                    connector_instance_id: writer.binding_key().instance_id.as_str().to_string(),
-                    connector_incarnation: writer.binding_key().incarnation.to_bytes().to_vec(),
                     catalog_handle: Some(encode_catalog_handle(writer.catalog_handle())),
                 }),
                 payload: handle.payload().to_vec(),

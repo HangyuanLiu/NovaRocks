@@ -417,8 +417,7 @@ fn validate_connector_write_attempt(
     input: &ConnectorWriteCommitInput,
 ) -> Result<(), DistributedQueryError> {
     let manifest = attachment.manifest();
-    if input.owner() != manifest.owner()
-        || input.operation_id() != manifest.operation_id()
+    if input.operation_id() != manifest.operation_id()
         || input.cohort_id() != manifest.cohort_id()
         || input.execution_id() != manifest.execution_id()
     {

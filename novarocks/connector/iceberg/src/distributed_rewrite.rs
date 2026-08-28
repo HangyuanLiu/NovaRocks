@@ -1669,8 +1669,7 @@ fn put_writer(out: &mut Vec<u8>, writer: &ConnectorWriterIdentity) -> Result<(),
     out.extend_from_slice(&writer.fragment_id().to_be_bytes());
     out.extend_from_slice(&writer.backend_num().to_be_bytes());
     put_u32(out, writer.sink_ordinal());
-    put_catalog_handle(out, writer.catalog_handle())?;
-    put_binding_key(out, writer.binding_key())
+    put_catalog_handle(out, writer.catalog_handle())
 }
 
 fn put_catalog_handle(out: &mut Vec<u8>, handle: &CatalogHandle) -> Result<(), ConnectorError> {
@@ -1777,7 +1776,6 @@ impl<'a> AttemptCursor<'a> {
             i32::from_be_bytes(self.take_array()?),
             self.take_u32()?,
             self.take_catalog_handle()?,
-            self.take_binding_key()?,
         ))
     }
 }
@@ -2266,9 +2264,8 @@ mod tests {
                     owner.instance_id.clone(),
                     CatalogVersion::from_bytes([1; 32]),
                 ),
-                owner.clone(),
             ),
-            1,
+            novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
             ConnectorWriterTerminalState::Staged,
             ConnectorStagedReportSummary {
                 input_rows: 11,

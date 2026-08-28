@@ -256,7 +256,10 @@ impl std::fmt::Debug for ConnectorWriteSinkProgram {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ConnectorWriteSinkProgram")
-            .field("owner", self.request.handle.owner())
+            .field(
+                "catalog_handle",
+                self.request.handle.writer().catalog_handle(),
+            )
             .field("writer", self.request.handle.writer())
             .field("input_ordinals", &self.input_ordinals)
             .finish_non_exhaustive()

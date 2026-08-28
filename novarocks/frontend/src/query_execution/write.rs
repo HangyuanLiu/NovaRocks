@@ -21,8 +21,7 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorExecutionBindingKey, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorStagedReport, ConnectorStagedReportSummary,
+    CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorStagedReport, ConnectorStagedReportSummary,
     ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteOperationId,
     ConnectorWriterIdentity, ConnectorWriterTerminalState, MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES,
     MAX_CONNECTOR_STAGED_REPORT_PARTS, MAX_CONNECTOR_STAGED_REPORT_PAYLOAD_BYTES,
@@ -57,11 +56,10 @@ pub struct WriteCommitInput {
 /// frame has passed the coordinator's ownership, bounds, and digest checks.
 ///
 /// This is the only distributed writer commit carrier: opaque SPI reports for
-/// one exact control binding and operation. Transaction runners never import
+/// one exact catalog-handle writer manifest and operation. Transaction runners never import
 /// a provider DTO.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConnectorWriteCommitInput {
-    owner: ConnectorExecutionBindingKey,
     operation_id: ConnectorWriteOperationId,
     cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
     execution_id: ConnectorWriteExecutionId,
@@ -69,10 +67,6 @@ pub(crate) struct ConnectorWriteCommitInput {
 }
 
 impl ConnectorWriteCommitInput {
-    pub(crate) fn owner(&self) -> &ConnectorExecutionBindingKey {
-        &self.owner
-    }
-
     pub(crate) const fn operation_id(&self) -> ConnectorWriteOperationId {
         self.operation_id
     }
@@ -131,7 +125,6 @@ impl ConnectorWriteCommitInput {
         >::new();
         let mut operation_id = None;
         let mut execution_id = None;
-        let mut owner = None;
         for writer in &write_commit.writers {
             if !expected_writer_keys.insert(writer.writer_key.clone()) {
                 return Err(contract_violation(
@@ -174,15 +167,6 @@ impl ConnectorWriteCommitInput {
                 None => execution_id = Some(identity.execution_id()),
                 _ => {}
             }
-            match &owner {
-                Some(expected) if expected != identity.binding_key() => {
-                    return Err(contract_violation(
-                        "generic connector write commit contains multiple connector binding generations",
-                    ));
-                }
-                None => owner = Some(identity.binding_key().clone()),
-                _ => {}
-            }
             let cohort_id = identity.cohort_id();
             if reports_by_cohort
                 .entry(cohort_id)
@@ -195,7 +179,6 @@ impl ConnectorWriteCommitInput {
                 ));
             }
         }
-        let owner = owner.expect("generic connector reports have an owner");
         let operation_id = operation_id.expect("generic connector reports have an operation");
         let execution_id = execution_id.expect("generic connector reports have an execution");
         Ok(reports_by_cohort
@@ -204,7 +187,6 @@ impl ConnectorWriteCommitInput {
                 (
                     cohort_id,
                     Self {
-                        owner: owner.clone(),
                         operation_id,
                         cohort_id,
                         execution_id,
@@ -619,19 +601,6 @@ fn connector_writer_identity_from_native(
         .ok_or_else(|| {
             contract_violation("connector staged report writer is missing fragment instance id")
         })?;
-    let binding_key = ConnectorExecutionBindingKey {
-        instance_id: ConnectorInstanceId::parse(&writer.connector_instance_id).map_err(
-            |error| {
-                contract_violation(format!(
-                    "connector staged report has invalid binding instance id: {error}"
-                ))
-            },
-        )?,
-        incarnation: ConnectorInstanceIncarnation::from_bytes(connector_id_bytes(
-            &writer.connector_incarnation,
-            "connector staged report binding incarnation",
-        )?),
-    };
     let catalog_handle = writer.catalog_handle.as_ref().ok_or_else(|| {
         contract_violation("connector staged report writer is missing catalog handle")
     })?;
@@ -657,7 +626,6 @@ fn connector_writer_identity_from_native(
         writer.backend_num,
         writer.sink_ordinal,
         catalog_handle,
-        binding_key,
     ))
 }
 
@@ -828,14 +796,21 @@ fn validate_connector_frame_identity(
         })
         || writer.backend_num != backend_num
         || writer.sink_ordinal != 0
-        || writer.connector_incarnation.len() != 16
-        || writer.connector_incarnation.iter().all(|byte| *byte == 0)
-        || ConnectorInstanceId::parse(&writer.connector_instance_id).is_err()
     {
         return Err(
             "connector staged report writer identity does not match its native owner".to_string(),
         );
     }
+    let catalog_handle = writer.catalog_handle.clone().ok_or_else(|| {
+        "connector staged report writer is missing an exact catalog handle".to_string()
+    })?;
+    novarocks_proto_codec::catalog::decode_catalog_handle(
+        catalog_handle,
+        novarocks_proto_codec::FieldPath::root("connector_staged_report")
+            .field("writer")
+            .field("catalog_handle"),
+    )
+    .map_err(|error| format!("connector staged report catalog handle: {error}"))?;
     if let Some(execution_id) = expected_execution_id
         && (writer.execution_query_id != query_id_to_be_bytes(execution_id)
             || writer.execution_attempt_id != execution_id.attempt_id().get())
@@ -911,8 +886,6 @@ mod tests {
                 fragment_id: 29,
                 backend_num: 31,
                 sink_ordinal: 0,
-                connector_instance_id: "unit".to_string(),
-                connector_incarnation: vec![2; 16],
                 catalog_handle: Some(novarocks_proto_models::catalog::CatalogHandle {
                     catalog_name: "unit".to_string(),
                     version: vec![4; 32],
@@ -1230,7 +1203,6 @@ mod tests {
             extracted.execution_id().attempt_id(),
             execution_id().attempt_id().get()
         );
-        assert_eq!(extracted.owner().instance_id.as_str(), "unit");
         assert_eq!(extracted.reports().len(), 1);
         assert_eq!(extracted.reports()[0].payload().as_ref(), b"firstsecond");
         assert_eq!(extracted.reports()[0].summary().input_rows, 37);

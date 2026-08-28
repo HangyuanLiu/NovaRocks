@@ -40,7 +40,10 @@ use super::{
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 
-pub const CONNECTOR_WRITE_CONTRACT_VERSION: u32 = 1;
+/// Version 2 removes the legacy FE connector-generation identity from the
+/// native writer and terminal-report carriers.  BE runtime selection is
+/// exclusively the exact query-leased catalog handle.
+pub const CONNECTOR_WRITE_CONTRACT_VERSION: u32 = 2;
 pub const MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_CONNECTOR_STAGED_REPORT_PARTS: u32 = 48;
 pub const MAX_CONNECTOR_STAGED_REPORT_PAYLOAD_BYTES: usize =
@@ -334,10 +337,8 @@ pub struct ConnectorWriterIdentity {
     backend_num: i32,
     sink_ordinal: u32,
     /// Exact immutable catalog runtime selected by the query lifecycle for
-    /// this writer. It is intentionally independent from the legacy effect
-    /// generation below: backend capability lookup uses this handle only.
+    /// this writer. Backend capability lookup uses this handle only.
     catalog_handle: CatalogHandle,
-    binding_key: ConnectorExecutionBindingKey,
 }
 
 impl ConnectorWriterIdentity {
@@ -351,7 +352,6 @@ impl ConnectorWriterIdentity {
         backend_num: i32,
         sink_ordinal: u32,
         catalog_handle: CatalogHandle,
-        binding_key: ConnectorExecutionBindingKey,
     ) -> Self {
         Self {
             operation_id,
@@ -362,7 +362,6 @@ impl ConnectorWriterIdentity {
             backend_num,
             sink_ordinal,
             catalog_handle,
-            binding_key,
         }
     }
 
@@ -396,10 +395,6 @@ impl ConnectorWriterIdentity {
 
     pub const fn catalog_handle(&self) -> &CatalogHandle {
         &self.catalog_handle
-    }
-
-    pub fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-        &self.binding_key
     }
 }
 
@@ -2127,7 +2122,7 @@ impl ConnectorWritePlanningRequest {
             if writer.operation_id != self.operation_id
                 || writer.cohort_id != self.cohort_id
                 || writer.execution_id != self.execution_id
-                || &writer.binding_key != owner
+                || writer.catalog_handle.catalog_name() != &owner.instance_id
             {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -2188,7 +2183,6 @@ fn write_planning_digest(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorWriterHandle {
-    owner: ConnectorExecutionBindingKey,
     writer: ConnectorWriterIdentity,
     version: u32,
     payload: Bytes,
@@ -2197,20 +2191,18 @@ pub struct ConnectorWriterHandle {
 
 impl ConnectorWriterHandle {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
         writer: ConnectorWriterIdentity,
         version: u32,
         payload: Bytes,
     ) -> Result<Self, ConnectorError> {
         validate_handle_payload(&payload)?;
-        if version == 0 || writer.binding_key != owner {
+        if version != CONNECTOR_WRITE_CONTRACT_VERSION {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "connector writer handle owner or version is invalid",
+                "connector writer handle contract version is unsupported",
             ));
         }
         Ok(Self {
-            owner,
             writer,
             version,
             payload_digest: sha256(&payload),
@@ -2219,8 +2211,7 @@ impl ConnectorWriterHandle {
     }
 
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        if self.version == 0
-            || self.writer.binding_key != self.owner
+        if self.version != CONNECTOR_WRITE_CONTRACT_VERSION
             || self.payload_digest != sha256(&self.payload)
         {
             return Err(ConnectorError::new(
@@ -2229,10 +2220,6 @@ impl ConnectorWriterHandle {
             ));
         }
         validate_handle_payload(&self.payload)
-    }
-
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
-        &self.owner
     }
 
     pub fn writer(&self) -> &ConnectorWriterIdentity {
@@ -2275,7 +2262,7 @@ impl ConnectorWritePlan {
         let mut writers = HashSet::with_capacity(handles.len());
         for handle in &handles {
             handle.validate()?;
-            if handle.owner != owner
+            if handle.writer.catalog_handle.catalog_name() != &owner.instance_id
                 || handle.writer.operation_id != operation_id
                 || handle.writer.cohort_id != cohort_id
                 || handle.writer.execution_id != execution_id
@@ -2361,10 +2348,10 @@ impl ConnectorStagedReport {
         payload: Bytes,
     ) -> Result<Self, ConnectorError> {
         validate_report_payload(&payload)?;
-        if version == 0 {
+        if version != CONNECTOR_WRITE_CONTRACT_VERSION {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "connector staged report version must be nonzero",
+                "connector staged report contract version is unsupported",
             ));
         }
         Ok(Self {
@@ -2378,7 +2365,9 @@ impl ConnectorStagedReport {
     }
 
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        if self.version == 0 || self.payload_digest != sha256(&self.payload) {
+        if self.version != CONNECTOR_WRITE_CONTRACT_VERSION
+            || self.payload_digest != sha256(&self.payload)
+        {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 "connector staged report integrity validation failed",
@@ -2551,7 +2540,7 @@ impl ConnectorStagedReportFrame {
         logical_payload_digest: [u8; 32],
         frame_payload: Bytes,
     ) -> Result<Self, ConnectorError> {
-        if version == 0
+        if version != CONNECTOR_WRITE_CONTRACT_VERSION
             || part_count == 0
             || part_count > MAX_CONNECTOR_STAGED_REPORT_PARTS
             || part_index >= part_count
@@ -2642,7 +2631,7 @@ impl ConnectorStagedReportFrame {
             + 8 // execution attempt
             + 1 + 16 // fragment instance presence + value
             + 4 + 4 + 4 // fragment/backend/sink ids
-            + LENGTH_PREFIX_BYTES + 16 // connector incarnation
+            + LENGTH_PREFIX_BYTES + 32 // catalog name and exact version
             + 4 // terminal state
             + 8 * 3 // summary
             + 4 + 4 // part index/count
@@ -2650,7 +2639,7 @@ impl ConnectorStagedReportFrame {
             + (LENGTH_PREFIX_BYTES + DIGEST_BYTES) * 2 // payload digests
             + LENGTH_PREFIX_BYTES; // frame payload length
         fixed
-            .checked_add(writer.binding_key().instance_id.as_str().len())
+            .checked_add(writer.catalog_handle().catalog_name().as_str().len())
             .and_then(|total| total.checked_add(self.frame_payload.len()))
             .ok_or_else(|| {
                 ConnectorError::new(
@@ -3136,7 +3125,7 @@ impl ConnectorWriteAttemptCompletion {
         for report in &reports {
             report.validate()?;
             let writer = report.writer();
-            if writer.binding_key() != &owner
+            if writer.catalog_handle().catalog_name() != &owner.instance_id
                 || writer.operation_id() != operation_id
                 || writer.cohort_id() != cohort_id
                 || writer.execution_id() != execution_id
@@ -3905,8 +3894,6 @@ impl Drop for ConnectorWriteLeaseRelease {
 }
 
 pub trait ConnectorWriteExecution: Send + Sync {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey;
-
     fn open_writer(
         &self,
         request: ConnectorOpenWriterRequest,
@@ -4156,7 +4143,12 @@ fn digest_writer(hasher: &mut Sha256, writer: &ConnectorWriterIdentity) {
     hasher.update(writer.fragment_id.to_be_bytes());
     hasher.update(writer.backend_num.to_be_bytes());
     hasher.update(writer.sink_ordinal.to_be_bytes());
-    digest_owner(hasher, &writer.binding_key);
+    digest_catalog_handle(hasher, writer.catalog_handle());
+}
+
+fn digest_catalog_handle(hasher: &mut Sha256, handle: &CatalogHandle) {
+    digest_bytes(hasher, handle.catalog_name().as_str().as_bytes());
+    hasher.update(handle.version().as_bytes());
 }
 
 fn digest_bytes(hasher: &mut Sha256, bytes: &[u8]) {
@@ -4334,7 +4326,6 @@ mod tests {
             5,
             0,
             catalog_handle(&key()),
-            key(),
         )
     }
 
@@ -4698,14 +4689,13 @@ mod tests {
     fn plan_rejects_conflicting_writer_manifest() {
         let writer = writer();
         let handle = ConnectorWriterHandle::try_new(
-            writer.binding_key().clone(),
             writer.clone(),
             CONNECTOR_WRITE_CONTRACT_VERSION,
             Bytes::new(),
         )
         .expect("handle");
         let error = ConnectorWritePlan::try_new(
-            writer.binding_key().clone(),
+            key(),
             writer.operation_id(),
             writer.cohort_id(),
             writer.execution_id(),
@@ -4719,10 +4709,9 @@ mod tests {
     #[test]
     fn planning_request_requires_exact_writer_owner() {
         let writer = writer();
-        let owner = writer.binding_key().clone();
-        let table =
-            ConnectorTableHandle::try_new(writer.binding_key().instance_id.clone(), Bytes::new())
-                .expect("table handle");
+        let owner = key();
+        let table = ConnectorTableHandle::try_new(owner.instance_id.clone(), Bytes::new())
+            .expect("table handle");
         let preparation = ConnectorWritePreparation::try_new(
             owner.clone(),
             table,
@@ -4880,7 +4869,7 @@ mod tests {
         let writer = writer();
         let operation_id = writer.operation_id();
         let cohort_id = writer.cohort_id();
-        let owner = writer.binding_key().clone();
+        let owner = key();
         let report = ConnectorStagedReport::try_new(
             writer.clone(),
             CONNECTOR_WRITE_CONTRACT_VERSION,

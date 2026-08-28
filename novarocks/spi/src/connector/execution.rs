@@ -465,15 +465,6 @@ impl ConnectorExecutionBinding {
                 "connector read execution owner does not match its execution binding",
             ));
         }
-        if write
-            .as_ref()
-            .is_some_and(|write| write.binding_key() != &key)
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector write execution owner does not match its execution binding",
-            ));
-        }
         Ok(Self {
             provider_id,
             key,

@@ -2230,9 +2230,8 @@ mod tests {
                 .into_iter()
                 .map(|writer| {
                     ConnectorWriterHandle::try_new(
-                        self.key.clone(),
                         writer,
-                        1,
+                        CONNECTOR_WRITE_CONTRACT_VERSION,
                         Bytes::from_static(b"test-handle"),
                     )
                 })
