@@ -41,11 +41,11 @@ use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
 use crate::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile, HashContractDigest};
 use crate::runtime_filter::domain::{
     BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
-    BackendCoverageWitnessId, BackendEnvelopeKind, BackendMaterializationOwner,
-    BackendMaterializationPolicy, BackendOutboundMaterializationGroup, BackendParticipantIdentity,
-    BackendParticipantInstall, BackendProducerInstall, BackendRouteEdgeId, BackendRouteEndpoint,
-    BackendRoutePeer, BackendRouteRole, BackendRoutingChannel, BackendRoutingEdge,
-    BackendRoutingShard,
+    BackendCoverageWitnessId, BackendEnvelopeKind, BackendFrontendFeedbackPublication,
+    BackendMaterializationOwner, BackendMaterializationPolicy, BackendOutboundMaterializationGroup,
+    BackendParticipantIdentity, BackendParticipantInstall, BackendProducerInstall,
+    BackendRouteEdgeId, BackendRouteEndpoint, BackendRoutePeer, BackendRouteRole,
+    BackendRoutingChannel, BackendRoutingEdge, BackendRoutingShard,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -879,8 +879,7 @@ fn decode_core_channel(
             .index(index);
         groups.push(decode_outbound_materialization_group(group, item_path)?);
     }
-    let _ = participant;
-    BackendChannelInstall::new(
+    let mut install = BackendChannelInstall::new(
         channel_id,
         decoded_contract.execution,
         lifecycle,
@@ -901,7 +900,60 @@ fn decode_core_channel(
         consumers,
         groups,
     )
-    .map_err(|error| invalid(path, error.to_string()))
+    .map_err(|error| invalid(path.clone(), error.to_string()))?;
+    if let Some(publication) = wire.frontend_feedback_publication.as_ref() {
+        let publication = decode_frontend_feedback_publication(publication, path.clone())?;
+        install = install
+            .with_frontend_feedback_publication(publication)
+            .map_err(|error| invalid(path.clone(), error.to_string()))?;
+    }
+    let _ = participant;
+    Ok(install)
+}
+
+fn decode_frontend_feedback_publication(
+    wire: &filter::RuntimeFilterFrontendFeedbackPublication,
+    path: FieldPath,
+) -> CodecResult<BackendFrontendFeedbackPublication> {
+    let publication_path = path.field("frontend_feedback_publication");
+    let publisher_owner =
+        match filter::RuntimeFilterOutboundMaterializationOwner::try_from(wire.publisher_owner) {
+            Ok(filter::RuntimeFilterOutboundMaterializationOwner::DirectSource) => {
+                BackendMaterializationOwner::DirectSource
+            }
+            Ok(filter::RuntimeFilterOutboundMaterializationOwner::Aggregator) => {
+                BackendMaterializationOwner::Aggregator
+            }
+            Ok(filter::RuntimeFilterOutboundMaterializationOwner::Unspecified) | Err(_) => {
+                return Err(codec_error(
+                    publication_path.clone().field("publisher_owner"),
+                    ProtocolErrorKind::InvalidEnum,
+                    format!(
+                        "invalid frontend feedback publisher owner={}",
+                        wire.publisher_owner
+                    ),
+                ));
+            }
+        };
+    let contract_digest: [u8; 32] = wire.contract_digest.as_slice().try_into().map_err(|_| {
+        invalid(
+            publication_path.clone().field("contract_digest"),
+            "frontend feedback contract digest must be 32 bytes",
+        )
+    })?;
+    let max_encoded_domain_bytes =
+        usize::try_from(wire.max_encoded_domain_bytes).map_err(|_| {
+            invalid(
+                publication_path.clone().field("max_encoded_domain_bytes"),
+                "frontend feedback domain budget does not fit usize",
+            )
+        })?;
+    BackendFrontendFeedbackPublication::new(
+        publisher_owner,
+        contract_digest,
+        max_encoded_domain_bytes,
+    )
+    .map_err(|error| invalid(publication_path, error.to_string()))
 }
 
 fn decode_outbound_materialization_group(

@@ -51,8 +51,8 @@ pub(crate) use identity::{
 pub(crate) use install::{BackendInstallPolicy, BackendInstallPolicyError};
 pub(crate) use participant_install::{
     BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall,
-    BackendMaterializationOwner, BackendMaterializationPolicy, BackendOutboundMaterializationGroup,
-    BackendParticipantInstall, BackendProducerInstall,
+    BackendFrontendFeedbackPublication, BackendMaterializationOwner, BackendMaterializationPolicy,
+    BackendOutboundMaterializationGroup, BackendParticipantInstall, BackendProducerInstall,
 };
 pub(crate) use reducer::{MembershipReducer, ReducerError};
 pub(crate) use reduction_state::{
@@ -64,7 +64,8 @@ pub(crate) use routing::{
     BackendRoutingShard,
 };
 pub(crate) use session::{
-    BackendMaterializedDelivery, BackendMaterializedDeliverySink, BackendRuntimeFilterSession,
+    BackendFrontendFeedbackOutcome, BackendFrontendFeedbackSink, BackendMaterializedDelivery,
+    BackendMaterializedDeliverySink, BackendRuntimeFilterSession,
 };
 #[cfg(test)]
 pub(crate) use snapshot::BackendLogicalSnapshot;

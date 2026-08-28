@@ -117,6 +117,9 @@ pub(crate) trait BackendQueryControl: Send + Sync + 'static {
 pub(crate) struct QueryControlAttachment {
     pub(crate) control: Arc<dyn BackendQueryControl>,
     pub(crate) events: tokio::sync::mpsc::Receiver<QueryControlEvent>,
+    /// Independent bounded best-effort feedback. The RPC mux drains normal
+    /// lifecycle correctness traffic before this receiver.
+    pub(crate) runtime_filter_feedback: tokio::sync::mpsc::Receiver<QueryControlEvent>,
     /// A single-slot, replaceable telemetry view. Correctness events remain on
     /// `events` so a congested profiler/progress producer cannot delay an ACK,
     /// drain barrier, or terminal snapshot.

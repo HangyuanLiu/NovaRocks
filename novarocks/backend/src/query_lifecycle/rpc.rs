@@ -345,6 +345,7 @@ pub(crate) async fn handle_query_control_stream(
         inbound,
         lease,
         attachment.events,
+        attachment.runtime_filter_feedback,
         outbound_tx,
         shutdown,
         heartbeat_stop,
@@ -364,6 +365,7 @@ async fn run_attached_control_stream(
     mut inbound: tonic::Streaming<proto::QueryControlRequest>,
     mut lease: CoordinatorLease,
     mut events: tokio::sync::mpsc::Receiver<QueryControlEvent>,
+    mut runtime_filter_feedback: tokio::sync::mpsc::Receiver<QueryControlEvent>,
     outbound: tokio::sync::mpsc::Sender<Result<proto::QueryControlResponse, tonic::Status>>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     heartbeat_stop: Option<QueryLifecycleFaultScope>,
@@ -408,6 +410,7 @@ async fn run_attached_control_stream(
 
     let mut awaiting_graceful_termination = false;
     let mut heartbeat_stop_logged = false;
+    let mut runtime_filter_feedback_open = true;
     loop {
         tokio::select! {
             biased;
@@ -586,6 +589,25 @@ async fn run_attached_control_stream(
                         continue;
                     }
                     lease.mark_graceful();
+                    break;
+                }
+            }
+            // Feedback is deliberately last in this biased mux. It is an
+            // optimization hint, never a lifecycle correctness dependency.
+            event = runtime_filter_feedback.recv(), if runtime_filter_feedback_open => {
+                let Some(event) = event else {
+                    // A feedback sender disappears on normal cancellation or
+                    // retirement; keep serving the required control stream.
+                    runtime_filter_feedback_open = false;
+                    continue;
+                };
+                if !send_control_response(
+                    &outbound,
+                    Ok(event.as_proto().clone()),
+                    &mut shutdown,
+                )
+                .await
+                {
                     break;
                 }
             }

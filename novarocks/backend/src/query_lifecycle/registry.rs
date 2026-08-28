@@ -55,6 +55,9 @@ use crate::metrics::{
 use crate::rpc::client::BackendRpcClient;
 use crate::runtime::profile_codec::encode_runtime_profile_tree;
 use crate::runtime::sink_commit::SinkCommitReportSnapshot;
+use crate::runtime_filter::domain::{
+    BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication, BackendFrontendFeedbackSink,
+};
 use crate::runtime_filter::install_decode::decode_runtime_filter_contribution;
 use crate::runtime_filter::observation::{
     RuntimeFilterChannelTerminal, RuntimeFilterConsumerOutcome, RuntimeFilterObservationSnapshot,
@@ -69,6 +72,76 @@ use crate::runtime_filter::rpc::{
 
 const CONTROL_EVENT_BUFFER_CAPACITY: usize = 16;
 const RESERVED_CONTROL_EVENT_CAPACITY: usize = 3;
+const RUNTIME_FILTER_FEEDBACK_BUFFER_CAPACITY: usize = 64;
+
+/// Attempt-local, best-effort control-stream egress for terminal logical
+/// feedback. The participant retains this only weakly, and `try_send` makes a
+/// congested or detached Frontend fail open without delaying execution.
+struct RuntimeFilterFeedbackEgress {
+    execution_id: QueryExecutionId,
+    init_digest: ParticipantManifestDigest,
+    backend: novarocks_proto_codec::lifecycle::ParticipantBackendIdentity,
+    participant_id: u32,
+    events: tokio::sync::mpsc::Sender<QueryControlEvent>,
+}
+
+impl BackendFrontendFeedbackSink for RuntimeFilterFeedbackEgress {
+    fn try_publish(
+        &self,
+        channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
+        deployment_epoch: u64,
+        publication: &BackendFrontendFeedbackPublication,
+        outcome: BackendFrontendFeedbackOutcome,
+    ) {
+        use novarocks_proto_models::novarocks as wire;
+
+        let terminal_outcome = match outcome {
+            BackendFrontendFeedbackOutcome::CanonicalDomain(domain) => {
+                wire::runtime_filter_feedback_event::TerminalOutcome::CanonicalDomain(
+                    domain.as_ref().to_vec(),
+                )
+            }
+            BackendFrontendFeedbackOutcome::DomainBudget => {
+                wire::runtime_filter_feedback_event::TerminalOutcome::UnavailableReason(
+                    wire::RuntimeFilterFeedbackUnavailableReason::DomainBudget as i32,
+                )
+            }
+            BackendFrontendFeedbackOutcome::TypeUnsupported => {
+                wire::runtime_filter_feedback_event::TerminalOutcome::UnavailableReason(
+                    wire::RuntimeFilterFeedbackUnavailableReason::TypeUnsupported as i32,
+                )
+            }
+            BackendFrontendFeedbackOutcome::ReductionUnavailable => {
+                wire::runtime_filter_feedback_event::TerminalOutcome::UnavailableReason(
+                    wire::RuntimeFilterFeedbackUnavailableReason::ReductionUnavailable as i32,
+                )
+            }
+            BackendFrontendFeedbackOutcome::ProducerUnavailable => {
+                wire::runtime_filter_feedback_event::TerminalOutcome::UnavailableReason(
+                    wire::RuntimeFilterFeedbackUnavailableReason::ProducerUnavailable as i32,
+                )
+            }
+        };
+        let event =
+            protocol_control_event(wire::query_control_response::Event::RuntimeFilterFeedback(
+                wire::RuntimeFilterFeedbackEvent {
+                    execution_id: Some(
+                        novarocks_proto_codec::lifecycle::encode_query_execution_id(
+                            self.execution_id,
+                        ),
+                    ),
+                    init_digest: self.init_digest.as_bytes().to_vec(),
+                    backend: Some(protocol_backend(self.backend.clone())),
+                    participant_id: self.participant_id,
+                    deployment_epoch,
+                    channel_id: channel_id.get(),
+                    contract_digest: publication.contract_digest().to_vec(),
+                    terminal_outcome: Some(terminal_outcome),
+                },
+            ));
+        let _ = self.events.try_send(event);
+    }
+}
 
 fn protocol_contract_error(error: novarocks_proto_codec::ProtocolError) -> QueryLifecycleError {
     QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
@@ -1608,6 +1681,8 @@ impl QueryLifecycleRegistry {
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(
             CONTROL_EVENT_BUFFER_CAPACITY + RESERVED_CONTROL_EVENT_CAPACITY + 1,
         );
+        let (runtime_filter_feedback_tx, runtime_filter_feedback_rx) =
+            tokio::sync::mpsc::channel(RUNTIME_FILTER_FEEDBACK_BUFFER_CAPACITY);
         let (observations_tx, observations_rx) = tokio::sync::watch::channel(None);
         let local_drained_event_permit =
             events_tx.clone().try_reserve_owned().map_err(|error| {
@@ -1700,6 +1775,18 @@ impl QueryLifecycleRegistry {
             state.local_drained_event_permit = Some(local_drained_event_permit);
             state.terminal_snapshot_event_permit = Some(terminal_snapshot_event_permit);
             state.terminal_event_permit = Some(terminal_event_permit);
+            if let Some(participant) = state.runtime_filter.as_ref() {
+                let feedback_sink: Arc<dyn BackendFrontendFeedbackSink> =
+                    Arc::new(RuntimeFilterFeedbackEgress {
+                        execution_id,
+                        init_digest: entry.digest,
+                        backend: validated(entry.manifest.backend()),
+                        participant_id: participant.local_participant_id(),
+                        events: runtime_filter_feedback_tx.clone(),
+                    });
+                participant.set_frontend_feedback_sink(Arc::downgrade(&feedback_sink));
+                state.frontend_feedback_sink = Some(feedback_sink);
+            }
             if entry.expected_fragment_instance_ids.is_empty() {
                 state.pre_start_deadline = None;
             }
@@ -1711,6 +1798,7 @@ impl QueryLifecycleRegistry {
             state.last_heartbeat = None;
             state.events = None;
             state.observations = None;
+            state.frontend_feedback_sink = None;
             state.local_drained_event_permit = None;
             state.terminal_snapshot_event_permit = None;
             state.terminal_event_permit = None;
@@ -1751,6 +1839,7 @@ impl QueryLifecycleRegistry {
                 execution_id,
             }),
             events: events_rx,
+            runtime_filter_feedback: runtime_filter_feedback_rx,
             observations: observations_rx,
         })
     }
@@ -3902,6 +3991,10 @@ impl QueryLifecycleRegistry {
                 return true;
             }
             state.runtime_filter_close_in_flight = true;
+            // Drop the strong egress before calling into participant cleanup.
+            // The participant only retained a Weak, so neither cancellation
+            // nor tombstone retention can keep a feedback queue alive.
+            state.frontend_feedback_sink = None;
             state.runtime_filter.take()
         };
         let participant = participant.expect("runtime-filter participant was checked present");
