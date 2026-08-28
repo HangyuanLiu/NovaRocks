@@ -41,8 +41,9 @@ use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
 use novarocks_frontend::{
-    ClusterBackendOpenConfig, FrontendExecutionConfig, FrontendQueryControlTimeouts,
-    FrontendServerConfig, LakePublicationRuntimePolicy, TaskUpdateRetryPolicy,
+    CatalogPruneConfig, ClusterBackendOpenConfig, FrontendExecutionConfig,
+    FrontendQueryControlTimeouts, FrontendServerConfig, LakePublicationRuntimePolicy,
+    TaskUpdateRetryPolicy,
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
     },
@@ -525,6 +526,14 @@ pub fn compose_frontend_server_config(
         native_compatibility_id,
     )
     .with_catalog_desired_state_source(catalog_source)
+    .with_catalog_prune_config(
+        CatalogPruneConfig::try_new(
+            Duration::from_millis(runtime_config.catalog_prune_interval_ms),
+            Duration::from_millis(runtime_config.catalog_prune_rpc_timeout_ms),
+            runtime_config.catalog_prune_max_inflight,
+        )
+        .map_err(|error| anyhow::anyhow!("construct catalog prune configuration: {error}"))?,
+    )
     .with_lake_publication_runtime_policy(
         LakePublicationRuntimePolicy::try_new(
             Duration::from_millis(runtime_config.lake_publication_max_attempt_duration_ms),

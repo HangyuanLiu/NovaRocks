@@ -21,6 +21,8 @@ pub mod catalog_application;
 pub mod catalog_attachment;
 pub mod catalog_controller;
 mod catalog_projection_metrics;
+mod catalog_prune;
+pub use catalog_prune::CatalogPruneConfig;
 pub mod client_connection;
 pub mod common;
 pub mod connector;

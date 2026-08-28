@@ -25,6 +25,9 @@ use novarocks_native_trust::{
     AutomaticTlsMaterial, NativeClientAuthInterceptor, NativeEndpointConnector,
     NativeIncomingAdapter, NativeTlsMaterial,
 };
+use novarocks_proto_codec::catalog::{
+    PruneCatalogsOutcome, PruneCatalogsRequest, PruneCatalogsResponse,
+};
 use novarocks_proto_codec::connector::{
     encode_connector_execution_binding_key, encode_connector_execution_declaration,
 };
@@ -57,6 +60,45 @@ use super::query_lifecycle::{
 
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 const QUERY_CONTROL_CHANNEL_CAPACITY: usize = 32;
+
+/// One best-effort response from a Backend catalog reachability prune.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CatalogPruneDispatchOutcome {
+    Accepted,
+    Rejected { safe_detail: String },
+}
+
+/// Sends one already-validated complete reachable-catalog snapshot to a live
+/// Backend. This has no query lifecycle side effect: callers record failure
+/// and retry on a later periodic round.
+pub(crate) fn prune_catalogs(
+    data_runtime: &FrontendDataRuntime,
+    endpoint: RuntimeEndpoint,
+    request: &PruneCatalogsRequest,
+    timeout: Duration,
+) -> Result<CatalogPruneDispatchOutcome, String> {
+    let client = Client::new(endpoint.native_endpoint().clone(), data_runtime.clone());
+    let response = data_runtime.block_on(async {
+        tokio::time::timeout(timeout, async {
+            let mut grpc = client.grpc().await?;
+            grpc.prune_catalogs(Request::new(request.as_proto().clone()))
+                .await
+                .map(|response| response.into_inner())
+                .map_err(|error| format!("prune_catalogs rpc failed: {error}"))
+        })
+        .await
+        .map_err(|_| "prune_catalogs rpc deadline exceeded".to_string())?
+    })??;
+    match PruneCatalogsResponse::parse(response)
+        .map_err(|error| format!("Backend returned an invalid PruneCatalogs response: {error}"))?
+        .outcome()
+    {
+        PruneCatalogsOutcome::Accepted => Ok(CatalogPruneDispatchOutcome::Accepted),
+        PruneCatalogsOutcome::Rejected { safe_detail } => {
+            Ok(CatalogPruneDispatchOutcome::Rejected { safe_detail })
+        }
+    }
+}
 
 /// Server-materialized transport capability consumed by the Frontend role.
 ///
