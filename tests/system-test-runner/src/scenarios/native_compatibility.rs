@@ -35,12 +35,20 @@ use novarocks_version::{
 };
 use prost::Message;
 use std::collections::BTreeSet;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 const REQUIRED_BACKENDS: usize = 3;
 const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![Box::new(MixedBuildSameIsland), Box::new(OtherIslandHardCut)]
+    vec![
+        Box::new(MixedBuildSameIsland),
+        Box::new(OtherIslandHardCut),
+        Box::new(IslandDrainAndReplacement),
+        Box::new(TargetIslandCutover),
+    ]
 }
 
 struct MixedBuildSameIsland;
@@ -100,6 +108,8 @@ impl Scenario for MixedBuildSameIsland {
 }
 
 struct OtherIslandHardCut;
+struct IslandDrainAndReplacement;
+struct TargetIslandCutover;
 
 impl Scenario for OtherIslandHardCut {
     fn name(&self) -> &'static str {
@@ -157,6 +167,155 @@ impl Scenario for OtherIslandHardCut {
         context.action(
             "excluded epoch-2 BE remained OtherIsland while SQL admitted only compatible BEs",
         );
+        Ok(())
+    }
+}
+
+impl Scenario for TargetIslandCutover {
+    fn name(&self) -> &'static str {
+        "native-compatibility/target-island-cutover"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        Ok(ScenarioLaunchConfig {
+            binary_layout: ScenarioBinaryLayout {
+                frontend: ScenarioBinary::Primary,
+                backends: vec![
+                    ScenarioBinary::Primary,
+                    ScenarioBinary::Compatible,
+                    ScenarioBinary::Compatible,
+                ],
+            },
+            expected_eligible_backend_count: Some(REQUIRED_BACKENDS),
+            ..Default::default()
+        })
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        assert_island_ready(context, 200)?;
+        let mut target = context.launch_peer_cluster(
+            "target-island",
+            ScenarioLaunchConfig {
+                binary_layout: ScenarioBinaryLayout {
+                    frontend: ScenarioBinary::OtherIsland,
+                    backends: vec![ScenarioBinary::OtherIsland; REQUIRED_BACKENDS],
+                },
+                expected_eligible_backend_count: Some(REQUIRED_BACKENDS),
+                ..Default::default()
+            },
+        )?;
+        let result = (|| -> Result<()> {
+            let target_island =
+                target.frontend_management_get("/island-readyz", Duration::from_secs(5))?;
+            ensure!(
+                target_island.status == 200,
+                "target island is not ready: {target_island:?}"
+            );
+            let source_user = context.mysql_user().to_string();
+            let source_port = context.mysql_port();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let result = (|| -> Result<Vec<i64>> {
+                    let mut connection =
+                        mysql_actor::connect(&source_user, source_port, Duration::from_secs(30))?;
+                    connection
+                        .query("SELECT sleep(2)")
+                        .context("run source pre-cutover query")
+                })();
+                let _ = sender.send(result);
+            });
+            thread::sleep(Duration::from_millis(200));
+            context
+                .handle()
+                .begin_fe_drain()
+                .context("begin source FE drain after target island readiness")?;
+            let target_rows: Vec<i64> = mysql_actor::connect(
+                target.mysql_user(),
+                target.runtime().fe_mysql_port,
+                context.remaining("connect target post-cutover client")?,
+            )?
+            .query(BASELINE_QUERY)
+            .context("run new query on target island")?;
+            ensure!(
+                target_rows == vec![1, 2],
+                "target island query returned {target_rows:?}"
+            );
+            let source_rows = receiver
+                .recv_timeout(context.remaining("wait for source pre-cutover query")?)
+                .map_err(|error| {
+                    anyhow::anyhow!("source pre-cutover query did not finish: {error}")
+                })??;
+            ensure!(
+                source_rows.len() == 1,
+                "source pre-cutover query returned {source_rows:?}"
+            );
+            let deadline = context.deadline();
+            context.handle().wait_fe_exit_until(deadline)?;
+            context.action("target island became ready before source drain; new query went to target while source attempt completed locally");
+            Ok(())
+        })();
+        let cleanup = ServerHandle::shutdown(&mut target);
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("target cleanup also failed: {cleanup:#}")))
+            }
+        }
+    }
+}
+
+impl Scenario for IslandDrainAndReplacement {
+    fn name(&self) -> &'static str {
+        "native-compatibility/island-drain-and-replacement"
+    }
+
+    fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        Ok(ScenarioLaunchConfig {
+            binary_layout: ScenarioBinaryLayout {
+                frontend: ScenarioBinary::Primary,
+                backends: vec![
+                    ScenarioBinary::Primary,
+                    ScenarioBinary::Compatible,
+                    ScenarioBinary::OtherIsland,
+                ],
+            },
+            expected_eligible_backend_count: Some(2),
+            ..Default::default()
+        })
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        context
+            .handle()
+            .begin_be_drain(0)
+            .context("begin SIGTERM drain for first compatible BE")?;
+        wait_for_eligible_count(context, 1)?;
+        context
+            .handle()
+            .begin_be_drain(1)
+            .context("begin SIGTERM drain for second compatible BE")?;
+        wait_for_eligible_count(context, 0)?;
+        assert_base_and_island_readiness(context, 200, 503)?;
+        context.action("drained both compatible BEs: base readiness remained true while island readiness became false");
+
+        let compatible = context.compatible_binary()?;
+        let deadline = context.deadline();
+        context
+            .handle()
+            .restart_be_with_binary_until(2, compatible, 1, deadline)
+            .context("replace OtherIsland BE with compatible binary")?;
+        wait_for_eligible_count(context, 1)?;
+        assert_base_and_island_readiness(context, 200, 200)?;
+        run_distributed_queries(context, &[2])?;
+        context.action("replaced the OtherIsland BE with a same-island binary and recovered distributed query admission");
         Ok(())
     }
 }
@@ -339,6 +498,41 @@ fn assert_island_ready(context: &mut ScenarioContext, expected_status: u16) -> R
         response.body
     );
     Ok(())
+}
+
+fn assert_base_and_island_readiness(
+    context: &mut ScenarioContext,
+    base_status: u16,
+    island_status: u16,
+) -> Result<()> {
+    let timeout = context.remaining("query FE readiness")?;
+    let base = context
+        .handle()
+        .frontend_management_get("/readyz", timeout)?;
+    ensure!(
+        base.status == base_status,
+        "/readyz expected {base_status}, got {}",
+        base.status
+    );
+    assert_island_ready(context, island_status)
+}
+
+fn wait_for_eligible_count(context: &mut ScenarioContext, expected: usize) -> Result<()> {
+    loop {
+        let rows = context.handle().frontend_backend_topology()?;
+        if rows.iter().filter(|row| row.is_eligible_live()).count() == expected {
+            return Ok(());
+        }
+        if context
+            .remaining("wait for compatibility island count")
+            .is_err()
+        {
+            anyhow::bail!(
+                "timed out waiting for compatible eligible backend count {expected}; rows={rows:?}"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 fn run_distributed_queries(

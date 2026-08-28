@@ -146,6 +146,12 @@ impl ScenarioContext {
         self.handle.diagnostics()
     }
 
+    pub fn compatible_binary(&self) -> Result<PathBuf> {
+        self.compatible_binary
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("scenario requires --compatible-binary"))
+    }
+
     pub fn retain_artifacts(&mut self) {
         self.handle.retain_runtime_artifacts();
     }

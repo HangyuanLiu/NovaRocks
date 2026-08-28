@@ -1661,6 +1661,7 @@ fn wait_for_live_backend_topology(
     be_processes: &mut [ManagedProcess],
 ) -> Result<()> {
     let expected = wait.expected_eligible_backend_count;
+    let allow_drained_backend_exit = expected < wait.expected_ports.len();
     let host = "127.0.0.1";
     let port = wait.runtime.fe_mysql_port;
     let rows = wait_for_live_backend_topology_with(
@@ -1668,23 +1669,25 @@ fn wait_for_live_backend_topology(
         wait.expected_eligible_backend_count,
         wait.timeout,
         || {
-            process_runtime_diagnostics(
+            process_runtime_diagnostics_with_drained_backends(
                 fe_process,
                 be_processes,
                 wait.fe_config_path,
                 wait.be_config_paths,
                 wait.runtime,
+                allow_drained_backend_exit,
             )
         },
         |io_timeout| query_frontend_backend_topology(wait.mysql_user, host, port, io_timeout),
         thread::sleep,
     )?;
-    let diagnostics = process_runtime_diagnostics(
+    let diagnostics = process_runtime_diagnostics_with_drained_backends(
         fe_process,
         be_processes,
         wait.fe_config_path,
         wait.be_config_paths,
         wait.runtime,
+        allow_drained_backend_exit,
     )?;
     let build_identities = rows
         .iter()
@@ -3235,6 +3238,40 @@ impl CrossProcessServerHandle {
         get_frontend_management(self.runtime.fe_http_port, path, timeout)
     }
 
+    /// Replace one BE with an explicitly selected binary and wait for its new
+    /// process identity to enter the requested exact compatibility island.
+    /// This is a system-test-only launch control; the server still derives its
+    /// compatibility ID entirely from the selected binary.
+    pub fn restart_be_with_binary_until(
+        &mut self,
+        index: usize,
+        binary: PathBuf,
+        expected_eligible_backend_count: usize,
+        deadline: Instant,
+    ) -> Result<()> {
+        self.ensure_be_index(index)?;
+        if expected_eligible_backend_count > self.be_processes.len() {
+            bail!(
+                "replacement expected eligible count {expected_eligible_backend_count} exceeds cluster size {}",
+                self.be_processes.len()
+            );
+        }
+        self.be_binaries[index] = binary;
+        self.expected_eligible_backend_count = expected_eligible_backend_count;
+        ServerHandle::restart_be_until(self, index, deadline)
+    }
+
+    /// Begin a BE SIGTERM drain without synchronously reaping the process.
+    /// The caller may observe the FE membership transition before final
+    /// process cleanup, just as FE drain scenarios observe their own window.
+    #[cfg(unix)]
+    pub fn begin_be_drain(&mut self, index: usize) -> Result<()> {
+        self.ensure_be_index(index)?;
+        self.be_processes[index]
+            .request_termination()
+            .with_context(|| format!("send SIGTERM to cross-process BE[{index}]"))
+    }
+
     /// Keep generated config and logs when the handle is dropped.
     pub fn retain_runtime_artifacts(&mut self) {
         self.retain_runtime_artifacts = true;
@@ -4136,7 +4173,14 @@ impl ServerHandle for CrossProcessServerHandle {
         self.be_processes[index]
             .stop()
             .with_context(|| format!("send SIGTERM to cross-process BE[{index}]"))?;
-        let expected_eligible = self.be_processes.len().saturating_sub(1);
+        let expected_eligible = self
+            .be_processes
+            .iter()
+            .enumerate()
+            .filter(|(candidate, process)| {
+                *candidate != index && process.is_running().unwrap_or(false)
+            })
+            .count();
         loop {
             let rows = query_frontend_backend_topology(
                 &self.mysql_user,
@@ -4275,6 +4319,24 @@ fn process_runtime_diagnostics(
     be_config_paths: &[PathBuf],
     runtime: &CrossProcessRuntime,
 ) -> Result<String> {
+    process_runtime_diagnostics_with_drained_backends(
+        fe_process,
+        be_processes,
+        fe_config_path,
+        be_config_paths,
+        runtime,
+        false,
+    )
+}
+
+fn process_runtime_diagnostics_with_drained_backends(
+    fe_process: &mut ManagedProcess,
+    be_processes: &mut [ManagedProcess],
+    fe_config_path: &Path,
+    be_config_paths: &[PathBuf],
+    runtime: &CrossProcessRuntime,
+    allow_drained_backend_exit: bool,
+) -> Result<String> {
     if be_processes.len() != runtime.be.len() || be_config_paths.len() != runtime.be.len() {
         bail!(
             "cross-process diagnostic cardinality mismatch: processes={} configs={} endpoints={}",
@@ -4310,8 +4372,12 @@ fn process_runtime_diagnostics(
         ) {
             Ok(diagnostic) => diagnostics.push(diagnostic),
             Err(error) => {
-                exited = true;
-                diagnostics.push(format!("{error:#}"));
+                if allow_drained_backend_exit {
+                    diagnostics.push(format!("drained {error:#}"));
+                } else {
+                    exited = true;
+                    diagnostics.push(format!("{error:#}"));
+                }
             }
         }
     }
