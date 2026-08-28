@@ -237,8 +237,11 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
         expected.binding().incarnation()
     );
     assert_eq!(
-        typed.prepared.table_scan.table().catalog().incarnation(),
-        expected.binding().incarnation().to_bytes()
+        typed.prepared.table_scan.table().catalog(),
+        expected
+            .binding()
+            .catalog_handle()
+            .expect("fixture lease carries a catalog handle")
     );
 }
 

@@ -26,7 +26,8 @@ mod handle;
 mod scheduling;
 mod table_scan;
 
-pub(crate) use handle::{CatalogHandle, Split, TableHandle};
+pub(crate) use handle::{Split, TableHandle};
+pub(crate) use novarocks_spi::connector::CatalogHandle;
 pub(crate) use scheduling::{
     PlanNodeAssignmentState, ScheduledSplit, SplitAssignment, SplitAssignmentError,
     SplitSequenceAllocator, TaskUpdateRequest,

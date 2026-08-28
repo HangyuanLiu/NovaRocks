@@ -430,10 +430,10 @@ impl ScanExecutionBindings {
 
     /// Record one typed connector scan.
     ///
-    /// The owner check is the same rule the opaque carrier enforced: a scan
-    /// frozen against one control generation may never be installed under
-    /// another, so the relation's catalog identity must be exactly the
-    /// declaration's binding key.
+    /// A catalog handle is content identity, while the legacy declaration is
+    /// still a control-generation transport key during the hard cut. They
+    /// must at least name the same catalog; the latter is validated by the
+    /// planning lease before this scan is prepared.
     pub(crate) fn insert_typed_scan(
         &mut self,
         fragment_id: FragmentId,
@@ -447,16 +447,10 @@ impl ScanExecutionBindings {
         }
         let binding_key = scan.declaration.binding_key();
         let catalog = scan.prepared.table_scan.table().catalog();
-        if catalog.instance_id() != binding_key.instance_id.as_str() {
+        if catalog.catalog_name() != &binding_key.instance_id {
             return Err(format!(
                 "typed connector scan fragment_id={fragment_id} node_id={node_id} names catalog '{}' but its declaration binds instance '{}'",
-                catalog.instance_id(),
-                binding_key.instance_id.as_str()
-            ));
-        }
-        if catalog.incarnation() != binding_key.incarnation.to_bytes() {
-            return Err(format!(
-                "typed connector scan fragment_id={fragment_id} node_id={node_id} names another incarnation of instance '{}' than its declaration",
+                catalog.catalog_name().as_str(),
                 binding_key.instance_id.as_str()
             ));
         }

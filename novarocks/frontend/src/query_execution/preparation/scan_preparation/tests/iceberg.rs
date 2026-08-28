@@ -90,7 +90,13 @@ fn a_pinned_cohort_read_freezes_the_relation_the_provider_named() {
         novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table
     );
     assert_eq!(
-        typed.prepared.table_scan.table().catalog().instance_id(),
+        typed
+            .prepared
+            .table_scan
+            .table()
+            .catalog()
+            .catalog_name()
+            .as_str(),
         "test_catalog",
         "the SPI relation remains bound to the cohort's admitted catalog"
     );
@@ -115,7 +121,13 @@ fn an_ordinary_iceberg_scan_lowers_to_a_typed_data_relation() {
         novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table
     );
     assert_eq!(
-        typed.prepared.table_scan.table().catalog().instance_id(),
+        typed
+            .prepared
+            .table_scan
+            .table()
+            .catalog()
+            .catalog_name()
+            .as_str(),
         typed.declaration.binding_key().instance_id.as_str(),
         "the frozen relation and its declaration name one generation"
     );

@@ -548,6 +548,7 @@ fn prepare_typed_connector_scan(
         physical_columns,
         facts,
         &materialization.planning_lease,
+        &materialization.catalog_handle,
         materialization.table.owner(),
         &relation,
         freeze.clone(),
@@ -592,6 +593,10 @@ fn prepare_typed_pinned_file_set_scan(
         physical_columns,
         facts,
         &read.planning_lease,
+        read.planning_lease
+            .binding()
+            .catalog_handle()
+            .map_err(|error| error.to_string())?,
         &read.owner,
         &relation,
         TypedRelationFreeze::PinnedFileSet(&read.pinned),
@@ -638,6 +643,10 @@ fn prepare_typed_table_execute_scan(
         physical_columns,
         facts,
         &read.planning_lease,
+        read.planning_lease
+            .binding()
+            .catalog_handle()
+            .map_err(|error| error.to_string())?,
         &read.owner,
         &relation,
         TypedRelationFreeze::TableExecute(
@@ -695,6 +704,7 @@ fn prepare_typed_relation_scan(
     physical_columns: &[ResolvedScanColumn],
     facts: &SqlScanPreparationFacts,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    catalog_handle: &CatalogHandle,
     source_owner: &novarocks_spi::connector::ConnectorInstanceId,
     relation: &SchemaTableName,
     freeze: TypedRelationFreeze<'_>,
@@ -709,6 +719,11 @@ fn prepare_typed_relation_scan(
             "typed connector scan node_id={node_id} has a table handle owned by another instance than its planning lease"
         ));
     }
+    if catalog_handle.catalog_name() != &binding.descriptor().instance_id {
+        return Err(format!(
+            "typed connector scan node_id={node_id} has a catalog handle owned by another instance than its planning lease"
+        ));
+    }
     let binding_key = ConnectorExecutionBindingKey {
         instance_id: binding.descriptor().instance_id.clone(),
         incarnation: binding.incarnation(),
@@ -721,13 +736,9 @@ fn prepare_typed_relation_scan(
     let declaration = binding
         .execution_declaration(context)
         .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
-    let catalog = CatalogHandle::new(
-        binding_key.instance_id.as_str(),
-        binding_key.incarnation.to_bytes(),
-    );
     let prepared = prepare_typed_scan(
         &typed.session,
-        catalog,
+        catalog_handle.clone(),
         &control,
         node_id,
         scan,
