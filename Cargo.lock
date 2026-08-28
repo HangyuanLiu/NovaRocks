@@ -3571,8 +3571,11 @@ dependencies = [
  "novarocks-cluster-harness",
  "novarocks-connector-iceberg",
  "novarocks-native-trust",
+ "novarocks-proto-models",
  "novarocks-secret",
  "novarocks-types",
+ "novarocks-version",
+ "prost 0.13.5",
  "tokio",
  "tonic",
 ]
