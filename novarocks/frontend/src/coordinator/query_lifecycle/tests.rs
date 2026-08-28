@@ -3182,8 +3182,10 @@ async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unkn
     ));
     assert!(error.is_unknown_init_outcome());
 
-    let _ = shutdown_tx.send(());
-    server.await.expect("join live lifecycle server");
+    drop(transport);
+    drop(shutdown_tx);
+    server.abort();
+    tokio::task::yield_now().await;
 }
 
 fn live_init_request(
