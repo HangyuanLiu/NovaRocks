@@ -750,7 +750,7 @@ impl ConnectorStagedCreateLease {
     /// writer fence came from one provider generation, without exposing that
     /// provider-generation key to FE effect orchestration.
     pub fn matches_write_lease(&self, write_lease: &ConnectorWriteLease) -> bool {
-        write_lease.binding_key() == &self.provider_binding_key
+        write_lease.matches_provider_binding_key(&self.provider_binding_key)
     }
 
     /// Constructs the provider-private prepare carrier from facts already

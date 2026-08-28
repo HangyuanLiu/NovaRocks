@@ -147,7 +147,7 @@ impl ConnectorWriteManifest {
         lease: ConnectorWriteLease,
         mut request: ConnectorWritePlanningRequest,
     ) -> Result<ConnectorWritePlanAttachment, ConnectorError> {
-        if lease.binding_key() != &self.owner {
+        if !lease.matches_provider_binding_key(&self.owner) {
             return Err(invalid(
                 "connector write lease does not match the frozen writer manifest generation",
             ));
@@ -174,7 +174,7 @@ impl ConnectorWriteManifest {
         // state while retaining an otherwise exact generation lease.
         let context = request.context.clone();
         let catalog_properties = lease.catalog_properties().cloned();
-        let plan = lease.control().plan_write(request)?;
+        let plan = lease.plan_write(request)?;
         validate_returned_plan(self, &plan)?;
         Ok(ConnectorWritePlanAttachment {
             manifest: self.clone(),
@@ -257,13 +257,6 @@ impl ConnectorWritePlanAttachment {
 
     pub fn descriptor(&self) -> &ConnectorWriteCohortDescriptor {
         &self.descriptor
-    }
-
-    /// The exact FE control capability retained from placement through the
-    /// terminal commit/abort decision. This intentionally exposes no registry
-    /// lookup, so a newer incarnation cannot take over the operation.
-    pub fn control(&self) -> &std::sync::Arc<dyn novarocks_spi::connector::ConnectorWriteControl> {
-        self._lease.control()
     }
 }
 

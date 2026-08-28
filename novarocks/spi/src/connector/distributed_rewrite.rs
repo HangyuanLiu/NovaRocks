@@ -920,6 +920,7 @@ impl ConnectorDistributedRewriteLease {
         let catalog_properties = self.planning_lease.binding().catalog_properties()?.clone();
         let retained = self.clone();
         ConnectorWriteLease::new_with_execution_distribution(
+            self.control_runtime_id,
             self.provider_binding_key.clone(),
             self.write.clone(),
             self.descriptor.provider_id.clone(),

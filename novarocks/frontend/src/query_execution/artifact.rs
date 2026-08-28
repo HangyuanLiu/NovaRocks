@@ -2356,6 +2356,7 @@ mod tests {
         let control: Arc<dyn ConnectorWriteControl> =
             Arc::new(TestWriteControl { key: owner.clone() });
         let lease = ConnectorWriteLease::new_with_execution_distribution(
+            novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             owner.clone(),
             control,
             novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),

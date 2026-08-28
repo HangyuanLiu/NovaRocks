@@ -791,6 +791,7 @@ impl ConnectorControlHost {
         };
         let state = Arc::downgrade(&self.state);
         ConnectorWriteLease::new_with_execution_distribution(
+            runtime_id,
             legacy_key,
             write,
             provider_id,

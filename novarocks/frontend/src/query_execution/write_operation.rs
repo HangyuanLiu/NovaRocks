@@ -95,7 +95,7 @@ impl ConnectorWriteOperationSession {
         lease: ConnectorWriteLease,
     ) -> Result<Self, ConnectorError> {
         let operation_id = registration.operation_id();
-        if registration.owner() != lease.binding_key() {
+        if !lease.matches_provider_binding_key(registration.owner()) {
             return Err(invalid(
                 "connector write operation registration does not match the exact write lease",
             ));
@@ -110,7 +110,7 @@ impl ConnectorWriteOperationSession {
                 "connector write operation registration does not retain the supplied exact lease generation",
             ));
         }
-        let owner = lease.binding_key().clone();
+        let owner = registration.owner().clone();
         let mut cohorts = BTreeMap::new();
         let sealed = registration.sealed_cohorts()?;
         let mut context = None;
@@ -251,7 +251,7 @@ impl ConnectorWriteOperationSession {
             }
             request
         };
-        match self.inner.lease.control().abort(request)? {
+        match self.inner.lease.abort(request)? {
             ConnectorWriteAbortOutcome::KnownUncommitted { .. } => Ok(()),
             ConnectorWriteAbortOutcome::KnownCommitted { .. } => Err(invalid(
                 "connector provider reported a known-empty operation already committed",
@@ -539,7 +539,7 @@ impl ConnectorWriteOperationSession {
             completion,
             context,
         };
-        self.inner.lease.control().commit(request)
+        self.inner.lease.commit(request)
     }
 
     pub fn abort(
@@ -576,7 +576,7 @@ impl ConnectorWriteOperationSession {
             }
             request
         };
-        self.inner.lease.control().abort(request)
+        self.inner.lease.abort(request)
     }
 
     pub fn reconcile(
@@ -604,7 +604,7 @@ impl ConnectorWriteOperationSession {
             evidence,
             context,
         };
-        self.inner.lease.control().reconcile(request)
+        self.inner.lease.reconcile(request)
     }
 
     /// One same-session, read-only publication adjudication for ordinary DML.
@@ -1001,6 +1001,7 @@ mod tests {
             abort_calls,
         });
         ConnectorWriteLease::new_with_execution_distribution(
+            novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             key.clone(),
             control,
             novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),
@@ -1025,6 +1026,7 @@ mod tests {
             abort_calls: Arc::new(AtomicUsize::new(0)),
         });
         let lease = ConnectorWriteLease::new_with_execution_distribution(
+            novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             key.clone(),
             control,
             novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),

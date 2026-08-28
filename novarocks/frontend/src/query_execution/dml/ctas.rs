@@ -929,23 +929,22 @@ impl CtasWriteTarget for CoreStandardCtasTargetSession {
             input_schema: Arc::clone(&input_schema),
             context,
         })?;
-        let outcome =
-            self.write_lease
-                .control()
-                .prepare_write(ConnectorWritePreparationRequest {
-                    table: binding.table().clone(),
-                    target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-                    intent: binding.intent(),
-                    purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-                    input: ConnectorWriteInputRequest::Data {
-                        fields: input_schema
-                            .fields()
-                            .iter()
-                            .map(|field| ConnectorWriteFieldRequest::new(field.as_ref().clone()))
-                            .collect(),
-                    },
-                    context: binding.context().clone(),
-                })?;
+        let outcome = self
+            .write_lease
+            .prepare_write(ConnectorWritePreparationRequest {
+                table: binding.table().clone(),
+                target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+                intent: binding.intent(),
+                purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                input: ConnectorWriteInputRequest::Data {
+                    fields: input_schema
+                        .fields()
+                        .iter()
+                        .map(|field| ConnectorWriteFieldRequest::new(field.as_ref().clone()))
+                        .collect(),
+                },
+                context: binding.context().clone(),
+            })?;
         let preparation = match outcome {
             ConnectorWritePreparationOutcome::Prepared(preparation) => preparation,
             ConnectorWritePreparationOutcome::Denied(error) => return Err(error),

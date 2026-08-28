@@ -254,7 +254,7 @@ impl ConnectorWritePlanningTemplate {
         lease: ConnectorWriteLease,
     ) -> Result<Self, ConnectorError> {
         activation.validate()?;
-        if activation.owner() != lease.binding_key() {
+        if !lease.matches_provider_binding_key(activation.owner()) {
             return Err(ConnectorError::new(
                 novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
                 "activated connector write cohort does not match its exact write lease",

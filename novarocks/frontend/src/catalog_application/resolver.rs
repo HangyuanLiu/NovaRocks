@@ -187,7 +187,7 @@ pub fn iceberg_connector_table_handle(
 ) -> Result<ConnectorTableHandle, String> {
     let instance_id = ConnectorInstanceId::parse(&target.catalog)
         .map_err(|error| format!("invalid Iceberg connector instance ID: {error}"))?;
-    if exact_lease.binding_key().instance_id != instance_id {
+    if !exact_lease.matches_provider_instance(&instance_id) {
         return Err("Iceberg write lease does not match the target connector instance".to_string());
     }
     let metadata = exact_lease

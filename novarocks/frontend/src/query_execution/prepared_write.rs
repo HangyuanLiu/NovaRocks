@@ -114,7 +114,7 @@ impl PreparedDistributedWriteRequest {
                 "prepared connector write mapping does not exactly cover registered cohorts",
             ));
         }
-        if registration.owner() != lease.binding_key() {
+        if !lease.matches_provider_binding_key(registration.owner()) {
             return Err(DistributedQueryError::new(
                 crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
                 "prepared connector write request registration does not match its retained lease",

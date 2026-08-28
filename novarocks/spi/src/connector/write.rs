@@ -31,10 +31,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    CatalogHandle, CatalogProperties, ConnectorCommittedVersion, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorExecutionDistribution, ConnectorMutationFailure, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableObjectId,
+    CatalogHandle, CatalogProperties, ConnectorCommittedVersion, ConnectorControlRuntimeId,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorMutationFailure,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ConnectorTableObjectId,
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
     LakePublicationFamily, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
@@ -3485,7 +3485,14 @@ pub trait ConnectorWriteControl: Send + Sync {
 
 #[derive(Clone)]
 pub struct ConnectorWriteLease {
-    binding_key: ConnectorExecutionBindingKey,
+    /// FE-local effect owner.  This identity never crosses the native BE
+    /// boundary and is deliberately independent of the BE-visible catalog
+    /// handle and the provider-private generation key below.
+    control_runtime_id: ConnectorControlRuntimeId,
+    /// Provider-private proof used only to validate opaque provider facts.
+    /// Frontend application code must use `control_runtime_id` for ownership;
+    /// it must not select a provider generation directly.
+    provider_binding_key: ConnectorExecutionBindingKey,
     /// Exact immutable BE runtime materialization input. This remains separate
     /// from the FE effect-generation key that fences commit/abort.
     catalog_properties: Option<CatalogProperties>,
@@ -3506,6 +3513,24 @@ impl ConnectorWriteLease {
         control: Arc<dyn ConnectorWriteControl>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
+        Self::new_with_control_runtime_id(
+            ConnectorControlRuntimeId::new(),
+            binding_key,
+            control,
+            release,
+        )
+    }
+
+    /// Construct a lease with an already-frozen FE control-runtime owner.
+    /// Production acquisition paths must use this constructor (or the
+    /// execution-distribution variant); `new` is retained for isolated
+    /// provider-conformance fixtures only.
+    pub fn new_with_control_runtime_id(
+        control_runtime_id: ConnectorControlRuntimeId,
+        binding_key: ConnectorExecutionBindingKey,
+        control: Arc<dyn ConnectorWriteControl>,
+        release: impl FnOnce() + Send + Sync + 'static,
+    ) -> Result<Self, ConnectorError> {
         if control.binding_key() != &binding_key {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -3513,7 +3538,8 @@ impl ConnectorWriteLease {
             ));
         }
         Ok(Self {
-            binding_key,
+            control_runtime_id,
+            provider_binding_key: binding_key,
             catalog_properties: None,
             control,
             execution_provider_id: None,
@@ -3530,20 +3556,50 @@ impl ConnectorWriteLease {
     /// callers must use this constructor; the narrower `new` remains useful
     /// for isolated control-only conformance tests.
     pub fn new_with_execution_distribution(
+        control_runtime_id: ConnectorControlRuntimeId,
         binding_key: ConnectorExecutionBindingKey,
         control: Arc<dyn ConnectorWriteControl>,
         execution_provider_id: ConnectorProviderId,
         execution_distribution: Arc<dyn ConnectorExecutionDistribution>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
-        let mut lease = Self::new(binding_key, control, release)?;
+        let mut lease =
+            Self::new_with_control_runtime_id(control_runtime_id, binding_key, control, release)?;
         lease.execution_provider_id = Some(execution_provider_id);
         lease.execution_distribution = Some(execution_distribution);
         Ok(lease)
     }
 
-    pub fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-        &self.binding_key
+    /// Return the FE-local effect owner retained by this exact lease.
+    pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
+        self.control_runtime_id
+    }
+
+    /// Validate a provider-signed legacy fact without exposing the provider
+    /// generation as an FE effect owner.
+    pub fn matches_provider_binding_key(&self, key: &ConnectorExecutionBindingKey) -> bool {
+        key == &self.provider_binding_key
+    }
+
+    /// Validate a provider table handle without exposing an incarnation.
+    pub fn matches_provider_instance(&self, instance_id: &super::ConnectorInstanceId) -> bool {
+        instance_id == &self.provider_binding_key.instance_id
+    }
+
+    /// Return the provider instance name for FE-local identity construction.
+    /// This deliberately does not disclose the provider incarnation.
+    pub fn provider_instance_id(&self) -> &super::ConnectorInstanceId {
+        &self.provider_binding_key.instance_id
+    }
+
+    /// Validate a pre-ready proof against this lease's private provider
+    /// generation without requiring its caller to observe that generation.
+    pub fn validate_pre_ready_write_planning_proof(
+        &self,
+        proof: &ConnectorPreReadyWritePlanningProof,
+        request: &ConnectorPreReadyWritePlanningRequest,
+    ) -> Result<(), ConnectorError> {
+        proof.validates(&self.provider_binding_key, request)
     }
 
     /// Attach the desired-state-frozen runtime input retained by the FE
@@ -3553,7 +3609,7 @@ impl ConnectorWriteLease {
         mut self,
         catalog_properties: CatalogProperties,
     ) -> Result<Self, ConnectorError> {
-        if catalog_properties.handle().catalog_name() != &self.binding_key.instance_id {
+        if catalog_properties.handle().catalog_name() != &self.provider_binding_key.instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "write catalog properties do not match the effect generation owner",
@@ -3567,19 +3623,109 @@ impl ConnectorWriteLease {
         self.catalog_properties.as_ref()
     }
 
-    pub fn control(&self) -> &Arc<dyn ConnectorWriteControl> {
-        &self.control
+    /// Call provider admission only after validating that the table handle
+    /// belongs to this lease's private provider generation.
+    pub fn prepare_write(
+        &self,
+        request: ConnectorWritePreparationRequest,
+    ) -> Result<ConnectorWritePreparationOutcome, ConnectorError> {
+        request.validate(&self.provider_binding_key)?;
+        let outcome = self.control.prepare_write(request)?;
+        if let ConnectorWritePreparationOutcome::Prepared(preparation) = &outcome {
+            preparation.validate()?;
+            if preparation.owner() != &self.provider_binding_key {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "connector write preparation does not retain the exact lease generation",
+                ));
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Plan an exact write through the retained provider capability.
+    pub fn plan_write(
+        &self,
+        request: ConnectorWritePlanningRequest,
+    ) -> Result<ConnectorWritePlan, ConnectorError> {
+        request.validate(&self.provider_binding_key)?;
+        let plan = self.control.plan_write(request)?;
+        if plan.owner() != &self.provider_binding_key {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector write plan does not retain the exact lease generation",
+            ));
+        }
+        Ok(plan)
+    }
+
+    /// Submit a provider terminal commit through the exact retained lease.
+    pub fn commit(
+        &self,
+        request: ConnectorWriteCommitRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        if request.owner() != &self.provider_binding_key {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write commit does not match the exact lease generation",
+            ));
+        }
+        self.control.commit(request)
+    }
+
+    /// Submit a provider terminal abort through the exact retained lease.
+    pub fn abort(
+        &self,
+        request: ConnectorWriteAbortRequest,
+    ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+        if request.owner != self.provider_binding_key {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write abort does not match the exact lease generation",
+            ));
+        }
+        self.control.abort(request)
+    }
+
+    /// Build and submit an abort for an activated but unplanned write using
+    /// the provider-private owner retained by this lease.
+    pub fn abort_activated(
+        &self,
+        sealed: ConnectorSealedWriteCohortSet,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+        let request = ConnectorWriteAbortRequest::try_new(
+            self.provider_binding_key.clone(),
+            sealed,
+            Vec::new(),
+            context,
+        )?;
+        self.abort(request)
+    }
+
+    /// Submit a provider reconciliation through the exact retained lease.
+    pub fn reconcile(
+        &self,
+        request: ConnectorWriteReconcileRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        if request.owner != self.provider_binding_key {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write reconciliation does not match the exact lease generation",
+            ));
+        }
+        self.control.reconcile(request)
     }
 
     pub fn prepare_row_mutation(
         &self,
         request: super::ConnectorRowMutationPreparationRequest,
     ) -> Result<super::ConnectorRowMutationPreparationOutcome, ConnectorError> {
-        request.validate(&self.binding_key)?;
+        request.validate(&self.provider_binding_key)?;
         let outcome = self.control.prepare_row_mutation(request)?;
         if let super::ConnectorRowMutationPreparationOutcome::Prepared(preparation) = &outcome {
             preparation.validate()?;
-            if preparation.owner() != &self.binding_key {
+            if preparation.owner() != &self.provider_binding_key {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::CorruptData,
                     "row-mutation preparation does not retain the lease generation",
@@ -3593,10 +3739,10 @@ impl ConnectorWriteLease {
         &self,
         request: ConnectorManagedPartitionSpecPreviewRequest,
     ) -> Result<ConnectorManagedPartitionSpecPreview, ConnectorError> {
-        request.validate(&self.binding_key)?;
+        request.validate(&self.provider_binding_key)?;
         let operation_id = request.operation_id();
         let preview = self.control.preview_managed_partition_spec(request)?;
-        preview.validate_for_request(&self.binding_key, operation_id)?;
+        preview.validate_for_request(&self.provider_binding_key, operation_id)?;
         Ok(preview)
     }
 
@@ -3604,14 +3750,14 @@ impl ConnectorWriteLease {
         &self,
         request: super::ConnectorRowMutationActivationRequest,
     ) -> Result<super::ConnectorRowMutationExecutionPlan, ConnectorError> {
-        request.validate(&self.binding_key)?;
+        request.validate(&self.provider_binding_key)?;
         let expected_request = request.clone();
         let preparation = request.preparation().clone();
         let plan = self.control.activate_row_mutation(request)?;
         let contract = preparation.match_contract();
         for route in plan.routes() {
             route.validate()?;
-            if route.preparation().owner() != &self.binding_key {
+            if route.preparation().owner() != &self.provider_binding_key {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::CorruptData,
                     "row-mutation route preparation does not retain the lease generation",
@@ -3649,7 +3795,7 @@ impl ConnectorWriteLease {
                 ));
             }
         }
-        plan.validate_against_activation(&expected_request, &self.binding_key)?;
+        plan.validate_against_activation(&expected_request, &self.provider_binding_key)?;
         Ok(plan)
     }
 
@@ -3657,11 +3803,11 @@ impl ConnectorWriteLease {
         &self,
         request: ConnectorWriteActivationRequest,
     ) -> Result<ConnectorWriteActivation, ConnectorError> {
-        let source_digest = request.validate(&self.binding_key)?;
+        let source_digest = request.validate(&self.provider_binding_key)?;
         let operation_id = request.operation_id;
         let activation = self.control.activate_write(request)?;
         activation.validate()?;
-        if activation.owner() != &self.binding_key
+        if activation.owner() != &self.provider_binding_key
             || activation.operation_id() != operation_id
             || activation.source_digest() != source_digest
         {
@@ -3677,11 +3823,11 @@ impl ConnectorWriteLease {
         &self,
         request: ConnectorPreReadyWritePlanningRequest,
     ) -> Result<ConnectorPreReadyWritePlanningProof, ConnectorError> {
-        request.validate(&self.binding_key)?;
+        request.validate(&self.provider_binding_key)?;
         let proof = self
             .control
             .certify_pre_ready_write_planning(request.clone())?;
-        proof.validates(&self.binding_key, &request)?;
+        proof.validates(&self.provider_binding_key, &request)?;
         Ok(proof)
     }
 
@@ -3689,7 +3835,9 @@ impl ConnectorWriteLease {
     /// Clones of one lease compare equal here; independently-derived leases
     /// compare equal only when they retain the same exact control capability.
     pub fn retains_same_generation(&self, other: &Self) -> bool {
-        self.binding_key == other.binding_key && Arc::ptr_eq(&self.control, &other.control)
+        self.provider_binding_key == other.provider_binding_key
+            && self.control_runtime_id == other.control_runtime_id
+            && Arc::ptr_eq(&self.control, &other.control)
     }
 
     /// Retain metadata from the same control generation as this writer.
@@ -3735,7 +3883,7 @@ impl ConnectorWriteLease {
         })?;
         let declaration = distribution.declaration(context)?;
         let key = declaration.binding_key();
-        if declaration.provider_id() != provider_id.as_str() || key != &self.binding_key {
+        if declaration.provider_id() != provider_id.as_str() || key != &self.provider_binding_key {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector write declaration does not match its retained binding generation",

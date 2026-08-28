@@ -1311,7 +1311,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         registration: ConnectorWriteOperationRegistration,
         lease: ConnectorWriteLease,
     ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
-        if registration.owner() != lease.binding_key() {
+        if !lease.matches_provider_binding_key(registration.owner()) {
             return Err(failed(
                 "connector write registration does not match caller-retained lease",
             ));

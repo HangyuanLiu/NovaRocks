@@ -646,7 +646,7 @@ fn prepare_frontend_first_refresh_write(
     let write_lease = planning_lease
         .derive_write_lease()
         .map_err(|error| format!("derive MV first-refresh write lease: {error}"))?;
-    if write_lease.binding_key() != &observed_binding {
+    if !write_lease.matches_provider_binding_key(&observed_binding) {
         return Err(
             "MV first-refresh target connector generation changed during admission".to_string(),
         );

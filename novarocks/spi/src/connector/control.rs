@@ -900,6 +900,7 @@ impl ConnectorControlPlanningLease {
         let key = write.binding_key().clone();
         let retained_planning_lease = self.clone();
         ConnectorWriteLease::new_with_execution_distribution(
+            self.control_runtime_id(),
             key,
             write,
             provider_id,
