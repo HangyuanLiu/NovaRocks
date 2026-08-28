@@ -37,9 +37,8 @@ use novarocks_execution::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
 use novarocks_execution::runtime::profile::Profiler;
-use novarocks_proto_codec::connector::AdmittedConnectorExecutionDeclaration;
 use novarocks_proto_codec::lifecycle::{QueryExecutionId, StageFragment};
-use novarocks_spi::connector::{ConnectorExecutionBindingKey, WriteCommitEvidenceLimits};
+use novarocks_spi::connector::WriteCommitEvidenceLimits;
 use tracing::error;
 
 use super::control::{FragmentControlHandle, FragmentControlRegistry};
@@ -956,21 +955,6 @@ impl NativeFragmentService {
 }
 
 impl NativeFragmentIngress for NativeFragmentService {
-    fn ensure_connector_execution_binding(
-        &self,
-        execution_id: QueryExecutionId,
-        declaration: AdmittedConnectorExecutionDeclaration,
-    ) -> novarocks_proto_codec::provider::EnsureConnectorExecutionBindingResult {
-        self.execution_host.ensure(execution_id, &declaration)
-    }
-
-    fn retire_connector_execution_binding(
-        &self,
-        key: ConnectorExecutionBindingKey,
-    ) -> novarocks_proto_codec::provider::RetireConnectorExecutionBindingResult {
-        self.execution_host.retire(&key)
-    }
-
     fn cancel(
         &self,
         request: NativeFragmentCancelRequest,
