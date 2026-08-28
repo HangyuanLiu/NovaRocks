@@ -23,7 +23,7 @@ use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
 use novarocks_proto_codec::lifecycle::{
-    AttemptId, ParticipantBackendIdentity, ParticipantManifest,
+    AttemptId, ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,
     ParticipantTerminalOutcome as ProtocolParticipantTerminalOutcome, QueryAbortRequest,
     QueryControlAttach, QueryControlEndpoint, QueryExecutionId, QueryInitOutcome, QueryInitRequest,
     QueryOptions, QueryStageOutcome, QueryStageRequest, QueryStartOutcome, QueryStartRequest,
@@ -1114,6 +1114,79 @@ fn stage_and_start_are_idempotent_after_control_ready() {
     assert_eq!(
         registry.start_prepared_query(start).outcome(),
         QueryStartOutcome::AlreadyStarted
+    );
+}
+
+#[test]
+fn exchange_route_becomes_authorized_only_after_stage_and_revokes_on_abort() {
+    let source = UniqueId::new(18, 1);
+    let destination = UniqueId::new(18, 2);
+    let execution_id = execution_id(1_803, ATTEMPT_1);
+    let manifest = ParticipantManifest::new(
+        execution_id,
+        ParticipantBackendIdentity::new(
+            local_process_id(),
+            QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
+        )
+        .expect("valid backend identity"),
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+        [protocol_unique_id(destination)],
+        default_query_options(),
+        10_000,
+        [ExchangeRouteManifest::new(
+            protocol_unique_id(source),
+            protocol_unique_id(destination),
+            77,
+            0,
+            1,
+        )
+        .expect("valid exchange route")],
+        None,
+        Duration::from_secs(30),
+        QueryControlEndpoint::new("127.0.0.1", 9031).expect("valid report endpoint"),
+    )
+    .expect("valid participant manifest");
+    let request = QueryInitRequest::from_manifest(manifest);
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+
+    assert_eq!(
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("init acknowledgement"),
+        QueryInitOutcome::QueryInitApplied
+    );
+    assert!(
+        registry
+            .authorize_exchange(destination, 77, source, 0, 1)
+            .is_err()
+    );
+
+    let _control = attach_control(&registry, &request);
+    let stage = stage_request(&request, 4, &[destination]);
+    assert_eq!(
+        registry.stage_fragments(stage).outcome(),
+        QueryStageOutcome::Applied
+    );
+    registry
+        .authorize_exchange(destination, 77, source, 0, 1)
+        .expect("staged route is authorized");
+
+    registry
+        .abort_query(QueryAbortRequest::new(
+            execution_id,
+            request
+                .manifest()
+                .expect("manifest")
+                .digest()
+                .expect("digest"),
+            "test abort",
+        ))
+        .expect("abort accepted");
+    assert!(
+        registry
+            .authorize_exchange(destination, 77, source, 0, 1)
+            .is_err()
     );
 }
 
