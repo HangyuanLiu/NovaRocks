@@ -34,6 +34,7 @@ use novarocks_proto_codec::lifecycle::{
     QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationAck,
     QueryTerminationReason, StageDigest, StageDigestVersion, TerminalOutcomeContentId,
 };
+use novarocks_spi::connector::CatalogProperties;
 use novarocks_types::{
     BackendProcessId, LocalQuerySequence, NativeCompatibilityId, QueryIdAttribution,
     QueryProcessNamespace, UniqueId,
@@ -41,7 +42,9 @@ use novarocks_types::{
 use prost::Message;
 use tracing::{info, warn};
 
-use super::entry::{ImmutableQueryTerminalRecord, QueryLifecycleEntry, QueryLifecyclePhase};
+use super::entry::{
+    ImmutableQueryTerminalRecord, QueryCatalogLoadState, QueryLifecycleEntry, QueryLifecyclePhase,
+};
 use super::{
     BackendQueryControl, QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
     QueryLifecycleIngress, QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
@@ -186,6 +189,22 @@ fn protocol_contract_error(error: novarocks_proto_codec::ProtocolError) -> Query
     QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
 }
 
+fn safe_catalog_failure_detail(value: &str) -> String {
+    let mut end = value.len().min(512);
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let value = value[..end]
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    if value.is_empty() {
+        "catalog materialization failed".to_owned()
+    } else {
+        value
+    }
+}
+
 /// Protocol wrappers have already passed structural validation at native
 /// ingress.  Backend uses this boundary helper only to make that invariant
 /// explicit while deriving BE-local routing IDs from generated values.
@@ -222,18 +241,44 @@ fn protocol_control_event(
     .expect("Backend-generated query control event satisfies the Protocol contract")
 }
 
-fn control_ready_event() -> QueryControlEvent {
+fn control_ready_event(catalog_load: &QueryCatalogLoadState) -> QueryControlEvent {
     use novarocks_proto_models::{catalog, novarocks as wire};
+    let state = match catalog_load {
+        QueryCatalogLoadState::Ready => {
+            catalog::catalog_load_state::State::Ready(catalog::CatalogReady {})
+        }
+        QueryCatalogLoadState::Loading { .. } => {
+            catalog::catalog_load_state::State::Loading(catalog::CatalogLoading {})
+        }
+        QueryCatalogLoadState::Failed { safe_detail } => {
+            catalog::catalog_load_state::State::Failed(catalog::CatalogLoadFailed {
+                reason: catalog::CatalogLoadFailureReason::InstallFailed as i32,
+                safe_detail: safe_detail.clone(),
+                safe_field_path: None,
+            })
+        }
+    };
     protocol_control_event(wire::query_control_response::Event::ControlReady(
         wire::QueryControlReady {
-            // CatalogManager is connected in the lifecycle owner slice. Until
-            // then every currently supported manifest carries the validated
-            // empty contribution and is immediately ready.
-            catalog_load_state: Some(catalog::CatalogLoadState {
-                state: Some(catalog::catalog_load_state::State::Ready(
-                    catalog::CatalogReady {},
-                )),
-            }),
+            catalog_load_state: Some(catalog::CatalogLoadState { state: Some(state) }),
+        },
+    ))
+}
+
+fn catalog_ready_event() -> QueryControlEvent {
+    use novarocks_proto_models::{catalog, novarocks as wire};
+    protocol_control_event(wire::query_control_response::Event::CatalogReady(
+        catalog::CatalogReady {},
+    ))
+}
+
+fn catalog_load_failed_event(safe_detail: String) -> QueryControlEvent {
+    use novarocks_proto_models::{catalog, novarocks as wire};
+    protocol_control_event(wire::query_control_response::Event::CatalogLoadFailed(
+        catalog::CatalogLoadFailed {
+            reason: catalog::CatalogLoadFailureReason::InstallFailed as i32,
+            safe_detail,
+            safe_field_path: None,
         },
     ))
 }
@@ -759,6 +804,23 @@ pub(crate) trait QueryLifecycleLocalRuntime: Send + Sync + 'static {
     fn release_query_resources(&self, execution_id: QueryExecutionId);
 }
 
+/// Startup-sealed provider bridge for a catalog lifecycle installation.
+///
+/// The query lifecycle owns when a frozen catalog is admitted and released;
+/// this narrow bridge owns only provider-local materialization.  In
+/// particular, it cannot create a second lifecycle or bypass the manifest.
+pub(crate) trait CatalogLifecycleMaterializer: Send + Sync + 'static {
+    fn materialize(&self, properties: &CatalogProperties) -> Result<(), String>;
+}
+
+struct RejectingCatalogLifecycleMaterializer;
+
+impl CatalogLifecycleMaterializer for RejectingCatalogLifecycleMaterializer {
+    fn materialize(&self, _properties: &CatalogProperties) -> Result<(), String> {
+        Err("catalog runtime materializer is not installed".to_owned())
+    }
+}
+
 /// Backend-local ingress state that remains useful until an attempt reaches
 /// its lifecycle tombstone. It is deliberately separate from execution
 /// resources: a late TaskUpdate must still be able to confirm an immutable
@@ -991,6 +1053,8 @@ impl Drop for StageResourceReservation {
 pub(crate) struct QueryLifecycleRegistry {
     state: Mutex<QueryLifecycleRegistryState>,
     local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
+    catalog_manager: Arc<crate::connector::catalog_manager::CatalogManager<()>>,
+    catalog_materializer: Arc<dyn CatalogLifecycleMaterializer>,
     runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
     config: QueryLifecycleRegistryConfig,
     local_process_id: BackendProcessId,
@@ -1385,6 +1449,8 @@ impl QueryLifecycleRegistry {
         let registry = Arc::new_cyclic(|self_weak| Self {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
+            catalog_manager: Arc::new(crate::connector::catalog_manager::CatalogManager::default()),
+            catalog_materializer: Arc::new(RejectingCatalogLifecycleMaterializer),
             runtime_filter_factory,
             config,
             local_process_id,
@@ -1445,6 +1511,15 @@ impl QueryLifecycleRegistry {
         state.draining && state.active_entries == 0
     }
 
+    /// The terminal owner releases catalog references in the same window as
+    /// other query execution resources: after terminal facts are frozen and
+    /// before their delivery.  The manager retains a warm runtime according
+    /// to its own bounded policy, but this attempt no longer protects it.
+    fn release_query_resources(&self, execution_id: QueryExecutionId) {
+        self.catalog_manager.release_query(execution_id);
+        self.local_runtime.release_query_resources(execution_id);
+    }
+
     /// Admission-derived authorization for the native exchange data plane.
     /// Routes exist only while the owning lifecycle entry can still execute;
     /// tombstone/terminal retention therefore automatically revokes frames.
@@ -1495,20 +1570,11 @@ impl QueryLifecycleRegistry {
     pub(crate) fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         let manifest = validated(request.manifest());
         let execution_id = validated(manifest.execution_id());
-        // A nonempty catalog contribution is intentionally fail-closed until
-        // the lifecycle owner has atomically registered its CatalogManager
-        // references. Reporting ControlReady before that point would let
-        // Stage observe an unmaterialized catalog runtime.
-        if !validated(validated(manifest.catalog_set()).catalogs()).is_empty() {
-            let digest = validated(manifest.digest());
-            let ack = QueryInitAck::new(
-                execution_id,
-                digest,
-                QueryInitOutcome::QueryInitRejectedInvalidManifest,
-            );
-            self.log_init(&ack);
-            return ack;
-        }
+        // Decode the exact frozen set before any local lifecycle entry or
+        // provider side effect exists.  The validated manifest owns the
+        // conflict fence for Init retries.
+        let catalog_set = validated(manifest.catalog_set());
+        let _catalogs = validated(catalog_set.catalogs());
         if validated(manifest.native_compatibility_id()) != self.native_compatibility_id {
             let digest = validated(manifest.digest());
             let ack = QueryInitAck::new(
@@ -1606,6 +1672,72 @@ impl QueryLifecycleRegistry {
         self.log_init(&ack);
         self.publish_metrics();
         ack
+    }
+
+    fn begin_catalog_install(
+        self: &Arc<Self>,
+        entry: Arc<QueryLifecycleEntry>,
+        execution_id: QueryExecutionId,
+        catalogs: Vec<CatalogProperties>,
+    ) {
+        let registry = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("catalog-lifecycle-install".to_owned())
+            .spawn(move || {
+                let result = catalogs.into_iter().try_for_each(|properties| {
+                    let materializer = Arc::clone(&registry.catalog_materializer);
+                    registry
+                        .catalog_manager
+                        .ensure(execution_id, properties, move |properties| {
+                            materializer
+                                .materialize(properties)
+                                .map_err(crate::connector::catalog_manager::CatalogManagerError::materialization_failed)
+                        })
+                        .map(|_| ())
+                });
+                let (event, release) = {
+                    let mut state = entry.state.lock().expect("query lifecycle entry lock");
+                    if state.termination_reason.is_some()
+                        || matches!(
+                            state.phase,
+                            QueryLifecyclePhase::Terminating
+                                | QueryLifecyclePhase::TerminalRetained
+                                | QueryLifecyclePhase::Tombstone
+                        )
+                    {
+                        (None, true)
+                    } else {
+                        match result {
+                            Ok(()) => {
+                                state.catalog_load = QueryCatalogLoadState::Ready;
+                                (Some(catalog_ready_event()), false)
+                            }
+                            Err(error) => {
+                                let safe_detail = safe_catalog_failure_detail(&error.to_string());
+                                state.catalog_load = QueryCatalogLoadState::Failed {
+                                    safe_detail: safe_detail.clone(),
+                                };
+                                (Some(catalog_load_failed_event(safe_detail)), false)
+                            }
+                        }
+                    }
+                };
+                if release {
+                    registry.catalog_manager.release_query(execution_id);
+                    return;
+                }
+                if let Some(event) = event
+                    && let Some(events) = entry
+                        .state
+                        .lock()
+                        .expect("query lifecycle entry lock")
+                        .events
+                        .clone()
+                {
+                    let _ = events.try_send(event);
+                }
+            })
+            .expect("catalog lifecycle installer thread must start");
     }
 
     fn wait_for_existing_init(
@@ -1853,7 +1985,13 @@ impl QueryLifecycleRegistry {
                 state.pre_start_deadline = None;
             }
         }
-        if let Err(error) = events_tx.try_send(control_ready_event()) {
+        let catalog_load = entry
+            .state
+            .lock()
+            .expect("query lifecycle entry lock")
+            .catalog_load
+            .clone();
+        if let Err(error) = events_tx.try_send(control_ready_event(&catalog_load)) {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             state.phase = QueryLifecyclePhase::Initialized;
             state.frontend_owner_epoch = None;
@@ -2086,7 +2224,13 @@ impl QueryLifecycleRegistry {
         let mut state = entry.state.lock().expect("query lifecycle entry lock");
         let (outcome, detail, build) = match state.phase {
             QueryLifecyclePhase::ControlAttached => {
-                if requested_instances != expected_instances {
+                if !matches!(state.catalog_load, QueryCatalogLoadState::Ready) {
+                    (
+                        QueryStageOutcome::RejectedInvalidState,
+                        "catalog materialization is not ready for staging",
+                        None,
+                    )
+                } else if requested_instances != expected_instances {
                     (
                         QueryStageOutcome::RejectedInvalidBatch,
                         "stage fragment set differs from participant manifest",
@@ -2894,7 +3038,7 @@ impl QueryLifecycleRegistry {
             state.heartbeat_timeouts = state.heartbeat_timeouts.saturating_add(1);
         }
         if !schedule_failure_drain {
-            self.local_runtime.release_query_resources(execution_id);
+            self.release_query_resources(execution_id);
         }
         let cleanup_complete = !schedule_failure_drain
             && self.try_complete_runtime_filter_cleanup(&entry, execution_id);
@@ -3261,7 +3405,7 @@ impl QueryLifecycleRegistry {
                 state.events.clone(),
             )
         };
-        self.local_runtime.release_query_resources(execution_id);
+        self.release_query_resources(execution_id);
         let _ = self.try_complete_runtime_filter_cleanup(&entry, execution_id);
         self.emit_terminal_retained_marker(record.snapshot(), content_id, record.encoded_len());
         self.deliver_terminal_outcome(
@@ -3329,7 +3473,7 @@ impl QueryLifecycleRegistry {
                 state.events.clone(),
             )
         };
-        self.local_runtime.release_query_resources(execution_id);
+        self.release_query_resources(execution_id);
         let _ = self.try_complete_runtime_filter_cleanup(entry, execution_id);
         self.deliver_terminal_outcome(
             Arc::clone(entry),
@@ -3461,7 +3605,7 @@ impl QueryLifecycleRegistry {
         };
         // All execution-owned resources are detached only after the immutable
         // contribution is retained and before it is delivered.
-        self.local_runtime.release_query_resources(execution_id);
+        self.release_query_resources(execution_id);
         let _ = self.try_complete_runtime_filter_cleanup(&entry, execution_id);
         self.emit_terminal_retained_marker(record.snapshot(), content_id, record.encoded_len());
         let terminal_events = terminal_delivery.1.clone();
@@ -4107,6 +4251,7 @@ impl QueryLifecycleRegistry {
             entry.init_completed.notify_all();
         }
         self.release_terminal_record(execution_id);
+        self.catalog_manager.release_query(execution_id);
         let mut state = self.state.lock().expect("query lifecycle registry lock");
         state.active_entries = state.active_entries.saturating_sub(1);
         state.tombstones.push_back(execution_id);
@@ -4495,9 +4640,7 @@ impl InitWorkspace {
                     reason,
                     &termination_detail(reason),
                 );
-                self.registry
-                    .local_runtime
-                    .release_query_resources(self.execution_id);
+                self.registry.release_query_resources(self.execution_id);
             }
             if self
                 .registry
@@ -4514,6 +4657,14 @@ impl InitWorkspace {
         }
 
         let participant = install_result.expect("runtime-filter install result was checked");
+        let catalogs = validated(validated(self.entry.manifest.catalog_set()).catalogs());
+        let catalog_load = if catalogs.is_empty() {
+            QueryCatalogLoadState::Ready
+        } else {
+            QueryCatalogLoadState::Loading {
+                catalogs: catalogs.clone(),
+            }
+        };
         let terminated = {
             let mut state = self.entry.state.lock().expect("query lifecycle entry lock");
             if state.termination_reason.is_some() {
@@ -4525,6 +4676,7 @@ impl InitWorkspace {
             } else {
                 state.runtime_filter_installed = participant.is_some();
                 state.runtime_filter = participant;
+                state.catalog_load = catalog_load;
                 state.phase = QueryLifecyclePhase::Initialized;
                 state.ever_initialized = true;
                 state.init_outcome = Some(QueryInitOutcome::QueryInitApplied);
@@ -4534,7 +4686,7 @@ impl InitWorkspace {
                 false
             }
         };
-        if terminated {
+        let ack = if terminated {
             let reason = self
                 .entry
                 .state
@@ -4560,7 +4712,16 @@ impl InitWorkspace {
                 self.digest,
                 QueryInitOutcome::QueryInitApplied,
             )
+        };
+
+        if !terminated && !catalogs.is_empty() {
+            self.registry.begin_catalog_install(
+                Arc::clone(&self.entry),
+                self.execution_id,
+                catalogs,
+            );
         }
+        ack
     }
 }
 
@@ -4667,9 +4828,7 @@ impl FragmentAdmissionPermit {
                     reason,
                     &termination_detail(reason),
                 );
-                registry
-                    .local_runtime
-                    .release_query_resources(self.execution_id);
+                registry.release_query_resources(self.execution_id);
             }
             return Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::Terminated,

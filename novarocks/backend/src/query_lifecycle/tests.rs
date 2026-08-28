@@ -22,6 +22,7 @@ use crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot;
 use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
+use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::{
     AttemptId, ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,
     ParticipantTerminalOutcome as ProtocolParticipantTerminalOutcome, QueryAbortRequest,
@@ -31,6 +32,9 @@ use novarocks_proto_codec::lifecycle::{
     RuntimeFilterContribution, StageDigest, StageDigestVersion, StageFragment,
 };
 use novarocks_proto_models::{common, filter, novarocks as proto_novarocks, plan};
+use novarocks_spi::connector::{
+    CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
+};
 use novarocks_types::UniqueId;
 use novarocks_types::{BackendProcessId, QueryId};
 use prost::Message;
@@ -872,6 +876,46 @@ fn init_request_fixture_for_process(
     QueryInitRequest::from_manifest(manifest)
 }
 
+fn catalog_set_fixture() -> CatalogSet {
+    CatalogSet::new([CatalogProperties::new(
+        CatalogHandle::new(
+            ConnectorInstanceId::try_from_canonical("catalog.lifecycle")
+                .expect("canonical catalog name"),
+            CatalogVersion::from_bytes([0x55; 32]),
+        ),
+        CatalogProviderKind::Iceberg,
+        1,
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("catalog properties")])
+    .expect("catalog set")
+}
+
+fn catalog_init_request_fixture(query_low: i64) -> QueryInitRequest {
+    let execution_id = execution_id(query_low, ATTEMPT_1);
+    let expected = UniqueId::new(query_low, 1);
+    let manifest = ParticipantManifest::new_with_catalog_set(
+        execution_id,
+        ParticipantBackendIdentity::new(
+            local_process_id(),
+            QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
+        )
+        .expect("valid backend identity"),
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+        [protocol_unique_id(expected)],
+        default_query_options(),
+        10_000,
+        [],
+        None,
+        Duration::from_secs(30),
+        QueryControlEndpoint::new("127.0.0.1", 9031).expect("valid report endpoint"),
+        catalog_set_fixture(),
+    )
+    .expect("valid catalog participant manifest");
+    QueryInitRequest::from_manifest(manifest)
+}
+
 fn fragment_init_request_fixture(query_low: i64, expected: &[UniqueId]) -> QueryInitRequest {
     let execution_id = execution_id(query_low, ATTEMPT_1);
     let manifest = ParticipantManifest::new(
@@ -1114,6 +1158,35 @@ fn stage_and_start_are_idempotent_after_control_ready() {
     assert_eq!(
         registry.start_prepared_query(start).outcome(),
         QueryStartOutcome::AlreadyStarted
+    );
+}
+
+#[test]
+fn nonempty_catalog_set_never_admits_stage_before_catalog_ready() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = catalog_init_request_fixture(1_801_001);
+    assert_eq!(
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
+        QueryInitOutcome::QueryInitApplied
+    );
+    let mut attachment = attach_control(&registry, &request);
+    let first = try_recv_event(&mut attachment).expect("ControlReady is delivered");
+    assert!(matches!(
+        first.event,
+        Some(proto_novarocks::query_control_response::Event::ControlReady(_))
+    ));
+
+    // The default test composition intentionally has no provider materializer.
+    // It may already report Failed or still be Loading, but neither state can
+    // cross the Stage admission boundary.
+    let expected = [UniqueId::new(1_801_001, 1)];
+    let stage = stage_request(&request, 1, &expected);
+    assert_eq!(
+        registry.stage_fragments(stage).outcome(),
+        QueryStageOutcome::RejectedInvalidState
     );
 }
 
