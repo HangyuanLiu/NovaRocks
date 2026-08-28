@@ -1204,7 +1204,7 @@ impl FrontendDistributedQueryCoordinator {
         // Started only after Start: a backend admits a task update only while
         // its attempt is staged or running. The guard owns the pump thread, so
         // every exit path below closes the sources by dropping it.
-        let split_assignment = split_assignment_plan
+        let mut split_assignment = split_assignment_plan
             .and_then(|plan| SplitAssignmentRoundGuard::start(execution_id, plan));
         let RunningNativeExecutionParts {
             root_fetch,
@@ -1289,6 +1289,21 @@ impl FrontendDistributedQueryCoordinator {
         if let Some(message) = self.registry.first_failure(query_id) {
             let message = abort_query_lifecycle(&mut query_lifecycle_lease, message);
             return Err(failed(message));
+        }
+
+        // A successful query must not construct its terminal/profile outcome
+        // while this attempt still owns an unconfirmed TaskUpdate.  On error
+        // the guard's Drop path stops and closes the sources; on success we
+        // join explicitly so every immutable split assignment is either
+        // confirmed or reported as the query failure.
+        if let Some(assignment) = split_assignment.take()
+            && let Err(error) = assignment.finish()
+        {
+            return Err(self.fail_cancel_then_abort_query_lifecycle(
+                query_id,
+                &mut query_lifecycle_lease,
+                format!("split assignment did not finish: {error}"),
+            ));
         }
 
         let terminal_set = query_lifecycle_lease
