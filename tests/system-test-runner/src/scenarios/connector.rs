@@ -477,20 +477,11 @@ impl Scenario for GenerationReplacement {
             .context("retire first connector generation")?;
         create_catalog(&mut control, "connector_generation_catalog", &warehouse)?;
 
-        context.action("read the same table through the replacement connector generation");
-        let rows: Vec<i64> = control
-            .query(
-                "SELECT count(*) FROM connector_generation_catalog.connector_generation_db.connector_generation_data",
-            )
-            .context("read table through replacement connector generation")?;
-        if rows != [300_000] {
-            bail!("replacement connector generation returned {rows:?}, expected [300000]");
-        }
-        wait_for_replacement_reader_on_every_backend(
-            context,
-            "connector_generation_catalog",
-            &old_incarnations,
-        )?;
+        context.action("reject the replacement generation while the old generation is leased");
+        let replacement_while_leased = control.query::<i64, _>(
+            "SELECT count(*) FROM connector_generation_catalog.connector_generation_db.connector_generation_data",
+        );
+        assert_generation_replacement_blocked(replacement_while_leased)?;
 
         context.action(format!(
             "cancel old-generation reader through KILL QUERY {connection_id}"
@@ -514,6 +505,21 @@ impl Scenario for GenerationReplacement {
             .map_err(|_| anyhow::anyhow!("old-generation connector read thread panicked"))??;
 
         wait_for_retired_incarnation_close(
+            context,
+            "connector_generation_catalog",
+            &old_incarnations,
+        )?;
+
+        context.action("read the same table through the replacement connector generation");
+        let rows: Vec<i64> = control
+            .query(
+                "SELECT count(*) FROM connector_generation_catalog.connector_generation_db.connector_generation_data",
+            )
+            .context("read table through replacement connector generation after old lease release")?;
+        if rows != [300_000] {
+            bail!("replacement connector generation returned {rows:?}, expected [300000]");
+        }
+        wait_for_replacement_reader_on_every_backend(
             context,
             "connector_generation_catalog",
             &old_incarnations,
@@ -868,6 +874,31 @@ fn assert_cancelled_query(
     match error {
         mysql::Error::MySqlError(error) if error.code == 1317 => Ok(()),
         other => bail!("expected MySQL cancellation error 1317, received {other}"),
+    }
+}
+
+fn assert_generation_replacement_blocked(
+    result: std::result::Result<Vec<i64>, mysql::Error>,
+) -> Result<()> {
+    let error = match result {
+        Ok(rows) => bail!(
+            "replacement connector generation unexpectedly ran while the old generation was leased: {rows:?}"
+        ),
+        Err(error) => error,
+    };
+    match error {
+        mysql::Error::MySqlError(error)
+            if error.code == 1105
+                && error.message.contains("reason=QueryIncarnationConflict")
+                && error.message.contains(
+                    "a prior connector generation is still leased by an active query",
+                ) =>
+        {
+            Ok(())
+        }
+        other => bail!(
+            "expected typed connector generation lease conflict while the old reader was active, received {other}"
+        ),
     }
 }
 
