@@ -1742,8 +1742,8 @@ mod tests {
             .register_read_execution(
                 3,
                 crate::connector::typed_runtime::test_support::installed_read_execution(),
-        )
-        .expect("stage registers the typed read execution");
+            )
+            .expect("stage registers the typed read execution");
         provisional_read_context.publish();
 
         let raw = novarocks_proto_models::connector_read::SplitAssignment {
