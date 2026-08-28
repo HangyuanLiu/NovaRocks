@@ -28,7 +28,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use novarocks_proto_codec::connector_read::MAX_SPLITS_PER_ASSIGNMENT;
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
-    ConnectorSplitBatch, ConnectorSplitSource, DynamicFilterSnapshot, TupleDomain,
+    ConnectorSplitBatch, ConnectorSplitSource, DynamicFilterSnapshot, SplitSourceProfile,
+    TupleDomain,
 };
 
 use crate::iceberg::spec::{Literal, Schema, StructType, Type};
@@ -126,6 +127,7 @@ pub struct IcebergSplitSource {
     target_split_size: i64,
     merge_adjacent_split_offsets: bool,
     weight_parameters: IcebergSplitWeightParameters,
+    profile: SplitSourceProfile,
 }
 
 impl IcebergSplitSource {
@@ -191,6 +193,7 @@ impl IcebergSplitSource {
             target_split_size: i64::try_from(target_split_size).unwrap_or(i64::MAX),
             merge_adjacent_split_offsets: options.merge_adjacent_split_offsets,
             weight_parameters,
+            profile: SplitSourceProfile::default(),
         })
     }
 
@@ -550,6 +553,10 @@ impl ConnectorSplitSource for IcebergSplitSource {
     type Split = IcebergSplit;
     type Column = IcebergColumnHandle;
 
+    fn profile_snapshot(&self) -> SplitSourceProfile {
+        self.profile
+    }
+
     fn next_batch(
         &mut self,
         max_size: usize,
@@ -580,17 +587,24 @@ impl ConnectorSplitSource for IcebergSplitSource {
                 break;
             }
             self.next_file += 1;
+            self.profile.files_considered = self.profile.files_considered.saturating_add(1);
             let splits = {
                 let file = &self.files[index];
                 if self.file_is_pruned(file, dynamic_filter)? {
+                    self.profile.files_pruned = self.profile.files_pruned.saturating_add(1);
                     continue;
                 }
+                self.profile.files_expanded = self.profile.files_expanded.saturating_add(1);
                 self.splits_for_file(file)?
             };
             self.pending.extend(splits);
         }
 
         let no_more_splits = self.pending.is_empty() && self.next_file >= self.files.len();
+        self.profile.splits_emitted = self
+            .profile
+            .splits_emitted
+            .saturating_add(u64::try_from(produced.len()).unwrap_or(u64::MAX));
         Ok(ConnectorSplitBatch::new(produced, no_more_splits))
     }
 

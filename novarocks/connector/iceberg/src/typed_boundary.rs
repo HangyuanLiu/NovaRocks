@@ -1047,6 +1047,10 @@ where
     S: ConnectorSplitSource<Column = IcebergColumnHandle> + Send,
     S::Split: IntoIcebergRuntimeSplit,
 {
+    fn profile_snapshot(&self) -> novarocks_spi::connector::read_stack::SplitSourceProfile {
+        self.inner.profile_snapshot()
+    }
+
     fn initial_dynamic_filter_wait_request(&self) -> std::time::Duration {
         self.initial_dynamic_filter_wait
     }

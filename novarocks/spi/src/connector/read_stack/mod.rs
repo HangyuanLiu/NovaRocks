@@ -77,6 +77,6 @@ pub use runtime::{
 };
 pub use session::{ConnectorSession, MAX_SESSION_PROPERTIES, SessionPropertyValue};
 pub use split::{ConnectorSplit, HostAddress, STANDARD_SPLIT_WEIGHT_RAW, SplitWeight};
-pub use split_source::{ConnectorSplitBatch, ConnectorSplitSource};
+pub use split_source::{ConnectorSplitBatch, ConnectorSplitSource, SplitSourceProfile};
 pub use system_table::{SystemTableColumn, SystemTableDistribution};
 pub use value::{ConnectorValue, ConnectorValueType, MAX_CONNECTOR_DECIMAL_PRECISION};

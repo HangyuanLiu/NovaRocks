@@ -81,6 +81,12 @@ pub trait ConnectorSplitSource: Send {
     type Split;
     type Column: Ord + Clone + Debug;
 
+    /// Immutable, monotonically increasing enumeration facts.  They describe
+    /// only split production, never backend I/O or page-source effects.
+    fn profile_snapshot(&self) -> SplitSourceProfile {
+        SplitSourceProfile::default()
+    }
+
     /// Produce up to `max_size` splits.
     ///
     /// The caller keeps at most one outstanding request. An empty batch means
@@ -96,6 +102,17 @@ pub trait ConnectorSplitSource: Send {
     /// Idempotent. A normal batch that completed before the close may still be
     /// delivered to the caller that requested it.
     fn close(&mut self) -> Result<(), ConnectorError>;
+}
+
+/// Provider-neutral facts collected while a source decides which unexpanded
+/// units become splits.  `files_pruned` is deliberately separate from actual
+/// I/O metrics: it is an avoided-work estimate, not bytes read.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SplitSourceProfile {
+    pub files_considered: u64,
+    pub files_pruned: u64,
+    pub files_expanded: u64,
+    pub splits_emitted: u64,
 }
 
 #[cfg(test)]

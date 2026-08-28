@@ -607,6 +607,10 @@ pub trait ConnectorReadMetadata: Send + Sync {
 }
 
 pub trait ConnectorReadSplitSource: Send {
+    fn profile_snapshot(&self) -> super::SplitSourceProfile {
+        super::SplitSourceProfile::default()
+    }
+
     /// A connector may ask the coordinator to wait briefly for an initial
     /// dynamic-filter snapshot before it expands its first file.  The
     /// coordinator owns the actual cap and fairness policy; zero means this
