@@ -11,6 +11,8 @@ pub struct ExchangeFrame {
     pub destination: RuntimeEndpoint,
     pub destination_fragment_instance_id: UniqueId,
     pub sender_fragment_instance_id: UniqueId,
+    pub sender_ordinal: u32,
+    pub sender_count: u32,
     pub destination_node_id: i32,
     pub sender_id: i32,
     pub backend_number: i32,

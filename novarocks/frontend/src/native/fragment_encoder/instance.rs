@@ -140,5 +140,8 @@ fn encode_destination(src: &FragmentDestination) -> Result<wire::Destination, St
     Ok(wire::Destination {
         finst_id: Some(encode_unique_id(src.finst_id())),
         endpoint: src.endpoint().as_host_port(),
+        source_finst_id: Some(encode_unique_id(&src.source_finst_id())),
+        sender_ordinal: src.sender_ordinal(),
+        sender_count: src.sender_count(),
     })
 }

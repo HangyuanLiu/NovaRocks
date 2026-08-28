@@ -1401,13 +1401,26 @@ fn populate_destinations(
             .get(&edge.target_fragment_id)
             .into_iter()
             .flatten()
-            .map(|placement| {
-                FragmentDestination::new(placement.finst_id, placement.endpoint.clone())
-            })
+            .map(|placement| (placement.finst_id, placement.endpoint.clone()))
             .collect::<Vec<_>>();
         if let Some(sources) = schedule.by_fragment.get_mut(&edge.source_fragment_id) {
-            for source in sources {
-                source.destinations.extend(destinations.iter().cloned());
+            let sender_count =
+                u32::try_from(sources.len()).expect("native fragment source count fits in u32");
+            for (sender_ordinal, source) in sources.iter_mut().enumerate() {
+                let sender_ordinal = u32::try_from(sender_ordinal)
+                    .expect("native fragment sender ordinal fits in u32");
+                for (destination_finst_id, destination_endpoint) in &destinations {
+                    source.destinations.push(
+                        FragmentDestination::new(
+                            *destination_finst_id,
+                            destination_endpoint.clone(),
+                            source.finst_id,
+                            sender_ordinal,
+                            sender_count,
+                        )
+                        .expect("scheduled exchange destination has a valid sender set"),
+                    );
+                }
             }
         }
     }

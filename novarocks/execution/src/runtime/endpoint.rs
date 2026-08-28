@@ -91,11 +91,34 @@ impl RuntimeEndpoint {
 pub struct FragmentDestination {
     finst_id: UniqueId,
     endpoint: RuntimeEndpoint,
+    source_finst_id: UniqueId,
+    sender_ordinal: u32,
+    sender_count: u32,
 }
 
 impl FragmentDestination {
-    pub fn new(finst_id: UniqueId, endpoint: RuntimeEndpoint) -> Self {
-        Self { finst_id, endpoint }
+    pub fn new(
+        finst_id: UniqueId,
+        endpoint: RuntimeEndpoint,
+        source_finst_id: UniqueId,
+        sender_ordinal: u32,
+        sender_count: u32,
+    ) -> Result<Self, String> {
+        if finst_id == UniqueId::new(0, 0) || source_finst_id == UniqueId::new(0, 0) {
+            return Err(
+                "fragment destination requires non-zero source and destination IDs".to_string(),
+            );
+        }
+        if sender_count == 0 || sender_ordinal >= sender_count {
+            return Err("fragment destination sender ordinal/count is invalid".to_string());
+        }
+        Ok(Self {
+            finst_id,
+            endpoint,
+            source_finst_id,
+            sender_ordinal,
+            sender_count,
+        })
     }
 
     pub fn finst_id(&self) -> &UniqueId {
@@ -104,6 +127,18 @@ impl FragmentDestination {
 
     pub fn endpoint(&self) -> &RuntimeEndpoint {
         &self.endpoint
+    }
+
+    pub const fn source_finst_id(&self) -> UniqueId {
+        self.source_finst_id
+    }
+
+    pub const fn sender_ordinal(&self) -> u32 {
+        self.sender_ordinal
+    }
+
+    pub const fn sender_count(&self) -> u32 {
+        self.sender_count
     }
 }
 

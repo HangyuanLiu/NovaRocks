@@ -1579,6 +1579,15 @@ impl DataStreamSinkOperator {
         mut pending: PendingPayload,
         allow_overflow: bool,
     ) -> Result<PayloadEnqueue, String> {
+        if dest.source_finst_id() != self.fragment_instance_id {
+            return Err(format!(
+                "exchange destination source fragment instance {}:{} does not match sender {}:{}",
+                dest.source_finst_id().high(),
+                dest.source_finst_id().low(),
+                self.fragment_instance_id.high(),
+                self.fragment_instance_id.low(),
+            ));
+        }
         let allow_overflow =
             allow_overflow || pending.payload_bytes > self.exchange_queue().max_inflight_bytes();
         let reserve_bytes = pending.payload_bytes.max(1);
@@ -1608,12 +1617,7 @@ impl DataStreamSinkOperator {
         ) {
             accounting.transfer_to(Arc::clone(tracker));
         }
-        let task = self.build_exchange_send_task(
-            addr.clone(),
-            dest_finst_id,
-            pending,
-            Arc::clone(error_state),
-        );
+        let task = self.build_exchange_send_task(dest.clone(), pending, Arc::clone(error_state));
         if allow_overflow {
             self.exchange_queue().try_submit(task, true)?;
             return Ok(PayloadEnqueue::Enqueued);
@@ -1624,8 +1628,7 @@ impl DataStreamSinkOperator {
 
     fn build_exchange_send_task(
         &self,
-        destination: crate::runtime::endpoint::RuntimeEndpoint,
-        dest_finst_id: UniqueId,
+        destination: FragmentDestination,
         pending: PendingPayload,
         error_state: Arc<RuntimeErrorState>,
     ) -> ExchangeSendTask {
@@ -1633,9 +1636,11 @@ impl DataStreamSinkOperator {
         record_payload_identity_for_test(self.fragment_instance_id, pending.be_number, pending.eos);
         ExchangeSendTask {
             frame: ExchangeFrame {
-                destination,
-                destination_fragment_instance_id: dest_finst_id,
-                sender_fragment_instance_id: self.fragment_instance_id,
+                destination: destination.endpoint().clone(),
+                destination_fragment_instance_id: *destination.finst_id(),
+                sender_fragment_instance_id: destination.source_finst_id(),
+                sender_ordinal: destination.sender_ordinal(),
+                sender_count: destination.sender_count(),
                 destination_node_id: self.input.dest_node_id,
                 sender_id: self.sender_id,
                 backend_number: pending.be_number,
@@ -2218,15 +2223,25 @@ mod tests {
         FragmentDestination::new(
             UniqueId::new(9, 9),
             RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+            UniqueId::new(1, 2),
+            0,
+            1,
         )
+        .expect("destination")
     }
 
     fn make_test_exchange_send_task() -> ExchangeSendTask {
         let mut op = make_test_operator();
         op.fragment_instance_id = UniqueId::new(81, 82);
         op.build_exchange_send_task(
-            RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
-            UniqueId::new(91, 92),
+            FragmentDestination::new(
+                UniqueId::new(91, 92),
+                RuntimeEndpoint::new("127.0.0.1", 9030).expect("endpoint"),
+                UniqueId::new(81, 82),
+                0,
+                1,
+            )
+            .expect("destination"),
             PendingPayload {
                 be_number: 7,
                 payload: vec![1, 2, 3],
@@ -2357,6 +2372,8 @@ mod tests {
             task.frame.sender_fragment_instance_id,
             UniqueId::new(81, 82)
         );
+        assert_eq!(task.frame.sender_ordinal, 0);
+        assert_eq!(task.frame.sender_count, 1);
     }
 
     #[test]

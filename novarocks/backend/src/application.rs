@@ -306,6 +306,23 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
         self.registry.init_query(request)
     }
 
+    fn authorize_exchange(
+        &self,
+        destination_fragment_instance_id: novarocks_types::UniqueId,
+        destination_node_id: i32,
+        source_fragment_instance_id: novarocks_types::UniqueId,
+        sender_ordinal: u32,
+        sender_count: u32,
+    ) -> Result<(), String> {
+        self.registry.authorize_exchange(
+            destination_fragment_instance_id,
+            destination_node_id,
+            source_fragment_instance_id,
+            sender_ordinal,
+            sender_count,
+        )
+    }
+
     fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
         match self.registry.begin_stage(request.clone()) {
             crate::query_lifecycle::StageBuildDecision::Complete(ack) => ack,

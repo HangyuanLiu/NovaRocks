@@ -86,9 +86,12 @@ impl BackendRpcService {
     ) -> Self {
         Self {
             native_fragment_ingress,
-            query_lifecycle_ingress,
+            query_lifecycle_ingress: Arc::clone(&query_lifecycle_ingress),
             query_control_shutdown: None,
-            data_plane: BackendDataPlane::with_exchange_receiver_port(exchange_receiver_port),
+            data_plane: BackendDataPlane::with_exchange_receiver_port(
+                exchange_receiver_port,
+                Arc::clone(&query_lifecycle_ingress),
+            ),
             runtime_filter_ingress,
             process_descriptor,
         }

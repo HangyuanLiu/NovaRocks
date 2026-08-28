@@ -14,6 +14,9 @@ pub struct ExchangeReceiverKey {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExchangeReceiverFrame {
+    pub source_fragment_instance_id: UniqueId,
+    pub sender_ordinal: u32,
+    pub sender_count: u32,
     pub sender_id: i32,
     pub backend_number: i32,
     pub sequence: i64,

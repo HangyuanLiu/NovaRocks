@@ -69,7 +69,11 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
         novarocks_types::UniqueId::new(3, 4),
         novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("10.0.0.9", 8060)
             .expect("destination endpoint"),
-    );
+        novarocks_types::UniqueId::new(1, 2),
+        0,
+        1,
+    )
+    .expect("destination");
     let mut per_exch_num_senders = BTreeMap::new();
     per_exch_num_senders.insert(42, 2);
     let placement = crate::query_execution::FragmentInstancePlacement {

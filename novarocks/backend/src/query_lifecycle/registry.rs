@@ -1324,6 +1324,50 @@ impl QueryLifecycleRegistry {
         state.draining && state.active_entries == 0
     }
 
+    /// Admission-derived authorization for the native exchange data plane.
+    /// Routes exist only while the owning lifecycle entry can still execute;
+    /// tombstone/terminal retention therefore automatically revokes frames.
+    pub(crate) fn authorize_exchange(
+        &self,
+        destination_fragment_instance_id: UniqueId,
+        destination_node_id: i32,
+        source_fragment_instance_id: UniqueId,
+        sender_ordinal: u32,
+        sender_count: u32,
+    ) -> Result<(), String> {
+        if sender_count == 0 || sender_ordinal >= sender_count {
+            return Err("exchange sender ordinal/count is invalid".to_string());
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "query lifecycle registry lock is poisoned".to_string())?;
+        for entry in state.entries.values() {
+            let phase = entry
+                .state
+                .lock()
+                .map_err(|_| "query lifecycle entry lock is poisoned".to_string())?
+                .phase;
+            if phase != QueryLifecyclePhase::Running {
+                continue;
+            }
+            for route in validated(entry.manifest.exchange_routes()) {
+                let source = validated(route.source_fragment_instance_id());
+                let destination = validated(route.destination_fragment_instance_id());
+                if UniqueId::new(source.hi, source.lo) == source_fragment_instance_id
+                    && UniqueId::new(destination.hi, destination.lo)
+                        == destination_fragment_instance_id
+                    && route.destination_node_id() == destination_node_id
+                    && route.sender_ordinal() == sender_ordinal
+                    && route.sender_count() == sender_count
+                {
+                    return Ok(());
+                }
+            }
+        }
+        Err("exchange route is absent from every active participant manifest".to_string())
+    }
+
     pub(crate) fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         let manifest = validated(request.manifest());
         let execution_id = validated(manifest.execution_id());
@@ -4693,6 +4737,24 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         QueryLifecycleRegistry::init_query(self, request)
+    }
+
+    fn authorize_exchange(
+        &self,
+        destination_fragment_instance_id: UniqueId,
+        destination_node_id: i32,
+        source_fragment_instance_id: UniqueId,
+        sender_ordinal: u32,
+        sender_count: u32,
+    ) -> Result<(), String> {
+        QueryLifecycleRegistry::authorize_exchange(
+            self,
+            destination_fragment_instance_id,
+            destination_node_id,
+            source_fragment_instance_id,
+            sender_ordinal,
+            sender_count,
+        )
     }
 
     fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
