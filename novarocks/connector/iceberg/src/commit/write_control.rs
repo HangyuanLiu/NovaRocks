@@ -58,6 +58,7 @@ use novarocks_spi::connector::{
     LakePublicationId, LakePublicationMarkerHeader,
 };
 
+use crate::commit::data_writer::parquet_row_group_size_bytes;
 use crate::delete_file::IcebergFileFormat;
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
@@ -1031,6 +1032,7 @@ impl IcebergWriteControl {
             partition_column_names: Vec::new(),
             transform_exprs: Vec::new(),
             data_input_schema: None,
+            parquet_row_group_size_bytes: None,
             position_delete_binding: None,
             position_delete_partitions: partitions,
         })
@@ -3579,6 +3581,9 @@ fn data_writer_payload(
         partition_column_names,
         transform_exprs,
         data_input_schema: Some(crate::scan_model::IcebergSchemaDef { fields }),
+        parquet_row_group_size_bytes: parquet_row_group_size_bytes(metadata.properties())
+            .map_err(invalid)?
+            .map(|value| value as u64),
         position_delete_binding: None,
         position_delete_partitions: Vec::new(),
     })
@@ -3639,6 +3644,7 @@ fn equality_delete_writer_payload(
         partition_column_names: Vec::new(),
         transform_exprs: Vec::new(),
         data_input_schema: None,
+        parquet_row_group_size_bytes: None,
         position_delete_binding: None,
         position_delete_partitions: Vec::new(),
     })

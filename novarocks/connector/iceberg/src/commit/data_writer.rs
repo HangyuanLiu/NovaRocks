@@ -55,6 +55,52 @@ use novarocks_connector_iceberg::theta_sketch::{
 type IcebergDataFileWriterBuilder =
     DataFileWriterBuilder<ParquetWriterBuilder, DefaultLocationGenerator, DefaultFileNameGenerator>;
 
+pub(crate) const PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY: &str = "write.parquet.row-group-size-bytes";
+const MAX_WRITE_BATCH_ROWS: usize = 1024;
+const ROW_GROUP_WRITE_BATCH_DIVISOR: usize = 64;
+
+fn row_group_write_batch_rows(max_row_group_bytes: usize) -> usize {
+    (max_row_group_bytes / ROW_GROUP_WRITE_BATCH_DIVISOR)
+        .max(1)
+        .min(MAX_WRITE_BATCH_ROWS)
+}
+
+pub(crate) fn parquet_row_group_size_bytes(
+    table_properties: &HashMap<String, String>,
+) -> Result<Option<usize>, String> {
+    table_properties
+        .get(PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY)
+        .map(|value| {
+            let max_row_group_bytes = value.parse::<usize>().map_err(|error| {
+            format!(
+                "Iceberg table property {PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY} must be a positive byte count: {error}"
+            )
+        })?;
+            if max_row_group_bytes == 0 {
+                return Err(format!(
+                    "Iceberg table property {PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY} must be a positive byte count"
+                ));
+            }
+            Ok(max_row_group_bytes)
+        })
+        .transpose()
+}
+
+fn parquet_writer_properties(
+    table_properties: &HashMap<String, String>,
+) -> Result<WriterProperties, String> {
+    let mut properties = WriterProperties::builder();
+    if let Some(max_row_group_bytes) = parquet_row_group_size_bytes(table_properties)? {
+        // Parquet only evaluates the byte threshold between write batches.
+        // Keep an explicitly small Iceberg row-group limit meaningful instead
+        // of allowing the default 1024-row batch to overshoot it wholesale.
+        properties = properties
+            .set_max_row_group_bytes(Some(max_row_group_bytes))
+            .set_write_batch_size(row_group_write_batch_rows(max_row_group_bytes));
+    }
+    Ok(properties.build())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StagedContent {
     Data,
@@ -221,9 +267,11 @@ impl StagedWriteContext {
             Some(unique_file_suffix()),
             DataFileFormat::Parquet,
         );
-        let parquet_builder =
-            ParquetWriterBuilder::new(WriterProperties::default(), self.writer_schema.clone())
-                .with_arrow_schema_override(Arc::clone(&self.annotated_schema));
+        let parquet_builder = ParquetWriterBuilder::new(
+            parquet_writer_properties(self.metadata.properties())?,
+            self.writer_schema.clone(),
+        )
+        .with_arrow_schema_override(Arc::clone(&self.annotated_schema));
         let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
             parquet_builder,
             self.file_io.clone(),
@@ -287,6 +335,12 @@ pub async fn write_record_batches(
 ) -> Result<Vec<StagedDataFile>, String> {
     ensure_data_file_staged_content(opts.content)?;
     let data_file_builder = ctx.data_file_writer_builder()?;
+    // Parquet checks its row-group byte threshold between RecordBatch writes.
+    // The SQL sink can hand us a much larger batch, so preserve the configured
+    // limit's usefulness by making the same bounded write granularity explicit.
+    let write_batch_rows = parquet_row_group_size_bytes(ctx.metadata.properties())?
+        .map(row_group_write_batch_rows)
+        .unwrap_or(usize::MAX);
     let variant_indices = variant_field_indices(ctx.schema());
 
     if ctx.partition_spec().fields().is_empty() {
@@ -313,10 +367,15 @@ pub async fn write_record_batches(
             if let Some(sketches) = maybe_collect_sketches(opts, &annotated)? {
                 batch_sketches.push(sketches);
             }
-            writer
-                .write(annotated)
-                .await
-                .map_err(|e| format!("iceberg data file write failed: {e}"))?;
+            for offset in
+                (0..annotated.num_rows()).step_by(write_batch_rows.min(annotated.num_rows()))
+            {
+                let length = (annotated.num_rows() - offset).min(write_batch_rows);
+                writer
+                    .write(annotated.slice(offset, length))
+                    .await
+                    .map_err(|e| format!("iceberg data file write failed: {e}"))?;
+            }
         }
         let data_files = writer
             .close()
@@ -373,10 +432,15 @@ pub async fn write_record_batches(
                 .build(Some(partition_key))
                 .await
                 .map_err(|e| format!("build iceberg partitioned data file writer failed: {e}"))?;
-            writer
-                .write(partition_batch)
-                .await
-                .map_err(|e| format!("iceberg partitioned data file write failed: {e}"))?;
+            for offset in (0..partition_batch.num_rows())
+                .step_by(write_batch_rows.min(partition_batch.num_rows()))
+            {
+                let length = (partition_batch.num_rows() - offset).min(write_batch_rows);
+                writer
+                    .write(partition_batch.slice(offset, length))
+                    .await
+                    .map_err(|e| format!("iceberg partitioned data file write failed: {e}"))?;
+            }
             let data_files = writer
                 .close()
                 .await
@@ -1291,9 +1355,36 @@ fn unique_file_suffix() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use novarocks_connector_iceberg::iceberg::spec::{DataContentType, NestedField, Struct};
 
     use super::*;
+
+    #[test]
+    fn parquet_writer_properties_honor_iceberg_row_group_byte_limit() {
+        let properties = parquet_writer_properties(&HashMap::from([(
+            PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY.to_string(),
+            "1024".to_string(),
+        )]))
+        .expect("valid row-group byte limit");
+
+        assert_eq!(properties.max_row_group_bytes(), Some(1024));
+        assert_eq!(properties.write_batch_size(), 16);
+        assert_eq!(row_group_write_batch_rows(1024), 16);
+    }
+
+    #[test]
+    fn parquet_writer_properties_reject_zero_or_malformed_row_group_limit() {
+        for value in ["0", "not-a-number"] {
+            let error = parquet_writer_properties(&HashMap::from([(
+                PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY.to_string(),
+                value.to_string(),
+            )]))
+            .expect_err("invalid row-group byte limit must fail");
+            assert!(error.contains("positive byte count"));
+        }
+    }
 
     #[test]
     fn retag_unpartitioned_data_file_with_current_default_spec_id() {

@@ -263,7 +263,7 @@ fn run_ncp5_partitioned_feedback_pruning(context: &mut ScenarioContext) -> Resul
         .query(&query)
         .context("execute NCP-5 Runtime Filter candidate")?;
     ensure!(
-        enabled == disabled && enabled == [10],
+        enabled == disabled && enabled == [1000],
         "NCP-5 Runtime Filter changed query correctness: disabled={disabled:?}, enabled={enabled:?}"
     );
     context.action("proved Runtime Filter on/off row fingerprint equivalence");
@@ -279,6 +279,7 @@ fn run_ncp5_partitioned_feedback_pruning(context: &mut ScenarioContext) -> Resul
     let profile = profile.join("\n");
     assert_positive_profile_counter(&profile, "ConnectorFilesConsidered")?;
     assert_positive_profile_counter(&profile, "ConnectorWholeFilesPruned")?;
+    assert_positive_profile_counter(&profile, "ConnectorFileRowGroupsPruned")?;
     context.action(
         "EXPLAIN ANALYZE proved broadcast FE feedback reached Iceberg whole-file dynamic pruning",
     );
@@ -410,6 +411,12 @@ fn create_ncp5_pruning_tables(
         .context("create NCP-5 probe table")?;
     control
         .query_drop(format!(
+            "ALTER TABLE {}.{}.{} SET TBLPROPERTIES ('write.parquet.row-group-size-bytes'='1024')",
+            tables.catalog, tables.database, tables.probe
+        ))
+        .context("set NCP-5 probe row-group size")?;
+    control
+        .query_drop(format!(
             "CREATE TABLE {}.{}.{} (k INT, flag VARCHAR(8))",
             tables.catalog, tables.database, tables.build
         ))
@@ -418,7 +425,7 @@ fn create_ncp5_pruning_tables(
         let lower = range * 200;
         control
             .query_drop(format!(
-                "INSERT INTO {}.{}.{} SELECT {} + generate_series, {} + (generate_series % 200) FROM TABLE(generate_series(1, 2000))",
+                "INSERT INTO {}.{}.{} SELECT {} + generate_series, {} + FLOOR((generate_series - 1) / 1000) FROM TABLE(generate_series(1, 200000))",
                 tables.catalog,
                 tables.database,
                 tables.probe,

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef as ArrowSchemaRef};
 
 use crate::access_binding::IcebergReadBinding;
-use crate::commit::data_writer::StagedWriteContext;
+use crate::commit::data_writer::{PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY, StagedWriteContext};
 use crate::commit::write_io::build_staged_file_io;
 use crate::iceberg::spec::{
     ListType, MapType, NestedField, PartitionSpec, PrimitiveType, SortOrder, StructType,
@@ -41,6 +41,7 @@ pub struct FrozenDataWriteFacts {
     pub partition_column_names: Vec<String>,
     pub transform_exprs: Vec<String>,
     pub data_input_schema: IcebergSchemaDef,
+    pub parquet_row_group_size_bytes: Option<u64>,
 }
 
 /// Build the provider writer context exclusively from the sealed handle and
@@ -77,6 +78,12 @@ fn build_target_table_metadata(
     )?;
     let mut properties = std::collections::HashMap::new();
     properties.insert("write.data.path".to_string(), facts.data_location.clone());
+    if let Some(value) = facts.parquet_row_group_size_bytes {
+        properties.insert(
+            PARQUET_ROW_GROUP_SIZE_BYTES_PROPERTY.to_string(),
+            value.to_string(),
+        );
+    }
     TableMetadataBuilder::new(
         writer_schema.clone(),
         PartitionSpec::unpartition_spec(),
