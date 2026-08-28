@@ -46,6 +46,11 @@ use crate::coordinator::query_registry::{
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::install_encoder::FrontendRuntimeFilterFeedbackDeclaration;
 
+/// v1 participant fanout cap. The production config projection is introduced
+/// with the coordinator composition change; keeping the cap here already
+/// prevents one OS thread per participant during the transitional path.
+const PARTICIPANT_FANOUT_MAX_INFLIGHT: usize = 32;
+
 #[derive(Clone, Copy)]
 pub(crate) struct FrontendQueryLifecycleConfig {
     heartbeat_interval: Duration,
@@ -737,62 +742,67 @@ fn init_all(
     config: FrontendQueryLifecycleConfig,
     metrics: &FrontendLifecycleMetrics,
 ) -> Vec<InitFailure> {
-    std::thread::scope(|scope| {
-        let handles = participants
-            .iter()
-            .map(|participant| {
-                scope.spawn(move || {
-                    let started = Instant::now();
-                    let result = init_one(transport, participant, config.init_rpc_timeout());
-                    let latency = started.elapsed();
-                    match &result {
-                        Ok(QueryInitOutcome::QueryInitApplied) => {
-                            metrics.observe_init(true, false, false, false, latency)
+    let mut failures = Vec::new();
+    for participant_wave in participants.chunks(PARTICIPANT_FANOUT_MAX_INFLIGHT) {
+        let wave_failures: Vec<InitFailure> = std::thread::scope(|scope| {
+            let handles = participant_wave
+                .iter()
+                .map(|participant| {
+                    scope.spawn(move || {
+                        let started = Instant::now();
+                        let result = init_one(transport, participant, config.init_rpc_timeout());
+                        let latency = started.elapsed();
+                        match &result {
+                            Ok(QueryInitOutcome::QueryInitApplied) => {
+                                metrics.observe_init(true, false, false, false, latency)
+                            }
+                            Ok(QueryInitOutcome::QueryInitAlreadyApplied) => {
+                                metrics.observe_init(false, true, false, false, latency)
+                            }
+                            Ok(_) => metrics.observe_init(false, false, false, false, latency),
+                            Err(error) => metrics.observe_init(
+                                false,
+                                false,
+                                error.uncertain_cleanup,
+                                error.manifest_conflict,
+                                latency,
+                            ),
                         }
-                        Ok(QueryInitOutcome::QueryInitAlreadyApplied) => {
-                            metrics.observe_init(false, true, false, false, latency)
+                        if result
+                            .as_ref()
+                            .is_err_and(|error| error.backend_epoch_mismatch)
+                        {
+                            metrics.backend_epoch_mismatch();
                         }
-                        Ok(_) => metrics.observe_init(false, false, false, false, latency),
-                        Err(error) => metrics.observe_init(
-                            false,
-                            false,
-                            error.uncertain_cleanup,
-                            error.manifest_conflict,
-                            latency,
-                        ),
-                    }
-                    if result
-                        .as_ref()
-                        .is_err_and(|error| error.backend_epoch_mismatch)
-                    {
-                        metrics.backend_epoch_mismatch();
-                    }
-                    tracing::info!(
-                        query_id_high = participant_execution_id(participant).query_id().high(),
-                        query_id_low = participant_execution_id(participant).query_id().low(),
-                        attempt_id = participant_execution_id(participant).attempt_id().get(),
-                        backend_idx = participant.target.backend_idx(),
-                        backend_process_id = %participant.target.process_id(),
-                        participant_digest = %hex::encode(participant.digest.as_bytes()),
-                        outcome = ?result,
-                        latency_micros = latency.as_micros() as u64,
-                        "frontend query lifecycle InitQuery completed"
-                    );
-                    result.map(|_| ())
+                        tracing::info!(
+                            query_id_high = participant_execution_id(participant).query_id().high(),
+                            query_id_low = participant_execution_id(participant).query_id().low(),
+                            attempt_id = participant_execution_id(participant).attempt_id().get(),
+                            backend_idx = participant.target.backend_idx(),
+                            backend_process_id = %participant.target.process_id(),
+                            participant_digest = %hex::encode(participant.digest.as_bytes()),
+                            outcome = ?result,
+                            latency_micros = latency.as_micros() as u64,
+                            "frontend query lifecycle InitQuery completed"
+                        );
+                        result.map(|_| ())
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .filter_map(|handle| match handle.join() {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error),
-                Err(_) => Some(InitFailure::failed(
-                    "query lifecycle InitQuery worker panicked",
-                )),
-            })
-            .collect()
-    })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .filter_map(|handle| match handle.join() {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error),
+                    Err(_) => Some(InitFailure::failed(
+                        "query lifecycle InitQuery worker panicked",
+                    )),
+                })
+                .collect()
+        });
+        failures.extend(wave_failures);
+    }
+    failures
 }
 
 #[derive(Debug)]
@@ -997,53 +1007,59 @@ pub(super) fn attach_all(
     metrics: &FrontendLifecycleMetrics,
     control: &Arc<AttemptControl>,
 ) -> Vec<String> {
-    let outcomes = std::thread::scope(|scope| {
-        let handles = participants
-            .iter()
-            .map(|participant| {
-                scope.spawn(move || {
-                    let started = Instant::now();
-                    let outcome = attach_one(transport, participant, frontend_owner_epoch, config);
-                    let latency = started.elapsed();
-                    metrics.observe_attach(outcome.is_ok(), latency);
-                    tracing::info!(
-                        query_id_high = participant_execution_id(participant).query_id().high(),
-                        query_id_low = participant_execution_id(participant).query_id().low(),
-                        attempt_id = participant_execution_id(participant).attempt_id().get(),
-                        backend_idx = participant.target.backend_idx(),
-                        backend_process_id = %participant.target.process_id(),
-                        participant_digest = %hex::encode(participant.digest.as_bytes()),
-                        ready = outcome.is_ok(),
-                        latency_micros = latency.as_micros() as u64,
-                        "frontend query lifecycle control attach completed"
-                    );
-                    match &outcome {
-                        Ok((session, catalog_ready)) => {
-                            control.add_session(session.clone());
-                            control.mark_control_ready(participant.target.backend_idx());
-                            if *catalog_ready {
-                                control.mark_catalog_ready(participant.target.backend_idx());
+    let mut outcomes = Vec::new();
+    for participant_wave in participants.chunks(PARTICIPANT_FANOUT_MAX_INFLIGHT) {
+        let wave_outcomes: Vec<Result<(ActiveSession, bool), (Option<ActiveSession>, String)>> =
+            std::thread::scope(|scope| {
+                let handles = participant_wave
+                    .iter()
+                    .map(|participant| {
+                        scope.spawn(move || {
+                        let started = Instant::now();
+                        let outcome =
+                            attach_one(transport, participant, frontend_owner_epoch, config);
+                        let latency = started.elapsed();
+                        metrics.observe_attach(outcome.is_ok(), latency);
+                        tracing::info!(
+                            query_id_high = participant_execution_id(participant).query_id().high(),
+                            query_id_low = participant_execution_id(participant).query_id().low(),
+                            attempt_id = participant_execution_id(participant).attempt_id().get(),
+                            backend_idx = participant.target.backend_idx(),
+                            backend_process_id = %participant.target.process_id(),
+                            participant_digest = %hex::encode(participant.digest.as_bytes()),
+                            ready = outcome.is_ok(),
+                            latency_micros = latency.as_micros() as u64,
+                            "frontend query lifecycle control attach completed"
+                        );
+                        match &outcome {
+                            Ok((session, catalog_ready)) => {
+                                control.add_session(session.clone());
+                                control.mark_control_ready(participant.target.backend_idx());
+                                if *catalog_ready {
+                                    control.mark_catalog_ready(participant.target.backend_idx());
+                                }
                             }
+                            Err((Some(session), _)) => control.add_session(session.clone()),
+                            Err((None, _)) => {}
                         }
-                        Err((Some(session), _)) => control.add_session(session.clone()),
-                        Err((None, _)) => {}
-                    }
-                    outcome
-                })
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle.join().unwrap_or_else(|_| {
-                    Err((
-                        None,
-                        "query lifecycle control attach worker panicked".to_string(),
-                    ))
-                })
-            })
-            .collect::<Vec<_>>()
-    });
+                        outcome
+                    })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            Err((
+                                None,
+                                "query lifecycle control attach worker panicked".to_string(),
+                            ))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+        outcomes.extend(wave_outcomes);
+    }
 
     let mut errors = Vec::new();
     for outcome in outcomes {
