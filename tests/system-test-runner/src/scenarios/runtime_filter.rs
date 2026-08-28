@@ -268,13 +268,20 @@ fn run_ncp5_partitioned_feedback_pruning(context: &mut ScenarioContext) -> Resul
     );
     context.action("proved Runtime Filter on/off row fingerprint equivalence");
 
+    // PARTITIONED coverage above is the aggregation/correctness gate. Its
+    // blocking wait graph may deliberately reject an FE source wait, so use
+    // the direct-source BROADCAST phase to prove the bounded-wait pruning
+    // optimization without weakening cycle safety.
+    configure_broadcast_runtime_filter(&mut control)?;
     let profile: Vec<String> = control
         .query(format!("EXPLAIN ANALYZE {query}"))
-        .context("collect NCP-5 partitioned feedback profile")?;
+        .context("collect NCP-5 broadcast feedback profile")?;
     let profile = profile.join("\n");
     assert_positive_profile_counter(&profile, "ConnectorFilesConsidered")?;
     assert_positive_profile_counter(&profile, "ConnectorWholeFilesPruned")?;
-    context.action("EXPLAIN ANALYZE proved FE feedback reached Iceberg whole-file dynamic pruning");
+    context.action(
+        "EXPLAIN ANALYZE proved broadcast FE feedback reached Iceberg whole-file dynamic pruning",
+    );
     Ok(())
 }
 

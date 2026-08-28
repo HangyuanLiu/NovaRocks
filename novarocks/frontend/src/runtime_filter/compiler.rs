@@ -894,6 +894,17 @@ fn compile_feedback_declaration(
                 binding.channel_id == channel_id
                     && matches!(binding.role, BindingRole::Producer { .. })
             }) {
+                // A split round pumps typed sources independently.  When a
+                // producer and its probe scan share a fragment, withholding
+                // that one probe source still leaves the build-side source
+                // runnable; treating the fragment-local relationship as a
+                // graph self-edge would reject a safe bounded wait and force
+                // every file to expand before direct-source feedback arrives.
+                // Cross-fragment edges remain subject to the existing full
+                // cycle validation below.
+                if producer.fragment_id == scan.fragment_id {
+                    continue;
+                }
                 candidate_edges.push((
                     (scan.fragment_id, scan.plan_node_id, channel_id),
                     RuntimeFilterWaitEdge::new(producer.fragment_id, scan.fragment_id, true),
