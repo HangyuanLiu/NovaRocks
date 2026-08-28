@@ -556,7 +556,7 @@ impl novarocks_spi::connector::ConnectorMetadataMaintenanceResolver
 
     fn acquire_exact_metadata_maintenance(
         &self,
-        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     ) -> Result<
         novarocks_spi::connector::ConnectorMetadataMaintenanceLease,
         novarocks_spi::connector::ConnectorError,
@@ -570,8 +570,8 @@ impl novarocks_spi::connector::ConnectorMetadataMaintenanceResolver
                     "test connector control registry lock poisoned",
                 )
             })?
-            .get(&key.instance_id)
-            .filter(|binding| binding.incarnation() == key.incarnation)
+            .values()
+            .find(|binding| binding.control_runtime_id() == control_runtime_id)
             .cloned()
             .ok_or_else(|| {
                 novarocks_spi::connector::ConnectorError::new(
@@ -688,7 +688,8 @@ fn test_metadata_maintenance_lease(
     };
     novarocks_spi::connector::ConnectorMetadataMaintenanceLease::new(
         binding.descriptor().clone(),
-        key,
+        binding.control_runtime_id(),
+        key.incarnation,
         Arc::clone(binding.metadata()),
         maintenance,
         || {},
