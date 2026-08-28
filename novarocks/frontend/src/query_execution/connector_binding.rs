@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend-owned legacy write connector installation barrier.
+//! Frontend-owned legacy connector-install compatibility shell.
 //!
 //! A declaration is control-plane state, never fragment-carrier data.  The
-//! compiler derives declarations only for legacy write attachments and requires
-//! their installs to ACK before native submissions exist. Typed reads carry
-//! their `CatalogSet` in the existing Init lifecycle round instead.
+//! Native reads and writes carry their `CatalogSet` in the existing Init
+//! lifecycle round. This module remains only until its old Ensure RPC surface
+//! can be removed as one compatibility-island change.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -203,11 +203,9 @@ pub trait ConnectorBindingInstallBarrier: Send + Sync + 'static {
     ) -> Result<ConnectorBindingInstallLease, DistributedQueryError>;
 }
 
-/// Derive the legacy write installation plan from placement-frozen writers at
-/// their actual BE placements. Typed reads are deliberately absent: their
-/// exact `CatalogHandle`s are already attached to the participant Init manifest
-/// and readiness is reported on that same control stream, so adding them here
-/// would impose a second warm-path RPC barrier.
+/// Native catalogs must not contribute a second post-ControlReady installation
+/// round. The empty result retains the surrounding coordinator type only while
+/// old Ensure RPC definitions await their final compatibility-island removal.
 pub(crate) fn compile_install_plan(
     _schedule: &SchedulingPlan,
     _connector_write_plans: &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,

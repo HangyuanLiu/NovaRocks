@@ -771,9 +771,9 @@ fn attach_connector_write_plans(
     Ok(())
 }
 
-/// Query lifecycle is ready, but connector instances still require their
-/// independent process-scoped install/ACK barrier before preparing native
-/// Stage batches.
+/// Query lifecycle is ready. The retained compatibility handoff no longer
+/// installs connector instances: CatalogSet readiness was established during
+/// Init, before Stage becomes admissible.
 pub struct ControlReadyDistributedQuery {
     handoff_id: u64,
     prepared: PreparedFragmentSet,
