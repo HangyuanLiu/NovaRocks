@@ -45,6 +45,7 @@ use crate::coordinator::query_registry::{
     QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
     RuntimeFilterTerminalRollupUnavailable,
 };
+use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 
 const ACTIVE: u8 = 0;
 const ABORTED: u8 = 1;
@@ -364,6 +365,7 @@ pub(super) struct AttemptControl {
     stop: (Mutex<bool>, Condvar),
     terminal: (Mutex<TerminalState>, Condvar),
     observations: Mutex<FragmentObservationState>,
+    feedback: Mutex<Arc<RuntimeFilterFeedbackState>>,
     readers: Mutex<Vec<JoinHandle<()>>>,
     metrics: Arc<FrontendLifecycleMetrics>,
 }
@@ -394,6 +396,10 @@ impl AttemptControl {
             stop: (Mutex::new(false), Condvar::new()),
             terminal: (Mutex::new(TerminalState::default()), Condvar::new()),
             observations: Mutex::new(FragmentObservationState::default()),
+            feedback: Mutex::new(Arc::new(
+                RuntimeFilterFeedbackState::new(execution_id, Default::default())
+                    .expect("empty runtime filter feedback declaration is valid"),
+            )),
             readers: Mutex::new(Vec::new()),
             metrics,
         })
@@ -405,6 +411,18 @@ impl AttemptControl {
 
     pub(super) const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
+    }
+
+    pub(crate) fn configure_runtime_filter_feedback(
+        &self,
+        declaration: crate::runtime_filter::install_encoder::FrontendRuntimeFilterFeedbackDeclaration,
+    ) -> Result<(), DistributedQueryError> {
+        let state =
+            RuntimeFilterFeedbackState::new(self.execution_id, declaration).map_err(|error| {
+                DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
+            })?;
+        *self.feedback.lock().expect("runtime filter feedback state") = Arc::new(state);
+        Ok(())
     }
 
     pub(super) fn set_planned(&self, participants: &[MaterializedParticipant]) {
@@ -1630,6 +1648,15 @@ impl AttemptControl {
                 let _ = self.store_fragment_observation(session, observation);
                 Ok(())
             }
+            Some(
+                novarocks_proto_models::novarocks::query_control_response::Event::RuntimeFilterFeedback(
+                    _,
+                ),
+            ) => self
+                .feedback
+                .lock()
+                .expect("runtime filter feedback state")
+                .admit(&event, session.target.process_id(), session.digest.as_bytes()),
             Some(novarocks_proto_models::novarocks::query_control_response::Event::TerminalOutcome(
                 outcome,
             )) => {

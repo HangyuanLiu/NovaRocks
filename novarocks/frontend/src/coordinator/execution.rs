@@ -1088,6 +1088,7 @@ impl FrontendDistributedQueryCoordinator {
                 self.runtime_filter_worker_count.get(),
             )?,
         )?;
+        let feedback_declaration = deployment.feedback_declaration().clone();
         let runtime_filter_attachment =
             scheduled.seal_runtime_filter_deployment(deployment.contributions())?;
         let runtime_filter_ready =
@@ -1122,7 +1123,8 @@ impl FrontendDistributedQueryCoordinator {
             Arc::clone(&self.registry),
             self.lifecycle_config,
         )
-        .with_cancellation(parts.cancellation.clone());
+        .with_cancellation(parts.cancellation.clone())
+        .with_runtime_filter_feedback(feedback_declaration);
         let init_options = QueryInitOptions::new(
             execution_id,
             self.native_compatibility_id,
