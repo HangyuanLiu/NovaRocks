@@ -10,6 +10,10 @@ pub const SCHEMA_LEDGER_VERSION: u32 = 1;
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/novarocks_descriptor.bin"));
 
+pub mod catalog {
+    include!(concat!(env!("OUT_DIR"), "/novarocks.catalog.rs"));
+}
+
 #[allow(clippy::len_without_is_empty)]
 pub mod common {
     include!(concat!(env!("OUT_DIR"), "/novarocks.common.rs"));

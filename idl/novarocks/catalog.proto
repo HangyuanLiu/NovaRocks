@@ -1,0 +1,106 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.catalog;
+
+// Immutable catalog content identity. The version is exactly 32 bytes at
+// validated ingress and never carries a Frontend process generation.
+message CatalogHandle {
+  string catalog_name = 1;
+  bytes version = 2;
+}
+
+enum CatalogProviderKind {
+  CATALOG_PROVIDER_KIND_UNSPECIFIED = 0;
+  CATALOG_PROVIDER_KIND_ICEBERG = 1;
+  CATALOG_PROVIDER_KIND_STARROCKS = 2;
+}
+
+message CatalogProperty {
+  string key = 1;
+  string value = 2;
+}
+
+// Reference only: the resolved credential value stays in role-local startup
+// composition and never crosses native wire.
+message CatalogCredentialReference {
+  string name = 1;
+  optional string revision = 2;
+}
+
+message CatalogProperties {
+  CatalogHandle handle = 1;
+  CatalogProviderKind provider_kind = 2;
+  uint32 config_format_version = 3;
+  repeated CatalogProperty execution_properties = 4;
+  repeated CatalogCredentialReference credential_references = 5;
+}
+
+// One exact, sorted query-wide contribution. It is carried by every
+// ParticipantManifest instead of a post-ControlReady Ensure RPC.
+message CatalogSet {
+  repeated CatalogProperties catalogs = 1;
+}
+
+message CatalogLoading {}
+
+message CatalogReady {}
+
+enum CatalogLoadFailureReason {
+  CATALOG_LOAD_FAILURE_REASON_UNSPECIFIED = 0;
+  CATALOG_LOAD_FAILURE_REASON_INVALID_CATALOG_SET = 1;
+  CATALOG_LOAD_FAILURE_REASON_INSTALL_FAILED = 2;
+  CATALOG_LOAD_FAILURE_REASON_RESOURCE_EXHAUSTED = 3;
+  CATALOG_LOAD_FAILURE_REASON_TERMINATED = 4;
+  CATALOG_LOAD_FAILURE_REASON_INTERNAL = 5;
+}
+
+message CatalogLoadFailed {
+  CatalogLoadFailureReason reason = 1;
+  string safe_detail = 2;
+  optional string safe_field_path = 3;
+}
+
+// The state in the first ControlReady frame. Loading must be followed on the
+// same stream by exactly one CatalogReady or CatalogLoadFailed event.
+message CatalogLoadState {
+  oneof state {
+    CatalogLoading loading = 1;
+    CatalogReady ready = 2;
+    CatalogLoadFailed failed = 3;
+  }
+}
+
+// A complete reachable snapshot; partial or delta snapshots are invalid.
+message PruneCatalogsRequest {
+  repeated CatalogHandle reachable_catalogs = 1;
+}
+
+message PruneCatalogsAccepted {}
+
+message PruneCatalogsRejected {
+  string safe_detail = 1;
+}
+
+message PruneCatalogsResponse {
+  oneof outcome {
+    PruneCatalogsAccepted accepted = 1;
+    PruneCatalogsRejected rejected = 2;
+  }
+}

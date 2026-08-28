@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod catalog;
 mod cleanup_maintenance;
 mod context;
 mod control;
@@ -58,6 +59,13 @@ pub use cleanup_maintenance::{
     MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_BYTES, MAX_CONNECTOR_CLEANUP_CANDIDATE_PAGE_ITEMS,
     MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS, MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES,
     PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
+};
+pub use catalog::{
+    CatalogCredentialReference, CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
+    ConnectorControlRuntimeId, CATALOG_VERSION_BYTES, MAX_CATALOGS_PER_QUERY, MAX_CATALOG_SET_BYTES,
+    MAX_CATALOG_CREDENTIAL_REFERENCES,
+    MAX_CATALOG_CREDENTIAL_REFERENCE_BYTES, MAX_CATALOG_PROPERTIES, MAX_CATALOG_PROPERTY_KEY_BYTES,
+    MAX_CATALOG_PROPERTY_VALUE_BYTES,
 };
 pub use context::{ConnectorCancellation, ConnectorRequestContext};
 pub use control::{
