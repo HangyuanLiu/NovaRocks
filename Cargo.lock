@@ -3450,7 +3450,6 @@ dependencies = [
  "novarocks-frontend",
  "novarocks-fs",
  "novarocks-native-trust",
- "novarocks-proto-models",
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-state-store-sqlite",
