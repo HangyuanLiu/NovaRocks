@@ -25,13 +25,14 @@ use crate::query_execution::contract::{
 use crate::query_execution::schedule::FragmentLifecycleProjection;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::{
     ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
     QueryControlEndpoint, QueryExecutionId, QueryOptions as ProtocolQueryOptions,
     RuntimeFilterContribution,
 };
+use novarocks_proto_models::common;
 use novarocks_proto_models::novarocks;
-use novarocks_proto_models::{catalog, common};
 use novarocks_types::BackendProcessId;
 use novarocks_types::NativeCompatibilityId;
 
@@ -162,6 +163,7 @@ pub struct QueryInitOptions {
     query_deadline_unix_ms: u64,
     pre_start_timeout: Duration,
     report_endpoint: QueryControlEndpoint,
+    catalog_set: CatalogSet,
 }
 
 impl QueryInitOptions {
@@ -233,6 +235,7 @@ impl QueryInitOptions {
             query_deadline_unix_ms,
             pre_start_timeout,
             report_endpoint,
+            catalog_set: CatalogSet::new([]).expect("the empty catalog set is valid"),
         })
     }
 
@@ -259,6 +262,18 @@ impl QueryInitOptions {
     /// manifest. Core does not project execution options into this carrier.
     pub const fn query_options(&self) -> &ProtocolQueryOptions {
         &self.query_options
+    }
+
+    /// Freezes the query-wide catalog contribution that is copied unchanged
+    /// into every participant's existing Init request. Query assembly owns
+    /// choosing this set; lifecycle only preserves its exact validated value.
+    pub fn with_catalog_set(mut self, catalog_set: CatalogSet) -> Self {
+        self.catalog_set = catalog_set;
+        self
+    }
+
+    pub fn catalog_set(&self) -> &CatalogSet {
+        &self.catalog_set
     }
 }
 
@@ -608,7 +623,7 @@ pub(crate) fn compile_query_init_plan(
             runtime_filter: runtime_filter.map(|contribution| contribution.as_proto().clone()),
             pre_start_timeout_ms: duration_millis(options.pre_start_timeout)?,
             report_endpoint: Some(options.report_endpoint.as_proto().clone()),
-            catalog_set: Some(catalog::CatalogSet { catalogs: vec![] }),
+            catalog_set: Some(options.catalog_set.as_proto().clone()),
         })
         .map_err(|error| {
             contract_error(format!(
@@ -642,11 +657,15 @@ mod tests {
     use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
     use crate::query_execution::contract::{QueryId, ResolvedQueryOptions};
     use crate::query_execution::schedule::FragmentLifecycleProjection;
+    use novarocks_proto_codec::catalog::CatalogSet;
     use novarocks_proto_codec::lifecycle::{
         AttemptId, QueryExecutionId, QueryOptions, RuntimeFilterContribution,
     };
     use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_proto_models::novarocks;
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
+    };
     use novarocks_types::{BackendProcessId, UniqueId};
 
     fn execution_id() -> QueryExecutionId {
@@ -697,6 +716,21 @@ mod tests {
         QueryOptions::parse(novarocks::QueryOptions::default()).expect("valid wire query options")
     }
 
+    fn catalog_set() -> CatalogSet {
+        CatalogSet::new([CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::try_from_canonical("catalog.analytics").expect("catalog name"),
+                CatalogVersion::from_bytes([0x23; 32]),
+            ),
+            CatalogProviderKind::Iceberg,
+            1,
+            vec![],
+            vec![],
+        )
+        .expect("catalog properties")])
+        .expect("catalog set")
+    }
+
     #[test]
     fn query_init_plan_unions_fragment_and_runtime_filter_participants() {
         let fragment_zero = UniqueId::new(10, 1);
@@ -727,7 +761,8 @@ mod tests {
                 "127.0.0.1:19030".parse().expect("valid report endpoint"),
             ),
         )
-        .expect("valid init options");
+        .expect("valid init options")
+        .with_catalog_set(catalog_set());
 
         let plan = compile_query_init_plan(
             &fragments,
@@ -752,6 +787,19 @@ mod tests {
                 .expect("validated contribution")
                 .is_some()
         );
+        let expected_catalogs = options.catalog_set().as_proto().clone();
+        for backend_idx in plan.backend_ids() {
+            assert_eq!(
+                plan.participant(backend_idx)
+                    .expect("participant")
+                    .manifest()
+                    .catalog_set()
+                    .expect("catalog set")
+                    .as_proto(),
+                &expected_catalogs,
+                "every Init manifest carries the same frozen query-wide catalog set"
+            );
+        }
     }
 
     #[test]
