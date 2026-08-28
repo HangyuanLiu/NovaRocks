@@ -20,7 +20,6 @@ use novarocks_spi::connector::CatalogRuntimeMaterializer;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 
 use crate::BackendDataRuntime;
-use crate::connector::ConnectorRegistry;
 use crate::exchange_receiver::BackendExchangeReceiverPort;
 use crate::fragment::control::FragmentControlRegistry;
 use crate::fragment::{
@@ -524,7 +523,6 @@ fn compose_backend_application_services(
             native_compatibility_id,
             catalog_runtime_materializers,
         );
-    let connector_registry = Arc::new(ConnectorRegistry::new());
     let native_fragment_service = Arc::new(
         NativeFragmentService::new_with_controls(
             grpc_exchange_transmitter(data_runtime.clone()),
@@ -532,7 +530,6 @@ fn compose_backend_application_services(
             native_result_writer(),
             Arc::clone(&controls),
             Arc::clone(&query_lifecycle_registry),
-            connector_registry,
             Arc::clone(&execution_runtime),
         )
         .with_write_commit_evidence_limits(write_commit_evidence_limits)

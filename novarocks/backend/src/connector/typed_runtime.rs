@@ -23,7 +23,7 @@
 //! - Drives the runtime split stream: one split becomes one page source, whose
 //!   pages become `Chunk`s through the execution-owned page adapter.
 //! - Owns terminal cleanup for the page sources it opened, mirroring the
-//!   opaque `ConnectorReadScanSource` reader-group discipline.
+//!   the same explicit reader-group discipline as the retired opaque carrier.
 //!
 //! Key exported interfaces:
 //! - Types: `TypedConnectorScanSource`, `TypedConnectorScanOp`.
@@ -46,7 +46,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::connector::runtime::ConnectorBatchTransform;
+use crate::connector::batch_transform::ConnectorBatchTransform;
 use crate::fragment::decode::plan::context::RuntimeFilterSessionResolver;
 use crate::runtime_filter::typed_dynamic_filter::scan_dynamic_filter_spi;
 use novarocks_execution::connector::{

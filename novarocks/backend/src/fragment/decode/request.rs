@@ -25,7 +25,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::connector::ConnectorRegistry;
 use novarocks_execution::runtime::fragment::FragmentSubmission;
 #[cfg(test)]
 use novarocks_proto_codec::lifecycle::decode_query_execution_id;
@@ -59,14 +58,12 @@ impl NativeFragmentRequest {
         execution_id: QueryExecutionId,
         fragment: plan::PlanFragment,
         instance_params: proto::InstanceParams,
-        connectors: Arc<ConnectorRegistry>,
         exchange_wait: std::time::Duration,
     ) -> Result<Self, NativeFragmentIngressError> {
         Self::try_decode_with_runtime(
             execution_id,
             fragment,
             instance_params,
-            connectors,
             Arc::new(NeverCancelled),
             exchange_wait,
             None,
@@ -77,7 +74,6 @@ impl NativeFragmentRequest {
         execution_id: QueryExecutionId,
         fragment: plan::PlanFragment,
         instance_params: proto::InstanceParams,
-        connectors: Arc<ConnectorRegistry>,
         connector_cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
         exchange_wait: std::time::Duration,
         typed_scan_runtime: Option<crate::fragment::decode::plan::context::TypedScanRuntime>,
@@ -87,7 +83,6 @@ impl NativeFragmentRequest {
             &fragment,
             instance,
             &instance_params,
-            connectors,
             connector_cancellation,
             exchange_wait,
             typed_scan_runtime,
@@ -171,7 +166,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::connector::ConnectorRegistry;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_proto_models::{common, novarocks as proto, plan};
     use novarocks_types::QueryId;
@@ -238,7 +232,6 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            Arc::new(ConnectorRegistry::new()),
             Duration::from_secs(1),
         )
         .expect("decode values request through backend ingress");

@@ -25,7 +25,7 @@ use arrow::datatypes::DataType;
 use super::super::context::NativePlanDecodeContext;
 use super::super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use super::super::layout::Layout;
-use crate::connector::runtime::ConnectorBatchTransform;
+use crate::connector::batch_transform::ConnectorBatchTransform;
 use crate::fragment::decode::type_decode::{decode_field_type, decode_type};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};

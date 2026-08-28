@@ -21,7 +21,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::connector::ConnectorRegistry;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::program::{
     FragmentContractVersion, FragmentProgramOptions, FragmentSinkSpec, ScanSourceContract,
@@ -65,7 +64,6 @@ pub(crate) fn decode_fragment_submission(
     fragment: &plan::PlanFragment,
     instance: NativeFragmentInstanceInput,
     instance_params: &proto::InstanceParams,
-    connectors: Arc<ConnectorRegistry>,
     connector_cancellation: Arc<dyn ConnectorCancellation>,
     exchange_wait: Duration,
     typed_scan_runtime: Option<super::context::TypedScanRuntime>,
@@ -99,7 +97,6 @@ pub(crate) fn decode_fragment_submission(
         instance.exchange_inputs.clone(),
         instance.raw_scan_ranges,
         instance.query_options.clone(),
-        connectors,
         connector_cancellation,
         instance.query_id,
         instance.fragment_instance_id,
@@ -185,7 +182,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::connector::ConnectorRegistry;
     use arrow::datatypes::DataType;
     use novarocks_execution::exec::fragment::program::FragmentSinkKind;
     use novarocks_execution::exec::node::ExecNodeKind;
@@ -275,7 +271,6 @@ mod tests {
             fragment,
             instance,
             params,
-            Arc::new(ConnectorRegistry::new()),
             Arc::new(NeverCancelled),
             Duration::from_secs(1),
             None,
@@ -295,7 +290,6 @@ mod tests {
             .expect("valid execution id"),
             fragment,
             params,
-            Arc::new(ConnectorRegistry::new()),
             Duration::from_secs(1),
         )
     }

@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use crate::connector::ConnectorRegistry;
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use crate::runtime::sink_commit::{BackendSinkCommitPort, ConfiguredBackendSinkCommitPort};
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
@@ -144,7 +143,6 @@ pub struct NativeFragmentService {
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
     lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
-    connector_registry: Arc<ConnectorRegistry>,
     execution_runtime: Arc<ExecutionRuntime>,
     commit_port: Arc<dyn FragmentCommitPort>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
@@ -188,7 +186,6 @@ impl NativeFragmentService {
         lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         lifecycle: Arc<QueryLifecycleRegistry>,
-        connector_registry: Arc<ConnectorRegistry>,
     ) -> Self {
         Self::new_with_controls(
             exchange_transmitter,
@@ -196,7 +193,6 @@ impl NativeFragmentService {
             result_writer,
             Arc::new(FragmentControlRegistry::default()),
             lifecycle,
-            connector_registry,
             test_execution_runtime(),
         )
     }
@@ -211,7 +207,6 @@ impl NativeFragmentService {
         result_writer: Arc<dyn FragmentResultWriter>,
         controls: Arc<FragmentControlRegistry>,
         lifecycle: Arc<QueryLifecycleRegistry>,
-        connector_registry: Arc<ConnectorRegistry>,
         execution_runtime: Arc<ExecutionRuntime>,
     ) -> Self {
         Self {
@@ -221,7 +216,6 @@ impl NativeFragmentService {
             exchange_transmitter,
             lookup_client,
             result_writer,
-            connector_registry,
             execution_runtime,
             commit_port: Arc::new(BackendSinkCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
@@ -269,7 +263,6 @@ impl NativeFragmentService {
             crate::fragment::native_result_writer(),
             controls,
             lifecycle,
-            Arc::new(ConnectorRegistry::new()),
             test_execution_runtime(),
         );
         service.lifecycle_observer = Some(Arc::new(observer));
@@ -590,7 +583,6 @@ impl NativeFragmentService {
                 execution_id,
                 fragment.plan().clone(),
                 fragment.instance_params().clone(),
-                Arc::clone(&self.connector_registry),
                 self.queries
                     .connector_cancellation_for_execution(execution_id),
                 std::time::Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
@@ -1237,7 +1229,6 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
-    use crate::connector::ConnectorRegistry;
     use novarocks_execution::runtime::fragment::{
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
     };
@@ -1397,7 +1388,6 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            Arc::new(ConnectorRegistry::new()),
             std::time::Duration::from_millis(120_000),
         )
         .expect("valid native fragment request")
@@ -1703,7 +1693,6 @@ mod tests {
             ),
             crate::fragment::native_result_writer(),
             test_lifecycle_registry(Arc::new(FragmentControlRegistry::default())),
-            Arc::new(ConnectorRegistry::new()),
         );
 
         let execution_id = QueryExecutionId::new(
@@ -1781,7 +1770,6 @@ mod tests {
             ),
             crate::fragment::native_result_writer(),
             test_lifecycle_registry(Arc::new(FragmentControlRegistry::default())),
-            Arc::new(ConnectorRegistry::new()),
         );
         let first = values_result_request(82_000, 82_002);
         let finst_id = first.fragment_instance_id();

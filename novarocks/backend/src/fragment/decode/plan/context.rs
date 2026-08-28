@@ -22,7 +22,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::connector::ConnectorRegistry;
 use crate::fragment::decode::expression::NativeExpressionInputLayout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
@@ -36,8 +35,6 @@ use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{common, expr};
 use novarocks_spi::connector::ConnectorCancellation;
-#[cfg(test)]
-use novarocks_spi::connector::ConnectorExecutionResolver;
 use novarocks_types::QueryId;
 
 use crate::fragment::decode::plan::error::{
@@ -177,9 +174,6 @@ pub(crate) struct NativePlanDecodeContext {
     raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
     captured_scan_ranges: RefCell<BTreeMap<FragmentNodeId, BoundScanRanges>>,
     query_options: Option<QueryOptions>,
-    connectors: Option<Arc<ConnectorRegistry>>,
-    #[cfg(test)]
-    execution_resolver: Option<Arc<dyn ConnectorExecutionResolver>>,
     connector_cancellation: Option<Arc<dyn ConnectorCancellation>>,
     query_id: Option<QueryId>,
     fragment_instance_id: FragmentInstanceId,
@@ -197,9 +191,6 @@ impl Default for NativePlanDecodeContext {
             raw_scan_ranges: BTreeMap::new(),
             captured_scan_ranges: RefCell::new(BTreeMap::new()),
             query_options: None,
-            connectors: None,
-            #[cfg(test)]
-            execution_resolver: None,
             connector_cancellation: None,
             query_id: None,
             fragment_instance_id: FragmentInstanceId::new(novarocks_types::UniqueId::new(0, 0)),
@@ -219,7 +210,6 @@ impl NativePlanDecodeContext {
         exchange_inputs: ExchangeInputAssignments,
         raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
         query_options: QueryOptions,
-        connectors: Arc<ConnectorRegistry>,
         connector_cancellation: Arc<dyn ConnectorCancellation>,
         query_id: QueryId,
         fragment_instance_id: FragmentInstanceId,
@@ -230,9 +220,6 @@ impl NativePlanDecodeContext {
             raw_scan_ranges,
             captured_scan_ranges: RefCell::new(BTreeMap::new()),
             query_options: Some(query_options),
-            connectors: Some(connectors),
-            #[cfg(test)]
-            execution_resolver: None,
             connector_cancellation: Some(connector_cancellation),
             query_id: Some(query_id),
             fragment_instance_id,
@@ -321,29 +308,6 @@ impl NativePlanDecodeContext {
         self.fragment_instance_id
     }
 
-    pub(crate) fn connectors(&self) -> Result<&ConnectorRegistry, NativeFragmentLeafDecodeError> {
-        self.connectors.as_deref().ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                novarocks_proto_codec::ProtocolErrorKind::MissingField,
-                "connector_registry",
-                "native ScanNode requires ConnectorRegistry in NativePlanDecodeContext",
-            )
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn execution_resolver(
-        &self,
-    ) -> Result<&dyn ConnectorExecutionResolver, NativeFragmentLeafDecodeError> {
-        self.execution_resolver.as_deref().ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                novarocks_proto_codec::ProtocolErrorKind::MissingField,
-                "connector_execution_resolver",
-                "native ConnectorReadSource requires a query-scoped execution resolver",
-            )
-        })
-    }
-
     pub(crate) fn connector_cancellation(
         &self,
     ) -> Result<Arc<dyn ConnectorCancellation>, NativeFragmentLeafDecodeError> {
@@ -351,7 +315,7 @@ impl NativePlanDecodeContext {
             NativeFragmentLeafDecodeError::at_field(
                 novarocks_proto_codec::ProtocolErrorKind::MissingField,
                 "connector_cancellation",
-                "native ConnectorReadSource requires an execution cancellation capability",
+                "native typed connector scan requires an execution cancellation capability",
             )
         })
     }
@@ -392,21 +356,6 @@ impl NativePlanDecodeContext {
             FragmentNodeId::new(key.node_id),
             ExchangeInputAssignment::new(count),
         )]));
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_execution_resolver(
-        mut self,
-        resolver: Arc<dyn ConnectorExecutionResolver>,
-    ) -> Self {
-        self.execution_resolver = Some(resolver);
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_connector_registry(mut self, connectors: Arc<ConnectorRegistry>) -> Self {
-        self.connectors = Some(connectors);
         self
     }
 

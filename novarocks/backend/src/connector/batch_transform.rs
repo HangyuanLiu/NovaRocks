@@ -15,9 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod catalog_manager;
-pub(crate) mod batch_transform;
-pub mod typed_registry;
-pub mod typed_runtime;
+//! Execution-domain projection applied to a typed connector page.
 
-pub use typed_registry::{InstalledReadExecution, InstalledWriteExecution};
+/// Backend-owned projection applied after a typed connector reader yields a
+/// batch and before execution materializes its output `Chunk`.
+///
+/// This deliberately exposes no connector registry, provider identity, or
+/// query lifecycle capability. Typed scan decoding resolves those exclusively
+/// through its query-leased `CatalogHandle` runtime.
+pub trait ConnectorBatchTransform: Send + Sync {
+    fn transform(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> Result<arrow::record_batch::RecordBatch, String>;
+}

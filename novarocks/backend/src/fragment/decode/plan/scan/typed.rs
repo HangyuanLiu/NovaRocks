@@ -39,7 +39,7 @@ use novarocks_spi::connector::CatalogHandle;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 use novarocks_types::SlotId;
 
-use crate::connector::runtime::ConnectorBatchTransform;
+use crate::connector::batch_transform::ConnectorBatchTransform;
 use crate::connector::typed_runtime::{
     TypedConnectorScanSource, TypedConnectorSystemTableScanSource,
 };
