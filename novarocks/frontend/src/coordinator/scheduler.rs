@@ -340,6 +340,7 @@ fn bind_query_lifecycle_fault_scopes(
             QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
             QueryLifecycleFaultKind::TerminalOutcomeSuppress,
             QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
+            QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
         ] {
             if let Some(scope) = bind_armed_fault(
                 &root,

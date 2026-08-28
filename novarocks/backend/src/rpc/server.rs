@@ -236,7 +236,7 @@ impl NovaRocksGrpc for BackendRpcService {
         .await
         .map_err(|error| {
             tonic::Status::internal(format!("task_update handler panicked: {error}"))
-        })?;
+        })??;
         Ok(tonic::Response::new(response))
     }
 

@@ -2244,6 +2244,24 @@ mod opt5_directive_tests {
     }
 
     #[test]
+    fn parse_meta_allows_task_update_terminal_ack_drop() {
+        let re = meta_re();
+        let meta = parse_meta(
+            &["-- @query_lifecycle_fault=task-update-terminal-ack-drop,1".to_string()],
+            &re,
+        )
+        .expect("parse task update terminal acknowledgement fault");
+
+        assert_eq!(
+            meta.query_lifecycle_faults,
+            vec![QueryLifecycleFaultDirective {
+                kind: QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
+                be_index: 1,
+            }]
+        );
+    }
+
+    #[test]
     fn runtime_filter_terminal_directives_use_closed_typed_categories() {
         let re = meta_re();
         let lines = vec![
