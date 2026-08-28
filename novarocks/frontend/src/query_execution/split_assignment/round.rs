@@ -24,14 +24,16 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use novarocks_proto_codec::connector_read::ConnectorReadCodec;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::read_stack::ConnectorReadSplitSource;
 
 use super::super::connector_domain::CatalogHandle;
-use super::driver::{AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError};
+use super::driver::{
+    AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError, SplitAssignmentStop,
+    TaskUpdateRetryPolicy,
+};
 use super::transport::TaskUpdateTransport;
 
 /// How many splits one batch pulls from a source.
@@ -54,7 +56,7 @@ pub(crate) struct RoundSplitSource {
 pub(crate) struct RoundSplitAssignment {
     driver: SplitAssignmentDriver,
     sources: Vec<RoundSplitSource>,
-    closed: Arc<AtomicBool>,
+    stop: SplitAssignmentStop,
 }
 
 impl RoundSplitAssignment {
@@ -64,7 +66,9 @@ impl RoundSplitAssignment {
         tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
         max_queued_splits_per_task: u64,
         sources: Vec<RoundSplitSource>,
+        retry_policy: TaskUpdateRetryPolicy,
     ) -> Self {
+        let stop = SplitAssignmentStop::default();
         Self {
             driver: SplitAssignmentDriver::new(
                 execution_id,
@@ -75,9 +79,11 @@ impl RoundSplitAssignment {
                     .iter()
                     .map(|source| (source.plan_node_id, Arc::clone(&source.codec)))
                     .collect(),
+                retry_policy,
+                stop.clone(),
             ),
             sources,
-            closed: Arc::new(AtomicBool::new(false)),
+            stop,
         }
     }
 
@@ -86,10 +92,8 @@ impl RoundSplitAssignment {
     /// Cancellation reaches the coordinator on the statement thread while the
     /// pump may be blocked in a batch request, so the stop signal has to be
     /// observable without holding the round.
-    pub(crate) fn stop_handle(&self) -> RoundSplitAssignmentStop {
-        RoundSplitAssignmentStop {
-            closed: Arc::clone(&self.closed),
-        }
+    pub(crate) fn stop_handle(&self) -> SplitAssignmentStop {
+        self.stop.clone()
     }
 
     /// Drain every source until each plan node has sent its terminal marker.
@@ -97,11 +101,11 @@ impl RoundSplitAssignment {
     /// A source that yields nothing right now is retried after the other
     /// sources get a turn, so one slow enumeration cannot starve the rest.
     pub(crate) fn pump_to_completion(&mut self) -> Result<(), SplitAssignmentDriverError> {
-        while !self.closed.load(Ordering::Acquire) {
+        while !self.stop.is_stopped() {
             let mut progressed = false;
             let mut pending = false;
             for index in 0..self.sources.len() {
-                if self.closed.load(Ordering::Acquire) {
+                if self.stop.is_stopped() {
                     break;
                 }
                 let plan_node_id = self.sources[index].plan_node_id;
@@ -139,9 +143,10 @@ impl RoundSplitAssignment {
 
     /// Idempotent. Closes the driver and every source exactly once.
     pub(crate) fn close(&mut self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if self.stop.is_stopped() {
             return;
         }
+        self.stop.stop();
         self.driver.close();
         for entry in &mut self.sources {
             // A source close may race an outstanding batch; the connector
@@ -178,23 +183,7 @@ pub(crate) fn emit_split_source_close_marker(plan_node_id: i32) {
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
-/// Closes a round's split assignment from another thread.
-#[derive(Clone)]
-pub(crate) struct RoundSplitAssignmentStop {
-    closed: Arc<AtomicBool>,
-}
-
-impl RoundSplitAssignmentStop {
-    /// Ask the pump to stop. The round still closes its sources on drop; this
-    /// only makes the pump notice without waiting for a batch to return.
-    pub(crate) fn stop(&self) {
-        self.closed.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn is_stopped(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
-    }
-}
+pub(crate) type RoundSplitAssignmentStop = SplitAssignmentStop;
 
 #[cfg(test)]
 mod tests {
@@ -202,12 +191,9 @@ mod tests {
 
     #[test]
     fn stop_handle_is_visible_to_the_pump() {
-        let closed = Arc::new(AtomicBool::new(false));
-        let stop = RoundSplitAssignmentStop {
-            closed: Arc::clone(&closed),
-        };
+        let stop = RoundSplitAssignmentStop::default();
         assert!(!stop.is_stopped());
         stop.stop();
-        assert!(closed.load(Ordering::Acquire));
+        assert!(stop.is_stopped());
     }
 }

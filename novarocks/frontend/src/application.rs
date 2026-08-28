@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
 use crate::query_execution::service::QueryExecutionService;
+use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
 use novarocks_native_trust::NativeTrust;
 use novarocks_spi::connector::ConnectorControlFactory;
@@ -220,6 +221,7 @@ pub struct FrontendExecutionConfig {
     /// Query-control timeouts frozen from `[runtime]` and handed to the
     /// coordinator, which validates them once at startup instead of per query.
     query_control_timeouts: FrontendQueryControlTimeouts,
+    task_update_retry_policy: TaskUpdateRetryPolicy,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     catalog_projection: CatalogProjectionConfig,
     /// The deployment's catalog desired-state authority, selected and validated
@@ -245,6 +247,7 @@ impl FrontendExecutionConfig {
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             query_control_timeouts: FrontendQueryControlTimeouts::default(),
+            task_update_retry_policy: TaskUpdateRetryPolicy::default(),
             lake_publication_runtime_policy: LakePublicationRuntimePolicy::try_new(
                 Duration::from_secs(30 * 60),
                 Duration::from_secs(45 * 60),
@@ -265,6 +268,11 @@ impl FrontendExecutionConfig {
 
     pub fn with_query_control_timeouts(mut self, timeouts: FrontendQueryControlTimeouts) -> Self {
         self.query_control_timeouts = timeouts;
+        self
+    }
+
+    pub fn with_task_update_retry_policy(mut self, policy: TaskUpdateRetryPolicy) -> Self {
+        self.task_update_retry_policy = policy;
         self
     }
 
@@ -1038,6 +1046,7 @@ impl FrontendApplicationHost {
                 execution.configured_report_port,
                 execution.runtime_filter_worker_count,
                 execution.query_control_timeouts,
+                execution.task_update_retry_policy,
                 self.backend_topology_port(),
                 Arc::clone(&self.connector_control),
                 self.data_runtime.clone(),

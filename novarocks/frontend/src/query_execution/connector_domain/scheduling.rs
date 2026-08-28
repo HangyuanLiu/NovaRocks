@@ -237,7 +237,12 @@ impl PlanNodeAssignmentState {
     }
 }
 
-/// One update delivered to one admitted task.
+/// One immutable update delivered to one admitted task.
+///
+/// A driver owns this value until it observes a terminal acknowledgement. It
+/// may pass the same borrowed request to its transport more than once after an
+/// unknown network outcome; every egress encoding therefore starts from these
+/// fixed assignments rather than rebuilding their sequence space.
 #[derive(Clone, Debug)]
 pub(crate) struct TaskUpdateRequest {
     fragment_instance_id: UniqueId,

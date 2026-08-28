@@ -676,6 +676,7 @@ pub struct FrontendDistributedQueryCoordinator {
     /// query admission consumes it rather than re-reading configuration.
     lifecycle_config: FrontendQueryLifecycleConfig,
     pre_start_timeout: Duration,
+    task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
 }
 
 fn build_lifecycle_config(
@@ -707,6 +708,7 @@ impl FrontendDistributedQueryCoordinator {
         configured_report_port: u16,
         runtime_filter_worker_count: NonZeroUsize,
         query_control_timeouts: crate::application::FrontendQueryControlTimeouts,
+        task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
         connector_control: Arc<ConnectorControlHost>,
         data_runtime: FrontendDataRuntime,
@@ -745,6 +747,7 @@ impl FrontendDistributedQueryCoordinator {
             data_runtime,
             lifecycle_config,
             pre_start_timeout: Duration::from_millis(query_control_timeouts.pre_start_timeout_ms),
+            task_update_retry_policy,
         })
     }
 
@@ -818,6 +821,8 @@ impl FrontendDistributedQueryCoordinator {
             lifecycle_config: build_lifecycle_config(test_timeouts)
                 .expect("default query-control timeouts validate"),
             pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
+            task_update_retry_policy:
+                crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
         }
     }
 
@@ -890,6 +895,8 @@ impl FrontendDistributedQueryCoordinator {
             lifecycle_config: build_lifecycle_config(test_timeouts)
                 .expect("default query-control timeouts validate"),
             pre_start_timeout: Duration::from_millis(test_timeouts.pre_start_timeout_ms),
+            task_update_retry_policy:
+                crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
         }
     }
 
@@ -1024,8 +1031,12 @@ impl FrontendDistributedQueryCoordinator {
         // task set and its transport are all derived from this schedule. They
         // are built here, while the schedule and the prepared scans are both
         // still in hand, and started only once the tasks can accept work.
-        let split_assignment_plan =
-            prepare_round_split_assignment(&parts.artifacts, &schedule, self.data_runtime.clone())?;
+        let split_assignment_plan = prepare_round_split_assignment(
+            &parts.artifacts,
+            &schedule,
+            self.data_runtime.clone(),
+            self.task_update_retry_policy,
+        )?;
         let binding_attachment =
             encode_binding_attachment(parts.artifacts.runtime_filter_binding_view())?;
         let scheduled = parts
@@ -2476,6 +2487,7 @@ fn prepare_round_split_assignment(
     artifacts: &PreparedDistributedQuery,
     schedule: &ValidatedFragmentSchedule,
     data_runtime: FrontendDataRuntime,
+    retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
 ) -> Result<Option<RoundSplitAssignmentPlan>, DistributedQueryError> {
     let scan_nodes = artifacts
         .typed_scans()
@@ -2528,5 +2540,6 @@ fn prepare_round_split_assignment(
         Arc::new(transport),
         targets,
         sources,
+        retry_policy,
     )))
 }

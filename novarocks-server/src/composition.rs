@@ -38,7 +38,7 @@ use novarocks_execution::runtime::execution_runtime::{
 };
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendExecutionConfig, FrontendQueryControlTimeouts,
-    FrontendServerConfig, LakePublicationRuntimePolicy,
+    FrontendServerConfig, LakePublicationRuntimePolicy, TaskUpdateRetryPolicy,
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
     },
@@ -515,7 +515,18 @@ pub fn compose_frontend_server_config(
         terminal_drain_timeout_ms: runtime_config.query_control_terminal_drain_timeout_ms,
         terminal_ack_timeout_ms: runtime_config.query_control_terminal_ack_timeout_ms,
         pre_start_timeout_ms: runtime_config.query_control_pre_start_timeout_ms,
-    });
+    })
+    .with_task_update_retry_policy(
+        TaskUpdateRetryPolicy::try_new(
+            Duration::from_millis(runtime_config.query_control_task_update_rpc_timeout_ms),
+            Duration::from_millis(runtime_config.query_control_task_update_retry_error_duration_ms),
+            Duration::from_millis(
+                runtime_config.query_control_task_update_retry_initial_backoff_ms,
+            ),
+            Duration::from_millis(runtime_config.query_control_task_update_retry_max_backoff_ms),
+        )
+        .map_err(|error| anyhow::anyhow!("construct task update retry policy: {error}"))?,
+    );
     if let Some(standalone) = config.standalone_server.as_ref() {
         let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");
         execution =

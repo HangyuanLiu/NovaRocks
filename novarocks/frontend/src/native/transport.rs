@@ -1086,12 +1086,15 @@ impl GrpcTaskUpdateTransport {
     }
 }
 
+// Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskUpdateTransport {
     fn send(
         &self,
         execution_id: novarocks_proto_codec::lifecycle::QueryExecutionId,
         target: &crate::query_execution::split_assignment::AssignmentTarget,
-        request: crate::query_execution::connector_domain::TaskUpdateRequest,
+        request: &crate::query_execution::connector_domain::TaskUpdateRequest,
+        timeout: Duration,
+        stop: &crate::query_execution::split_assignment::SplitAssignmentStop,
     ) -> Result<
         crate::query_execution::split_assignment::TaskUpdateOutcome,
         crate::query_execution::split_assignment::TaskUpdateTransportError,
@@ -1101,7 +1104,7 @@ impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskU
         };
 
         let client = self.clients.get(&target.backend_idx).ok_or_else(|| {
-            TaskUpdateTransportError::new(format!(
+            TaskUpdateTransportError::fatal(format!(
                 "task update client for backend {} is missing",
                 target.backend_idx
             ))
@@ -1120,19 +1123,32 @@ impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskU
             }),
             assignments: request
                 .to_proto_assignments()
-                .map_err(TaskUpdateTransportError::new)?,
+                .map_err(TaskUpdateTransportError::fatal)?,
         };
         let response = client
             .data_runtime
             .block_on(async {
-                let mut grpc = client.grpc().await?;
-                grpc.task_update(request)
-                    .await
-                    .map(|value| value.into_inner())
-                    .map_err(|error| format!("task_update rpc failed: {error}"))
+                let deadline = tokio::time::Instant::now() + timeout;
+                let mut stop = stop.subscribe();
+                let mut grpc = tokio::select! {
+                    _ = stop.changed() => Err(TaskUpdateTransportError::closed("task_update round stopped during channel acquisition")),
+                    result = tokio::time::timeout_at(deadline, client.grpc()) => result
+                        .map_err(|_| TaskUpdateTransportError::retryable_network("task_update rpc timeout during channel acquisition"))?
+                        .map_err(|error| TaskUpdateTransportError::fatal(format!("task_update channel acquisition failed: {error}"))),
+                }?;
+                tokio::select! {
+                    _ = stop.changed() => Err(TaskUpdateTransportError::closed("task_update round stopped awaiting response")),
+                    result = tokio::time::timeout_at(deadline, grpc.task_update(request)) => result
+                        .map_err(|_| TaskUpdateTransportError::retryable_network("task_update rpc timeout awaiting response"))?
+                        .map(|value| value.into_inner())
+                        .map_err(task_update_status_error),
+                }
             })
-            .map_err(TaskUpdateTransportError::new)?
-            .map_err(TaskUpdateTransportError::new)?;
+            .map_err(|error| {
+                TaskUpdateTransportError::fatal(format!(
+                    "task_update runtime execution failed: {error}"
+                ))
+            })??;
 
         match response.outcome {
             Some(novarocks_proto_models::novarocks::task_update_response::Outcome::Accepted(
@@ -1167,9 +1183,73 @@ impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskU
             }
             // A response with no outcome cannot be interpreted, and guessing
             // "accepted" would lose splits silently.
-            None => Err(TaskUpdateTransportError::new(
+            None => Err(TaskUpdateTransportError::fatal(
                 "task update response carried no outcome",
             )),
+        }
+    }
+}
+
+/// Classify only typed unary RPC statuses. A retrying caller must retain the
+/// exact request because every allowed status has an unknown remote outcome.
+fn task_update_status_error(
+    status: tonic::Status,
+) -> crate::query_execution::split_assignment::TaskUpdateTransportError {
+    use crate::query_execution::split_assignment::TaskUpdateTransportError;
+
+    let detail = format!(
+        "task_update rpc status {:?}: {}",
+        status.code(),
+        status.message()
+    );
+    match status.code() {
+        tonic::Code::Unavailable
+        | tonic::Code::DeadlineExceeded
+        | tonic::Code::Cancelled
+        | tonic::Code::Unknown => TaskUpdateTransportError::retryable_network(detail),
+        _ => TaskUpdateTransportError::fatal(detail),
+    }
+}
+
+#[cfg(test)]
+mod task_update_transport_tests {
+    use super::*;
+    use crate::query_execution::split_assignment::TaskUpdateTransportErrorKind;
+
+    #[test]
+    fn task_update_status_allowlist_is_exact() {
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Cancelled,
+            tonic::Code::Unknown,
+        ] {
+            assert_eq!(
+                task_update_status_error(tonic::Status::new(code, "unknown outcome")).kind(),
+                TaskUpdateTransportErrorKind::RetryableNetwork,
+                "{code:?} must preserve the immutable request for retry"
+            );
+        }
+
+        for code in [
+            tonic::Code::InvalidArgument,
+            tonic::Code::NotFound,
+            tonic::Code::AlreadyExists,
+            tonic::Code::PermissionDenied,
+            tonic::Code::ResourceExhausted,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::Aborted,
+            tonic::Code::OutOfRange,
+            tonic::Code::Unimplemented,
+            tonic::Code::Internal,
+            tonic::Code::DataLoss,
+            tonic::Code::Unauthenticated,
+        ] {
+            assert_eq!(
+                task_update_status_error(tonic::Status::new(code, "fatal")).kind(),
+                TaskUpdateTransportErrorKind::Fatal,
+                "{code:?} must not be retried"
+            );
         }
     }
 }

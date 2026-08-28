@@ -24,6 +24,9 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_types::UniqueId;
@@ -34,10 +37,117 @@ use novarocks_spi::connector::read_stack::{
 };
 
 use super::super::connector_domain::{PlanNodeAssignmentState, Split, SplitAssignmentError};
-use super::transport::{TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError};
+use super::transport::{
+    TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError, TaskUpdateTransportErrorKind,
+};
 
+// Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 /// Largest number of splits one update may carry, matching the wire bound.
 pub(crate) const MAX_SPLITS_PER_UPDATE: usize = 4096;
+
+/// Server-frozen retry policy for one TaskUpdate request. The driver receives
+/// this value through the coordinator and never consults process-global config.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskUpdateRetryPolicy {
+    pub(crate) rpc_timeout: Duration,
+    pub(crate) error_duration: Duration,
+    pub(crate) initial_backoff: Duration,
+    pub(crate) max_backoff: Duration,
+}
+
+impl TaskUpdateRetryPolicy {
+    pub fn try_new(
+        rpc_timeout: Duration,
+        error_duration: Duration,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) -> Result<Self, String> {
+        if rpc_timeout.is_zero()
+            || error_duration.is_zero()
+            || initial_backoff.is_zero()
+            || max_backoff.is_zero()
+        {
+            return Err("task update retry durations must be greater than zero".to_owned());
+        }
+        if initial_backoff > max_backoff {
+            return Err("task update retry initial backoff must not exceed max backoff".to_owned());
+        }
+        if rpc_timeout > error_duration {
+            return Err("task update rpc timeout must not exceed error duration".to_owned());
+        }
+        if max_backoff > error_duration {
+            return Err("task update retry max backoff must not exceed error duration".to_owned());
+        }
+        Ok(Self {
+            rpc_timeout,
+            error_duration,
+            initial_backoff,
+            max_backoff,
+        })
+    }
+}
+
+impl Default for TaskUpdateRetryPolicy {
+    fn default() -> Self {
+        Self::try_new(
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        )
+        .expect("default task update retry policy is valid")
+    }
+}
+
+/// The one round-owned stop authority. Its atomic makes hot checks cheap and
+/// its condition variable wakes a synchronous retry backoff immediately.
+#[derive(Clone)]
+pub(crate) struct SplitAssignmentStop {
+    stopped: Arc<AtomicBool>,
+    wait: Arc<(Mutex<()>, Condvar)>,
+    cancel: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for SplitAssignmentStop {
+    fn default() -> Self {
+        let (cancel, _) = tokio::sync::watch::channel(false);
+        Self {
+            stopped: Arc::new(AtomicBool::new(false)),
+            wait: Arc::new((Mutex::new(()), Condvar::new())),
+            cancel,
+        }
+    }
+}
+
+impl SplitAssignmentStop {
+    pub(crate) fn stop(&self) {
+        if !self.stopped.swap(true, Ordering::AcqRel) {
+            let _ = self.cancel.send(true);
+            self.wait.1.notify_all();
+        }
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    fn wait_backoff(&self, duration: Duration) -> bool {
+        if self.is_stopped() {
+            return true;
+        }
+        let guard = self.wait.0.lock().expect("split assignment stop lock");
+        let _ = self
+            .wait
+            .1
+            .wait_timeout(guard, duration)
+            .expect("split assignment stop condvar");
+        self.is_stopped()
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.cancel.subscribe()
+    }
+}
 
 /// One admitted task this driver may assign work to.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -170,6 +280,8 @@ pub(crate) struct SplitAssignmentDriver {
     /// stops pulling new batches.
     max_queued_splits_per_task: u64,
     codecs: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadCodec>>,
+    retry_policy: TaskUpdateRetryPolicy,
+    stop: SplitAssignmentStop,
 }
 
 impl SplitAssignmentDriver {
@@ -179,6 +291,8 @@ impl SplitAssignmentDriver {
         tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
         max_queued_splits_per_task: u64,
         codecs: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadCodec>>,
+        retry_policy: TaskUpdateRetryPolicy,
+        stop: SplitAssignmentStop,
     ) -> Self {
         let mut sequences = BTreeMap::new();
         let mut task_state = BTreeMap::new();
@@ -208,6 +322,8 @@ impl SplitAssignmentDriver {
             closed: false,
             max_queued_splits_per_task,
             codecs,
+            retry_policy,
+            stop,
         }
     }
 
@@ -344,11 +460,9 @@ impl SplitAssignmentDriver {
                     },
                 ));
             }
-            // Sequences are allocated before the send and are not rolled back
-            // if it fails. That is deliberate: a failed send ends the round, so
-            // the sequence space dies with it. Reusing a sequence after a
-            // failure would be indistinguishable, on the receiving task, from a
-            // conflicting retransmission of the one that failed.
+            // Sequences are allocated once and the resulting immutable request
+            // stays alive until a strict acknowledgement confirms it. A retry
+            // never enumerates splits or allocates a replacement sequence.
             let assignment = self
                 .sequences
                 .entry(target.clone())
@@ -371,16 +485,19 @@ impl SplitAssignmentDriver {
 
             let state = self.task_state.entry(target.clone()).or_default();
             state.in_flight = true;
-            let outcome = self.transport.send(self.execution_id, &target, request);
+            let outcome = self.send_until_confirmed(&target, &request);
             let state = self.task_state.entry(target.clone()).or_default();
             state.in_flight = false;
 
             match outcome {
                 Ok(TaskUpdateOutcome::Accepted(nodes)) => {
-                    if let Some(node) = nodes.iter().find(|node| node.plan_node_id == plan_node_id)
-                    {
-                        state.queued_splits = node.queued_splits;
-                    }
+                    let node = validate_accepted_ack(&request, &nodes).map_err(|detail| {
+                        SplitAssignmentDriverError::Transport {
+                            target: target.clone(),
+                            detail,
+                        }
+                    })?;
+                    state.queued_splits = node.queued_splits;
                 }
                 Ok(TaskUpdateOutcome::Rejected { reason, detail }) => {
                     return Err(SplitAssignmentDriverError::Rejected {
@@ -463,10 +580,105 @@ impl SplitAssignmentDriver {
     /// replacement round builds a new driver rather than reviving this one.
     pub(crate) fn close(&mut self) {
         self.closed = true;
+        self.stop.stop();
         for source in &mut self.sources {
             source.closed = true;
         }
     }
+
+    fn send_until_confirmed(
+        &self,
+        target: &AssignmentTarget,
+        request: &super::super::connector_domain::TaskUpdateRequest,
+    ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
+        let mut first_retryable_error = None;
+        let mut backoff = self.retry_policy.initial_backoff;
+        loop {
+            if self.stop.is_stopped() || self.closed {
+                return Err(TaskUpdateTransportError::closed(
+                    "split assignment round stopped",
+                ));
+            }
+            let remaining = first_retryable_error.map(|started: Instant| {
+                self.retry_policy
+                    .error_duration
+                    .saturating_sub(started.elapsed())
+            });
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                return Err(TaskUpdateTransportError::retryable_network(
+                    "task update retry error duration exhausted",
+                ));
+            }
+            let rpc_timeout = remaining
+                .map(|remaining| remaining.min(self.retry_policy.rpc_timeout))
+                .unwrap_or(self.retry_policy.rpc_timeout);
+            match self
+                .transport
+                .send(self.execution_id, target, request, rpc_timeout, &self.stop)
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(error) if error.kind() == TaskUpdateTransportErrorKind::RetryableNetwork => {
+                    let started = *first_retryable_error.get_or_insert_with(Instant::now);
+                    let remaining = self
+                        .retry_policy
+                        .error_duration
+                        .saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(error);
+                    }
+                    let wait = backoff.min(remaining);
+                    tracing::debug!(
+                        backend_idx = target.backend_idx,
+                        attempt_hi = request.fragment_instance_id().high(),
+                        attempt_lo = request.fragment_instance_id().low(),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        error_kind = "retryable_network",
+                        "retrying task update after unknown outcome"
+                    );
+                    if self.stop.wait_backoff(wait) {
+                        return Err(TaskUpdateTransportError::closed(
+                            "split assignment round stopped during task update retry",
+                        ));
+                    }
+                    backoff = backoff.saturating_mul(2).min(self.retry_policy.max_backoff);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+/// Validate that an Accepted acknowledgement covers exactly the immutable
+/// request that produced it. This remains pure so mocked transport tests cover
+/// malformed and stale acknowledgements without a live backend.
+fn validate_accepted_ack<'a>(
+    request: &super::super::connector_domain::TaskUpdateRequest,
+    accepted: &'a [super::transport::AcceptedPlanNode],
+) -> Result<&'a super::transport::AcceptedPlanNode, String> {
+    if request.assignments().len() != 1 || accepted.len() != request.assignments().len() {
+        return Err(
+            "task update accepted acknowledgement does not match request node count".to_owned(),
+        );
+    }
+    let assignment = &request.assignments()[0];
+    let node = accepted
+        .iter()
+        .find(|node| node.plan_node_id == assignment.plan_node_id())
+        .ok_or_else(|| {
+            "task update accepted acknowledgement misses request plan node".to_owned()
+        })?;
+    let max_sequence = assignment.splits().last().map(|split| split.sequence_id());
+    if max_sequence.is_some_and(|sequence| node.accepted_through_sequence < sequence) {
+        return Err(
+            "task update accepted acknowledgement watermark does not cover request".to_owned(),
+        );
+    }
+    if assignment.no_more_splits() && !node.no_more_splits {
+        return Err(
+            "task update accepted acknowledgement does not confirm no-more-splits".to_owned(),
+        );
+    }
+    Ok(node)
 }
 
 #[cfg(test)]

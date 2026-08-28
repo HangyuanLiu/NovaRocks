@@ -33,7 +33,8 @@ use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use crate::query_execution::artifact::ValidatedFragmentSchedule;
 use crate::query_execution::split_assignment::{
     AssignmentTarget, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitSource,
-    SplitAssignmentDriverError, TaskUpdateTransport, emit_split_source_close_marker,
+    SplitAssignmentDriverError, TaskUpdateRetryPolicy, TaskUpdateTransport,
+    emit_split_source_close_marker,
 };
 use novarocks_sql::plan_read::FragmentId;
 
@@ -93,6 +94,7 @@ pub(crate) struct RoundSplitAssignmentPlan {
     transport: Arc<dyn TaskUpdateTransport>,
     targets: BTreeMap<i32, Vec<AssignmentTarget>>,
     sources: Vec<RoundSplitSource>,
+    retry_policy: TaskUpdateRetryPolicy,
 }
 
 impl RoundSplitAssignmentPlan {
@@ -100,11 +102,13 @@ impl RoundSplitAssignmentPlan {
         transport: Arc<dyn TaskUpdateTransport>,
         targets: BTreeMap<i32, Vec<AssignmentTarget>>,
         sources: Vec<RoundSplitSource>,
+        retry_policy: TaskUpdateRetryPolicy,
     ) -> Self {
         Self {
             transport,
             targets,
             sources,
+            retry_policy,
         }
     }
 
@@ -161,6 +165,7 @@ impl SplitAssignmentRoundGuard {
             tasks,
             DEFAULT_MAX_QUEUED_SPLITS_PER_TASK,
             sources,
+            plan.retry_policy,
         );
         let stop = assignment.stop_handle();
         let worker = std::thread::Builder::new()
@@ -227,7 +232,9 @@ mod tests {
                 &self,
                 _execution_id: QueryExecutionId,
                 _target: &AssignmentTarget,
-                _request: crate::query_execution::connector_domain::TaskUpdateRequest,
+                _request: &crate::query_execution::connector_domain::TaskUpdateRequest,
+                _timeout: std::time::Duration,
+                _stop: &crate::query_execution::split_assignment::SplitAssignmentStop,
             ) -> Result<
                 crate::query_execution::split_assignment::TaskUpdateOutcome,
                 crate::query_execution::split_assignment::TaskUpdateTransportError,
@@ -238,7 +245,12 @@ mod tests {
         assert!(
             SplitAssignmentRoundGuard::start(
                 execution_id(),
-                RoundSplitAssignmentPlan::new(Arc::new(NeverCalled), BTreeMap::new(), Vec::new(),),
+                RoundSplitAssignmentPlan::new(
+                    Arc::new(NeverCalled),
+                    BTreeMap::new(),
+                    Vec::new(),
+                    TaskUpdateRetryPolicy::default(),
+                ),
             )
             .is_none()
         );

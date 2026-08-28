@@ -948,6 +948,14 @@ pub struct RuntimeConfig {
     pub query_control_start_rpc_timeout_ms: u64,
     #[serde(default = "default_query_control_pre_start_timeout_ms")]
     pub query_control_pre_start_timeout_ms: u64,
+    #[serde(default = "default_query_control_task_update_rpc_timeout_ms")]
+    pub query_control_task_update_rpc_timeout_ms: u64,
+    #[serde(default = "default_query_control_task_update_retry_error_duration_ms")]
+    pub query_control_task_update_retry_error_duration_ms: u64,
+    #[serde(default = "default_query_control_task_update_retry_initial_backoff_ms")]
+    pub query_control_task_update_retry_initial_backoff_ms: u64,
+    #[serde(default = "default_query_control_task_update_retry_max_backoff_ms")]
+    pub query_control_task_update_retry_max_backoff_ms: u64,
     #[serde(default = "default_query_control_tombstone_retention_ms")]
     pub query_control_tombstone_retention_ms: u64,
     #[serde(default = "default_query_control_tombstone_capacity")]
@@ -1181,6 +1189,18 @@ fn default_query_control_start_rpc_timeout_ms() -> u64 {
 fn default_query_control_pre_start_timeout_ms() -> u64 {
     30_000
 }
+fn default_query_control_task_update_rpc_timeout_ms() -> u64 {
+    5_000
+}
+fn default_query_control_task_update_retry_error_duration_ms() -> u64 {
+    30_000
+}
+fn default_query_control_task_update_retry_initial_backoff_ms() -> u64 {
+    100
+}
+fn default_query_control_task_update_retry_max_backoff_ms() -> u64 {
+    1_000
+}
 
 fn default_query_control_tombstone_retention_ms() -> u64 {
     120_000
@@ -1276,6 +1296,22 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
             runtime.query_control_pre_start_timeout_ms,
         ),
         (
+            "runtime.query_control_task_update_rpc_timeout_ms",
+            runtime.query_control_task_update_rpc_timeout_ms,
+        ),
+        (
+            "runtime.query_control_task_update_retry_error_duration_ms",
+            runtime.query_control_task_update_retry_error_duration_ms,
+        ),
+        (
+            "runtime.query_control_task_update_retry_initial_backoff_ms",
+            runtime.query_control_task_update_retry_initial_backoff_ms,
+        ),
+        (
+            "runtime.query_control_task_update_retry_max_backoff_ms",
+            runtime.query_control_task_update_retry_max_backoff_ms,
+        ),
+        (
             "runtime.query_control_tombstone_retention_ms",
             runtime.query_control_tombstone_retention_ms,
         ),
@@ -1339,6 +1375,27 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
     {
         bail!(
             "runtime.query_control_terminal_fallback_initial_backoff_ms must not exceed runtime.query_control_terminal_fallback_max_backoff_ms"
+        );
+    }
+    if runtime.query_control_task_update_retry_initial_backoff_ms
+        > runtime.query_control_task_update_retry_max_backoff_ms
+    {
+        bail!(
+            "runtime.query_control_task_update_retry_initial_backoff_ms must not exceed runtime.query_control_task_update_retry_max_backoff_ms"
+        );
+    }
+    if runtime.query_control_task_update_rpc_timeout_ms
+        > runtime.query_control_task_update_retry_error_duration_ms
+    {
+        bail!(
+            "runtime.query_control_task_update_rpc_timeout_ms must not exceed runtime.query_control_task_update_retry_error_duration_ms"
+        );
+    }
+    if runtime.query_control_task_update_retry_max_backoff_ms
+        > runtime.query_control_task_update_retry_error_duration_ms
+    {
+        bail!(
+            "runtime.query_control_task_update_retry_max_backoff_ms must not exceed runtime.query_control_task_update_retry_error_duration_ms"
         );
     }
     let nonzero_limits = [
@@ -1606,6 +1663,14 @@ impl Default for RuntimeConfig {
             query_control_stage_rpc_timeout_ms: default_query_control_stage_rpc_timeout_ms(),
             query_control_start_rpc_timeout_ms: default_query_control_start_rpc_timeout_ms(),
             query_control_pre_start_timeout_ms: default_query_control_pre_start_timeout_ms(),
+            query_control_task_update_rpc_timeout_ms:
+                default_query_control_task_update_rpc_timeout_ms(),
+            query_control_task_update_retry_error_duration_ms:
+                default_query_control_task_update_retry_error_duration_ms(),
+            query_control_task_update_retry_initial_backoff_ms:
+                default_query_control_task_update_retry_initial_backoff_ms(),
+            query_control_task_update_retry_max_backoff_ms:
+                default_query_control_task_update_retry_max_backoff_ms(),
             query_control_tombstone_retention_ms: default_query_control_tombstone_retention_ms(),
             query_control_tombstone_capacity: default_query_control_tombstone_capacity(),
             query_control_terminal_drain_timeout_ms:
@@ -1971,6 +2036,19 @@ mod tests {
         assert_eq!(runtime.query_control_stage_rpc_timeout_ms, 5_000);
         assert_eq!(runtime.query_control_start_rpc_timeout_ms, 2_000);
         assert_eq!(runtime.query_control_pre_start_timeout_ms, 30_000);
+        assert_eq!(runtime.query_control_task_update_rpc_timeout_ms, 5_000);
+        assert_eq!(
+            runtime.query_control_task_update_retry_error_duration_ms,
+            30_000
+        );
+        assert_eq!(
+            runtime.query_control_task_update_retry_initial_backoff_ms,
+            100
+        );
+        assert_eq!(
+            runtime.query_control_task_update_retry_max_backoff_ms,
+            1_000
+        );
         assert_eq!(runtime.query_control_tombstone_retention_ms, 120_000);
         assert_eq!(runtime.query_control_tombstone_capacity, 16_384);
         assert_eq!(runtime.query_control_terminal_drain_timeout_ms, 30_000);
@@ -2018,7 +2096,7 @@ mod tests {
         reason = "The table-driven validation fixture keeps each field mutator explicit."
     )]
     fn query_control_config_rejects_zero_values() {
-        let cases: [(&str, fn(&mut RuntimeConfig)); 8] = [
+        let cases: [(&str, fn(&mut RuntimeConfig)); 12] = [
             ("query_control_heartbeat_interval_ms", |runtime| {
                 runtime.query_control_heartbeat_interval_ms = 0;
             }),
@@ -2034,6 +2112,27 @@ mod tests {
             ("query_control_pre_start_timeout_ms", |runtime| {
                 runtime.query_control_pre_start_timeout_ms = 0;
             }),
+            ("query_control_task_update_rpc_timeout_ms", |runtime| {
+                runtime.query_control_task_update_rpc_timeout_ms = 0;
+            }),
+            (
+                "query_control_task_update_retry_error_duration_ms",
+                |runtime| {
+                    runtime.query_control_task_update_retry_error_duration_ms = 0;
+                },
+            ),
+            (
+                "query_control_task_update_retry_initial_backoff_ms",
+                |runtime| {
+                    runtime.query_control_task_update_retry_initial_backoff_ms = 0;
+                },
+            ),
+            (
+                "query_control_task_update_retry_max_backoff_ms",
+                |runtime| {
+                    runtime.query_control_task_update_retry_max_backoff_ms = 0;
+                },
+            ),
             ("query_control_tombstone_retention_ms", |runtime| {
                 runtime.query_control_tombstone_retention_ms = 0;
             }),
@@ -2073,6 +2172,39 @@ mod tests {
             error
                 .to_string()
                 .contains("query_control_heartbeat_timeout_ms")
+        );
+    }
+
+    #[test]
+    fn query_control_config_rejects_invalid_task_update_retry_relationships() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.query_control_task_update_retry_initial_backoff_ms = 1_001;
+        let error = validate_query_control_config(&runtime)
+            .expect_err("initial backoff above max must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("query_control_task_update_retry_initial_backoff_ms")
+        );
+
+        let mut runtime = RuntimeConfig::default();
+        runtime.query_control_task_update_rpc_timeout_ms = 30_001;
+        let error = validate_query_control_config(&runtime)
+            .expect_err("rpc timeout above retry duration must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("query_control_task_update_rpc_timeout_ms")
+        );
+
+        let mut runtime = RuntimeConfig::default();
+        runtime.query_control_task_update_retry_max_backoff_ms = 30_001;
+        let error = validate_query_control_config(&runtime)
+            .expect_err("max backoff above retry duration must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("query_control_task_update_retry_max_backoff_ms")
         );
     }
 

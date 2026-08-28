@@ -51,6 +51,13 @@ max_commit_receipts = 1000000
 maintenance_interval_commits = 256
 incremental_vacuum_pages = 1024
 
+[runtime]
+# TaskUpdate treats only typed unknown-outcome network failures as retryable.
+query_control_task_update_rpc_timeout_ms = 5000
+query_control_task_update_retry_error_duration_ms = 30000
+query_control_task_update_retry_initial_backoff_ms = 100
+query_control_task_update_retry_max_backoff_ms = 1000
+
 [standalone_server]
 mysql_port = 9030
 user = "root"

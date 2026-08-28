@@ -22,8 +22,10 @@
 //! a live backend, and keeps native transport ownership with the coordinator.
 
 use std::fmt;
+use std::time::Duration;
 
 use super::driver::AssignmentTarget;
+use super::driver::SplitAssignmentStop;
 use crate::query_execution::connector_domain::TaskUpdateRequest;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 
@@ -50,16 +52,59 @@ pub(crate) enum TaskUpdateOutcome {
     },
 }
 
+/// Whether a TaskUpdate failure has an unknown remote outcome and may be
+/// retried with the exact same immutable request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TaskUpdateTransportErrorKind {
+    /// The unary RPC may have reached the backend, but its terminal outcome
+    /// was not observed by the frontend.
+    RetryableNetwork,
+    /// The request, client construction, or received response was invalid for
+    /// this attempt. Retrying it would not establish what the backend did.
+    Fatal,
+    /// The split-assignment round was stopped locally.
+    Closed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct TaskUpdateTransportError {
+    kind: TaskUpdateTransportErrorKind,
     detail: String,
 }
 
 impl TaskUpdateTransportError {
+    /// Compatibility constructor for local callers that have no retryable
+    /// transport evidence. Such failures must fail closed.
     pub(crate) fn new(detail: impl Into<String>) -> Self {
+        Self::fatal(detail)
+    }
+
+    pub(crate) fn retryable_network(detail: impl Into<String>) -> Self {
         Self {
+            kind: TaskUpdateTransportErrorKind::RetryableNetwork,
             detail: detail.into(),
         }
+    }
+
+    pub(crate) fn fatal(detail: impl Into<String>) -> Self {
+        Self {
+            kind: TaskUpdateTransportErrorKind::Fatal,
+            detail: detail.into(),
+        }
+    }
+
+    /// Constructed by the driver when its round stop has won the race with an
+    /// in-flight delivery. The transport itself never guesses local stop from
+    /// a gRPC status.
+    pub(crate) fn closed(detail: impl Into<String>) -> Self {
+        Self {
+            kind: TaskUpdateTransportErrorKind::Closed,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> TaskUpdateTransportErrorKind {
+        self.kind
     }
 
     pub(crate) fn detail(&self) -> &str {
@@ -80,6 +125,99 @@ pub(crate) trait TaskUpdateTransport: Send + Sync {
         &self,
         execution_id: QueryExecutionId,
         target: &AssignmentTarget,
-        request: TaskUpdateRequest,
+        request: &TaskUpdateRequest,
+        timeout: Duration,
+        stop: &SplitAssignmentStop,
     ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_types::{AttemptId, QueryId, UniqueId};
+
+    struct RecordingTransport {
+        observed_request_addresses: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl TaskUpdateTransport for RecordingTransport {
+        fn send(
+            &self,
+            _execution_id: QueryExecutionId,
+            _target: &AssignmentTarget,
+            request: &TaskUpdateRequest,
+            _timeout: Duration,
+            _stop: &SplitAssignmentStop,
+        ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
+            self.observed_request_addresses
+                .lock()
+                .expect("recording transport lock")
+                .push(std::ptr::from_ref(request).addr());
+            Ok(TaskUpdateOutcome::Accepted(Vec::new()))
+        }
+    }
+
+    #[test]
+    fn unclassified_transport_failure_is_fatal() {
+        let error = TaskUpdateTransportError::new("local encoding failed");
+        assert_eq!(error.kind(), TaskUpdateTransportErrorKind::Fatal);
+        assert_eq!(error.detail(), "local encoding failed");
+    }
+
+    #[test]
+    fn error_kind_preserves_retry_and_round_stop_meaning() {
+        assert_eq!(
+            TaskUpdateTransportError::retryable_network("terminal ack lost").kind(),
+            TaskUpdateTransportErrorKind::RetryableNetwork
+        );
+        assert_eq!(
+            TaskUpdateTransportError::closed("round cancelled").kind(),
+            TaskUpdateTransportErrorKind::Closed
+        );
+    }
+
+    #[test]
+    fn transport_can_receive_the_same_immutable_request_more_than_once() {
+        let transport = RecordingTransport {
+            observed_request_addresses: std::sync::Mutex::new(Vec::new()),
+        };
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(3, 4),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("valid execution id");
+        let target = AssignmentTarget {
+            backend_idx: 0,
+            fragment_instance_id: UniqueId::new(5, 6),
+        };
+        let request = TaskUpdateRequest::new(target.fragment_instance_id, Vec::new());
+        let stop = SplitAssignmentStop::default();
+
+        transport
+            .send(
+                execution_id,
+                &target,
+                &request,
+                Duration::from_millis(10),
+                &stop,
+            )
+            .expect("first borrowed send");
+        transport
+            .send(
+                execution_id,
+                &target,
+                &request,
+                Duration::from_millis(10),
+                &stop,
+            )
+            .expect("second borrowed send");
+
+        assert_eq!(
+            *transport
+                .observed_request_addresses
+                .lock()
+                .expect("recording transport lock"),
+            vec![std::ptr::from_ref(&request).addr(); 2]
+        );
+    }
 }
