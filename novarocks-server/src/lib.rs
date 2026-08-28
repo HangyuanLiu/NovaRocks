@@ -22,6 +22,7 @@ mod env_reference;
 pub mod launch;
 pub mod logging;
 pub mod memory_limit;
+pub mod native_compatibility;
 pub mod native_trust;
 pub mod network;
 pub mod state_store_config;

@@ -3450,11 +3450,13 @@ dependencies = [
  "novarocks-frontend",
  "novarocks-fs",
  "novarocks-native-trust",
+ "novarocks-proto-models",
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-state-store-sqlite",
  "novarocks-test-support",
  "novarocks-types",
+ "novarocks-version",
  "serde",
  "tempfile",
  "tokio",
@@ -3606,6 +3608,11 @@ version = "0.1.0"
 [[package]]
 name = "novarocks-version"
 version = "0.1.0"
+dependencies = [
+ "novarocks-proto-models",
+ "novarocks-types",
+ "sha2",
+]
 
 [[package]]
 name = "nu-ansi-term"

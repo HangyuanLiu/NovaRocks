@@ -6,3 +6,11 @@ build = "build.rs"
 
 [lib]
 doctest = false
+
+[features]
+native-compatibility-test-fixture = []
+
+[dependencies]
+novarocks-proto-models = { path = "../proto-models" }
+novarocks-types = { path = "../types" }
+sha2 = "0.10"
