@@ -1348,7 +1348,10 @@ impl QueryLifecycleRegistry {
                 .lock()
                 .map_err(|_| "query lifecycle entry lock is poisoned".to_string())?
                 .phase;
-            if phase != QueryLifecyclePhase::Running {
+            if !matches!(
+                phase,
+                QueryLifecyclePhase::Staged | QueryLifecyclePhase::Running
+            ) {
                 continue;
             }
             for route in validated(entry.manifest.exchange_routes()) {
