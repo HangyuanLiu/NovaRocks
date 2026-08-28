@@ -3503,20 +3503,6 @@ impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
         Err(Self::rejected("ReportQueryTerminal"))
     }
 
-    async fn ensure_connector_execution_binding(
-        &self,
-        _request: Request<proto::EnsureConnectorExecutionBindingRequest>,
-    ) -> Result<Response<proto::EnsureConnectorExecutionBindingResponse>, Status> {
-        Err(Self::rejected("EnsureConnectorExecutionBinding"))
-    }
-
-    async fn retire_connector_execution_binding(
-        &self,
-        _request: Request<proto::RetireConnectorExecutionBindingRequest>,
-    ) -> Result<Response<proto::RetireConnectorExecutionBindingResponse>, Status> {
-        Err(Self::rejected("RetireConnectorExecutionBinding"))
-    }
-
     async fn prune_catalogs(
         &self,
         _request: Request<catalog::PruneCatalogsRequest>,

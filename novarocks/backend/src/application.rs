@@ -787,7 +787,6 @@ impl BackendApplicationHost {
             &bind_host,
             grpc_port,
             BackendRpcService::new(
-                native_fragment_service.clone(),
                 services.query_lifecycle_ingress.clone(),
                 runtime_filter_ingress,
                 Arc::clone(&services.exchange_receiver_port),

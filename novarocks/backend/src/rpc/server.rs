@@ -51,8 +51,6 @@ use tonic::server::NamedService;
 use tower::ServiceExt;
 
 use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
-use crate::connector::binding_decode;
-use crate::fragment::ingress::NativeFragmentIngress;
 use crate::query_lifecycle::rpc::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
     handle_stage_fragments, handle_start_prepared_query, handle_task_update,
@@ -69,7 +67,6 @@ const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 /// ingress ports while this service composes them with `BackendDataPlane`.
 #[derive(Clone)]
 pub(crate) struct BackendRpcService {
-    native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     query_control_shutdown: Option<watch::Receiver<bool>>,
     data_plane: BackendDataPlane,
@@ -79,14 +76,12 @@ pub(crate) struct BackendRpcService {
 
 impl BackendRpcService {
     pub(crate) fn new(
-        native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
         query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
         runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         process_descriptor: BackendProcessDescriptor,
     ) -> Self {
         Self {
-            native_fragment_ingress,
             query_lifecycle_ingress: Arc::clone(&query_lifecycle_ingress),
             query_control_shutdown: None,
             data_plane: BackendDataPlane::with_exchange_receiver_port(
@@ -242,52 +237,6 @@ impl NovaRocksGrpc for BackendRpcService {
             tonic::Status::internal(format!("task_update handler panicked: {error}"))
         })??;
         Ok(tonic::Response::new(response))
-    }
-
-    async fn ensure_connector_execution_binding(
-        &self,
-        request: tonic::Request<proto::EnsureConnectorExecutionBindingRequest>,
-    ) -> Result<tonic::Response<proto::EnsureConnectorExecutionBindingResponse>, tonic::Status>
-    {
-        let ingress = Arc::clone(&self.native_fragment_ingress);
-        let result =
-            tokio::task::spawn_blocking(move || {
-                match binding_decode::decode_ensure_request(request.into_inner()) {
-                    Ok((execution_id, declaration)) => {
-                        ingress.ensure_connector_execution_binding(execution_id, declaration)
-                    }
-                    Err(rejection) => rejection,
-                }
-            })
-            .await
-            .map_err(|error| {
-                tonic::Status::internal(format!(
-                    "ensure_connector_execution_binding handler panicked: {error}"
-                ))
-            })?;
-        Ok(tonic::Response::new(result.to_proto()))
-    }
-
-    async fn retire_connector_execution_binding(
-        &self,
-        request: tonic::Request<proto::RetireConnectorExecutionBindingRequest>,
-    ) -> Result<tonic::Response<proto::RetireConnectorExecutionBindingResponse>, tonic::Status>
-    {
-        let ingress = Arc::clone(&self.native_fragment_ingress);
-        let result =
-            tokio::task::spawn_blocking(move || {
-                match binding_decode::decode_retire_request(request.into_inner()) {
-                    Ok(key) => ingress.retire_connector_execution_binding(key),
-                    Err(outcome) => outcome,
-                }
-            })
-            .await
-            .map_err(|error| {
-                tonic::Status::internal(format!(
-                    "retire_connector_execution_binding handler panicked: {error}"
-                ))
-            })?;
-        Ok(tonic::Response::new(result.to_proto()))
     }
 
     async fn prune_catalogs(

@@ -810,22 +810,6 @@ impl NovaRocksGrpc for FrontendReportService {
         Err(Self::rejected("FetchResult"))
     }
 
-    async fn ensure_connector_execution_binding(
-        &self,
-        _request: tonic::Request<proto::EnsureConnectorExecutionBindingRequest>,
-    ) -> Result<tonic::Response<proto::EnsureConnectorExecutionBindingResponse>, tonic::Status>
-    {
-        Err(Self::rejected("EnsureConnectorExecutionBinding"))
-    }
-
-    async fn retire_connector_execution_binding(
-        &self,
-        _request: tonic::Request<proto::RetireConnectorExecutionBindingRequest>,
-    ) -> Result<tonic::Response<proto::RetireConnectorExecutionBindingResponse>, tonic::Status>
-    {
-        Err(Self::rejected("RetireConnectorExecutionBinding"))
-    }
-
     async fn prune_catalogs(
         &self,
         _request: tonic::Request<catalog::PruneCatalogsRequest>,

@@ -71,15 +71,6 @@ service NovaRocksGrpc {
   // This is not control-stream recovery and never recreates an execution attempt.
   rpc ReportQueryTerminal(ReportQueryTerminalRequest)
       returns (ReportQueryTerminalResponse);
-  // Coordinator ensures a provider-owned, credential-free BE execution
-  // binding and acquires its query lifecycle lease before any fragment using
-  // that exact generation is submitted.
-  rpc EnsureConnectorExecutionBinding(EnsureConnectorExecutionBindingRequest)
-      returns (EnsureConnectorExecutionBindingResponse);
-  // Best-effort resource retirement for one previously ensured execution
-  // binding generation. Existing query leases may drain.
-  rpc RetireConnectorExecutionBinding(RetireConnectorExecutionBindingRequest)
-      returns (RetireConnectorExecutionBindingResponse);
   // Coordinator publishes one complete catalog reachability snapshot. This is
   // best effort cache management and never carries a retire delta.
   rpc PruneCatalogs(novarocks.catalog.PruneCatalogsRequest)
