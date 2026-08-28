@@ -1201,6 +1201,13 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) fn installed_read_execution() -> crate::connector::InstalledReadExecution {
+        crate::connector::InstalledReadExecution::new(
+            std::sync::Arc::new(FixtureFactory),
+            std::sync::Arc::new(fixture_codec()),
+        )
+    }
+
     impl novarocks_proto_codec::connector_read::ConnectorReadCodec for FixtureCodec {
         fn owner(&self) -> &str {
             "fixture"
