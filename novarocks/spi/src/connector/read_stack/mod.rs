@@ -24,15 +24,17 @@
 //! It deliberately contains no provider name, no generated wire DTO, no
 //! opaque payload, and no downcast. Concrete provider facts that cross the
 //! FE/BE boundary are carried by the central IDL's closed per-category
-//! `oneof`s, validated by `novarocks-proto`, and converted to concrete domain
+//! `oneof`s, validated by `novarocks-proto-codec`, and converted to concrete domain
 //! types only inside the provider that produced them.
-// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
+// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
 
+pub mod adapter;
 pub mod dynamic_filter;
 pub mod handle;
 pub mod page_source;
 pub mod predicate;
 pub mod projection;
+pub mod runtime;
 pub mod session;
 pub mod split;
 pub mod split_source;
@@ -57,6 +59,18 @@ pub use predicate::{
 pub use projection::{
     Assignment, ConstraintApplicationResult, LimitApplicationResult, MAX_PROJECTION_ASSIGNMENTS,
     OrderedAssignments, ProjectionApplicationResult,
+};
+pub use runtime::{
+    ConnectorReadBinding, ConnectorReadChangeWindow, ConnectorReadColumnBinding,
+    ConnectorReadColumnHandle, ConnectorReadConstraint, ConnectorReadDynamicFilter,
+    ConnectorReadDynamicFilterSnapshot, ConnectorReadFilterApplication,
+    ConnectorReadFrozenRewriteGroup, ConnectorReadLimitApplication, ConnectorReadMetadata,
+    ConnectorReadPageSourceProvider, ConnectorReadProviderFactory, ConnectorReadRegistrationLease,
+    ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadRelationVersion,
+    ConnectorReadSplit, ConnectorReadSplitFacts, ConnectorReadSplitManager,
+    ConnectorReadSplitSource, ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider,
+    ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle, ConnectorReadTransactionHandle,
+    ConnectorReadWorkSource,
 };
 pub use session::{ConnectorSession, MAX_SESSION_PROPERTIES, SessionPropertyValue};
 pub use split::{ConnectorSplit, HostAddress, STANDARD_SPLIT_WEIGHT_RAW, SplitWeight};

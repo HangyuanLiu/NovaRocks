@@ -25,7 +25,7 @@ use crate::query_execution::dml::mutation::{
     MutationStageOutcome, MutationStatementKind, PrepareMutationRequest, PreparedMutation,
 };
 use novarocks_parser::ast::{DmlStatement, MergeClause, MutationSource};
-use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto_codec::lifecycle::QueryOptions;
 
 use crate::dml::error::{AdmitError, DmlError};
 use crate::dml::runner::{

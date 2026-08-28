@@ -5,8 +5,8 @@
 
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::query_options::{QueryCacheOptions, QueryOptions};
-use novarocks_proto::lifecycle::QueryOptions as ProtocolQueryOptions;
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::novarocks;
 
 pub(crate) fn decode_query_options(
@@ -131,7 +131,7 @@ fn decode_spill_config(
 #[cfg(test)]
 mod tests {
     use super::decode_query_options;
-    use novarocks_proto::ProtocolErrorKind;
+    use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::novarocks;
 
     #[test]

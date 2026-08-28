@@ -37,7 +37,7 @@ use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_execution::runtime::query_options::query_expire_durations;
-use novarocks_proto::ProtocolErrorKind;
+use novarocks_proto_codec::ProtocolErrorKind;
 use novarocks_proto_models::plan;
 use novarocks_types::SlotId;
 

@@ -32,8 +32,8 @@ use novarocks_execution::runtime::exchange::ExchangeKey;
 use novarocks_execution::runtime::fragment::ExchangeInputAssignment;
 use novarocks_execution::runtime::fragment::{ExchangeInputAssignments, FragmentInstanceId};
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_proto::FieldPath;
-use novarocks_proto::lifecycle::ScanRangeParams;
+use novarocks_proto_codec::FieldPath;
+use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{common, expr};
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
 use novarocks_types::QueryId;
@@ -49,8 +49,12 @@ use crate::fragment::decode::plan::layout::Layout;
 /// not keep growing one parameter at a time.
 #[derive(Clone)]
 pub(crate) struct TypedScanRuntime {
-    providers: Arc<crate::connector::TypedConnectorProviderRegistry>,
-    queues: Arc<novarocks_execution::connector::TaskAttemptSplitQueues>,
+    read_executions: Arc<crate::connector::typed_registry::InstalledReadExecutionRegistry>,
+    queues: Arc<
+        novarocks_execution::connector::TaskAttemptSplitQueues<
+            crate::fragment::ingress::ReceivedReadSplit,
+        >,
+    >,
     session: novarocks_spi::connector::read_stack::ConnectorSession,
     /// Resolves this attempt's runtime-filter session, or `None` when it
     /// installed none — in which case a typed scan uses the truthful
@@ -61,33 +65,50 @@ pub(crate) struct TypedScanRuntime {
     /// admission permit while its plan is decoded, and the lifecycle refuses a
     /// session without one, so resolving here would always answer `None`.
     runtime_filter: RuntimeFilterSessionResolver,
+    read_context: Arc<crate::fragment::ingress::TypedReadAttemptContext>,
 }
 
 /// Looks up the attempt's runtime-filter session at the moment it is needed.
 pub(crate) type RuntimeFilterSessionResolver = Arc<
-    dyn Fn() -> Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef> + Send + Sync,
+    dyn Fn() -> Result<Option<novarocks_execution::runtime_filter::RuntimeFilterSessionRef>, String>
+        + Send
+        + Sync,
 >;
 
 impl TypedScanRuntime {
     pub(crate) fn new(
-        providers: Arc<crate::connector::TypedConnectorProviderRegistry>,
-        queues: Arc<novarocks_execution::connector::TaskAttemptSplitQueues>,
+        read_executions: Arc<crate::connector::typed_registry::InstalledReadExecutionRegistry>,
+        queues: Arc<
+            novarocks_execution::connector::TaskAttemptSplitQueues<
+                crate::fragment::ingress::ReceivedReadSplit,
+            >,
+        >,
         session: novarocks_spi::connector::read_stack::ConnectorSession,
         runtime_filter: RuntimeFilterSessionResolver,
+        read_context: Arc<crate::fragment::ingress::TypedReadAttemptContext>,
     ) -> Self {
         Self {
-            providers,
+            read_executions,
             queues,
             session,
             runtime_filter,
+            read_context,
         }
     }
 
-    pub(crate) fn providers(&self) -> Arc<crate::connector::TypedConnectorProviderRegistry> {
-        Arc::clone(&self.providers)
+    pub(crate) fn read_executions(
+        &self,
+    ) -> Arc<crate::connector::typed_registry::InstalledReadExecutionRegistry> {
+        Arc::clone(&self.read_executions)
     }
 
-    pub(crate) fn queues(&self) -> Arc<novarocks_execution::connector::TaskAttemptSplitQueues> {
+    pub(crate) fn queues(
+        &self,
+    ) -> Arc<
+        novarocks_execution::connector::TaskAttemptSplitQueues<
+            crate::fragment::ingress::ReceivedReadSplit,
+        >,
+    > {
         Arc::clone(&self.queues)
     }
 
@@ -97,6 +118,14 @@ impl TypedScanRuntime {
 
     pub(crate) fn runtime_filter(&self) -> RuntimeFilterSessionResolver {
         Arc::clone(&self.runtime_filter)
+    }
+
+    pub(crate) fn register_read_execution(
+        &self,
+        plan_node_id: i32,
+        execution: crate::connector::typed_registry::InstalledReadExecution,
+    ) -> Result<(), String> {
+        self.read_context.register(plan_node_id, execution)
     }
 }
 
@@ -234,7 +263,7 @@ impl NativePlanDecodeContext {
             .map(Vec::as_slice)
             .ok_or_else(|| {
                 NativeFragmentLeafDecodeError::at_field(
-                    novarocks_proto::ProtocolErrorKind::MissingField,
+                    novarocks_proto_codec::ProtocolErrorKind::MissingField,
                     "scan_ranges",
                     format!("native ScanNode node_id={node_id} missing scan ranges"),
                 )
@@ -259,7 +288,7 @@ impl NativePlanDecodeContext {
     pub(crate) fn connectors(&self) -> Result<&ConnectorRegistry, NativeFragmentLeafDecodeError> {
         self.connectors.as_deref().ok_or_else(|| {
             NativeFragmentLeafDecodeError::at_field(
-                novarocks_proto::ProtocolErrorKind::MissingField,
+                novarocks_proto_codec::ProtocolErrorKind::MissingField,
                 "connector_registry",
                 "native ScanNode requires ConnectorRegistry in NativePlanDecodeContext",
             )
@@ -271,7 +300,7 @@ impl NativePlanDecodeContext {
     ) -> Result<&dyn ConnectorExecutionResolver, NativeFragmentLeafDecodeError> {
         self.execution_resolver.as_deref().ok_or_else(|| {
             NativeFragmentLeafDecodeError::at_field(
-                novarocks_proto::ProtocolErrorKind::MissingField,
+                novarocks_proto_codec::ProtocolErrorKind::MissingField,
                 "connector_execution_resolver",
                 "native ConnectorReadSource requires a query-scoped execution resolver",
             )
@@ -283,7 +312,7 @@ impl NativePlanDecodeContext {
     ) -> Result<Arc<dyn ConnectorCancellation>, NativeFragmentLeafDecodeError> {
         self.connector_cancellation.clone().ok_or_else(|| {
             NativeFragmentLeafDecodeError::at_field(
-                novarocks_proto::ProtocolErrorKind::MissingField,
+                novarocks_proto_codec::ProtocolErrorKind::MissingField,
                 "connector_cancellation",
                 "native ConnectorReadSource requires an execution cancellation capability",
             )
@@ -299,7 +328,7 @@ impl NativePlanDecodeContext {
             .get(&FragmentNodeId::new(node_id))
             .ok_or_else(|| {
                 NativeFragmentLeafDecodeError::at_field(
-                    novarocks_proto::ProtocolErrorKind::MissingField,
+                    novarocks_proto_codec::ProtocolErrorKind::MissingField,
                     "exchange_inputs",
                     format!("ExchangeReceiver missing sender count for node_id {node_id}"),
                 )

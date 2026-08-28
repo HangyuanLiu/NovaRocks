@@ -40,7 +40,6 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int8Array};
 use novarocks_fs::{FileReadBudget, FileReadContext, FileReaderOptions};
-use novarocks_proto::connector_read::WireDynamicFilter;
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{ConnectorPageSource, PageSourceMetrics, SourcePage};
 
@@ -53,7 +52,8 @@ use super::change_window::{
 use super::column_handle::{IcebergColumnHandle, invalid, unsupported};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager, RemovedRowSelection};
 use super::page_source::{
-    IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache, create_iceberg_page_source,
+    IcebergDynamicFilter, IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache,
+    create_iceberg_page_source,
 };
 
 /// Everything the change-window reader needs, all of it frozen or
@@ -70,7 +70,7 @@ pub struct IcebergChangeWindowPageSourceRequest<'a> {
     pub budget: FileReadBudget,
     pub reader_options: FileReaderOptions,
     pub scheduled_split_sequence_id: u64,
-    pub dynamic_filter: Arc<WireDynamicFilter>,
+    pub dynamic_filter: Arc<IcebergDynamicFilter>,
 }
 
 /// Build the page source for one change-window split.
@@ -580,7 +580,7 @@ mod tests {
                 scheduled_split_sequence_id: 0,
                 dynamic_filter: Arc::new(CompleteAllDynamicFilter::new(
                     std::collections::BTreeSet::new(),
-                )) as Arc<WireDynamicFilter>,
+                )) as Arc<IcebergDynamicFilter>,
             })
         }
     }
@@ -920,9 +920,9 @@ mod tests {
         // through the wire. A lossy round trip would make the sign look like an
         // impostor claiming its reserved field id.
         let column = change_op_column_handle().expect("change op");
-        let validated = novarocks_proto::connector_read::ValidatedColumnHandle::parse(
+        let validated = novarocks_proto_codec::connector_read::ValidatedColumnHandle::parse(
             column.to_column_handle_proto(),
-            novarocks_proto::FieldPath::root("column"),
+            novarocks_proto_codec::FieldPath::root("column"),
         )
         .expect("a well-formed wire column handle");
         let decoded = IcebergColumnHandle::from_column_handle_proto(validated.as_proto())

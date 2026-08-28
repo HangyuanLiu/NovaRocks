@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use novarocks_proto::connector_read::MAX_SPLITS_PER_ASSIGNMENT;
+use novarocks_proto_codec::connector_read::MAX_SPLITS_PER_ASSIGNMENT;
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
     ConnectorSplitBatch, ConnectorSplitSource, DynamicFilterSnapshot, TupleDomain,

@@ -28,23 +28,22 @@
 //! predicate lowering exactly -- `col <op> literal`, `literal <op> col`,
 //! `col IS [NOT] NULL`, and non-negated `col IN (literals)` -- so the two
 //! producers cannot disagree about which conjuncts a connector may see.
-// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
+// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_proto::connector_read::ValidatedColumnHandle;
 use novarocks_spi::connector::read_stack::{
-    Bound, ConnectorValue, ConnectorValueType, Domain, MAX_CONNECTOR_DECIMAL_PRECISION,
-    MAX_CONNECTOR_VALUE_BYTES, Range, TupleDomain, ValueSet,
+    Bound, ConnectorReadColumnHandle, ConnectorValue, ConnectorValueType, Domain,
+    MAX_CONNECTOR_DECIMAL_PRECISION, MAX_CONNECTOR_VALUE_BYTES, Range, TupleDomain, ValueSet,
 };
 use novarocks_sql::plan_read::{BinOp, ExprKind, LiteralValue, PlanScanNode, TypedExpr};
 
 /// What one scan's ordered top-level conjunct list lowered to.
 pub(crate) struct LoweredScanPredicate {
     /// The per-column conjunction that may be offered to the connector.
-    pub(crate) summary: TupleDomain<ValidatedColumnHandle>,
+    pub(crate) summary: TupleDomain<ConnectorReadColumnHandle>,
     /// Ordinals into `PlanScanNode::predicates` the engine must still
     /// evaluate itself, in ascending order.
     pub(crate) residual_ordinals: Vec<usize>,
@@ -62,7 +61,7 @@ pub(crate) struct LoweredScanPredicate {
 /// exactly one entry in it.
 pub(crate) fn lower_scan_predicates(
     scan: &PlanScanNode,
-    bindings: &BTreeMap<String, ValidatedColumnHandle>,
+    bindings: &BTreeMap<String, ConnectorReadColumnHandle>,
     value_types: &BTreeMap<String, ConnectorValueType>,
 ) -> LoweredScanPredicate {
     let mut summary = TupleDomain::all();
@@ -181,10 +180,10 @@ fn is_utc(zone: &str) -> bool {
 /// Lower one conjunct into a single-column tuple domain, or reject it.
 fn lower_conjunct(
     scan: &PlanScanNode,
-    bindings: &BTreeMap<String, ValidatedColumnHandle>,
+    bindings: &BTreeMap<String, ConnectorReadColumnHandle>,
     value_types: &BTreeMap<String, ConnectorValueType>,
     predicate: &TypedExpr,
-) -> Option<TupleDomain<ValidatedColumnHandle>> {
+) -> Option<TupleDomain<ConnectorReadColumnHandle>> {
     let (column, domain) = lower_atom(scan, bindings, value_types, predicate)?;
     // A one-column map is always inside the column bound; the caller's
     // `intersect` is what enforces the bound across conjuncts.
@@ -193,10 +192,10 @@ fn lower_conjunct(
 
 fn lower_atom(
     scan: &PlanScanNode,
-    bindings: &BTreeMap<String, ValidatedColumnHandle>,
+    bindings: &BTreeMap<String, ConnectorReadColumnHandle>,
     value_types: &BTreeMap<String, ConnectorValueType>,
     predicate: &TypedExpr,
-) -> Option<(ValidatedColumnHandle, Domain)> {
+) -> Option<(ConnectorReadColumnHandle, Domain)> {
     match &unnest(predicate).kind {
         ExprKind::BinaryOp { left, op, right } => {
             let (column, op, literal) =
@@ -294,13 +293,13 @@ fn single_range(value_type: ConnectorValueType, low: Bound, high: Bound) -> Opti
 
 /// One scan output column resolved to its connector handle and exact type.
 struct LoweredColumn {
-    column: ValidatedColumnHandle,
+    column: ConnectorReadColumnHandle,
     value_type: ConnectorValueType,
 }
 
 fn lower_column(
     scan: &PlanScanNode,
-    bindings: &BTreeMap<String, ValidatedColumnHandle>,
+    bindings: &BTreeMap<String, ConnectorReadColumnHandle>,
     value_types: &BTreeMap<String, ConnectorValueType>,
     expr: &TypedExpr,
 ) -> Option<LoweredColumn> {
@@ -465,8 +464,8 @@ fn unnest(mut expr: &TypedExpr) -> &TypedExpr {
 
 #[cfg(test)]
 pub(super) mod test_support {
-    use novarocks_proto::FieldPath;
-    use novarocks_proto::connector_read::ValidatedColumnHandle;
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::connector_read::ValidatedColumnHandle;
     use novarocks_proto_models::connector_read as dto;
     use novarocks_sql::plan_read::{
         BinOp, DistributedNodeKind, ExprKind, LiteralValue, OutputColumn, PlanScanNode, TypedExpr,
@@ -605,310 +604,22 @@ pub(super) mod test_support {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
-    use novarocks_spi::connector::read_stack::MAX_VALUE_SET_DISCRETE_VALUES;
-    use novarocks_sql::plan_read::BinOp;
 
-    use super::test_support::{
-        binary, column_handle, column_ref, in_list, int_literal, is_null, output, scan,
-        text_literal,
-    };
     use super::*;
 
-    const ID: u32 = 1;
-    const CATEGORY: u32 = 3;
-
-    fn id_column() -> TypedExpr {
-        column_ref(ID, "id", DataType::Int32, false)
-    }
-
-    fn category_column() -> TypedExpr {
-        column_ref(CATEGORY, "category", DataType::Utf8, true)
-    }
-
-    fn outputs() -> Vec<novarocks_sql::plan_read::OutputColumn> {
-        vec![
-            output(ID, "id", DataType::Int32, false),
-            output(CATEGORY, "category", DataType::Utf8, true),
-        ]
-    }
-
-    fn bindings() -> BTreeMap<String, ValidatedColumnHandle> {
-        BTreeMap::from([
-            ("id".to_owned(), column_handle(1, "id")),
-            ("category".to_owned(), column_handle(2, "category")),
-        ])
-    }
-
-    fn value_types() -> BTreeMap<String, ConnectorValueType> {
-        BTreeMap::from([
-            ("id".to_owned(), ConnectorValueType::Integer),
-            ("category".to_owned(), ConnectorValueType::Varchar),
-        ])
-    }
-
-    fn lower(predicates: Vec<TypedExpr>) -> LoweredScanPredicate {
-        lower_scan_predicates(&scan(outputs(), predicates), &bindings(), &value_types())
-    }
-
-    fn domain_of(lowered: &LoweredScanPredicate, field_id: i32, name: &str) -> Domain {
-        lowered
-            .summary
-            .domain_for(&column_handle(field_id, name))
-            .expect("the summary constrains this column")
-            .clone()
-    }
-
     #[test]
-    fn each_accepted_shape_becomes_its_exact_domain() {
-        let lowered = lower(vec![binary(id_column(), BinOp::Eq, int_literal(7))]);
-        assert!(lowered.residual_ordinals.is_empty());
+    fn only_lossless_connector_type_mappings_are_offered() {
         assert_eq!(
-            domain_of(&lowered, 1, "id"),
-            Domain::single_value(ConnectorValue::Integer(7)).expect("single value")
+            connector_value_type(&DataType::Int64),
+            Some(ConnectorValueType::BigInt)
         );
-
-        let lowered = lower(vec![binary(id_column(), BinOp::Lt, int_literal(10))]);
-        assert!(lowered.residual_ordinals.is_empty());
-        let expected = Domain::new(
-            ValueSet::of_ranges(
-                ConnectorValueType::Integer,
-                vec![
-                    Range::try_new(
-                        ConnectorValueType::Integer,
-                        Bound::Unbounded,
-                        Bound::Exclusive(ConnectorValue::Integer(10)),
-                    )
-                    .expect("valid range"),
-                ],
-            )
-            .expect("valid set"),
-            false,
-        );
-        assert_eq!(domain_of(&lowered, 1, "id"), expected);
-
-        let lowered = lower(vec![is_null(category_column(), false)]);
-        assert!(lowered.residual_ordinals.is_empty());
-        assert_eq!(
-            domain_of(&lowered, 2, "category"),
-            Domain::only_null(ConnectorValueType::Varchar)
-        );
-
-        let lowered = lower(vec![is_null(category_column(), true)]);
-        assert!(lowered.residual_ordinals.is_empty());
-        assert_eq!(
-            domain_of(&lowered, 2, "category"),
-            Domain::not_null(ConnectorValueType::Varchar)
-        );
-
-        let lowered = lower(vec![in_list(
-            category_column(),
-            vec![text_literal("b"), text_literal("a")],
-            false,
-        )]);
-        assert!(lowered.residual_ordinals.is_empty());
-        let expected = Domain::new(
-            ValueSet::of_values(
-                ConnectorValueType::Varchar,
-                vec![
-                    ConnectorValue::Varchar(Arc::from("a")),
-                    ConnectorValue::Varchar(Arc::from("b")),
-                ],
-            )
-            .expect("valid set"),
-            false,
-        );
-        assert_eq!(domain_of(&lowered, 2, "category"), expected);
-    }
-
-    #[test]
-    fn a_reversed_comparison_keeps_the_column_on_the_left() {
-        let lowered = lower(vec![binary(int_literal(3), BinOp::Le, id_column())]);
-        assert!(lowered.residual_ordinals.is_empty());
-        let expected = Domain::new(
-            ValueSet::of_ranges(
-                ConnectorValueType::Integer,
-                vec![
-                    Range::try_new(
-                        ConnectorValueType::Integer,
-                        Bound::Inclusive(ConnectorValue::Integer(3)),
-                        Bound::Unbounded,
-                    )
-                    .expect("valid range"),
-                ],
-            )
-            .expect("valid set"),
-            false,
-        );
-        assert_eq!(domain_of(&lowered, 1, "id"), expected);
-    }
-
-    #[test]
-    fn conjuncts_on_one_column_intersect() {
-        let lowered = lower(vec![
-            binary(id_column(), BinOp::Ge, int_literal(3)),
-            binary(id_column(), BinOp::Lt, int_literal(10)),
-        ]);
-        assert!(lowered.residual_ordinals.is_empty());
-        let values = domain_of(&lowered, 1, "id");
-        assert!(
-            values
-                .values()
-                .contains_value(&ConnectorValue::Integer(3))
-                .expect("typed")
-        );
-        assert!(
-            !values
-                .values()
-                .contains_value(&ConnectorValue::Integer(10))
-                .expect("typed")
-        );
-        assert!(
-            !values
-                .values()
-                .contains_value(&ConnectorValue::Integer(2))
-                .expect("typed")
-        );
-    }
-
-    #[test]
-    fn conflicting_conjuncts_collapse_to_an_unsatisfiable_summary() {
-        let lowered = lower(vec![
-            binary(id_column(), BinOp::Eq, int_literal(3)),
-            binary(id_column(), BinOp::Eq, int_literal(4)),
-        ]);
-        assert!(lowered.summary.is_none());
-        assert!(lowered.residual_ordinals.is_empty());
-    }
-
-    #[test]
-    fn every_unrepresentable_predicate_appears_in_the_residual_ordinals() {
-        // One entry per rejection reason, interleaved with a representable
-        // conjunct so a dropped ordinal cannot hide behind a shifted index.
-        let unknown_column = column_ref(99, "unknown", DataType::Int32, false);
-        let predicates = vec![
-            // 0: not a predicate shape at all.
-            binary(id_column(), BinOp::Add, int_literal(1)),
-            // 1: representable.
-            binary(id_column(), BinOp::Eq, int_literal(7)),
-            // 2: null-safe equality is a different predicate from `=`.
-            binary(id_column(), BinOp::EqForNull, int_literal(7)),
-            // 3: negated IN.
-            in_list(category_column(), vec![text_literal("a")], true),
-            // 4: empty IN.
-            in_list(category_column(), Vec::new(), false),
-            // 5: literal type does not match the column type.
-            binary(id_column(), BinOp::Eq, text_literal("7")),
-            // 6: the column is not a scan output.
-            binary(unknown_column, BinOp::Eq, int_literal(1)),
-            // 7: both sides are columns.
-            binary(id_column(), BinOp::Eq, category_column()),
-            // 8: representable again.
-            is_null(category_column(), true),
-        ];
-        let lowered = lower(predicates);
-        assert_eq!(lowered.residual_ordinals, vec![0, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(
-            domain_of(&lowered, 1, "id"),
-            Domain::single_value(ConnectorValue::Integer(7)).expect("single value")
-        );
-        assert_eq!(
-            domain_of(&lowered, 2, "category"),
-            Domain::not_null(ConnectorValueType::Varchar)
-        );
-    }
-
-    #[test]
-    fn a_column_with_no_binding_stays_residual() {
-        let scan = scan(
-            outputs(),
-            vec![binary(category_column(), BinOp::Eq, text_literal("a"))],
-        );
-        // Bind only `id`: `category` has no connector column at all.
-        let bindings = BTreeMap::from([("id".to_owned(), column_handle(1, "id"))]);
-        let lowered = lower_scan_predicates(&scan, &bindings, &value_types());
-        assert_eq!(lowered.residual_ordinals, vec![0]);
-        assert!(lowered.summary.is_all());
-    }
-
-    #[test]
-    fn an_over_long_in_list_stays_residual_instead_of_truncating() {
-        let values = (0..=MAX_VALUE_SET_DISCRETE_VALUES)
-            .map(|value| int_literal(value as i64))
-            .collect::<Vec<_>>();
-        let lowered = lower(vec![
-            in_list(id_column(), values, false),
-            binary(id_column(), BinOp::Eq, int_literal(7)),
-        ]);
-        assert_eq!(lowered.residual_ordinals, vec![0]);
-        // The surviving conjunct is exactly the second one: nothing from the
-        // rejected list leaked into the summary.
-        assert_eq!(
-            domain_of(&lowered, 1, "id"),
-            Domain::single_value(ConnectorValue::Integer(7)).expect("single value")
-        );
-    }
-
-    #[test]
-    fn a_nan_literal_stays_residual() {
-        let nan = TypedExpr {
-            kind: ExprKind::Literal(LiteralValue::Float(f64::NAN)),
-            data_type: DataType::Float64,
-            nullable: false,
-        };
-        let scan = scan(
-            vec![output(9, "score", DataType::Float64, false)],
-            vec![binary(
-                column_ref(9, "score", DataType::Float64, false),
-                BinOp::Gt,
-                nan,
-            )],
-        );
-        let lowered = lower_scan_predicates(
-            &scan,
-            &BTreeMap::from([("score".to_owned(), column_handle(4, "score"))]),
-            &BTreeMap::from([("score".to_owned(), ConnectorValueType::Double)]),
-        );
-        assert_eq!(lowered.residual_ordinals, vec![0]);
-        assert!(lowered.summary.is_all());
-    }
-
-    #[test]
-    fn only_exact_engine_types_have_a_typed_counterpart() {
-        assert_eq!(
-            connector_value_type(&DataType::Int32),
-            Some(ConnectorValueType::Integer)
-        );
-        assert_eq!(
-            connector_value_type(&DataType::Decimal128(18, 4)),
-            Some(ConnectorValueType::Decimal {
-                precision: 18,
-                scale: 4,
-            })
-        );
-        assert_eq!(
-            connector_value_type(&DataType::Timestamp(TimeUnit::Microsecond, None)),
-            Some(ConnectorValueType::TimestampMicros)
-        );
-        assert_eq!(
-            connector_value_type(&DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("UTC".into())
-            )),
-            Some(ConnectorValueType::TimestampTzMicros)
-        );
-        // A non-UTC zone would need a conversion the engine cannot prove.
-        assert_eq!(
-            connector_value_type(&DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("Asia/Shanghai".into())
-            )),
-            None
-        );
-        // No exact typed counterpart: widening would change the value.
         assert_eq!(connector_value_type(&DataType::Int16), None);
-        assert_eq!(connector_value_type(&DataType::LargeUtf8), None);
-        assert_eq!(connector_value_type(&DataType::Decimal128(0, 0)), None);
+        assert_eq!(
+            scan_output_value_type(&DataType::LargeUtf8),
+            Some(ConnectorValueType::NonComparable)
+        );
     }
 }

@@ -68,7 +68,7 @@ pub struct QueryCompilerPorts {
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control:
-        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
+        Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     query_execution: QueryExecutionService,
     backend_topology: BackendTopologyService,
@@ -86,7 +86,7 @@ impl QueryCompilerPorts {
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<
-            crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+            crate::connector::typed_control_registry::ConnectorReadControlRegistry,
         >,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         query_execution: QueryExecutionService,
@@ -154,7 +154,7 @@ pub struct DmlEnginePorts {
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control:
-        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
+        Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
@@ -169,7 +169,7 @@ impl DmlEnginePorts {
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<
-            crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+            crate::connector::typed_control_registry::ConnectorReadControlRegistry,
         >,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -340,7 +340,7 @@ pub struct MaintenanceCommandPorts {
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control:
-        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
+        Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
     service: Arc<dyn TableMaintenanceService>,
@@ -353,7 +353,7 @@ impl MaintenanceCommandPorts {
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<
-            crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+            crate::connector::typed_control_registry::ConnectorReadControlRegistry,
         >,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
@@ -564,7 +564,7 @@ pub(crate) struct MvRefreshProviderActivationPorts {
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control:
-        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
+        Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     query_execution: QueryExecutionService,
     backend_topology: BackendTopologyService,
@@ -581,7 +581,7 @@ impl MvRefreshProviderActivationPorts {
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<
-            crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+            crate::connector::typed_control_registry::ConnectorReadControlRegistry,
         >,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         query_execution: QueryExecutionService,
@@ -677,7 +677,7 @@ pub struct StatisticsAttemptExecutorPorts {
     execution_role: novarocks_types::ClusterRole,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control:
-        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
+        Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>,
     backend_topology: BackendTopologyService,
     query_execution: QueryExecutionService,
     attempt_timeout: Duration,
@@ -688,7 +688,7 @@ impl StatisticsAttemptExecutorPorts {
         execution_role: novarocks_types::ClusterRole,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<
-            crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+            crate::connector::typed_control_registry::ConnectorReadControlRegistry,
         >,
         backend_topology: BackendTopologyService,
         query_execution: QueryExecutionService,

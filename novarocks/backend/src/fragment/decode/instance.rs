@@ -26,8 +26,8 @@ use novarocks_execution::runtime::fragment::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_proto::lifecycle::ScanRangeParams;
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::lifecycle::ScanRangeParams;
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, novarocks as proto};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;

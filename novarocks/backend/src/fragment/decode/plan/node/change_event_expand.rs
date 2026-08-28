@@ -29,7 +29,7 @@ use novarocks_execution::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::FieldPath;
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_types::SlotId;

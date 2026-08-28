@@ -22,7 +22,7 @@
 //! split: the typed carrier has no split list, and a count taken here would
 //! pin the query's parallelism to whatever enumeration happened to produce
 //! first.
-// Design: ADR-0114 (docs/adr/ADR-0114-trino-aligned-typed-connector-read-stack.md)
+// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
 
 use std::sync::Arc;
 
@@ -31,7 +31,7 @@ use crate::catalog_application::query_bindings::{
 };
 use crate::catalog_application::query_materializer::metadata_table_alias_suffix;
 use crate::connector::typed_control_registry::{
-    TypedConnectorControl, TypedConnectorControlRegistry,
+    ConnectorReadControlRegistry, InstalledReadControl,
 };
 use crate::query_execution::connector_domain::CatalogHandle;
 use crate::query_execution::preparation::scan::{
@@ -39,11 +39,11 @@ use crate::query_execution::preparation::scan::{
     ResolvedScanColumn, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
 };
 use crate::query_execution::preparation::typed_scan::{TypedRelationFreeze, prepare_typed_scan};
-use novarocks_proto::connector_read::{
-    ConnectorRelationKind, TypedChangeWindow, TypedFrozenRewriteGroup, TypedRelationVersion,
-    TypedTableExecuteProcedure,
+use novarocks_spi::connector::read_stack::{
+    ConnectorReadChangeWindow, ConnectorReadFrozenRewriteGroup, ConnectorReadRelationKind,
+    ConnectorReadRelationVersion, ConnectorReadTableExecuteProcedure, ConnectorSession,
+    SchemaTableName,
 };
-use novarocks_spi::connector::read_stack::{ConnectorSession, SchemaTableName};
 use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorReadSelector};
 use novarocks_sql::plan_read::PlanScanNode;
 use novarocks_sql::plan_read::{DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId};
@@ -69,13 +69,13 @@ const NO_NODE_LIMIT: i64 = -1;
 /// planner hands it.
 #[derive(Clone)]
 pub(crate) struct TypedScanPreparation {
-    control: Arc<TypedConnectorControlRegistry>,
+    control: Arc<ConnectorReadControlRegistry>,
     session: ConnectorSession,
 }
 
 impl TypedScanPreparation {
     pub(crate) fn new(
-        control: Arc<TypedConnectorControlRegistry>,
+        control: Arc<ConnectorReadControlRegistry>,
         session: ConnectorSession,
     ) -> Self {
         Self { control, session }
@@ -129,7 +129,7 @@ impl ScanPreparationOptions {
     /// Attach the statement's typed connector control and session.
     pub(crate) fn with_typed_connector_control(
         mut self,
-        control: Arc<TypedConnectorControlRegistry>,
+        control: Arc<ConnectorReadControlRegistry>,
         session: ConnectorSession,
     ) -> Self {
         self.typed = Some(TypedScanPreparation::new(control, session));
@@ -424,7 +424,7 @@ fn prepare_scan_node(
                 &physical_columns,
                 &facts,
                 materialization,
-                TypedRelationFreeze::ChangeWindow(TypedChangeWindow::new(
+                TypedRelationFreeze::ChangeWindow(ConnectorReadChangeWindow::new(
                     window.from_snapshot_id(),
                     window.to_snapshot_id(),
                 )),
@@ -516,7 +516,7 @@ fn prepare_typed_connector_scan(
     options: &ScanPreparationOptions,
     dynamic_filters: &[(u32, String)],
 ) -> Result<PreparedTypedConnectorScan, String> {
-    let relation_name = typed_relation_name(node_id, facts, freeze)?;
+    let relation_name = typed_relation_name(node_id, facts, freeze.clone())?;
     let relation = SchemaTableName::try_new(facts.identity().namespace(), &relation_name).map_err(
         |error| {
             format!(
@@ -550,7 +550,7 @@ fn prepare_typed_connector_scan(
         &materialization.planning_lease,
         materialization.table.owner(),
         &relation,
-        freeze,
+        freeze.clone(),
         context,
         options,
         dynamic_filters,
@@ -640,13 +640,15 @@ fn prepare_typed_table_execute_scan(
         &read.planning_lease,
         &read.owner,
         &relation,
-        TypedRelationFreeze::TableExecute(TypedTableExecuteProcedure::RewritePositionDeleteFiles(
-            TypedFrozenRewriteGroup::new(
-                read.group.artifact_location(),
-                &artifact_digest_hex,
-                &group_digest_hex,
+        TypedRelationFreeze::TableExecute(
+            ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(
+                ConnectorReadFrozenRewriteGroup::new(
+                    read.group.artifact_location(),
+                    &artifact_digest_hex,
+                    &group_digest_hex,
+                ),
             ),
-        )),
+        ),
         context,
         options,
         dynamic_filters,
@@ -711,10 +713,11 @@ fn prepare_typed_relation_scan(
         instance_id: binding.descriptor().instance_id.clone(),
         incarnation: binding.incarnation(),
     };
-    let control: TypedConnectorControl = typed
-        .control
-        .resolve(&binding_key)
-        .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
+    let control: InstalledReadControl = typed.control.resolve_read_control(&binding_key).ok_or_else(|| {
+        format!(
+            "typed connector scan node_id={node_id}: no installed read control for exact binding"
+        )
+    })?;
     let declaration = binding
         .execution_declaration(context)
         .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
@@ -730,7 +733,7 @@ fn prepare_typed_relation_scan(
         scan,
         physical_columns,
         relation,
-        freeze,
+        freeze.clone(),
         node_scan_limit(node_limit),
         dynamic_filters,
     )
@@ -853,11 +856,11 @@ fn typed_relation_version(
     node_id: i32,
     facts: &SqlScanPreparationFacts,
     selector: ConnectorReadSelector,
-) -> Result<TypedRelationVersion, String> {
+) -> Result<ConnectorReadRelationVersion, String> {
     match selector {
-        ConnectorReadSelector::Current => Ok(TypedRelationVersion::Current),
+        ConnectorReadSelector::Current => Ok(ConnectorReadRelationVersion::Current),
         ConnectorReadSelector::SnapshotId(snapshot_id) => {
-            Ok(TypedRelationVersion::SnapshotId(snapshot_id))
+            Ok(ConnectorReadRelationVersion::SnapshotId(snapshot_id))
         }
         // A timestamp is resolved to a snapshot at admission. Reaching the
         // connector with one would ask it to re-resolve the pin this query
@@ -880,14 +883,14 @@ fn node_scan_limit(node_limit: i64) -> Option<u64> {
 ///
 /// Every kind is named so a new one is a compile error here rather than a
 /// relation that reports itself under some other family's name.
-const fn relation_kind_name(kind: ConnectorRelationKind) -> &'static str {
+const fn relation_kind_name(kind: ConnectorReadRelationKind) -> &'static str {
     match kind {
-        ConnectorRelationKind::Table => "table",
-        ConnectorRelationKind::TableFunction => "table_function",
-        ConnectorRelationKind::ChangeWindow => "change_window",
-        ConnectorRelationKind::SystemTable => "system_table",
-        ConnectorRelationKind::TableExecute => "table_execute",
-        ConnectorRelationKind::MergeTable => "merge_table",
+        ConnectorReadRelationKind::Table => "table",
+        ConnectorReadRelationKind::TableFunction => "table_function",
+        ConnectorReadRelationKind::ChangeWindow => "change_window",
+        ConnectorReadRelationKind::SystemTable => "system_table",
+        ConnectorReadRelationKind::TableExecute => "table_execute",
+        ConnectorReadRelationKind::MergeTable => "merge_table",
     }
 }
 
@@ -989,4 +992,22 @@ fn validate_resolved_execution_kind(
 }
 
 #[cfg(test)]
-mod tests;
+#[path = "tests/mod.rs"]
+mod integration_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_spi_relation_kind_has_a_stable_diagnostic_name() {
+        assert_eq!(
+            relation_kind_name(ConnectorReadRelationKind::Table),
+            "table"
+        );
+        assert_eq!(
+            relation_kind_name(ConnectorReadRelationKind::SystemTable),
+            "system_table"
+        );
+    }
+}

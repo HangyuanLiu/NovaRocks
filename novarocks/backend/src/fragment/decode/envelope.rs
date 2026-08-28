@@ -17,7 +17,7 @@
 
 //! Fragment-owned native wire envelope validation.
 
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 
 pub(crate) fn require_root(

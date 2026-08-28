@@ -135,7 +135,7 @@ pub struct FrontendApplicationHost {
     /// factories install into, so planning and installation never disagree
     /// about which generation exists.
     typed_connector_control:
-        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
+        Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>,
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     dml_service: Option<Arc<DmlService>>,
@@ -356,9 +356,7 @@ impl FrontendApplicationHost {
             // No composition root supplied one, so this host owns a private,
             // empty registry: a typed scan then fails to resolve rather than
             // reaching some other host's generation.
-            Arc::new(
-                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
-            ),
+            Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new()),
             data_runtime,
             native_trust,
             native_transport,
@@ -377,7 +375,7 @@ impl FrontendApplicationHost {
         backend: ClusterBackendOpenConfig,
         connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
         typed_connector_control: Arc<
-            crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+            crate::connector::typed_control_registry::ConnectorReadControlRegistry,
         >,
         data_runtime: Handle,
         native_trust: Arc<NativeTrust>,
@@ -784,7 +782,7 @@ impl FrontendApplicationHost {
     /// session factory is built.
     pub fn typed_connector_control(
         &self,
-    ) -> Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry> {
+    ) -> Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry> {
         Arc::clone(&self.typed_connector_control)
     }
 
@@ -1166,7 +1164,7 @@ mod tests {
             backend,
             Vec::new(),
             std::sync::Arc::new(
-                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
+                crate::connector::typed_control_registry::ConnectorReadControlRegistry::new(),
             ),
             tokio::runtime::Handle::current(),
             test_native_trust(),

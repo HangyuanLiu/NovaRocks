@@ -25,7 +25,7 @@ use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
 use crate::query_execution::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
-use novarocks_proto::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
+use novarocks_proto_codec::lifecycle::{ParticipantTerminalOutcome, QueryExecutionId};
 use novarocks_types::{BackendProcessId, QueryId, QueryProcessNamespace};
 
 type QueryKey = (i64, i64);
@@ -746,7 +746,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks_proto::lifecycle::{
+    use novarocks_proto_codec::lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantTerminalOutcome, QueryControlEndpoint,
         QueryTerminalSnapshot, TerminalizationProof,
     };
@@ -817,7 +817,7 @@ mod tests {
         };
         let snapshot = QueryTerminalSnapshot::parse(proto::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                 execution_id,
             )),
             backend: Some(backend.clone()),
@@ -837,7 +837,7 @@ mod tests {
         .expect("terminal snapshot");
         let proof = TerminalizationProof::parse(proto::TerminalizationProof {
             version: 1,
-            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                 execution_id,
             )),
             backend: Some(backend),

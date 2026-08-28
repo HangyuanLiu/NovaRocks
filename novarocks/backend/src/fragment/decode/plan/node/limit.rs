@@ -22,7 +22,7 @@ use super::common::{merge_limits, parse_distributed_limit, parse_optional_nonneg
 use crate::fragment::decode::plan::error::NativeFragmentLeafDecodeError;
 use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::{FieldPath, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 
 pub(super) fn lower_limit_node(
@@ -77,7 +77,7 @@ pub(super) fn lower_limit_node(
 mod tests {
     use super::super::tests::{one_col_values_node, physical_node};
     use novarocks_execution::exec::expr::ExprArena;
-    use novarocks_proto::ProtocolErrorKind;
+    use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::plan;
 
     fn limit_node(payload_limit: Option<i64>, offset: Option<i64>) -> plan::DistributedNode {

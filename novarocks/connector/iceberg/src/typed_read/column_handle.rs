@@ -31,8 +31,8 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks_proto::FieldPath;
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::FieldPath;
+use novarocks_proto_codec::connector_read::{
     MAX_JSON_BYTES, MAX_NAME_BYTES, decode_value, decode_value_type, encode_value,
     encode_value_type,
 };
@@ -70,7 +70,7 @@ pub(crate) fn unsupported(message: impl Into<String>) -> ConnectorError {
 ///
 /// The protocol error already names the field path that failed, so it is kept
 /// verbatim instead of being flattened into a generic message.
-pub(crate) fn from_protocol(error: novarocks_proto::ProtocolError) -> ConnectorError {
+pub(crate) fn from_protocol(error: novarocks_proto_codec::ProtocolError) -> ConnectorError {
     invalid(format!("iceberg typed read wire value is invalid: {error}"))
 }
 

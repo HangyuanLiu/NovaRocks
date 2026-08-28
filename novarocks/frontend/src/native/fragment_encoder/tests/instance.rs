@@ -21,7 +21,7 @@ use super::super::instance;
 fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() {
     use std::collections::{BTreeMap, HashMap};
 
-    let scan_range = novarocks_proto::lifecycle::ScanRangeParams::parse(
+    let scan_range = novarocks_proto_codec::lifecycle::ScanRangeParams::parse(
         novarocks_proto_models::novarocks::ScanRangeParams {
             range: Some(novarocks_proto_models::novarocks::ScanRange {
                 kind: Some(novarocks_proto_models::novarocks::scan_range::Kind::File(
@@ -161,7 +161,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     assert_eq!(pruning.max_int_value, Some(20));
     let opts = encoded.query_options.as_ref().expect("query options");
     assert_eq!(opts, &instance::encode_query_options(&query_options));
-    novarocks_proto::lifecycle::QueryOptions::parse(*opts)
+    novarocks_proto_codec::lifecycle::QueryOptions::parse(*opts)
         .expect("frontend query-options projection satisfies the Protocol contract");
     assert_eq!(opts.batch_size, 4096);
     assert_eq!(opts.query_timeout, 60);

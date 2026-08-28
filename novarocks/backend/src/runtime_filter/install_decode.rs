@@ -31,8 +31,8 @@ use novarocks_execution::runtime_filter::{
     RuntimeFilterLateApplyGranularity, RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
     RuntimeFilterProducerContract, RuntimeFilterProducerKind, RuntimeFilterReduction, contribution,
 };
-use novarocks_proto::lifecycle::{QueryExecutionId, RuntimeFilterContribution};
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::lifecycle::{QueryExecutionId, RuntimeFilterContribution};
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, filter, plan};
 use novarocks_types::UniqueId;
 
@@ -1747,7 +1747,9 @@ mod tests {
         },
         test_support::BackendRuntimeFilterFixture,
     };
-    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId, RuntimeFilterContribution};
+    use novarocks_proto_codec::lifecycle::{
+        AttemptId, QueryExecutionId, RuntimeFilterContribution,
+    };
     use novarocks_proto_models::{filter, novarocks as proto_novarocks};
     use novarocks_types::QueryId;
 

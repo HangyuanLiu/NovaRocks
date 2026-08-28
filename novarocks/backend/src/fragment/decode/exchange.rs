@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use novarocks_execution::exec::fragment::program::{ExchangeInputContract, FragmentNodeId};
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 
 use super::layout::chunk_schema_from_output_columns;
@@ -74,7 +74,7 @@ pub(crate) fn decode_exchange_contracts(
 #[cfg(test)]
 mod tests {
     use super::decode_exchange_contracts;
-    use novarocks_proto::FieldPath;
+    use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{common, plan};
 
     fn exchange_node(

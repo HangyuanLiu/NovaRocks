@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_proto::membership::{BackendProcessDescriptor, BackendReportedState};
+use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
 use novarocks_types::BackendProcessId;
 
 /// Frontend-owned topology and backend-management boundary consumed by core.
@@ -282,18 +282,18 @@ impl LiveBackendTarget {
         &self.descriptor
     }
 
-    pub fn process_id(&self) -> Result<BackendProcessId, novarocks_proto::ProtocolError> {
+    pub fn process_id(&self) -> Result<BackendProcessId, novarocks_proto_codec::ProtocolError> {
         self.descriptor.process_id()
     }
 
-    pub fn endpoint(&self) -> Result<RuntimeEndpoint, novarocks_proto::ProtocolError> {
+    pub fn endpoint(&self) -> Result<RuntimeEndpoint, novarocks_proto_codec::ProtocolError> {
         let endpoint = self.descriptor.endpoint()?;
         RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port())).map_err(|error| {
-            novarocks_proto::ProtocolError::new(
-                novarocks_proto::FieldPath::root("backend_process_descriptor")
+            novarocks_proto_codec::ProtocolError::new(
+                novarocks_proto_codec::FieldPath::root("backend_process_descriptor")
                     .field("endpoint")
                     .field("host"),
-                novarocks_proto::ProtocolErrorKind::InvalidValue,
+                novarocks_proto_codec::ProtocolErrorKind::InvalidValue,
                 format!("backend endpoint is invalid for native transport: {error}"),
             )
         })
@@ -437,8 +437,8 @@ mod tests {
     use super::{
         BackendTopologyError, BackendTopologySnapshot, CoordinatorReportEndpoint, LiveBackendTarget,
     };
-    use novarocks_proto::lifecycle::QueryControlEndpoint;
-    use novarocks_proto::membership::BackendProcessDescriptor;
+    use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
+    use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_types::BackendProcessId;
 
     fn descriptor(endpoint: SocketAddr) -> BackendProcessDescriptor {

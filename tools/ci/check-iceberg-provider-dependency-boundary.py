@@ -41,12 +41,13 @@ FORBIDDEN_PROVIDER_CLOSURE = {
     "novarocks-execution",
     "novarocks-frontend",
     "novarocks-backend",
-    "novarocks-proto",
     "novarocks-state-store-sqlite",
     "novarocks-connector-starrocks",
 }
 ALLOWED_PROVIDER_INTERNAL = {
     "novarocks-fs",
+    "novarocks-proto-codec",
+    "novarocks-proto-models",
     "novarocks-spi",
     "novarocks-types",
 }

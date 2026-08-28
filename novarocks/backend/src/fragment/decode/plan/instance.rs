@@ -18,8 +18,8 @@
 //! Fragment-instance wire decoding.
 
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use novarocks_proto::FieldPath;
-use novarocks_proto::lifecycle::ScanRangeParams;
+use novarocks_proto_codec::FieldPath;
+use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_types::UniqueId;
 
 use novarocks_proto_models::novarocks as native_proto;
@@ -145,7 +145,7 @@ fn unique_id(src: &novarocks_proto_models::common::UniqueId) -> UniqueId {
 mod tests {
     use super::decode_destinations;
     use crate::fragment::decode::query_options::decode_query_options;
-    use novarocks_proto::ProtocolErrorKind;
+    use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::novarocks as native_proto;
 
     #[test]

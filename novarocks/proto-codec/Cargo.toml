@@ -1,5 +1,5 @@
 [package]
-name = "novarocks-proto"
+name = "novarocks-proto-codec"
 version = "0.1.0"
 edition = "2024"
 

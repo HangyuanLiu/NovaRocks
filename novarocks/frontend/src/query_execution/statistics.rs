@@ -330,7 +330,7 @@ impl PreparedStatisticsCollectionRequest {
 pub fn prepare_statistics_collection_request(
     controls: &dyn ConnectorControlResolver,
     typed_connector_control: &Arc<
-        crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
     >,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     context: ConnectorRequestContext,

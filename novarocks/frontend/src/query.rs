@@ -64,7 +64,7 @@ use novarocks_parser::{
     ast::{self, Fold, Statement as ParsedStatement},
     printer::{print_expr, print_statement},
 };
-use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_types::naming::{DEFAULT_DATABASE, normalize_identifier};
 use novarocks_types::{ClusterRole, EngineErrorCode};
 use novarocks_user_error::UserError;

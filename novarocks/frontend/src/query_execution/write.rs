@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 
 use crate::query_execution::artifact::WriterRegistrationSet;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_proto_models::novarocks;
 use novarocks_types::UniqueId;
 
@@ -857,7 +857,7 @@ fn query_id_to_be_bytes(execution_id: QueryExecutionId) -> [u8; 16] {
 mod tests {
     use super::*;
     use crate::query_execution::contract::QueryId;
-    use novarocks_proto::lifecycle::{AttemptId, QueryTerminalSnapshot};
+    use novarocks_proto_codec::lifecycle::{AttemptId, QueryTerminalSnapshot};
     use novarocks_proto_models::{common, plan};
     use novarocks_types::BackendProcessId;
     use prost::Message;
@@ -969,7 +969,7 @@ mod tests {
     ) -> QueryTerminalSnapshot {
         QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                 execution_id(),
             )),
             backend: Some(novarocks::ParticipantBackendIdentity {

@@ -379,8 +379,8 @@ impl<'a> QueryPreparationContext<'a> {
 
 #[cfg(test)]
 mod tests {
-    use novarocks_proto::lifecycle::QueryControlEndpoint;
-    use novarocks_proto::membership::BackendProcessDescriptor;
+    use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
+    use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_types::BackendProcessId;
 
     use super::*;

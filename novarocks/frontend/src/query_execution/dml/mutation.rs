@@ -30,7 +30,7 @@ use novarocks_parser::Span;
 use novarocks_parser::ast::{
     DmlStatement, MergeClause, MergeMatchedAction, MutationSource, ObjectName as ParsedObjectName,
 };
-use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::LakePublicationId;
 use novarocks_sql::semantic::ObjectName;
 
@@ -764,7 +764,7 @@ mod tests {
             None,
             Arc::clone(&connector_control),
             std::sync::Arc::new(
-                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
+                crate::connector::typed_control_registry::ConnectorReadControlRegistry::new(),
             ),
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),

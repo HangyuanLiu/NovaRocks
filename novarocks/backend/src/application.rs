@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_native_trust::NativeTrust;
-use novarocks_proto::lifecycle::QueryControlEndpoint;
-use novarocks_proto::lifecycle::{
+use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
+use novarocks_proto_codec::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryInitAck, QueryInitRequest, QueryStageAck,
     QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartRequest, QueryTerminationAck,
 };
-use novarocks_proto::membership::BackendProcessDescriptor;
-use novarocks_proto::membership::{
+use novarocks_proto_codec::membership::BackendProcessDescriptor;
+use novarocks_proto_codec::membership::{
     BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
 };
 use novarocks_spi::connector::ConnectorExecutionInstaller;
@@ -68,12 +68,12 @@ pub struct BackendServerConfig {
     /// Backend only owns registration and lifecycle of these contributions; it
     /// never constructs a provider-specific installer or catalog binding.
     pub execution_installers: Vec<Arc<dyn ConnectorExecutionInstaller>>,
-    /// Worker-side typed provider factories, one per provider kind. A binding
-    /// generation gets its typed entry when the execution host ensures it, so
-    /// "installed" keeps exactly one meaning on this backend.
-    pub typed_provider_factories: Vec<(
+    /// Provider-owned constructors for complete worker read bundles, one per
+    /// provider kind. The Host installs factory and matching codec atomically
+    /// for each exact admitted binding generation.
+    pub read_execution_bundle_factories: Vec<(
         novarocks_spi::connector::ConnectorExecutionProviderKind,
-        Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+        Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
     )>,
 }
 
@@ -450,9 +450,9 @@ fn compose_backend_application_services(
     query_lifecycle_config: QueryLifecycleRegistryConfig,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
-    typed_provider_factories: &[(
+    read_execution_bundle_factories: &[(
         novarocks_spi::connector::ConnectorExecutionProviderKind,
-        Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+        Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
     )],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let execution_runtime = Arc::new(ExecutionRuntime::new(execution_runtime_config).map_err(
@@ -465,11 +465,11 @@ fn compose_backend_application_services(
     // One registry per backend: the execution host writes it on ensure and the
     // fragment runtime reads it at decode, so both agree on which generation is
     // installed.
-    let typed_providers = Arc::new(crate::connector::TypedConnectorProviderRegistry::new());
+    let read_executions = Arc::new(crate::connector::InstalledReadExecutionRegistry::default());
     let execution_host = seal_connector_execution_host(
         execution_installers,
-        typed_provider_factories,
-        Arc::clone(&typed_providers),
+        read_execution_bundle_factories,
+        Arc::clone(&read_executions),
     )?;
     let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(
         Arc::clone(&controls),
@@ -516,11 +516,11 @@ fn compose_backend_application_services(
 
 fn seal_connector_execution_host(
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
-    typed_provider_factories: &[(
+    read_execution_bundle_factories: &[(
         novarocks_spi::connector::ConnectorExecutionProviderKind,
-        Arc<dyn novarocks_proto::connector_read::TypedConnectorProviderFactory>,
+        Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
     )],
-    typed_registry: Arc<crate::connector::TypedConnectorProviderRegistry>,
+    read_executions: Arc<crate::connector::InstalledReadExecutionRegistry>,
 ) -> Result<Arc<crate::ConnectorExecutionHost>, BackendApplicationError> {
     #[cfg(test)]
     if execution_installers.is_empty() {
@@ -530,8 +530,8 @@ fn seal_connector_execution_host(
     }
     crate::ConnectorExecutionHost::try_new(
         execution_installers.iter().cloned(),
-        typed_provider_factories.iter().cloned(),
-        typed_registry,
+        read_execution_bundle_factories.iter().cloned(),
+        read_executions,
     )
     .map(Arc::new)
     .map_err(|error| {
@@ -650,7 +650,7 @@ impl BackendApplicationHost {
             write_commit_evidence_limits,
             execution_runtime_config,
             execution_installers,
-            typed_provider_factories,
+            read_execution_bundle_factories,
         } = config;
         let readiness_endpoint =
             NativeEndpoint::from_host_port(&advertise_endpoint.host, advertise_endpoint.port)
@@ -667,7 +667,7 @@ impl BackendApplicationHost {
             query_lifecycle_config,
             write_commit_evidence_limits,
             &execution_installers,
-            &typed_provider_factories,
+            &read_execution_bundle_factories,
         )?;
         let process_descriptor = BackendProcessDescriptor::new(
             services.query_lifecycle_ingress.backend_process_id(),
@@ -963,8 +963,8 @@ mod tests {
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
     use novarocks_native_trust::NativeClientAuthInterceptor;
-    use novarocks_proto::lifecycle as protocol_lifecycle;
-    use novarocks_proto::lifecycle::{
+    use novarocks_proto_codec::lifecycle as protocol_lifecycle;
+    use novarocks_proto_codec::lifecycle::{
         AttemptId, ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
         QueryAbortRequest, QueryControlEndpoint, QueryExecutionId, QueryInitRequest, QueryOptions,
         QueryTerminationReason,
@@ -1085,7 +1085,7 @@ mod tests {
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
             execution_runtime_config: execution_runtime_config(),
             execution_installers: Vec::new(),
-            typed_provider_factories: Vec::new(),
+            read_execution_bundle_factories: Vec::new(),
         }
     }
 

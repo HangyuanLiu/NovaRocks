@@ -30,15 +30,15 @@ use crate::native::transport::new_query_lifecycle_transport;
 use crate::query_execution::contract::{DistributedQueryIntent, PreReadyTopologyOutcome};
 use crate::query_execution::lifecycle_plan::{QueryInitBarrier, QueryInitPlan};
 use crate::{QueryLifecycleError, QueryLifecycleErrorCode};
-use novarocks_proto::lifecycle as protocol_lifecycle;
-use novarocks_proto::lifecycle::{
+use novarocks_proto_codec::lifecycle as protocol_lifecycle;
+use novarocks_proto_codec::lifecycle::{
     AttemptId, FragmentLiveObservation, ParticipantBackendIdentity, ParticipantManifest,
     QueryControlCommand as ProtocolQueryControlCommand, QueryControlEndpoint,
     QueryControlEvent as ProtocolQueryControlEvent, QueryExecutionId, QueryInitAck,
     QueryInitOutcome, QueryInitRequest, QueryOptions, QueryTerminationAck, QueryTerminationReason,
     RuntimeFilterContribution,
 };
-use novarocks_proto::membership::BackendProcessDescriptor;
+use novarocks_proto_codec::membership::BackendProcessDescriptor;
 use novarocks_proto_models::{common as proto_common, filter, novarocks as proto};
 use novarocks_types::{BackendProcessId, QueryId, UniqueId};
 use tokio_stream::wrappers::ReceiverStream;
@@ -72,7 +72,7 @@ fn terminal_outcome(
     let init_digest = snapshot.init_digest().as_bytes().to_vec();
     let proof = protocol_lifecycle::TerminalizationProof::parse(proto::TerminalizationProof {
         version: 1,
-        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             execution_id,
         )),
         backend: Some(backend.as_proto().clone()),
@@ -96,7 +96,7 @@ fn terminal_snapshot(
 ) -> protocol_lifecycle::QueryTerminalSnapshot {
     protocol_lifecycle::QueryTerminalSnapshot::parse(proto::QueryTerminalSnapshot {
         version: 1,
-        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             execution_id,
         )),
         backend: Some(backend.as_proto().clone()),
@@ -122,7 +122,7 @@ fn negative_attestation_outcome(
     digest: protocol_lifecycle::ParticipantManifestDigest,
 ) -> protocol_lifecycle::ParticipantTerminalOutcome {
     let attestation = protocol_lifecycle::NegativeAttestation::parse(proto::NegativeAttestation {
-        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             execution_id,
         )),
         backend: Some(backend.as_proto().clone()),
@@ -245,7 +245,7 @@ fn protocol_terminal_ack_command(
 ) -> protocol_lifecycle::QueryControlCommand {
     let snapshot = outcome.snapshot().expect("fixture terminal snapshot");
     let ack = protocol_lifecycle::QueryTerminalAck::parse(proto::QueryControlTerminalAck {
-        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             outcome.execution_id(),
         )),
         init_digest: outcome.init_digest().as_bytes().to_vec(),
@@ -268,7 +268,7 @@ fn protocol_attach_for(
     epoch: u64,
 ) -> protocol_lifecycle::QueryControlAttach {
     protocol_lifecycle::QueryControlAttach::parse(proto::QueryControlAttach {
-        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             execution_id,
         )),
         init_digest: digest.as_bytes().to_vec(),
@@ -283,7 +283,7 @@ fn protocol_abort_for(
     reason: impl Into<String>,
 ) -> protocol_lifecycle::QueryAbortRequest {
     protocol_lifecycle::QueryAbortRequest::parse(proto::AbortQueryRequest {
-        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             execution_id,
         )),
         init_digest: digest.as_bytes().to_vec(),
@@ -355,7 +355,7 @@ fn protocol_fragment_observation(
     elapsed_ms: u64,
 ) -> protocol_lifecycle::FragmentLiveObservation {
     protocol_lifecycle::FragmentLiveObservation::parse(proto::FragmentLiveObservation {
-        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             execution_id,
         )),
         init_digest: digest.as_bytes().to_vec(),

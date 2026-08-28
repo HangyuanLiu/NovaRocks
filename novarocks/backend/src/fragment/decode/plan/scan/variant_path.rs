@@ -24,7 +24,7 @@ use arrow::datatypes::{DataType, Field};
 use super::super::error::NativeFragmentLeafDecodeError;
 use super::common::{column_def_data_type, output_column_data_type};
 use novarocks_execution::exec::variant_read::VariantPathSpec;
-use novarocks_proto::ProtocolErrorKind;
+use novarocks_proto_codec::ProtocolErrorKind;
 use novarocks_proto_models::{common, plan};
 use novarocks_types::SlotId;
 

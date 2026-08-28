@@ -19,7 +19,7 @@
 
 use std::fmt;
 
-use novarocks_proto::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
 
 #[derive(Debug)]
 pub(crate) struct NativeExpressionLeafDecodeError {

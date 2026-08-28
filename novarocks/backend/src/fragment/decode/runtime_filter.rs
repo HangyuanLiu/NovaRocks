@@ -20,7 +20,7 @@
 use std::collections::BTreeSet;
 
 use novarocks_execution::exec::fragment::program::{RuntimeFilterContract, RuntimeFilterId};
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 
 pub(crate) fn decode_runtime_filter_contract(

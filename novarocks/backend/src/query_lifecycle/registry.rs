@@ -24,8 +24,8 @@ use novarocks_execution::runtime::fragment::{FragmentOutcome, FragmentTerminalFa
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_failpoint::QueryLifecycleFaultKind;
-use novarocks_proto::lifecycle::terminal::p0_max_encoded_len;
-use novarocks_proto::lifecycle::{
+use novarocks_proto_codec::lifecycle::terminal::p0_max_encoded_len;
+use novarocks_proto_codec::lifecycle::{
     FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifestDigest,
     ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach, QueryControlEndpoint,
     QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitOutcome, QueryInitRequest,
@@ -69,14 +69,14 @@ use crate::runtime_filter::rpc::{
 const CONTROL_EVENT_BUFFER_CAPACITY: usize = 16;
 const RESERVED_CONTROL_EVENT_CAPACITY: usize = 3;
 
-fn protocol_contract_error(error: novarocks_proto::ProtocolError) -> QueryLifecycleError {
+fn protocol_contract_error(error: novarocks_proto_codec::ProtocolError) -> QueryLifecycleError {
     QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
 }
 
 /// Protocol wrappers have already passed structural validation at native
 /// ingress.  Backend uses this boundary helper only to make that invariant
 /// explicit while deriving BE-local routing IDs from generated values.
-fn validated<T>(value: Result<T, novarocks_proto::ProtocolError>) -> T {
+fn validated<T>(value: Result<T, novarocks_proto_codec::ProtocolError>) -> T {
     value.expect("validated Protocol lifecycle carrier must retain its required field")
 }
 
@@ -89,7 +89,7 @@ fn generated_id(value: novarocks_proto_models::common::UniqueId) -> UniqueId {
     reason = "Retained for lifecycle protocol-fixture targets that convert manifest fragment identifiers."
 )]
 fn expected_fragment_ids(
-    manifest: &novarocks_proto::lifecycle::ParticipantManifest,
+    manifest: &novarocks_proto_codec::lifecycle::ParticipantManifest,
 ) -> Vec<UniqueId> {
     manifest
         .expected_fragment_instance_ids()
@@ -167,7 +167,7 @@ fn protocol_unique_id(value: UniqueId) -> novarocks_proto_models::common::Unique
 }
 
 fn protocol_backend(
-    backend: novarocks_proto::lifecycle::ParticipantBackendIdentity,
+    backend: novarocks_proto_codec::lifecycle::ParticipantBackendIdentity,
 ) -> novarocks_proto_models::novarocks::ParticipantBackendIdentity {
     let endpoint = validated(backend.endpoint());
     let process_id = validated(backend.process_id());
@@ -237,7 +237,7 @@ fn terminal_fragment_snapshot(
     profile: Option<RuntimeProfileTree>,
     statistics_payload: Vec<u8>,
 ) -> Result<FragmentTerminalSnapshot, QueryLifecycleError> {
-    use novarocks_proto::lifecycle::terminal::FragmentTerminalSnapshot as ProtocolFragment;
+    use novarocks_proto_codec::lifecycle::terminal::FragmentTerminalSnapshot as ProtocolFragment;
     use novarocks_proto_models::novarocks as wire;
     use wire::fragment_terminal_profile_telemetry::Telemetry;
     let profile = wire::FragmentTerminalProfileTelemetry {
@@ -296,20 +296,20 @@ fn fragment_outcome(
 
 fn terminal_outcome_from_snapshot(
     execution_id: QueryExecutionId,
-    backend: novarocks_proto::lifecycle::ParticipantBackendIdentity,
+    backend: novarocks_proto_codec::lifecycle::ParticipantBackendIdentity,
     init_digest: ParticipantManifestDigest,
     facts: Vec<FragmentTerminalSnapshot>,
     profile_contribution: novarocks_proto_models::novarocks::QueryTerminalProfileContributionTelemetry,
 ) -> Result<(QueryTerminalSnapshot, ParticipantTerminalOutcome), QueryLifecycleError> {
-    use novarocks_proto::lifecycle::terminal::{
+    use novarocks_proto_codec::lifecycle::terminal::{
         QueryTerminalSnapshot as ProtocolSnapshot, TerminalizationProof as ProtocolProof,
     };
     use novarocks_proto_models::novarocks as wire;
     use wire::participant_terminal_outcome::Outcome;
     let backend = protocol_backend(backend);
     let snapshot = ProtocolSnapshot::parse(wire::QueryTerminalSnapshot {
-        version: novarocks_proto::lifecycle::terminal::QUERY_TERMINAL_SNAPSHOT_VERSION_V1,
-        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+        version: novarocks_proto_codec::lifecycle::terminal::QUERY_TERMINAL_SNAPSHOT_VERSION_V1,
+        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             execution_id,
         )),
         backend: Some(backend.clone()),
@@ -323,7 +323,7 @@ fn terminal_outcome_from_snapshot(
     .map_err(protocol_contract_error)?;
     let proof = ProtocolProof::parse(wire::TerminalizationProof {
         version: 1,
-        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             execution_id,
         )),
         backend: Some(backend),
@@ -355,16 +355,16 @@ fn terminal_outcome_from_snapshot(
 
 fn negative_terminal_outcome(
     execution_id: QueryExecutionId,
-    backend: novarocks_proto::lifecycle::ParticipantBackendIdentity,
+    backend: novarocks_proto_codec::lifecycle::ParticipantBackendIdentity,
     init_digest: ParticipantManifestDigest,
     reason: novarocks_proto_models::novarocks::NegativeAttestationReason,
     detail: String,
 ) -> ParticipantTerminalOutcome {
-    use novarocks_proto::lifecycle::terminal::NegativeAttestation as ProtocolAttestation;
+    use novarocks_proto_codec::lifecycle::terminal::NegativeAttestation as ProtocolAttestation;
     use novarocks_proto_models::novarocks as wire;
     use wire::participant_terminal_outcome::Outcome;
     let attestation = ProtocolAttestation::parse(wire::NegativeAttestation {
-        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             execution_id,
         )),
         backend: Some(protocol_backend(backend)),
@@ -544,7 +544,7 @@ fn terminal_profile_contribution(
         .collect();
     QueryTerminalProfileContributionV1::seal(wire::QueryTerminalProfileContributionV1 {
         version:
-            novarocks_proto::lifecycle::terminal::QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
+            novarocks_proto_codec::lifecycle::terminal::QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
         channels,
         producer_streams,
         transport_routes,
@@ -575,7 +575,7 @@ pub(super) fn capture_terminal_profile_contribution(
         }
         return Ok(wire::QueryTerminalProfileContributionTelemetry {
             telemetry: Some(Telemetry::Available(wire::QueryTerminalProfileContributionV1 {
-                version: novarocks_proto::lifecycle::terminal::QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
+                version: novarocks_proto_codec::lifecycle::terminal::QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1,
                 ..Default::default()
             })),
         });
@@ -1713,9 +1713,9 @@ impl QueryLifecycleRegistry {
             let process_id = validated(backend.process_id());
             let observation = FragmentLiveObservation::parse(
                 novarocks_proto_models::novarocks::FragmentLiveObservation {
-                    execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
-                        execution_id,
-                    )),
+                    execution_id: Some(
+                        novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id),
+                    ),
                     init_digest: entry.digest.as_bytes().to_vec(),
                     backend: Some(
                         novarocks_proto_models::novarocks::ParticipantBackendIdentity {
@@ -3621,7 +3621,7 @@ impl QueryLifecycleRegistry {
                             }
                             let _ = registry.terminal_ack_from_control(
                                 QueryTerminalAck::parse(novarocks_proto_models::novarocks::QueryControlTerminalAck {
-                                    execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(outcome.execution_id())),
+                                    execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(outcome.execution_id())),
                                     init_digest: outcome.init_digest().as_bytes().to_vec(),
                                     snapshot_version: 1, snapshot_digest: content_id.as_bytes().to_vec(),
                                 }).expect("retained Protocol terminal outcome has a valid acknowledgement identity"),
@@ -4765,7 +4765,7 @@ fn internal_error(detail: impl Into<String>) -> QueryLifecycleError {
 
 #[cfg(test)]
 mod query_execution_diagnostic_tests {
-    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId};
+    use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_types::QueryId;
 
     use super::QueryExecutionDiagnostic;

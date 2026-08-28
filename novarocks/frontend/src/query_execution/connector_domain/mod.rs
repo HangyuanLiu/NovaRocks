@@ -31,4 +31,4 @@ pub(crate) use scheduling::{
     PlanNodeAssignmentState, ScheduledSplit, SplitAssignment, SplitAssignmentError,
     SplitSequenceAllocator, TaskUpdateRequest,
 };
-pub(crate) use table_scan::{TableScanNode, TableScanNodeError};
+pub(crate) use table_scan::{DynamicFilterBinding, TableScanNode, TableScanNodeError};

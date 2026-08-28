@@ -62,7 +62,7 @@ use novarocks_execution::exec::node::runtime_filter::{
     RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode,
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::FieldPath;
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
 #[derive(Clone, Debug)]
@@ -1926,7 +1926,7 @@ mod tests {
         assert_eq!(protocol.path().to_string(), "plan_fragment.root.children");
         assert_eq!(
             protocol.kind(),
-            novarocks_proto::ProtocolErrorKind::InconsistentFields
+            novarocks_proto_codec::ProtocolErrorKind::InconsistentFields
         );
     }
 

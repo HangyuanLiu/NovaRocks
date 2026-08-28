@@ -37,7 +37,7 @@ use crate::query_execution::dml::ctas::{
     StandardCtasPublicationAdjudicationOutcome, StandardCtasPublishOutcome,
     StandardCtasStageOutcome, StandardCtasTargetFacts, StandardCtasWriteOutcome,
 };
-use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorWriteOperationCompletion, ConnectorWriteOperationId, CreatePolicy,
     ExternalMutationFinalization, LakePublicationFamily, LakePublicationId,

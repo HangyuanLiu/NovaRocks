@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::outcome::FragmentProfileSet;
 use crate::query_execution::terminal_codec::decode_runtime_profile_tree;
-use novarocks_proto::lifecycle::{QueryTerminalProfileContributionV1, QueryTerminalSnapshot};
+use novarocks_proto_codec::lifecycle::{QueryTerminalProfileContributionV1, QueryTerminalSnapshot};
 use novarocks_proto_models::novarocks;
 
 const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
@@ -1102,7 +1102,7 @@ mod tests {
     };
     use crate::query_execution::contract::QueryId;
     use novarocks_execution::runtime::profile::{ProfileUnit, Profiler};
-    use novarocks_proto::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
+    use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId, QueryTerminalSnapshot};
     use novarocks_proto_models::{common, novarocks};
 
     fn test_backend_process_id(participant_seed: u64) -> novarocks::BackendProcessId {
@@ -1125,7 +1125,7 @@ mod tests {
                 .expect("execution id");
         QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(execution_id)),
+            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id)),
             backend: Some(novarocks::ParticipantBackendIdentity {
                 endpoint: Some(novarocks::QueryControlEndpoint {
                     host: "127.0.0.1".to_string(),
@@ -1248,7 +1248,7 @@ mod tests {
     fn profile_terminal_builder_ignores_canonical_empty_contribution() {
         let snapshot = QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                 QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
                     .expect("execution id"),
             )),

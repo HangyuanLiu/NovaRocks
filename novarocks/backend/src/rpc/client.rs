@@ -27,7 +27,7 @@ use std::time::Duration;
 use hyper_util::rt::TokioIo;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_native_trust::{NativeClientAuthInterceptor, NativeTrust};
-use novarocks_proto::membership::BackendAnnounceResult;
+use novarocks_proto_codec::membership::BackendAnnounceResult;
 use novarocks_proto_models::{filter, novarocks as proto};
 use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::UniqueId;

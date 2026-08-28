@@ -45,7 +45,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks_proto::connector_read::{
+use novarocks_proto_codec::connector_read::{
     MAX_DELETES_PER_SPLIT, MAX_JSON_BYTES, MAX_PATH_BYTES, MAX_SCAN_ASSIGNMENTS,
 };
 use novarocks_proto_models::connector_read as dto;

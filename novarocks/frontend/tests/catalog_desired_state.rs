@@ -571,7 +571,7 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
             .expect("valid FE backend config"),
             Vec::new(),
             std::sync::Arc::new(
-                novarocks_frontend::connector::typed_control_registry::TypedConnectorControlRegistry::default(),
+                novarocks_frontend::connector::typed_control_registry::ConnectorReadControlRegistry::default(),
             ),
             tokio::runtime::Handle::current(),
             Arc::new(NativeTrust::new(

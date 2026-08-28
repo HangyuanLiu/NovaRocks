@@ -25,18 +25,18 @@ use novarocks_native_trust::{
     AutomaticTlsMaterial, NativeClientAuthInterceptor, NativeEndpointConnector,
     NativeIncomingAdapter, NativeTlsMaterial,
 };
-use novarocks_proto::connector::{
+use novarocks_proto_codec::connector::{
     encode_connector_execution_binding_key, encode_connector_execution_declaration,
 };
-use novarocks_proto::lifecycle::{
+use novarocks_proto_codec::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
     QueryInitRequest, QueryStageAck, QueryStageRequest, QueryStartAck, QueryStartRequest,
     QueryTerminationAck, QueryTerminationReason,
 };
-use novarocks_proto::membership::{
+use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId, parse_reported_state,
 };
-use novarocks_proto::provider::{
+use novarocks_proto_codec::provider::{
     EnsureConnectorExecutionBindingOutcome, EnsureConnectorExecutionBindingResult,
     RetireConnectorExecutionBindingOutcome, RetireConnectorExecutionBindingResult,
 };
@@ -321,7 +321,7 @@ impl ConnectorBindingControl {
 impl ConnectorBindingDispatcher for ConnectorBindingControl {
     fn install(
         &self,
-        execution_id: novarocks_proto::lifecycle::QueryExecutionId,
+        execution_id: novarocks_proto_codec::lifecycle::QueryExecutionId,
         backend_idx: usize,
         endpoint: RuntimeEndpoint,
         declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
@@ -1089,10 +1089,9 @@ impl GrpcTaskUpdateTransport {
 impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskUpdateTransport {
     fn send(
         &self,
-        execution_id: novarocks_proto::lifecycle::QueryExecutionId,
+        execution_id: novarocks_proto_codec::lifecycle::QueryExecutionId,
         target: &crate::query_execution::split_assignment::AssignmentTarget,
-        fragment_instance_id: novarocks_types::UniqueId,
-        assignments: Vec<novarocks_proto_models::connector_read::SplitAssignment>,
+        request: crate::query_execution::connector_domain::TaskUpdateRequest,
     ) -> Result<
         crate::query_execution::split_assignment::TaskUpdateOutcome,
         crate::query_execution::split_assignment::TaskUpdateTransportError,
@@ -1116,10 +1115,12 @@ impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskU
                 attempt_id: execution_id.attempt_id().get(),
             }),
             fragment_instance_id: Some(ProtoUniqueId {
-                hi: fragment_instance_id.high(),
-                lo: fragment_instance_id.low(),
+                hi: request.fragment_instance_id().high(),
+                lo: request.fragment_instance_id().low(),
             }),
-            assignments,
+            assignments: request
+                .to_proto_assignments()
+                .map_err(TaskUpdateTransportError::new)?,
         };
         let response = client
             .data_runtime

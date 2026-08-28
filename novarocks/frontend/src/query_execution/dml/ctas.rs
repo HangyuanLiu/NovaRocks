@@ -51,7 +51,7 @@ use novarocks_parser::ast::{
     TableStatement,
 };
 use novarocks_parser::printer;
-use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_sql::semantic::ObjectName;
 
 #[derive(Clone, Debug, Eq, PartialEq)]

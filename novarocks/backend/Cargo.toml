@@ -11,7 +11,7 @@ doctest = false
 novarocks-execution = { path = "../execution" }
 novarocks-failpoint = { path = "../failpoint" }
 novarocks-native-trust = { path = "../native-trust" }
-novarocks-proto = { path = "../proto" }
+novarocks-proto-codec = { path = "../proto-codec" }
 novarocks-proto-models = { path = "../proto-models" }
 novarocks-spi = { path = "../spi" }
 bytes = "1"

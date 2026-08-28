@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(test)]
@@ -37,8 +37,8 @@ use novarocks_execution::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
 use novarocks_execution::runtime::profile::Profiler;
-use novarocks_proto::connector::AdmittedConnectorExecutionDeclaration;
-use novarocks_proto::lifecycle::{QueryExecutionId, StageFragment};
+use novarocks_proto_codec::connector::AdmittedConnectorExecutionDeclaration;
+use novarocks_proto_codec::lifecycle::{QueryExecutionId, StageFragment};
 use novarocks_spi::connector::{ConnectorExecutionBindingKey, WriteCommitEvidenceLimits};
 use tracing::error;
 
@@ -65,6 +65,32 @@ pub(super) enum NativeFragmentLifecycleEvent {
 }
 
 type LifecycleObserver = Arc<dyn Fn(NativeFragmentLifecycleEvent) + Send + Sync>;
+
+/// The native task-update protocol owns this ceiling.  Execution receives the
+/// value as configuration and therefore does not depend on ProtoCodec.
+fn split_queue_config() -> novarocks_execution::connector::SplitQueueConfig {
+    novarocks_execution::connector::SplitQueueConfig {
+        max_queued_bytes: novarocks_proto_codec::connector_read::MAX_ASSIGNMENT_RETAINED_BYTES,
+        max_replay_record_bytes:
+            novarocks_proto_codec::connector_read::MAX_ASSIGNMENT_RETAINED_BYTES,
+    }
+}
+
+fn split_queue_rejection(
+    error: novarocks_execution::connector::SplitQueueError,
+) -> crate::query_lifecycle::task_update::TaskUpdateAck {
+    use crate::query_lifecycle::task_update::{TaskUpdateAck, TaskUpdateRejectionReason};
+    use novarocks_execution::connector::SplitQueueErrorKind;
+
+    let reason = match error.kind() {
+        SplitQueueErrorKind::PlanNodeMismatch => TaskUpdateRejectionReason::UnknownPlanNode,
+        SplitQueueErrorKind::SequenceConflict => TaskUpdateRejectionReason::SequenceConflict,
+        SplitQueueErrorKind::AfterNoMoreSplits => TaskUpdateRejectionReason::AfterNoMoreSplits,
+        SplitQueueErrorKind::Closed => TaskUpdateRejectionReason::Terminated,
+        SplitQueueErrorKind::ResourceExhausted => TaskUpdateRejectionReason::ResourceExhausted,
+    };
+    TaskUpdateAck::rejected(reason, error.to_string())
+}
 
 #[cfg(test)]
 fn test_execution_runtime() -> Arc<ExecutionRuntime> {
@@ -128,7 +154,19 @@ pub struct NativeFragmentService {
     /// Runtime split delivery for admitted tasks. It is keyed by execution id
     /// and fragment instance, so a replaced attempt gets a fresh queue set and
     /// can never inherit a sequence space.
-    split_queues: Arc<novarocks_execution::connector::SplitQueueRegistry>,
+    split_queues: Arc<
+        novarocks_execution::connector::SplitQueueRegistry<
+            crate::fragment::ingress::ReceivedReadSplit,
+        >,
+    >,
+    read_contexts: Arc<
+        Mutex<
+            BTreeMap<
+                novarocks_execution::connector::TaskAttemptKey,
+                Arc<crate::fragment::ingress::TypedReadAttemptContext>,
+            >,
+        >,
+    >,
     lifecycle_observer: Option<LifecycleObserver>,
     #[cfg(test)]
     after_lifecycle_admission: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -194,6 +232,7 @@ impl NativeFragmentService {
             commit_port: Arc::new(BackendSinkCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
             split_queues: Arc::new(novarocks_execution::connector::SplitQueueRegistry::new()),
+            read_contexts: Arc::new(Mutex::new(BTreeMap::new())),
             lifecycle_observer: None,
             #[cfg(test)]
             after_lifecycle_admission: None,
@@ -289,8 +328,22 @@ impl NativeFragmentService {
             .unwrap_or_else(|| novarocks_types::UniqueId::new(0, 0));
         let queues = self.split_queues.open_attempt(
             novarocks_execution::connector::TaskAttemptKey::new(execution_id, fragment_instance_id),
-            novarocks_execution::connector::SplitQueueConfig::default(),
+            split_queue_config(),
         );
+        let attempt_key =
+            novarocks_execution::connector::TaskAttemptKey::new(execution_id, fragment_instance_id);
+        let read_contexts = {
+            let mut contexts = self
+                .read_contexts
+                .lock()
+                .expect("typed read context map lock");
+            contexts
+                .entry(attempt_key)
+                .or_insert_with(|| {
+                    Arc::new(crate::fragment::ingress::TypedReadAttemptContext::new())
+                })
+                .clone()
+        };
         // The session is role-local and carries no credential: object-store
         // access stays with the binding owner.
         let session = novarocks_spi::connector::read_stack::ConnectorSession::try_new(
@@ -306,46 +359,25 @@ impl NativeFragmentService {
             std::time::SystemTime::now(),
         )
         .expect("a query execution id is never an empty session query id");
-        // A fragment with no installed runtime filter gets `None`, which the
-        // typed scan turns into the truthful unconstrained filter rather than
-        // a live one that never narrows.
-        // Resolved lazily, not here.
-        //
-        // A fragment does not hold its admission permit while its plan is being
-        // decoded, and the lifecycle refuses a session without one. Resolving
-        // eagerly therefore always failed, and swallowing that failure turned a
-        // contract violation into a silent degrade: every typed scan received
-        // the truthful unconstrained filter, so a live runtime filter could
-        // never reach a page source and no row group was ever pruned.
+        // Resolving is deliberately deferred until bind: decode has no
+        // admission permit, while the lifecycle exposes a runtime-filter
+        // session only to an admitted fragment.  `None` is the ordinary
+        // no-filter result; a lifecycle error is returned to the scan and must
+        // fail the reader rather than silently widening it to CompleteAll.
         use crate::fragment::decode::plan::context::RuntimeFilterSessionResolver;
         let lifecycle = Arc::clone(&self.lifecycle);
         let runtime_filter: RuntimeFilterSessionResolver = Arc::new(move || {
-            match lifecycle.runtime_filter_session_for_fragment(
-                execution_id,
-                fragment_instance_id,
-                false,
-            ) {
-                // `None` is the ordinary answer for an attempt that installed
-                // no runtime filter at all.
-                Ok(session) => session,
-                // Not ordinary: the lifecycle refused to hand out a session it
-                // may have. Reporting it is the difference between "this query
-                // has no runtime filter" and "this query silently lost one".
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "runtime filter session unavailable for a typed scan; it will read unfiltered"
-                    );
-                    None
-                }
-            }
+            lifecycle
+                .runtime_filter_session_for_fragment(execution_id, fragment_instance_id, false)
+                .map_err(|error| format!("resolve typed scan runtime-filter session: {error}"))
         });
 
         crate::fragment::decode::plan::context::TypedScanRuntime::new(
-            self.execution_host.typed_providers(),
+            self.execution_host.read_executions(),
             queues,
             session,
             runtime_filter,
+            read_contexts,
         )
     }
 
@@ -358,22 +390,81 @@ impl NativeFragmentService {
         &self,
         execution_id: QueryExecutionId,
         fragment_instance_id: novarocks_types::UniqueId,
-        assignments: &[novarocks_proto::connector_read::SplitAssignment],
+        assignments: &[novarocks_proto_codec::connector_read::SplitAssignment],
     ) -> crate::query_lifecycle::task_update::TaskUpdateAck {
-        use crate::query_lifecycle::task_update::{
-            TaskUpdateAcceptedNode, TaskUpdateAck, TaskUpdateRejectionReason,
-        };
-        use novarocks_execution::connector::{SplitQueueErrorKind, TaskAttemptKey};
+        use crate::query_lifecycle::task_update::{TaskUpdateAcceptedNode, TaskUpdateAck};
+        use novarocks_execution::connector::TaskAttemptKey;
 
         let key = TaskAttemptKey::new(execution_id, fragment_instance_id);
-        let attempt = self.split_queues.open_attempt(
-            key,
-            novarocks_execution::connector::SplitQueueConfig::default(),
-        );
+        let attempt = self.split_queues.open_attempt(key, split_queue_config());
         let mut accepted = Vec::with_capacity(assignments.len());
         for assignment in assignments {
-            match attempt.offer(assignment) {
-                Ok(outcome) => {
+            let queue = attempt.queue(assignment.plan_node_id());
+            let read_execution = self
+                .read_contexts
+                .lock()
+                .ok()
+                .and_then(|contexts| contexts.get(&key).cloned())
+                .and_then(|context| context.resolve(assignment.plan_node_id()));
+            let Some(read_execution) = read_execution else {
+                return TaskUpdateAck::rejected(
+                    crate::query_lifecycle::task_update::TaskUpdateRejectionReason::UnknownPlanNode,
+                    format!(
+                        "no typed connector read context exists for plan node {}",
+                        assignment.plan_node_id()
+                    ),
+                );
+            };
+            let evidence = assignment
+                .splits()
+                .iter()
+                .map(|split| {
+                    novarocks_execution::connector::SplitReplayEvidence::new(
+                        split.sequence_id(),
+                        split.plan_node_id(),
+                        split.canonical_bytes().to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            // Queue state decides whether this is a replay, a conflict, or a
+            // terminal update before a concrete binding attempts to recover a
+            // provider payload.  A later codec fills `ReceivedReadSplit` only
+            // for `new_sequences`; exact replay never depends on map order in
+            // a recovered provider value.
+            let preflight = match queue.preflight_replay(assignment.plan_node_id(), &evidence) {
+                Ok(preflight) => preflight,
+                Err(error) => return split_queue_rejection(error),
+            };
+            let received = assignment
+                .splits()
+                .iter()
+                .filter(|split| !preflight.is_replay(split.sequence_id()))
+                .map(|split| {
+                    read_execution
+                        .codec()
+                        .decode_scheduled_split(split)
+                        .map(|decoded| {
+                            let (evidence, split) = decoded.into_parts();
+                            crate::fragment::ingress::ReceivedReadSplit::new(evidence, split)
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>();
+            let received = match received {
+                Ok(received) => received,
+                Err(error) => {
+                    return TaskUpdateAck::rejected(
+                        crate::query_lifecycle::task_update::TaskUpdateRejectionReason::InvalidAssignment,
+                        error.to_string(),
+                    );
+                }
+            };
+            match queue.offer_splits(
+                assignment.plan_node_id(),
+                received,
+                assignment.no_more_splits(),
+            ) {
+                Ok(mut outcome) => {
+                    outcome.replayed = preflight.replayed().to_vec();
                     // Stable acceptance evidence for distributed acceptance
                     // runs: it proves a real remote assignment reached this
                     // task, which a single-process smoke cannot show.
@@ -415,27 +506,7 @@ impl NativeFragmentService {
                             .unwrap_or_default(),
                     });
                 }
-                Err(error) => {
-                    // A partially applied update is still reported: the queue
-                    // itself is all-or-nothing per assignment, so the sender
-                    // needs to know exactly how far it got.
-                    let reason = match error.kind() {
-                        SplitQueueErrorKind::PlanNodeMismatch => {
-                            TaskUpdateRejectionReason::UnknownPlanNode
-                        }
-                        SplitQueueErrorKind::SequenceConflict => {
-                            TaskUpdateRejectionReason::SequenceConflict
-                        }
-                        SplitQueueErrorKind::AfterNoMoreSplits => {
-                            TaskUpdateRejectionReason::AfterNoMoreSplits
-                        }
-                        SplitQueueErrorKind::Closed => TaskUpdateRejectionReason::Terminated,
-                        SplitQueueErrorKind::ResourceExhausted => {
-                            TaskUpdateRejectionReason::ResourceExhausted
-                        }
-                    };
-                    return TaskUpdateAck::rejected(reason, error.to_string());
-                }
+                Err(error) => return split_queue_rejection(error),
             }
         }
         TaskUpdateAck::Accepted(accepted)
@@ -467,6 +538,24 @@ impl NativeFragmentService {
                     failure.ordinal
                 )));
             }
+            let fragment_instance_id = fragment
+                .instance_params()
+                .fragment_instance_id
+                .as_ref()
+                .map(|id| novarocks_types::UniqueId::new(id.hi, id.lo))
+                .unwrap_or_else(|| novarocks_types::UniqueId::new(0, 0));
+            // The context is provisional through decode and admission.  Its
+            // Drop path removes it unless this fragment reaches the existing
+            // registration/commit boundary below, so TaskUpdate can never
+            // resolve a half-decoded plan node.
+            let mut provisional_read_context = ProvisionalTypedReadContext::new(
+                Arc::clone(&self.read_contexts),
+                novarocks_execution::connector::TaskAttemptKey::new(
+                    execution_id,
+                    fragment_instance_id,
+                ),
+            );
+            let typed_runtime = self.typed_scan_runtime(execution_id, fragment.instance_params());
             let request = NativeFragmentRequest::try_decode_with_execution_resolver(
                 execution_id,
                 fragment.plan().clone(),
@@ -476,9 +565,16 @@ impl NativeFragmentService {
                 self.queries
                     .connector_cancellation_for_execution(execution_id),
                 std::time::Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
-                Some(self.typed_scan_runtime(execution_id, fragment.instance_params())),
-            )?;
-            self.stage_one(request, Arc::clone(&gate))?;
+                Some(typed_runtime),
+            );
+            let request = match request {
+                Ok(request) => request,
+                Err(error) => return Err(error),
+            };
+            if let Err(error) = self.stage_one(request, Arc::clone(&gate)) {
+                return Err(error);
+            }
+            provisional_read_context.publish();
         }
         Ok(())
     }
@@ -558,12 +654,23 @@ impl NativeFragmentService {
                 query_expire,
             )
             .map_err(NativeFragmentIngressError::new)?;
+        if let Some(context) = self.read_contexts.lock().ok().and_then(|contexts| {
+            contexts
+                .get(&novarocks_execution::connector::TaskAttemptKey::new(
+                    execution_id,
+                    fragment_instance_id,
+                ))
+                .cloned()
+        }) {
+            context.publish();
+        }
         let pending_control =
             Arc::new(PendingFragmentControl::new(self.lifecycle_observer.clone()));
         let control_handle: Arc<dyn FragmentControlHandle> = pending_control.clone();
         let token = reservation.publish(control_handle);
         let queries = self.queries.clone();
         let split_queues = Arc::clone(&self.split_queues);
+        let read_contexts = Arc::clone(&self.read_contexts);
         let lifecycle = Arc::clone(&self.lifecycle);
         let observer = self.lifecycle_observer.clone();
         std::thread::Builder::new()
@@ -616,6 +723,7 @@ impl NativeFragmentService {
                     token,
                     queries,
                     split_queues,
+                    read_contexts,
                     lifecycle,
                     execution_id,
                     backend_num,
@@ -719,6 +827,7 @@ impl NativeFragmentService {
         let (start_tx, start_rx) = mpsc::sync_channel::<()>(0);
         let queries = self.queries.clone();
         let split_queues = Arc::clone(&self.split_queues);
+        let read_contexts = Arc::clone(&self.read_contexts);
         let lifecycle = Arc::clone(&self.lifecycle);
         let observer = self.lifecycle_observer.clone();
         #[cfg(test)]
@@ -782,6 +891,7 @@ impl NativeFragmentService {
                     token,
                     queries,
                     split_queues,
+                    read_contexts,
                     lifecycle,
                     execution_id,
                     backend_num,
@@ -813,14 +923,14 @@ impl NativeFragmentIngress for NativeFragmentService {
         &self,
         execution_id: QueryExecutionId,
         declaration: AdmittedConnectorExecutionDeclaration,
-    ) -> novarocks_proto::provider::EnsureConnectorExecutionBindingResult {
+    ) -> novarocks_proto_codec::provider::EnsureConnectorExecutionBindingResult {
         self.execution_host.ensure(execution_id, &declaration)
     }
 
     fn retire_connector_execution_binding(
         &self,
         key: ConnectorExecutionBindingKey,
-    ) -> novarocks_proto::provider::RetireConnectorExecutionBindingResult {
+    ) -> novarocks_proto_codec::provider::RetireConnectorExecutionBindingResult {
         self.execution_host.retire(&key)
     }
 
@@ -912,7 +1022,9 @@ impl FragmentControlHandle for RunningFragmentControl {
 /// leaves a driver waiting for splits that will not arrive, and makes every
 /// later queue for that attempt born closed.
 fn close_task_split_queues(
-    split_queues: &novarocks_execution::connector::SplitQueueRegistry,
+    split_queues: &novarocks_execution::connector::SplitQueueRegistry<
+        crate::fragment::ingress::ReceivedReadSplit,
+    >,
     execution_id: QueryExecutionId,
     fragment_instance_id: novarocks_types::UniqueId,
 ) {
@@ -922,11 +1034,108 @@ fn close_task_split_queues(
     ));
 }
 
+fn remove_task_read_context(
+    read_contexts: &Mutex<
+        BTreeMap<
+            novarocks_execution::connector::TaskAttemptKey,
+            Arc<crate::fragment::ingress::TypedReadAttemptContext>,
+        >,
+    >,
+    execution_id: QueryExecutionId,
+    fragment_instance_id: novarocks_types::UniqueId,
+) {
+    if let Ok(mut contexts) = read_contexts.lock() {
+        contexts.remove(&novarocks_execution::connector::TaskAttemptKey::new(
+            execution_id,
+            fragment_instance_id,
+        ));
+    }
+}
+
+/// Keeps an attempt/node read context invisible until the fragment has fully
+/// decoded and passed the established admission/registration flow. The map is
+/// role-local state; this guard owns neither the connector binding nor the
+/// lifecycle permit, and only makes their already-admitted result visible to
+/// TaskUpdate.
+struct ProvisionalTypedReadContext {
+    contexts: Arc<
+        Mutex<
+            BTreeMap<
+                novarocks_execution::connector::TaskAttemptKey,
+                Arc<crate::fragment::ingress::TypedReadAttemptContext>,
+            >,
+        >,
+    >,
+    key: novarocks_execution::connector::TaskAttemptKey,
+    context: Arc<crate::fragment::ingress::TypedReadAttemptContext>,
+    published: bool,
+}
+
+impl ProvisionalTypedReadContext {
+    fn new(
+        contexts: Arc<
+            Mutex<
+                BTreeMap<
+                    novarocks_execution::connector::TaskAttemptKey,
+                    Arc<crate::fragment::ingress::TypedReadAttemptContext>,
+                >,
+            >,
+        >,
+        key: novarocks_execution::connector::TaskAttemptKey,
+    ) -> Self {
+        let context = contexts
+            .lock()
+            .expect("typed read context map lock")
+            .entry(key)
+            .or_insert_with(|| Arc::new(crate::fragment::ingress::TypedReadAttemptContext::new()))
+            .clone();
+        Self {
+            contexts,
+            key,
+            context,
+            published: false,
+        }
+    }
+
+    fn publish(&mut self) {
+        self.context.publish();
+        self.published = true;
+    }
+}
+
+impl Drop for ProvisionalTypedReadContext {
+    fn drop(&mut self) {
+        if self.published {
+            return;
+        }
+        if let Ok(mut contexts) = self.contexts.lock() {
+            if contexts
+                .get(&self.key)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.context))
+            {
+                contexts.remove(&self.key);
+            }
+        }
+    }
+}
+
 fn consume_terminal_fact(
     running: RunningFragmentHandle,
     token: super::control::FragmentControlToken,
     queries: NativeFragmentQueryRuntime,
-    split_queues: Arc<novarocks_execution::connector::SplitQueueRegistry>,
+    split_queues: Arc<
+        novarocks_execution::connector::SplitQueueRegistry<
+            crate::fragment::ingress::ReceivedReadSplit,
+        >,
+    >,
+    read_contexts: Arc<
+        Mutex<
+            BTreeMap<
+                novarocks_execution::connector::TaskAttemptKey,
+                Arc<crate::fragment::ingress::TypedReadAttemptContext>,
+            >,
+        >,
+    >,
     lifecycle: Arc<QueryLifecycleRegistry>,
     execution_id: QueryExecutionId,
     backend_num: i32,
@@ -941,6 +1150,7 @@ fn consume_terminal_fact(
     // QLC terminal facts are transferred before local runtime cleanup.
     lifecycle.record_fragment_terminal_fact(execution_id, fact, backend_num, sink);
     close_task_split_queues(&split_queues, execution_id, fragment_instance_id);
+    remove_task_read_context(&read_contexts, execution_id, fragment_instance_id);
     queries.unregister_fragment_execution(execution_id, fragment_instance_id);
     queries.finish_fragment(execution_id);
     // Publish the terminal report before this fact can fail-close the local
@@ -1001,8 +1211,8 @@ mod tests {
     use novarocks_execution::runtime::fragment::{
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
     };
-    use novarocks_proto::lifecycle::{AttemptId as ProtocolAttemptId, QueryExecutionId};
-    use novarocks_proto::lifecycle::{
+    use novarocks_proto_codec::lifecycle::{AttemptId as ProtocolAttemptId, QueryExecutionId};
+    use novarocks_proto_codec::lifecycle::{
         ParticipantBackendIdentity, ParticipantManifest, QueryControlAttach, QueryControlEndpoint,
         QueryInitOutcome, QueryInitRequest, QueryOptions, StageFragment,
     };
@@ -1479,9 +1689,9 @@ mod tests {
             )],
             no_more_splits: true,
         };
-        let assignment = novarocks_proto::connector_read::SplitAssignment::parse(
+        let assignment = novarocks_proto_codec::connector_read::SplitAssignment::parse(
             raw,
-            novarocks_proto::FieldPath::root("split_assignment"),
+            novarocks_proto_codec::FieldPath::root("split_assignment"),
         )
         .expect("valid assignment");
 
@@ -1677,6 +1887,7 @@ mod tests {
             failed_token,
             service.queries.clone(),
             Arc::clone(&service.split_queues),
+            Arc::clone(&service.read_contexts),
             Arc::clone(&service.lifecycle),
             execution_id,
             0,

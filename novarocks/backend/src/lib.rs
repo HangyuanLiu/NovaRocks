@@ -19,5 +19,6 @@ pub use connector::{
     ConnectorExecutionHost, ConnectorExecutionLease, ConnectorExecutionQueryResolver,
 };
 pub use fragment::NativeFragmentService;
+pub use novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory;
 pub use query_lifecycle::QueryLifecycleRegistryConfig;
 pub use rpc::runtime::{BackendDataRuntime, BackendNativeTransport};

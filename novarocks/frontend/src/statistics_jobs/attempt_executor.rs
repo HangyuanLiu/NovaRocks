@@ -54,7 +54,7 @@ pub(crate) struct StatisticsAttemptExecutionPorts {
     /// an ordinary typed read, so it resolves its relation through the same
     /// installed generation every statement does.
     typed_connector_control:
-        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
+        Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>,
     backend_topology: BackendTopologyService,
     query_execution: QueryExecutionService,
     attempt_timeout: Duration,
@@ -65,7 +65,7 @@ impl StatisticsAttemptExecutionPorts {
         execution_role: novarocks_types::ClusterRole,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<
-            crate::connector::typed_control_registry::TypedConnectorControlRegistry,
+            crate::connector::typed_control_registry::ConnectorReadControlRegistry,
         >,
         backend_topology: BackendTopologyService,
         query_execution: QueryExecutionService,

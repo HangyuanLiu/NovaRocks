@@ -483,7 +483,7 @@ fn encode_scan_source(
         ctx.scan_facts
             .and_then(|facts| facts.connector_read_for_node(node_id))
     }) {
-        let source = typed.table_scan_source();
+        let source = typed.table_scan_source()?;
         // The ordered assignments are the output-order authority: assignment
         // `i` produces page channel `i`, which the decoder binds to output
         // slot `i`. The encoder therefore copies them in place and only

@@ -26,7 +26,7 @@ use crate::query_execution::dml::insert::{
     IcebergInsertSource, InsertEngine, InsertOverwriteMode, InsertTargetName, InsertValue,
     PrepareIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
 };
-use novarocks_proto::lifecycle::QueryOptions;
+use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{LakePublicationFamily, LakePublicationId};
 
 use crate::dml::error::{AdmitError, DmlError};

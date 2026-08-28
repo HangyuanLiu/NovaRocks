@@ -32,16 +32,17 @@ use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::scan::{BoundScanRanges, ScanSource};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::connector_read::{ConnectorRelation, ConnectorRelationKind, ScanWorkSource};
-use novarocks_proto::{FieldPath, ProtocolError, ProtocolErrorKind};
+use novarocks_proto_codec::connector_read::{ConnectorRelation, ConnectorRelationKind};
+use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{connector_read as dto, plan};
+use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 use novarocks_spi::connector::{
     ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
 };
 use novarocks_types::SlotId;
 
 use crate::connector::runtime::ConnectorBatchTransform;
-use crate::connector::typed_registry::TypedConnectorProviderRegistry;
+use crate::connector::typed_registry::InstalledReadExecutionRegistry;
 use crate::connector::typed_runtime::{
     TypedConnectorScanSource, TypedConnectorSystemTableScanSource,
 };
@@ -70,7 +71,7 @@ pub(super) fn lower_typed_connector_scan(
 ) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
     // One parse, and the only one: presence, bounds, known enums, uniqueness,
     // and the carrier's cross-field rules are the protocol layer's contract.
-    let scan_source = novarocks_proto::connector_read::ConnectorTableScanSource::parse(
+    let scan_source = novarocks_proto_codec::connector_read::ConnectorTableScanSource::parse(
         source.clone(),
         FieldPath::root("typed_connector_read"),
     )
@@ -110,29 +111,55 @@ pub(super) fn lower_typed_connector_scan(
 
     let binding_key = binding_key(table)?;
     let inputs = typed_scan_runtime_inputs(ctx)?;
-    let providers = inputs.providers.resolve(&binding_key).map_err(|error| {
+    let execution = inputs
+        .read_executions
+        .resolve(&binding_key)
+        .ok_or_else(|| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "table",
+                "no exact installed connector read execution exists for this binding",
+            )
+            .append_field("catalog_name")
+        })?;
+    let decoded_scan = novarocks_proto_codec::connector_read::DecodedConnectorReadScan::decode(
+        execution.codec().as_ref(),
+        &scan_source,
+    )
+    .map_err(|error| {
         NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InvalidValue,
-            "table",
+            "typed_connector_read",
             error.to_string(),
         )
-        .append_field("catalog_name")
     })?;
+    ctx.typed_scan_runtime()
+        .expect("typed runtime was resolved above")
+        .register_read_execution(node.node_id, execution.clone())
+        .map_err(|error| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::Conflict,
+                "typed_connector_read",
+                error,
+            )
+        })?;
 
     let predicate = lower_scan_predicate(scan, arena, &layout, ctx)?;
     // `slot_ids[i]` names page channel `i`, and a page channel exists for each
     // assignment, so both lanes are handed the connector's read column list
     // rather than the node's output schema. Whatever separates the two is the
     // materialization's job, not this list's.
-    let source: Arc<dyn ScanSource> = match scan_source.work_source() {
-        ScanWorkSource::RuntimeSplits => {
+    let source: Arc<dyn ScanSource> = match decoded_scan.work_source() {
+        ConnectorReadWorkSource::RuntimeSplits => {
             // The provider is built per fragment instance so its footer cache
             // and delete manager cannot outlive the request that opened them.
-            let page_source_provider = providers
-                .page_source(&inputs.request)
+            let page_source_provider = execution
+                .factory()
+                .create_page_source_provider(&inputs.request)
                 .map_err(provider_refusal)?;
             let source = TypedConnectorScanSource::new(
                 scan_source,
+                decoded_scan,
                 page_source_provider,
                 inputs.session,
                 inputs.request,
@@ -148,15 +175,16 @@ pub(super) fn lower_typed_connector_scan(
                 None => Arc::new(source),
             }
         }
-        ScanWorkSource::WholeRelation => {
+        ConnectorReadWorkSource::WholeRelation => {
             // One backend reads the whole relation itself, so this lane needs
             // no split queue and no runtime filter: there is nothing to divide
             // and nothing to prune between splits.
-            let system_table_provider = providers
-                .system_table(&inputs.request)
+            let system_table_provider = execution
+                .factory()
+                .create_system_table_provider(&inputs.request)
                 .map_err(provider_refusal)?;
             let source = TypedConnectorSystemTableScanSource::new(
-                scan_source,
+                decoded_scan,
                 system_table_provider,
                 inputs.session,
                 inputs.request,
@@ -196,8 +224,12 @@ pub(super) fn lower_typed_connector_scan(
 
 /// The fragment-local runtime inputs a typed scan needs beyond its carrier.
 struct TypedScanRuntimeInputs {
-    providers: Arc<TypedConnectorProviderRegistry>,
-    queues: Arc<novarocks_execution::connector::TaskAttemptSplitQueues>,
+    read_executions: Arc<InstalledReadExecutionRegistry>,
+    queues: Arc<
+        novarocks_execution::connector::TaskAttemptSplitQueues<
+            crate::fragment::ingress::ReceivedReadSplit,
+        >,
+    >,
     session: novarocks_spi::connector::read_stack::ConnectorSession,
     request: novarocks_spi::connector::ConnectorRequestContext,
     /// Absent when this attempt installed no runtime filter.
@@ -239,7 +271,7 @@ fn typed_scan_runtime_inputs(
         )
     })?;
     Ok(TypedScanRuntimeInputs {
-        providers: runtime.providers(),
+        read_executions: runtime.read_executions(),
         queues: runtime.queues(),
         session: runtime.session(),
         request,
@@ -282,7 +314,7 @@ fn connector_read_slot_ids(
 /// expression identifier minted by the producer, deliberately not the column's
 /// name, so comparing the two would reject every real scan.
 fn check_assignments_match_read_columns(
-    scan_source: &novarocks_proto::connector_read::ConnectorTableScanSource,
+    scan_source: &novarocks_proto_codec::connector_read::ConnectorTableScanSource,
     read_slot_ids: &[SlotId],
 ) -> Result<(), NativeFragmentLeafDecodeError> {
     let assignments = scan_source.assignments();
@@ -353,7 +385,7 @@ fn provider_refusal(
 
 /// The exact connector binding generation this relation belongs to.
 fn binding_key(
-    table: &novarocks_proto::connector_read::CatalogTableHandle,
+    table: &novarocks_proto_codec::connector_read::CatalogTableHandle,
 ) -> Result<ConnectorExecutionBindingKey, NativeFragmentLeafDecodeError> {
     // The carrier already proved the catalog name is a normalized instance id
     // and the incarnation is exactly 16 bytes; both conversions below therefore
@@ -590,7 +622,7 @@ mod tests {
         }
     }
 
-    fn decode_node_error(node: &plan::DistributedNode) -> novarocks_proto::ProtocolError {
+    fn decode_node_error(node: &plan::DistributedNode) -> novarocks_proto_codec::ProtocolError {
         let error = decode_node(
             node,
             &mut ExprArena::default(),
@@ -603,7 +635,7 @@ mod tests {
     fn decode_error(
         source: dto::ConnectorTableScanSource,
         columns: Vec<common::OutputColumn>,
-    ) -> novarocks_proto::ProtocolError {
+    ) -> novarocks_proto_codec::ProtocolError {
         let node = typed_scan_node(source, columns);
         let error = decode_node(
             &node,
@@ -620,7 +652,7 @@ mod tests {
         source.assignments.push(dto::ScanAssignment {
             variable: "v1".to_owned(),
             column: Some(test_support::column_handle(2)),
-            value_type: Some(novarocks_proto::connector_read::encode_value_type(
+            value_type: Some(novarocks_proto_codec::connector_read::encode_value_type(
                 novarocks_spi::connector::read_stack::ConnectorValueType::BigInt,
             )),
         });

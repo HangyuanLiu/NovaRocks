@@ -26,7 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use novarocks_proto::connector_read::{MAX_JSON_BYTES, MAX_PATH_BYTES};
+use novarocks_proto_codec::connector_read::{MAX_JSON_BYTES, MAX_PATH_BYTES};
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
     ConnectorExpression, ConnectorTableHandle, ConnectorTransactionHandle, Constraint,

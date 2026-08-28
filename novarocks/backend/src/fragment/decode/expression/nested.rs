@@ -21,7 +21,7 @@ use arrow::datatypes::DataType;
 
 use super::{decode_expr_at, decode_expr_type_at};
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
-use novarocks_proto::FieldPath;
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::expr;
 
 use super::NativeExpressionInputLayout;

@@ -27,7 +27,7 @@ use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::set_op::{SetOpKind, SetOpNode};
 use novarocks_execution::exec::node::union_all::UnionAllNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::FieldPath;
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{common as proto_common, plan};
 use novarocks_types::SlotId;
 

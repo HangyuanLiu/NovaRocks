@@ -74,7 +74,7 @@ pub struct FrontendServerConfig {
     /// generation. The composition root installs into the same instance the
     /// planner resolves from, so there is one answer to "which generation".
     pub typed_connector_control:
-        Arc<crate::connector::typed_control_registry::TypedConnectorControlRegistry>,
+        Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>,
     /// Application-owned storage observation composed by the server role.
     /// Frontend and Core never decode provider table handles directly.
     pub mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -802,7 +802,7 @@ mod tests {
             ),
             connector_control_factories: Vec::new(),
             typed_connector_control: Arc::new(
-                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
+                crate::connector::typed_control_registry::ConnectorReadControlRegistry::new(),
             ),
             mv_storage_observation: Arc::new(UnavailableMvStorageObservationPort),
             state_store_input: None,
@@ -872,9 +872,7 @@ mod tests {
             ),
             frontend_backend_open_config(),
             vec![Arc::new(EchoingControlFactory)],
-            Arc::new(
-                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
-            ),
+            Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new()),
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),
@@ -969,9 +967,7 @@ mod tests {
             FrontendExecutionConfig::new("127.0.0.1", 0, std::num::NonZeroUsize::new(1).unwrap()),
             frontend_backend_open_config(),
             Vec::new(),
-            Arc::new(
-                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
-            ),
+            Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new()),
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),
@@ -1021,9 +1017,7 @@ mod tests {
             ),
             frontend_backend_open_config(),
             Vec::new(),
-            Arc::new(
-                crate::connector::typed_control_registry::TypedConnectorControlRegistry::new(),
-            ),
+            Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new()),
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),

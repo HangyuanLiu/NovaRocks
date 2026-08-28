@@ -28,7 +28,7 @@ use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch};
 use crate::query_execution::lifecycle_plan::{
     QueryInitBarrier, QueryInitPlan, QueryLifecycleLease,
 };
-use novarocks_proto::lifecycle::{
+use novarocks_proto_codec::lifecycle::{
     AttemptId as CoreAttemptId, AttemptId as ProtocolAttemptId, QueryControlAttach,
     QueryExecutionId, QueryInitOutcome, QueryStageAck, QueryStartAck, QueryStartRequest,
 };
@@ -573,16 +573,16 @@ fn validate_start_ack(
 
 fn protocol_execution_id(
     execution_id: QueryExecutionId,
-) -> Result<novarocks_proto::lifecycle::QueryExecutionId, String> {
+) -> Result<novarocks_proto_codec::lifecycle::QueryExecutionId, String> {
     let attempt = ProtocolAttemptId::new(execution_id.attempt_id().get())
         .map_err(|error| error.to_string())?;
-    novarocks_proto::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
+    novarocks_proto_codec::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
         .map_err(|error| error.to_string())
 }
 
 fn participant_execution_id(
     participant: &MaterializedParticipant,
-) -> novarocks_proto::lifecycle::QueryExecutionId {
+) -> novarocks_proto_codec::lifecycle::QueryExecutionId {
     participant
         .request
         .manifest()
@@ -1026,7 +1026,7 @@ fn attach_one(
     config: FrontendQueryLifecycleConfig,
 ) -> Result<ActiveSession, (Option<ActiveSession>, String)> {
     let attach = QueryControlAttach::parse(protocol_wire::QueryControlAttach {
-        execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             participant_execution_id(participant),
         )),
         init_digest: participant.digest.as_bytes().to_vec(),

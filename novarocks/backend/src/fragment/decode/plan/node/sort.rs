@@ -26,7 +26,7 @@ use crate::fragment::decode::plan::layout::Layout;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_proto::{FieldPath, ProtocolErrorKind};
+use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{expr, plan};
 
 #[expect(

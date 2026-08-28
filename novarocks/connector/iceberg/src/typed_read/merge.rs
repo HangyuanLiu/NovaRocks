@@ -33,7 +33,7 @@
 
 use std::sync::Arc;
 
-use novarocks_proto::connector_read::{MAX_JSON_BYTES, MAX_PATH_BYTES, MAX_SCAN_ASSIGNMENTS};
+use novarocks_proto_codec::connector_read::{MAX_JSON_BYTES, MAX_PATH_BYTES, MAX_SCAN_ASSIGNMENTS};
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
     ConnectorMergeTableHandle as ConnectorMergeTableHandleMarker, ConnectorTableHandle,

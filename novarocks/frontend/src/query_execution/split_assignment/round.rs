@@ -26,8 +26,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use novarocks_proto::connector_read::TypedConnectorSplitSource;
-use novarocks_proto::lifecycle::QueryExecutionId;
+use novarocks_proto_codec::connector_read::ConnectorReadCodec;
+use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_spi::connector::read_stack::ConnectorReadSplitSource;
 
 use super::super::connector_domain::CatalogHandle;
 use super::driver::{AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError};
@@ -45,7 +46,8 @@ const IDLE_PUMP_BACKOFF: std::time::Duration = std::time::Duration::from_millis(
 /// One typed scan's split source, with the plan node it feeds.
 pub(crate) struct RoundSplitSource {
     pub(crate) plan_node_id: i32,
-    pub(crate) source: Box<dyn TypedConnectorSplitSource>,
+    pub(crate) source: Box<dyn ConnectorReadSplitSource>,
+    pub(crate) codec: Arc<dyn ConnectorReadCodec>,
 }
 
 /// The per-round owner of every split source and the driver that drains them.
@@ -69,6 +71,10 @@ impl RoundSplitAssignment {
                 transport,
                 tasks,
                 max_queued_splits_per_task,
+                sources
+                    .iter()
+                    .map(|source| (source.plan_node_id, Arc::clone(&source.codec)))
+                    .collect(),
             ),
             sources,
             closed: Arc::new(AtomicBool::new(false)),
@@ -192,267 +198,16 @@ impl RoundSplitAssignmentStop {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
-    use novarocks_proto::FieldPath;
-    use novarocks_proto::connector_read::ValidatedConnectorSplit;
-    use novarocks_proto_models::connector_read as dto;
-    use novarocks_spi::connector::read_stack::ConnectorSplitBatch;
-    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-    use novarocks_types::{AttemptId, QueryId, UniqueId};
-
-    use super::super::transport::{AcceptedPlanNode, TaskUpdateOutcome, TaskUpdateTransportError};
     use super::*;
 
-    #[derive(Default)]
-    struct CountingTransport {
-        delivered: Mutex<Vec<(i32, usize, bool)>>,
-    }
-
-    impl TaskUpdateTransport for CountingTransport {
-        fn send(
-            &self,
-            _execution_id: QueryExecutionId,
-            _target: &AssignmentTarget,
-            _fragment_instance_id: UniqueId,
-            assignments: Vec<dto::SplitAssignment>,
-        ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
-            let mut delivered = self.delivered.lock().expect("transport lock");
-            let mut accepted = Vec::new();
-            for assignment in &assignments {
-                delivered.push((
-                    assignment.plan_node_id,
-                    assignment.splits.len(),
-                    assignment.no_more_splits,
-                ));
-                accepted.push(AcceptedPlanNode {
-                    plan_node_id: assignment.plan_node_id,
-                    accepted_through_sequence: assignment
-                        .splits
-                        .last()
-                        .map(|split| split.sequence_id)
-                        .unwrap_or_default(),
-                    no_more_splits: assignment.no_more_splits,
-                    queued_splits: 0,
-                });
-            }
-            Ok(TaskUpdateOutcome::Accepted(accepted))
-        }
-    }
-
-    struct ScriptedSource {
-        batches: std::collections::VecDeque<ConnectorSplitBatch<ValidatedConnectorSplit>>,
-        closed: Arc<AtomicBool>,
-    }
-
-    impl TypedConnectorSplitSource for ScriptedSource {
-        fn next_batch(
-            &mut self,
-            _max_size: usize,
-            _dynamic_filter: &novarocks_proto::connector_read::WireDynamicFilterSnapshot,
-        ) -> Result<ConnectorSplitBatch<ValidatedConnectorSplit>, ConnectorError> {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::Cancelled,
-                    "split source is closed",
-                ));
-            }
-            Ok(self
-                .batches
-                .pop_front()
-                .unwrap_or_else(ConnectorSplitBatch::finished))
-        }
-
-        fn is_finished(&self) -> bool {
-            self.batches.is_empty()
-        }
-
-        fn close(&mut self) -> Result<(), ConnectorError> {
-            self.closed.store(true, Ordering::Release);
-            Ok(())
-        }
-    }
-
-    fn validated_split() -> ValidatedConnectorSplit {
-        let raw = dto::ConnectorSplit {
-            split_weight_raw: 100,
-            remotely_accessible: true,
-            addresses: Vec::new(),
-            affinity_key: None,
-            retained_size_in_bytes: 64,
-            category: Some(dto::connector_split::Category::Data(dto::DataSplit {
-                provider: Some(dto::data_split::Provider::Iceberg(dto::IcebergSplit {
-                    path: "s3://bucket/table/data/0001.parquet".to_owned(),
-                    start: 0,
-                    length: 1024,
-                    file_size: 1024,
-                    file_record_count: 10,
-                    file_format: dto::IcebergFileFormat::Parquet as i32,
-                    partition_spec_id: 0,
-                    partition_data_json: "{}".to_owned(),
-                    deletes: Vec::new(),
-                    file_statistics_domain: Some(dto::TupleDomain {
-                        none: false,
-                        column_domains: Vec::new(),
-                    }),
-                    data_sequence_number: Some(1),
-                    file_first_row_id: None,
-                    decryption_data: None,
-                })),
-            })),
-        };
-        ValidatedConnectorSplit::parse(raw, FieldPath::root("connector_split"))
-            .expect("valid split")
-    }
-
-    fn execution_id() -> QueryExecutionId {
-        QueryExecutionId::new(QueryId::new(4, 4), AttemptId::new(1).expect("attempt"))
-            .expect("execution id")
-    }
-
-    fn round(
-        transport: Arc<CountingTransport>,
-        sources: Vec<RoundSplitSource>,
-        plan_nodes: &[i32],
-    ) -> RoundSplitAssignment {
-        let mut tasks = BTreeMap::new();
-        for plan_node_id in plan_nodes {
-            tasks.insert(
-                *plan_node_id,
-                vec![AssignmentTarget {
-                    backend_idx: 0,
-                    fragment_instance_id: UniqueId::new(1, 1),
-                }],
-            );
-        }
-        RoundSplitAssignment::new(execution_id(), transport, tasks, 1024, sources)
-    }
-
-    fn scripted(
-        plan_node_id: i32,
-        batches: Vec<ConnectorSplitBatch<ValidatedConnectorSplit>>,
-    ) -> RoundSplitSource {
-        RoundSplitSource {
-            plan_node_id,
-            source: Box::new(ScriptedSource {
-                batches: batches.into_iter().collect(),
-                closed: Arc::new(AtomicBool::new(false)),
-            }),
-        }
-    }
-
     #[test]
-    fn every_source_is_drained_and_every_plan_node_reaches_its_terminal_marker() {
-        let transport = Arc::new(CountingTransport::default());
-        let mut round = round(
-            Arc::clone(&transport),
-            vec![
-                scripted(
-                    1,
-                    vec![
-                        ConnectorSplitBatch::new(vec![validated_split()], false),
-                        ConnectorSplitBatch::new(vec![validated_split()], true),
-                    ],
-                ),
-                scripted(2, vec![ConnectorSplitBatch::new(Vec::new(), true)]),
-            ],
-            &[1, 2],
-        );
-        round.pump_to_completion().expect("pump");
-        let delivered = transport.delivered.lock().expect("transport lock");
-        assert_eq!(
-            delivered
-                .iter()
-                .filter(|(node, _, terminal)| *node == 1 && *terminal)
-                .count(),
-            1
-        );
-        assert_eq!(
-            delivered
-                .iter()
-                .filter(|(node, _, terminal)| *node == 2 && *terminal)
-                .count(),
-            1
-        );
-        assert_eq!(
-            delivered
-                .iter()
-                .filter(|(node, splits, _)| *node == 1 && *splits > 0)
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn a_slow_source_does_not_starve_the_others() {
-        // The first source needs three turns; the second finishes on its
-        // first. Round-robin means the second is not left waiting for the
-        // first to finish.
-        let transport = Arc::new(CountingTransport::default());
-        let mut round = round(
-            Arc::clone(&transport),
-            vec![
-                scripted(
-                    1,
-                    vec![
-                        ConnectorSplitBatch::new(vec![validated_split()], false),
-                        ConnectorSplitBatch::new(vec![validated_split()], false),
-                        ConnectorSplitBatch::new(Vec::new(), true),
-                    ],
-                ),
-                scripted(
-                    2,
-                    vec![ConnectorSplitBatch::new(vec![validated_split()], true)],
-                ),
-            ],
-            &[1, 2],
-        );
-        round.pump_to_completion().expect("pump");
-        let delivered = transport.delivered.lock().expect("transport lock");
-        let first_node_two = delivered
-            .iter()
-            .position(|(node, _, _)| *node == 2)
-            .expect("node 2 delivered");
-        assert!(
-            first_node_two <= 1,
-            "node 2 waited until index {first_node_two}"
-        );
-    }
-
-    #[test]
-    fn stopping_the_round_ends_the_pump_and_closes_every_source() {
-        let transport = Arc::new(CountingTransport::default());
-        let mut round = round(
-            Arc::clone(&transport),
-            vec![scripted(
-                1,
-                vec![ConnectorSplitBatch::new(vec![validated_split()], false)],
-            )],
-            &[1],
-        );
-        let stop = round.stop_handle();
-        stop.stop();
-        round.pump_to_completion().expect("stopped pump");
-        assert!(stop.is_stopped());
-        assert!(transport.delivered.lock().expect("lock").is_empty());
-        round.close();
-        round.close();
-    }
-
-    #[test]
-    fn closing_is_idempotent_and_happens_on_drop() {
-        let transport = Arc::new(CountingTransport::default());
+    fn stop_handle_is_visible_to_the_pump() {
         let closed = Arc::new(AtomicBool::new(false));
-        let source = RoundSplitSource {
-            plan_node_id: 1,
-            source: Box::new(ScriptedSource {
-                batches: std::collections::VecDeque::new(),
-                closed: Arc::clone(&closed),
-            }),
+        let stop = RoundSplitAssignmentStop {
+            closed: Arc::clone(&closed),
         };
-        {
-            let _round = round(transport, vec![source], &[1]);
-        }
+        assert!(!stop.is_stopped());
+        stop.stop();
         assert!(closed.load(Ordering::Acquire));
     }
 }

@@ -50,7 +50,7 @@ use crate::query_execution::write::WriteTerminalBuilder;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_proto::lifecycle::QueryOptions as ProtocolQueryOptions;
+use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
 use novarocks_spi::connector::ConnectorWriteLease;
 use novarocks_types::{
     AttemptId, LocalQuerySequence, QueryExecutionId, QueryId, QueryIdAttribution,
@@ -89,7 +89,7 @@ use crate::runtime_filter::compiler::{
 };
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 #[cfg(test)]
-use novarocks_proto::lifecycle::{
+use novarocks_proto_codec::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
     QueryInitOutcome, QueryInitRequest, QueryStageAck, QueryStageOutcome, QueryStageRequest,
     QueryStartAck, QueryStartOutcome, QueryStartRequest, QueryTerminationAck,
@@ -504,7 +504,7 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         let execution_id = manifest.execution_id().map_err(protocol_contract_error)?;
         let digest = manifest.digest().map_err(protocol_contract_error)?;
         QueryInitAck::parse(protocol::InitQueryResponse {
-            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                 execution_id,
             )),
             init_digest: digest.as_bytes().to_vec(),
@@ -575,7 +575,7 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         _timeout: Duration,
     ) -> Result<QueryTerminationAck, QueryLifecycleTransportError> {
         QueryTerminationAck::parse(protocol::AbortQueryResponse {
-            execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                 request.execution_id().map_err(protocol_contract_error)?,
             )),
             accepted_reason: QueryTerminationReason::QueryTerminationCoordinatorAbort as i32,
@@ -585,7 +585,9 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
 }
 
 #[cfg(test)]
-fn protocol_contract_error(error: novarocks_proto::ProtocolError) -> QueryLifecycleTransportError {
+fn protocol_contract_error(
+    error: novarocks_proto_codec::ProtocolError,
+) -> QueryLifecycleTransportError {
     QueryLifecycleTransportError::new(
         QueryLifecycleTransportErrorKind::InvalidResponse,
         error.to_string(),
@@ -1809,8 +1811,8 @@ mod tests {
     };
     use crate::query_execution::preparation::{ScanPreparationOptions, prepare_fragments};
     use crate::topology::ClusterBackendService;
-    use novarocks_proto::lifecycle::{QueryControlEndpoint, QueryExecutionId};
-    use novarocks_proto::membership::{BackendProcessDescriptor, BackendReportedState};
+    use novarocks_proto_codec::lifecycle::{QueryControlEndpoint, QueryExecutionId};
+    use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
     use novarocks_proto_models::novarocks as protocol;
     use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
     use novarocks_types::{
@@ -2006,7 +2008,7 @@ mod tests {
                 .and_then(|manifest| manifest.digest())
                 .map_err(super::protocol_contract_error)?;
             QueryInitAck::parse(protocol::InitQueryResponse {
-                execution_id: Some(novarocks_proto::lifecycle::encode_query_execution_id(
+                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                     execution_id,
                 )),
                 init_digest: digest.as_bytes().to_vec(),
@@ -2491,8 +2493,8 @@ fn prepare_round_split_assignment(
             .split_manager
             .get_splits(
                 &session,
-                table_scan.table().handle(),
-                table_scan.source().assignments(),
+                table_scan.table().relation().table(),
+                table_scan.assignments(),
                 &table_scan.dynamic_filter_columns(),
                 &scan.prepared.constraint,
             )
@@ -2504,6 +2506,7 @@ fn prepare_round_split_assignment(
         sources.push(RoundSplitSource {
             plan_node_id,
             source,
+            codec: Arc::clone(&scan.prepared.codec),
         });
     }
     let targets = assignment_targets(schedule, &scan_nodes);
