@@ -18,7 +18,7 @@
 //! Frontend refresh-lifecycle handoff assembled from Core SQL facts.
 
 use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorWriteOperationId, LakePublicationId,
+    ConnectorProviderBindingKey, ConnectorWriteOperationId, LakePublicationId,
 };
 
 use super::refresh_artifact::{
@@ -140,7 +140,7 @@ impl PreparedMvRefreshWrite {
 pub struct PreparedMvRefresh {
     pub statement: MvRefreshStatement,
     pub attempt: MvRefreshAttemptIdentity,
-    pub observed_binding: ConnectorExecutionBindingKey,
+    pub observed_binding: ConnectorProviderBindingKey,
     pub finalize: MvRefreshFinalizeFacts,
     pub work: PreparedMvRefreshWork,
 }

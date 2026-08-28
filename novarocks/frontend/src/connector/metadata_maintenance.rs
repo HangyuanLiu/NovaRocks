@@ -479,12 +479,12 @@ mod tests {
     use arrow::datatypes::Schema;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorControlRuntimeId, ConnectorExecutionBindingKey,
-        ConnectorInstanceDescriptor, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-        ConnectorMaxCompactableDataFiles, ConnectorMetadata, ConnectorMetadataMaintenance,
-        ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
-        ConnectorMetadataMaintenanceReceiptSummary, ConnectorNamespaceRequest, ConnectorProviderId,
-        ConnectorTableMetadata, ConnectorTablePlanningFacts,
+        ConnectorCancellation, ConnectorControlRuntimeId, ConnectorInstanceDescriptor,
+        ConnectorListTablesRequest, ConnectorMaxCompactableDataFiles, ConnectorMetadata,
+        ConnectorMetadataMaintenance, ConnectorMetadataMaintenancePlanSummary,
+        ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceiptSummary,
+        ConnectorNamespaceRequest, ConnectorProviderBindingKey, ConnectorProviderId,
+        ConnectorTableMetadata, ConnectorTablePlanningFacts, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -505,7 +505,7 @@ mod tests {
 
     struct FakeProvider {
         descriptor: ConnectorInstanceDescriptor,
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         mode: Mode,
         metadata_calls: AtomicUsize,
         plan_calls: AtomicUsize,
@@ -521,9 +521,9 @@ mod tests {
                     provider_id: ConnectorProviderId::parse("fake-maintenance").unwrap(),
                     instance_id: instance_id.clone(),
                 },
-                key: ConnectorExecutionBindingKey {
+                key: ConnectorProviderBindingKey {
                     instance_id,
-                    incarnation: ConnectorInstanceIncarnation::from_bytes([5; 16]),
+                    incarnation: ProviderBindingEpoch::from_bytes([5; 16]),
                 },
                 mode,
                 metadata_calls: AtomicUsize::new(0),
@@ -604,7 +604,7 @@ mod tests {
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
         }
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
         fn plan_maintenance(
@@ -826,7 +826,7 @@ mod tests {
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.inner.descriptor
         }
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.inner.key
         }
         fn plan_maintenance(

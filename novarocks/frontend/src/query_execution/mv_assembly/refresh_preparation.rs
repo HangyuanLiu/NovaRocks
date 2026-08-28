@@ -77,8 +77,8 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use novarocks_spi::connector::{
-    ConnectorCommittedPartitioning, ConnectorExecutionBindingKey, ConnectorInstanceId,
-    ConnectorManagedDescriptorProperties, ConnectorManagedPartitionSpecPreviewRequest,
+    ConnectorCommittedPartitioning, ConnectorInstanceId, ConnectorManagedDescriptorProperties,
+    ConnectorManagedPartitionSpecPreviewRequest, ConnectorProviderBindingKey,
     ConnectorTableIdentity, ConnectorTableObjectId,
 };
 use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
@@ -401,8 +401,8 @@ pub(crate) fn validate_retained_target_identity(
 
 fn execution_binding_key_for_target(
     lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-) -> ConnectorExecutionBindingKey {
-    ConnectorExecutionBindingKey {
+) -> ConnectorProviderBindingKey {
+    ConnectorProviderBindingKey {
         instance_id: lease.binding().descriptor().instance_id.clone(),
         incarnation: lease.binding().incarnation(),
     }
@@ -621,7 +621,7 @@ fn prepare_frontend_first_refresh_write(
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
     base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
-    observed_binding: ConnectorExecutionBindingKey,
+    observed_binding: ConnectorProviderBindingKey,
     repartition_transition: Option<&PreparedManagedRepartitionTransition>,
     retained_repartition_target: Option<&RetainedRepartitionTarget>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
@@ -1254,7 +1254,7 @@ fn prepare_frontend_incremental_write(
     current_database: &str,
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
-    observed_binding: ConnectorExecutionBindingKey,
+    observed_binding: ConnectorProviderBindingKey,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreparedIncrementalRefreshWork, String> {
     let target = IcebergMvTarget {

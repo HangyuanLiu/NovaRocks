@@ -463,10 +463,10 @@ mod tests {
     use arrow::array::{Int8Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorMutationEffectField, ConnectorMutationSourceField,
-        ConnectorMutationTargetField, ConnectorRequestContext, ConnectorTableHandle,
-        ConnectorWriteBaseVersion, ConnectorWriteFieldToken,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorMutationEffectField,
+        ConnectorMutationSourceField, ConnectorMutationTargetField, ConnectorProviderBindingKey,
+        ConnectorRequestContext, ConnectorTableHandle, ConnectorWriteBaseVersion,
+        ConnectorWriteFieldToken, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -491,9 +491,9 @@ mod tests {
     }
 
     fn contract() -> ConnectorMutationMatchContract {
-        let owner = ConnectorExecutionBindingKey {
+        let owner = ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("iceberg").unwrap(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([4; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([4; 16]),
         };
         let table = ConnectorTableHandle::try_new(
             owner.instance_id.clone(),

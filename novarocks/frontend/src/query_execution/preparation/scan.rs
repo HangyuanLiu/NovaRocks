@@ -19,8 +19,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_spi::connector::{
     CatalogProperties, ConnectorBatchBudget, ConnectorControlPlanningLease,
-    ConnectorExecutionDeclaration, ConnectorFrozenRewriteGroup, ConnectorInstanceId,
-    ConnectorPinnedFileSet, ConnectorPredicateDisposition, ConnectorScan, ConnectorSplit,
+    ConnectorFrozenRewriteGroup, ConnectorInstanceId, ConnectorPinnedFileSet,
+    ConnectorPredicateDisposition, ConnectorProviderBinding, ConnectorScan, ConnectorSplit,
     ConnectorSplitPlanningMetrics, ConnectorStaticPredicate,
 };
 
@@ -196,7 +196,7 @@ pub(crate) fn fixture_query_scan_materialization(instance_id: &str) -> QueryScan
 /// scheduling hints, and native-carrier assembly.
 #[derive(Clone)]
 pub(crate) struct PlannedConnectorRead {
-    pub(crate) declaration: ConnectorExecutionDeclaration,
+    pub(crate) declaration: ConnectorProviderBinding,
     pub(crate) scan: ConnectorScan,
     /// Stable provider field ordinals aligned 1:1 with `scan.output_schema`.
     /// These are frozen with the exact FE read and are the only authority for
@@ -504,7 +504,7 @@ impl ScanExecutionBindings {
             ));
         }
         let declaration_key =
-            novarocks_spi::connector::ConnectorExecutionBindingKey::from(&read.declaration);
+            novarocks_spi::connector::ConnectorProviderBindingKey::from(&read.declaration);
         if read.scan.handle().owner() != &declaration_key.instance_id {
             return Err(format!(
                 "connector read fragment_id={fragment_id} node_id={node_id} has a scan handle owned by another instance"

@@ -58,7 +58,7 @@ pub fn admit_connector_change_window(
         )
         .map_err(|error| error.to_string())?;
     scan.validate(
-        &novarocks_spi::connector::ConnectorExecutionBindingKey {
+        &novarocks_spi::connector::ConnectorProviderBindingKey {
             instance_id: binding.descriptor().instance_id.clone(),
             incarnation: binding.incarnation(),
         },

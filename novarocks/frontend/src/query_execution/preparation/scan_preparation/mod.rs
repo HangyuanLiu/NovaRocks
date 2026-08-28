@@ -747,7 +747,7 @@ fn prepare_typed_relation_scan(
     // returned legacy declaration is deliberately discarded; typed reads are
     // materialized solely from the Init-carried CatalogSet.
     let _ = binding
-        .execution_declaration(context)
+        .provider_binding(context)
         .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
     let prepared = prepare_typed_scan(
         &typed.session,

@@ -610,8 +610,8 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorDataMutationPlanSummary, ConnectorDataMutationReceipt,
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorProviderId,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
+        ProviderBindingEpoch,
     };
 
     use super::*;
@@ -685,7 +685,7 @@ mod tests {
                 provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
                 instance_id: ConnectorInstanceId::parse("catalog").expect("instance"),
             },
-            ConnectorInstanceIncarnation::from_bytes([1; 16]),
+            ProviderBindingEpoch::from_bytes([1; 16]),
             ConnectorMutationOperationId::from_bytes([2; 16]),
             novarocks_spi::connector::REGISTER_EXISTING_FILES_KIND,
             [3; 32],

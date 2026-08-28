@@ -458,10 +458,10 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorControlRuntimeId, ConnectorDataMutation,
-        ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary, ConnectorExecutionBindingKey,
-        ConnectorInstanceDescriptor, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-        ConnectorMetadata, ConnectorNamespaceRequest, ConnectorProviderId, ConnectorTableMetadata,
-        ConnectorTablePlanningFacts,
+        ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary, ConnectorInstanceDescriptor,
+        ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+        ConnectorProviderBindingKey, ConnectorProviderId, ConnectorTableMetadata,
+        ConnectorTablePlanningFacts, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -487,7 +487,7 @@ mod tests {
 
     struct FakeProvider {
         descriptor: ConnectorInstanceDescriptor,
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         control_runtime_id: ConnectorControlRuntimeId,
         mode: Mode,
         metadata_calls: AtomicUsize,
@@ -506,9 +506,9 @@ mod tests {
             };
             Arc::new(Self {
                 descriptor,
-                key: ConnectorExecutionBindingKey {
+                key: ConnectorProviderBindingKey {
                     instance_id,
-                    incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+                    incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
                 },
                 control_runtime_id: ConnectorControlRuntimeId::from_bytes([8; 16]),
                 mode,
@@ -602,7 +602,7 @@ mod tests {
             &self.descriptor
         }
 
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
 

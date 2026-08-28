@@ -26,7 +26,6 @@ mod distribution;
 mod domain_facts;
 mod error;
 mod execution;
-mod execution_declaration;
 mod handle;
 mod identity;
 mod metadata;
@@ -34,6 +33,7 @@ mod metadata_maintenance;
 mod mutation;
 mod mv_storage_observation;
 mod predicate;
+mod provider_binding;
 mod publication;
 mod read;
 mod read_session;
@@ -106,7 +106,7 @@ pub use distributed_rewrite::{
     MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES, REWRITE_DATA_FILES_KIND,
     REWRITE_POSITION_DELETES_KIND,
 };
-pub use distribution::ConnectorInstanceIncarnation;
+pub use distribution::ProviderBindingEpoch;
 pub use domain_facts::{
     ConnectorAvailableScanUnitDomainFacts, ConnectorScanUnitColumn, ConnectorScanUnitColumnDomain,
     ConnectorScanUnitColumnFacts, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsEvidence,
@@ -120,10 +120,6 @@ pub use execution::{
     ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
     ConnectorPreparedScanUnitSet, ConnectorReadExecution,
     MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT,
-};
-pub use execution_declaration::{
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorExecutionDeclarationProvider, ConnectorExecutionProviderKind,
 };
 pub use handle::{
     ConnectorPinnedFileSet, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,
@@ -199,6 +195,10 @@ pub use predicate::{
     MAX_CONNECTOR_STATIC_LITERAL_PAYLOAD_BYTES, MAX_CONNECTOR_STATIC_PREDICATES,
     MAX_CONNECTOR_STATIC_VARIABLE_LITERAL_BYTES, normalize_predicate_dispositions,
     validate_static_predicates,
+};
+pub use provider_binding::{
+    ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderBindingKind,
+    ConnectorProviderBindingProvider,
 };
 pub use publication::{
     LakePublicationDisposition, LakePublicationFamily, LakePublicationId,

@@ -906,9 +906,9 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteOperationId,
-        ConnectorWriteRouteId, ConnectorWriterHandle, ConnectorWriterIdentity,
+        ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorWriteCohortId,
+        ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriteRouteId,
+        ConnectorWriterHandle, ConnectorWriterIdentity, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -982,9 +982,9 @@ mod tests {
         fragment_id: FragmentId,
         finst_id: UniqueId,
     ) -> ConnectorWriterHandle {
-        let owner = ConnectorExecutionBindingKey {
+        let owner = ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("iceberg").expect("valid instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         };
         let operation_id = ConnectorWriteOperationId::new();
         let writer = ConnectorWriterIdentity::new(

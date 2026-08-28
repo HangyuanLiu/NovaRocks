@@ -4451,18 +4451,18 @@ mod tests {
         base_version_ordinal: Option<i64>,
     ) -> novarocks_spi::connector::ConnectorRowMutationPreparation {
         use novarocks_spi::connector::{
-            ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
-            ConnectorMutationEffectField, ConnectorMutationMatchContract,
-            ConnectorMutationSourceField, ConnectorMutationTargetField, ConnectorRowMutationIntent,
+            ConnectorInstanceId, ConnectorMutationEffectField, ConnectorMutationMatchContract,
+            ConnectorMutationSourceField, ConnectorMutationTargetField,
+            ConnectorProviderBindingKey, ConnectorRowMutationIntent,
             ConnectorRowMutationPreparation, ConnectorRowMutationStrategy, ConnectorTableHandle,
             ConnectorWriteBaseVersion, ConnectorWriteFieldToken, ConnectorWriteOperationId,
-            ConnectorWriteTargetRef,
+            ConnectorWriteTargetRef, ProviderBindingEpoch,
         };
 
         let instance_id = ConnectorInstanceId::parse("iceberg").expect("instance ID");
-        let owner = ConnectorExecutionBindingKey {
+        let owner = ConnectorProviderBindingKey {
             instance_id: instance_id.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         };
         let table = ConnectorTableHandle::try_new(instance_id, bytes::Bytes::from_static(b"table"))
             .expect("table handle");
@@ -4619,27 +4619,26 @@ mod tests {
         value_type: DataType,
     ) -> CowRewriteQueryFixture {
         use novarocks_spi::connector::{
-            ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
-            ConnectorMutationEffectField, ConnectorMutationMatchContract,
+            ConnectorInstanceId, ConnectorMutationEffectField, ConnectorMutationMatchContract,
             ConnectorMutationRouteInput, ConnectorMutationSourceField,
-            ConnectorMutationTargetField, ConnectorRowMutationCohortRecipe,
-            ConnectorRowMutationEffect, ConnectorRowMutationIntent,
-            ConnectorRowMutationPreparation, ConnectorRowMutationRoute,
+            ConnectorMutationTargetField, ConnectorProviderBindingKey,
+            ConnectorRowMutationCohortRecipe, ConnectorRowMutationEffect,
+            ConnectorRowMutationIntent, ConnectorRowMutationPreparation, ConnectorRowMutationRoute,
             ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
             ConnectorRowMutationSelectionOrdinal, ConnectorRowMutationStrategy,
             ConnectorTableHandle, ConnectorWriteBaseVersion, ConnectorWriteCohortId,
             ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
             ConnectorWriteIntent, ConnectorWriteOperationId, ConnectorWritePreparation,
-            ConnectorWriteRouteId, ConnectorWriteTargetRef,
+            ConnectorWriteRouteId, ConnectorWriteTargetRef, ProviderBindingEpoch,
         };
 
         let row_count = row_ids.len();
         assert_eq!(after_ids.len(), row_count);
         assert_eq!(after_values.len(), row_count);
         let instance_id = ConnectorInstanceId::parse("iceberg").expect("instance ID");
-        let owner = ConnectorExecutionBindingKey {
+        let owner = ConnectorProviderBindingKey {
             instance_id: instance_id.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         };
         let table =
             ConnectorTableHandle::try_new(instance_id.clone(), bytes::Bytes::from_static(b"table"))
@@ -4845,13 +4844,13 @@ mod tests {
     }
 
     struct RecordingDirectWriteControl {
-        owner: novarocks_spi::connector::ConnectorExecutionBindingKey,
+        owner: novarocks_spi::connector::ConnectorProviderBindingKey,
         activate_calls: std::sync::atomic::AtomicUsize,
         observed_source: std::sync::Mutex<Option<([u8; 32], usize, bool)>>,
     }
 
     impl novarocks_spi::connector::ConnectorWriteControl for RecordingDirectWriteControl {
-        fn binding_key(&self) -> &novarocks_spi::connector::ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &novarocks_spi::connector::ConnectorProviderBindingKey {
             &self.owner
         }
 
@@ -5102,8 +5101,8 @@ mod tests {
 
     fn abort_unknown_evidence() -> novarocks_spi::connector::ExternalMutationEvidence {
         use novarocks_spi::connector::{
-            ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-            ConnectorMutationOperationId, ConnectorProviderId, ExternalMutationEvidence,
+            ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationOperationId,
+            ConnectorProviderId, ExternalMutationEvidence, ProviderBindingEpoch,
         };
 
         ExternalMutationEvidence::try_new(
@@ -5112,7 +5111,7 @@ mod tests {
                 provider_id: ConnectorProviderId::parse("test-provider").expect("provider ID"),
                 instance_id: ConnectorInstanceId::parse("test-instance").expect("instance ID"),
             },
-            ConnectorInstanceIncarnation::from_bytes([33; 16]),
+            ProviderBindingEpoch::from_bytes([33; 16]),
             ConnectorMutationOperationId::from_bytes([44; 16]),
             "row-mutation-abort",
             bytes::Bytes::from_static(b"uncertain"),

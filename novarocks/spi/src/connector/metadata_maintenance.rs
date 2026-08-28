@@ -25,10 +25,10 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorMetadata, ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
-    ExternalMutationEvidence, ExternalMutationOutcome,
+    ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorMetadata, ConnectorMutationOperationId,
+    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorTableHandle,
+    ExternalMutationEvidence, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
 pub const CONNECTOR_METADATA_MAINTENANCE_CONTRACT_VERSION: u16 = 1;
@@ -133,7 +133,7 @@ impl ConnectorMetadataMaintenanceOperation {
 #[derive(Clone)]
 pub struct ConnectorMetadataMaintenancePlanningRequest {
     operation_id: ConnectorMutationOperationId,
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation: ConnectorMetadataMaintenanceOperation,
     request_digest: [u8; 32],
     pub context: ConnectorRequestContext,
@@ -142,7 +142,7 @@ pub struct ConnectorMetadataMaintenancePlanningRequest {
 impl ConnectorMetadataMaintenancePlanningRequest {
     pub fn try_new(
         operation_id: ConnectorMutationOperationId,
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation: ConnectorMetadataMaintenanceOperation,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
@@ -165,7 +165,7 @@ impl ConnectorMetadataMaintenancePlanningRequest {
     pub const fn operation_id(&self) -> ConnectorMutationOperationId {
         self.operation_id
     }
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub fn operation(&self) -> &ConnectorMetadataMaintenanceOperation {
@@ -255,7 +255,7 @@ impl ConnectorMetadataMaintenancePlanSummary {
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConnectorMetadataMaintenancePlan {
     schema_version: u16,
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorMutationOperationId,
     operation_kind: Arc<str>,
     request_digest: [u8; 32],
@@ -300,7 +300,7 @@ impl ConnectorMetadataMaintenancePlan {
     /// a current connector generation.
     #[allow(clippy::too_many_arguments)]
     pub fn try_restore(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorMutationOperationId,
         operation_kind: impl Into<Arc<str>>,
         request_digest: [u8; 32],
@@ -330,7 +330,7 @@ impl ConnectorMetadataMaintenancePlan {
     pub const fn schema_version(&self) -> u16 {
         self.schema_version
     }
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub const fn operation_id(&self) -> ConnectorMutationOperationId {
@@ -417,7 +417,7 @@ pub struct ConnectorMetadataMaintenanceReceiptSummary {
 pub struct ConnectorMetadataMaintenanceReceipt {
     schema_version: u16,
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     operation_id: ConnectorMutationOperationId,
     operation_kind: Arc<str>,
     request_digest: [u8; 32],
@@ -431,7 +431,7 @@ impl ConnectorMetadataMaintenanceReceipt {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         operation_id: ConnectorMutationOperationId,
         operation_kind: impl Into<Arc<str>>,
         request_digest: [u8; 32],
@@ -464,7 +464,7 @@ impl ConnectorMetadataMaintenanceReceipt {
     pub const fn schema_version(&self) -> u16 {
         self.schema_version
     }
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    pub const fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
     pub const fn operation_id(&self) -> ConnectorMutationOperationId {
@@ -552,7 +552,7 @@ impl ConnectorMaxCompactableDataFiles {
 
 pub trait ConnectorMetadataMaintenance: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey;
+    fn binding_key(&self) -> &ConnectorProviderBindingKey;
     fn plan_maintenance(
         &self,
         request: ConnectorMetadataMaintenancePlanningRequest,
@@ -595,7 +595,7 @@ pub trait ConnectorMetadataMaintenanceResolver: Send + Sync {
 pub struct ConnectorMetadataMaintenanceLease {
     descriptor: ConnectorInstanceDescriptor,
     control_runtime_id: ConnectorControlRuntimeId,
-    provider_binding_key: ConnectorExecutionBindingKey,
+    provider_binding_key: ConnectorProviderBindingKey,
     metadata: Arc<dyn ConnectorMetadata>,
     maintenance: Arc<dyn ConnectorMetadataMaintenance>,
     _release: Arc<MaintenanceRelease>,
@@ -607,12 +607,12 @@ impl ConnectorMetadataMaintenanceLease {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
-        provider_incarnation: ConnectorInstanceIncarnation,
+        provider_incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         maintenance: Arc<dyn ConnectorMetadataMaintenance>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
-        let provider_binding_key = ConnectorExecutionBindingKey {
+        let provider_binding_key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation: provider_incarnation,
         };
@@ -783,7 +783,7 @@ impl Drop for MaintenanceRelease {
 
 pub(crate) fn validate_metadata_maintenance_owner(
     descriptor: &ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     maintenance: &dyn ConnectorMetadataMaintenance,
 ) -> Result<(), ConnectorError> {
     if maintenance.descriptor() != descriptor
@@ -800,7 +800,7 @@ pub(crate) fn validate_metadata_maintenance_owner(
 
 fn request_digest(
     operation_id: ConnectorMutationOperationId,
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     operation: &ConnectorMetadataMaintenanceOperation,
 ) -> [u8; 32] {
     let mut hash = Sha256::new();

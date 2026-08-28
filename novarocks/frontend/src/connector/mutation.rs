@@ -228,10 +228,10 @@ mod tests {
         ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
         ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
         ConnectorCatalogMutationResolver, ConnectorControlRuntimeId, ConnectorError,
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorProviderId,
-        ConnectorRequestContext, CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence,
-        ExternalMutationFinalization, ExternalMutationOutcome,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationFailure,
+        ConnectorMutationFailureKind, ConnectorProviderId, ConnectorRequestContext, CreatePolicy,
+        ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+        ExternalMutationOutcome, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -245,14 +245,14 @@ mod tests {
 
     struct UnknownMutation {
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
     }
 
     impl ConnectorCatalogMutation for UnknownMutation {
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
         }
-        fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        fn incarnation(&self) -> ProviderBindingEpoch {
             self.incarnation
         }
         fn execute(
@@ -343,14 +343,14 @@ mod tests {
 
     struct OuterErrorMutation {
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
     }
 
     impl ConnectorCatalogMutation for OuterErrorMutation {
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
         }
-        fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        fn incarnation(&self) -> ProviderBindingEpoch {
             self.incarnation
         }
         fn execute(
@@ -427,7 +427,7 @@ mod tests {
         };
         let mutation = Arc::new(UnknownMutation {
             descriptor: descriptor.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([3; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([3; 16]),
         });
         let result = execute_catalog_mutation(
             &Resolver(mutation),
@@ -465,7 +465,7 @@ mod tests {
         };
         let mutation = Arc::new(OuterErrorMutation {
             descriptor: descriptor.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         });
         let resolution = resolve_catalog_mutation(
             &OuterErrorResolver(mutation),

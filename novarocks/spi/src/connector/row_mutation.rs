@@ -28,7 +28,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorPinnedFileSet,
+    ConnectorError, ConnectorErrorKind, ConnectorPinnedFileSet, ConnectorProviderBindingKey,
     ConnectorRequestContext, ConnectorSealedWriteCohortSet, ConnectorTableHandle,
     ConnectorWriteBaseVersion, ConnectorWriteCohortId, ConnectorWriteFieldToken,
     ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWriteOperationId,
@@ -182,7 +182,7 @@ impl ConnectorMutationEffectField {
 /// duplicate-detection tuple are token-bound, not inferred from column names.
 #[derive(Clone)]
 pub struct ConnectorMutationMatchContract {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     table: ConnectorTableHandle,
     base_version: ConnectorWriteBaseVersion,
     identity_fields: Vec<ConnectorMutationSourceField>,
@@ -196,7 +196,7 @@ pub struct ConnectorMutationMatchContract {
 impl ConnectorMutationMatchContract {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         table: ConnectorTableHandle,
         base_version: ConnectorWriteBaseVersion,
         identity_fields: Vec<ConnectorMutationSourceField>,
@@ -294,7 +294,7 @@ impl ConnectorMutationMatchContract {
         }
         Ok(())
     }
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub fn table(&self) -> &ConnectorTableHandle {
@@ -477,7 +477,7 @@ impl ConnectorRowMutationRoute {
 /// must be activated with this exact operation and retained write lease.
 #[derive(Clone)]
 pub struct ConnectorRowMutationPreparation {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     table: ConnectorTableHandle,
     match_source: ConnectorTableHandle,
@@ -497,7 +497,7 @@ pub struct ConnectorRowMutationPreparation {
 impl ConnectorRowMutationPreparation {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
         table: ConnectorTableHandle,
         match_source: ConnectorTableHandle,
@@ -617,7 +617,7 @@ impl ConnectorRowMutationPreparation {
         }
         Ok(())
     }
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub const fn operation_id(&self) -> ConnectorWriteOperationId {
@@ -695,7 +695,7 @@ pub struct ConnectorRowMutationPreparationRequest {
 }
 
 impl ConnectorRowMutationPreparationRequest {
-    pub fn validate(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
+    pub fn validate(&self, owner: &ConnectorProviderBindingKey) -> Result<(), ConnectorError> {
         if self.table.owner() != &owner.instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -1139,7 +1139,7 @@ impl ConnectorRowMutationActivationRequest {
             Self::Direct { .. } => None,
         }
     }
-    pub fn validate(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
+    pub fn validate(&self, owner: &ConnectorProviderBindingKey) -> Result<(), ConnectorError> {
         let preparation = self.preparation();
         preparation.validate()?;
         if preparation.owner() != owner {
@@ -1329,7 +1329,7 @@ impl ConnectorRowMutationExecutionPlan {
     pub fn validate_against_activation(
         &self,
         request: &ConnectorRowMutationActivationRequest,
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
     ) -> Result<(), ConnectorError> {
         let checked = (|| {
             self.validate()?;
@@ -1387,7 +1387,7 @@ impl ConnectorRowMutationExecutionPlan {
         &self.preparation
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         self.preparation.owner()
     }
 
@@ -1995,7 +1995,7 @@ fn digest_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
 }
-fn digest_owner(hasher: &mut Sha256, owner: &ConnectorExecutionBindingKey) {
+fn digest_owner(hasher: &mut Sha256, owner: &ConnectorProviderBindingKey) {
     digest_bytes(hasher, owner.instance_id.as_str().as_bytes());
     hasher.update(owner.incarnation.to_bytes());
 }
@@ -2004,7 +2004,7 @@ fn digest_owner(hasher: &mut Sha256, owner: &ConnectorExecutionBindingKey) {
 // again here, and would let a caller build a partially-populated digest input.
 #[allow(clippy::too_many_arguments)]
 fn match_digest(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     table: &ConnectorTableHandle,
     base: &ConnectorWriteBaseVersion,
     identity: &[ConnectorMutationSourceField],
@@ -2180,7 +2180,7 @@ fn execution_plan_digest(
 // parameter list that wants grouping.
 #[allow(clippy::too_many_arguments)]
 fn preparation_digest(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     operation: ConnectorWriteOperationId,
     table: &ConnectorTableHandle,
     match_source: &ConnectorTableHandle,
@@ -2664,9 +2664,9 @@ mod tests {
     #[test]
     fn append_recipe_enforces_exact_coverage_and_activation_selection() {
         let instance = super::super::ConnectorInstanceId::parse("iceberg").expect("instance");
-        let owner = ConnectorExecutionBindingKey {
+        let owner = ConnectorProviderBindingKey {
             instance_id: instance.clone(),
-            incarnation: super::super::ConnectorInstanceIncarnation::from_bytes([8; 16]),
+            incarnation: super::super::ProviderBindingEpoch::from_bytes([8; 16]),
         };
         let table =
             ConnectorTableHandle::try_new(instance, Bytes::from_static(b"table")).expect("table");
@@ -3241,9 +3241,9 @@ mod tests {
     ) -> ConnectorRowMutationPreparation {
         let instance_id =
             super::super::ConnectorInstanceId::parse("iceberg").expect("valid instance ID");
-        let owner = ConnectorExecutionBindingKey {
+        let owner = ConnectorProviderBindingKey {
             instance_id: instance_id.clone(),
-            incarnation: super::super::ConnectorInstanceIncarnation::from_bytes([7u8; 16]),
+            incarnation: super::super::ProviderBindingEpoch::from_bytes([7u8; 16]),
         };
         let table = ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))
             .expect("table");

@@ -285,10 +285,10 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorError, ConnectorExecutionBindingKey, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorRequestContext, ConnectorStagedReport,
-        ConnectorStagedReportSummary, ConnectorWriteExecutionId, ConnectorWriteOperationId,
-        ConnectorWriterHandle, ConnectorWriterIdentity, ConnectorWriterTerminalState,
+        ConnectorCancellation, ConnectorError, ConnectorInstanceId, ConnectorProviderBindingKey,
+        ConnectorRequestContext, ConnectorStagedReport, ConnectorStagedReportSummary,
+        ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriterHandle,
+        ConnectorWriterIdentity, ConnectorWriterTerminalState, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -371,9 +371,9 @@ mod tests {
         stats: Arc<WriterStats>,
         execution_catalog_version: [u8; 32],
     ) -> Result<ConnectorWriteSinkProgram, ExecPlanBuildError> {
-        let key = ConnectorExecutionBindingKey {
+        let key = ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("test.connector").expect("instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         };
         let operation_id = ConnectorWriteOperationId::from_bytes([1; 16]);
         let catalog_handle = novarocks_spi::connector::CatalogHandle::new(

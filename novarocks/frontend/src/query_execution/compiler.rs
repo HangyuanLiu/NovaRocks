@@ -257,7 +257,7 @@ impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControl
         &self,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorExecutionBindingKey,
+        novarocks_spi::connector::ConnectorProviderBindingKey,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -280,7 +280,7 @@ impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControl
                     ),
                 )
             })?;
-        Ok(novarocks_spi::connector::ConnectorExecutionBindingKey {
+        Ok(novarocks_spi::connector::ConnectorProviderBindingKey {
             instance_id: binding.descriptor().instance_id.clone(),
             incarnation: binding.incarnation(),
         })
@@ -506,7 +506,7 @@ fn test_data_mutation_lease(
             "test connector control binding has no data mutation capability",
         )
     })?;
-    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+    let key = novarocks_spi::connector::ConnectorProviderBindingKey {
         instance_id: binding.descriptor().instance_id.clone(),
         incarnation: binding.incarnation(),
     };
@@ -656,7 +656,7 @@ fn test_cleanup_maintenance_lease(
             "test connector control binding has no cleanup maintenance capability",
         )
     })?;
-    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+    let key = novarocks_spi::connector::ConnectorProviderBindingKey {
         instance_id: binding.descriptor().instance_id.clone(),
         incarnation: binding.incarnation(),
     };
@@ -683,7 +683,7 @@ fn test_metadata_maintenance_lease(
             "test connector control binding has no metadata maintenance capability",
         )
     })?;
-    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+    let key = novarocks_spi::connector::ConnectorProviderBindingKey {
         instance_id: binding.descriptor().instance_id.clone(),
         incarnation: binding.incarnation(),
     };

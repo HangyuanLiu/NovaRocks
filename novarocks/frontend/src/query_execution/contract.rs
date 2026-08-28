@@ -40,7 +40,7 @@ use novarocks_execution::runtime::query_options::{
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
-    ConnectorActivatedWriteCohort, ConnectorError, ConnectorExecutionBindingKey,
+    ConnectorActivatedWriteCohort, ConnectorError, ConnectorProviderBindingKey,
     ConnectorRequestContext, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
     ConnectorWriteActivationSource, ConnectorWriteCohortId, ConnectorWriteExecutionId,
     ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlanningRequest,
@@ -384,7 +384,7 @@ impl ConnectorWritePlanningTemplate {
 
     pub fn stable_digest(
         &self,
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
     ) -> Result<[u8; 32], ConnectorError> {
         self.clone()
             .into_request(ConnectorWriteExecutionId::new([0; 16], 0))
@@ -412,7 +412,7 @@ impl ConnectorWritePlanningTemplate {
 #[derive(Clone)]
 pub struct ConnectorWriteOperationRegistration {
     operation_id: ConnectorWriteOperationId,
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     cohorts: Vec<ConnectorWritePlanningTemplate>,
 }
 
@@ -470,7 +470,7 @@ impl ConnectorWriteOperationRegistration {
         self.operation_id
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 

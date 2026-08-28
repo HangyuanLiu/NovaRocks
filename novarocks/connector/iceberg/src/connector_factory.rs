@@ -32,9 +32,9 @@ use crate::catalog_control::staged_create::IcebergStagedCreateAdapter;
 use crate::catalog_control::unanchored_ctas_cleanup::IcebergUnanchoredCtasCleanupAdapter;
 use crate::commit::IcebergWriteControl;
 use crate::distributed_rewrite::IcebergDistributedRewriteControl;
-use crate::execution_declaration::IcebergInstanceDistribution;
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
+use crate::provider_binding::IcebergInstanceDistribution;
 use crate::resources::IcebergMetadataResources;
 use crate::typed_boundary::IcebergTypedBoundary;
 use novarocks_proto_codec::connector_read::ConnectorReadCodec;
@@ -44,8 +44,8 @@ use novarocks_spi::connector::read_stack::{
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
     ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorProviderId,
+    ConnectorInstanceDescriptor, ConnectorProviderBindingKey, ConnectorProviderId,
+    ProviderBindingEpoch,
 };
 use std::sync::Arc;
 
@@ -158,13 +158,13 @@ impl ConnectorControlFactory for IcebergConnectorFactory {
             provider_id: self.provider_id.clone(),
             instance_id: request.instance_id().clone(),
         };
-        let incarnation = ConnectorInstanceIncarnation::new();
+        let incarnation = ProviderBindingEpoch::new();
         let provider = Arc::new(IcebergMetadata::new(
             descriptor.clone(),
             incarnation,
             Arc::clone(&unpublished.runtime),
         ));
-        let key = ConnectorExecutionBindingKey {
+        let key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation,
         };

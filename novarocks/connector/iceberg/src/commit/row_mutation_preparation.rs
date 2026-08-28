@@ -26,9 +26,9 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Schema};
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorMutationEffectField,
+    ConnectorError, ConnectorErrorKind, ConnectorMutationEffectField,
     ConnectorMutationMatchContract, ConnectorMutationSourceField, ConnectorMutationTargetField,
-    ConnectorRowMutationEffect, ConnectorRowMutationPreparation,
+    ConnectorProviderBindingKey, ConnectorRowMutationEffect, ConnectorRowMutationPreparation,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
     ConnectorTableHandle, ConnectorWriteBaseVersion, ConnectorWriteFieldRequest,
     ConnectorWriteFieldToken,
@@ -49,7 +49,7 @@ use crate::metadata::{IcebergTablePayload, metadata_arrow_fields, projected_sche
 /// facts before any staging service is registered.
 pub(crate) fn prepare_row_mutation(
     request: ConnectorRowMutationPreparationRequest,
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
 ) -> Result<ConnectorRowMutationPreparationOutcome, ConnectorError> {
     request.validate(owner)?;
     let payload: IcebergTablePayload = decode_payload(
@@ -332,7 +332,7 @@ pub(crate) fn prepare_row_mutation(
 /// The hashed byte sequence is a frozen cross-layer domain: any change here
 /// silently invalidates every preparation already issued against it.
 fn row_mutation_identity_token(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     table: &ConnectorTableHandle,
     ordinal: usize,
 ) -> ConnectorWriteFieldToken {
@@ -348,7 +348,7 @@ fn row_mutation_identity_token(
 /// Sign one before/after target column. `role` is length-prefixed so that no
 /// two role/ordinal pairs can collide by concatenation.
 fn row_mutation_field_token(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     table: &ConnectorTableHandle,
     role: &[u8],
     ordinal: usize,
@@ -367,7 +367,7 @@ fn row_mutation_field_token(
 /// Sign the single logical-effect column. Unlike the identity and target
 /// domains this one deliberately does not mix in the incarnation.
 fn row_mutation_effect_token(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     table: &ConnectorTableHandle,
 ) -> ConnectorWriteFieldToken {
     let mut hasher = Sha256::new();
@@ -384,9 +384,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorRequestContext, ConnectorRowMutationIntent, ConnectorRowMutationStrategy,
-        ConnectorWriteOperationId, ConnectorWriteTargetRef,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorRowMutationIntent, ConnectorRowMutationStrategy, ConnectorWriteOperationId,
+        ConnectorWriteTargetRef, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -419,10 +419,10 @@ mod tests {
 
     /// A binding key with a pinned incarnation, so every signed token in these
     /// tests is reproducible byte for byte.
-    fn owner() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn owner() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: instance_id(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         }
     }
 
@@ -1339,9 +1339,9 @@ mod tests {
     #[test]
     fn token_domains_bind_the_incarnation_except_for_the_effect_field() {
         let first = owner();
-        let second = ConnectorExecutionBindingKey {
+        let second = ConnectorProviderBindingKey {
             instance_id: instance_id(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([8; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([8; 16]),
         };
         let table = ConnectorTableHandle::try_new(
             instance_id(),

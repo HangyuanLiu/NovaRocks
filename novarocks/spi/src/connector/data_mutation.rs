@@ -25,10 +25,10 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorMetadata, ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
-    ExternalMutationEvidence, ExternalMutationOutcome,
+    ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorMetadata, ConnectorMutationOperationId,
+    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorTableHandle,
+    ExternalMutationEvidence, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
 pub const CONNECTOR_DATA_MUTATION_CONTRACT_VERSION: u16 = 3;
@@ -295,7 +295,7 @@ impl ConnectorDataMutationOperation {
 #[derive(Clone)]
 pub struct ConnectorDataMutationPlanningRequest {
     operation_id: ConnectorMutationOperationId,
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation: ConnectorDataMutationOperation,
     request_digest: [u8; 32],
     pub context: ConnectorRequestContext,
@@ -304,7 +304,7 @@ pub struct ConnectorDataMutationPlanningRequest {
 impl ConnectorDataMutationPlanningRequest {
     pub fn try_new(
         operation_id: ConnectorMutationOperationId,
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation: ConnectorDataMutationOperation,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
@@ -329,7 +329,7 @@ impl ConnectorDataMutationPlanningRequest {
         self.operation_id
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -417,7 +417,7 @@ impl ConnectorDataMutationPlanSummary {
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConnectorDataMutationPlan {
     schema_version: u16,
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorMutationOperationId,
     operation_kind: Arc<str>,
     request_digest: [u8; 32],
@@ -469,7 +469,7 @@ impl ConnectorDataMutationPlan {
         self.schema_version
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -591,7 +591,7 @@ impl ConnectorDataMutationPlan {
         }
         let schema_version = reader.read_u16()?;
         let instance_id = ConnectorInstanceId::parse(reader.read_utf8_u16("instance ID")?)?;
-        let incarnation = ConnectorInstanceIncarnation::from_bytes(reader.read_array()?);
+        let incarnation = ProviderBindingEpoch::from_bytes(reader.read_array()?);
         let operation_id = ConnectorMutationOperationId::from_bytes(reader.read_array()?);
         let operation_kind: Arc<str> = Arc::from(reader.read_utf8_u16("operation kind")?);
         let request_digest = reader.read_array()?;
@@ -634,7 +634,7 @@ impl ConnectorDataMutationPlan {
         reader.finish()?;
         let plan = Self {
             schema_version,
-            owner: ConnectorExecutionBindingKey {
+            owner: ConnectorProviderBindingKey {
                 instance_id,
                 incarnation,
             },
@@ -691,7 +691,7 @@ impl ConnectorDataMutationExecuteRequest {
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConnectorDataMutationReceipt {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     operation_id: ConnectorMutationOperationId,
     operation_kind: Arc<str>,
     request_digest: [u8; 32],
@@ -706,7 +706,7 @@ impl ConnectorDataMutationReceipt {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         operation_id: ConnectorMutationOperationId,
         operation_kind: impl Into<Arc<str>>,
         request_digest: [u8; 32],
@@ -738,7 +738,7 @@ impl ConnectorDataMutationReceipt {
         &self.descriptor
     }
 
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    pub const fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
 
@@ -844,7 +844,7 @@ impl ConnectorDataMutationReceipt {
         }
         let provider_id = super::ConnectorProviderId::parse(reader.read_utf8_u16("provider ID")?)?;
         let instance_id = ConnectorInstanceId::parse(reader.read_utf8_u16("instance ID")?)?;
-        let incarnation = ConnectorInstanceIncarnation::from_bytes(reader.read_array()?);
+        let incarnation = ProviderBindingEpoch::from_bytes(reader.read_array()?);
         let operation_id = ConnectorMutationOperationId::from_bytes(reader.read_array()?);
         let operation_kind = reader.read_utf8_u16("operation kind")?;
         let request_digest = reader.read_array()?;
@@ -901,7 +901,7 @@ impl fmt::Debug for ConnectorDataMutationReceipt {
 
 #[derive(Clone)]
 pub struct ConnectorDataMutationReconcileRequest {
-    pub owner: ConnectorExecutionBindingKey,
+    pub owner: ConnectorProviderBindingKey,
     pub operation_id: ConnectorMutationOperationId,
     pub operation_kind: Arc<str>,
     pub request_digest: [u8; 32],
@@ -943,7 +943,7 @@ impl ConnectorDataMutationReconcileRequest {
 /// execution binding and intentionally has no public abort method.
 pub trait ConnectorDataMutation: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey;
+    fn binding_key(&self) -> &ConnectorProviderBindingKey;
 
     fn plan_mutation(
         &self,
@@ -977,7 +977,7 @@ pub trait ConnectorDataMutationResolver: Send + Sync {
 pub struct ConnectorDataMutationLease {
     descriptor: ConnectorInstanceDescriptor,
     control_runtime_id: ConnectorControlRuntimeId,
-    provider_binding_key: ConnectorExecutionBindingKey,
+    provider_binding_key: ConnectorProviderBindingKey,
     metadata: Arc<dyn ConnectorMetadata>,
     mutation: Arc<dyn ConnectorDataMutation>,
     _release: Arc<DataMutationLeaseRelease>,
@@ -993,12 +993,12 @@ impl ConnectorDataMutationLease {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
-        provider_incarnation: ConnectorInstanceIncarnation,
+        provider_incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         mutation: Arc<dyn ConnectorDataMutation>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
-        let provider_binding_key = ConnectorExecutionBindingKey {
+        let provider_binding_key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation: provider_incarnation,
         };
@@ -1242,7 +1242,7 @@ impl Drop for DataMutationLeaseRelease {
 
 pub(crate) fn validate_data_mutation_owner(
     descriptor: &ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     mutation: &dyn ConnectorDataMutation,
 ) -> Result<(), ConnectorError> {
     if mutation.descriptor() != descriptor
@@ -1259,7 +1259,7 @@ pub(crate) fn validate_data_mutation_owner(
 
 fn request_digest(
     operation_id: ConnectorMutationOperationId,
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     operation: &ConnectorDataMutationOperation,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -1507,10 +1507,9 @@ mod tests {
         ConnectorDataMutationSourceScope,
     };
     use crate::connector::{
-        ConnectorCancellation, ConnectorErrorKind, ConnectorExecutionBindingKey,
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorMutationOperationId, ConnectorProviderId, ConnectorRequestContext,
-        ConnectorTableHandle,
+        ConnectorCancellation, ConnectorErrorKind, ConnectorInstanceDescriptor,
+        ConnectorInstanceId, ConnectorMutationOperationId, ConnectorProviderBindingKey,
+        ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ProviderBindingEpoch,
     };
 
     struct NeverCancelled;
@@ -1525,9 +1524,9 @@ mod tests {
         let instance_id = ConnectorInstanceId::parse("analytics").expect("instance ID");
         let request = ConnectorDataMutationPlanningRequest::try_new(
             ConnectorMutationOperationId::from_bytes([3; 16]),
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: instance_id.clone(),
-                incarnation: ConnectorInstanceIncarnation::from_bytes([4; 16]),
+                incarnation: ProviderBindingEpoch::from_bytes([4; 16]),
             },
             ConnectorDataMutationOperation::register_existing_files(
                 ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))

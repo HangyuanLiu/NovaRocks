@@ -72,7 +72,7 @@ pub struct BackendServerConfig {
     /// provider kind. The Host installs factory and matching codec atomically
     /// for each exact admitted binding generation.
     pub read_execution_bundle_factories: Vec<(
-        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        novarocks_spi::connector::ConnectorProviderBindingKind,
         Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
     )>,
     /// Provider-owned constructors for catalog-scoped writer capabilities,
@@ -80,7 +80,7 @@ pub struct BackendServerConfig {
     /// query becomes ControlReady; decode must resolve the result through the
     /// query's exact catalog lease.
     pub write_execution_bundle_factories: Vec<(
-        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        novarocks_spi::connector::ConnectorProviderBindingKind,
         Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
     )>,
 }
@@ -482,11 +482,11 @@ fn compose_backend_application_services(
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     catalog_runtime_materializers: &[Arc<dyn CatalogRuntimeMaterializer>],
     read_execution_bundle_factories: &[(
-        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        novarocks_spi::connector::ConnectorProviderBindingKind,
         Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
     )],
     write_execution_bundle_factories: &[(
-        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        novarocks_spi::connector::ConnectorProviderBindingKind,
         Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
     )],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
@@ -556,13 +556,13 @@ fn compose_backend_application_services(
 }
 
 fn catalog_provider_kind(
-    kind: novarocks_spi::connector::ConnectorExecutionProviderKind,
+    kind: novarocks_spi::connector::ConnectorProviderBindingKind,
 ) -> novarocks_spi::connector::CatalogProviderKind {
     match kind {
-        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg => {
+        novarocks_spi::connector::ConnectorProviderBindingKind::Iceberg => {
             novarocks_spi::connector::CatalogProviderKind::Iceberg
         }
-        novarocks_spi::connector::ConnectorExecutionProviderKind::StarRocks => {
+        novarocks_spi::connector::ConnectorProviderBindingKind::StarRocks => {
             novarocks_spi::connector::CatalogProviderKind::StarRocks
         }
     }

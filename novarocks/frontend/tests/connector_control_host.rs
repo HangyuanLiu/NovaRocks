@@ -33,26 +33,25 @@ use novarocks_spi::connector::{
     ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewritePlan,
     ConnectorDistributedRewritePlanningRequest, ConnectorDistributedRewriteReceipt,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorMetadataMaintenance,
     ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
-    ConnectorMetadataMaintenanceResolver, ConnectorNamespaceRequest, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorSplitPlanningRequest, ConnectorStatistics, ConnectorStatisticsResolver,
-    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest,
-    ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest, ConnectorWriteActivation,
-    ConnectorWriteAttemptCompletion, ConnectorWriteCommitRequest, ConnectorWriteControl,
-    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWriteReceipt,
-    ConnectorWriteReconcileRequest, ExternalMutationOutcome, StatisticsDataVersion,
-    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsReadRequest, StatisticsReader,
-    StatisticsRowCoverage,
+    ConnectorMetadataMaintenanceResolver, ConnectorNamespaceRequest, ConnectorProviderBinding,
+    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorStatistics,
+    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
+    ConnectorTableRequest, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
+    ConnectorWriteActivation, ConnectorWriteAttemptCompletion, ConnectorWriteCommitRequest,
+    ConnectorWriteControl, ConnectorWritePlan, ConnectorWritePlanningRequest,
+    ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ExternalMutationOutcome,
+    ProviderBindingEpoch, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
+    StatisticsReadRequest, StatisticsReader, StatisticsRowCoverage,
 };
 
 struct TestControl {
     instance_id: ConnectorInstanceId,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
 }
 
 impl ConnectorMetadata for TestControl {
@@ -112,8 +111,8 @@ impl ConnectorExecutionDistribution for TestControl {
     fn declaration(
         &self,
         _context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-        ConnectorExecutionDeclaration::iceberg(
+    ) -> Result<ConnectorProviderBinding, ConnectorError> {
+        ConnectorProviderBinding::iceberg(
             self.instance_id.as_str(),
             self.incarnation.to_bytes(),
             "default",
@@ -125,7 +124,7 @@ impl ConnectorExecutionDistribution for TestControl {
 fn binding(incarnation: u8) -> ConnectorControlBinding {
     let provider = Arc::new(TestControl {
         instance_id: ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([incarnation; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([incarnation; 16]),
     });
     ConnectorControlBinding::try_new(
         ConnectorInstanceDescriptor {
@@ -143,7 +142,7 @@ fn binding(incarnation: u8) -> ConnectorControlBinding {
 
 struct TestMutation {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
 }
 
 impl ConnectorCatalogMutation for TestMutation {
@@ -151,7 +150,7 @@ impl ConnectorCatalogMutation for TestMutation {
         &self.descriptor
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
 
@@ -194,7 +193,7 @@ fn binding_with_mutation(incarnation: u8) -> ConnectorControlBinding {
 
 struct TestDataMutation {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl ConnectorDataMutation for TestDataMutation {
@@ -202,7 +201,7 @@ impl ConnectorDataMutation for TestDataMutation {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -232,7 +231,7 @@ fn binding_with_data_mutation(incarnation_byte: u8) -> ConnectorControlBinding {
     let binding = binding(incarnation_byte);
     let descriptor = binding.descriptor().clone();
     let incarnation = binding.incarnation();
-    let key = ConnectorExecutionBindingKey {
+    let key = ConnectorProviderBindingKey {
         instance_id: descriptor.instance_id.clone(),
         incarnation,
     };
@@ -254,7 +253,7 @@ fn binding_with_data_mutation(incarnation_byte: u8) -> ConnectorControlBinding {
 
 struct TestCleanupMaintenance {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl ConnectorCleanupMaintenance for TestCleanupMaintenance {
@@ -262,7 +261,7 @@ impl ConnectorCleanupMaintenance for TestCleanupMaintenance {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -306,7 +305,7 @@ fn binding_with_cleanup_maintenance(incarnation_byte: u8) -> ConnectorControlBin
     let binding = binding(incarnation_byte);
     let descriptor = binding.descriptor().clone();
     let incarnation = binding.incarnation();
-    let key = ConnectorExecutionBindingKey {
+    let key = ConnectorProviderBindingKey {
         instance_id: descriptor.instance_id.clone(),
         incarnation,
     };
@@ -334,7 +333,7 @@ fn binding_with_cleanup_maintenance(incarnation_byte: u8) -> ConnectorControlBin
 
 struct TestMetadataMaintenance {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl ConnectorMetadataMaintenance for TestMetadataMaintenance {
@@ -342,7 +341,7 @@ impl ConnectorMetadataMaintenance for TestMetadataMaintenance {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -365,7 +364,7 @@ fn binding_with_metadata_maintenance(incarnation_byte: u8) -> ConnectorControlBi
     let binding = binding(incarnation_byte);
     let descriptor = binding.descriptor().clone();
     let incarnation = binding.incarnation();
-    let key = ConnectorExecutionBindingKey {
+    let key = ConnectorProviderBindingKey {
         instance_id: descriptor.instance_id.clone(),
         incarnation,
     };
@@ -390,7 +389,7 @@ fn binding_with_metadata_maintenance(incarnation_byte: u8) -> ConnectorControlBi
 
 struct TestDistributedRewrite {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl ConnectorDistributedRewrite for TestDistributedRewrite {
@@ -398,7 +397,7 @@ impl ConnectorDistributedRewrite for TestDistributedRewrite {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -444,11 +443,11 @@ impl ConnectorDistributedRewrite for TestDistributedRewrite {
 }
 
 struct TestWrite {
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl ConnectorWriteControl for TestWrite {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -488,7 +487,7 @@ fn binding_with_distributed_rewrite(
     let binding = binding(incarnation_byte);
     let descriptor = binding.descriptor().clone();
     let incarnation = binding.incarnation();
-    let key = ConnectorExecutionBindingKey {
+    let key = ConnectorProviderBindingKey {
         instance_id: descriptor.instance_id.clone(),
         incarnation,
     };
@@ -520,7 +519,7 @@ fn binding_with_distributed_rewrite(
 
 struct TestStatistics {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
 }
 
 impl StatisticsReader for TestStatistics {
@@ -528,7 +527,7 @@ impl StatisticsReader for TestStatistics {
         &self.descriptor
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
 
@@ -603,9 +602,9 @@ fn mutation_lease_fences_retirement_and_missing_capability_is_unsupported() {
 fn exact_mutation_lease_never_uses_a_replacement_runtime() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-    let old_key = ConnectorExecutionBindingKey {
+    let old_key = ConnectorProviderBindingKey {
         instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
     };
     let old_binding = binding_with_mutation(7);
     let old_control_runtime_id = old_binding.control_runtime_id();
@@ -688,9 +687,9 @@ fn data_mutation_lease_requires_the_capability_and_fences_retirement() {
 fn exact_data_mutation_lease_never_uses_a_replacement_runtime() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-    let old_key = ConnectorExecutionBindingKey {
+    let old_key = ConnectorProviderBindingKey {
         instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
     };
     let old_binding = binding_with_data_mutation(7);
     let old_control_runtime_id = old_binding.control_runtime_id();
@@ -779,9 +778,9 @@ fn metadata_maintenance_lease_requires_the_capability_and_fences_retirement() {
 fn exact_metadata_maintenance_lease_never_uses_a_replacement_runtime() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-    let old_key = ConnectorExecutionBindingKey {
+    let old_key = ConnectorProviderBindingKey {
         instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
     };
     let old_binding = binding_with_metadata_maintenance(7);
     let old_control_runtime_id = old_binding.control_runtime_id();
@@ -871,9 +870,9 @@ fn cleanup_maintenance_lease_requires_the_capability_and_fences_retirement() {
 fn exact_cleanup_maintenance_lease_never_uses_a_replacement_runtime() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-    let old_key = ConnectorExecutionBindingKey {
+    let old_key = ConnectorProviderBindingKey {
         instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
     };
     let old_binding = binding_with_cleanup_maintenance(7);
     let old_control_runtime_id = old_binding.control_runtime_id();
@@ -978,9 +977,9 @@ fn distributed_rewrite_lease_requires_both_capabilities_and_fences_retirement() 
 fn exact_distributed_rewrite_lease_never_uses_a_replacement_incarnation() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-    let old_key = ConnectorExecutionBindingKey {
+    let old_key = ConnectorProviderBindingKey {
         instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
     };
     let old = binding_with_distributed_rewrite(7, true);
     let old_control_runtime_id = old.control_runtime_id();

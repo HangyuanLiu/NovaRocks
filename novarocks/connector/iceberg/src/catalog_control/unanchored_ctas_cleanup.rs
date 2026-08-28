@@ -30,9 +30,9 @@ use novarocks_fs::{FsLocation, FsScheme};
 use novarocks_spi::connector::{
     ConnectorCtasUnanchoredCleanupOutcome, ConnectorCtasUnanchoredCleanupRequest,
     ConnectorCtasUnanchoredDiscoveryRequest, ConnectorCtasUnanchoredProvenance, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceIncarnation, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorRequestContext, ConnectorUnanchoredCtasCleanup,
+    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorUnanchoredCtasCleanup, ProviderBindingEpoch,
 };
 
 use super::staged_create::{
@@ -46,7 +46,7 @@ const CTAS_UNANCHORED_PROVENANCE_FILE: &str = "_novarocks.ctas.provenance.v1.jso
 #[derive(Clone)]
 pub(crate) struct IcebergUnanchoredCtasCleanupAdapter {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     runtime: Arc<IcebergMetadataContext>,
 }
 
@@ -61,7 +61,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
     /// where the reason is known.
     pub(crate) fn try_new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         runtime: Arc<IcebergMetadataContext>,
     ) -> Result<Self, ConnectorError> {
         let warehouse = runtime.control_state().configuration().warehouse_uri.trim();
@@ -105,8 +105,8 @@ impl IcebergUnanchoredCtasCleanupAdapter {
         })
     }
 
-    fn owner(&self) -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn owner(&self) -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: self.descriptor.instance_id.clone(),
             incarnation: self.incarnation,
         }
@@ -275,7 +275,7 @@ impl ConnectorUnanchoredCtasCleanup for IcebergUnanchoredCtasCleanupAdapter {
         &self.descriptor
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
 

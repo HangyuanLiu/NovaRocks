@@ -25,8 +25,8 @@ use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorControlRegistry, ConnectorControlResolver,
     ConnectorControlRuntimeId, ConnectorDataMutationLease, ConnectorDataMutationResolver,
     ConnectorDistributedRewriteLease, ConnectorDistributedRewriteResolver, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceId,
-    ConnectorMetadataMaintenanceLease, ConnectorMetadataMaintenanceResolver, ConnectorProviderId,
+    ConnectorErrorKind, ConnectorInstanceId, ConnectorMetadataMaintenanceLease,
+    ConnectorMetadataMaintenanceResolver, ConnectorProviderBindingKey, ConnectorProviderId,
     ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorWriteLease,
 };
 
@@ -45,17 +45,17 @@ struct ControlHostState {
     retired: BTreeSet<ConnectorControlRuntimeId>,
     /// Temporary bridge for the legacy FE effect contract.
     /// It is not a control-generation owner and is removed with that contract.
-    legacy_execution_index: BTreeMap<ConnectorExecutionBindingKey, ConnectorControlRuntimeId>,
+    legacy_execution_index: BTreeMap<ConnectorProviderBindingKey, ConnectorControlRuntimeId>,
     /// Compatibility-only evidence retained until the FE effect contract stops
     /// carrying legacy execution keys. It never drives BE retirement.
-    installed_backends: BTreeMap<ConnectorExecutionBindingKey, BTreeSet<String>>,
+    installed_backends: BTreeMap<ConnectorProviderBindingKey, BTreeSet<String>>,
     ready_retires: Vec<ConnectorControlRetirement>,
 }
 
 impl ControlHostState {
     fn runtime_for_legacy_effect(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        key: &ConnectorProviderBindingKey,
     ) -> Result<ConnectorControlRuntimeId, ConnectorError> {
         self.legacy_execution_index
             .get(key)
@@ -71,7 +71,7 @@ impl ControlHostState {
     fn active_legacy_effect(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorExecutionBindingKey, ConnectorError> {
+    ) -> Result<ConnectorProviderBindingKey, ConnectorError> {
         let runtime_id = self.active.get(instance_id).copied().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::NotFound,
@@ -96,7 +96,7 @@ impl ControlHostState {
 // Design: ADR-0017 (docs/adr/ADR-0017-connector-catalog-mutation-outcomes.md)
 struct ControlGeneration {
     binding: Arc<ConnectorControlBinding>,
-    legacy_execution_key: ConnectorExecutionBindingKey,
+    legacy_execution_key: ConnectorProviderBindingKey,
     state: ControlGenerationState,
     planning_leases: usize,
     mutation_leases: usize,
@@ -132,7 +132,7 @@ enum ControlGenerationState {
 /// reachability snapshots and `PruneCatalogs`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorControlRetirement {
-    pub key: ConnectorExecutionBindingKey,
+    pub key: ConnectorProviderBindingKey,
     pub installed_backends: Vec<String>,
 }
 
@@ -185,7 +185,7 @@ impl ConnectorControlHost {
 
     pub fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError> {
         let binding = Arc::new(binding);
-        let legacy_execution_key = ConnectorExecutionBindingKey {
+        let legacy_execution_key = ConnectorProviderBindingKey {
             instance_id: binding.descriptor().instance_id.clone(),
             incarnation: binding.incarnation(),
         };
@@ -277,7 +277,7 @@ impl ConnectorControlHost {
     /// data is not used to manage BE catalog lifetime.
     pub fn record_installed_backend(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        key: &ConnectorProviderBindingKey,
         endpoint: impl Into<String>,
     ) -> Result<(), ConnectorError> {
         let mut state = self.lock_state()?;
@@ -861,7 +861,7 @@ impl ConnectorControlResolver for ConnectorControlHost {
     fn observe_current_binding(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorExecutionBindingKey, ConnectorError> {
+    ) -> Result<ConnectorProviderBindingKey, ConnectorError> {
         let state = self.lock_state()?;
         let runtime_id = state.active.get(instance_id).copied().ok_or_else(|| {
             ConnectorError::new(
@@ -1161,11 +1161,11 @@ pub(crate) mod tests {
     use novarocks_spi::connector::{
         ConnectorBeginScanRequest, ConnectorControlCreation, ConnectorControlFactory,
         ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorError,
-        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-        ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
-        ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
-        ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorTableHandle,
-        ConnectorTableMetadata, ConnectorTableRequest,
+        ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorListTablesRequest,
+        ConnectorMetadata, ConnectorNamespaceRequest, ConnectorProviderBinding,
+        ConnectorProviderId, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+        ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorTableMetadata,
+        ConnectorTableRequest, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -1373,7 +1373,7 @@ pub(crate) mod tests {
 
     struct TestControl {
         instance_id: ConnectorInstanceId,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
     }
 
     impl ConnectorMetadata for TestControl {
@@ -1434,8 +1434,8 @@ pub(crate) mod tests {
         fn declaration(
             &self,
             _context: &novarocks_spi::connector::ConnectorRequestContext,
-        ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-            ConnectorExecutionDeclaration::iceberg(
+        ) -> Result<ConnectorProviderBinding, ConnectorError> {
+            ConnectorProviderBinding::iceberg(
                 self.instance_id.as_str(),
                 self.incarnation.to_bytes(),
                 "default",
@@ -1465,7 +1465,7 @@ pub(crate) mod tests {
     ) -> ConnectorControlBinding {
         let provider = Arc::new(TestControl {
             instance_id,
-            incarnation: ConnectorInstanceIncarnation::from_bytes([incarnation; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([incarnation; 16]),
         });
         ConnectorControlBinding::try_new(
             ConnectorInstanceDescriptor {
@@ -1518,9 +1518,9 @@ pub(crate) mod tests {
         let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
         host.register(binding(7)).expect("register old generation");
         let lease = host.acquire_current(&instance_id).expect("planning lease");
-        let old_key = ConnectorExecutionBindingKey {
+        let old_key = ConnectorProviderBindingKey {
             instance_id: instance_id.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         };
         host.record_installed_backend(&old_key, "be-1")
             .expect("record ensure ack");
@@ -1560,7 +1560,7 @@ pub(crate) mod tests {
             .expect("acquire first lease");
         let declaration = lease
             .binding()
-            .execution_declaration(&starrocks_context())
+            .provider_binding(&starrocks_context())
             .expect("declaration");
         assert_eq!(
             declaration.binding_key().incarnation(),

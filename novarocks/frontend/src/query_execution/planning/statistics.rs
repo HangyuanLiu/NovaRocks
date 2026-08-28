@@ -330,13 +330,12 @@ mod unified_tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorControlBinding, ConnectorControlPlanningLease,
-        ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
-        ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorProviderId,
-        ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-        ConnectorStatistics, ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest,
-        StatisticsDataVersion, StatisticsEvidence, StatisticsMetric, StatisticsReadRequest,
-        StatisticsReader,
+        ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata,
+        ConnectorProviderBinding, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
+        ConnectorScanHandle, ConnectorScanPlanning, ConnectorStatistics, ConnectorTableHandle,
+        ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch, StatisticsDataVersion,
+        StatisticsEvidence, StatisticsMetric, StatisticsReadRequest, StatisticsReader,
     };
     use novarocks_types::schema::ColumnDef;
 
@@ -390,7 +389,7 @@ mod unified_tests {
 
     struct ContextObservingProvider {
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         reads: AtomicUsize,
     }
 
@@ -461,7 +460,7 @@ mod unified_tests {
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,
-        ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+        ) -> Result<ConnectorProviderBinding, ConnectorError> {
             Err(Self::unsupported())
         }
     }
@@ -471,7 +470,7 @@ mod unified_tests {
             &self.descriptor
         }
 
-        fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        fn incarnation(&self) -> ProviderBindingEpoch {
             self.incarnation
         }
 
@@ -541,7 +540,7 @@ mod unified_tests {
                 provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
                 instance_id: ConnectorInstanceId::parse("ice.main").expect("instance ID"),
             },
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
             reads: AtomicUsize::new(0),
         })
     }

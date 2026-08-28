@@ -42,7 +42,7 @@ pub struct ConnectorWriteOperationSession {
 
 struct ConnectorWriteOperationSessionInner {
     operation_id: ConnectorWriteOperationId,
-    owner: novarocks_spi::connector::ConnectorExecutionBindingKey,
+    owner: novarocks_spi::connector::ConnectorProviderBindingKey,
     sealed: ConnectorSealedWriteCohortSet,
     cohorts: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanningTemplate>,
     lease: ConnectorWriteLease,
@@ -157,7 +157,7 @@ impl ConnectorWriteOperationSession {
         self.inner.operation_id
     }
 
-    pub fn owner(&self) -> &novarocks_spi::connector::ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &novarocks_spi::connector::ConnectorProviderBindingKey {
         &self.inner.owner
     }
 
@@ -785,15 +785,15 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorExecutionBindingKey,
-        ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
-        ConnectorExecutionProviderKind, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorRequestContext, ConnectorStagedReport, ConnectorStagedReportSummary,
-        ConnectorTableHandle, ConnectorWriteBaseVersion, ConnectorWriteControl,
-        ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-        ConnectorWriteIntent, ConnectorWritePlan, ConnectorWritePlanningRequest,
-        ConnectorWritePreparation, ConnectorWriterHandle, ConnectorWriterIdentity,
-        ConnectorWriterTerminalState, ExternalMutationFinalization,
+        CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorExecutionDistribution,
+        ConnectorInstanceId, ConnectorProviderBinding, ConnectorProviderBindingKey,
+        ConnectorProviderBindingKind, ConnectorRequestContext, ConnectorStagedReport,
+        ConnectorStagedReportSummary, ConnectorTableHandle, ConnectorWriteBaseVersion,
+        ConnectorWriteControl, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+        ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWritePlan,
+        ConnectorWritePlanningRequest, ConnectorWritePreparation, ConnectorWriterHandle,
+        ConnectorWriterIdentity, ConnectorWriterTerminalState, ExternalMutationFinalization,
+        ProviderBindingEpoch,
     };
 
     use super::*;
@@ -815,28 +815,26 @@ mod tests {
     }
 
     struct TestDistribution {
-        key: ConnectorExecutionBindingKey,
-        provider_kind: ConnectorExecutionProviderKind,
+        key: ConnectorProviderBindingKey,
+        provider_kind: ConnectorProviderBindingKind,
     }
 
     impl ConnectorExecutionDistribution for TestDistribution {
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,
-        ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+        ) -> Result<ConnectorProviderBinding, ConnectorError> {
             match self.provider_kind {
-                ConnectorExecutionProviderKind::Iceberg => ConnectorExecutionDeclaration::iceberg(
+                ConnectorProviderBindingKind::Iceberg => ConnectorProviderBinding::iceberg(
                     self.key.instance_id.as_str(),
                     self.key.incarnation.to_bytes(),
                     "session-test-binding",
                 ),
-                ConnectorExecutionProviderKind::StarRocks => {
-                    ConnectorExecutionDeclaration::starrocks(
-                        self.key.instance_id.as_str(),
-                        self.key.incarnation.to_bytes(),
-                        "session-test-binding",
-                    )
-                }
+                ConnectorProviderBindingKind::StarRocks => ConnectorProviderBinding::starrocks(
+                    self.key.instance_id.as_str(),
+                    self.key.incarnation.to_bytes(),
+                    "session-test-binding",
+                ),
             }
             .map_err(|error| {
                 ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
@@ -845,14 +843,14 @@ mod tests {
     }
 
     struct TestControl {
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         plan_calls: Arc<AtomicUsize>,
         commit_calls: Arc<AtomicUsize>,
         abort_calls: Arc<AtomicUsize>,
     }
 
     impl ConnectorWriteControl for TestControl {
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
 
@@ -917,10 +915,10 @@ mod tests {
         }
     }
 
-    fn owner() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn owner() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("session-test").expect("instance ID"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         }
     }
 
@@ -1005,7 +1003,7 @@ mod tests {
             novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),
             Arc::new(TestDistribution {
                 key,
-                provider_kind: ConnectorExecutionProviderKind::Iceberg,
+                provider_kind: ConnectorProviderBindingKind::Iceberg,
             }),
             move || {
                 release_calls.fetch_add(1, Ordering::SeqCst);
@@ -1015,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn write_lease_rejects_execution_declaration_from_another_provider() {
+    fn write_lease_rejects_provider_binding_from_another_provider() {
         let key = owner();
         let control: Arc<dyn ConnectorWriteControl> = Arc::new(TestControl {
             key: key.clone(),
@@ -1030,14 +1028,14 @@ mod tests {
             novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),
             Arc::new(TestDistribution {
                 key,
-                provider_kind: ConnectorExecutionProviderKind::StarRocks,
+                provider_kind: ConnectorProviderBindingKind::StarRocks,
             }),
             || {},
         )
         .expect("exact write lease");
 
         let error = lease
-            .execution_declaration(&context())
+            .provider_binding(&context())
             .expect_err("a declaration from another provider must be rejected");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }

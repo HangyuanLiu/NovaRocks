@@ -26,13 +26,13 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorControlPlanningLease, ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorMetadata, ConnectorPinnedFileSet, ConnectorRequestContext, ConnectorScanPlanning,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorMetadata, ConnectorPinnedFileSet, ConnectorProviderBinding,
+    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorScanPlanning,
     ConnectorTableHandle, ConnectorWriteActivation, ConnectorWriteAttemptCompletion,
     ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteIntent,
     ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
-    ConnectorWriteReceipt,
+    ConnectorWriteReceipt, ProviderBindingEpoch,
 };
 
 pub const CONNECTOR_DISTRIBUTED_REWRITE_CONTRACT_VERSION: u16 = 1;
@@ -110,7 +110,7 @@ impl ConnectorDistributedRewriteOperation {
 #[derive(Clone)]
 pub struct ConnectorDistributedRewritePlanningRequest {
     operation_id: ConnectorWriteOperationId,
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation: ConnectorDistributedRewriteOperation,
     request_digest: [u8; 32],
     pub context: ConnectorRequestContext,
@@ -119,7 +119,7 @@ pub struct ConnectorDistributedRewritePlanningRequest {
 impl ConnectorDistributedRewritePlanningRequest {
     pub fn try_new(
         operation_id: ConnectorWriteOperationId,
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation: ConnectorDistributedRewriteOperation,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
@@ -141,7 +141,7 @@ impl ConnectorDistributedRewritePlanningRequest {
     pub const fn operation_id(&self) -> ConnectorWriteOperationId {
         self.operation_id
     }
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub fn operation(&self) -> &ConnectorDistributedRewriteOperation {
@@ -390,7 +390,7 @@ impl fmt::Debug for ConnectorDistributedRewriteCohortPlan {
 
 #[derive(Clone)]
 pub struct ConnectorDistributedRewritePlan {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     operation_kind: Arc<str>,
     target: ConnectorTableHandle,
@@ -456,7 +456,7 @@ impl ConnectorDistributedRewritePlan {
             plan_digest,
         })
     }
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub const fn operation_id(&self) -> ConnectorWriteOperationId {
@@ -661,7 +661,7 @@ impl ConnectorDistributedRewriteReceipt {
 
 pub trait ConnectorDistributedRewrite: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey;
+    fn binding_key(&self) -> &ConnectorProviderBindingKey;
     fn plan_rewrite(
         &self,
         request: ConnectorDistributedRewritePlanningRequest,
@@ -704,7 +704,7 @@ pub trait ConnectorDistributedRewriteResolver: Send + Sync {
 pub struct ConnectorDistributedRewriteLease {
     descriptor: ConnectorInstanceDescriptor,
     control_runtime_id: ConnectorControlRuntimeId,
-    provider_binding_key: ConnectorExecutionBindingKey,
+    provider_binding_key: ConnectorProviderBindingKey,
     planning_lease: ConnectorControlPlanningLease,
     metadata: Arc<dyn ConnectorMetadata>,
     planning: Arc<dyn ConnectorScanPlanning>,
@@ -722,7 +722,7 @@ impl ConnectorDistributedRewriteLease {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
-        provider_incarnation: ConnectorInstanceIncarnation,
+        provider_incarnation: ProviderBindingEpoch,
         planning_lease: ConnectorControlPlanningLease,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
@@ -731,7 +731,7 @@ impl ConnectorDistributedRewriteLease {
         distribution: Arc<dyn ConnectorExecutionDistribution>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
-        let provider_binding_key = ConnectorExecutionBindingKey {
+        let provider_binding_key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation: provider_incarnation,
         };
@@ -786,10 +786,10 @@ impl ConnectorDistributedRewriteLease {
     /// Produce the typed BE installer declaration from the same exact
     /// generation that froze this rewrite.  This prevents a later active
     /// incarnation from silently serving a staged operation.
-    pub fn execution_declaration(
+    pub fn provider_binding(
         &self,
         context: &ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+    ) -> Result<ConnectorProviderBinding, ConnectorError> {
         let declaration = self.distribution.declaration(context)?;
         let key = declaration.binding_key();
         if declaration.provider_id() != self.descriptor.provider_id.as_str()
@@ -797,7 +797,7 @@ impl ConnectorDistributedRewriteLease {
             || key.incarnation != self.provider_binding_key.incarnation
         {
             return Err(invalid(
-                "distributed rewrite execution declaration does not match lease generation",
+                "distributed rewrite provider binding does not match lease generation",
             ));
         }
         Ok(declaration)
@@ -971,7 +971,7 @@ impl Drop for RewriteLeaseRelease {
 
 pub(crate) fn validate_distributed_rewrite_owner(
     descriptor: &ConnectorInstanceDescriptor,
-    incarnation: super::ConnectorInstanceIncarnation,
+    incarnation: super::ProviderBindingEpoch,
     rewrite: &dyn ConnectorDistributedRewrite,
 ) -> Result<(), ConnectorError> {
     if rewrite.descriptor() != descriptor
@@ -987,7 +987,7 @@ pub(crate) fn validate_distributed_rewrite_owner(
 
 fn request_digest(
     operation_id: ConnectorWriteOperationId,
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     operation: &ConnectorDistributedRewriteOperation,
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
@@ -1095,9 +1095,9 @@ mod tests {
 
     fn request() -> ConnectorDistributedRewritePlanningRequest {
         let instance = ConnectorInstanceId::parse("rewrite-contract-test").unwrap();
-        let owner = ConnectorExecutionBindingKey {
+        let owner = ConnectorProviderBindingKey {
             instance_id: instance.clone(),
-            incarnation: super::super::ConnectorInstanceIncarnation::from_bytes([9; 16]),
+            incarnation: super::super::ProviderBindingEpoch::from_bytes([9; 16]),
         };
         let table = ConnectorTableHandle::try_new(instance, Bytes::from_static(b"table")).unwrap();
         ConnectorDistributedRewritePlanningRequest::try_new(

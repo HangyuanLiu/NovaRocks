@@ -30,22 +30,22 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
 use novarocks_spi::connector::{
-    ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorMetadata,
-    ConnectorMutationOperationId, ConnectorNamespaceIdentity, ConnectorNamespaceRequest,
-    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorReadNamedReference,
-    ConnectorReadPurpose, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
-    ConnectorReadReferenceKind, ConnectorReadSelector, ConnectorReadSnapshotLogEntry,
-    ConnectorScalarType, ConnectorScalarValue, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
+    ConnectorMetadata, ConnectorMutationOperationId, ConnectorNamespaceIdentity,
+    ConnectorNamespaceRequest, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
+    ConnectorProviderBindingKey, ConnectorReadNamedReference, ConnectorReadPurpose,
+    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
+    ConnectorReadSelector, ConnectorReadSnapshotLogEntry, ConnectorScalarType,
+    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableDefinitionFacts,
     ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
     ConnectorTableObjectBinding, ConnectorTableObjectBindingFailure,
     ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
     ConnectorTableObjectSelector, ConnectorTablePlanningFacts, ConnectorTableRequest,
-    ConnectorTableResolution, validate_static_predicates,
+    ConnectorTableResolution, ProviderBindingEpoch, validate_static_predicates,
 };
 use serde::{Deserialize, Serialize};
 
@@ -101,8 +101,8 @@ impl GenerationOwner {
 #[derive(Clone)]
 pub struct IcebergMetadata {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
-    binding_key: ConnectorExecutionBindingKey,
+    incarnation: ProviderBindingEpoch,
+    binding_key: ConnectorProviderBindingKey,
     runtime: Arc<IcebergMetadataContext>,
     generation_owner: Arc<GenerationOwner>,
 }
@@ -110,10 +110,10 @@ pub struct IcebergMetadata {
 impl IcebergMetadata {
     pub(crate) fn new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         runtime: Arc<IcebergMetadataContext>,
     ) -> Self {
-        let binding_key = ConnectorExecutionBindingKey {
+        let binding_key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation,
         };
@@ -132,7 +132,7 @@ impl IcebergMetadata {
         &self.descriptor
     }
 
-    pub(crate) fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    pub(crate) fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
 
@@ -691,7 +691,7 @@ impl ConnectorScanPlanning for IcebergMetadata {
                 },
             };
             return ConnectorScan::try_new_change_window(
-                ConnectorExecutionBindingKey {
+                ConnectorProviderBindingKey {
                     instance_id: self.descriptor.instance_id.clone(),
                     incarnation: self.incarnation,
                 },
@@ -754,7 +754,7 @@ impl ConnectorScanPlanning for IcebergMetadata {
             mode: IcebergScanModeV1::Snapshot,
         };
         ConnectorScan::try_new_snapshot(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: self.descriptor.instance_id.clone(),
                 incarnation: self.incarnation,
             },
@@ -2013,7 +2013,7 @@ mod plan_splits_pruning_tests {
                 provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
                 instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
             },
-            ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            ProviderBindingEpoch::from_bytes([7; 16]),
             runtime,
         );
         (executor, warehouse, provider)

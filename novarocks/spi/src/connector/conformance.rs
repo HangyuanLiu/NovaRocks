@@ -184,12 +184,12 @@ mod tests {
 
     use super::*;
     use crate::connector::{
-        ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
-        ConnectorNamespaceRequest, ConnectorRequestContext, ConnectorTableDefinitionFacts,
-        ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
-        ConnectorTableObjectId, ConnectorTableObjectSelector, ConnectorTablePlanningFacts,
-        ConnectorTableRequest, ConnectorTableResolution,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorListTablesRequest, ConnectorMetadata,
+        ConnectorNamespaceRequest, ConnectorProviderBindingKey, ConnectorRequestContext,
+        ConnectorTableDefinitionFacts, ConnectorTableHandle, ConnectorTableIdentity,
+        ConnectorTableMetadata, ConnectorTableObjectId, ConnectorTableObjectSelector,
+        ConnectorTablePlanningFacts, ConnectorTableRequest, ConnectorTableResolution,
+        ProviderBindingEpoch,
     };
 
     struct NeverCancelled;
@@ -210,10 +210,10 @@ mod tests {
         .expect("request context")
     }
 
-    fn owner() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn owner() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("catalog.ice").expect("instance id"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([2; 16]),
         }
     }
 

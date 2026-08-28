@@ -66,7 +66,7 @@ impl novarocks_spi::connector::ConnectorControlResolver for RejectCurrentControl
         &self,
         _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorExecutionBindingKey,
+        novarocks_spi::connector::ConnectorProviderBindingKey,
         novarocks_spi::connector::ConnectorError,
     > {
         panic!("topology-only re-planning must not observe a current connector binding")

@@ -23,14 +23,14 @@ use super::{
     ConnectorCleanupMaintenanceResolver, ConnectorControlRuntimeId, ConnectorDataMutation,
     ConnectorDataMutationResolver, ConnectorDistributedRewrite,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
-    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
-    ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,
-    ConnectorTableHandle, ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease,
-    ConnectorViewMetadata, ConnectorWriteControl, ConnectorWriteLease,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata,
+    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorProviderBinding,
+    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorStagedCreate, ConnectorStagedCreateLease, ConnectorStatistics,
+    ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorTableHandle,
+    ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata,
+    ConnectorWriteControl, ConnectorWriteLease, ProviderBindingEpoch,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -57,7 +57,7 @@ pub trait ConnectorExecutionDistribution: Send + Sync {
     fn declaration(
         &self,
         context: &ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError>;
+    ) -> Result<ConnectorProviderBinding, ConnectorError>;
 }
 
 /// Process-local input used by a frontend composition root when a catalog
@@ -224,7 +224,7 @@ pub trait ConnectorControlFactoryResolver: Send + Sync {
 /// FE-local owner and is deliberately unable to open a batch reader.
 pub struct ConnectorControlBinding {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     control_runtime_id: ConnectorControlRuntimeId,
     /// Immutable BE materialization input assigned by the FE desired-state
     /// owner before this control binding becomes query-admissible.
@@ -253,7 +253,7 @@ pub struct ConnectorControlBinding {
 impl ConnectorControlBinding {
     pub fn try_new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -274,7 +274,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_write(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -295,7 +295,7 @@ impl ConnectorControlBinding {
 
     pub fn try_new_with_statistics(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -317,7 +317,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_data_mutation(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -340,7 +340,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_capabilities(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -364,7 +364,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_capabilities(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -441,7 +441,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_capabilities_and_metadata_maintenance(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -469,7 +469,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_capabilities_and_staged_create(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -514,7 +514,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_maintenance_capabilities(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -544,7 +544,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_maintenance_capabilities_and_staged_create(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -578,7 +578,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -599,7 +599,7 @@ impl ConnectorControlBinding {
             )?;
         }
         if let Some(cleanup) = &cleanup_maintenance {
-            let key = ConnectorExecutionBindingKey {
+            let key = ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
             };
@@ -631,7 +631,7 @@ impl ConnectorControlBinding {
         &self.descriptor
     }
 
-    pub fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    pub fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
 
@@ -783,10 +783,10 @@ impl ConnectorControlBinding {
         Ok(self)
     }
 
-    pub fn execution_declaration(
+    pub fn provider_binding(
         &self,
         context: &ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+    ) -> Result<ConnectorProviderBinding, ConnectorError> {
         let declaration = self.distribution.declaration(context)?;
         let key = declaration.binding_key();
         if declaration.provider_id() != self.descriptor.provider_id.as_str()
@@ -795,7 +795,7 @@ impl ConnectorControlBinding {
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "connector execution declaration does not match its control binding generation",
+                "connector provider binding does not match its control binding generation",
             ));
         }
         Ok(declaration)
@@ -812,7 +812,7 @@ pub trait ConnectorControlResolver: Send + Sync {
     fn observe_current_binding(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorExecutionBindingKey, ConnectorError>;
+    ) -> Result<ConnectorProviderBindingKey, ConnectorError>;
 
     /// Observe the active FE-local control runtime without retaining it.
     /// This identity is intentionally separate from the legacy effect key and

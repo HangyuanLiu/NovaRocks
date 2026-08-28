@@ -25,7 +25,7 @@
 use arrow::datatypes::{DataType, Field};
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorTableHandle,
+    ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorTableHandle,
     ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion, ConnectorWriteFieldBinding,
     ConnectorWriteFieldRequest, ConnectorWriteFieldToken, ConnectorWriteInputRequest,
     ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWritePreparation,
@@ -53,7 +53,7 @@ use crate::storage_inspector::MV_DESCRIPTOR_PACKAGE_ID_PROP;
 /// or recreate a preparation for another connector incarnation.
 pub(crate) fn prepare_write(
     request: ConnectorWritePreparationRequest,
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
 ) -> Result<ConnectorWritePreparationOutcome, ConnectorError> {
     request.validate(owner)?;
     let payload: IcebergTablePayload =
@@ -247,7 +247,7 @@ fn write_support_denial(
 
 fn bind_write_input(
     request: &ConnectorWritePreparationRequest,
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     metadata: &TableMetadata,
 ) -> Result<ConnectorWriteInputShape, ConnectorError> {
     Ok(match &request.input {
@@ -417,7 +417,7 @@ fn position_delete_partition_field_requests(
 
 fn bind_write_fields(
     fields: &[ConnectorWriteFieldRequest],
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     table: &ConnectorTableHandle,
     intent: ConnectorWriteIntent,
     domain: u8,
@@ -450,8 +450,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorRequestContext, ConnectorWriteTargetRef,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorWriteTargetRef, ProviderBindingEpoch,
     };
 
     use crate::iceberg::spec::{
@@ -482,10 +482,10 @@ mod tests {
         .expect("context")
     }
 
-    fn owner() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn owner() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         }
     }
 
@@ -546,7 +546,7 @@ mod tests {
     }
 
     fn table_handle(
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         payload: &IcebergTablePayload,
     ) -> ConnectorTableHandle {
         ConnectorTableHandle::try_new(
@@ -557,7 +557,7 @@ mod tests {
     }
 
     fn data_request(
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         payload: &IcebergTablePayload,
         purpose: ConnectorWriteAdmissionPurpose,
     ) -> ConnectorWritePreparationRequest {
@@ -580,7 +580,7 @@ mod tests {
     /// `RowDelta` intent it declares plus the equality-delete input shape that
     /// only this statement produces.
     fn equality_delete_request(
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         payload: &IcebergTablePayload,
     ) -> ConnectorWritePreparationRequest {
         ConnectorWritePreparationRequest {
@@ -1239,7 +1239,7 @@ mod tests {
     #[test]
     fn a_table_owned_by_another_instance_is_rejected_before_decoding() {
         let owner = owner();
-        let other = ConnectorExecutionBindingKey {
+        let other = ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("other").expect("instance"),
             incarnation: owner.incarnation,
         };

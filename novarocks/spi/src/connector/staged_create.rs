@@ -32,12 +32,12 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorColumnDefinition, ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorMutationFailure, ConnectorMutationOperationId, ConnectorPartitionTransform,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorWriteIntent,
-    ConnectorWriteLease, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
-    CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationOperationId,
+    ConnectorPartitionTransform, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorWriteIntent, ConnectorWriteLease,
+    ConnectorWriteOperationCompletion, ConnectorWriteOperationId, CreatePolicy,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, ProviderBindingEpoch,
 };
 
 pub const CONNECTOR_STAGED_CREATE_CONTRACT_VERSION: u32 = 1;
@@ -50,7 +50,7 @@ const UNANCHORED_CTAS_PROVENANCE_DOMAIN: &[u8] =
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConnectorStagedTableHandle {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorStagedCreateOperationId,
     provider_payload: Bytes,
     digest: [u8; 32],
@@ -58,7 +58,7 @@ pub struct ConnectorStagedTableHandle {
 
 impl ConnectorStagedTableHandle {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorStagedCreateOperationId,
         provider_payload: Bytes,
     ) -> Result<Self, ConnectorError> {
@@ -86,7 +86,7 @@ impl ConnectorStagedTableHandle {
         })
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -117,7 +117,7 @@ pub struct ConnectorStagedWritePlanningRequest {
 /// they are consumed only by the existing connector writer planner.
 #[derive(Clone)]
 pub struct ConnectorStagedWritePlanningBinding {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     target_operation_id: ConnectorStagedCreateOperationId,
     target_handle_digest: [u8; 32],
     operation_id: ConnectorWriteOperationId,
@@ -162,7 +162,7 @@ impl ConnectorStagedWritePlanningBinding {
         })
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -213,7 +213,7 @@ impl std::fmt::Debug for ConnectorStagedTableHandle {
 
 #[derive(Clone)]
 pub struct ConnectorStagedCreatePrepareRequest {
-    pub owner: ConnectorExecutionBindingKey,
+    pub owner: ConnectorProviderBindingKey,
     /// The statement-level identity shared by the staged root, Iceberg marker
     /// and eventual unanchored-GC provenance.  `operation_id` remains the
     /// lease-local dispatch key; it must not become a second durable owner.
@@ -236,7 +236,7 @@ pub enum ConnectorStagedCreateReceiptPhase {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorStagedCreateReceipt {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorStagedCreateOperationId,
     phase: ConnectorStagedCreateReceiptPhase,
     effect: ExternalMutationEffect,
@@ -245,7 +245,7 @@ pub struct ConnectorStagedCreateReceipt {
 
 impl ConnectorStagedCreateReceipt {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorStagedCreateOperationId,
         phase: ConnectorStagedCreateReceiptPhase,
         effect: ExternalMutationEffect,
@@ -266,7 +266,7 @@ impl ConnectorStagedCreateReceipt {
         })
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub const fn operation_id(&self) -> ConnectorStagedCreateOperationId {
@@ -376,7 +376,7 @@ pub enum ConnectorStagedCreatePublicationAdjudicationOutcome {
 
 pub trait ConnectorStagedCreate: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
-    fn incarnation(&self) -> ConnectorInstanceIncarnation;
+    fn incarnation(&self) -> ProviderBindingEpoch;
 
     fn prepare(
         &self,
@@ -492,7 +492,7 @@ impl ConnectorCtasUnanchoredProvenance {
 /// a table handle.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorCtasUnanchoredCleanupRequest {
-    pub owner: ConnectorExecutionBindingKey,
+    pub owner: ConnectorProviderBindingKey,
     pub warehouse_root: Arc<str>,
     pub cutoff_ms: i64,
     pub provenance: ConnectorCtasUnanchoredProvenance,
@@ -503,14 +503,14 @@ pub struct ConnectorCtasUnanchoredCleanupRequest {
 /// list young roots and leave filtering to a later, potentially skewed owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorCtasUnanchoredDiscoveryRequest {
-    pub owner: ConnectorExecutionBindingKey,
+    pub owner: ConnectorProviderBindingKey,
     pub warehouse_root: Arc<str>,
     pub cutoff_ms: i64,
 }
 
 impl ConnectorCtasUnanchoredDiscoveryRequest {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         warehouse_root: Arc<str>,
         cutoff_ms: i64,
     ) -> Result<Self, ConnectorError> {
@@ -529,7 +529,7 @@ impl ConnectorCtasUnanchoredDiscoveryRequest {
 
 impl ConnectorCtasUnanchoredCleanupRequest {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         warehouse_root: Arc<str>,
         cutoff_ms: i64,
         provenance: ConnectorCtasUnanchoredProvenance,
@@ -566,7 +566,7 @@ pub enum ConnectorCtasUnanchoredCleanupOutcome {
 /// deletes that prefix. Any negative or ambiguous observation is retained.
 pub trait ConnectorUnanchoredCtasCleanup: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
-    fn incarnation(&self) -> ConnectorInstanceIncarnation;
+    fn incarnation(&self) -> ProviderBindingEpoch;
     fn warehouse_root(&self) -> Result<Arc<str>, ConnectorError>;
 
     /// Enumerate only provenance sidecars under the fixed warehouse prefix.
@@ -592,7 +592,7 @@ pub trait ConnectorUnanchoredCtasCleanup: Send + Sync {
 #[derive(Clone)]
 pub struct ConnectorUnanchoredCtasCleanupLease {
     control_runtime_id: ConnectorControlRuntimeId,
-    provider_binding_key: ConnectorExecutionBindingKey,
+    provider_binding_key: ConnectorProviderBindingKey,
     capability: Arc<dyn ConnectorUnanchoredCtasCleanup>,
     _release: Arc<StagedCreateLeaseRelease>,
 }
@@ -601,11 +601,11 @@ impl ConnectorUnanchoredCtasCleanupLease {
     pub fn new_with_control_runtime(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
-        provider_incarnation: ConnectorInstanceIncarnation,
+        provider_incarnation: ProviderBindingEpoch,
         capability: Arc<dyn ConnectorUnanchoredCtasCleanup>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
-        let provider_binding_key = ConnectorExecutionBindingKey {
+        let provider_binding_key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation: provider_incarnation,
         };
@@ -671,7 +671,7 @@ impl ConnectorUnanchoredCtasCleanupLease {
 #[derive(Clone)]
 pub struct ConnectorStagedCreateLease {
     control_runtime_id: ConnectorControlRuntimeId,
-    provider_binding_key: ConnectorExecutionBindingKey,
+    provider_binding_key: ConnectorProviderBindingKey,
     capability: Arc<dyn ConnectorStagedCreate>,
     operations: Arc<Mutex<HashMap<ConnectorStagedCreateOperationId, LeaseOperationState>>>,
     _release: Arc<StagedCreateLeaseRelease>,
@@ -711,11 +711,11 @@ impl ConnectorStagedCreateLease {
     pub fn new_with_control_runtime(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
-        provider_incarnation: ConnectorInstanceIncarnation,
+        provider_incarnation: ProviderBindingEpoch,
         capability: Arc<dyn ConnectorStagedCreate>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
-        let provider_binding_key = ConnectorExecutionBindingKey {
+        let provider_binding_key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation: provider_incarnation,
         };
@@ -782,7 +782,7 @@ impl ConnectorStagedCreateLease {
 
     #[cfg(test)]
     pub fn new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         capability: Arc<dyn ConnectorStagedCreate>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
@@ -797,7 +797,7 @@ impl ConnectorStagedCreateLease {
     }
 
     #[cfg(test)]
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.provider_binding_key
     }
 
@@ -1547,9 +1547,9 @@ mod tests {
         )
         .unwrap();
         let request = ConnectorCtasUnanchoredCleanupRequest::try_new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id,
-                incarnation: ConnectorInstanceIncarnation::new(),
+                incarnation: ProviderBindingEpoch::new(),
             },
             Arc::from("s3://warehouse/root"),
             100,
@@ -1568,7 +1568,7 @@ mod tests {
 
     struct FakeCapability {
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         aborts: AtomicUsize,
         prepares: AtomicUsize,
         unknown_prepare: bool,
@@ -1587,7 +1587,7 @@ mod tests {
             phase: ConnectorStagedCreateReceiptPhase,
         ) -> ConnectorStagedCreateReceipt {
             ConnectorStagedCreateReceipt::try_new(
-                ConnectorExecutionBindingKey {
+                ConnectorProviderBindingKey {
                     instance_id: self.descriptor.instance_id.clone(),
                     incarnation: self.incarnation,
                 },
@@ -1627,7 +1627,7 @@ mod tests {
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
         }
-        fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        fn incarnation(&self) -> ProviderBindingEpoch {
             self.incarnation
         }
         fn prepare(
@@ -1764,7 +1764,7 @@ mod tests {
             self.inner.descriptor()
         }
 
-        fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        fn incarnation(&self) -> ProviderBindingEpoch {
             self.inner.incarnation()
         }
 
@@ -1824,13 +1824,13 @@ mod tests {
         }
     }
 
-    fn owner() -> (ConnectorInstanceDescriptor, ConnectorInstanceIncarnation) {
+    fn owner() -> (ConnectorInstanceDescriptor, ProviderBindingEpoch) {
         (
             ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
                 instance_id: ConnectorInstanceId::parse("rest").unwrap(),
             },
-            ConnectorInstanceIncarnation::new(),
+            ProviderBindingEpoch::new(),
         )
     }
 
@@ -1845,7 +1845,7 @@ mod tests {
     }
 
     fn prepare_request(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorStagedCreateOperationId,
     ) -> ConnectorStagedCreatePrepareRequest {
         ConnectorStagedCreatePrepareRequest {
@@ -1866,12 +1866,12 @@ mod tests {
         }
     }
 
-    fn completion(owner: ConnectorExecutionBindingKey) -> ConnectorWriteOperationCompletion {
+    fn completion(owner: ConnectorProviderBindingKey) -> ConnectorWriteOperationCompletion {
         completion_for(owner, ConnectorWriteOperationId::new())
     }
 
     fn completion_for(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
     ) -> ConnectorWriteOperationCompletion {
         let cohort_id = ConnectorWriteCohortId::primary(operation_id);
@@ -1943,7 +1943,7 @@ mod tests {
             publishes: AtomicUsize::new(0),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
             },
@@ -2007,7 +2007,7 @@ mod tests {
             publishes: AtomicUsize::new(0),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
             },
@@ -2023,7 +2023,7 @@ mod tests {
             panic!("expected prepared")
         };
         let mut foreign_owner = lease.owner().clone();
-        foreign_owner.incarnation = ConnectorInstanceIncarnation::new();
+        foreign_owner.incarnation = ProviderBindingEpoch::new();
         let foreign = ConnectorStagedTableHandle::try_new(
             foreign_owner,
             operation_id,
@@ -2078,7 +2078,7 @@ mod tests {
             publishes: AtomicUsize::new(0),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
             },
@@ -2130,7 +2130,7 @@ mod tests {
             publishes: AtomicUsize::new(0),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
             },
@@ -2167,7 +2167,7 @@ mod tests {
             publishes: AtomicUsize::new(0),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id,
                 incarnation,
             },
@@ -2205,7 +2205,7 @@ mod tests {
             publishes: AtomicUsize::new(0),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
             },
@@ -2244,7 +2244,7 @@ mod tests {
             publishes: AtomicUsize::new(0),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
             },
@@ -2283,7 +2283,7 @@ mod tests {
             publishes: AtomicUsize::new(0),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
             },
@@ -2342,7 +2342,7 @@ mod tests {
             publishes: AtomicUsize::new(0),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
             },
@@ -2404,7 +2404,7 @@ mod tests {
             publishes: AtomicUsize::new(0),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id,
                 incarnation,
             },
@@ -2450,7 +2450,7 @@ mod tests {
             poison_on_abort: Mutex::new(None),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id,
                 incarnation,
             },
@@ -2510,7 +2510,7 @@ mod tests {
             poison_on_abort: Mutex::new(None),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id,
                 incarnation,
             },
@@ -2558,7 +2558,7 @@ mod tests {
             publishes: AtomicUsize::new(0),
         });
         let lease = ConnectorStagedCreateLease::new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
             },

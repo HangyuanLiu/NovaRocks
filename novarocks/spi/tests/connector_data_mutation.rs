@@ -28,14 +28,14 @@ use novarocks_spi::connector::{
     ConnectorDataMutationOperation, ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorDataMutationSourceScope, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorNamespaceRequest, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTableRequest, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_DATA_MUTATION_FILES,
-    MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
+    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorNamespaceRequest,
+    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, MAX_CONNECTOR_DATA_MUTATION_FILES,
+    MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES, ProviderBindingEpoch,
 };
 
 struct NeverCancelled;
@@ -98,7 +98,7 @@ enum ExecuteMode {
 
 struct FakeDataMutation {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
     plans: Mutex<HashMap<ConnectorMutationOperationId, ([u8; 32], ConnectorDataMutationPlan)>>,
     mode: Mutex<ExecuteMode>,
     execute_calls: Mutex<usize>,
@@ -112,9 +112,9 @@ impl FakeDataMutation {
                 provider_id: ConnectorProviderId::parse(provider).expect("provider ID"),
                 instance_id: instance_id.clone(),
             },
-            key: ConnectorExecutionBindingKey {
+            key: ConnectorProviderBindingKey {
                 instance_id,
-                incarnation: ConnectorInstanceIncarnation::from_bytes(incarnation),
+                incarnation: ProviderBindingEpoch::from_bytes(incarnation),
             },
             plans: Mutex::new(HashMap::new()),
             mode: Mutex::new(ExecuteMode::Committed),
@@ -173,7 +173,7 @@ impl ConnectorDataMutation for FakeDataMutation {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -403,7 +403,7 @@ fn bounds_and_exact_generation_fail_closed() {
         ConnectorDataMutationLease::new(
             fake.descriptor.clone(),
             ConnectorControlRuntimeId::from_bytes([2; 16]),
-            ConnectorInstanceIncarnation::from_bytes([9; 16]),
+            ProviderBindingEpoch::from_bytes([9; 16]),
             Arc::new(FakeMetadata {
                 instance_id: fake.key.instance_id.clone(),
             }),

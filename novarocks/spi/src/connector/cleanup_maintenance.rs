@@ -26,9 +26,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorMetadata, ConnectorRequestContext, ConnectorTableHandle,
+    ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorMetadata, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorTableHandle, ProviderBindingEpoch,
 };
 
 pub const CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION: u16 = 2;
@@ -340,7 +340,7 @@ impl ConnectorCleanupOperation {
 #[derive(Clone)]
 pub struct ConnectorCleanupPlanningRequest {
     operation_id: ConnectorCleanupOperationId,
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation: ConnectorCleanupOperation,
     owned_ref_selection: Option<ConnectorCleanupOwnedRefSelection>,
     request_digest: [u8; 32],
@@ -350,7 +350,7 @@ pub struct ConnectorCleanupPlanningRequest {
 impl ConnectorCleanupPlanningRequest {
     pub fn try_new(
         operation_id: ConnectorCleanupOperationId,
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation: ConnectorCleanupOperation,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
@@ -376,7 +376,7 @@ impl ConnectorCleanupPlanningRequest {
     /// discovery request, this mode can never authorize an object sweep.
     pub fn try_new_selected_owned_refs(
         operation_id: ConnectorCleanupOperationId,
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation: ConnectorCleanupOperation,
         owned_ref_selection: ConnectorCleanupOwnedRefSelection,
         context: ConnectorRequestContext,
@@ -405,7 +405,7 @@ impl ConnectorCleanupPlanningRequest {
         self.operation_id
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -524,7 +524,7 @@ impl ConnectorCleanupPlanSummary {
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConnectorCleanupPlan {
     schema_version: u16,
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorCleanupOperationId,
     request_digest: [u8; 32],
     base_state_digest: [u8; 32],
@@ -566,7 +566,7 @@ impl ConnectorCleanupPlan {
 
     #[allow(clippy::too_many_arguments)]
     pub fn try_restore(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorCleanupOperationId,
         request_digest: [u8; 32],
         base_state_digest: [u8; 32],
@@ -593,7 +593,7 @@ impl ConnectorCleanupPlan {
     pub const fn schema_version(&self) -> u16 {
         self.schema_version
     }
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub const fn operation_id(&self) -> ConnectorCleanupOperationId {
@@ -662,7 +662,7 @@ impl fmt::Debug for ConnectorCleanupPlan {
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct PreparedBatch {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorCleanupOperationId,
     plan_digest: [u8; 32],
     manifest_digest: [u8; 32],
@@ -675,7 +675,7 @@ pub struct PreparedBatch {
 impl PreparedBatch {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorCleanupOperationId,
         plan_digest: [u8; 32],
         manifest_digest: [u8; 32],
@@ -711,7 +711,7 @@ impl PreparedBatch {
         })
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub const fn operation_id(&self) -> ConnectorCleanupOperationId {
@@ -848,7 +848,7 @@ impl PreparedBatch {
             )
         })?;
         let incarnation =
-            ConnectorInstanceIncarnation::from_bytes(take(16, &mut cursor)?.try_into().unwrap());
+            ProviderBindingEpoch::from_bytes(take(16, &mut cursor)?.try_into().unwrap());
         let operation_id =
             ConnectorCleanupOperationId::from_bytes(take(16, &mut cursor)?.try_into().unwrap());
         let plan_digest = take(32, &mut cursor)?.try_into().unwrap();
@@ -865,7 +865,7 @@ impl PreparedBatch {
             ));
         }
         let prepared = Self::try_new(
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: ConnectorInstanceId::parse(instance)?,
                 incarnation,
             },
@@ -943,7 +943,7 @@ impl BatchReceiptSummary {
 #[derive(Clone, Eq, PartialEq)]
 pub struct BatchReceipt {
     descriptor: ConnectorInstanceDescriptor,
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorCleanupOperationId,
     plan_digest: [u8; 32],
     manifest_digest: [u8; 32],
@@ -958,7 +958,7 @@ impl BatchReceipt {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         descriptor: ConnectorInstanceDescriptor,
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorCleanupOperationId,
         plan_digest: [u8; 32],
         manifest_digest: [u8; 32],
@@ -1004,7 +1004,7 @@ impl BatchReceipt {
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub const fn operation_id(&self) -> ConnectorCleanupOperationId {
@@ -1070,7 +1070,7 @@ impl fmt::Debug for BatchReceipt {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidatePage {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorCleanupOperationId,
     manifest_digest: [u8; 32],
     offset: u64,
@@ -1080,7 +1080,7 @@ pub struct CandidatePage {
 
 impl CandidatePage {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorCleanupOperationId,
         manifest_digest: [u8; 32],
         offset: u64,
@@ -1098,7 +1098,7 @@ impl CandidatePage {
         page.validate()?;
         Ok(page)
     }
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub const fn operation_id(&self) -> ConnectorCleanupOperationId {
@@ -1252,7 +1252,7 @@ impl ConnectorCleanupFinalizeRequest {
 /// planning. `execute_batch` is invoked once per prepared batch.
 pub trait ConnectorCleanupMaintenance: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey;
+    fn binding_key(&self) -> &ConnectorProviderBindingKey;
     fn plan_cleanup(
         &self,
         request: ConnectorCleanupPlanningRequest,
@@ -1290,7 +1290,7 @@ pub trait ConnectorCleanupMaintenanceResolver: Send + Sync {
 pub struct ConnectorCleanupMaintenanceLease {
     descriptor: ConnectorInstanceDescriptor,
     control_runtime_id: ConnectorControlRuntimeId,
-    provider_binding_key: ConnectorExecutionBindingKey,
+    provider_binding_key: ConnectorProviderBindingKey,
     metadata: Arc<dyn ConnectorMetadata>,
     cleanup: Arc<dyn ConnectorCleanupMaintenance>,
     _release: Arc<CleanupRelease>,
@@ -1303,12 +1303,12 @@ impl ConnectorCleanupMaintenanceLease {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
-        provider_incarnation: ConnectorInstanceIncarnation,
+        provider_incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         cleanup: Arc<dyn ConnectorCleanupMaintenance>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
-        let provider_binding_key = ConnectorExecutionBindingKey {
+        let provider_binding_key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation: provider_incarnation,
         };
@@ -1498,7 +1498,7 @@ impl Drop for CleanupRelease {
 
 pub(crate) fn validate_cleanup_maintenance_owner(
     descriptor: &ConnectorInstanceDescriptor,
-    key: &ConnectorExecutionBindingKey,
+    key: &ConnectorProviderBindingKey,
     cleanup: &dyn ConnectorCleanupMaintenance,
 ) -> Result<(), ConnectorError> {
     if cleanup.descriptor() != descriptor || cleanup.binding_key() != key {
@@ -1531,7 +1531,7 @@ fn validate_prepared_for_plan(
 
 fn request_digest(
     id: ConnectorCleanupOperationId,
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     operation: &ConnectorCleanupOperation,
     owned_ref_selection: Option<&ConnectorCleanupOwnedRefSelection>,
 ) -> [u8; 32] {
@@ -1569,7 +1569,7 @@ fn plan_digest(
     hash.finalize().into()
 }
 fn prepared_digest(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     id: ConnectorCleanupOperationId,
     plan: [u8; 32],
     manifest: [u8; 32],
@@ -1592,7 +1592,7 @@ fn prepared_digest(
 #[allow(clippy::too_many_arguments)]
 fn receipt_digest(
     descriptor: &ConnectorInstanceDescriptor,
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     id: ConnectorCleanupOperationId,
     plan: [u8; 32],
     manifest: [u8; 32],
@@ -1639,14 +1639,13 @@ mod tests {
 
     use super::*;
     use crate::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorProviderId,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId, ProviderBindingEpoch,
     };
 
-    fn owner() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn owner() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("iceberg.main").unwrap(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         }
     }
 

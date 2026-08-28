@@ -27,9 +27,9 @@ use uuid::Uuid;
 
 use super::{
     ConnectorCommittedPartitioning, ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorNamespaceIdentity, ConnectorRequestContext,
-    ConnectorTableIdentity, ConnectorTableObjectId,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorNamespaceIdentity,
+    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorTableIdentity,
+    ConnectorTableObjectId, ProviderBindingEpoch,
 };
 
 /// Largest provider-owned reconciliation payload accepted by the control plane.
@@ -684,7 +684,7 @@ impl ConnectorCatalogMutationOperation {
 #[derive(Clone)]
 pub struct ConnectorCatalogMutationRequest {
     pub operation_id: ConnectorMutationOperationId,
-    pub target: ConnectorExecutionBindingKey,
+    pub target: ConnectorProviderBindingKey,
     pub operation: ConnectorCatalogMutationOperation,
     pub context: ConnectorRequestContext,
 }
@@ -692,7 +692,7 @@ pub struct ConnectorCatalogMutationRequest {
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConnectorCatalogMutationReceipt {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     operation_id: ConnectorMutationOperationId,
     operation_kind: Arc<str>,
     provider_version: Option<Bytes>,
@@ -703,7 +703,7 @@ pub struct ConnectorCatalogMutationReceipt {
 impl ConnectorCatalogMutationReceipt {
     pub fn try_new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         operation_id: ConnectorMutationOperationId,
         operation_kind: impl Into<Arc<str>>,
         provider_version: Option<Bytes>,
@@ -730,7 +730,7 @@ impl ConnectorCatalogMutationReceipt {
 
     pub fn try_new_with_committed_version(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         operation_id: ConnectorMutationOperationId,
         operation_kind: impl Into<Arc<str>>,
         provider_version: Option<Bytes>,
@@ -752,7 +752,7 @@ impl ConnectorCatalogMutationReceipt {
 
     pub fn try_new_with_committed_facts(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         operation_id: ConnectorMutationOperationId,
         operation_kind: impl Into<Arc<str>>,
         provider_version: Option<Bytes>,
@@ -774,7 +774,7 @@ impl ConnectorCatalogMutationReceipt {
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    pub const fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
     pub const fn operation_id(&self) -> ConnectorMutationOperationId {
@@ -817,7 +817,7 @@ impl fmt::Debug for ConnectorCatalogMutationReceipt {
 pub struct ExternalMutationEvidence {
     schema_version: u16,
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     operation_id: ConnectorMutationOperationId,
     operation_kind: Arc<str>,
     provider_payload: Bytes,
@@ -827,7 +827,7 @@ impl ExternalMutationEvidence {
     pub fn try_new(
         schema_version: u16,
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         operation_id: ConnectorMutationOperationId,
         operation_kind: impl Into<Arc<str>>,
         provider_payload: Bytes,
@@ -854,7 +854,7 @@ impl ExternalMutationEvidence {
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    pub const fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
     pub const fn operation_id(&self) -> ConnectorMutationOperationId {
@@ -1016,7 +1016,7 @@ impl ExternalMutationEvidence {
                 provider_id: super::ConnectorProviderId::parse(provider_id)?,
                 instance_id: ConnectorInstanceId::parse(instance_id)?,
             },
-            ConnectorInstanceIncarnation::from_bytes(incarnation),
+            ProviderBindingEpoch::from_bytes(incarnation),
             ConnectorMutationOperationId::from_bytes(operation_id),
             operation_kind,
             Bytes::copy_from_slice(payload),
@@ -1049,7 +1049,7 @@ pub struct ConnectorCatalogMutationReconcileRequest {
 /// BE execution binding.
 pub trait ConnectorCatalogMutation: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
-    fn incarnation(&self) -> ConnectorInstanceIncarnation;
+    fn incarnation(&self) -> ProviderBindingEpoch;
     fn execute(
         &self,
         request: ConnectorCatalogMutationRequest,
@@ -1078,7 +1078,7 @@ pub trait ConnectorCatalogMutationResolver: Send + Sync {
 pub struct ConnectorCatalogMutationLease {
     descriptor: ConnectorInstanceDescriptor,
     control_runtime_id: ConnectorControlRuntimeId,
-    provider_incarnation: ConnectorInstanceIncarnation,
+    provider_incarnation: ProviderBindingEpoch,
     mutation: Arc<dyn ConnectorCatalogMutation>,
     _release: Arc<MutationLeaseRelease>,
 }
@@ -1091,7 +1091,7 @@ impl ConnectorCatalogMutationLease {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         control_runtime_id: ConnectorControlRuntimeId,
-        provider_incarnation: ConnectorInstanceIncarnation,
+        provider_incarnation: ProviderBindingEpoch,
         mutation: Arc<dyn ConnectorCatalogMutation>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
@@ -1130,7 +1130,7 @@ impl ConnectorCatalogMutationLease {
     ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
         self.execute(ConnectorCatalogMutationRequest {
             operation_id,
-            target: ConnectorExecutionBindingKey {
+            target: ConnectorProviderBindingKey {
                 instance_id: self.descriptor.instance_id.clone(),
                 incarnation: self.provider_incarnation,
             },
@@ -1248,8 +1248,8 @@ mod tests {
     };
     use crate::connector::{
         ConnectorCommittedPartitionField, ConnectorCommittedPartitioning, ConnectorErrorKind,
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorManagedPartitionTransform, ConnectorProviderId, ConnectorTableIdentity,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorManagedPartitionTransform,
+        ConnectorProviderId, ConnectorTableIdentity, ProviderBindingEpoch,
     };
 
     fn table() -> ConnectorTableIdentity {
@@ -1284,7 +1284,7 @@ mod tests {
                 provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
                 instance_id: ConnectorInstanceId::parse("analytics").expect("instance ID"),
             },
-            ConnectorInstanceIncarnation::new(),
+            ProviderBindingEpoch::new(),
             ConnectorMutationOperationId::new(),
             "statistics-publish",
             Bytes::from_static(b"operation-specific-evidence"),

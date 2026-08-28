@@ -489,14 +489,15 @@ mod tests {
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorControlBinding, ConnectorDistributedRewrite,
         ConnectorDistributedRewriteCohortPlan, ConnectorDistributedRewritePlanSummary,
-        ConnectorDistributedRewritePlanningRequest, ConnectorExecutionBindingKey,
-        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorProviderId,
+        ConnectorDistributedRewritePlanningRequest, ConnectorExecutionDistribution,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata,
+        ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderId,
         ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteActivationIntent,
         ConnectorWriteActivationRequest, ConnectorWriteActivationSource, ConnectorWriteBaseVersion,
         ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
         ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
         ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
+        ProviderBindingEpoch,
     };
 
     use super::*;
@@ -520,7 +521,7 @@ mod tests {
     }
 
     fn preparation(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         table: ConnectorTableHandle,
         schema: &arrow::datatypes::SchemaRef,
     ) -> ConnectorWritePreparation {
@@ -610,14 +611,14 @@ mod tests {
 
     struct TestRewrite {
         descriptor: ConnectorInstanceDescriptor,
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
     }
 
     impl ConnectorDistributedRewrite for TestRewrite {
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
         }
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
         fn plan_rewrite(
@@ -676,10 +677,10 @@ mod tests {
     }
 
     struct TestWrite {
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
     }
     impl ConnectorWriteControl for TestWrite {
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
         fn plan_write(
@@ -710,14 +711,14 @@ mod tests {
 
     struct TestDistribution {
         descriptor: ConnectorInstanceDescriptor,
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
     }
     impl ConnectorExecutionDistribution for TestDistribution {
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,
-        ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-            ConnectorExecutionDeclaration::iceberg(
+        ) -> Result<ConnectorProviderBinding, ConnectorError> {
+            ConnectorProviderBinding::iceberg(
                 self.descriptor.instance_id.as_str(),
                 self.key.incarnation.to_bytes(),
                 "test",
@@ -740,9 +741,9 @@ mod tests {
             provider_id: provider,
             instance_id: instance.clone(),
         };
-        let key = ConnectorExecutionBindingKey {
+        let key = ConnectorProviderBindingKey {
             instance_id: instance.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         };
         let operation_id = ConnectorWriteOperationId::new();
         let table =

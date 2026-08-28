@@ -36,15 +36,14 @@ use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::{
     CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCommittedPartitionField, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceIncarnation, ConnectorManagedDescriptorProperties,
+    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorManagedDescriptorProperties,
     ConnectorManagedPartitionField, ConnectorManagedPartitionSpecObservation,
     ConnectorManagedPartitionSpecPreview, ConnectorManagedPartitionSpecPreviewRequest,
     ConnectorManagedPartitionSpecReplacement, ConnectorManagedPartitionTransform,
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
     ConnectorPreReadyWritePlanningProof, ConnectorPreReadyWritePlanningRequest,
-    ConnectorRequestContext, ConnectorRowMutationActivationRequest,
+    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorRowMutationActivationRequest,
     ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationExecutionPlan,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
     ConnectorTableObjectId, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
@@ -56,7 +55,7 @@ use novarocks_spi::connector::{
     ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
     ConnectorWriterHandle, ExternalMutationEffect, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationFamily,
-    LakePublicationId, LakePublicationMarkerHeader,
+    LakePublicationId, LakePublicationMarkerHeader, ProviderBindingEpoch,
 };
 
 use crate::commit::data_writer::parquet_row_group_size_bytes;
@@ -98,7 +97,7 @@ const MAX_ICEBERG_WRITE_TERMINAL_TOMBSTONES: usize = 16_384;
 /// Iceberg control generation.
 #[derive(Clone)]
 pub struct IcebergWriteControl {
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
     provider: IcebergMetadata,
     runtime: Arc<IcebergMetadataContext>,
@@ -348,10 +347,10 @@ impl IcebergWriteControl {
     /// one owned by `runtime`; callers cannot inject an independent registry.
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         runtime: Arc<IcebergMetadataContext>,
     ) -> Self {
-        let key = ConnectorExecutionBindingKey {
+        let key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation,
         };
@@ -367,7 +366,7 @@ impl IcebergWriteControl {
         }
     }
 
-    fn ensure_owner(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
+    fn ensure_owner(&self, owner: &ConnectorProviderBindingKey) -> Result<(), ConnectorError> {
         if owner != &self.key {
             return Err(invalid(
                 "Iceberg write request does not match the exact connector generation",
@@ -1708,7 +1707,7 @@ impl IcebergWriteControl {
 }
 
 impl ConnectorWriteControl for IcebergWriteControl {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -3937,7 +3936,7 @@ mod tests {
         .expect("context")
     }
 
-    fn catalog_handle(owner: &ConnectorExecutionBindingKey) -> CatalogHandle {
+    fn catalog_handle(owner: &ConnectorProviderBindingKey) -> CatalogHandle {
         CatalogHandle::new(
             owner.instance_id.clone(),
             CatalogVersion::from_bytes([1; 32]),
@@ -3975,7 +3974,7 @@ mod tests {
         };
         let control = IcebergWriteControl::new(
             descriptor,
-            ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            ProviderBindingEpoch::from_bytes([7; 16]),
             runtime,
         );
         (executor, control)
@@ -4017,7 +4016,7 @@ mod tests {
         };
         let control = IcebergWriteControl::new(
             descriptor,
-            ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            ProviderBindingEpoch::from_bytes([7; 16]),
             Arc::clone(&runtime),
         );
         let catalog = runtime.novarocks_catalog().vendored_client();
@@ -4048,7 +4047,7 @@ mod tests {
         (executor, warehouse, control, table)
     }
 
-    fn preparation(owner: &ConnectorExecutionBindingKey, marker: u8) -> ConnectorWritePreparation {
+    fn preparation(owner: &ConnectorProviderBindingKey, marker: u8) -> ConnectorWritePreparation {
         let schema = Schema::builder()
             .with_fields(vec![
                 NestedField::optional(1, "value", Type::Primitive(PrimitiveType::Long)).into(),
@@ -4071,7 +4070,7 @@ mod tests {
     }
 
     fn preparation_for_metadata(
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         metadata: &crate::iceberg::spec::TableMetadata,
         intent: ConnectorWriteIntent,
         marker: u8,
@@ -4125,7 +4124,7 @@ mod tests {
     }
 
     fn activation_request(
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
         marker: u8,
     ) -> ConnectorWriteActivationRequest {

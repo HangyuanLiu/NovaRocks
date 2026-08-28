@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use novarocks_spi::connector::{
     ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorControlResolver,
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceId,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorProviderBindingKey,
 };
 
 #[derive(Clone, Default)]
@@ -92,9 +92,9 @@ impl ConnectorControlResolver for FixtureControlResolver {
     fn observe_current_binding(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorExecutionBindingKey, ConnectorError> {
+    ) -> Result<ConnectorProviderBindingKey, ConnectorError> {
         let binding = self.registry.binding(instance_id)?;
-        Ok(ConnectorExecutionBindingKey {
+        Ok(ConnectorProviderBindingKey {
             instance_id: binding.descriptor().instance_id.clone(),
             incarnation: binding.incarnation(),
         })

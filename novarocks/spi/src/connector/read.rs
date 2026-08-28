@@ -24,9 +24,9 @@ use arrow::record_batch::RecordBatch;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorPredicateDisposition, ConnectorReadSessionLease, ConnectorRequestContext,
-    ConnectorScanHandle, ConnectorSplit, ConnectorStaticPredicate,
+    ConnectorError, ConnectorErrorKind, ConnectorPredicateDisposition, ConnectorProviderBindingKey,
+    ConnectorReadSessionLease, ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
+    ConnectorStaticPredicate,
 };
 
 const MAX_CONNECTOR_CHANGE_PARTITIONS: usize = 16_384;
@@ -39,7 +39,7 @@ const CHANGE_PARTITION_FIELD_BYTES: usize = 24;
 
 #[derive(Clone, Debug)]
 pub struct ConnectorScan {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     selection: ConnectorScanSelection,
     admission: ConnectorScanAdmission,
     handle: ConnectorScanHandle,
@@ -53,7 +53,7 @@ pub struct ConnectorScan {
 
 impl ConnectorScan {
     pub fn try_new_snapshot(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         selector: ConnectorReadSelector,
         handle: ConnectorScanHandle,
         output_schema: SchemaRef,
@@ -70,7 +70,7 @@ impl ConnectorScan {
     }
 
     pub fn try_new_change_window(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         window: ConnectorChangeWindow,
         admission: ConnectorChangeWindowAdmission,
         handle: ConnectorScanHandle,
@@ -90,7 +90,7 @@ impl ConnectorScan {
     }
 
     fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         selection: ConnectorScanSelection,
         admission: ConnectorScanAdmission,
         handle: ConnectorScanHandle,
@@ -137,7 +137,7 @@ impl ConnectorScan {
 
     pub fn validate(
         &self,
-        expected_owner: &ConnectorExecutionBindingKey,
+        expected_owner: &ConnectorProviderBindingKey,
         expected_selection: ConnectorScanSelection,
     ) -> Result<(), ConnectorError> {
         if &self.owner != expected_owner {
@@ -172,7 +172,7 @@ impl ConnectorScan {
         Ok(())
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -726,7 +726,7 @@ fn hash_bytes(digest: &mut Sha256, bytes: &[u8]) {
 }
 
 fn connector_scan_seal_digest(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     selection_digest: [u8; 32],
     handle_digest: [u8; 32],
     admission_digest: [u8; 32],
@@ -956,9 +956,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    };
+    use crate::connector::{ConnectorCancellation, ConnectorInstanceId, ProviderBindingEpoch};
 
     struct NeverCancelled;
 
@@ -978,14 +976,14 @@ mod tests {
         .expect("valid connector request context")
     }
 
-    fn owner() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn owner() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("iceberg.test").expect("instance ID"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         }
     }
 
-    fn handle(owner: &ConnectorExecutionBindingKey, payload: &'static [u8]) -> ConnectorScanHandle {
+    fn handle(owner: &ConnectorProviderBindingKey, payload: &'static [u8]) -> ConnectorScanHandle {
         ConnectorScanHandle::try_new(owner.instance_id.clone(), Bytes::from_static(payload))
             .expect("scan handle")
     }

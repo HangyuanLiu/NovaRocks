@@ -34,8 +34,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorRequestContext,
-    ConnectorStatistics, ConnectorTableHandle, StatisticsDataVersion, StatisticsEvidence,
+    ConnectorError, ConnectorInstanceId, ConnectorRequestContext, ConnectorStatistics,
+    ConnectorTableHandle, ProviderBindingEpoch, StatisticsDataVersion, StatisticsEvidence,
     StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest, StatisticsReadRequest,
 };
 
@@ -56,13 +56,13 @@ pub enum StatisticsResolutionFailure {
 pub struct ResolvedStatisticsTable {
     pub table: ConnectorTableHandle,
     pub data_version: StatisticsDataVersion,
-    pub incarnation: ConnectorInstanceIncarnation,
+    pub incarnation: ProviderBindingEpoch,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ResolvedCacheKey {
     instance_id: ConnectorInstanceId,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     table_payload: Bytes,
     data_version: StatisticsDataVersion,
     metrics: Vec<StatisticsMetric>,
@@ -71,7 +71,7 @@ struct ResolvedCacheKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ArtifactCacheKey {
     instance_id: ConnectorInstanceId,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     table_payload: Bytes,
     data_version: StatisticsDataVersion,
     evidence_revision: StatisticsEvidenceRevision,
@@ -193,7 +193,7 @@ mod tests {
 
     struct TestStatistics {
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         evidence: StatisticsEvidence,
     }
 
@@ -202,7 +202,7 @@ mod tests {
             &self.descriptor
         }
 
-        fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        fn incarnation(&self) -> ProviderBindingEpoch {
             self.incarnation
         }
 
@@ -239,7 +239,7 @@ mod tests {
 
     fn resolved_table(
         instance: &str,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
     ) -> ResolvedStatisticsTable {
         ResolvedStatisticsTable {
             table: ConnectorTableHandle::try_new(
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn resolver_fails_closed_for_owner_incarnation_and_data_version_mismatch() {
         let resolver = UnifiedStatisticsResolver::default();
-        let incarnation = ConnectorInstanceIncarnation::from_bytes([1; 16]);
+        let incarnation = ProviderBindingEpoch::from_bytes([1; 16]);
         let table = resolved_table("ice.main", incarnation);
 
         let owner_mismatch = TestStatistics {
@@ -271,7 +271,7 @@ mod tests {
 
         let incarnation_mismatch = TestStatistics {
             descriptor: descriptor("ice.main"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([2; 16]),
             evidence: evidence(),
         };
         assert_eq!(

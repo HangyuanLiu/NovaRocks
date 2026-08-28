@@ -399,9 +399,9 @@ fn loaded_view_from_metadata(
 
 use crate::metadata::IcebergMetadata;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorListViewsRequest, ConnectorViewDialect, ConnectorViewIdentity, ConnectorViewMetadata,
-    ConnectorViewMetadataValue, ConnectorViewRequest,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorListViewsRequest,
+    ConnectorViewDialect, ConnectorViewIdentity, ConnectorViewMetadata, ConnectorViewMetadataValue,
+    ConnectorViewRequest, ProviderBindingEpoch,
 };
 
 impl ConnectorViewMetadata for IcebergMetadata {
@@ -409,7 +409,7 @@ impl ConnectorViewMetadata for IcebergMetadata {
         self.descriptor()
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation()
     }
 

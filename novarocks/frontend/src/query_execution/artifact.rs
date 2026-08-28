@@ -414,7 +414,7 @@ impl ScheduleBoundDistributedQuery {
         operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
         cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
         catalog_handle: novarocks_spi::connector::CatalogHandle,
-        owner: novarocks_spi::connector::ConnectorExecutionBindingKey,
+        owner: novarocks_spi::connector::ConnectorProviderBindingKey,
     ) -> Result<ConnectorWriteManifest, DistributedQueryError> {
         ConnectorWriteManifest::freeze(
             self.schedule.planning_schedule(),
@@ -2013,16 +2013,15 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
-        ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorRequestContext, ConnectorSplit,
-        ConnectorTableHandle, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
-        ConnectorWriteBaseVersion, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
-        ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteFieldBinding,
-        ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteLease,
-        ConnectorWriteOperationId, ConnectorWritePlan, ConnectorWritePlanningRequest,
-        ConnectorWritePreparation, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
-        ConnectorWriterHandle,
+        ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution, ConnectorInstanceId,
+        ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorRequestContext,
+        ConnectorSplit, ConnectorTableHandle, ConnectorWriteAbortOutcome,
+        ConnectorWriteAbortRequest, ConnectorWriteBaseVersion, ConnectorWriteCohortId,
+        ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteExecutionId,
+        ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
+        ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlan,
+        ConnectorWritePlanningRequest, ConnectorWritePreparation, ConnectorWriteReceipt,
+        ConnectorWriteReconcileRequest, ConnectorWriterHandle, ProviderBindingEpoch,
     };
 
     use super::{
@@ -2193,19 +2192,19 @@ mod tests {
     }
 
     struct TestWriteControl {
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
     }
 
     struct TestWriteDistribution {
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
     }
 
     impl ConnectorExecutionDistribution for TestWriteDistribution {
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,
-        ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-            ConnectorExecutionDeclaration::iceberg(
+        ) -> Result<ConnectorProviderBinding, ConnectorError> {
+            ConnectorProviderBinding::iceberg(
                 self.key.instance_id.as_str(),
                 self.key.incarnation.to_bytes(),
                 "test-write-binding",
@@ -2217,7 +2216,7 @@ mod tests {
     }
 
     impl ConnectorWriteControl for TestWriteControl {
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
 
@@ -2283,10 +2282,10 @@ mod tests {
         }
     }
 
-    fn write_owner() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn write_owner() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("test-write").expect("valid instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         }
     }
 
@@ -2335,7 +2334,7 @@ mod tests {
         schedule: &SchedulingPlan,
         fragment_ids: &BTreeSet<u32>,
         cohort_id: ConnectorWriteCohortId,
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
     ) -> super::ConnectorWritePlanAttachment {
         let execution_id = write_execution();
@@ -2594,9 +2593,9 @@ mod tests {
         .expect_err("overlapping cohort attachments must fail closed");
         assert!(error.message().contains("overlap"));
 
-        let foreign_owner = ConnectorExecutionBindingKey {
+        let foreign_owner = ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("foreign-write").expect("foreign instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([8; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([8; 16]),
         };
         let owner_first = planned_attachment_for(
             &schedule,

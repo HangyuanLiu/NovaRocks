@@ -28,7 +28,7 @@ use std::collections::BTreeSet;
 
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
+    ConnectorProviderBindingKey, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
     ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlan,
     ConnectorWritePlanningRequest, ConnectorWriterIdentity,
 };
@@ -44,7 +44,7 @@ use novarocks_types::UniqueId;
 /// carry more than one connector sink.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorWriteManifest {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     cohort_id: ConnectorWriteCohortId,
     execution_id: novarocks_spi::connector::ConnectorWriteExecutionId,
@@ -59,7 +59,7 @@ impl ConnectorWriteManifest {
         operation_id: ConnectorWriteOperationId,
         cohort_id: ConnectorWriteCohortId,
         catalog_handle: CatalogHandle,
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         execution_id: QueryExecutionId,
     ) -> Result<Self, ConnectorError> {
         if terminal_write_fragment_ids.is_empty() {
@@ -114,7 +114,7 @@ impl ConnectorWriteManifest {
         })
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -297,7 +297,7 @@ fn connector_execution_id(
 }
 
 fn writer_manifest_digest(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     cohort_id: ConnectorWriteCohortId,
     execution_id: novarocks_spi::connector::ConnectorWriteExecutionId,
@@ -343,7 +343,7 @@ mod tests {
     use super::*;
     use crate::query_execution::schedule::FragmentInstancePlacement;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-    use novarocks_spi::connector::{ConnectorInstanceId, ConnectorInstanceIncarnation};
+    use novarocks_spi::connector::{ConnectorInstanceId, ProviderBindingEpoch};
 
     fn placement(
         fragment_id: FragmentId,
@@ -364,10 +364,10 @@ mod tests {
         }
     }
 
-    fn owner() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn owner() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("iceberg").expect("valid instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([9; 16]),
         }
     }
 
