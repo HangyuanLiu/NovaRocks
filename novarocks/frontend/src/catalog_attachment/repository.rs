@@ -21,7 +21,12 @@ use std::sync::Arc;
 
 use crate::state_store::metrics::StateStoreMetrics;
 use crate::state_store::{OperationId, RunFailure, run_side_effect_free};
-use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
+use novarocks_spi::connector::{
+    CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
+    CatalogNonSecretProperty, ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
+    MAX_CATALOG_NON_SECRET_PROPERTIES, StaticCredentialReference,
+    canonicalize_catalog_credential_bindings,
+};
 use novarocks_spi::state_store::{
     CommitResolution, Direction, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
     StateStoreError, StateStoreErrorKind, VersionToken,
@@ -31,7 +36,8 @@ use uuid::Uuid;
 use crate::durable::{DurableRecordError, DurableRecordStore};
 
 use super::codec::{
-    CATALOG_ATTACHMENT_SCHEMA_VERSION, StoredCatalogAttachment, StoredProperty, decode, encode,
+    CATALOG_ATTACHMENT_SCHEMA_VERSION, StoredCatalogAttachment, StoredCredentialBinding,
+    StoredProperty, decode, encode,
 };
 use super::key::{attachment_key, attachment_prefix};
 
@@ -44,6 +50,7 @@ pub struct CatalogAttachment {
     pub provider_id: ConnectorProviderId,
     pub display_name: String,
     pub durable_properties: Vec<(String, String)>,
+    pub credential_bindings: Vec<CatalogCredentialBinding>,
     pub created_at_ms: i64,
 }
 
@@ -515,6 +522,11 @@ fn stored_from(attachment: &CatalogAttachment) -> StoredCatalogAttachment {
                 value: value.clone(),
             })
             .collect(),
+        credential_bindings: attachment
+            .credential_bindings
+            .iter()
+            .map(stored_binding_from)
+            .collect(),
         created_at_ms: attachment.created_at_ms,
     }
 }
@@ -535,6 +547,11 @@ fn attachment_from(
             .into_iter()
             .map(|property| (property.key, property.value))
             .collect(),
+        credential_bindings: stored
+            .credential_bindings
+            .into_iter()
+            .map(binding_from_stored)
+            .collect::<Result<Vec<_>, _>>()?,
         created_at_ms: stored.created_at_ms,
     };
     validate_attachment(&attachment).map_err(|error| {
@@ -547,12 +564,16 @@ fn validate_attachment(attachment: &CatalogAttachment) -> Result<(), CatalogAtta
     if attachment.display_name.trim().is_empty() {
         return Err(invalid("catalog attachment display name must not be empty"));
     }
+    if attachment.durable_properties.len() > MAX_CATALOG_NON_SECRET_PROPERTIES {
+        return Err(invalid(format!(
+            "catalog attachment declares more than {MAX_CATALOG_NON_SECRET_PROPERTIES} non-secret properties"
+        )));
+    }
     let mut previous = None;
     let mut keys = BTreeSet::new();
-    for (key, _) in &attachment.durable_properties {
-        if key.trim().is_empty() {
-            return Err(invalid("catalog attachment property key must not be empty"));
-        }
+    for (key, value) in &attachment.durable_properties {
+        CatalogNonSecretProperty::try_new(key, value)
+            .map_err(|error| invalid(error.to_string()))?;
         if !keys.insert(key.as_str()) {
             return Err(invalid(format!(
                 "duplicate catalog attachment property: {key}"
@@ -563,27 +584,84 @@ fn validate_attachment(attachment: &CatalogAttachment) -> Result<(), CatalogAtta
                 "catalog attachment properties must be sorted by key",
             ));
         }
-        let normalized = key.to_ascii_lowercase();
-        if [
-            "password",
-            "secret",
-            "token",
-            "credential",
-            "access-key",
-            "access_key",
-            "private-key",
-            "private_key",
-        ]
-        .iter()
-        .any(|marker| normalized.contains(marker))
-        {
-            return Err(invalid(format!(
-                "credential-like catalog attachment property cannot be durable: {key}"
-            )));
-        }
         previous = Some(key);
     }
+    let canonical =
+        canonicalize_catalog_credential_bindings(attachment.credential_bindings.clone())
+            .map_err(|error| invalid(format!("invalid catalog credential bindings: {error}")))?;
+    if canonical != attachment.credential_bindings {
+        return Err(invalid(
+            "catalog credential bindings must use canonical order",
+        ));
+    }
     Ok(())
+}
+
+fn stored_binding_from(binding: &CatalogCredentialBinding) -> StoredCredentialBinding {
+    let (mode, name, generation) = match binding.mode() {
+        CatalogCredentialMode::Static(reference) => (
+            "static",
+            Some(reference.name().to_string()),
+            Some(reference.generation().to_string()),
+        ),
+        CatalogCredentialMode::Vended => ("vended", None, None),
+    };
+    StoredCredentialBinding {
+        purpose: match binding.purpose() {
+            CatalogCredentialPurpose::CatalogControl => "catalog-control",
+            CatalogCredentialPurpose::ObjectStoreData => "object-store-data",
+        }
+        .to_string(),
+        consumer_role: match binding.consumer_role() {
+            CredentialConsumerRole::Frontend => "frontend",
+            CredentialConsumerRole::Backend => "backend",
+        }
+        .to_string(),
+        mode: mode.to_string(),
+        name,
+        generation,
+    }
+}
+
+fn binding_from_stored(
+    stored: StoredCredentialBinding,
+) -> Result<CatalogCredentialBinding, CatalogAttachmentError> {
+    let purpose = match stored.purpose.as_str() {
+        "catalog-control" => CatalogCredentialPurpose::CatalogControl,
+        "object-store-data" => CatalogCredentialPurpose::ObjectStoreData,
+        _ => return Err(corruption("unknown catalog credential purpose")),
+    };
+    let consumer_role = match stored.consumer_role.as_str() {
+        "frontend" => CredentialConsumerRole::Frontend,
+        "backend" => CredentialConsumerRole::Backend,
+        _ => return Err(corruption("unknown catalog credential consumer role")),
+    };
+    let mode = match stored.mode.as_str() {
+        "static" => {
+            let name = stored
+                .name
+                .as_deref()
+                .ok_or_else(|| corruption("static catalog credential binding requires name"))?;
+            let generation = stored.generation.as_deref().ok_or_else(|| {
+                corruption("static catalog credential binding requires generation")
+            })?;
+            CatalogCredentialMode::Static(
+                StaticCredentialReference::try_new(name, generation)
+                    .map_err(|error| corruption(error.to_string()))?,
+            )
+        }
+        "vended" => {
+            if stored.name.is_some() || stored.generation.is_some() {
+                return Err(corruption(
+                    "vended catalog credential binding forbids name and generation",
+                ));
+            }
+            CatalogCredentialMode::Vended
+        }
+        _ => return Err(corruption("unknown catalog credential mode")),
+    };
+    CatalogCredentialBinding::try_new(purpose, consumer_role, mode)
+        .map_err(|error| corruption(error.to_string()))
 }
 
 fn invalid(message: impl Into<String>) -> CatalogAttachmentError {
@@ -647,6 +725,18 @@ mod tests {
 
     use super::*;
 
+    fn object_store_binding(generation: &str) -> CatalogCredentialBinding {
+        CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::ObjectStoreData,
+            CredentialConsumerRole::Backend,
+            CatalogCredentialMode::Static(
+                StaticCredentialReference::try_new("warehouse-data", generation)
+                    .expect("credential reference"),
+            ),
+        )
+        .expect("credential binding")
+    }
+
     fn attachment(properties: Vec<(String, String)>) -> CatalogAttachment {
         CatalogAttachment {
             attachment_id: Uuid::now_v7(),
@@ -654,6 +744,7 @@ mod tests {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
             display_name: "Warehouse.Main".to_string(),
             durable_properties: properties,
+            credential_bindings: vec![object_store_binding("blue")],
             created_at_ms: 1,
         }
     }
@@ -747,6 +838,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_reconstructs_the_exact_canonical_binding() {
+        let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
+        let registry =
+            builtin_state_store_provider_registry().expect("builtin StateStore registry");
+        let mut host = StateStoreHost::open(
+            &registry,
+            StateStoreHostConfig {
+                state_store: StateStoreAppConfig {
+                    store: StateStoreConfig {
+                        cluster_id: "catalog-attachment-binding-restart-test".to_string(),
+                        limits: StateStoreLimitOverrides::default(),
+                        provider: StateStoreProviderConfig::Sqlite {
+                            path: directory.path().join("state-store.sqlite"),
+                        },
+                    },
+                    mysql_client: None,
+                },
+                foundationdb_client: None,
+            },
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("open SQLite StateStore");
+        let store = host.state_store().expect("ready StateStore");
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open catalog attachment repository");
+        let requested = attachment(vec![("type".into(), "iceberg".into())]);
+        let created = repository
+            .create(requested.clone())
+            .await
+            .expect("create attachment");
+        drop(repository);
+
+        let reopened = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("reopen catalog attachment repository");
+        let reconstructed = reopened
+            .get(&requested.instance_id)
+            .await
+            .expect("read attachment")
+            .expect("attachment remains");
+        assert_eq!(reconstructed.attachment, created.attachment);
+        assert_eq!(
+            reconstructed.attachment.credential_bindings,
+            vec![object_store_binding("blue")]
+        );
+
+        drop(reopened);
+        drop(store);
+        host.shutdown(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("shutdown SQLite StateStore");
+    }
+
+    #[tokio::test]
     async fn create_rejects_an_over_budget_attachment_without_writing_a_record() {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
         let registry =
@@ -788,7 +935,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("catalog-attachment schema version 1")
+                .contains("catalog-attachment schema version 2")
         );
         assert!(error.to_string().contains("256-byte budget"));
         assert!(

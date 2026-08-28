@@ -724,6 +724,7 @@ mod tests {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
             display_name: "catalog.analytics".to_string(),
             durable_properties: Vec::new(),
+            credential_bindings: Vec::new(),
             created_at_ms: 1,
         }
     }

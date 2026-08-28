@@ -46,10 +46,9 @@ pub mod virtual_table;
 
 pub mod frontend_port;
 pub use desired_state::{
-    CatalogCredentialReference, CatalogDesiredStateEntry, CatalogDesiredStateSnapshot,
-    CatalogDesiredStateSnapshotIdentity, CatalogDesiredStateSource, CatalogDesiredStateSourceInput,
-    CatalogDesiredStateSourceMode, CatalogLogicalConfig, CatalogSourceEntryIdentity,
-    CatalogSqlMutationAdmission,
+    CatalogDesiredStateEntry, CatalogDesiredStateSnapshot, CatalogDesiredStateSnapshotIdentity,
+    CatalogDesiredStateSource, CatalogDesiredStateSourceInput, CatalogDesiredStateSourceMode,
+    CatalogLogicalConfig, CatalogSourceEntryIdentity, CatalogSqlMutationAdmission,
 };
 pub use frontend_port::FrontendCatalogApplicationPort;
 pub use static_file::load_static_file_snapshot;

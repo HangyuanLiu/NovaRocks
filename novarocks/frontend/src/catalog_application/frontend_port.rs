@@ -45,8 +45,10 @@ use super::{
 };
 use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorControlFactoryRequest, ConnectorControlFactoryResolver,
-    ConnectorControlResolver, ConnectorInstanceId, ConnectorProviderId,
+    CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
+    ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlResolver,
+    ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole, StaticCredentialReference,
+    canonicalize_catalog_credential_bindings,
 };
 use tokio::runtime::{Handle, RuntimeFlavor};
 use uuid::Uuid;

@@ -48,12 +48,13 @@ fn frontend_static_file_preflight_resolves_relative_path_and_retains_snapshot() 
     fs::write(
         &catalogs,
         r#"
-format_version = 1
+format_version = 2
 [[catalogs]]
 instance_id = "catalog.analytics"
 provider_id = "iceberg"
 display_name = "Analytics"
-config_format_version = 1
+config_format_version = 2
+credential_bindings = []
 [catalogs.properties]
 type = "iceberg"
 "#,
@@ -91,7 +92,7 @@ static_file_path = "catalogs.toml"
 fn deployable_role_cross_validation_is_closed_and_fail_closed() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let missing_static = temp.path().join("missing-static.toml");
-    fs::write(&missing_static, "format_version = 1\ncatalogs = []\n").expect("fixture");
+    fs::write(&missing_static, "format_version = 2\ncatalogs = []\n").expect("fixture");
     let config = temp.path().join("novarocks-fe.toml");
 
     fs::write(

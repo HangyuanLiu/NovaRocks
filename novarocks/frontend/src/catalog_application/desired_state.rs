@@ -50,8 +50,10 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
 use novarocks_spi::connector::{
-    CatalogCredentialReference as ExecutionCredentialReference, CatalogHandle, CatalogProperties,
+    CatalogCredentialBinding, CatalogHandle, CatalogNonSecretProperty, CatalogProperties,
     CatalogProperty, CatalogProviderKind, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
+    MAX_CATALOG_NON_SECRET_PROPERTIES, canonical_catalog_credential_binding_bytes,
+    canonicalize_catalog_credential_bindings,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -61,7 +63,7 @@ use crate::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
 use crate::state_family::StateFamily;
 
 /// Domain separator for the snapshot identity digest.
-const SNAPSHOT_IDENTITY_DOMAIN: &[u8] = b"novarocks/frontend/catalog/desired-state/snapshot/v1";
+const SNAPSHOT_IDENTITY_DOMAIN: &[u8] = b"novarocks/frontend/catalog/desired-state/snapshot/v2";
 
 /// Domain separator for a catalog execution definition version.
 ///
@@ -69,7 +71,7 @@ const SNAPSHOT_IDENTITY_DOMAIN: &[u8] = b"novarocks/frontend/catalog/desired-sta
 /// identity describes the complete desired set for diagnostics, while a
 /// catalog version identifies one credential-free execution definition that a
 /// backend may materialize and retain after a Frontend restart.
-const CATALOG_VERSION_DOMAIN: &[u8] = b"novarocks/frontend/catalog/execution-definition/v1";
+const CATALOG_VERSION_DOMAIN: &[u8] = b"novarocks/frontend/catalog/execution-definition/v2";
 
 /// The config format version the dynamic StateStore mode stamps on every entry
 /// it enumerates.
@@ -191,27 +193,49 @@ pub struct CatalogLogicalConfig {
     provider_id: ConnectorProviderId,
     display_name: String,
     durable_properties: Vec<(String, String)>,
-    credential_references: Vec<CatalogCredentialReference>,
+    credential_bindings: Vec<CatalogCredentialBinding>,
     config_format_version: u8,
 }
 
 impl CatalogLogicalConfig {
-    pub fn new(
+    pub fn try_new(
         instance_id: ConnectorInstanceId,
         provider_id: ConnectorProviderId,
         display_name: impl Into<String>,
         durable_properties: Vec<(String, String)>,
-        credential_references: Vec<CatalogCredentialReference>,
+        credential_bindings: Vec<CatalogCredentialBinding>,
         config_format_version: u8,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CatalogApplicationError> {
+        if config_format_version == 0 {
+            return Err(invalid_logical_config("config format version must be non-zero"));
+        }
+        if durable_properties.len() > MAX_CATALOG_NON_SECRET_PROPERTIES {
+            return Err(invalid_logical_config(format!(
+                "catalog declares more than {MAX_CATALOG_NON_SECRET_PROPERTIES} non-secret properties"
+            )));
+        }
+        let mut durable_properties = durable_properties
+            .into_iter()
+            .map(|(key, value)| {
+                let property = CatalogNonSecretProperty::try_new(&key, &value)
+                    .map_err(|error| invalid_logical_config(error.to_string()))?;
+                Ok((property.key().to_string(), property.value().to_string()))
+            })
+            .collect::<Result<Vec<_>, CatalogApplicationError>>()?;
+        durable_properties.sort_by(|left, right| left.0.cmp(&right.0));
+        if durable_properties.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(invalid_logical_config("duplicate catalog non-secret property key"));
+        }
+        let credential_bindings = canonicalize_catalog_credential_bindings(credential_bindings)
+            .map_err(|error| invalid_logical_config(format!("invalid catalog credential bindings: {error}")))?;
+        Ok(Self {
             instance_id,
             provider_id,
             display_name: display_name.into(),
             durable_properties,
-            credential_references,
+            credential_bindings,
             config_format_version,
-        }
+        })
     }
 
     /// The catalog's SQL name.
@@ -233,8 +257,8 @@ impl CatalogLogicalConfig {
         &self.durable_properties
     }
 
-    pub fn credential_references(&self) -> &[CatalogCredentialReference] {
-        &self.credential_references
+    pub fn credential_bindings(&self) -> &[CatalogCredentialBinding] {
+        &self.credential_bindings
     }
 
     pub const fn config_format_version(&self) -> u8 {
@@ -245,7 +269,7 @@ impl CatalogLogicalConfig {
     ///
     /// Framing every variable-length field keeps two different configurations
     /// from hashing to one identity through boundary ambiguity.
-    fn update_digest(&self, hasher: &mut Sha256) {
+    fn update_digest(&self, hasher: &mut Sha256) -> Result<(), CatalogApplicationError> {
         update_framed(hasher, self.instance_id.as_str().as_bytes());
         update_framed(hasher, self.provider_id.as_str().as_bytes());
         update_framed(hasher, self.display_name.as_bytes());
@@ -254,11 +278,11 @@ impl CatalogLogicalConfig {
             update_framed(hasher, key.as_bytes());
             update_framed(hasher, value.as_bytes());
         }
-        hasher.update((self.credential_references.len() as u64).to_be_bytes());
-        for reference in &self.credential_references {
-            update_framed(hasher, reference.as_str().as_bytes());
-        }
+        let binding_bytes = canonical_catalog_credential_binding_bytes(&self.credential_bindings)
+            .map_err(|error| invalid_logical_config(format!("invalid catalog credential bindings: {error}")))?;
+        update_framed(hasher, &binding_bytes);
         hasher.update([self.config_format_version]);
+        Ok(())
     }
 }
 
@@ -313,18 +337,20 @@ impl CatalogDesiredStateEntry {
     /// `created_at_ms` is deliberately dropped: it records when *this* store
     /// first admitted the catalog, which is a fact about the deployment rather
     /// than part of what the operator asked for.
-    pub(crate) fn from_attachment(attachment: &CatalogAttachment) -> Self {
-        Self {
+    pub(crate) fn from_attachment(
+        attachment: &CatalogAttachment,
+    ) -> Result<Self, CatalogApplicationError> {
+        Ok(Self {
             identity: CatalogSourceEntryIdentity::new(attachment.attachment_id),
-            config: CatalogLogicalConfig {
-                instance_id: attachment.instance_id.clone(),
-                provider_id: attachment.provider_id.clone(),
-                display_name: attachment.display_name.clone(),
-                durable_properties: attachment.durable_properties.clone(),
-                credential_references: Vec::new(),
-                config_format_version: DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION,
-            },
-        }
+            config: CatalogLogicalConfig::try_new(
+                attachment.instance_id.clone(),
+                attachment.provider_id.clone(),
+                attachment.display_name.clone(),
+                attachment.durable_properties.clone(),
+                attachment.credential_bindings.clone(),
+                DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION,
+            )?,
+        })
     }
 
     /// Projects one located desired-state entry into the immutable execution
@@ -357,19 +383,14 @@ impl CatalogDesiredStateEntry {
             .map_err(|error| projection_error(config, error))?;
         execution_properties.sort_by(|left, right| left.key().cmp(right.key()));
 
-        let mut credential_references = config
-            .credential_references()
-            .iter()
-            .map(|reference| ExecutionCredentialReference::new(reference.as_str(), None::<&str>))
-            .collect::<Result<Vec<_>, _>>()
+        let binding_bytes = canonical_catalog_credential_binding_bytes(config.credential_bindings())
             .map_err(|error| projection_error(config, error))?;
-        credential_references.sort();
 
         let version = CatalogVersion::from_bytes(self.execution_definition_digest(
             mode,
             provider_kind,
             &execution_properties,
-            &credential_references,
+            &binding_bytes,
         ));
         let handle = CatalogHandle::new(config.instance_id().clone(), version);
         CatalogProperties::new(
@@ -377,7 +398,7 @@ impl CatalogDesiredStateEntry {
             provider_kind,
             u32::from(config.config_format_version()),
             execution_properties,
-            credential_references,
+            Vec::new(),
         )
         .map_err(|error| projection_error(config, error))
     }
@@ -387,7 +408,7 @@ impl CatalogDesiredStateEntry {
         mode: CatalogDesiredStateSourceMode,
         provider_kind: CatalogProviderKind,
         execution_properties: &[CatalogProperty],
-        credential_references: &[ExecutionCredentialReference],
+        binding_bytes: &[u8],
     ) -> [u8; 32] {
         let config = self.config();
         let mut hasher = Sha256::new();
@@ -401,17 +422,7 @@ impl CatalogDesiredStateEntry {
             update_framed(&mut hasher, property.key().as_bytes());
             update_framed(&mut hasher, property.value().as_bytes());
         }
-        hasher.update((credential_references.len() as u64).to_be_bytes());
-        for reference in credential_references {
-            update_framed(&mut hasher, reference.name().as_bytes());
-            match reference.revision() {
-                Some(revision) => {
-                    hasher.update([1]);
-                    update_framed(&mut hasher, revision.as_bytes());
-                }
-                None => hasher.update([0]),
-            }
-        }
+        update_framed(&mut hasher, binding_bytes);
         match mode {
             CatalogDesiredStateSourceMode::DynamicStateStore => {
                 hasher.update(b"dynamic-attachment-id");
@@ -516,7 +527,7 @@ impl CatalogDesiredStateSnapshot {
         hasher.update(SNAPSHOT_IDENTITY_DOMAIN);
         hasher.update((located.len() as u64).to_be_bytes());
         for entry in located.values() {
-            entry.config().update_digest(&mut hasher);
+            entry.config().update_digest(&mut hasher)?;
         }
         Ok(Self {
             identity: CatalogDesiredStateSnapshotIdentity {
