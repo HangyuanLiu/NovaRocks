@@ -27,7 +27,7 @@
 use std::collections::BTreeSet;
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+    CatalogProperties, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
     ConnectorExecutionDeclaration, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
     ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlan,
     ConnectorWritePlanningRequest, ConnectorWriterIdentity,
@@ -172,6 +172,7 @@ impl ConnectorWriteManifest {
         // state while retaining an otherwise exact generation lease.
         let context = request.context.clone();
         let execution_declaration = lease.execution_declaration(&context)?;
+        let catalog_properties = lease.catalog_properties().cloned();
         let plan = lease.control().plan_write(request)?;
         validate_returned_plan(self, &plan)?;
         Ok(ConnectorWritePlanAttachment {
@@ -179,6 +180,7 @@ impl ConnectorWriteManifest {
             plan,
             context,
             execution_declaration,
+            catalog_properties,
             descriptor,
             _lease: lease,
         })
@@ -228,6 +230,7 @@ pub struct ConnectorWritePlanAttachment {
     plan: ConnectorWritePlan,
     context: novarocks_spi::connector::ConnectorRequestContext,
     execution_declaration: ConnectorExecutionDeclaration,
+    catalog_properties: Option<CatalogProperties>,
     descriptor: ConnectorWriteCohortDescriptor,
     _lease: ConnectorWriteLease,
 }
@@ -251,6 +254,12 @@ impl ConnectorWritePlanAttachment {
     /// writer in this placement-frozen manifest.
     pub fn execution_declaration(&self) -> &ConnectorExecutionDeclaration {
         &self.execution_declaration
+    }
+
+    /// The exact catalog runtime contribution for this write, when the source
+    /// lease came from a desired-state-admitted FE control binding.
+    pub fn catalog_properties(&self) -> Option<&CatalogProperties> {
+        self.catalog_properties.as_ref()
     }
 
     pub fn descriptor(&self) -> &ConnectorWriteCohortDescriptor {

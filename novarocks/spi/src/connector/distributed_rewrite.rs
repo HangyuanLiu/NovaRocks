@@ -892,6 +892,7 @@ impl ConnectorDistributedRewriteLease {
         Ok(rewrite_receipt)
     }
     pub fn derive_write_lease(&self) -> Result<ConnectorWriteLease, ConnectorError> {
+        let catalog_properties = self.planning_lease.binding().catalog_properties()?.clone();
         let retained = self.clone();
         ConnectorWriteLease::new_with_execution_distribution(
             self.key.clone(),
@@ -900,6 +901,7 @@ impl ConnectorDistributedRewriteLease {
             self.distribution.clone(),
             move || drop(retained),
         )
+        .and_then(|lease| lease.with_catalog_properties(catalog_properties))
     }
     fn validate_plan(&self, plan: &ConnectorDistributedRewritePlan) -> Result<(), ConnectorError> {
         plan.validate()?;

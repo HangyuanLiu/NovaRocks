@@ -923,6 +923,7 @@ impl ConnectorControlPlanningLease {
         })?;
         let distribution = self.binding.execution_distribution().clone();
         let provider_id = self.binding.descriptor().provider_id.clone();
+        let catalog_properties = self.binding.catalog_properties()?.clone();
         let key = write.binding_key().clone();
         let retained_planning_lease = self.clone();
         ConnectorWriteLease::new_with_execution_distribution(
@@ -932,6 +933,7 @@ impl ConnectorControlPlanningLease {
             distribution,
             move || drop(retained_planning_lease),
         )
+        .and_then(|lease| lease.with_catalog_properties(catalog_properties))
         .map(|lease| lease.with_metadata(Arc::clone(&self.binding.metadata)))
     }
 

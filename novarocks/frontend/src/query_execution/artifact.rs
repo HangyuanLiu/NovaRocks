@@ -608,7 +608,11 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
                 "query initialization execution id does not match validated schedule",
             ));
         }
-        let catalog_set = merge_prepared_catalog_set(&self.prepared, options.catalog_set())?;
+        let catalog_set = merge_prepared_catalog_set(
+            &self.prepared,
+            &self.connector_write_plans,
+            options.catalog_set(),
+        )?;
         let options = options.with_catalog_set(catalog_set);
         let runtime_filters = self
             .runtime_filter_contributions
@@ -645,14 +649,23 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
 /// has started.
 fn merge_prepared_catalog_set(
     prepared: &PreparedFragmentSet,
+    connector_write_plans: &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
     existing: &CatalogSet,
 ) -> Result<CatalogSet, DistributedQueryError> {
+    let typed_reads = prepared
+        .scan_bindings()
+        .typed_scans()
+        .map(|(_, _, scan)| scan.catalog_properties.clone());
+    let writes = connector_write_plans.values().map(|attachment| {
+        attachment.catalog_properties().cloned().ok_or_else(|| {
+            contract_error(
+                "native connector write attachment has no desired-state catalog properties",
+            )
+        })
+    });
     merge_catalog_properties(
         existing,
-        prepared
-            .scan_bindings()
-            .typed_scans()
-            .map(|(_, _, scan)| scan.catalog_properties.clone()),
+        typed_reads.chain(writes.collect::<Result<Vec<_>, _>>()?),
     )
 }
 
@@ -2329,6 +2342,19 @@ mod tests {
         )
     }
 
+    #[test]
+    fn planned_write_attachment_retains_catalog_materialization() {
+        let attachment = planned_attachment(&write_schedule(UniqueId::new(3, 30)));
+        let catalog_properties = attachment
+            .catalog_properties()
+            .expect("native write attachment retains desired-state catalog properties");
+        assert_eq!(
+            catalog_properties.handle().catalog_name().as_str(),
+            "test-write"
+        );
+        assert_eq!(catalog_properties.handle().version().as_bytes(), &[3; 32]);
+    }
+
     fn planned_attachment_for(
         schedule: &SchedulingPlan,
         fragment_ids: &BTreeSet<u32>,
@@ -2355,7 +2381,9 @@ mod tests {
             Arc::new(TestWriteDistribution { key: owner.clone() }),
             || {},
         )
-        .expect("valid exact control lease");
+        .expect("valid exact control lease")
+        .with_catalog_properties(catalog_properties("test-write", 3, "s3://test-write"))
+        .expect("write catalog properties match the exact effect owner");
         let query_id = execution_id.query_id();
         let mut query_id_bytes = [0; 16];
         query_id_bytes[..8].copy_from_slice(&query_id.high().to_be_bytes());

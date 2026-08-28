@@ -722,7 +722,7 @@ impl ConnectorControlHost {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorWriteLease, ConnectorError> {
-        let (write, provider_id, distribution, legacy_key, runtime_id) = {
+        let (write, provider_id, distribution, catalog_properties, legacy_key, runtime_id) = {
             let mut state = self.lock_state()?;
             let runtime_id = state.active.get(instance_id).copied().ok_or_else(|| {
                 ConnectorError::new(
@@ -753,11 +753,13 @@ impl ConnectorControlHost {
             })?;
             let provider_id = generation.binding.descriptor().provider_id.clone();
             let distribution = generation.binding.execution_distribution().clone();
+            let catalog_properties = generation.binding.catalog_properties()?.clone();
             generation.write_leases = generation.write_leases.saturating_add(1);
             (
                 write,
                 provider_id,
                 distribution,
+                catalog_properties,
                 generation.legacy_execution_key.clone(),
                 runtime_id,
             )
@@ -771,6 +773,7 @@ impl ConnectorControlHost {
             distribution,
             move || release_lease(&state, &retirement_sink, runtime_id, LeaseKind::Write),
         )
+        .and_then(|lease| lease.with_catalog_properties(catalog_properties))
     }
 
     fn acquire_statistics(

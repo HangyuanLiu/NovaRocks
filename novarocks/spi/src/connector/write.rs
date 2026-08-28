@@ -31,12 +31,12 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorMutationFailure,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationFamily,
-    LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    CatalogProperties, ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
+    ConnectorMutationFailure, ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    LakePublicationFamily, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 
 pub const CONNECTOR_WRITE_CONTRACT_VERSION: u32 = 1;
@@ -3461,6 +3461,9 @@ pub trait ConnectorWriteControl: Send + Sync {
 #[derive(Clone)]
 pub struct ConnectorWriteLease {
     binding_key: ConnectorExecutionBindingKey,
+    /// Exact immutable BE runtime materialization input. This remains separate
+    /// from the FE effect-generation key that fences commit/abort.
+    catalog_properties: Option<CatalogProperties>,
     control: Arc<dyn ConnectorWriteControl>,
     execution_provider_id: Option<ConnectorProviderId>,
     execution_distribution: Option<Arc<dyn ConnectorExecutionDistribution>>,
@@ -3486,6 +3489,7 @@ impl ConnectorWriteLease {
         }
         Ok(Self {
             binding_key,
+            catalog_properties: None,
             control,
             execution_provider_id: None,
             execution_distribution: None,
@@ -3515,6 +3519,27 @@ impl ConnectorWriteLease {
 
     pub fn binding_key(&self) -> &ConnectorExecutionBindingKey {
         &self.binding_key
+    }
+
+    /// Attach the desired-state-frozen runtime input retained by the FE
+    /// control lease. Direct control-only fixtures may omit it, but a native
+    /// write attachment must carry it into the query-wide Init CatalogSet.
+    pub fn with_catalog_properties(
+        mut self,
+        catalog_properties: CatalogProperties,
+    ) -> Result<Self, ConnectorError> {
+        if catalog_properties.handle().catalog_name() != &self.binding_key.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "write catalog properties do not match the effect generation owner",
+            ));
+        }
+        self.catalog_properties = Some(catalog_properties);
+        Ok(self)
+    }
+
+    pub fn catalog_properties(&self) -> Option<&CatalogProperties> {
+        self.catalog_properties.as_ref()
     }
 
     pub fn control(&self) -> &Arc<dyn ConnectorWriteControl> {
