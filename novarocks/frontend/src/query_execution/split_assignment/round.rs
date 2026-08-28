@@ -24,14 +24,16 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use novarocks_proto_codec::connector_read::ConnectorReadCodec;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::read_stack::ConnectorReadSplitSource;
 
 use super::super::connector_domain::CatalogHandle;
-use super::driver::{AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError};
+use super::driver::{
+    AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError, SplitAssignmentStop,
+    TaskUpdateRetryPolicy,
+};
 use super::transport::TaskUpdateTransport;
 
 /// How many splits one batch pulls from a source.
@@ -54,7 +56,11 @@ pub(crate) struct RoundSplitSource {
 pub(crate) struct RoundSplitAssignment {
     driver: SplitAssignmentDriver,
     sources: Vec<RoundSplitSource>,
-    closed: Arc<AtomicBool>,
+    stop: SplitAssignmentStop,
+    /// Closing owns source cleanup. It is deliberately independent from
+    /// `stop`: the coordinator signals stop before it joins the worker, and
+    /// that worker must still release every source after observing the signal.
+    closed: bool,
 }
 
 impl RoundSplitAssignment {
@@ -64,7 +70,9 @@ impl RoundSplitAssignment {
         tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
         max_queued_splits_per_task: u64,
         sources: Vec<RoundSplitSource>,
+        retry_policy: TaskUpdateRetryPolicy,
     ) -> Self {
+        let stop = SplitAssignmentStop::default();
         Self {
             driver: SplitAssignmentDriver::new(
                 execution_id,
@@ -75,9 +83,12 @@ impl RoundSplitAssignment {
                     .iter()
                     .map(|source| (source.plan_node_id, Arc::clone(&source.codec)))
                     .collect(),
+                retry_policy,
+                stop.clone(),
             ),
             sources,
-            closed: Arc::new(AtomicBool::new(false)),
+            stop,
+            closed: false,
         }
     }
 
@@ -86,10 +97,8 @@ impl RoundSplitAssignment {
     /// Cancellation reaches the coordinator on the statement thread while the
     /// pump may be blocked in a batch request, so the stop signal has to be
     /// observable without holding the round.
-    pub(crate) fn stop_handle(&self) -> RoundSplitAssignmentStop {
-        RoundSplitAssignmentStop {
-            closed: Arc::clone(&self.closed),
-        }
+    pub(crate) fn stop_handle(&self) -> SplitAssignmentStop {
+        self.stop.clone()
     }
 
     /// Drain every source until each plan node has sent its terminal marker.
@@ -97,11 +106,11 @@ impl RoundSplitAssignment {
     /// A source that yields nothing right now is retried after the other
     /// sources get a turn, so one slow enumeration cannot starve the rest.
     pub(crate) fn pump_to_completion(&mut self) -> Result<(), SplitAssignmentDriverError> {
-        while !self.closed.load(Ordering::Acquire) {
+        while !self.stop.is_stopped() {
             let mut progressed = false;
             let mut pending = false;
             for index in 0..self.sources.len() {
-                if self.closed.load(Ordering::Acquire) {
+                if self.stop.is_stopped() {
                     break;
                 }
                 let plan_node_id = self.sources[index].plan_node_id;
@@ -139,9 +148,11 @@ impl RoundSplitAssignment {
 
     /// Idempotent. Closes the driver and every source exactly once.
     pub(crate) fn close(&mut self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        if self.closed {
             return;
         }
+        self.closed = true;
+        self.stop.stop();
         self.driver.close();
         for entry in &mut self.sources {
             // A source close may race an outstanding batch; the connector
@@ -178,36 +189,194 @@ pub(crate) fn emit_split_source_close_marker(plan_node_id: i32) {
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
-/// Closes a round's split assignment from another thread.
-#[derive(Clone)]
-pub(crate) struct RoundSplitAssignmentStop {
-    closed: Arc<AtomicBool>,
-}
-
-impl RoundSplitAssignmentStop {
-    /// Ask the pump to stop. The round still closes its sources on drop; this
-    /// only makes the pump notice without waiting for a batch to return.
-    pub(crate) fn stop(&self) {
-        self.closed.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn is_stopped(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
-    }
-}
+pub(crate) type RoundSplitAssignmentStop = SplitAssignmentStop;
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use novarocks_proto_codec::connector_read::{
+        CatalogTableHandle, ConnectorReadCodecError, ValidatedColumnHandle,
+        ValidatedConnectorSplit, ValidatedTransactionHandle,
+    };
+    use novarocks_spi::connector::ConnectorError;
+    use novarocks_spi::connector::read_stack::{
+        ConnectorReadDynamicFilterSnapshot, ConnectorReadSplit, ConnectorReadSplitSource,
+        ConnectorSplitBatch,
+    };
+    use novarocks_types::{AttemptId, QueryId};
+
+    use crate::query_execution::connector_domain::TaskUpdateRequest;
+    use crate::query_execution::split_assignment::{TaskUpdateOutcome, TaskUpdateTransportError};
+
     use super::*;
+
+    struct NeverSend;
+
+    impl TaskUpdateTransport for NeverSend {
+        fn send(
+            &self,
+            _execution_id: QueryExecutionId,
+            _target: &AssignmentTarget,
+            _request: &TaskUpdateRequest,
+            _timeout: std::time::Duration,
+            _stop: &SplitAssignmentStop,
+        ) -> Result<TaskUpdateOutcome, TaskUpdateTransportError> {
+            panic!("closing a round must not send a task update")
+        }
+    }
+
+    struct CloseCountingSource {
+        close_calls: Arc<AtomicUsize>,
+    }
+
+    impl ConnectorReadSplitSource for CloseCountingSource {
+        fn next_batch(
+            &mut self,
+            _max_size: usize,
+            _dynamic_filter: &ConnectorReadDynamicFilterSnapshot,
+        ) -> Result<ConnectorSplitBatch<ConnectorReadSplit>, ConnectorError> {
+            panic!("close lifecycle tests must not enumerate splits")
+        }
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+
+        fn close(&mut self) -> Result<(), ConnectorError> {
+            self.close_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct InertCodec;
+
+    impl ConnectorReadCodec for InertCodec {
+        fn owner(&self) -> &str {
+            "round-close-test"
+        }
+
+        fn decode_relation(
+            &self,
+            _relation: &CatalogTableHandle,
+        ) -> Result<
+            novarocks_spi::connector::read_stack::ConnectorReadRelation,
+            ConnectorReadCodecError,
+        > {
+            unreachable!("close lifecycle tests must not decode relations")
+        }
+
+        fn encode_relation(
+            &self,
+            _relation: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
+        ) -> Result<
+            novarocks_proto_models::connector_read::CatalogTableHandle,
+            ConnectorReadCodecError,
+        > {
+            unreachable!("close lifecycle tests must not encode relations")
+        }
+
+        fn decode_column(
+            &self,
+            _column: &ValidatedColumnHandle,
+        ) -> Result<
+            novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+            ConnectorReadCodecError,
+        > {
+            unreachable!("close lifecycle tests must not decode columns")
+        }
+
+        fn encode_column(
+            &self,
+            _column: &novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+        ) -> Result<novarocks_proto_models::connector_read::ColumnHandle, ConnectorReadCodecError>
+        {
+            unreachable!("close lifecycle tests must not encode columns")
+        }
+
+        fn decode_transaction(
+            &self,
+            _transaction: &ValidatedTransactionHandle,
+        ) -> Result<
+            novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
+            ConnectorReadCodecError,
+        > {
+            unreachable!("close lifecycle tests must not decode transactions")
+        }
+
+        fn encode_transaction(
+            &self,
+            _transaction: &novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
+        ) -> Result<
+            novarocks_proto_models::connector_read::ConnectorTransactionHandle,
+            ConnectorReadCodecError,
+        > {
+            unreachable!("close lifecycle tests must not encode transactions")
+        }
+
+        fn decode_split(
+            &self,
+            _split: &ValidatedConnectorSplit,
+        ) -> Result<ConnectorReadSplit, ConnectorReadCodecError> {
+            unreachable!("close lifecycle tests must not decode splits")
+        }
+
+        fn encode_split(
+            &self,
+            _split: &ConnectorReadSplit,
+        ) -> Result<novarocks_proto_models::connector_read::ConnectorSplit, ConnectorReadCodecError>
+        {
+            unreachable!("close lifecycle tests must not encode splits")
+        }
+    }
+
+    fn assignment(close_calls: Arc<AtomicUsize>) -> RoundSplitAssignment {
+        let execution_id = QueryExecutionId::new(
+            QueryId::new(9, 9),
+            AttemptId::new(1).expect("attempt id must be valid"),
+        )
+        .expect("execution id must be valid");
+        RoundSplitAssignment::new(
+            execution_id,
+            Arc::new(NeverSend),
+            BTreeMap::new(),
+            1,
+            vec![RoundSplitSource {
+                plan_node_id: 7,
+                source: Box::new(CloseCountingSource { close_calls }),
+                codec: Arc::new(InertCodec),
+            }],
+            TaskUpdateRetryPolicy::default(),
+        )
+    }
 
     #[test]
     fn stop_handle_is_visible_to_the_pump() {
-        let closed = Arc::new(AtomicBool::new(false));
-        let stop = RoundSplitAssignmentStop {
-            closed: Arc::clone(&closed),
-        };
+        let stop = RoundSplitAssignmentStop::default();
         assert!(!stop.is_stopped());
         stop.stop();
-        assert!(closed.load(Ordering::Acquire));
+        assert!(stop.is_stopped());
+    }
+
+    #[test]
+    fn close_releases_sources_after_an_external_stop() {
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let mut assignment = assignment(Arc::clone(&close_calls));
+
+        assignment.stop_handle().stop();
+        assignment.close();
+
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn close_releases_each_source_only_once() {
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let mut assignment = assignment(Arc::clone(&close_calls));
+
+        assignment.close();
+        assignment.close();
+
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
     }
 }

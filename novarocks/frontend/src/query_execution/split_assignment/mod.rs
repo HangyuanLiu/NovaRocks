@@ -26,8 +26,10 @@ mod driver;
 mod round;
 mod transport;
 
+pub use driver::TaskUpdateRetryPolicy;
 pub(crate) use driver::{
-    AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError, SplitSourceHandle,
+    AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError, SplitAssignmentStop,
+    SplitSourceHandle,
 };
 pub(crate) use round::{
     DEFAULT_PUMP_BATCH_SIZE, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitSource,
@@ -35,4 +37,5 @@ pub(crate) use round::{
 };
 pub(crate) use transport::{
     AcceptedPlanNode, TaskUpdateOutcome, TaskUpdateTransport, TaskUpdateTransportError,
+    TaskUpdateTransportErrorKind,
 };

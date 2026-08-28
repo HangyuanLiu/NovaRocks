@@ -22,7 +22,7 @@
 //! split: the typed carrier has no split list, and a count taken here would
 //! pin the query's parallelism to whatever enumeration happened to produce
 //! first.
-// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
+// Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 
 use std::sync::Arc;
 

@@ -33,7 +33,8 @@ use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use crate::query_execution::artifact::ValidatedFragmentSchedule;
 use crate::query_execution::split_assignment::{
     AssignmentTarget, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitSource,
-    SplitAssignmentDriverError, TaskUpdateTransport, emit_split_source_close_marker,
+    SplitAssignmentDriverError, TaskUpdateRetryPolicy, TaskUpdateTransport,
+    emit_split_source_close_marker,
 };
 use novarocks_sql::plan_read::FragmentId;
 
@@ -93,6 +94,7 @@ pub(crate) struct RoundSplitAssignmentPlan {
     transport: Arc<dyn TaskUpdateTransport>,
     targets: BTreeMap<i32, Vec<AssignmentTarget>>,
     sources: Vec<RoundSplitSource>,
+    retry_policy: TaskUpdateRetryPolicy,
 }
 
 impl RoundSplitAssignmentPlan {
@@ -100,11 +102,13 @@ impl RoundSplitAssignmentPlan {
         transport: Arc<dyn TaskUpdateTransport>,
         targets: BTreeMap<i32, Vec<AssignmentTarget>>,
         sources: Vec<RoundSplitSource>,
+        retry_policy: TaskUpdateRetryPolicy,
     ) -> Self {
         Self {
             transport,
             targets,
             sources,
+            retry_policy,
         }
     }
 
@@ -161,6 +165,7 @@ impl SplitAssignmentRoundGuard {
             tasks,
             DEFAULT_MAX_QUEUED_SPLITS_PER_TASK,
             sources,
+            plan.retry_policy,
         );
         let stop = assignment.stop_handle();
         let worker = std::thread::Builder::new()
@@ -185,13 +190,14 @@ impl SplitAssignmentRoundGuard {
         })
     }
 
-    /// Stop the pump and wait for it, returning what it ended with.
+    /// Wait for delivery to finish, returning the worker result.
     ///
-    /// A pump that already finished normally returns `Ok`; one stopped early
-    /// also returns `Ok`, because an interrupted round is not itself a fault.
-    /// Only a real assignment failure surfaces as an error.
+    /// The root fetch may complete before an unknown-outcome TaskUpdate has
+    /// received its retry acknowledgement. A normal successful finish must
+    /// therefore not stop the worker: doing so would discard an accepted but
+    /// unconfirmed immutable assignment. Cancellation and unwinding still use
+    /// `Drop`, which signals stop before joining.
     pub(crate) fn finish(mut self) -> Result<(), SplitAssignmentDriverError> {
-        self.stop.stop();
         match self.worker.take() {
             Some(worker) => worker.join().unwrap_or(Ok(())),
             None => Ok(()),
@@ -210,6 +216,10 @@ impl Drop for SplitAssignmentRoundGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
     use novarocks_types::{AttemptId, QueryId};
 
     use super::*;
@@ -227,7 +237,9 @@ mod tests {
                 &self,
                 _execution_id: QueryExecutionId,
                 _target: &AssignmentTarget,
-                _request: crate::query_execution::connector_domain::TaskUpdateRequest,
+                _request: &crate::query_execution::connector_domain::TaskUpdateRequest,
+                _timeout: std::time::Duration,
+                _stop: &crate::query_execution::split_assignment::SplitAssignmentStop,
             ) -> Result<
                 crate::query_execution::split_assignment::TaskUpdateOutcome,
                 crate::query_execution::split_assignment::TaskUpdateTransportError,
@@ -238,9 +250,37 @@ mod tests {
         assert!(
             SplitAssignmentRoundGuard::start(
                 execution_id(),
-                RoundSplitAssignmentPlan::new(Arc::new(NeverCalled), BTreeMap::new(), Vec::new(),),
+                RoundSplitAssignmentPlan::new(
+                    Arc::new(NeverCalled),
+                    BTreeMap::new(),
+                    Vec::new(),
+                    TaskUpdateRetryPolicy::default(),
+                ),
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn finish_does_not_cancel_an_in_flight_delivery() {
+        let stop = RoundSplitAssignmentStop::default();
+        let observed_stop = Arc::new(AtomicBool::new(true));
+        let worker_stop = stop.clone();
+        let worker_observed_stop = Arc::clone(&observed_stop);
+        let guard = SplitAssignmentRoundGuard {
+            stop,
+            worker: Some(std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                worker_observed_stop.store(worker_stop.is_stopped(), Ordering::SeqCst);
+                Ok(())
+            })),
+        };
+
+        guard.finish().expect("finish waits for delivery");
+
+        assert!(
+            !observed_stop.load(Ordering::SeqCst),
+            "normal finish must not interrupt an in-flight task update retry"
         );
     }
 }

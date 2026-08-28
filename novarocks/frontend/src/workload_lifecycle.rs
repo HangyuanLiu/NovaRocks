@@ -17,7 +17,7 @@
 
 //! FE-local serving lifecycle and workload admission ownership.
 //!
-//! Design: ADR-0119. This owner deliberately has no knowledge of MySQL,
+//! Design: ADR-0121. This owner deliberately has no knowledge of MySQL,
 //! Native transport, or a particular background scheduler. Its mutex is the
 //! single linearization point for serving-state transitions and admission.
 
@@ -284,7 +284,7 @@ struct LifecycleShared {
 }
 
 /// Process-runtime authority for serving state and admission leases.
-// Design: ADR-0119 (docs/adr/ADR-0119-frontend-serving-lifecycle-and-admission-drain.md)
+// Design: ADR-0121 (docs/adr/ADR-0121-frontend-serving-lifecycle-and-admission-drain.md)
 #[derive(Clone)]
 pub struct FrontendServingLifecycle {
     shared: Arc<LifecycleShared>,

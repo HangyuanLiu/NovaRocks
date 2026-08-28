@@ -36,6 +36,7 @@ pub(crate) enum TaskUpdateRejectionReason {
     UnknownTask,
     NotAdmitted,
     Terminated,
+    /// Preserved wire rejection for the generic strict batch-order defense.
     SequenceConflict,
     AfterNoMoreSplits,
     UnknownPlanNode,

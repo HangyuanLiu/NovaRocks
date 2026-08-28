@@ -38,6 +38,7 @@ use crate::query_lifecycle::{
 
 const CONTROL_STREAM_CAPACITY: usize = 16;
 
+// Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 pub(crate) type QueryControlResponseStream =
     ReceiverStream<Result<proto::QueryControlResponse, tonic::Status>>;
 
@@ -163,13 +164,49 @@ pub(crate) fn handle_stage_fragments(
 /// A malformed or refused task update is a typed rejection on the response,
 /// not a transport error: the sender needs the reason to decide whether to
 /// retransmit, stop, or fail the query.
+#[expect(
+    clippy::result_large_err,
+    reason = "The tonic service boundary must preserve Status without changing its generated signature."
+)]
 pub(crate) fn handle_task_update(
     ingress: &dyn QueryLifecycleIngress,
     request: proto::TaskUpdateRequest,
-) -> proto::TaskUpdateResponse {
+) -> Result<proto::TaskUpdateResponse, tonic::Status> {
     match super::task_update::TaskUpdateRequest::parse(request) {
-        Ok(request) => ingress.task_update(request).to_proto(),
-        Err(error) => super::task_update::rejection_from_contract_error(&error).to_proto(),
+        Ok(request) => {
+            // Claim only after the backend has durably accepted an update
+            // which both carries a split and closes that plan node. A malformed,
+            // refused, or nonterminal delivery must leave the runner token for
+            // the real terminal acknowledgement.
+            let terminal_nonempty = request
+                .assignments()
+                .iter()
+                .any(|assignment| assignment.no_more_splits() && !assignment.splits().is_empty());
+            let execution_id = request.execution_id();
+            let response = ingress.task_update(request);
+            if terminal_nonempty
+                && matches!(&response, super::task_update::TaskUpdateAck::Accepted(_))
+                && let Some(scope) = claim_backend_fault(
+                    QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
+                    execution_id,
+                    ingress.backend_process_id(),
+                )?
+            {
+                eprintln!(
+                    "NOVAROCKS_TASK_UPDATE_TERMINAL_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={}",
+                    execution_id.query_id().high(),
+                    execution_id.query_id().low(),
+                    execution_id.attempt_id().get(),
+                    scope.backend_index,
+                    scope.token
+                );
+                return Err(tonic::Status::deadline_exceeded(
+                    "runner-owned TaskUpdate terminal acknowledgement dropped after acceptance",
+                ));
+            }
+            Ok(response.to_proto())
+        }
+        Err(error) => Ok(super::task_update::rejection_from_contract_error(&error).to_proto()),
     }
 }
 

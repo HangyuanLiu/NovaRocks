@@ -1,5 +1,5 @@
 ---
-id: ADR-0119
+id: ADR-0121
 title: "Frontend serving lifecycle uses one-way admission drain instead of connection shutdown or remote management mutation"
 domain: [runtime-role, distributed-query-lifecycle]
 status: active

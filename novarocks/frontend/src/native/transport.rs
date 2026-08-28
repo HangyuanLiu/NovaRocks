@@ -109,6 +109,36 @@ impl FrontendNativeTransport {
 type AuthenticatedNovaRocksGrpcClient =
     NovaRocksGrpcClient<InterceptedService<Channel, NativeClientAuthInterceptor>>;
 
+/// A Native channel either fails before an outbound connection is attempted,
+/// or while that connection is being established.  TaskUpdate must preserve
+/// that distinction: the latter has an unknown remote outcome, while the
+/// former cannot be repaired by resending an immutable request.
+#[derive(Debug)]
+enum ChannelAcquisitionError {
+    Fatal(String),
+    RetryableNetwork(String),
+}
+
+impl ChannelAcquisitionError {
+    fn fatal(detail: impl Into<String>) -> Self {
+        Self::Fatal(detail.into())
+    }
+
+    fn retryable_network(detail: impl Into<String>) -> Self {
+        Self::RetryableNetwork(detail.into())
+    }
+}
+
+impl std::fmt::Display for ChannelAcquisitionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fatal(detail) | Self::RetryableNetwork(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for ChannelAcquisitionError {}
+
 #[derive(Clone)]
 struct Client {
     endpoint: NativeEndpoint,
@@ -124,6 +154,14 @@ impl Client {
     }
 
     async fn grpc(&self) -> Result<AuthenticatedNovaRocksGrpcClient, String> {
+        self.grpc_with_channel_error()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn grpc_with_channel_error(
+        &self,
+    ) -> Result<AuthenticatedNovaRocksGrpcClient, ChannelAcquisitionError> {
         Ok(NovaRocksGrpcClient::with_interceptor(
             channel(&self.data_runtime, self.endpoint.clone()).await?,
             NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
@@ -147,7 +185,7 @@ impl Client {
 async fn channel(
     data_runtime: &FrontendDataRuntime,
     endpoint: NativeEndpoint,
-) -> Result<Channel, String> {
+) -> Result<Channel, ChannelAcquisitionError> {
     if let Some(channel) = data_runtime.cached_channel(&endpoint) {
         return Ok(channel);
     }
@@ -155,21 +193,33 @@ async fn channel(
     // the actual TCP/TLS dial using the typed endpoint; this never creates a
     // bare h2c client factory.
     let origin = format!("http://{endpoint}");
+    let connector = data_runtime
+        .native_transport()
+        .connector(endpoint.clone())
+        .map_err(|error| {
+            ChannelAcquisitionError::fatal(format!(
+                "construct Native endpoint connector failed: {error}"
+            ))
+        })?;
     let created = tonic::transport::Endpoint::from_shared(origin)
-        .map_err(|error| format!("construct Native client origin failed: {error}"))?
+        .map_err(|error| {
+            ChannelAcquisitionError::fatal(format!(
+                "construct Native client origin failed: {error}"
+            ))
+        })?
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(10))
         .http2_adaptive_window(true)
         .initial_stream_window_size(Some(32 * 1024 * 1024))
         .initial_connection_window_size(Some(128 * 1024 * 1024))
-        .connect_with_connector(
-            data_runtime
-                .native_transport()
-                .connector(endpoint.clone())?,
-        )
+        .connect_with_connector(connector)
         .await
-        .map_err(|error| format!("connect Native endpoint failed: {error}"))?;
+        .map_err(|error| {
+            ChannelAcquisitionError::retryable_network(format!(
+                "connect Native endpoint failed: {error}"
+            ))
+        })?;
     data_runtime.cache_channel(endpoint, created.clone());
     Ok(created)
 }
@@ -1086,12 +1136,15 @@ impl GrpcTaskUpdateTransport {
     }
 }
 
+// Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskUpdateTransport {
     fn send(
         &self,
         execution_id: novarocks_proto_codec::lifecycle::QueryExecutionId,
         target: &crate::query_execution::split_assignment::AssignmentTarget,
-        request: crate::query_execution::connector_domain::TaskUpdateRequest,
+        request: &crate::query_execution::connector_domain::TaskUpdateRequest,
+        timeout: Duration,
+        stop: &crate::query_execution::split_assignment::SplitAssignmentStop,
     ) -> Result<
         crate::query_execution::split_assignment::TaskUpdateOutcome,
         crate::query_execution::split_assignment::TaskUpdateTransportError,
@@ -1101,7 +1154,7 @@ impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskU
         };
 
         let client = self.clients.get(&target.backend_idx).ok_or_else(|| {
-            TaskUpdateTransportError::new(format!(
+            TaskUpdateTransportError::fatal(format!(
                 "task update client for backend {} is missing",
                 target.backend_idx
             ))
@@ -1120,19 +1173,50 @@ impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskU
             }),
             assignments: request
                 .to_proto_assignments()
-                .map_err(TaskUpdateTransportError::new)?,
+                .map_err(TaskUpdateTransportError::fatal)?,
         };
-        let response = client
-            .data_runtime
-            .block_on(async {
-                let mut grpc = client.grpc().await?;
-                grpc.task_update(request)
-                    .await
-                    .map(|value| value.into_inner())
-                    .map_err(|error| format!("task_update rpc failed: {error}"))
-            })
-            .map_err(TaskUpdateTransportError::new)?
-            .map_err(TaskUpdateTransportError::new)?;
+        let response = match client.data_runtime.block_on(async {
+                let deadline = tokio::time::Instant::now() + timeout;
+                let mut stop = stop.subscribe();
+                let mut grpc = tokio::select! {
+                    _ = stop.changed() => Err(TaskUpdateTransportError::closed("task_update round stopped during channel acquisition")),
+                    result = tokio::time::timeout_at(deadline, client.grpc_with_channel_error()) => result
+                        .map_err(|_| TaskUpdateTransportError::retryable_network("task_update rpc timeout during channel acquisition"))?
+                        .map_err(task_update_channel_acquisition_error),
+                }?;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(TaskUpdateTransportError::retryable_network(
+                        "task_update rpc timeout before unary submission",
+                    ));
+                }
+                let mut request = tonic::Request::new(request);
+                request.set_timeout(remaining);
+                tokio::select! {
+                    _ = stop.changed() => Err(TaskUpdateTransportError::closed("task_update round stopped awaiting response")),
+                    result = tokio::time::timeout_at(deadline, grpc.task_update(request)) => result
+                        .map_err(|_| TaskUpdateTransportError::retryable_network("task_update rpc timeout awaiting response"))?
+                        .map(|value| value.into_inner())
+                        .map_err(task_update_status_error),
+                }
+            }) {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                // A retryable outcome may have left the shared HTTP/2 stream
+                // unusable. Reacquire a channel before replaying the exact
+                // immutable request instead of letting a poisoned cache stall
+                // its retry until the statement deadline.
+                if error.kind() == crate::query_execution::split_assignment::TaskUpdateTransportErrorKind::RetryableNetwork {
+                    client.data_runtime.invalidate_channel(&client.endpoint);
+                }
+                return Err(error);
+            }
+            Err(error) => {
+                return Err(TaskUpdateTransportError::fatal(format!(
+                    "task_update runtime execution failed: {error}"
+                )));
+            }
+        };
 
         match response.outcome {
             Some(novarocks_proto_models::novarocks::task_update_response::Outcome::Accepted(
@@ -1167,9 +1251,113 @@ impl crate::query_execution::split_assignment::TaskUpdateTransport for GrpcTaskU
             }
             // A response with no outcome cannot be interpreted, and guessing
             // "accepted" would lose splits silently.
-            None => Err(TaskUpdateTransportError::new(
+            None => Err(TaskUpdateTransportError::fatal(
                 "task update response carried no outcome",
             )),
         }
+    }
+}
+
+/// Preserve the typed channel-acquisition boundary for TaskUpdate retries.
+/// URI and connector construction are deterministic local failures, while a
+/// completed connector that cannot dial or establish its HTTP/2 stream leaves
+/// the remote outcome unknown.
+fn task_update_channel_acquisition_error(
+    error: ChannelAcquisitionError,
+) -> crate::query_execution::split_assignment::TaskUpdateTransportError {
+    use crate::query_execution::split_assignment::TaskUpdateTransportError;
+
+    match error {
+        ChannelAcquisitionError::Fatal(detail) => TaskUpdateTransportError::fatal(format!(
+            "task_update channel acquisition failed: {detail}"
+        )),
+        ChannelAcquisitionError::RetryableNetwork(detail) => {
+            TaskUpdateTransportError::retryable_network(format!(
+                "task_update channel acquisition failed: {detail}"
+            ))
+        }
+    }
+}
+
+/// Classify only typed unary RPC statuses. A retrying caller must retain the
+/// exact request because every allowed status has an unknown remote outcome.
+fn task_update_status_error(
+    status: tonic::Status,
+) -> crate::query_execution::split_assignment::TaskUpdateTransportError {
+    use crate::query_execution::split_assignment::TaskUpdateTransportError;
+
+    let detail = format!(
+        "task_update rpc status {:?}: {}",
+        status.code(),
+        status.message()
+    );
+    match status.code() {
+        tonic::Code::Unavailable
+        | tonic::Code::DeadlineExceeded
+        | tonic::Code::Cancelled
+        | tonic::Code::Unknown => TaskUpdateTransportError::retryable_network(detail),
+        _ => TaskUpdateTransportError::fatal(detail),
+    }
+}
+
+#[cfg(test)]
+mod task_update_transport_tests {
+    use super::*;
+    use crate::query_execution::split_assignment::TaskUpdateTransportErrorKind;
+
+    #[test]
+    fn task_update_status_allowlist_is_exact() {
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::Cancelled,
+            tonic::Code::Unknown,
+        ] {
+            assert_eq!(
+                task_update_status_error(tonic::Status::new(code, "unknown outcome")).kind(),
+                TaskUpdateTransportErrorKind::RetryableNetwork,
+                "{code:?} must preserve the immutable request for retry"
+            );
+        }
+
+        for code in [
+            tonic::Code::InvalidArgument,
+            tonic::Code::NotFound,
+            tonic::Code::AlreadyExists,
+            tonic::Code::PermissionDenied,
+            tonic::Code::ResourceExhausted,
+            tonic::Code::FailedPrecondition,
+            tonic::Code::Aborted,
+            tonic::Code::OutOfRange,
+            tonic::Code::Unimplemented,
+            tonic::Code::Internal,
+            tonic::Code::DataLoss,
+            tonic::Code::Unauthenticated,
+        ] {
+            assert_eq!(
+                task_update_status_error(tonic::Status::new(code, "fatal")).kind(),
+                TaskUpdateTransportErrorKind::Fatal,
+                "{code:?} must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn task_update_channel_acquisition_preserves_typed_retryability() {
+        let connector_construction = task_update_channel_acquisition_error(
+            ChannelAcquisitionError::fatal("invalid TLS material"),
+        );
+        assert_eq!(
+            connector_construction.kind(),
+            TaskUpdateTransportErrorKind::Fatal
+        );
+
+        let dial_or_stream = task_update_channel_acquisition_error(
+            ChannelAcquisitionError::retryable_network("connection interrupted"),
+        );
+        assert_eq!(
+            dial_or_stream.kind(),
+            TaskUpdateTransportErrorKind::RetryableNetwork
+        );
     }
 }

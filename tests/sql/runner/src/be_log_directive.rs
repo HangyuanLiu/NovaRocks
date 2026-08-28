@@ -291,6 +291,11 @@ fn lifecycle_evidence(
     let logs = lifecycle_log_deltas(snapshot, server_handle, endpoint_count)?;
 
     if let Some(limit) = step.meta.query_control_fragment_backend_limit {
+        if limit > endpoint_count {
+            bail!(
+                "query-control fragment backend limit {limit} exceeds available BE count {endpoint_count}"
+            );
+        }
         let marker = "NOVAROCKS_QUERY_CONTROL_READY";
         let mut by_execution = BTreeMap::<String, Vec<(usize, usize)>>::new();
         for (index, log) in logs.iter().enumerate() {
@@ -326,15 +331,26 @@ fn lifecycle_evidence(
                 "NOVAROCKS_QUERY_FRAGMENT_ACCEPTED",
                 &execution,
             )?;
-            if services.len() == 1 && executors.len() == limit && services.is_disjoint(&executors) {
+            let expected_service_only = endpoint_count.saturating_sub(limit);
+            if services.len() == expected_service_only
+                && executors.len() == limit
+                && services.is_disjoint(&executors)
+            {
+                let kind = if expected_service_only == 0 {
+                    "all-executors"
+                } else {
+                    "service-only"
+                };
                 return Ok(Some(LogEvidenceCheck::Satisfied(vec![format!(
-                    "    query_lifecycle_evidence PASS kind=service-only execution_id={execution} participants=3 executors={limit} service_backend={}",
-                    services.iter().next().unwrap()
+                    "    query_lifecycle_evidence PASS kind={kind} execution_id={execution} participants={endpoint_count} executors={limit} service_only={expected_service_only}",
                 )])));
             }
         }
         return Ok(Some(LogEvidenceCheck::Pending(
-            "no single execution proves 3 participants, exactly one service-only participant, and exactly 2 fragment executors".to_string(),
+            format!(
+                "no single execution proves {endpoint_count} participants, {} service-only participants, and {limit} fragment executors",
+                endpoint_count.saturating_sub(limit)
+            ),
         )));
     }
 
@@ -1593,6 +1609,29 @@ mod tests {
         let snapshot = BeLogSnapshot::default();
 
         let check = lifecycle_evidence(&step, &handle, &snapshot, 3)
+            .expect("evaluate evidence")
+            .expect("lifecycle check");
+
+        assert!(matches!(check, LogEvidenceCheck::Satisfied(_)));
+    }
+
+    #[test]
+    fn all_executor_evidence_accepts_each_backend_receiving_a_fragment() {
+        let execution = "10:20:1";
+        let logs = (0..3)
+            .map(|backend| {
+                format!(
+                    "NOVAROCKS_QUERY_CONTROL_READY execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789ab{backend} expected_fragments=1\nNOVAROCKS_QUERY_FRAGMENT_ACCEPTED execution_id={execution} process_id=018f3d8a-2b4c-7d6e-8f90-123456789ab{backend} finst_id=1:{backend}\n"
+                )
+            })
+            .collect::<Vec<_>>();
+        let handle = FakeBeLogHandle::new(logs.iter().map(String::as_str).collect());
+        let step = step(QueryMeta {
+            query_control_fragment_backend_limit: Some(3),
+            ..QueryMeta::default()
+        });
+
+        let check = lifecycle_evidence(&step, &handle, &BeLogSnapshot::default(), 3)
             .expect("evaluate evidence")
             .expect("lifecycle check");
 

@@ -1,11 +1,10 @@
-//! Structural validation and canonical encoding for the typed connector read
-//! wire.
+//! Structural validation for the typed connector read wire.
 //!
 //! This module owns bounds, required presence, known enums, uniqueness,
-//! cross-field consistency, and canonical bytes for replay comparison. It does
+//! cross-field consistency, and closed-carrier bounds. It does
 //! not own connector semantics: a provider variant is carried and validated
 //! structurally, and only the provider that produced it interprets it.
-// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
+// Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 
 mod handle;
 mod predicate;
@@ -29,7 +28,7 @@ pub use predicate::{
 pub use runtime_codec::{
     ConnectorReadCodec, ConnectorReadCodecError, ConnectorReadExecutionBundle,
     ConnectorReadExecutionBundleFactory, DecodedConnectorReadScan, DecodedScheduledReadSplit,
-    ReceivedScheduledSplitEvidence,
+    ReceivedScheduledSplit,
 };
 pub use scan::{ConnectorTableScanSource, DynamicFilterBinding, ScanAssignment, ScanWorkSource};
 pub use split::{SplitCategory, ValidatedConnectorSplit};

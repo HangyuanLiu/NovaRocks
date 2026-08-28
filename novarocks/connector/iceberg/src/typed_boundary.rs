@@ -37,7 +37,7 @@
 //!
 //! It is additive: the existing [`crate::metadata`] control path is
 //! untouched and keeps its own resolution rules.
-// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
+// Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;

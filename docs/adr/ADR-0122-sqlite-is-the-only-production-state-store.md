@@ -1,5 +1,5 @@
 ---
-id: ADR-0119
+id: ADR-0122
 title: "SQLite is the only production StateStore"
 domain: [crate-boundary, configuration]
 status: active

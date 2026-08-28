@@ -390,6 +390,10 @@ mode = "dynamic-state-store"
 
 [runtime]
 exchange_wait_ms = 300000
+query_control_task_update_rpc_timeout_ms = 5000
+query_control_task_update_retry_error_duration_ms = 30000
+query_control_task_update_retry_initial_backoff_ms = 100
+query_control_task_update_retry_max_backoff_ms = 1000
 
 [state_store]
 provider = "sqlite"

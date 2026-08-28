@@ -76,6 +76,7 @@ pub use mysql::{
 pub use native::report_server::FrontendReportServerHandle;
 pub use native::transport::FrontendNativeTransport;
 pub use query::FrontendQueryService;
+pub use query_execution::split_assignment::TaskUpdateRetryPolicy;
 pub use query_lifecycle_error::{QueryLifecycleError, QueryLifecycleErrorCode};
 pub use server::{
     FrontendServerConfig, build_frontend_query_session_factory,

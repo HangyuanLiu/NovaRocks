@@ -26,7 +26,7 @@
 //! Ordered assignments are the sole output-order authority. A connector may
 //! narrow its own handle in response to a projection, but it never reorders,
 //! adds, or removes an output column.
-// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
+// Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

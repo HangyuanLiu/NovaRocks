@@ -495,6 +495,9 @@ fn compose_backend_application_services(
         .with_write_commit_evidence_limits(write_commit_evidence_limits)
         .with_exchange_receiver_port(Arc::clone(&exchange_receiver_port)),
     );
+    let terminal_cleanup: Arc<dyn crate::query_lifecycle::QueryLifecycleTerminalCleanup> =
+        native_fragment_service.clone();
+    query_lifecycle_registry.install_terminal_cleanup(Arc::downgrade(&terminal_cleanup));
     controls.publish_resource_snapshot();
     execution_host.publish_resource_snapshot();
     crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global()

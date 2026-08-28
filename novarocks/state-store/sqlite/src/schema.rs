@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Design: ADR-0119 (docs/adr/ADR-0119-sqlite-is-the-only-production-state-store.md)
+// Design: ADR-0122 (docs/adr/ADR-0122-sqlite-is-the-only-production-state-store.md)
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::{Uuid, Version};
@@ -848,4 +848,4 @@ fn load_optional(
 const fn schema_error(message: &'static str) -> StateStoreError {
     StateStoreError::new(StateStoreErrorKind::Corruption, message)
 }
-// Design: ADR-0119 (docs/adr/ADR-0119-sqlite-is-the-only-production-state-store.md)
+// Design: ADR-0122 (docs/adr/ADR-0122-sqlite-is-the-only-production-state-store.md)

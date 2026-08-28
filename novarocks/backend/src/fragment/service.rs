@@ -53,7 +53,9 @@ use crate::fragment::decode::request::NativeFragmentRequest;
 use crate::fragment::ingress::{
     NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
 };
-use crate::query_lifecycle::{QueryLifecycleRegistry, stage::StartGate};
+use crate::query_lifecycle::{
+    QueryLifecycleRegistry, QueryLifecycleTerminalCleanup, stage::StartGate,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum NativeFragmentLifecycleEvent {
@@ -71,8 +73,6 @@ type LifecycleObserver = Arc<dyn Fn(NativeFragmentLifecycleEvent) + Send + Sync>
 fn split_queue_config() -> novarocks_execution::connector::SplitQueueConfig {
     novarocks_execution::connector::SplitQueueConfig {
         max_queued_bytes: novarocks_proto_codec::connector_read::MAX_ASSIGNMENT_RETAINED_BYTES,
-        max_replay_record_bytes:
-            novarocks_proto_codec::connector_read::MAX_ASSIGNMENT_RETAINED_BYTES,
     }
 }
 
@@ -400,47 +400,56 @@ impl NativeFragmentService {
         let mut accepted = Vec::with_capacity(assignments.len());
         for assignment in assignments {
             let queue = attempt.queue(assignment.plan_node_id());
-            let read_execution = self
-                .read_contexts
-                .lock()
-                .ok()
-                .and_then(|contexts| contexts.get(&key).cloned())
-                .and_then(|context| context.resolve(assignment.plan_node_id()));
-            let Some(read_execution) = read_execution else {
-                return TaskUpdateAck::rejected(
-                    crate::query_lifecycle::task_update::TaskUpdateRejectionReason::UnknownPlanNode,
-                    format!(
-                        "no typed connector read context exists for plan node {}",
-                        assignment.plan_node_id()
-                    ),
-                );
-            };
-            let evidence = assignment
+            let sequences = assignment
                 .splits()
                 .iter()
                 .map(|split| {
-                    novarocks_execution::connector::SplitReplayEvidence::new(
+                    novarocks_execution::connector::SplitSequenceEvidence::new(
                         split.sequence_id(),
                         split.plan_node_id(),
-                        split.canonical_bytes().to_vec(),
                     )
                 })
                 .collect::<Vec<_>>();
-            // Queue state decides whether this is a replay, a conflict, or a
-            // terminal update before a concrete binding attempts to recover a
-            // provider payload.  A later codec fills `ReceivedReadSplit` only
-            // for `new_sequences`; exact replay never depends on map order in
-            // a recovered provider value.
-            let preflight = match queue.preflight_replay(assignment.plan_node_id(), &evidence) {
+            // Closed-carrier validation precedes this point. Queue state then
+            // classifies duplicate sequence numbers before provider decoding,
+            // so an at-or-below-watermark retransmission never recovers a
+            // provider payload.
+            let preflight = match queue.preflight_sequences(assignment.plan_node_id(), &sequences) {
                 Ok(preflight) => preflight,
                 Err(error) => return split_queue_rejection(error),
+            };
+            let has_new_splits = assignment
+                .splits()
+                .iter()
+                .any(|split| !preflight.is_duplicate(split.sequence_id()));
+            let read_execution = if has_new_splits {
+                let read_execution = self
+                    .read_contexts
+                    .lock()
+                    .ok()
+                    .and_then(|contexts| contexts.get(&key).cloned())
+                    .and_then(|context| context.resolve(assignment.plan_node_id()));
+                let Some(read_execution) = read_execution else {
+                    return TaskUpdateAck::rejected(
+                        crate::query_lifecycle::task_update::TaskUpdateRejectionReason::UnknownPlanNode,
+                        format!(
+                            "no typed connector read context exists for plan node {}",
+                            assignment.plan_node_id()
+                        ),
+                    );
+                };
+                Some(read_execution)
+            } else {
+                None
             };
             let received = assignment
                 .splits()
                 .iter()
-                .filter(|split| !preflight.is_replay(split.sequence_id()))
+                .filter(|split| !preflight.is_duplicate(split.sequence_id()))
                 .map(|split| {
                     read_execution
+                        .as_ref()
+                        .expect("new splits require a typed read execution")
                         .codec()
                         .decode_scheduled_split(split)
                         .map(|decoded| {
@@ -463,14 +472,17 @@ impl NativeFragmentService {
                 received,
                 assignment.no_more_splits(),
             ) {
-                Ok(mut outcome) => {
-                    outcome.replayed = preflight.replayed().to_vec();
+                Ok(outcome) => {
+                    let preflight_duplicate_count = preflight.duplicate_sequences().len();
+                    queue.record_preflight_duplicate_splits(preflight_duplicate_count);
+                    let duplicate_count =
+                        preflight_duplicate_count.saturating_add(outcome.duplicate_sequences.len());
                     // Stable acceptance evidence for distributed acceptance
                     // runs: it proves a real remote assignment reached this
                     // task, which a single-process smoke cannot show.
                     if crate::config::debug_emit_connector_reader_marker() {
                         println!(
-                            "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED execution_id={}:{}:{} finst={:x}:{:x} plan_node={} enqueued={} replayed={} accepted_through={}",
+                            "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_ACCEPTED execution_id={}:{}:{} finst={:x}:{:x} plan_node={} enqueued={} duplicate={} accepted_through={}",
                             execution_id.query_id().high(),
                             execution_id.query_id().low(),
                             execution_id.attempt_id().get(),
@@ -478,9 +490,22 @@ impl NativeFragmentService {
                             fragment_instance_id.low(),
                             assignment.plan_node_id(),
                             outcome.enqueued.len(),
-                            outcome.replayed.len(),
+                            duplicate_count,
                             outcome.max_accepted_sequence.unwrap_or_default(),
                         );
+                        if duplicate_count > 0 {
+                            println!(
+                                "NOVAROCKS_TASK_SPLIT_ASSIGNMENT_DUPLICATE execution_id={}:{}:{} finst={:x}:{:x} plan_node={} duplicate={} duplicate_splits_skipped={}",
+                                execution_id.query_id().high(),
+                                execution_id.query_id().low(),
+                                execution_id.attempt_id().get(),
+                                fragment_instance_id.high(),
+                                fragment_instance_id.low(),
+                                assignment.plan_node_id(),
+                                duplicate_count,
+                                queue.stats().duplicate_splits_skipped,
+                            );
+                        }
                         if outcome.no_more_splits {
                             println!(
                                 "NOVAROCKS_TASK_SPLIT_NO_MORE execution_id={}:{}:{} finst={:x}:{:x} plan_node={}",
@@ -1103,6 +1128,15 @@ impl ProvisionalTypedReadContext {
     }
 }
 
+impl QueryLifecycleTerminalCleanup for NativeFragmentService {
+    fn cleanup_terminal_execution(&self, execution_id: QueryExecutionId) {
+        self.split_queues.close_execution(execution_id);
+        if let Ok(mut contexts) = self.read_contexts.lock() {
+            contexts.retain(|key, _| key.execution_id() != execution_id);
+        }
+    }
+}
+
 impl Drop for ProvisionalTypedReadContext {
     fn drop(&mut self) {
         if self.published {
@@ -1147,9 +1181,17 @@ fn consume_terminal_fact(
     }
     let sink = crate::runtime::sink_commit::report_snapshot(fragment_instance_id)
         .with_connector_staged_report_frames(running.take_connector_staged_report_frames());
+    let succeeded = matches!(fact.outcome(), FragmentOutcome::Succeeded);
     // QLC terminal facts are transferred before local runtime cleanup.
     lifecycle.record_fragment_terminal_fact(execution_id, fact, backend_num, sink);
-    close_task_split_queues(&split_queues, execution_id, fragment_instance_id);
+    // A successful terminal split assignment carries no_more_splits and must
+    // retain its watermark until the lifecycle tombstone. The sender may have
+    // lost the unary acknowledgement and retry after this worker has exited.
+    // Failed and cancelled workers still close immediately to wake parked
+    // scans; their lifecycle cannot accept more work.
+    if !succeeded {
+        close_task_split_queues(&split_queues, execution_id, fragment_instance_id);
+    }
     remove_task_read_context(&read_contexts, execution_id, fragment_instance_id);
     queries.unregister_fragment_execution(execution_id, fragment_instance_id);
     queries.finish_fragment(execution_id);

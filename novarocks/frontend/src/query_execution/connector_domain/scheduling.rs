@@ -18,9 +18,11 @@
 //! Runtime split-assignment values owned by the coordinator.
 //!
 //! Sequence is the only scheduling identity: it is monotonic within one
-//! (task attempt, plan node), an exact replay is idempotent, and the same
-//! sequence carrying different content is a conflict. No split digest, content
-//! id, or self-attestation exists here.
+//! (task attempt, plan node), and a sequence at or below the receiver
+//! watermark is idempotently skipped regardless of its payload. Sender-side
+//! immutable assignment ownership is therefore the sole guard against mapping
+//! one sequence to different content. No split digest, content id, or
+//! self-attestation exists here.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -237,7 +239,12 @@ impl PlanNodeAssignmentState {
     }
 }
 
-/// One update delivered to one admitted task.
+/// One immutable update delivered to one admitted task.
+///
+/// A driver owns this value until it observes a terminal acknowledgement. It
+/// may pass the same borrowed request to its transport more than once after an
+/// unknown network outcome; every egress encoding therefore starts from these
+/// fixed assignments rather than rebuilding their sequence space.
 #[derive(Clone, Debug)]
 pub(crate) struct TaskUpdateRequest {
     fragment_instance_id: UniqueId,

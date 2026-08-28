@@ -20,10 +20,9 @@
 //! Responsibilities:
 //! - Owns the runtime stream of splits a scan receives after its plan was
 //!   frozen, one queue per plan node inside one task attempt.
-//! - Enforces the wire contract locally: monotonic sequences, idempotent exact
-//!   replay, typed conflict on a rewritten sequence, an idempotent terminal
-//!   marker, and a retained-byte ceiling that a sender can use for
-//!   backpressure.
+//! - Enforces the wire contract locally: monotonic sequence watermarks,
+//!   idempotent duplicate suppression, an idempotent terminal marker, and a
+//!   retained-byte ceiling that a sender can use for backpressure.
 //!
 //! Key exported interfaces:
 //! - Types: `SplitQueueRegistry`, `TaskAttemptSplitQueues`, `SplitQueue`,
@@ -37,11 +36,11 @@
 //!   born with the attempt and die with it.
 //!
 //! Provider neutrality: the queue moves role-owned received splits and reads
-//! only their sequence, plan node, canonical bytes, and retained size. It
+//! only their sequence, plan node, and retained size. It
 //! imports neither a wire model nor a provider implementation.
-// Design: ADR-0119 (docs/adr/ADR-0119-connector-read-spi-runtime-and-wire-codec-separation.md)
+// Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -50,15 +49,12 @@ use novarocks_types::{QueryExecutionId, UniqueId};
 
 use crate::runtime::observable::Observable;
 
-/// Per-entry overhead of one replay record: the sequence key plus the vector
-/// header that owns its canonical bytes.
-const REPLAY_ENTRY_OVERHEAD_BYTES: u64 = (size_of::<u64>() + size_of::<Vec<u8>>()) as u64;
-
 /// The facts this queue needs from one scheduled split.
 ///
 /// The queue is generic over this narrow view rather than over a wire type.
 /// Roles recover their own received split before entering the queue, so
-/// ordering, replay, and budget rules cannot reach a provider variant.
+/// ordering, duplicate suppression, and budget rules cannot reach a provider
+/// variant.
 pub trait ScheduledSplitFacts: Send + Sync + 'static {
     /// Monotonic within one (task attempt, plan node).
     fn sequence_id(&self) -> u64;
@@ -66,30 +62,25 @@ pub trait ScheduledSplitFacts: Send + Sync + 'static {
     /// The plan node whose queue this split belongs to.
     fn plan_node_id(&self) -> i32;
 
-    /// The bytes an exact replay must reproduce.
-    fn canonical_bytes(&self) -> &[u8];
-
     /// Retained-byte estimate charged against the queue's ceiling.
     fn retained_size_in_bytes(&self) -> u64;
 }
 
 /// The protocol evidence required to classify a retransmission before a role
-/// attempts provider-specific recovery.  It intentionally carries no split
-/// payload: exact replay, closed, sequence-conflict, and terminal-state
-/// outcomes take precedence over a malformed new provider payload.
+/// attempts provider-specific recovery. It intentionally carries no payload:
+/// a sequence at or below the accepted watermark is a duplicate regardless of
+/// its payload, so it must not be decoded merely to compare content.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SplitReplayEvidence {
+pub struct SplitSequenceEvidence {
     sequence_id: u64,
     plan_node_id: i32,
-    canonical_bytes: Arc<[u8]>,
 }
 
-impl SplitReplayEvidence {
-    pub fn new(sequence_id: u64, plan_node_id: i32, canonical_bytes: impl Into<Arc<[u8]>>) -> Self {
+impl SplitSequenceEvidence {
+    pub const fn new(sequence_id: u64, plan_node_id: i32) -> Self {
         Self {
             sequence_id,
             plan_node_id,
-            canonical_bytes: canonical_bytes.into(),
         }
     }
 
@@ -99,10 +90,6 @@ impl SplitReplayEvidence {
 
     pub const fn plan_node_id(&self) -> i32 {
         self.plan_node_id
-    }
-
-    pub fn canonical_bytes(&self) -> &[u8] {
-        &self.canonical_bytes
     }
 }
 
@@ -114,9 +101,7 @@ impl SplitReplayEvidence {
 pub enum SplitQueueErrorKind {
     /// The assignment names a plan node other than the queue it reached.
     PlanNodeMismatch,
-    /// The same sequence was already accepted carrying different canonical
-    /// bytes, the batch did not strictly increase, or the sequence is below the
-    /// accepted high-water mark and was never seen.
+    /// The batch did not strictly increase.
     SequenceConflict,
     /// A previously unseen sequence arrived after this plan node's terminal
     /// marker.
@@ -203,15 +188,6 @@ pub struct SplitQueueConfig {
     /// the backpressure signal: a sender that ignores the reported queue depth
     /// is rejected rather than allowed to grow the queue without bound.
     pub max_queued_bytes: u64,
-    /// Ceiling on the replay record, which keeps the canonical bytes of every
-    /// accepted sequence for this attempt.
-    ///
-    /// The record cannot shrink while the attempt lives: telling an exact
-    /// replay apart from a rewritten sequence needs the original bytes, and a
-    /// digest would reintroduce the content id the wire contract deliberately
-    /// does not have. Bounding it is therefore the only honest option, and
-    /// exceeding the bound is a typed resource error, not a silent truncation.
-    pub max_replay_record_bytes: u64,
 }
 
 impl Default for SplitQueueConfig {
@@ -220,7 +196,6 @@ impl Default for SplitQueueConfig {
             // Roles select their protocol budget explicitly. Execution has no
             // dependency on the central wire contract.
             max_queued_bytes: 64 * 1024 * 1024,
-            max_replay_record_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -233,33 +208,33 @@ impl Default for SplitQueueConfig {
 pub struct SplitOfferOutcome {
     /// Sequences newly enqueued by this offer, in offer order.
     pub enqueued: Vec<u64>,
-    /// Sequences recognized as exact replays; they enqueued nothing.
-    pub replayed: Vec<u64>,
+    /// Sequences at or below the accepted watermark; they enqueued nothing.
+    pub duplicate_sequences: Vec<u64>,
     /// The highest sequence this plan node has accepted.
     pub max_accepted_sequence: Option<u64>,
     /// Whether this plan node has seen its terminal marker.
     pub no_more_splits: bool,
 }
 
-/// The result of a replay-only preflight.  Roles use this to avoid decoding an
-/// exact replay and to preserve queue-state rejection priority.
+/// The result of a sequence-only preflight. Roles use this to avoid decoding
+/// duplicates and to preserve queue-state rejection priority.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SplitReplayPreflight {
-    replayed: Vec<u64>,
+pub struct SplitSequencePreflight {
+    duplicate_sequences: Vec<u64>,
     new_sequences: Vec<u64>,
 }
 
-impl SplitReplayPreflight {
-    pub fn replayed(&self) -> &[u64] {
-        &self.replayed
+impl SplitSequencePreflight {
+    pub fn duplicate_sequences(&self) -> &[u64] {
+        &self.duplicate_sequences
     }
 
     pub fn new_sequences(&self) -> &[u64] {
         &self.new_sequences
     }
 
-    pub fn is_replay(&self, sequence_id: u64) -> bool {
-        self.replayed.binary_search(&sequence_id).is_ok()
+    pub fn is_duplicate(&self, sequence_id: u64) -> bool {
+        self.duplicate_sequences.binary_search(&sequence_id).is_ok()
     }
 }
 
@@ -268,8 +243,10 @@ impl SplitReplayPreflight {
 pub struct SplitQueueStats {
     pub queued_splits: usize,
     pub queued_bytes: u64,
-    pub accepted_splits: usize,
-    pub replay_record_bytes: u64,
+    /// Number of splits skipped because their sequence was at or below the
+    /// accepted watermark. This is observability only: it never retains or
+    /// compares split payloads.
+    pub duplicate_splits_skipped: u64,
     pub max_accepted_sequence: Option<u64>,
     pub no_more_splits: bool,
     pub closed: bool,
@@ -293,19 +270,17 @@ pub enum SplitPoll<S> {
 
 struct SplitQueueState<S> {
     pending: VecDeque<S>,
-    /// Canonical bytes of every sequence accepted for this plan node. See
-    /// [`SplitQueueConfig::max_replay_record_bytes`] for why it is retained.
-    accepted: BTreeMap<u64, Vec<u8>>,
+    max_accepted_sequence: Option<u64>,
     queued_bytes: u64,
-    replay_record_bytes: u64,
+    duplicate_splits_skipped: u64,
     no_more_splits: bool,
     closed: bool,
 }
 
 /// What the classification pass decided about one offered split.
 enum SplitDecision {
-    Enqueue { retained: u64, record: u64 },
-    Replay,
+    Enqueue { retained: u64 },
+    Duplicate,
 }
 
 /// One plan node's runtime split queue inside one task attempt.
@@ -327,9 +302,9 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
             config,
             state: Mutex::new(SplitQueueState {
                 pending: VecDeque::new(),
-                accepted: BTreeMap::new(),
+                max_accepted_sequence: None,
                 queued_bytes: 0,
-                replay_record_bytes: 0,
+                duplicate_splits_skipped: 0,
                 no_more_splits: false,
                 closed: false,
             }),
@@ -351,15 +326,15 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
         Arc::clone(&self.observable)
     }
 
-    /// Classify already-accepted evidence without recovering provider data or
-    /// mutating the queue.  The caller must still submit every newly decoded
-    /// split through [`Self::offer_splits`], which performs the atomic commit
-    /// and budget checks.
-    pub fn preflight_replay(
+    /// Classify sequence evidence without recovering provider data or mutating
+    /// the queue. The caller must still submit every newly decoded split
+    /// through [`Self::offer_splits`], which performs the atomic commit and
+    /// budget checks.
+    pub fn preflight_sequences(
         &self,
         plan_node_id: i32,
-        splits: &[SplitReplayEvidence],
-    ) -> Result<SplitReplayPreflight, SplitQueueError> {
+        splits: &[SplitSequenceEvidence],
+    ) -> Result<SplitSequencePreflight, SplitQueueError> {
         if plan_node_id != self.plan_node_id {
             return Err(self.error(
                 SplitQueueErrorKind::PlanNodeMismatch,
@@ -378,9 +353,8 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
                 "the queue is closed and accepts no further split",
             ));
         }
-        let high_water = state.accepted.keys().next_back().copied();
         let mut previous = None;
-        let mut outcome = SplitReplayPreflight::default();
+        let mut outcome = SplitSequencePreflight::default();
         for split in splits {
             let sequence_id = split.sequence_id();
             if split.plan_node_id() != self.plan_node_id {
@@ -400,34 +374,20 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
                 ));
             }
             previous = Some(sequence_id);
-            match state.accepted.get(&sequence_id) {
-                Some(recorded) if recorded.as_slice() == split.canonical_bytes() => {
-                    outcome.replayed.push(sequence_id);
-                }
-                Some(_) => {
+            if state
+                .max_accepted_sequence
+                .is_some_and(|watermark| sequence_id <= watermark)
+            {
+                outcome.duplicate_sequences.push(sequence_id);
+            } else {
+                if state.no_more_splits {
                     return Err(self.error(
-                        SplitQueueErrorKind::SequenceConflict,
+                        SplitQueueErrorKind::AfterNoMoreSplits,
                         Some(sequence_id),
-                        "sequence was already accepted with different canonical bytes",
+                        "plan node already saw its terminal marker",
                     ));
                 }
-                None => {
-                    if high_water.is_some_and(|high_water| sequence_id <= high_water) {
-                        return Err(self.error(
-                            SplitQueueErrorKind::SequenceConflict,
-                            Some(sequence_id),
-                            "sequence is below the accepted high-water mark and was never seen",
-                        ));
-                    }
-                    if state.no_more_splits {
-                        return Err(self.error(
-                            SplitQueueErrorKind::AfterNoMoreSplits,
-                            Some(sequence_id),
-                            "plan node already saw its terminal marker",
-                        ));
-                    }
-                    outcome.new_sequences.push(sequence_id);
-                }
+                outcome.new_sequences.push(sequence_id);
             }
         }
         Ok(outcome)
@@ -464,10 +424,8 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
             ));
         }
 
-        let high_water = state.accepted.keys().next_back().copied();
         let mut decisions = Vec::with_capacity(splits.len());
         let mut added_queued_bytes: u64 = 0;
-        let mut added_record_bytes: u64 = 0;
         let mut previous: Option<u64> = None;
 
         for split in &splits {
@@ -493,44 +451,25 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
             }
             previous = Some(sequence_id);
 
-            match state.accepted.get(&sequence_id) {
-                Some(recorded) => {
-                    if recorded.as_slice() != split.canonical_bytes() {
-                        return Err(self.error(
-                            SplitQueueErrorKind::SequenceConflict,
-                            Some(sequence_id),
-                            "sequence was already accepted with different canonical bytes",
-                        ));
-                    }
-                    // An exact replay is idempotent. It stays legal after the
-                    // terminal marker, because the batch that carried the
-                    // marker is exactly what a sender retransmits.
-                    decisions.push(SplitDecision::Replay);
+            if state
+                .max_accepted_sequence
+                .is_some_and(|watermark| sequence_id <= watermark)
+            {
+                // Duplicate classification intentionally ignores payload. The
+                // receiver records only a monotonically advancing watermark,
+                // so retransmission never retains or compares provider bytes.
+                decisions.push(SplitDecision::Duplicate);
+            } else {
+                if state.no_more_splits {
+                    return Err(self.error(
+                        SplitQueueErrorKind::AfterNoMoreSplits,
+                        Some(sequence_id),
+                        "plan node already saw its terminal marker",
+                    ));
                 }
-                None => {
-                    if let Some(high_water) = high_water
-                        && sequence_id <= high_water
-                    {
-                        return Err(self.error(
-                            SplitQueueErrorKind::SequenceConflict,
-                            Some(sequence_id),
-                            "sequence is below the accepted high-water mark and was never seen",
-                        ));
-                    }
-                    if state.no_more_splits {
-                        return Err(self.error(
-                            SplitQueueErrorKind::AfterNoMoreSplits,
-                            Some(sequence_id),
-                            "plan node already saw its terminal marker",
-                        ));
-                    }
-                    let retained = split.retained_size_in_bytes();
-                    let record = (split.canonical_bytes().len() as u64)
-                        .saturating_add(REPLAY_ENTRY_OVERHEAD_BYTES);
-                    added_queued_bytes = added_queued_bytes.saturating_add(retained);
-                    added_record_bytes = added_record_bytes.saturating_add(record);
-                    decisions.push(SplitDecision::Enqueue { retained, record });
-                }
+                let retained = split.retained_size_in_bytes();
+                added_queued_bytes = added_queued_bytes.saturating_add(retained);
+                decisions.push(SplitDecision::Enqueue { retained });
             }
         }
 
@@ -545,41 +484,29 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
                 ),
             ));
         }
-        let projected_record = state.replay_record_bytes.saturating_add(added_record_bytes);
-        if projected_record > self.config.max_replay_record_bytes {
-            return Err(self.error(
-                SplitQueueErrorKind::ResourceExhausted,
-                None,
-                format!(
-                    "offer would retain {projected_record} replay-record bytes, above the ceiling of {}",
-                    self.config.max_replay_record_bytes
-                ),
-            ));
-        }
-
         let mut outcome = SplitOfferOutcome::default();
         for (split, decision) in splits.into_iter().zip(decisions) {
             let sequence_id = split.sequence_id();
             match decision {
-                SplitDecision::Enqueue { retained, record } => {
-                    state
-                        .accepted
-                        .insert(sequence_id, split.canonical_bytes().to_vec());
+                SplitDecision::Enqueue { retained } => {
+                    state.max_accepted_sequence = Some(sequence_id);
                     state.queued_bytes = state.queued_bytes.saturating_add(retained);
-                    state.replay_record_bytes = state.replay_record_bytes.saturating_add(record);
                     state.pending.push_back(split);
                     outcome.enqueued.push(sequence_id);
                 }
-                SplitDecision::Replay => outcome.replayed.push(sequence_id),
+                SplitDecision::Duplicate => outcome.duplicate_sequences.push(sequence_id),
             }
         }
+        state.duplicate_splits_skipped = state
+            .duplicate_splits_skipped
+            .saturating_add(outcome.duplicate_sequences.len() as u64);
 
         // The terminal marker is idempotent: only the first transition wakes.
         let marked_terminal = no_more_splits && !state.no_more_splits;
         if marked_terminal {
             state.no_more_splits = true;
         }
-        outcome.max_accepted_sequence = state.accepted.keys().next_back().copied();
+        outcome.max_accepted_sequence = state.max_accepted_sequence;
         outcome.no_more_splits = state.no_more_splits;
 
         if !outcome.enqueued.is_empty() || marked_terminal {
@@ -658,14 +585,28 @@ impl<S: ScheduledSplitFacts> SplitQueue<S> {
         state.closed
     }
 
+    /// Record duplicates classified by a role before provider decoding.
+    ///
+    /// `preflight_sequences` intentionally leaves queue state unchanged, so a
+    /// role calls this only after the matching offer has committed. Duplicates
+    /// discovered again during that commit are accounted for by
+    /// [`Self::offer_splits`].
+    pub fn record_preflight_duplicate_splits(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut state = self.state.lock().expect("split queue lock");
+        state.duplicate_splits_skipped =
+            state.duplicate_splits_skipped.saturating_add(count as u64);
+    }
+
     pub fn stats(&self) -> SplitQueueStats {
         let state = self.state.lock().expect("split queue lock");
         SplitQueueStats {
             queued_splits: state.pending.len(),
             queued_bytes: state.queued_bytes,
-            accepted_splits: state.accepted.len(),
-            replay_record_bytes: state.replay_record_bytes,
-            max_accepted_sequence: state.accepted.keys().next_back().copied(),
+            duplicate_splits_skipped: state.duplicate_splits_skipped,
+            max_accepted_sequence: state.max_accepted_sequence,
             no_more_splits: state.no_more_splits,
             closed: state.closed,
         }
@@ -720,8 +661,8 @@ impl fmt::Display for TaskAttemptKey {
 /// Every plan-node queue of exactly one task attempt.
 ///
 /// The attempt id is part of the key, so a retry never reaches these queues: it
-/// keys a different entry, which is allocated fresh with an empty replay map
-/// and an empty sequence space. There is no reopen, so a handle to a closed
+/// keys a different entry, which is allocated fresh with an empty sequence
+/// space. There is no reopen, so a handle to a closed
 /// attempt can never be revived into a live one.
 pub struct TaskAttemptSplitQueues<S> {
     key: TaskAttemptKey,
@@ -877,6 +818,28 @@ impl<S: ScheduledSplitFacts> SplitQueueRegistry<S> {
         }
     }
 
+    /// Drop every queue owned by one query execution. The lifecycle owner uses
+    /// this only after the attempt reaches its bounded terminal tombstone, so
+    /// a late TaskUpdate can still confirm an already accepted watermark.
+    pub fn close_execution(&self, execution_id: QueryExecutionId) -> usize {
+        let attempts = {
+            let mut attempts = self.attempts.lock().expect("split queue registry lock");
+            let keys = attempts
+                .keys()
+                .filter(|key| key.execution_id() == execution_id)
+                .copied()
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|key| attempts.remove(&key))
+                .collect::<Vec<_>>()
+        };
+        let count = attempts.len();
+        for attempt in attempts {
+            attempt.close();
+        }
+        count
+    }
+
     pub fn len(&self) -> usize {
         let attempts = self.attempts.lock().expect("split queue registry lock");
         attempts.len()
@@ -911,17 +874,15 @@ mod tests {
     struct TestSplit {
         sequence_id: u64,
         plan_node_id: i32,
-        canonical: Vec<u8>,
         retained: u64,
     }
 
     impl TestSplit {
-        fn new(sequence_id: u64, plan_node_id: i32, canonical: &[u8]) -> Self {
+        fn new(sequence_id: u64, plan_node_id: i32, payload: &[u8]) -> Self {
             Self {
                 sequence_id,
                 plan_node_id,
-                canonical: canonical.to_vec(),
-                retained: canonical.len() as u64,
+                retained: payload.len() as u64,
             }
         }
 
@@ -938,10 +899,6 @@ mod tests {
 
         fn plan_node_id(&self) -> i32 {
             self.plan_node_id
-        }
-
-        fn canonical_bytes(&self) -> &[u8] {
-            &self.canonical
         }
 
         fn retained_size_in_bytes(&self) -> u64 {
@@ -984,7 +941,7 @@ mod tests {
             .offer_splits(NODE, Vec::new(), true)
             .expect("terminal marker only");
         assert!(outcome.enqueued.is_empty());
-        assert!(outcome.replayed.is_empty());
+        assert!(outcome.duplicate_sequences.is_empty());
         assert_eq!(outcome.max_accepted_sequence, None);
         assert!(outcome.no_more_splits);
 
@@ -1015,20 +972,25 @@ mod tests {
     }
 
     #[test]
-    fn a_pure_replay_offer_does_not_wake_waiters() {
+    fn a_duplicate_offer_does_not_wake_waiters_or_consume_bytes() {
         let queue = queue();
         queue
             .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"a")], false)
             .expect("first split");
+        let before = queue.stats();
         let woken = counting_observer(&queue);
         queue
-            .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"a")], false)
-            .expect("exact replay");
+            .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"different")], false)
+            .expect("duplicate with rewritten payload");
         assert_eq!(woken.load(Ordering::Acquire), 0);
+        let after = queue.stats();
+        assert_eq!(after.queued_splits, before.queued_splits);
+        assert_eq!(after.queued_bytes, before.queued_bytes);
+        assert_eq!(after.duplicate_splits_skipped, 1);
     }
 
     #[test]
-    fn exact_replay_is_idempotent() {
+    fn duplicate_classification_uses_the_sequence_watermark_not_payload_bytes() {
         let queue = queue();
         let first = queue
             .offer_splits(
@@ -1039,59 +1001,69 @@ mod tests {
             .expect("first offer");
         assert_eq!(first.enqueued, vec![1, 2]);
 
-        let replay = queue
+        let duplicate = queue
             .offer_splits(
                 NODE,
-                vec![TestSplit::new(1, NODE, b"a"), TestSplit::new(2, NODE, b"b")],
+                vec![
+                    TestSplit::new(1, NODE, b"rewritten-one"),
+                    TestSplit::new(2, NODE, b"rewritten-two"),
+                ],
                 false,
             )
-            .expect("exact replay");
-        assert!(replay.enqueued.is_empty());
-        assert_eq!(replay.replayed, vec![1, 2]);
-        assert_eq!(replay.max_accepted_sequence, Some(2));
+            .expect("duplicate batch");
+        assert!(duplicate.enqueued.is_empty());
+        assert_eq!(duplicate.duplicate_sequences, vec![1, 2]);
+        assert_eq!(duplicate.max_accepted_sequence, Some(2));
         assert_eq!(queue.stats().queued_splits, 2);
+        assert_eq!(queue.stats().duplicate_splits_skipped, 2);
     }
 
     #[test]
-    fn replay_preflight_classifies_canonical_evidence_without_mutating_the_queue() {
+    fn sequence_preflight_classifies_duplicates_without_mutating_the_queue() {
         let queue = queue();
         queue
             .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"one")], false)
             .expect("first offer");
 
         let preflight = queue
-            .preflight_replay(
+            .preflight_sequences(
                 NODE,
                 &[
-                    SplitReplayEvidence::new(1, NODE, b"one".to_vec()),
-                    SplitReplayEvidence::new(2, NODE, b"two".to_vec()),
+                    SplitSequenceEvidence::new(1, NODE),
+                    SplitSequenceEvidence::new(2, NODE),
                 ],
             )
-            .expect("replay and new tail are admissible");
-        assert_eq!(preflight.replayed(), &[1]);
+            .expect("duplicate and new tail are admissible");
+        assert_eq!(preflight.duplicate_sequences(), &[1]);
         assert_eq!(preflight.new_sequences(), &[2]);
-        assert_eq!(queue.stats().accepted_splits, 1);
         assert_eq!(queue.stats().queued_splits, 1);
+        assert_eq!(queue.stats().duplicate_splits_skipped, 0);
+        queue.record_preflight_duplicate_splits(preflight.duplicate_sequences().len());
+        assert_eq!(queue.stats().duplicate_splits_skipped, 1);
     }
 
     #[test]
-    fn replay_preflight_reports_a_rewritten_sequence_before_provider_recovery() {
+    fn sequence_preflight_treats_a_watermark_hole_as_a_duplicate() {
         let queue = queue();
         queue
-            .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"one")], false)
+            .offer_splits(NODE, vec![TestSplit::new(5, NODE, b"five")], false)
             .expect("first offer");
 
-        let error = queue
-            .preflight_replay(
+        let preflight = queue
+            .preflight_sequences(
                 NODE,
-                &[SplitReplayEvidence::new(1, NODE, b"rewritten".to_vec())],
+                &[
+                    SplitSequenceEvidence::new(3, NODE),
+                    SplitSequenceEvidence::new(6, NODE),
+                ],
             )
-            .expect_err("rewritten replay must not reach recovery");
-        assert_eq!(error.kind(), SplitQueueErrorKind::SequenceConflict);
+            .expect("watermark hole is duplicate and tail is new");
+        assert_eq!(preflight.duplicate_sequences(), &[3]);
+        assert_eq!(preflight.new_sequences(), &[6]);
     }
 
     #[test]
-    fn a_replay_that_extends_the_batch_enqueues_only_the_new_tail() {
+    fn a_mixed_duplicate_and_new_batch_enqueues_only_the_new_tail() {
         let queue = queue();
         queue
             .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"a")], false)
@@ -1103,36 +1075,22 @@ mod tests {
                 false,
             )
             .expect("retransmission with a new tail");
-        assert_eq!(outcome.replayed, vec![1]);
+        assert_eq!(outcome.duplicate_sequences, vec![1]);
         assert_eq!(outcome.enqueued, vec![2]);
     }
 
     #[test]
-    fn the_same_sequence_with_different_bytes_is_a_conflict() {
-        let queue = queue();
-        queue
-            .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"a")], false)
-            .expect("first offer");
-        let error = queue
-            .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"different")], false)
-            .expect_err("rewriting a sequence must be rejected");
-        assert_eq!(error.kind(), SplitQueueErrorKind::SequenceConflict);
-        assert_eq!(error.sequence_id(), Some(1));
-        // The recorded split is untouched: no silent overwrite.
-        assert_eq!(queue.stats().queued_splits, 1);
-    }
-
-    #[test]
-    fn an_out_of_order_sequence_is_a_conflict() {
+    fn a_sequence_below_the_watermark_is_a_duplicate_even_when_never_queued() {
         let queue = queue();
         queue
             .offer_splits(NODE, vec![TestSplit::new(5, NODE, b"a")], false)
             .expect("first offer");
-        let error = queue
-            .offer_splits(NODE, vec![TestSplit::new(3, NODE, b"b")], false)
-            .expect_err("a never-seen sequence below the high-water mark is a conflict");
-        assert_eq!(error.kind(), SplitQueueErrorKind::SequenceConflict);
-        assert_eq!(error.sequence_id(), Some(3));
+        let outcome = queue
+            .offer_splits(NODE, vec![TestSplit::new(3, NODE, b"hole")], false)
+            .expect("sequence below the watermark is duplicate");
+        assert_eq!(outcome.duplicate_sequences, vec![3]);
+        assert!(outcome.enqueued.is_empty());
+        assert_eq!(queue.stats().queued_splits, 1);
     }
 
     #[test]
@@ -1146,7 +1104,7 @@ mod tests {
             )
             .expect_err("a repeated sequence inside one batch is a conflict");
         assert_eq!(error.kind(), SplitQueueErrorKind::SequenceConflict);
-        assert_eq!(queue.stats().accepted_splits, 0);
+        assert_eq!(queue.stats().max_accepted_sequence, None);
     }
 
     #[test]
@@ -1164,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn no_more_splits_is_idempotent_and_replayable() {
+    fn no_more_splits_is_idempotent_and_terminal_retransmission_is_a_duplicate() {
         let queue = queue();
         let first = queue
             .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"a")], true)
@@ -1172,20 +1130,20 @@ mod tests {
         assert!(first.no_more_splits);
 
         let woken = counting_observer(&queue);
-        // Retransmitting the terminal batch verbatim stays legal and changes
-        // nothing, which is what a sender that missed the response does.
+        // Retransmitting the terminal batch stays legal and changes nothing,
+        // even if its payload differs: the watermark is the acknowledgement.
         let again = queue
-            .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"a")], true)
-            .expect("terminal batch replay");
+            .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"rewritten")], true)
+            .expect("terminal batch retransmission");
         assert!(again.no_more_splits);
         assert!(again.enqueued.is_empty());
-        assert_eq!(again.replayed, vec![1]);
+        assert_eq!(again.duplicate_sequences, vec![1]);
         assert_eq!(woken.load(Ordering::Acquire), 0);
 
         // A bare repeated marker is equally idempotent.
         let bare = queue
             .offer_splits(NODE, Vec::new(), true)
-            .expect("bare terminal marker replay");
+            .expect("bare terminal marker retransmission");
         assert!(bare.no_more_splits);
         assert_eq!(woken.load(Ordering::Acquire), 0);
     }
@@ -1246,7 +1204,6 @@ mod tests {
             NODE,
             SplitQueueConfig {
                 max_queued_bytes: 64,
-                max_replay_record_bytes: u64::MAX,
             },
         );
         queue
@@ -1266,9 +1223,8 @@ mod tests {
             )
             .expect_err("the ceiling must reject the offer");
         assert_eq!(error.kind(), SplitQueueErrorKind::ResourceExhausted);
-        // Rejected in full: neither the queue nor the replay record moved.
+        // Rejected in full: the queue and watermark do not move.
         assert_eq!(queue.stats().queued_splits, 1);
-        assert_eq!(queue.stats().accepted_splits, 1);
 
         // Draining frees the budget again, which is what makes this a
         // backpressure signal rather than a permanent cap.
@@ -1284,22 +1240,6 @@ mod tests {
     }
 
     #[test]
-    fn the_replay_record_ceiling_rejects_an_oversized_offer() {
-        let queue: Arc<SplitQueue<TestSplit>> = SplitQueue::new(
-            NODE,
-            SplitQueueConfig {
-                max_queued_bytes: u64::MAX,
-                max_replay_record_bytes: 1,
-            },
-        );
-        let error = queue
-            .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"a")], false)
-            .expect_err("the replay record ceiling must reject the offer");
-        assert_eq!(error.kind(), SplitQueueErrorKind::ResourceExhausted);
-        assert_eq!(queue.stats().accepted_splits, 0);
-    }
-
-    #[test]
     fn two_attempts_are_isolated() {
         let registry: SplitQueueRegistry<TestSplit> = SplitQueueRegistry::new();
         let first = registry.open_attempt(attempt_key(1), SplitQueueConfig::default());
@@ -1311,9 +1251,8 @@ mod tests {
             .queue(NODE)
             .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"a")], true)
             .expect("first attempt");
-        // The same sequence with different bytes is a conflict inside one
-        // attempt, and a plain first offer in another: the sequence space and
-        // the replay record are per attempt.
+        // Sequence watermarks are per attempt, so each attempt starts with a
+        // fresh sequence space.
         second
             .queue(NODE)
             .offer_splits(NODE, vec![TestSplit::new(1, NODE, b"different")], false)
@@ -1338,6 +1277,24 @@ mod tests {
         assert!(!Arc::ptr_eq(&reopened, &first));
         assert!(!reopened.is_closed());
         assert_eq!(reopened.queue(NODE).stats(), SplitQueueStats::default());
+    }
+
+    #[test]
+    fn closing_an_execution_releases_all_of_its_attempts_only() {
+        let registry: SplitQueueRegistry<TestSplit> = SplitQueueRegistry::new();
+        let execution_id = attempt_key(1).execution_id();
+        let first = registry.open_attempt(attempt_key(1), SplitQueueConfig::default());
+        let sibling = registry.open_attempt(
+            TaskAttemptKey::new(execution_id, UniqueId::new(3, 5)),
+            SplitQueueConfig::default(),
+        );
+        let other = registry.open_attempt(attempt_key(2), SplitQueueConfig::default());
+
+        assert_eq!(registry.close_execution(execution_id), 2);
+        assert!(first.is_closed());
+        assert!(sibling.is_closed());
+        assert!(!other.is_closed());
+        assert_eq!(registry.len(), 1);
     }
 
     #[test]
