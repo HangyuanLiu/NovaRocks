@@ -46,8 +46,9 @@ use super::entry::{
     ImmutableQueryTerminalRecord, QueryCatalogLoadState, QueryLifecycleEntry, QueryLifecyclePhase,
 };
 use super::{
-    BackendQueryControl, QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryLifecycleIngress, QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
+    BackendQueryControl, CatalogPruneOutcome, QueryControlAttachment, QueryLifecycleError,
+    QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminalFallbackTransport,
+    QueryTerminalFallbackTransportError,
 };
 use crate::BackendDataRuntime;
 use crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot;
@@ -5054,6 +5055,23 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         QueryLifecycleRegistry::init_query(self, request)
+    }
+
+    fn prune_catalogs(
+        &self,
+        reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,
+    ) -> CatalogPruneOutcome {
+        match self.catalog_manager.prune_unreachable(&reachable) {
+            crate::connector::catalog_manager::CatalogPruneResult::Pruned { .. } => {
+                CatalogPruneOutcome::Accepted
+            }
+            crate::connector::catalog_manager::CatalogPruneResult::Rejected { .. } => {
+                CatalogPruneOutcome::Rejected {
+                    safe_detail: "catalog reachability snapshot omits one or more live catalogs"
+                        .to_string(),
+                }
+            }
+        }
     }
 
     fn authorize_exchange(

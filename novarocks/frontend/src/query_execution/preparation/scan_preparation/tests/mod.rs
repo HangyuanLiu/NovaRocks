@@ -667,6 +667,11 @@ fn fixture_query_table_bindings(
                     .map_err(|error| error.to_string())?;
                 let scan_materialization = QueryScanMaterialization {
                     table: metadata.table,
+                    catalog_handle: lease
+                        .binding()
+                        .catalog_handle()
+                        .map_err(|error| error.to_string())?
+                        .clone(),
                     schema: metadata.schema,
                     selector: ConnectorReadSelector::Current,
                     statistics_pin: None,
@@ -696,6 +701,11 @@ fn fixture_query_table_bindings(
                             snapshot_id,
                             QueryScanMaterialization {
                                 table: metadata.table,
+                                catalog_handle: lease
+                                    .binding()
+                                    .catalog_handle()
+                                    .map_err(|error| error.to_string())?
+                                    .clone(),
                                 schema: metadata.schema,
                                 selector: ConnectorReadSelector::SnapshotId(snapshot_id),
                                 statistics_pin: None,

@@ -306,6 +306,13 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
         self.registry.init_query(request)
     }
 
+    fn prune_catalogs(
+        &self,
+        reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,
+    ) -> crate::query_lifecycle::CatalogPruneOutcome {
+        self.registry.prune_catalogs(reachable)
+    }
+
     fn authorize_exchange(
         &self,
         destination_fragment_instance_id: novarocks_types::UniqueId,

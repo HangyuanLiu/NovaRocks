@@ -49,6 +49,9 @@ pub use service::QueryCatalogService;
 /// never decodes a provider table handle or metadata payload.
 #[derive(Clone)]
 pub struct ConnectorQueryTableMaterialization {
+    /// Frozen desired-state identity shared by every execution artifact this
+    /// query derives from the admitted control lease.
+    pub catalog_handle: novarocks_spi::connector::CatalogHandle,
     pub schema_version: Option<Vec<u8>>,
     pub columns: Vec<novarocks_types::schema::ColumnDef>,
     pub row_lineage_metadata_columns: Vec<novarocks_types::schema::ColumnDef>,
@@ -188,7 +191,18 @@ pub fn connector_table_materialization_from_metadata(
                 data_version,
             },
         );
+    let catalog_handle = planning_lease
+        .binding()
+        .catalog_handle()
+        .map_err(|error| error.to_string())?
+        .clone();
+    if catalog_handle.catalog_name() != metadata.table.owner() {
+        return Err(
+            "connector metadata owner does not match the admitted catalog handle".to_string(),
+        );
+    }
     Ok(ConnectorQueryTableMaterialization {
+        catalog_handle,
         schema_version: metadata.version.map(|version| version.to_vec()),
         columns,
         row_lineage_metadata_columns,

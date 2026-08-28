@@ -37,6 +37,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_native_trust::{NativeIncomingAdapter, NativeServerAdmission, NativeTrust};
+use novarocks_proto_codec::catalog::{PruneCatalogsRequest, PruneCatalogsResponse};
 use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId,
 };
@@ -52,11 +53,11 @@ use tower::ServiceExt;
 use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 use crate::connector::binding_decode;
 use crate::fragment::ingress::NativeFragmentIngress;
-use crate::query_lifecycle::QueryLifecycleIngress;
 use crate::query_lifecycle::rpc::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
     handle_stage_fragments, handle_start_prepared_query, handle_task_update,
 };
+use crate::query_lifecycle::{CatalogPruneOutcome, QueryLifecycleIngress};
 use crate::rpc::runtime::BackendNativeTransport;
 use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
@@ -291,11 +292,29 @@ impl NovaRocksGrpc for BackendRpcService {
 
     async fn prune_catalogs(
         &self,
-        _request: tonic::Request<catalog::PruneCatalogsRequest>,
+        request: tonic::Request<catalog::PruneCatalogsRequest>,
     ) -> Result<tonic::Response<catalog::PruneCatalogsResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "catalog reachability pruning is not connected yet",
-        ))
+        let request = PruneCatalogsRequest::parse(request.into_inner())
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        let reachable = request
+            .reachable_catalogs()
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?
+            .into_iter()
+            .collect();
+        let ingress = Arc::clone(&self.query_lifecycle_ingress);
+        let response =
+            tokio::task::spawn_blocking(move || match ingress.prune_catalogs(reachable) {
+                CatalogPruneOutcome::Accepted => PruneCatalogsResponse::accepted(),
+                CatalogPruneOutcome::Rejected { safe_detail } => {
+                    PruneCatalogsResponse::rejected(safe_detail)
+                        .expect("lifecycle ingress produces a bounded safe catalog-prune detail")
+                }
+            })
+            .await
+            .map_err(|error| {
+                tonic::Status::internal(format!("prune_catalogs handler panicked: {error}"))
+            })?;
+        Ok(tonic::Response::new(response.as_proto().clone()))
     }
 
     async fn heartbeat(

@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex};
 
 use super::desired_state::{
     CatalogDesiredStateEntry, CatalogDesiredStateSnapshot, CatalogDesiredStateSource,
+    CatalogDesiredStateSourceMode,
 };
 use super::{
     CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind, CatalogApplicationPort,
@@ -385,6 +386,7 @@ impl FrontendCatalogApplicationPort {
             .await?;
 
         let mut workers = tokio::task::JoinSet::new();
+        let mode = snapshot.mode();
         for entry in snapshot.clone().into_entries() {
             if workers.len() >= worker_count {
                 let completed = workers.join_next().await.ok_or_else(|| {
@@ -401,7 +403,7 @@ impl FrontendCatalogApplicationPort {
                 })?;
             }
             let projection = Arc::clone(self);
-            workers.spawn_blocking(move || projection.materialize_entry(entry));
+            workers.spawn_blocking(move || projection.materialize_entry(entry, mode));
         }
         while let Some(completed) = workers.join_next().await {
             completed.map_err(|error| {
@@ -472,7 +474,11 @@ impl FrontendCatalogApplicationPort {
     /// snapshot; giving this function a `Result` would let one broken catalog
     /// abort the reconcile of every healthy one, which is the failure scope
     /// this design exists to keep separate.
-    fn materialize_entry(&self, entry: CatalogDesiredStateEntry) {
+    fn materialize_entry(
+        &self,
+        entry: CatalogDesiredStateEntry,
+        mode: CatalogDesiredStateSourceMode,
+    ) {
         let attachment_id = entry.identity().as_uuid();
         let instance_id = entry.config().instance_id().clone();
         let provider_id = entry.config().provider_id().clone();
@@ -512,6 +518,9 @@ impl FrontendCatalogApplicationPort {
                 .create_control(request)
                 .map_err(connector_error)?;
             let (binding, _) = creation.into_parts();
+            let binding = binding
+                .with_catalog_handle(entry.catalog_properties(mode)?.handle().clone())
+                .map_err(connector_error)?;
             self.install_created(&entry, binding).map(|_| ())
         })();
         if let Err(error) = installed {
@@ -665,6 +674,14 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
             entry.config().provider_id(),
             "catalog desired-state runtime is being installed",
         );
+        let binding = binding
+            .with_catalog_handle(
+                entry
+                    .catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)?
+                    .handle()
+                    .clone(),
+            )
+            .map_err(connector_error)?;
         self.install_created(&entry, binding)
     }
 

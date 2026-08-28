@@ -115,7 +115,7 @@ impl CatalogSet {
     }
 
     pub fn parse(raw: wire::CatalogSet) -> Result<Self, ProtocolError> {
-        if raw.encoded_len() > MAX_PRUNE_CATALOG_SET_BYTES {
+        if raw.encoded_len() > MAX_CATALOG_SET_BYTES {
             return Err(resource_exhausted(
                 FieldPath::root("catalog_set"),
                 "encoded catalog set exceeds 1 MiB",
@@ -187,7 +187,7 @@ impl PruneCatalogsRequest {
     }
 
     pub fn parse(raw: wire::PruneCatalogsRequest) -> Result<Self, ProtocolError> {
-        if raw.encoded_len() > MAX_CATALOG_SET_BYTES {
+        if raw.encoded_len() > MAX_PRUNE_CATALOG_SET_BYTES {
             return Err(resource_exhausted(
                 FieldPath::root("prune_catalogs_request"),
                 "encoded reachable catalog snapshot exceeds 8 MiB",

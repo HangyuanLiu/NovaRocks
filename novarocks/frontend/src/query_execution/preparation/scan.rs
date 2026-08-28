@@ -179,6 +179,11 @@ pub(crate) fn fixture_query_scan_materialization(instance_id: &str) -> QueryScan
         .expect("fixture connector read admission");
     QueryScanMaterialization {
         table: metadata.table,
+        catalog_handle: planning_lease
+            .binding()
+            .catalog_handle()
+            .expect("fixture control binding has a catalog handle")
+            .clone(),
         schema: metadata.schema,
         selector: ConnectorReadSelector::Current,
         statistics_pin: None,

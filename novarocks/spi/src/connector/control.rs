@@ -18,19 +18,19 @@
 use std::sync::{Arc, Mutex};
 
 use super::{
-    ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
-    ConnectorCleanupMaintenance, ConnectorCleanupMaintenanceResolver, ConnectorDataMutation,
-    ConnectorDataMutationResolver, ConnectorDistributedRewrite,
-    ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
-    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
-    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsLease,
-    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorUnanchoredCtasCleanup,
-    ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata, ConnectorWriteControl,
-    ConnectorWriteLease,
+    CatalogHandle, ConnectorBeginScanRequest, ConnectorCatalogMutation,
+    ConnectorCatalogMutationResolver, ConnectorCleanupMaintenance,
+    ConnectorCleanupMaintenanceResolver, ConnectorDataMutation, ConnectorDataMutationResolver,
+    ConnectorDistributedRewrite, ConnectorDistributedRewriteResolver, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStagedCreate,
+    ConnectorStagedCreateLease, ConnectorStagedPublicationRecovery, ConnectorStatistics,
+    ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorTableHandle,
+    ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata,
+    ConnectorWriteControl, ConnectorWriteLease,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -224,6 +224,9 @@ pub trait ConnectorControlFactoryResolver: Send + Sync {
 pub struct ConnectorControlBinding {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
+    /// Immutable execution identity assigned by the FE desired-state owner
+    /// before this control binding becomes query-admissible.
+    catalog_handle: Option<CatalogHandle>,
     metadata: Arc<dyn ConnectorMetadata>,
     planning: Arc<dyn ConnectorScanPlanning>,
     distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -409,6 +412,7 @@ impl ConnectorControlBinding {
         Ok(Self {
             descriptor,
             incarnation,
+            catalog_handle: None,
             metadata,
             planning,
             distribution,
@@ -621,6 +625,36 @@ impl ConnectorControlBinding {
 
     pub fn incarnation(&self) -> ConnectorInstanceIncarnation {
         self.incarnation
+    }
+
+    /// Stamps this FE-local control generation with the exact immutable
+    /// catalog identity derived from authoritative desired state. Provider
+    /// factories cannot mint this value because it must not depend on a
+    /// process-local control incarnation.
+    pub fn with_catalog_handle(
+        mut self,
+        catalog_handle: CatalogHandle,
+    ) -> Result<Self, ConnectorError> {
+        if catalog_handle.catalog_name() != &self.descriptor.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "catalog handle owner does not match its control binding",
+            ));
+        }
+        self.catalog_handle = Some(catalog_handle);
+        Ok(self)
+    }
+
+    /// Returns the desired-state-derived execution identity. A binding which
+    /// was not admitted through the catalog application owner must fail
+    /// closed instead of deriving an identity from its control incarnation.
+    pub fn catalog_handle(&self) -> Result<&CatalogHandle, ConnectorError> {
+        self.catalog_handle.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector control binding has no catalog execution identity",
+            )
+        })
     }
 
     pub fn metadata(&self) -> &Arc<dyn ConnectorMetadata> {

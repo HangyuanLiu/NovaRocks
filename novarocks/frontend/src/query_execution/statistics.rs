@@ -485,6 +485,11 @@ fn admit_statistics_scan_binding(
                     scan_materialization: Some(
                         crate::catalog_application::query_bindings::QueryScanMaterialization {
                             table: program.plan().table().clone(),
+                            catalog_handle: planning_lease
+                                .binding()
+                                .catalog_handle()
+                                .map_err(|error| error.to_string())?
+                                .clone(),
                             schema: input_schema.clone(),
                             selector: ConnectorReadSelector::SnapshotId(version_ordinal),
                             statistics_pin: None,
