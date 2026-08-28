@@ -187,6 +187,81 @@ pub struct PageSourceMetrics {
     pub completed_bytes: u64,
     pub completed_positions: u64,
     pub read_time_nanos: u64,
+    /// Provider-neutral physical file-reader counters, when this page source
+    /// is backed by files. Non-file sources leave this snapshot empty.
+    pub file: PageSourceFileMetrics,
+}
+
+/// Physical file-reader counters retained across the typed page-source
+/// boundary.
+///
+/// These are execution facts rather than provider semantics: a provider may
+/// obtain them from any file implementation, while the backend projects them
+/// into the stable runtime-profile counter names.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PageSourceFileMetrics {
+    pub bytes_read: u64,
+    pub read_requests: u64,
+    pub rows_decoded: u64,
+    pub batches_delivered: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    pub io_time_ns: u64,
+    pub decode_time_ns: u64,
+    pub row_groups_read: u64,
+    pub row_groups_pruned: u64,
+    pub delayed_materialization_ranges: u64,
+    pub page_index_attempts: u64,
+    pub page_index_fallbacks: u64,
+    pub page_index_rows_considered: u64,
+    pub page_index_rows_pruned: u64,
+}
+
+impl PageSourceFileMetrics {
+    pub fn saturating_delta_since(self, previous: Self) -> Self {
+        Self {
+            bytes_read: self.bytes_read.saturating_sub(previous.bytes_read),
+            read_requests: self.read_requests.saturating_sub(previous.read_requests),
+            rows_decoded: self.rows_decoded.saturating_sub(previous.rows_decoded),
+            batches_delivered: self
+                .batches_delivered
+                .saturating_sub(previous.batches_delivered),
+            cache_hits: self.cache_hits.saturating_sub(previous.cache_hits),
+            cache_misses: self.cache_misses.saturating_sub(previous.cache_misses),
+            io_time_ns: self.io_time_ns.saturating_sub(previous.io_time_ns),
+            decode_time_ns: self.decode_time_ns.saturating_sub(previous.decode_time_ns),
+            row_groups_read: self
+                .row_groups_read
+                .saturating_sub(previous.row_groups_read),
+            row_groups_pruned: self
+                .row_groups_pruned
+                .saturating_sub(previous.row_groups_pruned),
+            delayed_materialization_ranges: self
+                .delayed_materialization_ranges
+                .saturating_sub(previous.delayed_materialization_ranges),
+            page_index_attempts: self
+                .page_index_attempts
+                .saturating_sub(previous.page_index_attempts),
+            page_index_fallbacks: self
+                .page_index_fallbacks
+                .saturating_sub(previous.page_index_fallbacks),
+            page_index_rows_considered: self
+                .page_index_rows_considered
+                .saturating_sub(previous.page_index_rows_considered),
+            page_index_rows_pruned: self
+                .page_index_rows_pruned
+                .saturating_sub(previous.page_index_rows_pruned),
+        }
+    }
+}
+
+/// Query-scoped reader policy supplied when a worker creates a page-source
+/// provider. It is separate from the provider's generation-scoped resources:
+/// two queries using the same installed connector generation may choose
+/// different physical reader behavior.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ConnectorPageSourceProviderOptions {
+    pub enable_parquet_reader_page_index: bool,
 }
 
 /// A connector reader bound to exactly one split.

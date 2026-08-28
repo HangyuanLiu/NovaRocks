@@ -665,6 +665,7 @@ pub trait ConnectorReadProviderFactory: Send + Sync {
     fn create_page_source_provider(
         &self,
         request: &ConnectorRequestContext,
+        options: super::ConnectorPageSourceProviderOptions,
     ) -> Result<Arc<dyn ConnectorReadPageSourceProvider>, ConnectorError>;
 
     fn create_system_table_provider(

@@ -27,6 +27,7 @@ use std::sync::Arc;
 use novarocks_proto_codec::connector_read::{
     ConnectorReadExecutionBundle, ConnectorReadExecutionBundleFactory,
 };
+use novarocks_spi::connector::read_stack::ConnectorPageSourceProviderOptions;
 use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadFactory, ProviderReadFactoryAdapter, ProviderReadPageSourceProvider,
     ProviderReadRuntime, ProviderReadSystemTableProvider, ReadRuntimeAdapter,
@@ -101,14 +102,16 @@ where
     fn create_page_source_provider(
         &self,
         request: &ConnectorRequestContext,
+        reader_policy: ConnectorPageSourceProviderOptions,
     ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError> {
         let context = self
             .binding
             .file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
+        let options = apply_reader_policy(self.options, reader_policy);
         Ok(Arc::new(IcebergPageSourceProvider::new(
             self.binding.clone(),
             context,
-            self.options,
+            options,
         )))
     }
 
@@ -124,6 +127,39 @@ where
             context,
             self.options.budget.max_rows,
         )))
+    }
+}
+
+fn apply_reader_policy(
+    mut options: IcebergPageSourceProviderOptions,
+    reader_policy: ConnectorPageSourceProviderOptions,
+) -> IcebergPageSourceProviderOptions {
+    options.reader_options.enable_parquet_reader_page_index =
+        reader_policy.enable_parquet_reader_page_index;
+    options
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_reader_policy_overrides_the_generation_default() {
+        let options = apply_reader_policy(
+            IcebergPageSourceProviderOptions::with_default_budget(),
+            ConnectorPageSourceProviderOptions {
+                enable_parquet_reader_page_index: true,
+            },
+        );
+        assert!(options.reader_options.enable_parquet_reader_page_index);
+
+        let options = apply_reader_policy(
+            options,
+            ConnectorPageSourceProviderOptions {
+                enable_parquet_reader_page_index: false,
+            },
+        );
+        assert!(!options.reader_options.enable_parquet_reader_page_index);
     }
 }
 

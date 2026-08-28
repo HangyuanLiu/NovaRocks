@@ -740,13 +740,37 @@ fn assert_mv_not_recovered_after_base_replacement(
 ) -> Result<()> {
     context.remaining("verify MV is not recovered after same-name base replacement")?;
     context.action("verify MV is not recovered after same-name base replacement");
-    let error = conn
-        .query_drop(format!("SELECT k1, v2 FROM {mv} ORDER BY k1"))
-        .expect_err("a recreated base table must not recover the prior MV");
-    let message = error.to_string();
-    if !message.contains(&format!("unknown table: ns.{mv}")) {
+    let views: Vec<Row> = conn
+        .query("SHOW MATERIALIZED VIEWS FROM ns")
+        .context("list MVs after same-name base replacement")?;
+    let names = views
+        .iter()
+        .map(|row| {
+            row.get::<String, _>(0)
+                .context("SHOW MATERIALIZED VIEWS name column")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if names.iter().any(|name| name == mv) {
         bail!(
-            "read after same-name base replacement returned unexpected error {message:?}; {}",
+            "a recreated base table recovered the prior MV definition unexpectedly: names={names:?}; {}",
+            context.diagnostics()
+        );
+    }
+    let error = match conn.query_drop(format!("REFRESH MATERIALIZED VIEW {mv}")) {
+        Err(error) => error,
+        Ok(()) => {
+            bail!(
+                "a quarantined MV accepted refresh unexpectedly; {}",
+                context.diagnostics()
+            )
+        }
+    };
+    let message = error.to_string();
+    if !message.contains("MV target is unavailable")
+        || !message.contains("base table identity changed")
+    {
+        bail!(
+            "refresh after same-name base replacement returned unexpected error {message:?}; {}",
             context.diagnostics()
         );
     }

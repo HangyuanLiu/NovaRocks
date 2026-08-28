@@ -221,12 +221,10 @@ impl<'a> PreparedFragmentSchedulingView<'a> {
         self.scan_bindings.scan_ranges(fragment_id, node_id)
     }
 
-    pub(crate) fn connector_read(
-        self,
-        fragment_id: FragmentId,
-        node_id: i32,
-    ) -> Option<&'a super::scan::PlannedConnectorRead> {
-        self.scan_bindings.connector_read(fragment_id, node_id)
+    pub(crate) fn has_typed_connector_scan(self, fragment_id: FragmentId, node_id: i32) -> bool {
+        self.scan_bindings
+            .typed_scan(fragment_id, node_id)
+            .is_some()
     }
 
     pub(crate) fn typed_scan(

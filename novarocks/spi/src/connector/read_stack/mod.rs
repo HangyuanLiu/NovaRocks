@@ -49,7 +49,10 @@ pub use handle::{
     ConnectorTableFunctionHandle, ConnectorTableHandle, ConnectorTransactionHandle,
     MAX_SCHEMA_TABLE_NAME_BYTES, SchemaTableName,
 };
-pub use page_source::{ConnectorPageSource, LazyBlockLoader, PageSourceMetrics, SourcePage};
+pub use page_source::{
+    ConnectorPageSource, ConnectorPageSourceProviderOptions, LazyBlockLoader,
+    PageSourceFileMetrics, PageSourceMetrics, SourcePage,
+};
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,
     MAX_CONNECTOR_EXPRESSION_DEPTH, MAX_CONNECTOR_EXPRESSION_NODES, MAX_CONNECTOR_VALUE_BYTES,

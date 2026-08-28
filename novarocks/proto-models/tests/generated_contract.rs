@@ -476,9 +476,9 @@ fn the_worker_system_relation_set_stays_closed() {
             "ICEBERG_SYSTEM_TABLE_TYPE_HISTORY".to_owned(),
             "ICEBERG_SYSTEM_TABLE_TYPE_REFS".to_owned(),
             "ICEBERG_SYSTEM_TABLE_TYPE_MANIFESTS".to_owned(),
+            "ICEBERG_SYSTEM_TABLE_TYPE_PARTITIONS".to_owned(),
         ],
-        "PARTITIONS is a view over the pinned FILES relation, and there is no \
-         ALL_* or unknown worker variant"
+        "the worker set is exact, with no ALL_* or unknown system-table variant"
     );
 }
 

@@ -2462,6 +2462,7 @@ impl ConnectorPageSource for IcebergSystemPageSource {
             // The metadata files were read before the first page, so no page
             // request has spent measurable time reading.
             read_time_nanos: 0,
+            ..Default::default()
         }
     }
 

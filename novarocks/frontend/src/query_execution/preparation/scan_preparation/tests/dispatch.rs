@@ -145,6 +145,13 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
     for (node_id, _) in &scan_facts {
         assert!(prepared.scan_bindings().binding(*node_id).is_some());
     }
+    let scheduling = prepared.scheduling_view();
+    for (fragment_id, node_id, _) in prepared.scan_bindings().typed_scans() {
+        assert!(
+            scheduling.has_typed_connector_scan(fragment_id, node_id),
+            "the scheduling projection must retain typed connector scan presence"
+        );
+    }
     let expected_ids = distributed
         .fragments()
         .iter()

@@ -155,7 +155,7 @@ pub(super) fn lower_typed_connector_scan(
             // and delete manager cannot outlive the request that opened them.
             let page_source_provider = execution
                 .factory()
-                .create_page_source_provider(&inputs.request)
+                .create_page_source_provider(&inputs.request, inputs.reader_policy)
                 .map_err(provider_refusal)?;
             let source = TypedConnectorScanSource::new(
                 scan_source,
@@ -232,6 +232,7 @@ struct TypedScanRuntimeInputs {
     >,
     session: novarocks_spi::connector::read_stack::ConnectorSession,
     request: novarocks_spi::connector::ConnectorRequestContext,
+    reader_policy: novarocks_spi::connector::read_stack::ConnectorPageSourceProviderOptions,
     /// Absent when this attempt installed no runtime filter.
     runtime_filter: crate::fragment::decode::plan::context::RuntimeFilterSessionResolver,
 }
@@ -275,6 +276,11 @@ fn typed_scan_runtime_inputs(
         queues: runtime.queues(),
         session: runtime.session(),
         request,
+        reader_policy: novarocks_spi::connector::read_stack::ConnectorPageSourceProviderOptions {
+            enable_parquet_reader_page_index: ctx
+                .query_options()
+                .is_some_and(|options| options.enable_parquet_reader_page_index()),
+        },
         runtime_filter: runtime.runtime_filter(),
     })
 }
@@ -771,6 +777,21 @@ mod tests {
             .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
         decode_node(&node, &mut ExprArena::default(), &ctx)
             .expect("a supplied runtime binds the typed scan");
+    }
+
+    #[test]
+    fn typed_scan_runtime_carries_the_query_page_index_policy() {
+        let ctx = NativePlanDecodeContext::default()
+            .with_query_options(Some(
+                novarocks_execution::runtime::query_options::QueryOptions {
+                    enable_parquet_reader_page_index: true,
+                    ..Default::default()
+                },
+            ))
+            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
+            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+        let inputs = typed_scan_runtime_inputs(&ctx).expect("typed runtime inputs");
+        assert!(inputs.reader_policy.enable_parquet_reader_page_index);
     }
 
     #[test]

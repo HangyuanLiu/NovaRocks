@@ -31,7 +31,10 @@ use uuid::Uuid;
 use super::application::StatisticsPublicationTerminal;
 use super::model::{StatisticsJob, StatisticsJobError, StatisticsJobErrorKind, StatisticsJobState};
 use super::repository::StatisticsJobRepository;
-use crate::workload_lifecycle::{FrontendServingLifecycle, FrontendWorkloadKind};
+use crate::workload_lifecycle::{
+    FrontendServingLifecycle, FrontendServingSnapshotReader, FrontendServingState,
+    FrontendWorkloadKind,
+};
 
 pub const STATISTICS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -192,6 +195,17 @@ async fn run_worker(
     loop {
         if stop.load(Ordering::Acquire) {
             return Ok(());
+        }
+        match workload_lifecycle.frontend_serving_snapshot().serving_state {
+            FrontendServingState::Starting => {
+                tokio::select! {
+                    _ = repository.wait_for_change() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+                continue;
+            }
+            FrontendServingState::Ready => {}
+            FrontendServingState::Draining | FrontendServingState::Stopping => return Ok(()),
         }
         let workload_lease = match workload_lifecycle.try_admit(FrontendWorkloadKind::Background) {
             Ok(lease) => lease,
@@ -458,6 +472,35 @@ mod tests {
         )
         .await
         .expect("draining worker exits without claiming a job");
+    }
+
+    #[tokio::test]
+    async fn starting_worker_waits_for_the_serving_lifecycle() {
+        let lifecycle = FrontendServingLifecycle::new();
+        let repository = StatisticsJobRepository::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let executor: Arc<dyn StatisticsAttemptExecutor> = Arc::new(NeverRunExecutor);
+        let worker = tokio::spawn(run_worker(
+            repository.clone(),
+            Arc::downgrade(&executor),
+            Arc::clone(&stop),
+            lifecycle.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !worker.is_finished(),
+            "the statistics worker must not exit while the frontend is starting"
+        );
+
+        lifecycle.mark_ready().expect("mark lifecycle ready");
+        lifecycle.begin_drain(Duration::from_secs(1));
+        repository.notify_worker();
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("worker observes the terminal serving state")
+            .expect("worker task joins")
+            .expect("worker exits without claiming a job");
     }
 }
 

@@ -249,6 +249,7 @@ impl ConnectorPageSource for IcebergRewritePositionDeleteFilesPageSource {
             completed_bytes: self.bytes_read,
             completed_positions: self.next_row as u64,
             read_time_nanos: 0,
+            ..Default::default()
         }
     }
 

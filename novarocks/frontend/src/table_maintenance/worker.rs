@@ -32,7 +32,10 @@ use tokio::task::JoinHandle;
 use crate::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceTargetRebind, TableMaintenanceEngine,
 };
-use crate::workload_lifecycle::{FrontendServingLifecycle, FrontendWorkloadKind};
+use crate::workload_lifecycle::{
+    FrontendServingLifecycle, FrontendServingSnapshotReader, FrontendServingState,
+    FrontendWorkloadKind,
+};
 
 use super::model::OptimizeJob;
 use super::now_unix_millis;
@@ -152,6 +155,18 @@ async fn run_worker(
                 })?;
             return Ok(());
         };
+        match workload_lifecycle.frontend_serving_snapshot().serving_state {
+            FrontendServingState::Starting => {
+                tokio::select! {
+                    _ = wakeup.notified() => {}
+                    _ = jobs.wait_for_change() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                }
+                continue;
+            }
+            FrontendServingState::Ready => {}
+            FrontendServingState::Draining | FrontendServingState::Stopping => return Ok(()),
+        }
         let workload_lease = match workload_lifecycle.try_admit(FrontendWorkloadKind::Background) {
             Ok(lease) => lease,
             Err(_) => return Ok(()),
@@ -389,6 +404,111 @@ pub(crate) fn optimize_outcome(
         added_data_files: i64::from(added_data_files_count),
         output_record_count,
     })
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use novarocks_spi::connector::ConnectorTableObjectId;
+
+    use super::{OptimizeJobExecutor, run_worker};
+    use crate::maintenance::MaintenanceTarget;
+    use crate::query_execution::maintenance::{
+        MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
+        MaintenanceTargetRebind, TableMaintenanceEngine,
+    };
+    use crate::table_maintenance::model::OptimizeJob;
+    use crate::table_maintenance::runtime::OptimizeProcessRuntime;
+    use crate::workload_lifecycle::FrontendServingLifecycle;
+
+    struct NeverRunEngine;
+
+    impl TableMaintenanceEngine for NeverRunEngine {
+        fn resolve_target(
+            &self,
+            _name_parts: &[String],
+            _context: MaintenanceRequestContext<'_>,
+        ) -> Result<MaintenanceTarget, String> {
+            Err("never run".to_string())
+        }
+
+        fn capture_target_object_id(
+            &self,
+            _target: &MaintenanceTarget,
+        ) -> Result<ConnectorTableObjectId, String> {
+            Err("never run".to_string())
+        }
+
+        fn rebind_target_object(
+            &self,
+            _target: &MaintenanceTarget,
+            _expected_object_id: &ConnectorTableObjectId,
+        ) -> Result<MaintenanceTargetRebind, String> {
+            Err("never run".to_string())
+        }
+
+        fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
+            Err("never run".to_string())
+        }
+
+        fn current_snapshot_id(&self, _target: &MaintenanceTarget) -> Result<i64, String> {
+            Err("never run".to_string())
+        }
+
+        fn execute_action(
+            &self,
+            _request: MaintenanceActionRequest,
+        ) -> Result<MaintenanceActionOutcome, String> {
+            Err("never run".to_string())
+        }
+    }
+
+    struct NeverRunExecutor;
+
+    impl OptimizeJobExecutor for NeverRunExecutor {
+        fn execute(
+            &self,
+            _runtime: &tokio::runtime::Handle,
+            _engine: &dyn TableMaintenanceEngine,
+            _job: &OptimizeJob,
+        ) -> Result<MaintenanceActionOutcome, String> {
+            Err("never run".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn starting_worker_waits_for_the_serving_lifecycle() {
+        let lifecycle = FrontendServingLifecycle::new();
+        let jobs = Arc::new(OptimizeProcessRuntime::new());
+        let engine: Arc<dyn TableMaintenanceEngine> = Arc::new(NeverRunEngine);
+        let executor: Arc<dyn OptimizeJobExecutor> = Arc::new(NeverRunExecutor);
+        let worker = tokio::spawn(run_worker(
+            tokio::runtime::Handle::current(),
+            Arc::clone(&jobs),
+            Arc::downgrade(&engine),
+            executor,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(tokio::sync::Notify::new()),
+            lifecycle.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !worker.is_finished(),
+            "the optimize worker must not exit while the frontend is starting"
+        );
+
+        lifecycle.mark_ready().expect("mark lifecycle ready");
+        lifecycle.begin_drain(Duration::from_secs(1));
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("worker observes the terminal serving state")
+            .expect("worker task joins")
+            .expect("worker exits without claiming a job");
+    }
 }
 
 #[cfg(all(test, debug_assertions))]
