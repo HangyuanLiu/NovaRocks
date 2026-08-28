@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod catalog_manager;
 pub(crate) mod batch_transform;
+pub mod catalog_manager;
 pub mod typed_registry;
 pub mod typed_runtime;
 
