@@ -18,10 +18,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorControlPlanningLease, ConnectorExecutionDeclaration,
-    ConnectorFrozenRewriteGroup, ConnectorInstanceId, ConnectorPinnedFileSet,
-    ConnectorPredicateDisposition, ConnectorScan, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorStaticPredicate,
+    CatalogProperties, ConnectorBatchBudget, ConnectorControlPlanningLease,
+    ConnectorExecutionDeclaration, ConnectorFrozenRewriteGroup, ConnectorInstanceId,
+    ConnectorPinnedFileSet, ConnectorPredicateDisposition, ConnectorScan, ConnectorSplit,
+    ConnectorSplitPlanningMetrics, ConnectorStaticPredicate,
 };
 
 use crate::catalog_application::query_bindings::QueryScanMaterialization;
@@ -229,10 +229,9 @@ pub(crate) struct PlannedConnectorRead {
 /// that used to size itself from a frozen split count must ask the live
 /// backend topology instead.
 pub(crate) struct PreparedTypedConnectorScan {
-    /// The exact control generation this scan was frozen against. Every
-    /// backend that runs the fragment installs this declaration before a
-    /// runtime split can resolve its provider.
-    pub(crate) declaration: ConnectorExecutionDeclaration,
+    /// Exact immutable BE materialization input. Query assembly de-duplicates
+    /// this into the one `CatalogSet` carried in every participant Init.
+    pub(crate) catalog_properties: CatalogProperties,
     /// The typed scan node, its lazy split manager, and the constraint the
     /// round driver must enumerate under.
     pub(crate) prepared: PreparedTypedScan,
@@ -241,8 +240,8 @@ pub(crate) struct PreparedTypedConnectorScan {
     /// declined is not here: it travels as the carrier's unenforced predicate
     /// and the backend reader applies it.
     pub(crate) residual_predicates: Vec<TypedExpr>,
-    /// Keeps the exact FE control generation alive through the BE ensure
-    /// barrier. It is never encoded into a fragment carrier.
+    /// Keeps the exact FE control generation alive through query execution.
+    /// It is never encoded into a fragment carrier.
     #[allow(
         dead_code,
         reason = "The lease is retained for its drop-time ownership release through BE admission."
@@ -254,7 +253,7 @@ impl std::fmt::Debug for PreparedTypedConnectorScan {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PreparedTypedConnectorScan")
-            .field("declaration", &self.declaration)
+            .field("catalog_handle", self.catalog_properties.handle())
             .field("prepared", &self.prepared)
             .finish_non_exhaustive()
     }
@@ -430,10 +429,9 @@ impl ScanExecutionBindings {
 
     /// Record one typed connector scan.
     ///
-    /// A catalog handle is content identity, while the legacy declaration is
-    /// still a control-generation transport key during the hard cut. They
-    /// must at least name the same catalog; the latter is validated by the
-    /// planning lease before this scan is prepared.
+    /// The frozen typed relation and the immutable materialization input must
+    /// name the same exact catalog content. A name-only match would permit a
+    /// fragment to select another version after desired state changes.
     pub(crate) fn insert_typed_scan(
         &mut self,
         fragment_id: FragmentId,
@@ -445,13 +443,10 @@ impl ScanExecutionBindings {
                 "duplicate typed connector scan fragment_id={fragment_id} node_id={node_id}"
             ));
         }
-        let binding_key = scan.declaration.binding_key();
         let catalog = scan.prepared.table_scan.table().catalog();
-        if catalog.catalog_name() != &binding_key.instance_id {
+        if catalog != scan.catalog_properties.handle() {
             return Err(format!(
-                "typed connector scan fragment_id={fragment_id} node_id={node_id} names catalog '{}' but its declaration binds instance '{}'",
-                catalog.catalog_name().as_str(),
-                binding_key.instance_id.as_str()
+                "typed connector scan fragment_id={fragment_id} node_id={node_id} does not match its frozen catalog materialization input"
             ));
         }
         if scan.prepared.table_scan.plan_node_id() != node_id {

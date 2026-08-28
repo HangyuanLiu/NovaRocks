@@ -54,17 +54,18 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    CONNECTOR_FIELD_HIDDEN_FROM_SQL, CatalogHandle, CatalogVersion, ConnectorBeginScanRequest,
-    ConnectorChangeWindowAdmission, ConnectorControlBinding, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
-    ConnectorExecutionProviderKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
-    ConnectorNamespaceRequest, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
-    ConnectorProviderId, ConnectorReadPurpose, ConnectorRequestContext, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit,
-    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
-    ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateKind,
-    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest,
+    CONNECTOR_FIELD_HIDDEN_FROM_SQL, CatalogHandle, CatalogProperties, CatalogProviderKind,
+    CatalogVersion, ConnectorBeginScanRequest, ConnectorChangeWindowAdmission,
+    ConnectorControlBinding, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorExecutionProviderKind,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
+    ConnectorReadPurpose, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
+    ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableHandle,
+    ConnectorTableMetadata, ConnectorTableRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -794,8 +795,17 @@ pub fn planned_files_fixture_binding_for_provider(
         None,
     )
     .expect("fixture connector control binding")
-    .with_catalog_handle(catalog_handle)
-    .expect("fixture catalog handle belongs to the fixture binding")
+    .with_catalog_properties(
+        CatalogProperties::new(
+            catalog_handle,
+            CatalogProviderKind::Iceberg,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("valid fixture catalog properties"),
+    )
+    .expect("fixture catalog properties belong to the fixture binding")
 }
 
 /// Register a fixture that answers for every table name with the same units.

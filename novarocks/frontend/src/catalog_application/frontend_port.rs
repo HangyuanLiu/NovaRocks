@@ -519,7 +519,7 @@ impl FrontendCatalogApplicationPort {
                 .map_err(connector_error)?;
             let (binding, _) = creation.into_parts();
             let binding = binding
-                .with_catalog_handle(entry.catalog_properties(mode)?.handle().clone())
+                .with_catalog_properties(entry.catalog_properties(mode)?)
                 .map_err(connector_error)?;
             self.install_created(&entry, binding).map(|_| ())
         })();
@@ -675,11 +675,8 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
             "catalog desired-state runtime is being installed",
         );
         let binding = binding
-            .with_catalog_handle(
-                entry
-                    .catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)?
-                    .handle()
-                    .clone(),
+            .with_catalog_properties(
+                entry.catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)?,
             )
             .map_err(connector_error)?;
         self.install_created(&entry, binding)

@@ -26,7 +26,6 @@ use novarocks_proto_codec::connector_read::{
     ConnectorTableScanSource, encode_connector_expression,
 };
 use novarocks_proto_models::connector_read as dto;
-use novarocks_spi::connector::ConnectorExecutionDeclaration;
 use novarocks_sql::plan_read::{ColumnId, FragmentId, OutputColumn, TypedExpr};
 use novarocks_types::schema::ColumnDef;
 
@@ -226,12 +225,9 @@ pub struct NativeConnectorReadView<'a> {
 }
 
 impl<'a> NativeConnectorReadView<'a> {
-    pub fn declaration(self) -> &'a ConnectorExecutionDeclaration {
-        &self.scan.declaration
-    }
-
     /// Encode the frozen SPI scan only at native fragment egress.  The codec
-    /// belongs to the exact installed binding that minted every opaque handle.
+    /// belongs to the exact catalog runtime that materialized every opaque
+    /// handle.
     pub fn table_scan_source(self) -> Result<ConnectorTableScanSource, String> {
         let node = &self.scan.prepared.table_scan;
         let codec = self.scan.prepared.codec.as_ref();

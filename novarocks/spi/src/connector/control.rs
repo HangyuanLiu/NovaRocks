@@ -18,7 +18,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::{
-    CatalogHandle, ConnectorBeginScanRequest, ConnectorCatalogMutation,
+    CatalogHandle, CatalogProperties, ConnectorBeginScanRequest, ConnectorCatalogMutation,
     ConnectorCatalogMutationResolver, ConnectorCleanupMaintenance,
     ConnectorCleanupMaintenanceResolver, ConnectorDataMutation, ConnectorDataMutationResolver,
     ConnectorDistributedRewrite, ConnectorDistributedRewriteResolver, ConnectorError,
@@ -224,9 +224,13 @@ pub trait ConnectorControlFactoryResolver: Send + Sync {
 pub struct ConnectorControlBinding {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
-    /// Immutable execution identity assigned by the FE desired-state owner
-    /// before this control binding becomes query-admissible.
-    catalog_handle: Option<CatalogHandle>,
+    /// Immutable BE materialization input assigned by the FE desired-state
+    /// owner before this control binding becomes query-admissible.
+    ///
+    /// Retaining the complete value, rather than only its handle, is what lets
+    /// query assembly carry one exact `CatalogSet` in Init without re-reading
+    /// desired state or reconstructing provider configuration.
+    catalog_properties: Option<CatalogProperties>,
     catalog_handle_installer:
         Option<Arc<dyn Fn(&CatalogHandle) -> Result<(), ConnectorError> + Send + Sync>>,
     metadata: Arc<dyn ConnectorMetadata>,
@@ -414,7 +418,7 @@ impl ConnectorControlBinding {
         Ok(Self {
             descriptor,
             incarnation,
-            catalog_handle: None,
+            catalog_properties: None,
             catalog_handle_installer: None,
             metadata,
             planning,
@@ -630,14 +634,15 @@ impl ConnectorControlBinding {
         self.incarnation
     }
 
-    /// Stamps this FE-local control generation with the exact immutable
-    /// catalog identity derived from authoritative desired state. Provider
+    /// Stamps this FE-local control generation with the exact immutable BE
+    /// materialization input derived from authoritative desired state. Provider
     /// factories cannot mint this value because it must not depend on a
     /// process-local control incarnation.
-    pub fn with_catalog_handle(
+    pub fn with_catalog_properties(
         mut self,
-        catalog_handle: CatalogHandle,
+        catalog_properties: CatalogProperties,
     ) -> Result<Self, ConnectorError> {
+        let catalog_handle = catalog_properties.handle();
         if catalog_handle.catalog_name() != &self.descriptor.instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -645,9 +650,9 @@ impl ConnectorControlBinding {
             ));
         }
         if let Some(installer) = self.catalog_handle_installer.as_ref() {
-            installer(&catalog_handle)?;
+            installer(catalog_handle)?;
         }
-        self.catalog_handle = Some(catalog_handle);
+        self.catalog_properties = Some(catalog_properties);
         Ok(self)
     }
 
@@ -665,10 +670,17 @@ impl ConnectorControlBinding {
     /// was not admitted through the catalog application owner must fail
     /// closed instead of deriving an identity from its control incarnation.
     pub fn catalog_handle(&self) -> Result<&CatalogHandle, ConnectorError> {
-        self.catalog_handle.as_ref().ok_or_else(|| {
+        self.catalog_properties().map(CatalogProperties::handle)
+    }
+
+    /// Returns the complete frozen materialization input for the exact catalog
+    /// handle. Query assembly must carry this value verbatim in its Init
+    /// `CatalogSet`; it must not derive a substitute from a control runtime.
+    pub fn catalog_properties(&self) -> Result<&CatalogProperties, ConnectorError> {
+        self.catalog_properties.as_ref().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "connector control binding has no catalog execution identity",
+                "connector control binding has no catalog execution properties",
             )
         })
     }

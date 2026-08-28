@@ -33,18 +33,17 @@ use crate::catalog_application::query_materializer::metadata_table_alias_suffix;
 use crate::connector::typed_control_registry::{
     ConnectorReadControlRegistry, InstalledReadControl,
 };
-use crate::query_execution::connector_domain::CatalogHandle;
 use crate::query_execution::preparation::scan::{
     PreparedTypedConnectorScan, QueryPinnedFileSetRead, QueryRewriteGroupRead, ResolvedScanBinding,
     ResolvedScanColumn, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
 };
 use crate::query_execution::preparation::typed_scan::{TypedRelationFreeze, prepare_typed_scan};
-use novarocks_spi::connector::ConnectorReadSelector;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadChangeWindow, ConnectorReadFrozenRewriteGroup, ConnectorReadRelationKind,
     ConnectorReadRelationVersion, ConnectorReadTableExecuteProcedure, ConnectorSession,
     SchemaTableName,
 };
+use novarocks_spi::connector::{CatalogProperties, ConnectorReadSelector};
 use novarocks_sql::plan_read::PlanScanNode;
 use novarocks_sql::plan_read::{DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId};
 use novarocks_sql::planning::query_execution::{
@@ -548,7 +547,11 @@ fn prepare_typed_connector_scan(
         physical_columns,
         facts,
         &materialization.planning_lease,
-        &materialization.catalog_handle,
+        materialization
+            .planning_lease
+            .binding()
+            .catalog_properties()
+            .map_err(|error| error.to_string())?,
         materialization.table.owner(),
         &relation,
         freeze.clone(),
@@ -595,7 +598,7 @@ fn prepare_typed_pinned_file_set_scan(
         &read.planning_lease,
         read.planning_lease
             .binding()
-            .catalog_handle()
+            .catalog_properties()
             .map_err(|error| error.to_string())?,
         &read.owner,
         &relation,
@@ -645,7 +648,7 @@ fn prepare_typed_table_execute_scan(
         &read.planning_lease,
         read.planning_lease
             .binding()
-            .catalog_handle()
+            .catalog_properties()
             .map_err(|error| error.to_string())?,
         &read.owner,
         &relation,
@@ -704,7 +707,7 @@ fn prepare_typed_relation_scan(
     physical_columns: &[ResolvedScanColumn],
     facts: &SqlScanPreparationFacts,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    catalog_handle: &CatalogHandle,
+    catalog_properties: &CatalogProperties,
     source_owner: &novarocks_spi::connector::ConnectorInstanceId,
     relation: &SchemaTableName,
     freeze: TypedRelationFreeze<'_>,
@@ -714,6 +717,7 @@ fn prepare_typed_relation_scan(
 ) -> Result<PreparedTypedConnectorScan, String> {
     let typed = options.typed()?;
     let binding = planning_lease.binding();
+    let catalog_handle = catalog_properties.handle();
     if source_owner != &binding.descriptor().instance_id {
         return Err(format!(
             "typed connector scan node_id={node_id} has a table handle owned by another instance than its planning lease"
@@ -724,12 +728,25 @@ fn prepare_typed_relation_scan(
             "typed connector scan node_id={node_id} has a catalog handle owned by another instance than its planning lease"
         ));
     }
+    if binding
+        .catalog_properties()
+        .map_err(|error| error.to_string())?
+        != catalog_properties
+    {
+        return Err(format!(
+            "typed connector scan node_id={node_id} has catalog properties from another frozen desired state"
+        ));
+    }
     let control: InstalledReadControl = typed.control.resolve_read_control(catalog_handle).ok_or_else(|| {
         format!(
             "typed connector scan node_id={node_id}: no installed read control for exact catalog handle"
         )
     })?;
-    let declaration = binding
+    // This remains a FE-only control validation: providers use the request
+    // context to observe cancellation before expensive read preparation. The
+    // returned legacy declaration is deliberately discarded; typed reads are
+    // materialized solely from the Init-carried CatalogSet.
+    let _ = binding
         .execution_declaration(context)
         .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
     let prepared = prepare_typed_scan(
@@ -770,7 +787,7 @@ fn prepare_typed_relation_scan(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(PreparedTypedConnectorScan {
-        declaration,
+        catalog_properties: catalog_properties.clone(),
         prepared,
         residual_predicates,
         planning_lease: planning_lease.clone(),

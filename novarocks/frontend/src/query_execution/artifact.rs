@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::Field;
-use novarocks_spi::connector::ConnectorWriteCohortId;
+use novarocks_spi::connector::{CatalogHandle, CatalogProperties, ConnectorWriteCohortId};
 use sha2::{Digest, Sha256};
 
 use crate::common::backend_topology::LiveBackendTarget;
@@ -53,6 +53,7 @@ use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploym
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::{
     AttemptId as ProtocolAttemptId, QueryExecutionId as ProtocolQueryExecutionId,
 };
@@ -607,6 +608,8 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
                 "query initialization execution id does not match validated schedule",
             ));
         }
+        let catalog_set = merge_prepared_catalog_set(&self.prepared, options.catalog_set())?;
+        let options = options.with_catalog_set(catalog_set);
         let runtime_filters = self
             .runtime_filter_contributions
             .into_iter()
@@ -634,6 +637,51 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             connector_write_plans: self.connector_write_plans,
         })
     }
+}
+
+/// Freeze every catalog required by typed reads into the exact query-wide Init
+/// contribution. `CatalogSet` is the sole BE materialization input: never
+/// recover these values from the current FE control host after query assembly
+/// has started.
+fn merge_prepared_catalog_set(
+    prepared: &PreparedFragmentSet,
+    existing: &CatalogSet,
+) -> Result<CatalogSet, DistributedQueryError> {
+    merge_catalog_properties(
+        existing,
+        prepared
+            .scan_bindings()
+            .typed_scans()
+            .map(|(_, _, scan)| scan.catalog_properties.clone()),
+    )
+}
+
+fn merge_catalog_properties(
+    existing: &CatalogSet,
+    additional: impl IntoIterator<Item = CatalogProperties>,
+) -> Result<CatalogSet, DistributedQueryError> {
+    let mut by_handle: BTreeMap<CatalogHandle, CatalogProperties> = existing
+        .catalogs()
+        .map_err(|error| contract_error(format!("invalid existing query catalog set: {error}")))?
+        .into_iter()
+        .map(|properties| (properties.handle().clone(), properties))
+        .collect();
+    for properties in additional {
+        let handle = properties.handle().clone();
+        match by_handle.get(&handle) {
+            Some(existing) if existing != &properties => {
+                return Err(contract_error(
+                    "typed scans freeze conflicting materialization inputs for one catalog handle",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                by_handle.insert(handle, properties);
+            }
+        }
+    }
+    CatalogSet::new(by_handle.into_values())
+        .map_err(|error| contract_error(format!("invalid query catalog set: {error}")))
 }
 
 fn attach_connector_write_plans(
@@ -1974,6 +2022,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use bytes::Bytes;
     use novarocks_spi::connector::{
+        CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
         ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
         ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceId,
         ConnectorInstanceIncarnation, ConnectorRequestContext, ConnectorSplit,
@@ -1988,12 +2037,13 @@ mod tests {
 
     use super::{
         attach_connector_write_plans, build_fragment_lifecycle_projection,
-        derive_fragment_instance_id,
+        derive_fragment_instance_id, merge_catalog_properties,
     };
     use crate::common::backend_topology::LiveBackendTarget;
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+    use novarocks_proto_codec::catalog::CatalogSet;
     use novarocks_proto_codec::lifecycle::{
         AttemptId, ExchangeRouteManifest, QueryControlEndpoint, QueryExecutionId,
     };
@@ -2003,6 +2053,20 @@ mod tests {
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
     use novarocks_types::{BackendProcessId, UniqueId};
+
+    fn catalog_properties(name: &str, version: u8, warehouse: &str) -> CatalogProperties {
+        CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse(name).expect("valid catalog name"),
+                CatalogVersion::from_bytes([version; 32]),
+            ),
+            CatalogProviderKind::Iceberg,
+            1,
+            vec![CatalogProperty::new("warehouse", warehouse).expect("valid warehouse")],
+            Vec::new(),
+        )
+        .expect("valid catalog properties")
+    }
 
     fn live_backend(backend_idx: usize, endpoint: std::net::SocketAddr) -> LiveBackendTarget {
         let descriptor = BackendProcessDescriptor::new(
@@ -2044,6 +2108,43 @@ mod tests {
             estimated_bytes,
         )
         .expect("valid split")
+    }
+
+    #[test]
+    fn catalog_set_merges_exact_typed_read_materializations_once() {
+        let existing = CatalogSet::new([catalog_properties("catalog.alpha", 1, "s3://alpha")])
+            .expect("valid initial catalog set");
+        let merged = merge_catalog_properties(
+            &existing,
+            [
+                catalog_properties("catalog.alpha", 1, "s3://alpha"),
+                catalog_properties("catalog.beta", 2, "s3://beta"),
+            ],
+        )
+        .expect("exact duplicate typed read materialization is idempotent");
+        let catalogs = merged.catalogs().expect("valid merged catalog set");
+        assert_eq!(catalogs.len(), 2);
+        assert_eq!(
+            catalogs[0].handle().catalog_name().as_str(),
+            "catalog.alpha"
+        );
+        assert_eq!(catalogs[1].handle().catalog_name().as_str(), "catalog.beta");
+    }
+
+    #[test]
+    fn catalog_set_rejects_conflicting_typed_read_materialization() {
+        let existing = CatalogSet::new([catalog_properties("catalog.alpha", 1, "s3://alpha")])
+            .expect("valid initial catalog set");
+        let error = merge_catalog_properties(
+            &existing,
+            [catalog_properties("catalog.alpha", 1, "s3://other-alpha")],
+        )
+        .expect_err("one catalog handle cannot name two materialization inputs");
+        assert!(
+            error
+                .message()
+                .contains("conflicting materialization inputs")
+        );
     }
 
     fn placed_split_ids(placements: Vec<Vec<ConnectorSplit>>) -> Vec<Vec<String>> {

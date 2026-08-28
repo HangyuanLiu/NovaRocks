@@ -128,7 +128,7 @@ fn an_ordinary_iceberg_scan_lowers_to_a_typed_data_relation() {
             .catalog()
             .catalog_name()
             .as_str(),
-        typed.declaration.binding_key().instance_id.as_str(),
+        typed.catalog_properties.handle().catalog_name().as_str(),
         "the frozen relation and its declaration name one generation"
     );
 }

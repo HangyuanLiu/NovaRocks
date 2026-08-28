@@ -336,7 +336,9 @@ mod tests {
 
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
-    use novarocks_spi::connector::{CatalogHandle, CatalogVersion, ConnectorInstanceId};
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
+    };
 
     use super::*;
 
@@ -730,7 +732,16 @@ mod tests {
             CatalogVersion::from_bytes([7; 32]),
         );
         let binding = binding
-            .with_catalog_handle(expected_handle.clone())
+            .with_catalog_properties(
+                CatalogProperties::new(
+                    expected_handle.clone(),
+                    CatalogProviderKind::Iceberg,
+                    1,
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .expect("valid desired-state catalog properties"),
+            )
             .expect("desired state stamps the catalog handle");
         assert_eq!(
             observed_key.lock().expect("key lock").as_ref(),
@@ -782,10 +793,19 @@ mod tests {
 
         let creation = factory.create_control(request).expect("control creation");
         let (binding, _) = creation.into_parts();
-        let error = match binding.with_catalog_handle(CatalogHandle::new(
-            ConnectorInstanceId::parse("ice").expect("instance ID"),
-            CatalogVersion::from_bytes([8; 32]),
-        )) {
+        let error = match binding.with_catalog_properties(
+            CatalogProperties::new(
+                CatalogHandle::new(
+                    ConnectorInstanceId::parse("ice").expect("instance ID"),
+                    CatalogVersion::from_bytes([8; 32]),
+                ),
+                CatalogProviderKind::Iceberg,
+                1,
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("valid desired-state catalog properties"),
+        ) {
             Ok(_) => panic!("registration failure must prevent catalog-handle stamping"),
             Err(error) => error,
         };
