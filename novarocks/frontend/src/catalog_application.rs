@@ -40,16 +40,19 @@ pub mod query_catalog;
 pub mod query_materializer;
 pub mod resolver;
 pub mod statement;
+pub mod static_file;
 pub mod system_catalog;
 pub mod virtual_table;
 
 pub mod frontend_port;
 pub use desired_state::{
     CatalogCredentialReference, CatalogDesiredStateEntry, CatalogDesiredStateSnapshot,
-    CatalogDesiredStateSnapshotIdentity, CatalogDesiredStateSource, CatalogDesiredStateSourceMode,
-    CatalogLogicalConfig, CatalogSourceEntryIdentity, CatalogSqlMutationAdmission,
+    CatalogDesiredStateSnapshotIdentity, CatalogDesiredStateSource, CatalogDesiredStateSourceInput,
+    CatalogDesiredStateSourceMode, CatalogLogicalConfig, CatalogSourceEntryIdentity,
+    CatalogSqlMutationAdmission,
 };
 pub use frontend_port::FrontendCatalogApplicationPort;
+pub use static_file::load_static_file_snapshot;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogCreateCommand {

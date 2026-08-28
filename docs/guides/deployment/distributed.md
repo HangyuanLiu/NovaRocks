@@ -53,7 +53,10 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
   secret 与 transport mode；Native JWT 是 mandatory，TLS 只是在其上增加的可选层。
 - 所有 BE 节点都能访问相同的数据源、对象存储和 catalog。
 - 如果使用对象存储，所有节点的凭据、endpoint 和 path-style 设置应保持一致。
-- `role=fe` 必须配置一个可用的 `[state_store]`，供 catalog、MV 等其余 FE durable owner 使用；它不是 backend membership source。backend desired lifecycle 属于外部 orchestrator，FE 的 observed registry 会由 BE announce 和 FE-pull heartbeat 在重启后重建。SQLite 只适用于恰好一个 active FE。
+- `role=fe` 必须显式选择 `[catalog_source]`。StaticFile 从一份挂载的完整 snapshot 启动；
+  DynamicStateStore 才要求可用的 `[state_store]` 并允许 SQL catalog mutation。StateStore
+  不是 backend membership source。backend desired lifecycle 属于外部 orchestrator，FE 的 observed
+  registry 会由 BE announce 和 FE-pull heartbeat 在重启后重建。SQLite 只适用于恰好一个 active FE。
 
 ## 编译 NovaRocks
 
@@ -90,6 +93,9 @@ log_level = "info"
 host = "0.0.0.0"
 grpc_port = 9080
 http_port = 8040
+# Keep this aligned with terminationGracePeriodSeconds: 360 below.
+frontend_drain_timeout_ms = 300000
+frontend_cleanup_timeout_ms = 30000
 
 [native_trust]
 deployment_id = "analytics-prod"
@@ -134,9 +140,11 @@ affected process. Credentials never enter native fragments or FE-to-BE transport
 ## 配置 FE 节点
 
 FE 节点启动 `server.grpc_port` 接收 BE coordinator report 和 authenticated backend
-announce，并启动独立 `server.http_port` 暴露 FE-scoped metrics 和现有 gated lifecycle
-debug。Native listener 不承载 management HTTP。FE 必须配置 `[state_store]`，但它不持久化
-backend membership：BE 由外部 orchestrator 创建，并向 FE self-register。
+announce，并启动独立 `server.http_port` 暴露 FE-scoped metrics 和 lifecycle observation。
+Native listener 不承载 management HTTP。FE 的 catalog source 必须显式选择；StaticFile 可配合
+可丢弃的本地 SQLite Accelerator carrier，DynamicStateStore 则使用 StateStore 作为 catalog
+authority。无论哪种 mode，StateStore 都不持久化 backend membership：BE 由外部 orchestrator
+创建，并向 FE self-register。
 
 示例 `fe.toml`：
 
@@ -148,6 +156,10 @@ provider = "sqlite"
 cluster_id = "production-cluster"
 path = "meta/fe-state-store.sqlite"
 deployment_owner = "fe-a"
+
+[catalog_source]
+# This distributed example creates catalogs through SQL.
+mode = "dynamic-state-store"
 
 [server]
 host = "0.0.0.0"
@@ -175,7 +187,12 @@ heartbeat_timeout_retries = 3
 backend_announce_lease_ttl_ms = 5000
 ```
 
-`[state_store]` 是 FE durable control-plane state 的唯一持久化入口，但 membership 只是可重建的内存投影：FE 重启后由仍在运行的 BE renew announce 重建。不得添加第二套 metadata store、seed 或内存 fallback。持久用户表属于 external Iceberg catalog；`[connector.object_store]` 只提供 connector execution 的进程本地凭据。
+`[catalog_source]` 是 catalog desired-state 的唯一 authority。上例的 `dynamic-state-store`
+使 `[state_store]` 成为该 authority 的 durable carrier；StaticFile deployment 仍可配置 SQLite
+作为可重建 Accelerator carrier，但必须只从 static snapshot 读取 catalog truth。membership 只是
+可重建的内存投影：FE 重启后由仍在运行的 BE renew announce 重建。不得添加第二套 metadata store、seed
+或内存 fallback。持久用户表属于 external Iceberg catalog；`[connector.object_store]` 只提供
+connector execution 的进程本地凭据。
 
 启动 FE：
 
@@ -259,9 +276,12 @@ BE 启动后创建新的 process identity，立即通过同一受 NWT-3 保护�
 
 推荐停止顺序：
 
-1. 停止新查询入口或断开客户端。
-2. 对 BE 发送 `SIGTERM`，使其先 announce `Draining`、拒绝新的 Init，并等待已接纳 lifecycle 完成。
-3. 停止 FE 进程。
+1. 在 LB/Gateway 中 external deactivate 旧 FE，先停止把新连接路由到它。
+2. 对旧 FE 发送 `SIGTERM`。它会立即拒绝新 statement/background work，保留已准入 attempt 最多
+   300 秒；management `/livez` 在 drain 中仍为 200，`/readyz` 变为 503。
+3. 为 Pod 配置 `terminationGracePeriodSeconds: 360`：300 秒 drain + 30 秒 cleanup，外加 30 秒
+   orchestrator margin。不要用短于该总预算的 preStop sleep 代替本地 drain。
+4. FE 退出后再停止其 BE，或由外部 orchestrator 按 BE 自己的 drain 协议处理。
 
 ## 常见问题
 
@@ -272,7 +292,7 @@ BE 启动后创建新的 process identity，立即通过同一受 NWT-3 保护�
 | `Unauthenticated` 或 native trust startup failure | 检查每个 FE/BE 的 `deployment_id`、environment-resolved secret 与 transport mode 完全一致；不要为恢复连接而删除 `[native_trust]`。 |
 | TLS handshake / certificate failure | 所有 role 必须使用同一 TLS mode；检查 advertised IP/DNS reference 与 certificate SAN，PEM mode 还要检查显式 trust roots。 |
 | 查询报 `role=fe: no live backend available` | 当前 FE 没有可调度的 live BE；先恢复或注册 BE。 |
-| FE 启动时提示缺少 StateStore | 为 `role=fe` 配置 `[state_store]`；不要使用 core metadata 或内存 registry 作为 membership fallback。 |
+| FE 启动时提示缺少 catalog source | StaticFile mode 必须提供可读、完整的 snapshot file；DynamicStateStore mode 必须配置 `[state_store]`。不要使用 core metadata 或内存 registry 作为 fallback。 |
 | BE 启动时配置校验失败 | `role=be` 必须配置 `[cluster].frontend_endpoint`，且不能配置 FE heartbeat 或 lease 设置。 |
 | Native 或 management endpoint 冲突 | 让 FE MySQL、FE Native gRPC、FE management HTTP、BE Native gRPC、BE management HTTP 使用不重叠的 bind endpoint；同时检查 wildcard bind。 |
 | `/metrics` 在 gRPC port 不可用 | 改访问对应 role 的 `[server].http_port`；metrics 使用 role-local registry，不会跨 FE/BE 混合。 |

@@ -70,6 +70,13 @@ enum LocalProjection {
     },
 }
 
+/// Aggregate local materialization result for one exact desired-state snapshot.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CatalogProjectionCounts {
+    pub(crate) ready: usize,
+    pub(crate) unavailable: usize,
+}
+
 impl LocalProjection {
     fn attachment_id(&self) -> Uuid {
         match self {
@@ -345,6 +352,21 @@ impl FrontendCatalogApplicationPort {
         page_size: usize,
         worker_count: usize,
     ) -> Result<(), CatalogApplicationError> {
+        self.reconcile_snapshot_with_page_size(page_size, worker_count)
+            .await
+            .map(|_| ())
+    }
+
+    /// Reconciles one complete source snapshot and returns its exact identity
+    /// together with this process's materialization counts.  The source is
+    /// enumerated exactly once; callers must not reread it merely to publish
+    /// bootstrap observability.
+    pub(crate) async fn reconcile_snapshot_with_page_size(
+        self: &Arc<Self>,
+        page_size: usize,
+        worker_count: usize,
+    ) -> Result<(CatalogDesiredStateSnapshot, CatalogProjectionCounts), CatalogApplicationError>
+    {
         if worker_count == 0 {
             return Err(CatalogApplicationError::new(
                 CatalogApplicationErrorKind::InvalidRequest,
@@ -363,7 +385,7 @@ impl FrontendCatalogApplicationPort {
             .await?;
 
         let mut workers = tokio::task::JoinSet::new();
-        for entry in snapshot.into_entries() {
+        for entry in snapshot.clone().into_entries() {
             if workers.len() >= worker_count {
                 let completed = workers.join_next().await.ok_or_else(|| {
                     CatalogApplicationError::new(
@@ -389,7 +411,7 @@ impl FrontendCatalogApplicationPort {
                 )
             })?;
         }
-        Ok(())
+        Ok((snapshot, self.projection_counts()))
     }
 
     /// Retires every local projection the snapshot no longer declares.
@@ -545,6 +567,24 @@ impl FrontendCatalogApplicationPort {
                     .values()
                     .filter(|projection| matches!(projection, LocalProjection::Ready { .. }))
                     .count()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn projection_counts(&self) -> CatalogProjectionCounts {
+        self.projections
+            .lock()
+            .map(|projections| {
+                projections.values().fold(
+                    CatalogProjectionCounts::default(),
+                    |mut counts, projection| {
+                        match projection {
+                            LocalProjection::Ready { .. } => counts.ready += 1,
+                            LocalProjection::Unavailable { .. } => counts.unavailable += 1,
+                        }
+                        counts
+                    },
+                )
             })
             .unwrap_or_default()
     }

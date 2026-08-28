@@ -60,6 +60,27 @@ fn init_process(config: &NovaRocksConfig) -> anyhow::Result<tokio::runtime::Runt
         .map_err(|error| anyhow::anyhow!("build data Tokio runtime: {error}"))
 }
 
+/// SIGTERM is the production authority for the one-way FE drain. SIGINT uses
+/// the same path for local operation; neither signal is interpreted as an
+/// immediate process-wide connection cancellation.
+async fn termination_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = signal(SignalKind::terminate())
+            .expect("install SIGTERM handler for NovaRocks server process");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 fn run_frontend(role: launch::RoleConfig, runtime: &tokio::runtime::Runtime) -> anyhow::Result<()> {
     let frontend = composition::compose_frontend_server_config(
         &role.config,
@@ -71,9 +92,7 @@ fn run_frontend(role: launch::RoleConfig, runtime: &tokio::runtime::Runtime) -> 
         .block_on(novarocks_frontend::run_frontend_server_until_shutdown(
             frontend,
             runtime.handle().clone(),
-            async {
-                let _ = tokio::signal::ctrl_c().await;
-            },
+            termination_signal(),
         ))
         .map_err(|error| anyhow::anyhow!("role=fe: {error}"))
 }
@@ -93,9 +112,7 @@ fn run_backend(role: launch::RoleConfig, runtime: &tokio::runtime::Runtime) -> a
         .block_on(novarocks_backend::run_backend_server_until_shutdown(
             backend,
             data_runtime,
-            async {
-                let _ = tokio::signal::ctrl_c().await;
-            },
+            termination_signal(),
         ))
         .map_err(|error| anyhow::anyhow!("role=be: {error}"))
 }
@@ -126,14 +143,14 @@ async fn run_all_in_one(
         std::sync::Arc::clone(&backend.native_trust),
         backend.native_transport.clone(),
     );
-    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let (frontend_stop_tx, frontend_stop_rx) = tokio::sync::watch::channel(false);
+    let (backend_stop_tx, backend_stop_rx) = tokio::sync::watch::channel(false);
     let frontend_runtime = runtime.clone();
-    let frontend_stop = stop_rx.clone();
     let frontend_run = async move {
         novarocks_frontend::run_frontend_server_until_shutdown(
             frontend,
             frontend_runtime,
-            wait_for_stop(frontend_stop),
+            wait_for_stop(frontend_stop_rx),
         )
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))
@@ -142,14 +159,18 @@ async fn run_all_in_one(
         novarocks_backend::run_backend_server_until_shutdown(
             backend,
             backend_runtime,
-            wait_for_stop(stop_rx),
+            wait_for_stop(backend_stop_rx),
         )
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))
     };
-    novarocks_server::supervisor::supervise_all_in_one(frontend_run, backend_run, stop_tx, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
+    novarocks_server::supervisor::supervise_all_in_one(
+        frontend_run,
+        backend_run,
+        frontend_stop_tx,
+        backend_stop_tx,
+        termination_signal(),
+    )
     .await
 }
 

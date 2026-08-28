@@ -19,7 +19,8 @@
 #
 # `novarocks-cluster-harness` owns the real launch contract and rewrites the
 # volatile parts of this file per process: it inserts `[cluster] role`, the BE
-# endpoint list, every port, and a per-run `[state_store] path`. Only the
+# endpoint list, every port, a per-run `[state_store] path`, and removes the
+# FE-only catalog source from BE configs. Only the
 # provider-neutral, non-volatile fields belong here.
 #
 # It also materializes one mandatory `[native_trust]` table for every generated
@@ -43,6 +44,12 @@ provider = "sqlite"
 cluster_id = "novarocks-system-scenarios"
 path = "tmp/system-scenarios-state-store.sqlite"
 deployment_owner = "fe-1"
+
+[catalog_source]
+# System scenarios create and mutate catalogs through SQL, so their FE uses
+# the explicit DynamicStateStore authority. The harness strips this section
+# while rendering every BE config.
+mode = "dynamic-state-store"
 
 [standalone_server]
 mysql_port = 9030

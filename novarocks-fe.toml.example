@@ -19,6 +19,10 @@ host = "127.0.0.1"
 grpc_port = 9080
 # FE management HTTP listener for FE-scoped metrics and gated lifecycle debug.
 http_port = 8040
+# These FE-only bounds reserve 300s for admitted work and 30s for final
+# teardown after SIGTERM.
+frontend_drain_timeout_ms = 300000
+frontend_cleanup_timeout_ms = 30000
 
 [cluster]
 role = "fe"
@@ -26,6 +30,14 @@ role = "fe"
 # announces itself to this FE endpoint; FE keeps only an in-memory observed
 # eligibility projection. SQL ADD/DROP BACKEND and cluster.backends are not
 # supported configuration or management surfaces.
+
+# This example uses one immutable catalog desired-state snapshot. Copy this
+# file together with novarocks-catalogs.toml.example and keep the relative path.
+# Use mode = "dynamic-state-store" instead when SQL CREATE/DROP CATALOG must be
+# the catalog authority; StateStore presence never selects that mode implicitly.
+[catalog_source]
+mode = "static-file"
+static_file_path = "novarocks-catalogs.toml"
 
 [state_store]
 provider = "sqlite"

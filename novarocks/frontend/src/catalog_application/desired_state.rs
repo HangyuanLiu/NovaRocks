@@ -41,10 +41,10 @@
 //!    deployment rejects `CREATE`/`DROP CATALOG` rather than applying it to a
 //!    store nothing reads.
 //!
-//! Only [`CatalogDesiredStateSourceMode::DynamicStateStore`] is implemented.
-//! The other two modes are frozen port positions: selecting one fails with a
+//! Dynamic StateStore and StaticFile are implemented by distinct authorities.
+//! ManagedController remains a frozen port position: selecting it fails with a
 //! typed error before startup opens anything, and there is deliberately no arm
-//! anywhere that lets them borrow the dynamic StateStore authority instead.
+//! anywhere that lets it borrow another authority.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
@@ -83,10 +83,9 @@ const DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION: u8 =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CatalogDesiredStateSourceMode {
     /// StateStore attachment records are the desired-state authority, and SQL
-    /// `CREATE`/`DROP CATALOG` write them.  The only implemented mode.
+    /// `CREATE`/`DROP CATALOG` write them.
     DynamicStateStore,
-    /// Pre-deployment configuration files are the authority.  Port position
-    /// only; LNP-8 owns the configuration parsing and startup composition.
+    /// Pre-deployment configuration files are the authority.
     StaticFile,
     /// An external controller delivers desired state.  Port position only; the
     /// delivery protocol is not designed yet.
@@ -128,10 +127,8 @@ impl CatalogDesiredStateSourceMode {
     /// implementation.
     pub fn require_implemented(self) -> Result<(), CatalogApplicationError> {
         match self {
-            Self::DynamicStateStore => Ok(()),
-            Self::StaticFile | Self::ManagedController => {
-                Err(unsupported_mode(self, "serve catalog desired state"))
-            }
+            Self::DynamicStateStore | Self::StaticFile => Ok(()),
+            Self::ManagedController => Err(unsupported_mode(self, "serve catalog desired state")),
         }
     }
 }
@@ -452,6 +449,35 @@ impl CatalogDesiredStateSnapshot {
     pub(crate) fn into_entries(self) -> impl Iterator<Item = CatalogDesiredStateEntry> {
         self.entries.into_values()
     }
+
+    /// Returns the entry from this exact snapshot, without consulting a
+    /// second authority. StaticFile deliberately has no reload/watch path.
+    pub(crate) fn locate(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Option<CatalogDesiredStateEntry> {
+        self.entries.get(instance_id).cloned()
+    }
+}
+
+/// The complete source input composition validates before it opens runtime
+/// resources. StaticFile carries its already parsed, bounded snapshot; it is
+/// not a path that a later owner can reopen or reinterpret.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogDesiredStateSourceInput {
+    DynamicStateStore,
+    StaticFile(CatalogDesiredStateSnapshot),
+    ManagedControllerUnsupported,
+}
+
+impl CatalogDesiredStateSourceInput {
+    pub const fn mode(&self) -> CatalogDesiredStateSourceMode {
+        match self {
+            Self::DynamicStateStore => CatalogDesiredStateSourceMode::DynamicStateStore,
+            Self::StaticFile(_) => CatalogDesiredStateSourceMode::StaticFile,
+            Self::ManagedControllerUnsupported => CatalogDesiredStateSourceMode::ManagedController,
+        }
+    }
 }
 
 /// The desired-state source this frontend was composed with.
@@ -475,12 +501,34 @@ pub struct CatalogDesiredStateSource {
 enum CatalogDesiredStateAuthority {
     /// StateStore attachment records are the desired-state authority.
     DynamicStateStore(CatalogAttachmentRepository),
+    /// One startup-validated StaticFile snapshot. It is immutable for this
+    /// process and therefore cannot accidentally turn a partial reread into a
+    /// smaller desired state.
+    StaticFile(CatalogDesiredStateSnapshot),
     /// The mode's port position exists; this binary implements no authority for
     /// it.
     Unimplemented,
 }
 
 impl CatalogDesiredStateSource {
+    /// Binds an already validated composition input to its sole authority.
+    pub fn from_input(
+        input: CatalogDesiredStateSourceInput,
+        attachments: Option<CatalogAttachmentRepository>,
+    ) -> Result<Self, CatalogApplicationError> {
+        match input {
+            CatalogDesiredStateSourceInput::DynamicStateStore => Self::select(
+                CatalogDesiredStateSourceMode::DynamicStateStore,
+                attachments,
+            ),
+            CatalogDesiredStateSourceInput::StaticFile(snapshot) => Self::static_file(snapshot),
+            CatalogDesiredStateSourceInput::ManagedControllerUnsupported => Err(unsupported_mode(
+                CatalogDesiredStateSourceMode::ManagedController,
+                "serve catalog desired state",
+            )),
+        }
+    }
+
     /// Binds the deployment's selected mode to the authority that serves it.
     ///
     /// The `match` is exhaustive over the closed mode enum, and this is the
@@ -502,8 +550,11 @@ impl CatalogDesiredStateSource {
                     )
                 })?))
             }
-            CatalogDesiredStateSourceMode::StaticFile
-            | CatalogDesiredStateSourceMode::ManagedController => Ok(Self {
+            CatalogDesiredStateSourceMode::StaticFile => Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Unavailable,
+                "the static-file catalog source requires a startup-validated snapshot",
+            )),
+            CatalogDesiredStateSourceMode::ManagedController => Ok(Self {
                 mode,
                 authority: CatalogDesiredStateAuthority::Unimplemented,
             }),
@@ -516,6 +567,22 @@ impl CatalogDesiredStateSource {
             mode: CatalogDesiredStateSourceMode::DynamicStateStore,
             authority: CatalogDesiredStateAuthority::DynamicStateStore(attachments),
         }
+    }
+
+    /// The StaticFile source reads only the exact snapshot preflight created.
+    pub fn static_file(
+        snapshot: CatalogDesiredStateSnapshot,
+    ) -> Result<Self, CatalogApplicationError> {
+        if snapshot.mode() != CatalogDesiredStateSourceMode::StaticFile {
+            return Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::InvalidRequest,
+                "the static-file catalog source requires a static-file snapshot",
+            ));
+        }
+        Ok(Self {
+            mode: CatalogDesiredStateSourceMode::StaticFile,
+            authority: CatalogDesiredStateAuthority::StaticFile(snapshot),
+        })
     }
 
     pub const fn mode(&self) -> CatalogDesiredStateSourceMode {
@@ -553,6 +620,7 @@ impl CatalogDesiredStateSource {
                         .collect::<Vec<_>>(),
                 )
             }
+            CatalogDesiredStateAuthority::StaticFile(snapshot) => Ok(snapshot.clone()),
             CatalogDesiredStateAuthority::Unimplemented => {
                 Err(unsupported_mode(self.mode, "enumerate desired state"))
             }
@@ -577,6 +645,7 @@ impl CatalogDesiredStateSource {
                 .await
                 .map_err(|error| untrustworthy_enumeration(self.mode, error))?
                 .map(|versioned| CatalogDesiredStateEntry::from_attachment(&versioned.attachment))),
+            CatalogDesiredStateAuthority::StaticFile(snapshot) => Ok(snapshot.locate(instance_id)),
             CatalogDesiredStateAuthority::Unimplemented => {
                 Err(unsupported_mode(self.mode, "locate a catalog"))
             }
@@ -594,6 +663,10 @@ impl CatalogDesiredStateSource {
         match self.sql_mutation_admission() {
             CatalogSqlMutationAdmission::Accepted => match &self.authority {
                 CatalogDesiredStateAuthority::DynamicStateStore(attachments) => Ok(attachments),
+                CatalogDesiredStateAuthority::StaticFile(_) => Err(CatalogApplicationError::new(
+                    CatalogApplicationErrorKind::UnsupportedSourceMode,
+                    "the static-file catalog source does not admit SQL catalog mutation",
+                )),
                 // Unreachable through `select`, which pairs the accepting mode
                 // with this authority. Reported rather than asserted so a
                 // future mode that accepts SQL cannot reach a store it has not
@@ -725,11 +798,8 @@ mod tests {
     }
 
     #[test]
-    fn an_unimplemented_mode_never_borrows_the_dynamic_authority() {
-        for mode in [
-            CatalogDesiredStateSourceMode::StaticFile,
-            CatalogDesiredStateSourceMode::ManagedController,
-        ] {
+    fn managed_controller_never_borrows_the_dynamic_authority() {
+        for mode in [CatalogDesiredStateSourceMode::ManagedController] {
             assert_eq!(
                 mode.require_implemented()
                     .expect_err("an unimplemented mode must be rejected before startup")
@@ -755,6 +825,11 @@ mod tests {
                 .require_implemented()
                 .is_ok()
         );
+        assert!(
+            CatalogDesiredStateSourceMode::StaticFile
+                .require_implemented()
+                .is_ok()
+        );
         assert_eq!(
             CatalogDesiredStateSourceMode::DynamicStateStore.sql_mutation_admission(),
             CatalogSqlMutationAdmission::Accepted
@@ -768,6 +843,34 @@ mod tests {
             StateFamily::CatalogDesiredState
                 .record_version()
                 .expect("the catalog desired-state family declares a record version")
+        );
+    }
+
+    #[tokio::test]
+    async fn static_file_uses_its_exact_snapshot_and_rejects_sql_mutation() {
+        let snapshot = CatalogDesiredStateSnapshot::try_new(
+            CatalogDesiredStateSourceMode::StaticFile,
+            [entry("catalog.analytics", "analytics")],
+        )
+        .expect("static snapshot");
+        let source =
+            CatalogDesiredStateSource::static_file(snapshot.clone()).expect("static source");
+        assert_eq!(source.mode(), CatalogDesiredStateSourceMode::StaticFile);
+        assert_eq!(
+            source
+                .enumerate(1)
+                .await
+                .expect("static enumeration")
+                .identity(),
+            snapshot.identity()
+        );
+        let error = match source.sql_mutation_authority() {
+            Ok(_) => panic!("StaticFile must reject SQL mutation"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            CatalogApplicationErrorKind::UnsupportedSourceMode
         );
     }
 }

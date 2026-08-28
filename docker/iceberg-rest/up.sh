@@ -383,6 +383,11 @@ grpc_port = $fe_grpc_port
 [cluster]
 role = "fe"
 
+[catalog_source]
+# The Iceberg REST fixture creates catalogs through SQL, so StateStore is the
+# explicit desired-state authority rather than an implicit compatibility path.
+mode = "dynamic-state-store"
+
 [runtime]
 exchange_wait_ms = 300000
 

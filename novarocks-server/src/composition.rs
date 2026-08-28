@@ -490,11 +490,17 @@ pub fn compose_frontend_server_config(
         .standalone_server
         .as_ref()
         .map(|standalone| standalone.mv_refresh_scheduler_failure_backoff_ms.max(1));
+    let catalog_source = config
+        .catalog_source
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("compose frontend server without catalog source preflight"))?
+        .input()?;
     let mut execution = FrontendExecutionConfig::new(
         native_trust.advertised_endpoint().host().to_string(),
         native_trust.advertised_endpoint().port(),
         runtime_filter_worker_count,
     )
+    .with_catalog_desired_state_source(catalog_source)
     .with_lake_publication_runtime_policy(
         LakePublicationRuntimePolicy::try_new(
             Duration::from_millis(runtime_config.lake_publication_max_attempt_duration_ms),
@@ -578,6 +584,8 @@ pub fn compose_frontend_server_config(
         report_bind_host: config.server.host.clone(),
         report_grpc_port: config.server.grpc_port,
         metrics_http_port: config.server.http_port,
+        frontend_drain_timeout: Duration::from_millis(config.server.frontend_drain_timeout_ms),
+        frontend_cleanup_timeout: Duration::from_millis(config.server.frontend_cleanup_timeout_ms),
         mysql_listener,
         connector_control_factories: compose_frontend_control_factories(
             config,

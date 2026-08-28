@@ -18,6 +18,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 
+use crate::catalog_source_config::{CatalogSourceConfig, preflight_catalog_source};
 use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{
     FoundationDbClientConfig, MySqlClientConfig, MySqlTlsMode, StateStoreAppConfig,
@@ -30,6 +31,9 @@ use novarocks_types::{ClusterRole, NativeEndpoint};
 use uuid::Uuid;
 
 pub use crate::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
+
+pub const DEFAULT_FRONTEND_DRAIN_TIMEOUT_MS: u64 = 300_000;
+pub const DEFAULT_FRONTEND_CLEANUP_TIMEOUT_MS: u64 = 30_000;
 
 fn default_log_level() -> String {
     "info".to_string()
@@ -511,6 +515,11 @@ pub struct NovaRocksConfig {
     #[serde(default)]
     pub server: ServerConfig,
 
+    /// FE-only closed desired-state source selection. It is validated and, for
+    /// StaticFile, fully parsed by deployable-role preflight.
+    #[serde(default)]
+    pub catalog_source: Option<CatalogSourceConfig>,
+
     #[serde(default)]
     pub runtime: RuntimeConfig,
 
@@ -569,7 +578,7 @@ impl NovaRocksConfig {
             );
         }
 
-        let cfg = deserialize_loaded_config(path, document)?;
+        let mut cfg = deserialize_loaded_config(path, document)?;
         cfg.cluster
             .validate()
             .map_err(anyhow::Error::msg)
@@ -580,6 +589,7 @@ impl NovaRocksConfig {
                 path.display()
             );
         }
+        preflight_catalog_source(&mut cfg, path)?;
         Ok(cfg)
     }
 }
@@ -725,6 +735,7 @@ impl Default for NovaRocksConfig {
             sys_log_roll_mode: default_sys_log_roll_mode(),
             sys_log_roll_num: default_sys_log_roll_num(),
             server: ServerConfig::default(),
+            catalog_source: None,
             runtime: RuntimeConfig::default(),
             state_store: None,
             foundationdb_client: None,
@@ -774,6 +785,10 @@ pub struct ServerConfig {
     pub http_port: u16,
     #[serde(default = "default_grpc_port")]
     pub grpc_port: u16,
+    #[serde(default = "default_frontend_drain_timeout_ms")]
+    pub frontend_drain_timeout_ms: u64,
+    #[serde(default = "default_frontend_cleanup_timeout_ms")]
+    pub frontend_cleanup_timeout_ms: u64,
 }
 
 fn default_server_host() -> String {
@@ -785,6 +800,12 @@ fn default_http_port() -> u16 {
 fn default_grpc_port() -> u16 {
     9080
 }
+fn default_frontend_drain_timeout_ms() -> u64 {
+    DEFAULT_FRONTEND_DRAIN_TIMEOUT_MS
+}
+fn default_frontend_cleanup_timeout_ms() -> u64 {
+    DEFAULT_FRONTEND_CLEANUP_TIMEOUT_MS
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -793,6 +814,8 @@ impl Default for ServerConfig {
             priority_networks: String::new(),
             http_port: default_http_port(),
             grpc_port: default_grpc_port(),
+            frontend_drain_timeout_ms: default_frontend_drain_timeout_ms(),
+            frontend_cleanup_timeout_ms: default_frontend_cleanup_timeout_ms(),
         }
     }
 }

@@ -28,7 +28,6 @@ use crate::common::admitted_query_context::{
     RequestAdmission, RequestContext, SessionOptimizerSettings,
 };
 use crate::common::backend_topology::BackendTopologyService;
-use crate::common::query_cancellation::QueryCancellationSource;
 use crate::mv::domain::application::{
     MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine, MvRequestContext,
     MvStatementResult,
@@ -42,6 +41,7 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefresh, PreparedMvRefreshWork,
 };
 use crate::query_execution::service::QueryExecutionService;
+use crate::workload_lifecycle::{FrontendServingLifecycle, FrontendWorkloadKind};
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 
 use super::{
@@ -77,6 +77,7 @@ pub struct FrontendMvService {
     /// carries the value that statement admission would otherwise have to guess.
     optimizer_query_mem_limit_bytes: u64,
     attempt_timeout: Duration,
+    workload_lifecycle: Option<FrontendServingLifecycle>,
 }
 
 impl FrontendMvService {
@@ -94,6 +95,7 @@ impl FrontendMvService {
             topology: None,
             optimizer_query_mem_limit_bytes: 2 * 1024 * 1024 * 1024,
             attempt_timeout: MV_WORKER_ATTEMPT_TIMEOUT,
+            workload_lifecycle: None,
         }
     }
 
@@ -133,7 +135,16 @@ impl FrontendMvService {
             topology: Some(topology),
             optimizer_query_mem_limit_bytes,
             attempt_timeout,
+            workload_lifecycle: None,
         }
+    }
+
+    /// Installs the FE-local owner that admits every effect-capable MV
+    /// background attempt. The application host must install the one shared
+    /// lifecycle before binding the background engine.
+    pub(crate) fn with_workload_lifecycle(mut self, lifecycle: FrontendServingLifecycle) -> Self {
+        self.workload_lifecycle = Some(lifecycle);
+        self
     }
 
     pub(crate) fn background_engine_sink(service: Arc<Self>) -> Arc<dyn MvBackgroundEngineSink> {
@@ -181,6 +192,12 @@ impl FrontendMvService {
                     "frontend table-maintenance service is not installed",
                 )
             })?;
+        let workload_lifecycle = self.workload_lifecycle.clone().ok_or_else(|| {
+            MvBackgroundEngineError::new(
+                MvBackgroundEngineErrorKind::InvariantViolation,
+                "frontend MV background workers require the shared serving lifecycle",
+            )
+        })?;
         let mut guard = self.background.lock().map_err(|error| {
             MvBackgroundEngineError::new(
                 MvBackgroundEngineErrorKind::InvariantViolation,
@@ -205,6 +222,7 @@ impl FrontendMvService {
                 table_maintenance_engine: bindings.table_maintenance_engine,
                 table_maintenance_service,
                 activity_gate: self.activity_gate.clone(),
+                workload_lifecycle,
                 maintenance_wakeup_tx: None,
                 optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
                 attempt_timeout: self.attempt_timeout,
@@ -361,6 +379,7 @@ struct RefreshWorkerDependencies {
     table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
     activity_gate: MvActivityGate,
+    workload_lifecycle: FrontendServingLifecycle,
     maintenance_wakeup_tx: Option<mpsc::SyncSender<()>>,
     optimizer_query_mem_limit_bytes: u64,
     attempt_timeout: Duration,
@@ -393,6 +412,7 @@ impl FrontendMvBackgroundRuntime {
                 table_maintenance_engine: Arc::clone(&dependencies.table_maintenance_engine),
                 table_maintenance_service: Arc::clone(&dependencies.table_maintenance_service),
                 activity_gate: dependencies.activity_gate.clone(),
+                workload_lifecycle: dependencies.workload_lifecycle.clone(),
                 coordinator_config: dependencies.maintenance_config.clone(),
                 attempt_timeout: dependencies.attempt_timeout,
             },
@@ -509,6 +529,18 @@ fn run_scheduled_refreshes(
             scheduler.requeue(request);
             continue;
         }
+        let workload_lease = match dependencies
+            .workload_lifecycle
+            .try_admit(FrontendWorkloadKind::Background)
+        {
+            Ok(lease) => lease,
+            Err(_) => {
+                // Draining is terminal for this process runtime. Preserve the
+                // coalesced request without creating a new refresh attempt.
+                scheduler.requeue(request);
+                break;
+            }
+        };
         let mut ticket = match dependencies.activity_gate.request(
             CanonicalMvTarget::from_mv_target(&request.target),
             MvActivityOwner::ScheduledRefresh,
@@ -525,24 +557,26 @@ fn run_scheduled_refreshes(
             Err(_) => continue,
         };
         if scheduler.mark_started(request.definition.mv_id) {
-            started.push((request, lease));
+            started.push((request, lease, workload_lease));
         } else {
             scheduler.requeue(request);
         }
     }
     std::thread::scope(|scope| {
         let (result_tx, result_rx) = mpsc::channel();
-        for (request, lease) in started {
+        for (request, lease, workload_lease) in started {
             let dependencies = dependencies.clone();
             let result_tx = result_tx.clone();
             scope.spawn(move || {
-                let disposition =
-                    execute_scheduled_refresh(&dependencies, &request, lease.cancellation());
-                let _ = result_tx.send((request, disposition));
+                let cancellation = workload_lease.cancellation_source().view();
+                let disposition = execute_scheduled_refresh(&dependencies, &request, cancellation);
+                // The receiver completes the scheduler's terminal transition
+                // before it releases these attempt leases.
+                let _ = result_tx.send((request, disposition, lease, workload_lease));
             });
         }
         drop(result_tx);
-        for (request, disposition) in result_rx {
+        for (request, disposition, _activity_lease, _workload_lease) in result_rx {
             let completed = matches!(disposition, ScheduledRefreshDisposition::Completed);
             if let Err(error) = scheduler.complete(&request, disposition, now_unix_millis()) {
                 tracing::warn!(mv_id = request.definition.mv_id, error = %error, "persist frontend MV scheduler outcome failed");
@@ -556,9 +590,8 @@ fn run_scheduled_refreshes(
 fn execute_scheduled_refresh(
     dependencies: &RefreshWorkerDependencies,
     request: &ScheduledRefreshRequest,
-    cancellation: Option<crate::common::query_cancellation::QueryCancellationView>,
+    cancellation: crate::common::query_cancellation::QueryCancellationView,
 ) -> ScheduledRefreshDisposition {
-    let cancellation = cancellation.unwrap_or_else(|| QueryCancellationSource::new().view());
     if scheduled_refresh_test_barrier(&request.target, &cancellation) {
         return ScheduledRefreshDisposition::ShutdownCancelled;
     }
@@ -595,6 +628,9 @@ fn execute_scheduled_refresh(
         Ok(context) => context,
         Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error),
     };
+    if cancellation.is_cancelled() {
+        return ScheduledRefreshDisposition::ShutdownCancelled;
+    }
     let steps = match dependencies
         .background_engine
         .resolve_refresh_steps(&request.target)

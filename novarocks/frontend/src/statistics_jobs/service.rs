@@ -30,6 +30,7 @@ use super::worker::{
     StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor,
     StatisticsCollectedAttempt,
 };
+use crate::workload_lifecycle::FrontendServingLifecycle;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalyzeTableStatement {
@@ -373,6 +374,7 @@ pub struct FrontendStatisticsApplicationPort {
     runtime: tokio::runtime::Handle,
     attempt_executor: Mutex<Option<Arc<dyn StatisticsAttemptExecutor>>>,
     worker: Mutex<Option<StatisticsAnalyzeWorker>>,
+    workload_lifecycle: Option<FrontendServingLifecycle>,
 }
 
 impl FrontendStatisticsApplicationPort {
@@ -383,7 +385,14 @@ impl FrontendStatisticsApplicationPort {
             runtime,
             attempt_executor: Mutex::new(None),
             worker: Mutex::new(None),
+            workload_lifecycle: None,
         }
+    }
+
+    /// Installs the shared FE lifecycle before the process-local worker starts.
+    pub(crate) fn with_workload_lifecycle(mut self, lifecycle: FrontendServingLifecycle) -> Self {
+        self.workload_lifecycle = Some(lifecycle);
+        self
     }
 
     pub fn bind_table_statistics_reader(
@@ -424,11 +433,15 @@ impl FrontendStatisticsApplicationPort {
         if executor_slot.is_some() {
             return Err("statistics attempt executor is already bound".to_string());
         }
+        let workload_lifecycle = self.workload_lifecycle.clone().ok_or_else(|| {
+            "statistics worker requires the shared frontend serving lifecycle".to_string()
+        })?;
         let worker = tokio::task::block_in_place(|| {
             self.runtime.block_on(StatisticsAnalyzeWorker::start(
                 &self.runtime,
                 self.service.repository(),
                 Arc::clone(&adapter),
+                workload_lifecycle,
             ))
         })?;
         let mut worker_slot = self

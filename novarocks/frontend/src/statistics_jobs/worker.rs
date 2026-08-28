@@ -31,6 +31,7 @@ use uuid::Uuid;
 use super::application::StatisticsPublicationTerminal;
 use super::model::{StatisticsJob, StatisticsJobError, StatisticsJobErrorKind, StatisticsJobState};
 use super::repository::StatisticsJobRepository;
+use crate::workload_lifecycle::{FrontendServingLifecycle, FrontendWorkloadKind};
 
 pub const STATISTICS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -121,12 +122,14 @@ impl StatisticsAnalyzeWorker {
         runtime: &tokio::runtime::Handle,
         repository: StatisticsJobRepository,
         executor: Arc<dyn StatisticsAttemptExecutor>,
+        workload_lifecycle: FrontendServingLifecycle,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let join = runtime.spawn(run_worker(
             repository.clone(),
             Arc::downgrade(&executor),
             Arc::clone(&stop),
+            workload_lifecycle,
         ));
         Ok(Self {
             repository,
@@ -184,16 +187,22 @@ async fn run_worker(
     repository: StatisticsJobRepository,
     executor: Weak<dyn StatisticsAttemptExecutor>,
     stop: Arc<AtomicBool>,
+    workload_lifecycle: FrontendServingLifecycle,
 ) -> Result<(), String> {
     loop {
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
+        let workload_lease = match workload_lifecycle.try_admit(FrontendWorkloadKind::Background) {
+            Ok(lease) => lease,
+            Err(_) => return Ok(()),
+        };
         let Some(job) = repository
             .claim_next(now_ms())
             .await
             .map_err(|error| error.to_string())?
         else {
+            drop(workload_lease);
             tokio::select! {
                 _ = repository.wait_for_change() => {}
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
@@ -208,6 +217,7 @@ async fn run_worker(
             executor.as_ref(),
             job,
             STATISTICS_ATTEMPT_TIMEOUT,
+            workload_lease.cancellation_source().view(),
         )
         .await?;
     }
@@ -218,9 +228,10 @@ async fn run_attempt(
     executor: &dyn StatisticsAttemptExecutor,
     job: StatisticsJob,
     timeout: Duration,
+    cancellation: crate::common::query_cancellation::QueryCancellationView,
 ) -> Result<(), String> {
     let started = Instant::now();
-    if must_stop(repository, job.job_id, started, timeout).await? {
+    if must_stop(repository, job.job_id, started, timeout, &cancellation).await? {
         return cancel(
             repository,
             job.job_id,
@@ -251,7 +262,7 @@ async fn run_attempt(
             .await;
         }
     };
-    if must_stop(repository, running.job_id, started, timeout).await? {
+    if must_stop(repository, running.job_id, started, timeout, &cancellation).await? {
         return cancel(
             repository,
             running.job_id,
@@ -272,7 +283,7 @@ async fn run_attempt(
             .await;
         }
     };
-    if must_stop(repository, running.job_id, started, timeout).await? {
+    if must_stop(repository, running.job_id, started, timeout, &cancellation).await? {
         return cancel(
             repository,
             running.job_id,
@@ -322,8 +333,9 @@ async fn must_stop(
     job_id: Uuid,
     started: Instant,
     timeout: Duration,
+    cancellation: &crate::common::query_cancellation::QueryCancellationView,
 ) -> Result<bool, String> {
-    if started.elapsed() >= timeout {
+    if cancellation.is_cancelled() || started.elapsed() >= timeout {
         return Ok(true);
     }
     repository
@@ -387,6 +399,66 @@ async fn finish_error(
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use super::{
+        StatisticsAttemptError, StatisticsAttemptExecutor, StatisticsCollectedAttempt, run_worker,
+    };
+    use crate::statistics_jobs::model::StatisticsJob;
+    use crate::statistics_jobs::repository::StatisticsJobRepository;
+    use crate::workload_lifecycle::FrontendServingLifecycle;
+
+    struct NeverRunExecutor;
+
+    impl StatisticsAttemptExecutor for NeverRunExecutor {
+        fn collect(
+            &self,
+            _job: &StatisticsJob,
+        ) -> Result<Box<dyn StatisticsCollectedAttempt>, StatisticsAttemptError> {
+            unreachable!("draining must reject before a statistics attempt starts")
+        }
+
+        fn prepare_publish(
+            &self,
+            _job: &StatisticsJob,
+            _collected: &dyn StatisticsCollectedAttempt,
+        ) -> Result<novarocks_spi::connector::ExternalMutationEvidence, StatisticsAttemptError>
+        {
+            unreachable!("draining must reject before a statistics attempt starts")
+        }
+
+        fn publish(
+            &self,
+            _job: &StatisticsJob,
+            _collected: &dyn StatisticsCollectedAttempt,
+            _evidence: &novarocks_spi::connector::ExternalMutationEvidence,
+        ) -> Result<(), StatisticsAttemptError> {
+            unreachable!("draining must reject before a statistics attempt starts")
+        }
+    }
+
+    #[tokio::test]
+    async fn draining_rejects_the_worker_before_it_can_claim_an_attempt() {
+        let lifecycle = FrontendServingLifecycle::new();
+        lifecycle.mark_ready().expect("mark lifecycle ready");
+        lifecycle.begin_drain(Duration::from_secs(1));
+        let executor: Arc<dyn StatisticsAttemptExecutor> = Arc::new(NeverRunExecutor);
+
+        run_worker(
+            StatisticsJobRepository::new(),
+            Arc::downgrade(&executor),
+            Arc::new(AtomicBool::new(false)),
+            lifecycle,
+        )
+        .await
+        .expect("draining worker exits without claiming a job");
+    }
 }
 
 fn now_ms() -> i64 {

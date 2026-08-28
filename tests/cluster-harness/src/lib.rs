@@ -368,6 +368,15 @@ pub struct CrossProcessRuntime {
     pub fe_mysql_port: u16,
 }
 
+/// Sanitized response captured from the FE management listener during a
+/// lifecycle scenario. The harness exposes it read-only; it has no drain or
+/// administration mutation endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrontendManagementResponse {
+    pub status: u16,
+    pub body: String,
+}
+
 /// Native transport profile owned by the system-test harness.
 ///
 /// The profile selects the server configuration and the companion raw probe
@@ -1700,6 +1709,51 @@ fn scrape_prometheus_metrics(port: u16) -> Result<String> {
     Ok(body.to_string())
 }
 
+fn get_frontend_management(
+    port: u16,
+    path: &str,
+    timeout: Duration,
+) -> Result<FrontendManagementResponse> {
+    if !path.starts_with('/') || path.contains('\r') || path.contains('\n') {
+        bail!("invalid frontend management path {path:?}");
+    }
+    let address = format!("127.0.0.1:{port}");
+    let socket = address
+        .parse()
+        .with_context(|| format!("parse frontend management address {address}"))?;
+    let mut stream = TcpStream::connect_timeout(&socket, timeout)
+        .with_context(|| format!("connect FE management endpoint {address}{path}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("set FE management read timeout")?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .context("set FE management write timeout")?;
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .with_context(|| format!("request FE management endpoint {path}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .with_context(|| format!("read FE management endpoint {path}"))?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .context("malformed FE management HTTP response")?;
+    let status = headers
+        .split_whitespace()
+        .nth(1)
+        .context("missing FE management HTTP status")?
+        .parse::<u16>()
+        .context("parse FE management HTTP status")?;
+    Ok(FrontendManagementResponse {
+        status,
+        body: body.to_string(),
+    })
+}
+
 const FRONTEND_METRIC_FAMILIES: [&str; 14] = [
     "novarocks_fragment_scheduled_total",
     "novarocks_heartbeat_rtt_seconds",
@@ -2212,6 +2266,7 @@ pub fn render_cross_process_config(
 
     if role == ClusterProcessRole::Be {
         root.remove("state_store");
+        root.remove("catalog_source");
     }
 
     toml::to_string(&value).context("serialize cross-process standalone config")
@@ -2219,6 +2274,7 @@ pub fn render_cross_process_config(
 
 struct CrossProcessLaunchConfig<'a> {
     base_config: &'a str,
+    source_config_dir: &'a Path,
     role: ClusterProcessRole,
     be_index: usize,
     runtime: &'a CrossProcessRuntime,
@@ -2232,6 +2288,7 @@ struct CrossProcessLaunchConfig<'a> {
 fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> Result<String> {
     let CrossProcessLaunchConfig {
         base_config,
+        source_config_dir,
         role,
         be_index,
         runtime,
@@ -2251,6 +2308,7 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
     if let Some(overlay) = overlay {
         merge_safe_config_overlay(root, overlay)?;
     }
+    materialize_static_catalog_snapshot(root, runtime_dir, source_config_dir)?;
     native_trust_fixture.apply_config(root);
     let cluster = table_mut(root, "cluster");
     cluster.insert(
@@ -2327,6 +2385,47 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
         );
     }
     toml::to_string(&value).context("serialize cross-process launch config")
+}
+
+/// Copy a caller-owned static snapshot into the per-launch runtime directory.
+///
+/// The generated FE config then uses a relative path, so Server resolves it
+/// against that isolated config directory instead of the caller's CWD. Dynamic
+/// source mode retains its StateStore path owned below by the harness.
+fn materialize_static_catalog_snapshot(
+    root: &mut toml::map::Map<String, Value>,
+    runtime_dir: &Path,
+    source_config_dir: &Path,
+) -> Result<()> {
+    let Some(source) = root.get_mut("catalog_source").and_then(Value::as_table_mut) else {
+        return Ok(());
+    };
+    if source.get("mode").and_then(Value::as_str) != Some("static-file") {
+        return Ok(());
+    }
+    let configured_path = source
+        .get("static_file_path")
+        .and_then(Value::as_str)
+        .context("static-file catalog source requires static_file_path")?;
+    let configured_path = Path::new(configured_path);
+    let source_path = if configured_path.is_absolute() {
+        configured_path.to_path_buf()
+    } else {
+        source_config_dir.join(configured_path)
+    };
+    let target_path = runtime_dir.join("catalogs.toml");
+    fs::copy(&source_path, &target_path).with_context(|| {
+        format!(
+            "copy static catalog snapshot {} into isolated runtime directory {}",
+            source_path.display(),
+            runtime_dir.display()
+        )
+    })?;
+    source.insert(
+        "static_file_path".to_string(),
+        Value::String("catalogs.toml".to_string()),
+    );
+    Ok(())
 }
 
 struct QueryLifecycleFaultFiles {
@@ -2785,6 +2884,7 @@ impl CrossProcessServerHandle {
         let render = |role: ClusterProcessRole, be_index: usize| -> Result<String> {
             render_cross_process_launch_config(CrossProcessLaunchConfig {
                 base_config: &base_config,
+                source_config_dir: base_config_path.parent().unwrap_or_else(|| Path::new(".")),
                 role,
                 be_index,
                 runtime: &runtime,
@@ -3035,6 +3135,33 @@ impl CrossProcessServerHandle {
     /// MySQL user parsed from the supplied base config.
     pub fn mysql_user(&self) -> &str {
         &self.mysql_user
+    }
+
+    /// Begins the real FE SIGTERM drain without waiting for process exit, so a
+    /// system scenario can inspect management/readiness during the drain.
+    #[cfg(unix)]
+    pub fn begin_fe_drain(&mut self) -> Result<()> {
+        self.fe_process
+            .request_termination()
+            .context("send SIGTERM to cross-process FE")
+    }
+
+    /// Waits for a prior `begin_fe_drain` request to finish successfully.
+    #[cfg(unix)]
+    pub fn wait_fe_exit_until(&mut self, deadline: Instant) -> Result<()> {
+        self.fe_process
+            .wait_for_successful_exit_until(deadline)
+            .context("wait for cross-process FE graceful exit")
+            .map(|_| ())
+    }
+
+    /// Reads one FE management endpoint with a caller-owned deadline.
+    pub fn frontend_management_get(
+        &self,
+        path: &str,
+        timeout: Duration,
+    ) -> Result<FrontendManagementResponse> {
+        get_frontend_management(self.runtime.fe_http_port, path, timeout)
     }
 
     /// Keep generated config and logs when the handle is dropped.
@@ -4213,9 +4340,21 @@ fn merge_safe_config_overlay(
     let overlay = overlay
         .as_table()
         .context("cross-process config overlay root must be a TOML table")?;
-    for key in ["server", "cluster", "state_store"] {
+    for key in ["cluster", "state_store"] {
         if overlay.contains_key(key) {
             bail!("cross-process config overlay cannot modify [{key}]");
+        }
+    }
+    if let Some(server) = overlay.get("server").and_then(Value::as_table) {
+        for key in server.keys() {
+            if !matches!(
+                key.as_str(),
+                "frontend_drain_timeout_ms" | "frontend_cleanup_timeout_ms"
+            ) {
+                bail!(
+                    "cross-process config overlay cannot modify server.{key}; only frontend drain budgets are scenario-safe"
+                );
+            }
         }
     }
     if overlay
@@ -5271,6 +5410,9 @@ cluster_id = "novarocks-sql-test-cross-process"
 path = "tmp/novarocks-sql-test-state-store.sqlite"
 deployment_owner = "fe-1"
 
+[catalog_source]
+mode = "dynamic-state-store"
+
 [standalone_server]
 mysql_port = 9030
 user = "root"
@@ -5315,6 +5457,10 @@ enable_path_style_access = true
         assert_eq!(fe_value["standalone_server"]["user"].as_str(), Some("root"));
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
         assert_eq!(
+            fe_value["catalog_source"]["mode"].as_str(),
+            Some("dynamic-state-store")
+        );
+        assert_eq!(
             fe_value["cluster"]["heartbeat_interval_ms"].as_integer(),
             Some(500)
         );
@@ -5327,6 +5473,10 @@ enable_path_style_access = true
         assert!(
             be_value.get("state_store").is_none(),
             "BE rendering must not own frontend StateStore"
+        );
+        assert!(
+            be_value.get("catalog_source").is_none(),
+            "BE rendering must not retain the FE catalog source"
         );
         assert!(
             be_value.get("metadata").is_none(),
@@ -5414,6 +5564,7 @@ enable_path_style_access = true
 
         let be = render_cross_process_launch_config(CrossProcessLaunchConfig {
             base_config: BASE_CONFIG,
+            source_config_dir: Path::new("/tmp"),
             role: ClusterProcessRole::Be,
             be_index: 0,
             runtime: &runtime,
@@ -5493,6 +5644,7 @@ enable_path_style_access = true
 
         let first = render_cross_process_launch_config(CrossProcessLaunchConfig {
             base_config: BASE_CONFIG,
+            source_config_dir: Path::new("/tmp"),
             role: ClusterProcessRole::Fe,
             be_index: 0,
             runtime: &runtime,
@@ -5507,6 +5659,7 @@ enable_path_style_access = true
         .unwrap();
         let second = render_cross_process_launch_config(CrossProcessLaunchConfig {
             base_config: BASE_CONFIG,
+            source_config_dir: Path::new("/tmp"),
             role: ClusterProcessRole::Fe,
             be_index: 0,
             runtime: &runtime,
@@ -5543,6 +5696,57 @@ enable_path_style_access = true
             "ordinary cross-process config must not render debug knobs"
         );
     }
+
+    #[test]
+    fn static_catalog_snapshot_is_copied_to_the_isolated_fe_runtime() {
+        let runtime = make_runtime_1be();
+        let root = std::env::temp_dir().join(format!(
+            "novarocks-static-catalog-render-{}",
+            next_fragment_failure_token(99)
+        ));
+        let source = root.join("source");
+        let output = root.join("runtime");
+        fs::create_dir_all(&source).expect("create static source directory");
+        fs::create_dir_all(&output).expect("create isolated runtime directory");
+        let snapshot = source.join("catalogs.toml");
+        fs::write(&snapshot, "format_version = 1\ncatalogs = []\n").expect("write static snapshot");
+        let base_config = r#"
+[state_store]
+provider = "sqlite"
+path = "frontend-state.sqlite"
+cluster_id = "static-harness"
+deployment_owner = "fe-1"
+
+[catalog_source]
+mode = "static-file"
+static_file_path = "catalogs.toml"
+"#;
+        let native_trust_fixture = rendered_native_trust_fixture();
+        let rendered = render_cross_process_launch_config(CrossProcessLaunchConfig {
+            base_config,
+            source_config_dir: &source,
+            role: ClusterProcessRole::Fe,
+            be_index: 0,
+            runtime: &runtime,
+            runtime_dir: &output,
+            query_lifecycle_faults_enabled: false,
+            cleanup_faults_enabled: false,
+            overlay: None,
+            native_trust_fixture: &native_trust_fixture,
+        })
+        .expect("render static FE config");
+        let rendered: Value = rendered.parse().expect("parse static FE config");
+        assert_eq!(
+            rendered["catalog_source"]["static_file_path"].as_str(),
+            Some("catalogs.toml")
+        );
+        assert_eq!(
+            fs::read_to_string(output.join("catalogs.toml")).expect("read copied snapshot"),
+            "format_version = 1\ncatalogs = []\n"
+        );
+        fs::remove_dir_all(&root).expect("remove static catalog render root");
+    }
+
     #[test]
     fn render_cross_process_config_empty_base_patches_fe_heartbeat_only() {
         let runtime = make_runtime_1be();
@@ -5928,6 +6132,16 @@ enable_path_style_access = true
         );
         assert_eq!(root["runtime"]["exchange_wait_ms"].as_integer(), Some(42));
         assert!(merge_safe_config_overlay(root, "[cluster]\nrole = 'be'\n").is_err());
+        assert!(merge_safe_config_overlay(root, "[server]\ngrpc_port = 1\n").is_err());
+        merge_safe_config_overlay(
+            root,
+            "[server]\nfrontend_drain_timeout_ms = 500\nfrontend_cleanup_timeout_ms = 2000\n",
+        )
+        .expect("merge scenario-safe frontend drain budgets");
+        assert_eq!(
+            root["server"]["frontend_drain_timeout_ms"].as_integer(),
+            Some(500)
+        );
         assert!(merge_safe_config_overlay(root, "[standalone_server]\nmysql_port = 1\n").is_err());
     }
 

@@ -9,6 +9,13 @@ use std::time::{Duration, Instant};
 pub trait Scenario: Send + Sync {
     fn name(&self) -> &'static str;
 
+    /// External-fixture scenarios remain discoverable and runnable by exact
+    /// selector, but do not turn the normal no-Docker system baseline into a
+    /// Docker requirement.
+    fn is_explicit_stage(&self) -> bool {
+        false
+    }
+
     fn child_environment(&self) -> CrossProcessChildEnvironment {
         CrossProcessChildEnvironment::default()
     }
@@ -36,6 +43,10 @@ pub struct ScenarioContext {
     scenario_root: PathBuf,
     deadline: Instant,
     actions: Vec<String>,
+    binary: PathBuf,
+    base_config_path: PathBuf,
+    cluster_size: usize,
+    startup_timeout: Duration,
 }
 
 impl ScenarioContext {
@@ -44,6 +55,9 @@ impl ScenarioContext {
         handle: CrossProcessServerHandle,
         scenario_root: PathBuf,
         timeout: Duration,
+        binary: PathBuf,
+        base_config_path: PathBuf,
+        cluster_size: usize,
     ) -> Self {
         Self {
             name,
@@ -51,6 +65,10 @@ impl ScenarioContext {
             scenario_root,
             deadline: Instant::now() + timeout,
             actions: Vec::new(),
+            binary,
+            base_config_path,
+            cluster_size,
+            startup_timeout: timeout,
         }
     }
 
@@ -108,5 +126,28 @@ impl ScenarioContext {
 
     pub fn shutdown(&mut self) -> Result<()> {
         ServerHandle::shutdown(&mut self.handle)
+    }
+
+    /// Launch a peer native cluster for a focused multi-cluster scenario.
+    /// The peer shares the runner binary and base configuration, while the
+    /// caller owns an isolated runtime directory and its explicit overlay.
+    pub fn launch_peer_cluster(
+        &self,
+        name: &str,
+        launch_config: ScenarioLaunchConfig,
+    ) -> Result<CrossProcessServerHandle> {
+        let runtime_root = self.scenario_root.join(name);
+        CrossProcessServerHandle::launch(novarocks_cluster_harness::CrossProcessClusterOptions {
+            binary: self.binary.clone(),
+            base_config_path: self.base_config_path.clone(),
+            runtime_root,
+            cluster_size: self.cluster_size,
+            query_lifecycle_faults_enabled: true,
+            cleanup_faults_enabled: true,
+            startup_timeout: self.startup_timeout,
+            child_environment: launch_config.child_environment,
+            config_overlay: launch_config.config_overlay,
+            native_trust_fixture: launch_config.native_trust_fixture,
+        })
     }
 }

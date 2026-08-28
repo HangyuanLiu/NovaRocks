@@ -50,6 +50,7 @@ pub mod table_maintenance;
 mod topology;
 mod user_variable;
 pub mod view;
+pub mod workload_lifecycle;
 
 pub use application::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
@@ -90,3 +91,9 @@ pub use statistics::FrontendStatisticsService;
 pub use system_catalog::SystemCatalogService;
 pub use topology::ClusterBackendOpenConfig;
 pub use view::FrontendViewService;
+pub use workload_lifecycle::{
+    FrontendAdmissionError, FrontendCatalogCounts, FrontendCatalogSnapshotIdentity,
+    FrontendCatalogSourceMode, FrontendServingLifecycle, FrontendServingSnapshot,
+    FrontendServingSnapshotReader, FrontendServingState, FrontendWorkloadKind,
+    FrontendWorkloadLease, LateBoundFrontendServingSnapshotReader,
+};

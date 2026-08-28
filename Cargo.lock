@@ -3343,6 +3343,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "tonic-build",
  "tower 0.5.2",

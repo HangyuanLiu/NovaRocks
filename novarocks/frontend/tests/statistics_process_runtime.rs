@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use novarocks_frontend::FrontendServingLifecycle;
 use novarocks_frontend::statistics_jobs::application::StatisticsColumnIntent;
 use novarocks_frontend::statistics_jobs::model::{
     StatisticsJob, StatisticsJobCreate, StatisticsJobErrorKind, StatisticsJobState,
@@ -194,10 +195,13 @@ async fn commit_unknown_is_terminal_and_never_dispatches_another_mutation() {
     let executor = Arc::new(CommitUnknownExecutor {
         publishes: AtomicUsize::new(0),
     });
+    let lifecycle = FrontendServingLifecycle::new();
+    lifecycle.mark_ready().expect("mark frontend ready");
     let mut worker = StatisticsAnalyzeWorker::start(
         &tokio::runtime::Handle::current(),
         repository.clone(),
         executor.clone(),
+        lifecycle,
     )
     .await
     .unwrap();

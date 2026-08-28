@@ -31,7 +31,7 @@ use crate::common::admitted_query_context::{
 };
 use crate::common::backend_topology::BackendTopologyService;
 use crate::common::engine_error::EngineError;
-use crate::common::query_cancellation::QueryCancellationReason;
+use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
 use crate::mv::command::MvCommandExecutor;
 use crate::query_execution::backend_command::BackendCommandExecutor;
 use crate::query_execution::control::{
@@ -74,6 +74,9 @@ use crate::dml::DmlService;
 use crate::query::compiler::{FrontendQueryCompiler, FrontendQueryCompilerError};
 use crate::statistics::command::StatisticsCommandExecutor;
 use crate::view::command::ViewCommandExecutor;
+use crate::workload_lifecycle::{
+    FrontendAdmissionError, FrontendServingLifecycle, FrontendWorkloadKind, FrontendWorkloadLease,
+};
 
 pub(crate) mod compiler;
 
@@ -496,6 +499,7 @@ pub struct FrontendQueryService {
     /// whenever the session did not set one itself.
     optimizer_query_mem_limit_bytes: u64,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
+    serving_lifecycle: FrontendServingLifecycle,
 }
 
 impl FrontendQueryService {
@@ -553,7 +557,20 @@ impl FrontendQueryService {
             truncate_engine,
             optimizer_query_mem_limit_bytes,
             lake_publication_runtime_policy,
+            // A deployable FE must install its shared lifecycle before
+            // opening MySQL. Keep an omitted install fail-closed rather than
+            // silently creating a second ready admission authority.
+            serving_lifecycle: FrontendServingLifecycle::new(),
         }
+    }
+
+    /// Installs the process-wide serving owner composed by the FE server.
+    ///
+    /// The constructor is intentionally fail-closed; deployable composition
+    /// must install its shared lifecycle before opening the MySQL listener.
+    pub(crate) fn with_serving_lifecycle(mut self, lifecycle: FrontendServingLifecycle) -> Self {
+        self.serving_lifecycle = lifecycle;
+        self
     }
 }
 
@@ -562,12 +579,13 @@ impl QuerySessionFactory for FrontendQueryService {
         &self,
         request: QuerySessionOpenRequest,
     ) -> Result<Arc<dyn QuerySession>, QueryServiceError> {
+        let query_control = self.query_control.clone();
+        let identity =
+            SessionIdentity::new(request.connection_token(), request.principal().to_string());
         let lease = self
-            .query_control
-            .register_session(SessionIdentity::new(
-                request.connection_token(),
-                request.principal().to_string(),
-            ))
+            .serving_lifecycle
+            .register_session(|| query_control.register_session(identity))
+            .map_err(query_service_admission_error)?
             .map_err(|error| {
                 QueryServiceError::new(
                     QueryServiceErrorKind::Internal,
@@ -577,12 +595,29 @@ impl QuerySessionFactory for FrontendQueryService {
         Ok(Arc::new(FrontendQuerySession {
             service: self.clone(),
             lease: Mutex::new(Some(lease)),
+            active_statements: Mutex::new(Vec::new()),
             state: Mutex::new(FrontendSessionState::default()),
         }))
     }
 
     fn cancel_all(&self, reason: QueryCancellationReason) {
         self.query_control.cancel_all(reason);
+    }
+}
+
+fn query_service_admission_error(error: FrontendAdmissionError) -> QueryServiceError {
+    match error {
+        FrontendAdmissionError::Draining => QueryServiceError::frontend_draining(),
+        FrontendAdmissionError::NotReady { .. } | FrontendAdmissionError::Stopping => {
+            QueryServiceError::new(
+                QueryServiceErrorKind::Unavailable,
+                "frontend is not ready for workload admission",
+            )
+        }
+        FrontendAdmissionError::SessionRequiresRegistration => QueryServiceError::new(
+            QueryServiceErrorKind::Internal,
+            "session admission must use lifecycle registration",
+        ),
     }
 }
 
@@ -610,6 +645,7 @@ impl Default for FrontendSessionState {
 struct FrontendQuerySession {
     service: FrontendQueryService,
     lease: Mutex<Option<QuerySessionLease>>,
+    active_statements: Mutex<Vec<FrontendWorkloadLease>>,
     state: Mutex<FrontendSessionState>,
 }
 
@@ -636,7 +672,9 @@ impl FrontendQuerySession {
     async fn execute_statement(
         &self,
         statement: &str,
+        admission: FrontendWorkloadLease,
     ) -> Result<StatementResult, QueryServiceError> {
+        let cancellation = admission.cancellation_source();
         let trimmed = strip_leading_line_comments(statement.trim().trim_end_matches(';').trim());
         if trimmed.is_empty() {
             return Ok(StatementResult::Ok);
@@ -652,14 +690,29 @@ impl FrontendQuerySession {
                 "command admission requires exactly one statement",
             ));
         };
-        match parsed_statement {
+        let result = match parsed_statement {
             ParsedStatement::Session(statement) => {
-                self.execute_session_statement(trimmed, statement).await
-            }
-            statement => {
-                self.execute_typed_statement(trimmed.to_string(), statement.clone())
+                self.execute_session_statement(trimmed, statement, cancellation)
                     .await
             }
+            statement => {
+                self.execute_typed_statement(trimmed.to_string(), statement.clone(), cancellation)
+                    .await
+            }
+        };
+        if matches!(&result, Ok(StatementResult::Query(_))) {
+            let mut active_statements = self.active_statements.lock().map_err(poisoned_state)?;
+            // A QueryResult is consumed by the MySQL protocol after this
+            // method returns. Retain the admission through that write so an
+            // FE drain observes streaming work and can cancel it at deadline.
+            active_statements.push(admission);
+        }
+        result
+    }
+
+    fn complete_active_statement(&self) {
+        if let Ok(mut active_statements) = self.active_statements.lock() {
+            active_statements.clear();
         }
     }
 
@@ -667,6 +720,7 @@ impl FrontendQuerySession {
         &self,
         source: &str,
         statement: &ast::SessionStatement,
+        cancellation: QueryCancellationSource,
     ) -> Result<StatementResult, QueryServiceError> {
         match statement {
             ast::SessionStatement::Set(statement) => {
@@ -674,7 +728,7 @@ impl FrontendQuerySession {
                     self.admit_session_set_assignment(source, assignment)?;
                 }
                 for assignment in &statement.assignments {
-                    self.apply_session_set_assignment(source, assignment)
+                    self.apply_session_set_assignment(source, assignment, cancellation.clone())
                         .await?;
                 }
                 Ok(StatementResult::Ok)
@@ -730,6 +784,7 @@ impl FrontendQuerySession {
         &self,
         source: &str,
         assignment: &ast::SetAssignment,
+        cancellation: QueryCancellationSource,
     ) -> Result<(), QueryServiceError> {
         match &assignment.target {
             ast::SetTarget::UserVariable(variable) => {
@@ -739,7 +794,7 @@ impl FrontendQuerySession {
                         let statement = ParsedStatement::Query((**query).clone());
                         let query_source = print_statement(&statement);
                         match self
-                            .execute_typed_statement(query_source, statement)
+                            .execute_typed_statement(query_source, statement, cancellation)
                             .await?
                         {
                             StatementResult::Query(result) => {
@@ -942,6 +997,7 @@ impl FrontendQuerySession {
         &self,
         sql: String,
         parsed_statement: ParsedStatement,
+        cancellation_source: QueryCancellationSource,
     ) -> Result<StatementResult, QueryServiceError> {
         let state = self.state.lock().map_err(poisoned_state)?.clone();
         let assignments = state
@@ -955,7 +1011,7 @@ impl FrontendQuerySession {
         let mut active = self
             .service
             .query_control
-            .begin_statement(token)
+            .begin_statement_with_cancellation(token, cancellation_source)
             .map_err(|error| {
                 QueryServiceError::new(
                     QueryServiceErrorKind::Internal,
@@ -1173,9 +1229,23 @@ impl FrontendQuerySession {
                 }
             }
         } else {
-            worker
-                .await
-                .map_err(|error| internal_error(error.to_string()))?
+            // A drain cancellation is injected through the same statement
+            // source as ordinary query control. Some blocking execution paths
+            // only observe it at their next cooperative boundary, so the
+            // protocol owner must not wait indefinitely before returning the
+            // first-wins typed cancellation to its already-admitted client.
+            loop {
+                tokio::select! {
+                    result = &mut worker => break result.map_err(|error| internal_error(error.to_string()))?,
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if cancellation.is_cancelled() {
+                            return Err(cancellation_error(
+                                cancellation.reason().expect("cancelled statement has a reason"),
+                            ));
+                        }
+                    }
+                }
+            }
         };
         let (result, completion) = result;
         match completion {
@@ -1407,14 +1477,30 @@ impl QuerySession for FrontendQuerySession {
     }
 
     async fn execute_batch(&self, sql: &str) -> Result<StatementResult, QueryServiceError> {
-        let statements = split_sql_statements(sql)?;
         // Match the standalone MySQL session contract: a batch returns its
         // most recent result set even when subsequent DDL/session statements
         // complete successfully. In particular, all-in-one routes through
         // this frontend session before reaching the Stage/Start lifecycle.
         let mut last_query_result = None;
-        for statement in statements {
-            match self.execute_statement(&statement).await? {
+        let mut cursor = SqlBatchCursor::new(sql);
+        while cursor.has_remaining() {
+            // The lifecycle lease intentionally precedes fragment scanning and
+            // parsing. This makes the admission latch the linearization point
+            // even for malformed SQL and for later batch fragments.
+            let admission = self
+                .service
+                .serving_lifecycle
+                .try_admit(FrontendWorkloadKind::Statement)
+                .map_err(query_service_admission_error)?;
+            let Some(statement) = cursor.next_fragment()? else {
+                break;
+            };
+            // Empty/comment-only fragments release their just-acquired lease
+            // before any session mutation or execution starts.
+            if strip_leading_line_comments(statement.trim()).is_empty() {
+                continue;
+            }
+            match self.execute_statement(statement, admission).await? {
                 StatementResult::Query(result) => last_query_result = Some(result),
                 StatementResult::Ok => {}
             }
@@ -1422,6 +1508,10 @@ impl QuerySession for FrontendQuerySession {
         Ok(last_query_result
             .map(StatementResult::Query)
             .unwrap_or(StatementResult::Ok))
+    }
+
+    fn complete_statement(&self) {
+        self.complete_active_statement();
     }
 
     fn cancel_current(&self, reason: QueryCancellationReason) {
@@ -1440,6 +1530,7 @@ impl QuerySession for FrontendQuerySession {
 
     fn close(&self) {
         self.cancel_current(QueryCancellationReason::ClientDisconnected);
+        self.complete_active_statement();
         if let Ok(mut lease) = self.lease.lock() {
             lease.take();
         }
@@ -1650,70 +1741,99 @@ fn resolve_database_context(
     }
 }
 
-fn split_sql_statements(sql: &str) -> Result<Vec<String>, QueryServiceError> {
-    #[derive(Clone, Copy)]
-    enum State {
-        Normal,
-        SingleQuote,
-        DoubleQuote,
-        Backtick,
-        LineComment,
-        BlockComment,
+struct SqlBatchCursor<'a> {
+    sql: &'a str,
+    offset: usize,
+}
+
+impl<'a> SqlBatchCursor<'a> {
+    fn new(sql: &'a str) -> Self {
+        Self { sql, offset: 0 }
     }
 
-    let mut statements = Vec::new();
-    let mut start = 0;
-    let bytes = sql.as_bytes();
-    let mut index = 0;
-    let mut state = State::Normal;
-    while index < bytes.len() {
-        match state {
-            State::Normal => match bytes[index] {
-                b'\'' => state = State::SingleQuote,
-                b'"' => state = State::DoubleQuote,
-                b'`' => state = State::Backtick,
-                b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                    state = State::LineComment;
-                    index += 1;
-                }
-                b'#' => state = State::LineComment,
-                b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                    state = State::BlockComment;
-                    index += 1;
-                }
-                b';' => {
-                    let statement = sql[start..index].trim();
-                    if !statement.is_empty() {
-                        statements.push(statement.to_string());
+    fn has_remaining(&self) -> bool {
+        self.offset < self.sql.len()
+    }
+
+    /// Returns one raw semicolon-delimited fragment. The cursor never scans a
+    /// later fragment, so draining between statements does not parse or admit
+    /// work that has not crossed the lifecycle gate yet.
+    fn next_fragment(&mut self) -> Result<Option<&'a str>, QueryServiceError> {
+        if !self.has_remaining() {
+            return Ok(None);
+        }
+        #[derive(Clone, Copy)]
+        enum State {
+            Normal,
+            SingleQuote,
+            DoubleQuote,
+            Backtick,
+            LineComment,
+            BlockComment,
+        }
+
+        let start = self.offset;
+        let bytes = self.sql.as_bytes();
+        let mut index = start;
+        let mut state = State::Normal;
+        while index < bytes.len() {
+            match state {
+                State::Normal => match bytes[index] {
+                    b'\'' => state = State::SingleQuote,
+                    b'"' => state = State::DoubleQuote,
+                    b'`' => state = State::Backtick,
+                    b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                        state = State::LineComment;
+                        index += 1;
                     }
-                    start = index + 1;
+                    b'#' => state = State::LineComment,
+                    b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                        state = State::BlockComment;
+                        index += 1;
+                    }
+                    b';' => {
+                        self.offset = index + 1;
+                        return Ok(Some(&self.sql[start..index]));
+                    }
+                    _ => {}
+                },
+                State::SingleQuote if bytes[index] == b'\'' => state = State::Normal,
+                State::DoubleQuote if bytes[index] == b'"' => state = State::Normal,
+                State::Backtick if bytes[index] == b'`' => state = State::Normal,
+                State::LineComment if bytes[index] == b'\n' => state = State::Normal,
+                State::BlockComment
+                    if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') =>
+                {
+                    state = State::Normal;
+                    index += 1;
                 }
                 _ => {}
-            },
-            State::SingleQuote if bytes[index] == b'\'' => state = State::Normal,
-            State::DoubleQuote if bytes[index] == b'"' => state = State::Normal,
-            State::Backtick if bytes[index] == b'`' => state = State::Normal,
-            State::LineComment if bytes[index] == b'\n' => state = State::Normal,
-            State::BlockComment if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') => {
-                state = State::Normal;
-                index += 1;
             }
-            _ => {}
+            index += 1;
         }
-        index += 1;
+        if matches!(
+            state,
+            State::SingleQuote | State::DoubleQuote | State::Backtick
+        ) {
+            self.offset = self.sql.len();
+            return Err(QueryServiceError::new(
+                QueryServiceErrorKind::Parse,
+                "unterminated quoted string in SQL batch",
+            ));
+        }
+        self.offset = self.sql.len();
+        Ok(Some(&self.sql[start..]))
     }
-    if matches!(
-        state,
-        State::SingleQuote | State::DoubleQuote | State::Backtick
-    ) {
-        return Err(QueryServiceError::new(
-            QueryServiceErrorKind::Parse,
-            "unterminated quoted string in SQL batch",
-        ));
-    }
-    let statement = sql[start..].trim();
-    if !statement.is_empty() {
-        statements.push(statement.to_string());
+}
+
+fn split_sql_statements(sql: &str) -> Result<Vec<String>, QueryServiceError> {
+    let mut cursor = SqlBatchCursor::new(sql);
+    let mut statements = Vec::new();
+    while let Some(fragment) = cursor.next_fragment()? {
+        let statement = fragment.trim();
+        if !statement.is_empty() {
+            statements.push(statement.to_string());
+        }
     }
     Ok(statements)
 }
@@ -1950,6 +2070,12 @@ fn cancellation_error(reason: QueryCancellationReason) -> QueryServiceError {
         QueryCancellationReason::DeadlineExceeded { timeout_ms } => (
             QueryServiceErrorKind::Timeout,
             format!("query timed out after {timeout_ms} ms"),
+        ),
+        QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms } => (
+            QueryServiceErrorKind::Interrupted,
+            format!(
+                "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded after {timeout_ms} ms"
+            ),
         ),
         QueryCancellationReason::ExplicitKill { .. } => (
             QueryServiceErrorKind::Interrupted,
@@ -2701,6 +2827,30 @@ mod tests {
             .kind(),
             QueryServiceErrorKind::Interrupted
         );
+    }
+
+    #[test]
+    fn draining_admission_uses_the_fixed_retryable_error() {
+        let error = query_service_admission_error(FrontendAdmissionError::Draining);
+        assert_eq!(error.kind(), QueryServiceErrorKind::FrontendDraining);
+        assert_eq!(
+            error.message(),
+            QueryServiceError::FRONTEND_DRAINING_MESSAGE
+        );
+    }
+
+    #[test]
+    fn batch_cursor_does_not_scan_later_fragments_before_their_turn() {
+        let mut cursor = SqlBatchCursor::new("SELECT 1; SELECT 'unterminated");
+        assert_eq!(
+            cursor.next_fragment().expect("first fragment"),
+            Some("SELECT 1")
+        );
+        assert!(cursor.has_remaining());
+        let error = cursor
+            .next_fragment()
+            .expect_err("later malformed fragment remains deferred");
+        assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
     }
 
     #[test]

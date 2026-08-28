@@ -30,7 +30,11 @@ fn select<'a>(
     only: &[String],
 ) -> Result<Vec<&'a dyn Scenario>> {
     if only.is_empty() {
-        return Ok(scenarios.iter().map(|scenario| scenario.as_ref()).collect());
+        return Ok(scenarios
+            .iter()
+            .filter(|scenario| !scenario.is_explicit_stage())
+            .map(|scenario| scenario.as_ref())
+            .collect());
     }
     let mut selected = Vec::with_capacity(only.len());
     for requested in only {
@@ -64,7 +68,15 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         native_trust_fixture: launch_config.native_trust_fixture,
     })
     .with_context(|| format!("launch system scenario {}", scenario.name()))?;
-    let mut context = ScenarioContext::new(scenario.name(), handle, scenario_root, config.timeout);
+    let mut context = ScenarioContext::new(
+        scenario.name(),
+        handle,
+        scenario_root,
+        config.timeout,
+        config.binary.clone(),
+        config.base_config_path.clone(),
+        config.cluster_size,
+    );
     context.action("cluster launched and topology barrier passed");
     let result = scenario.run(&mut context);
     if let Err(error) = &result {
@@ -112,5 +124,23 @@ mod tests {
     #[test]
     fn empty_registry_rejects_unknown_selector() {
         assert!(select(&[], &["missing".to_string()]).is_err());
+    }
+
+    #[test]
+    fn default_selection_excludes_external_fixture_scenarios() {
+        let scenarios = crate::scenarios::all();
+        let selected = select(&scenarios, &[]).expect("select default system baseline");
+        assert!(selected.iter().all(|scenario| {
+            scenario.name() != "frontend-lifecycle/blue-green-session-cutover"
+        }));
+        assert!(
+            select(
+                &scenarios,
+                &["frontend-lifecycle/blue-green-session-cutover".to_string()]
+            )
+            .expect("select explicit blue/green scenario")
+            .iter()
+            .any(|scenario| scenario.name() == "frontend-lifecycle/blue-green-session-cutover")
+        );
     }
 }

@@ -27,9 +27,11 @@ use novarocks_native_trust::NativeTrust;
 use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
 
-use crate::catalog_application::FrontendCatalogApplicationPort;
 use crate::catalog_application::desired_state::{
     CatalogDesiredStateSource, CatalogDesiredStateSourceMode,
+};
+use crate::catalog_application::{
+    CatalogDesiredStateSnapshot, CatalogDesiredStateSourceInput, FrontendCatalogApplicationPort,
 };
 use crate::catalog_attachment::CatalogAttachmentRepository;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
@@ -53,6 +55,10 @@ use crate::statistics_jobs::service::{
 use crate::table_maintenance::FrontendTableMaintenanceService;
 use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
 use crate::view::FrontendViewService;
+use crate::workload_lifecycle::{
+    FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,
+    FrontendServingLifecycle,
+};
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -137,6 +143,7 @@ pub struct FrontendApplicationHost {
     typed_connector_control:
         Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>,
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
+    serving_lifecycle: Arc<FrontendServingLifecycle>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
     dml_service: Option<Arc<DmlService>>,
     statistics_application_service: Option<Arc<StatisticsApplicationService>>,
@@ -215,12 +222,13 @@ pub struct FrontendExecutionConfig {
     query_control_timeouts: FrontendQueryControlTimeouts,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     catalog_projection: CatalogProjectionConfig,
-    /// The deployment's catalog desired-state source mode, selected once.
+    /// The deployment's catalog desired-state authority, selected and validated
+    /// once before this application opens any runtime resource.
     ///
     /// Frozen here rather than consulted per statement so that "which authority
     /// owns catalog desired state" cannot change while the process runs, and so
     /// an unimplemented mode is rejected before startup opens anything.
-    catalog_desired_state_source_mode: CatalogDesiredStateSourceMode,
+    catalog_desired_state_source: CatalogDesiredStateSourceInput,
 }
 
 impl FrontendExecutionConfig {
@@ -246,7 +254,12 @@ impl FrontendExecutionConfig {
             )
             .expect("default lake publication policy is safe"),
             catalog_projection: CatalogProjectionConfig::default(),
-            catalog_desired_state_source_mode: CatalogDesiredStateSourceMode::DynamicStateStore,
+            // This constructor remains an in-process test convenience. Server
+            // composition always replaces it with its preflighted closed input.
+            catalog_desired_state_source: CatalogDesiredStateSourceInput::StaticFile(
+                CatalogDesiredStateSnapshot::try_new(CatalogDesiredStateSourceMode::StaticFile, [])
+                    .expect("an empty static catalog snapshot is valid"),
+            ),
         }
     }
 
@@ -298,21 +311,17 @@ impl FrontendExecutionConfig {
         self
     }
 
-    /// Selects the deployment's catalog desired-state source mode.
-    ///
-    /// Only [`CatalogDesiredStateSourceMode::DynamicStateStore`] is implemented;
-    /// selecting another mode makes `open` fail before it produces any startup
-    /// side effect.
-    pub fn with_catalog_desired_state_source_mode(
+    /// Supplies the already preflighted, closed desired-state source input.
+    pub fn with_catalog_desired_state_source(
         mut self,
-        mode: CatalogDesiredStateSourceMode,
+        source: CatalogDesiredStateSourceInput,
     ) -> Self {
-        self.catalog_desired_state_source_mode = mode;
+        self.catalog_desired_state_source = source;
         self
     }
 
-    pub const fn catalog_desired_state_source_mode(&self) -> CatalogDesiredStateSourceMode {
-        self.catalog_desired_state_source_mode
+    pub const fn catalog_desired_state_source(&self) -> &CatalogDesiredStateSourceInput {
+        &self.catalog_desired_state_source
     }
 }
 
@@ -388,7 +397,8 @@ impl FrontendApplicationHost {
         // mean either a partially opened frontend to clean up or — worse — a
         // path that quietly serves an unimplemented mode from the dynamic
         // StateStore authority.
-        let catalog_source_mode = execution.catalog_desired_state_source_mode();
+        let catalog_source_input = execution.catalog_desired_state_source().clone();
+        let catalog_source_mode = catalog_source_input.mode();
         if let Err(error) = catalog_source_mode.require_implemented() {
             return Err(FrontendApplicationError::new(
                 FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
@@ -413,6 +423,7 @@ impl FrontendApplicationHost {
             ),
             typed_connector_control,
             catalog_runtime_projection,
+            serving_lifecycle: Arc::new(FrontendServingLifecycle::new()),
             statistics_service: None,
             dml_service: None,
             statistics_application_service: None,
@@ -444,46 +455,55 @@ impl FrontendApplicationHost {
         {
             return Err(host.cleanup_open_error(error).await);
         }
-        host.catalog_application_port = match host.state_store() {
-            Some(store) => {
-                let attachments = match CatalogAttachmentRepository::open(store).await {
-                    Ok(repository) => repository,
-                    Err(error) => {
-                        return Err(host
-                            .cleanup_open_error(FrontendApplicationError::new(
-                                FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
-                                error,
-                            ))
-                            .await);
-                    }
-                };
-                match CatalogDesiredStateSource::select(catalog_source_mode, Some(attachments)) {
-                    Ok(source) => Some(Arc::new(FrontendCatalogApplicationPort::new(
-                        source,
-                        Arc::clone(&host.connector_control),
-                        host.catalog_runtime_projection.publisher(),
-                        tokio::runtime::Handle::current(),
-                    ))),
-                    Err(error) => {
-                        return Err(host
-                            .cleanup_open_error(FrontendApplicationError::new(
-                                FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
-                                error,
-                            ))
-                            .await);
-                    }
+        let attachments = if catalog_source_mode == CatalogDesiredStateSourceMode::DynamicStateStore
+        {
+            let store = match host.state_store() {
+                Some(store) => store,
+                None => {
+                    return Err(host
+                        .cleanup_open_error(FrontendApplicationError::new(
+                            FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
+                            "the dynamic StateStore catalog source requires a configured Frontend StateStore",
+                        ))
+                        .await);
+                }
+            };
+            match CatalogAttachmentRepository::open(store).await {
+                Ok(repository) => Some(repository),
+                Err(error) => {
+                    return Err(host
+                        .cleanup_open_error(FrontendApplicationError::new(
+                            FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
+                            error,
+                        ))
+                        .await);
                 }
             }
-            // No StateStore means no desired-state source at all in this
-            // process, which is distinct from a configured source that is
-            // failing: the port admits nothing rather than reporting an outage.
-            None => Some(Arc::new(FrontendCatalogApplicationPort::unavailable(
-                Arc::clone(&host.connector_control),
-                host.catalog_runtime_projection.publisher(),
-                tokio::runtime::Handle::current(),
-            ))),
+        } else {
+            None
         };
-        if let Some(store) = host.state_store() {
+        let catalog_source =
+            match CatalogDesiredStateSource::from_input(catalog_source_input, attachments) {
+                Ok(source) => source,
+                Err(error) => {
+                    return Err(host
+                        .cleanup_open_error(FrontendApplicationError::new(
+                            FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
+                            error,
+                        ))
+                        .await);
+                }
+            };
+        host.catalog_application_port = Some(Arc::new(FrontendCatalogApplicationPort::new(
+            catalog_source,
+            Arc::clone(&host.connector_control),
+            host.catalog_runtime_projection.publisher(),
+            tokio::runtime::Handle::current(),
+        )));
+        if catalog_source_mode == CatalogDesiredStateSourceMode::DynamicStateStore {
+            let store = host
+                .state_store()
+                .expect("dynamic catalog source required a StateStore above");
             let controller = match FrontendCatalogController::new(
                 store,
                 Arc::clone(
@@ -511,6 +531,21 @@ impl FrontendApplicationHost {
                     ))
                     .await);
             }
+            let counts = host
+                .catalog_application_port
+                .as_ref()
+                .expect("catalog application port is installed")
+                .projection_counts();
+            host.serving_lifecycle.publish_catalog_bootstrap(
+                FrontendCatalogSourceMode::DynamicStateStore,
+                true,
+                None,
+                FrontendCatalogCounts {
+                    desired: counts.ready + counts.unavailable,
+                    ready: counts.ready,
+                    unavailable: counts.unavailable,
+                },
+            );
             if let Err(error) = controller.start() {
                 return Err(host
                     .cleanup_open_error(FrontendApplicationError::new(
@@ -520,6 +555,46 @@ impl FrontendApplicationHost {
                     .await);
             }
             host.catalog_controller = Some(controller);
+        } else if catalog_source_mode == CatalogDesiredStateSourceMode::StaticFile {
+            let projection = Arc::clone(
+                host.catalog_application_port
+                    .as_ref()
+                    .expect("catalog application port is installed"),
+            );
+            match projection
+                .reconcile_snapshot_with_page_size(
+                    execution.catalog_projection.page_size,
+                    execution.catalog_projection.worker_count,
+                )
+                .await
+            {
+                Ok((snapshot, counts)) => {
+                    host.serving_lifecycle.publish_catalog_bootstrap(
+                        FrontendCatalogSourceMode::StaticFile,
+                        true,
+                        Some(
+                            FrontendCatalogSnapshotIdentity::try_new(
+                                snapshot.identity().catalog_count(),
+                                snapshot.identity().short_digest(),
+                            )
+                            .expect("catalog snapshot identity has a fixed short digest"),
+                        ),
+                        FrontendCatalogCounts {
+                            desired: snapshot.identity().catalog_count(),
+                            ready: counts.ready,
+                            unavailable: counts.unavailable,
+                        },
+                    );
+                }
+                Err(error) => {
+                    return Err(host
+                        .cleanup_open_error(FrontendApplicationError::new(
+                            FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
+                            error,
+                        ))
+                        .await);
+                }
+            }
         }
         match ClusterBackendService::open(backend, tokio::runtime::Handle::current(), data_runtime)
             .await
@@ -546,7 +621,9 @@ impl FrontendApplicationHost {
         )
         .await
         .map(|service| {
-            service.with_lake_publication_runtime_policy(host.lake_publication_runtime_policy())
+            service
+                .with_lake_publication_runtime_policy(host.lake_publication_runtime_policy())
+                .with_workload_lifecycle((*host.serving_lifecycle()).clone())
         });
         match table_maintenance_open {
             Ok(service) => host.table_maintenance_service = Some(Arc::new(service)),
@@ -575,20 +652,23 @@ impl FrontendApplicationHost {
                             repository;
                         let provider_activation =
                             Arc::new(FrontendMvRefreshProviderActivationPort::new());
-                        let service = Arc::new(FrontendMvService::with_refresh_dependencies(
-                            Arc::clone(&repository),
-                            host.query_execution_service(),
-                            Arc::clone(&host.connector_control)
-                                as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
-                            Arc::clone(&provider_activation),
-                            host.execution_role,
-                            host.backend_topology_port(),
-                            execution.mv_scheduler.clone(),
-                            execution.mv_maintenance.clone(),
-                            host.table_maintenance_service(),
-                            host.optimizer_query_mem_limit_bytes,
-                            Duration::from_secs(30 * 60),
-                        ));
+                        let service = Arc::new(
+                            FrontendMvService::with_refresh_dependencies(
+                                Arc::clone(&repository),
+                                host.query_execution_service(),
+                                Arc::clone(&host.connector_control)
+                                    as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+                                Arc::clone(&provider_activation),
+                                host.execution_role,
+                                host.backend_topology_port(),
+                                execution.mv_scheduler.clone(),
+                                execution.mv_maintenance.clone(),
+                                host.table_maintenance_service(),
+                                host.optimizer_query_mem_limit_bytes,
+                                Duration::from_secs(30 * 60),
+                            )
+                            .with_workload_lifecycle((*host.serving_lifecycle()).clone()),
+                        );
                         let application_service: Arc<
                             dyn crate::mv::domain::application::MvApplicationService,
                         > = Arc::clone(&service)
@@ -629,7 +709,8 @@ impl FrontendApplicationHost {
         let statistics_application_port = Ok(FrontendStatisticsApplicationPort::new(
             host.statistics_application_service().as_ref().clone(),
             tokio::runtime::Handle::current(),
-        ));
+        )
+        .with_workload_lifecycle((*host.serving_lifecycle()).clone()));
         match statistics_application_port {
             Ok(port) => host.statistics_application_port = Some(Arc::new(port)),
             Err(error) => return Err(host.cleanup_open_error(error).await),
@@ -698,6 +779,12 @@ impl FrontendApplicationHost {
         &self,
     ) -> Arc<crate::catalog_application::CatalogRuntimeProjection> {
         Arc::clone(&self.catalog_runtime_projection)
+    }
+
+    /// FE-local serving lifecycle shared by SQL and background admission
+    /// owners. Server orchestration alone owns its Ready/Draining transitions.
+    pub fn serving_lifecycle(&self) -> Arc<FrontendServingLifecycle> {
+        Arc::clone(&self.serving_lifecycle)
     }
 
     pub fn table_maintenance_service(&self) -> Arc<dyn TableMaintenanceService> {
@@ -904,9 +991,22 @@ impl FrontendApplicationHost {
     }
 
     pub async fn shutdown(mut self) -> Result<(), FrontendApplicationError> {
-        self.release_resources().await.map_err(|error| {
-            FrontendApplicationError::new(FrontendApplicationErrorKind::Shutdown, error)
-        })
+        self.shutdown_until(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    /// Releases FE-owned resources under one absolute deadline. Individual
+    /// cleanup owners must not start a fresh full timeout after another owner
+    /// has already consumed the shutdown budget.
+    pub async fn shutdown_until(
+        mut self,
+        deadline: Instant,
+    ) -> Result<(), FrontendApplicationError> {
+        self.release_resources_until(deadline)
+            .await
+            .map_err(|error| {
+                FrontendApplicationError::new(FrontendApplicationErrorKind::Shutdown, error)
+            })
     }
 
     async fn open_configured(
@@ -953,13 +1053,16 @@ impl FrontendApplicationHost {
         &mut self,
         primary: FrontendApplicationError,
     ) -> FrontendApplicationError {
-        match self.release_resources().await {
+        match self
+            .release_resources_until(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
+            .await
+        {
             Ok(()) => primary,
             Err(cleanup_error) => primary.with_cleanup_context(cleanup_error),
         }
     }
 
-    async fn release_resources(&mut self) -> Result<(), String> {
+    async fn release_resources_until(&mut self, deadline: Instant) -> Result<(), String> {
         // The worker owns durable attempt activity and must stop before the
         // coordinator/topology/StateStore it depends on are released.
         let mv_worker_error = self
@@ -1015,7 +1118,24 @@ impl FrontendApplicationHost {
         self.statistics_application_port.take();
         self.statistics_application_service.take();
         let catalog_controller_error = match self.catalog_controller.take() {
-            Some(controller) => controller.shutdown().await.err(),
+            Some(controller) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    Some(
+                        "frontend cleanup deadline elapsed before catalog controller shutdown"
+                            .to_string(),
+                    )
+                } else {
+                    tokio::time::timeout(remaining, controller.shutdown())
+                        .await
+                        .map_err(|_| {
+                            "frontend cleanup deadline elapsed shutting down catalog controller"
+                                .to_string()
+                        })
+                        .and_then(|result| result)
+                        .err()
+                }
+            }
             None => None,
         };
         self.catalog_application_port.take();
@@ -1034,10 +1154,7 @@ impl FrontendApplicationHost {
             }
         }
         if let Some(host) = self.state_store_host.as_mut() {
-            if let Err(error) = host
-                .shutdown(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
-                .await
-            {
+            if let Err(error) = host.shutdown(deadline).await {
                 let host_error = format!("shutdown frontend StateStore host failed: {error}");
                 if let Some(primary) = primary_error.as_mut() {
                     primary.push_str(&format!("; cleanup failed: {host_error}"));

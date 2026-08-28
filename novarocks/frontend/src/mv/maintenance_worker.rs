@@ -34,7 +34,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::background::{MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind};
-use crate::common::query_cancellation::QueryCancellationSource;
 use crate::maintenance::MaintenanceTarget;
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::readiness::MvReadinessPort;
@@ -43,6 +42,7 @@ use crate::query_execution::maintenance::{
     AutomaticMaintenanceContext, MaintenanceActionOutcome, MaintenanceActionRequest,
     OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
 };
+use crate::workload_lifecycle::{FrontendServingLifecycle, FrontendWorkloadKind};
 
 use super::activity::{CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityOwner};
 use super::maintenance::{
@@ -59,6 +59,7 @@ pub(crate) struct FrontendMaintenanceWorkerDependencies {
     pub(crate) table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     pub(crate) table_maintenance_service: Arc<dyn TableMaintenanceService>,
     pub(crate) activity_gate: MvActivityGate,
+    pub(crate) workload_lifecycle: FrontendServingLifecycle,
     pub(crate) coordinator_config: MaintenanceCoordinatorConfig,
     pub(crate) attempt_timeout: Duration,
 }
@@ -244,6 +245,22 @@ impl FrontendMaintenanceWorker {
             }
         };
 
+        let workload_lease = match self
+            .dependencies
+            .workload_lifecycle
+            .try_admit(FrontendWorkloadKind::Background)
+        {
+            Ok(lease) => lease,
+            Err(_) => {
+                pass.lock()
+                    .expect("frontend MV maintenance pass lock poisoned")
+                    .skipped
+                    .push(FrontendMaintenanceSkip::Stopping {
+                        mv_id: definition.mv_id,
+                    });
+                return;
+            }
+        };
         let mut ticket = match self.dependencies.activity_gate.request(
             CanonicalMvTarget::from_parts(Some(&target.catalog), &target.namespace, &target.table),
             MvActivityOwner::AutomaticMaintenance,
@@ -319,9 +336,7 @@ impl FrontendMaintenanceWorker {
             engine: Arc::clone(&self.dependencies.table_maintenance_engine),
             service: Arc::clone(&self.dependencies.table_maintenance_service),
             context: AutomaticMaintenanceContext::with_deadline(
-                lease
-                    .cancellation()
-                    .unwrap_or_else(|| QueryCancellationSource::new().view()),
+                workload_lease.cancellation_source().view(),
                 Instant::now() + self.dependencies.attempt_timeout,
             ),
         };
@@ -334,6 +349,7 @@ impl FrontendMaintenanceWorker {
         // terminal transition have completed.  Its Drop wakes the next FIFO
         // request for this MV target.
         let _lease = lease;
+        let _workload_lease = workload_lease;
         pass.lock()
             .expect("frontend MV maintenance pass lock poisoned")
             .attempts
