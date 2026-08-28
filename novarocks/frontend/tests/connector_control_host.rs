@@ -600,6 +600,60 @@ fn mutation_lease_fences_retirement_and_missing_capability_is_unsupported() {
 }
 
 #[test]
+fn exact_mutation_lease_never_uses_a_replacement_runtime() {
+    let host = ConnectorControlHost::new();
+    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+    let old_key = ConnectorExecutionBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+    };
+    let old_binding = binding_with_mutation(7);
+    let old_control_runtime_id = old_binding.control_runtime_id();
+    host.register(old_binding)
+        .expect("register old mutation generation");
+    let planning = host.acquire_current(&instance_id).expect("planning lease");
+    host.retire_current(&instance_id)
+        .expect("retire old generation");
+
+    let replacement_binding = binding_with_mutation(8);
+    let replacement_control_runtime_id = replacement_binding.control_runtime_id();
+    host.register(replacement_binding)
+        .expect("register replacement generation");
+    let replacement = host
+        .acquire_current_mutation(&instance_id)
+        .expect("replacement mutation lease");
+    assert_eq!(
+        replacement.control_runtime_id(),
+        replacement_control_runtime_id
+    );
+
+    let exact_old = host
+        .acquire_exact_mutation(old_control_runtime_id)
+        .expect("exact retiring mutation lease");
+    assert_eq!(exact_old.control_runtime_id(), old_control_runtime_id);
+
+    let error = match host.acquire_exact_mutation(ConnectorControlRuntimeId::from_bytes([9; 16])) {
+        Ok(_) => panic!("unknown control runtime must not use the replacement"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+
+    drop(planning);
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    drop(exact_old);
+    let ready = host.take_ready_retires().expect("retire queue");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].key, old_key);
+
+    let error = match host.acquire_exact_mutation(old_control_runtime_id) {
+        Ok(_) => panic!("retired control runtime must not be recreated"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    drop(replacement);
+}
+
+#[test]
 fn data_mutation_lease_requires_the_capability_and_fences_retirement() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");

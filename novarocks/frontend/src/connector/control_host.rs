@@ -337,9 +337,9 @@ impl ConnectorControlHost {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
-        let (descriptor, incarnation, mutation, key) = {
-            let mut state = self.lock_state()?;
-            let key = state.active.get(instance_id).cloned().ok_or_else(|| {
+        let control_runtime_id = {
+            let state = self.lock_state()?;
+            state.active.get(instance_id).copied().ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     format!(
@@ -347,14 +347,28 @@ impl ConnectorControlHost {
                         instance_id.as_str()
                     ),
                 )
-            })?;
-            let generation = state.generations.get_mut(&key).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "active connector control generation is missing",
-                )
-            })?;
-            if generation.state != ControlGenerationState::Active {
+            })?
+        };
+        self.acquire_exact_mutation(control_runtime_id, true)
+    }
+
+    fn acquire_exact_mutation(
+        &self,
+        control_runtime_id: ConnectorControlRuntimeId,
+        require_active: bool,
+    ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
+        let (descriptor, provider_incarnation, mutation) = {
+            let mut state = self.lock_state()?;
+            let generation = state
+                .generations
+                .get_mut(&control_runtime_id)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "connector control runtime is not registered",
+                    )
+                })?;
+            if require_active && generation.state != ControlGenerationState::Active {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Unavailable,
                     "connector control generation is retiring",
@@ -371,13 +385,16 @@ impl ConnectorControlHost {
                 generation.binding.descriptor().clone(),
                 generation.binding.incarnation(),
                 mutation,
-                key,
             )
         };
         let state = Arc::downgrade(&self.state);
-        ConnectorCatalogMutationLease::new(descriptor, incarnation, mutation, move || {
-            release_lease(&state, key, LeaseKind::Mutation);
-        })
+        ConnectorCatalogMutationLease::new(
+            descriptor,
+            control_runtime_id,
+            provider_incarnation,
+            mutation,
+            move || release_lease(&state, control_runtime_id, LeaseKind::Mutation),
+        )
     }
 
     fn acquire_current_data_mutation(
@@ -907,6 +924,13 @@ impl ConnectorCatalogMutationResolver for ConnectorControlHost {
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
         self.acquire_mutation(instance_id)
+    }
+
+    fn acquire_exact_mutation(
+        &self,
+        control_runtime_id: ConnectorControlRuntimeId,
+    ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
+        Self::acquire_exact_mutation(self, control_runtime_id, false)
     }
 }
 

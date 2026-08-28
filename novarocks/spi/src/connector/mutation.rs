@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ConnectorCommittedPartitioning, ConnectorError, ConnectorErrorKind,
+    ConnectorCommittedPartitioning, ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorInstanceIncarnation, ConnectorNamespaceIdentity, ConnectorRequestContext,
     ConnectorTableIdentity, ConnectorTableObjectId,
@@ -1067,12 +1067,18 @@ pub trait ConnectorCatalogMutationResolver: Send + Sync {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorCatalogMutationLease, ConnectorError>;
+
+    fn acquire_exact_mutation(
+        &self,
+        control_runtime_id: ConnectorControlRuntimeId,
+    ) -> Result<ConnectorCatalogMutationLease, ConnectorError>;
 }
 
 #[derive(Clone)]
 pub struct ConnectorCatalogMutationLease {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    control_runtime_id: ConnectorControlRuntimeId,
+    provider_incarnation: ConnectorInstanceIncarnation,
     mutation: Arc<dyn ConnectorCatalogMutation>,
     _release: Arc<MutationLeaseRelease>,
 }
@@ -1084,11 +1090,12 @@ struct MutationLeaseRelease {
 impl ConnectorCatalogMutationLease {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        control_runtime_id: ConnectorControlRuntimeId,
+        provider_incarnation: ConnectorInstanceIncarnation,
         mutation: Arc<dyn ConnectorCatalogMutation>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
-        if mutation.descriptor() != &descriptor || mutation.incarnation() != incarnation {
+        if mutation.descriptor() != &descriptor || mutation.incarnation() != provider_incarnation {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector mutation capability does not match its lease generation",
@@ -1096,7 +1103,8 @@ impl ConnectorCatalogMutationLease {
         }
         Ok(Self {
             descriptor,
-            incarnation,
+            control_runtime_id,
+            provider_incarnation,
             mutation,
             _release: Arc::new(MutationLeaseRelease {
                 release: Mutex::new(Some(Box::new(release))),
@@ -1107,8 +1115,28 @@ impl ConnectorCatalogMutationLease {
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
-        self.incarnation
+    pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
+        self.control_runtime_id
+    }
+
+    /// Builds a provider request behind an FE-owned control-runtime lease.
+    /// Provider incarnation remains internal to retain legacy external
+    /// evidence validation without exposing it to FE application callers.
+    pub fn execute_operation(
+        &self,
+        operation_id: ConnectorMutationOperationId,
+        operation: ConnectorCatalogMutationOperation,
+        context: ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
+        self.execute(ConnectorCatalogMutationRequest {
+            operation_id,
+            target: ConnectorExecutionBindingKey {
+                instance_id: self.descriptor.instance_id.clone(),
+                incarnation: self.provider_incarnation,
+            },
+            operation,
+            context,
+        })
     }
 
     pub fn execute(
@@ -1138,7 +1166,7 @@ impl ConnectorCatalogMutationLease {
         request: &ConnectorCatalogMutationRequest,
     ) -> Result<(), ConnectorError> {
         if request.target.instance_id != self.descriptor.instance_id
-            || request.target.incarnation != self.incarnation
+            || request.target.incarnation != self.provider_incarnation
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -1150,7 +1178,9 @@ impl ConnectorCatalogMutationLease {
     }
 
     fn validate_evidence(&self, evidence: &ExternalMutationEvidence) -> Result<(), ConnectorError> {
-        if evidence.descriptor() != &self.descriptor || evidence.incarnation() != self.incarnation {
+        if evidence.descriptor() != &self.descriptor
+            || evidence.incarnation() != self.provider_incarnation
+        {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "external mutation evidence does not match its lease generation",
@@ -1168,7 +1198,7 @@ impl ConnectorCatalogMutationLease {
         match outcome {
             ExternalMutationOutcome::KnownCommitted { receipt, .. } => {
                 if receipt.descriptor() != &self.descriptor
-                    || receipt.incarnation() != self.incarnation
+                    || receipt.incarnation() != self.provider_incarnation
                     || receipt.operation_id() != operation_id
                     || receipt.operation_kind() != operation_kind
                 {

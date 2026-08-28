@@ -974,11 +974,16 @@ impl ConnectorControlPlanningLease {
             )
         })?;
         let descriptor = self.binding.descriptor().clone();
-        let incarnation = self.binding.incarnation();
+        let control_runtime_id = self.binding.control_runtime_id();
+        let provider_incarnation = self.binding.incarnation();
         let retained_planning_lease = self.clone();
-        super::ConnectorCatalogMutationLease::new(descriptor, incarnation, mutation, move || {
-            drop(retained_planning_lease)
-        })
+        super::ConnectorCatalogMutationLease::new(
+            descriptor,
+            control_runtime_id,
+            provider_incarnation,
+            mutation,
+            move || drop(retained_planning_lease),
+        )
     }
 
     /// Derive the exact-generation atomic staged-publication capability.

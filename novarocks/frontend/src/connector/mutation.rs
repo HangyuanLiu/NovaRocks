@@ -19,8 +19,7 @@
 
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorCatalogMutationReceipt,
-    ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
-    ConnectorCatalogMutationResolver, ConnectorError, ConnectorExecutionBindingKey,
+    ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationResolver, ConnectorError,
     ConnectorInstanceId, ConnectorMutationFailure, ConnectorMutationOperationId,
     ConnectorRequestContext, ExternalMutationEffect, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome,
@@ -134,16 +133,7 @@ pub fn resolve_catalog_mutation_with_lease(
     operation: ConnectorCatalogMutationOperation,
     context: ConnectorRequestContext,
 ) -> ResolvedCatalogMutation {
-    let request = ConnectorCatalogMutationRequest {
-        operation_id,
-        target: ConnectorExecutionBindingKey {
-            instance_id: lease.descriptor().instance_id.clone(),
-            incarnation: lease.incarnation(),
-        },
-        operation,
-        context: context.clone(),
-    };
-    let outcome = match lease.execute(request) {
+    let outcome = match lease.execute_operation(operation_id, operation, context.clone()) {
         Ok(outcome) => outcome,
         Err(error) => {
             return ResolvedCatalogMutation::ContractFailure {
@@ -167,16 +157,7 @@ pub fn dispatch_catalog_mutation_once_with_lease(
     operation: ConnectorCatalogMutationOperation,
     context: ConnectorRequestContext,
 ) -> ResolvedCatalogMutation {
-    let request = ConnectorCatalogMutationRequest {
-        operation_id,
-        target: ConnectorExecutionBindingKey {
-            instance_id: lease.descriptor().instance_id.clone(),
-            incarnation: lease.incarnation(),
-        },
-        operation,
-        context,
-    };
-    match lease.execute(request) {
+    match lease.execute_operation(operation_id, operation, context) {
         Ok(ExternalMutationOutcome::KnownCommitted {
             effect,
             receipt,
@@ -246,11 +227,11 @@ mod tests {
     use novarocks_spi::connector::{
         ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
         ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
-        ConnectorCatalogMutationResolver, ConnectorError, ConnectorInstanceDescriptor,
-        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMutationFailure,
-        ConnectorMutationFailureKind, ConnectorProviderId, ConnectorRequestContext, CreatePolicy,
-        ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-        ExternalMutationOutcome,
+        ConnectorCatalogMutationResolver, ConnectorControlRuntimeId, ConnectorError,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorProviderId,
+        ConnectorRequestContext, CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence,
+        ExternalMutationFinalization, ExternalMutationOutcome,
     };
 
     use super::*;
@@ -322,10 +303,19 @@ mod tests {
         {
             novarocks_spi::connector::ConnectorCatalogMutationLease::new(
                 self.0.descriptor.clone(),
+                ConnectorControlRuntimeId::from_bytes([1; 16]),
                 self.0.incarnation,
                 self.0.clone(),
                 || {},
             )
+        }
+
+        fn acquire_exact_mutation(
+            &self,
+            _control_runtime_id: ConnectorControlRuntimeId,
+        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError>
+        {
+            unreachable!()
         }
     }
 
@@ -340,6 +330,14 @@ mod tests {
                 novarocks_spi::connector::ConnectorErrorKind::Unsupported,
                 "mutation capability is unavailable",
             ))
+        }
+
+        fn acquire_exact_mutation(
+            &self,
+            _control_runtime_id: ConnectorControlRuntimeId,
+        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError>
+        {
+            unreachable!()
         }
     }
 
@@ -383,10 +381,19 @@ mod tests {
         {
             novarocks_spi::connector::ConnectorCatalogMutationLease::new(
                 self.0.descriptor.clone(),
+                ConnectorControlRuntimeId::from_bytes([2; 16]),
                 self.0.incarnation,
                 self.0.clone(),
                 || {},
             )
+        }
+
+        fn acquire_exact_mutation(
+            &self,
+            _control_runtime_id: ConnectorControlRuntimeId,
+        ) -> Result<novarocks_spi::connector::ConnectorCatalogMutationLease, ConnectorError>
+        {
+            unreachable!()
         }
     }
 

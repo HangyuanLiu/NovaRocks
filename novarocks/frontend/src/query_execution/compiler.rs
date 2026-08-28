@@ -384,6 +384,47 @@ impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnecto
         })?;
         novarocks_spi::connector::ConnectorCatalogMutationLease::new(
             binding.descriptor().clone(),
+            binding.control_runtime_id(),
+            binding.incarnation(),
+            mutation,
+            || {},
+        )
+    }
+
+    fn acquire_exact_mutation(
+        &self,
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorCatalogMutationLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .values()
+            .find(|binding| binding.control_runtime_id() == control_runtime_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    "exact connector control runtime is unavailable",
+                )
+            })?;
+        let mutation = binding.mutation().cloned().ok_or_else(|| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "test connector control binding has no mutation capability",
+            )
+        })?;
+        novarocks_spi::connector::ConnectorCatalogMutationLease::new(
+            binding.descriptor().clone(),
+            binding.control_runtime_id(),
             binding.incarnation(),
             mutation,
             || {},
