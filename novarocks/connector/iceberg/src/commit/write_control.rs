@@ -3897,15 +3897,16 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
-        CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorInstanceId,
-        ConnectorManagedDescriptorProperties, ConnectorManagedPublicationIntent,
-        ConnectorManagedPublicationTarget, ConnectorPreReadyWritePlanningRequest,
-        ConnectorProviderId, ConnectorSealedWriteCohortSet, ConnectorStagedPublicationBaseFact,
-        ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorTableHandle,
-        ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion, ConnectorWriteCohortCompletion,
-        ConnectorWriteCohortDescriptor, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
-        ConnectorWriteIntent, ConnectorWriteOperationCompletion, ConnectorWritePreparation,
-        ConnectorWriteTargetRef, ConnectorWriterIdentity, ConnectorWriterTerminalState,
+        CONNECTOR_WRITE_CONTRACT_VERSION, CatalogHandle, CatalogVersion, ConnectorCancellation,
+        ConnectorInstanceId, ConnectorManagedDescriptorProperties,
+        ConnectorManagedPublicationIntent, ConnectorManagedPublicationTarget,
+        ConnectorPreReadyWritePlanningRequest, ConnectorProviderId, ConnectorSealedWriteCohortSet,
+        ConnectorStagedPublicationBaseFact, ConnectorStagedReport, ConnectorStagedReportSummary,
+        ConnectorTableHandle, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
+        ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteFieldBinding,
+        ConnectorWriteFieldToken, ConnectorWriteIntent, ConnectorWriteOperationCompletion,
+        ConnectorWritePreparation, ConnectorWriteTargetRef, ConnectorWriterIdentity,
+        ConnectorWriterTerminalState,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -3938,6 +3939,13 @@ mod tests {
             4 * 1024 * 1024,
         )
         .expect("context")
+    }
+
+    fn catalog_handle(owner: &ConnectorExecutionBindingKey) -> CatalogHandle {
+        CatalogHandle::new(
+            owner.instance_id.clone(),
+            CatalogVersion::from_bytes([1; 32]),
+        )
     }
 
     fn control() -> (tokio::runtime::Runtime, IcebergWriteControl) {
@@ -4320,6 +4328,7 @@ mod tests {
             5,
             6,
             0,
+            catalog_handle(&owner),
             owner.clone(),
         );
         let request = ConnectorWritePlanningRequest {
@@ -4382,6 +4391,7 @@ mod tests {
                 fragment_id,
                 backend_num,
                 0,
+                catalog_handle(&owner),
                 owner.clone(),
             )
         };
@@ -4420,6 +4430,7 @@ mod tests {
             5,
             6,
             0,
+            catalog_handle(&owner),
             owner.clone(),
         );
         let planning = ConnectorWritePlanningRequest {
@@ -4851,6 +4862,7 @@ mod tests {
             1,
             1,
             0,
+            catalog_handle(&owner),
             owner.clone(),
         );
         let planning = ConnectorWritePlanningRequest {
@@ -5169,6 +5181,7 @@ mod tests {
             1,
             2,
             0,
+            catalog_handle(&owner),
             owner.clone(),
         );
         let planning = ConnectorWritePlanningRequest {

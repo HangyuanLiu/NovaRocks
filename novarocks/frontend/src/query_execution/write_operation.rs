@@ -161,6 +161,18 @@ impl ConnectorWriteOperationSession {
         &self.inner.owner
     }
 
+    pub fn catalog_handle(
+        &self,
+    ) -> Result<novarocks_spi::connector::CatalogHandle, ConnectorError> {
+        self.inner
+            .lease
+            .catalog_properties()
+            .map(|properties| properties.handle().clone())
+            .ok_or_else(|| {
+                invalid("connector write operation has no immutable catalog runtime identity")
+            })
+    }
+
     pub fn sealed(&self) -> &ConnectorSealedWriteCohortSet {
         &self.inner.sealed
     }

@@ -326,6 +326,11 @@ fn patch_native_connector_write_sink_in_place(
                                 .incarnation
                                 .to_bytes()
                                 .to_vec(),
+                            catalog_handle: Some(
+                                novarocks_proto_codec::catalog::encode_catalog_handle(
+                                    writer.catalog_handle(),
+                                ),
+                            ),
                         }),
                         payload: handle.payload().to_vec(),
                         payload_sha256: handle.payload_digest().to_vec(),

@@ -32,21 +32,21 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::{
-    ConnectorDistributedRewrite, ConnectorDistributedRewriteAttemptCheckpoint,
-    ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewriteCohortPlan,
-    ConnectorDistributedRewriteOperation, ConnectorDistributedRewritePlan,
-    ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
-    ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorFrozenRewriteGroup,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorPinnedFileSet, ConnectorRequestContext, ConnectorRewriteCohortRead,
-    ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorTableHandle,
-    ConnectorWriteActivation, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
-    ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
-    ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
-    ConnectorWritePreparation, ConnectorWriteReceipt, ConnectorWriteTargetRef,
-    ConnectorWriterIdentity, ConnectorWriterTerminalState, REWRITE_DATA_FILES_KIND,
-    REWRITE_POSITION_DELETES_KIND,
+    CatalogHandle, CatalogVersion, ConnectorDistributedRewrite,
+    ConnectorDistributedRewriteAttemptCheckpoint, ConnectorDistributedRewriteAttemptDisposition,
+    ConnectorDistributedRewriteCohortPlan, ConnectorDistributedRewriteOperation,
+    ConnectorDistributedRewritePlan, ConnectorDistributedRewritePlanSummary,
+    ConnectorDistributedRewritePlanningRequest, ConnectorDistributedRewriteReceipt,
+    ConnectorDistributedRewriteReceiptSummary, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorFrozenRewriteGroup, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorPinnedFileSet,
+    ConnectorRequestContext, ConnectorRewriteCohortRead, ConnectorStagedReport,
+    ConnectorStagedReportSummary, ConnectorTableHandle, ConnectorWriteActivation,
+    ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion, ConnectorWriteCohortId,
+    ConnectorWriteControl, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+    ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWritePreparation,
+    ConnectorWriteReceipt, ConnectorWriteTargetRef, ConnectorWriterIdentity,
+    ConnectorWriterTerminalState, REWRITE_DATA_FILES_KIND, REWRITE_POSITION_DELETES_KIND,
 };
 
 use crate::commit::write_control::{
@@ -61,7 +61,7 @@ use crate::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
 };
 
-pub(crate) const ARTIFACT_VERSION: u16 = 1;
+pub(crate) const ARTIFACT_VERSION: u16 = 2;
 pub(crate) const GROUP_PAYLOAD_VERSION: u16 = 1;
 pub(crate) const REWRITE_ARTIFACT_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const REWRITE_ARTIFACT_MAX_GROUPS: usize = 4096;
@@ -1669,7 +1669,18 @@ fn put_writer(out: &mut Vec<u8>, writer: &ConnectorWriterIdentity) -> Result<(),
     out.extend_from_slice(&writer.fragment_id().to_be_bytes());
     out.extend_from_slice(&writer.backend_num().to_be_bytes());
     put_u32(out, writer.sink_ordinal());
+    put_catalog_handle(out, writer.catalog_handle())?;
     put_binding_key(out, writer.binding_key())
+}
+
+fn put_catalog_handle(out: &mut Vec<u8>, handle: &CatalogHandle) -> Result<(), ConnectorError> {
+    let name = handle.catalog_name().as_str().as_bytes();
+    let length = u16::try_from(name.len())
+        .map_err(|_| exhausted("Iceberg rewrite catalog name exceeds u16 width"))?;
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(handle.version().as_bytes());
+    Ok(())
 }
 
 struct AttemptCursor<'a> {
@@ -1737,6 +1748,16 @@ impl<'a> AttemptCursor<'a> {
         })
     }
 
+    fn take_catalog_handle(&mut self) -> Result<CatalogHandle, ConnectorError> {
+        let length = self.take_u16()? as usize;
+        let instance = std::str::from_utf8(self.take_exact(length)?)
+            .map_err(|_| invalid("Iceberg rewrite catalog name is not UTF-8"))?;
+        Ok(CatalogHandle::new(
+            ConnectorInstanceId::parse(instance)?,
+            CatalogVersion::from_bytes(self.take_array()?),
+        ))
+    }
+
     fn take_execution_id(
         &mut self,
     ) -> Result<novarocks_spi::connector::ConnectorWriteExecutionId, ConnectorError> {
@@ -1755,6 +1776,7 @@ impl<'a> AttemptCursor<'a> {
             i32::from_be_bytes(self.take_array()?),
             i32::from_be_bytes(self.take_array()?),
             self.take_u32()?,
+            self.take_catalog_handle()?,
             self.take_binding_key()?,
         ))
     }
@@ -2240,6 +2262,10 @@ mod tests {
                 4,
                 2,
                 1,
+                CatalogHandle::new(
+                    owner.instance_id.clone(),
+                    CatalogVersion::from_bytes([1; 32]),
+                ),
                 owner.clone(),
             ),
             1,

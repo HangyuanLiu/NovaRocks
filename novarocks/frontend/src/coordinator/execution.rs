@@ -1097,6 +1097,9 @@ impl FrontendDistributedQueryCoordinator {
                         &fragment_ids,
                         session.operation_id(),
                         cohort_id,
+                        session.catalog_handle().map_err(|error| {
+                            failed(format!("resolve connector writer catalog handle: {error}"))
+                        })?,
                         session.owner().clone(),
                     )?;
                     attachments.push(session.plan_manifest(&manifest).map_err(|error| {

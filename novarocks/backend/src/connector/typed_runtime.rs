@@ -1443,6 +1443,7 @@ pub(crate) mod test_support {
                     Err("no query-leased test catalog runtime".to_owned())
                 }
             }),
+            std::sync::Arc::new(|_| Err("no query-leased test writer runtime".to_owned())),
             queues,
             session,
             std::sync::Arc::new(|| Ok(None)),

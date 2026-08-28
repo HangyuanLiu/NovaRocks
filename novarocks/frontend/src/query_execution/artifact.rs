@@ -418,6 +418,7 @@ impl ScheduleBoundDistributedQuery {
         terminal_write_fragment_ids: &BTreeSet<FragmentId>,
         operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
         cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
+        catalog_handle: novarocks_spi::connector::CatalogHandle,
         owner: novarocks_spi::connector::ConnectorExecutionBindingKey,
     ) -> Result<ConnectorWriteManifest, DistributedQueryError> {
         ConnectorWriteManifest::freeze(
@@ -425,6 +426,7 @@ impl ScheduleBoundDistributedQuery {
             terminal_write_fragment_ids,
             operation_id,
             cohort_id,
+            catalog_handle,
             owner,
             self.schedule.execution_id(),
         )

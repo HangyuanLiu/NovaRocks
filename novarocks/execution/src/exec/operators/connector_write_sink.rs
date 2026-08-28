@@ -73,11 +73,8 @@ fn open_writer(
     program: &ConnectorWriteSinkProgram,
     request: ConnectorOpenWriterRequest,
 ) -> Result<Box<dyn ConnectorBatchWriter>, String> {
-    let execution = program.binding().write().ok_or_else(|| {
-        "resolved connector execution binding has no write capability during sink materialization"
-            .to_string()
-    })?;
-    let writer = execution
+    let writer = program
+        .execution()
         .open_writer(request)
         .map_err(|error| format!("open connector batch writer: {error}"))?;
     eprintln!("NOVAROCKS_CONNECTOR_WRITER_OPENED");
@@ -288,12 +285,10 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorError, ConnectorExecutionBinding,
-        ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorProviderId, ConnectorRequestContext, ConnectorStagedReport,
-        ConnectorStagedReportSummary, ConnectorWriteExecution, ConnectorWriteExecutionId,
-        ConnectorWriteOperationId, ConnectorWriterHandle, ConnectorWriterIdentity,
-        ConnectorWriterTerminalState,
+        ConnectorCancellation, ConnectorError, ConnectorExecutionBindingKey, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorRequestContext, ConnectorStagedReport,
+        ConnectorStagedReportSummary, ConnectorWriteExecutionId, ConnectorWriteOperationId,
+        ConnectorWriterHandle, ConnectorWriterIdentity, ConnectorWriterTerminalState,
     };
 
     use super::*;
@@ -317,13 +312,13 @@ mod tests {
     }
 
     struct TestWriteExecution {
-        key: ConnectorExecutionBindingKey,
+        catalog_handle: novarocks_spi::connector::CatalogHandle,
         stats: Arc<WriterStats>,
     }
 
-    impl ConnectorWriteExecution for TestWriteExecution {
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-            &self.key
+    impl novarocks_spi::connector::CatalogWriteExecution for TestWriteExecution {
+        fn catalog_handle(&self) -> &novarocks_spi::connector::CatalogHandle {
+            &self.catalog_handle
         }
 
         fn open_writer(
@@ -377,6 +372,10 @@ mod tests {
             incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
         };
         let operation_id = ConnectorWriteOperationId::from_bytes([1; 16]);
+        let catalog_handle = novarocks_spi::connector::CatalogHandle::new(
+            key.instance_id.clone(),
+            novarocks_spi::connector::CatalogVersion::from_bytes([9; 32]),
+        );
         let writer = ConnectorWriterIdentity::new(
             operation_id,
             novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id),
@@ -385,22 +384,15 @@ mod tests {
             5,
             6,
             0,
+            catalog_handle.clone(),
             key.clone(),
         );
         let handle =
             ConnectorWriterHandle::try_new(key.clone(), writer, 1, Bytes::new()).expect("handle");
-        let binding = Arc::new(
-            ConnectorExecutionBinding::try_new_capabilities(
-                ConnectorProviderId::parse("test").expect("provider"),
-                key,
-                None,
-                Some(Arc::new(TestWriteExecution {
-                    key: handle.owner().clone(),
-                    stats,
-                })),
-            )
-            .expect("binding"),
-        );
+        let execution = Arc::new(TestWriteExecution {
+            catalog_handle,
+            stats,
+        });
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let context = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
@@ -410,7 +402,7 @@ mod tests {
         )
         .expect("context");
         ConnectorWriteSinkProgram::try_new(
-            binding,
+            execution,
             ConnectorOpenWriterRequest {
                 handle,
                 expected_schema: schema,

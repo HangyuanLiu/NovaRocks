@@ -377,9 +377,15 @@ impl NativeFragmentService {
         let catalog_read_execution: CatalogReadExecutionResolver = Arc::new(move |handle| {
             lifecycle.catalog_read_execution_for_query(execution_id, handle)
         });
+        let lifecycle = Arc::clone(&self.lifecycle);
+        use crate::fragment::decode::plan::context::CatalogWriteExecutionResolver;
+        let catalog_write_execution: CatalogWriteExecutionResolver = Arc::new(move |handle| {
+            lifecycle.catalog_write_execution_for_query(execution_id, handle)
+        });
 
         crate::fragment::decode::plan::context::TypedScanRuntime::new(
             catalog_read_execution,
+            catalog_write_execution,
             queues,
             session,
             runtime_filter,

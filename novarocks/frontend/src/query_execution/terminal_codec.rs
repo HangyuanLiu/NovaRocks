@@ -62,6 +62,9 @@ pub(crate) fn encode_connector_staged_report_frame(
             sink_ordinal: writer.sink_ordinal(),
             connector_instance_id: writer.binding_key().instance_id.as_str().to_string(),
             connector_incarnation: writer.binding_key().incarnation.to_bytes().to_vec(),
+            catalog_handle: Some(novarocks_proto_codec::catalog::encode_catalog_handle(
+                writer.catalog_handle(),
+            )),
         }),
         terminal_state: match frame.state() {
             ConnectorWriterTerminalState::Staged => CONNECTOR_WRITER_TERMINAL_STAGED,

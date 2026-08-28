@@ -632,6 +632,18 @@ fn connector_writer_identity_from_native(
             "connector staged report binding incarnation",
         )?),
     };
+    let catalog_handle = writer.catalog_handle.as_ref().ok_or_else(|| {
+        contract_violation("connector staged report writer is missing catalog handle")
+    })?;
+    let catalog_handle = novarocks_proto_codec::catalog::decode_catalog_handle(
+        catalog_handle.clone(),
+        novarocks_proto_codec::FieldPath::root("connector_staged_report")
+            .field("writer")
+            .field("catalog_handle"),
+    )
+    .map_err(|error| {
+        contract_violation(format!("connector staged report catalog handle: {error}"))
+    })?;
     let fragment_id = writer.fragment_id;
     Ok(ConnectorWriterIdentity::new(
         operation_id,
@@ -644,6 +656,7 @@ fn connector_writer_identity_from_native(
         fragment_id,
         writer.backend_num,
         writer.sink_ordinal,
+        catalog_handle,
         binding_key,
     ))
 }

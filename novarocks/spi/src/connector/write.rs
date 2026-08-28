@@ -31,12 +31,13 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    CatalogProperties, ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
-    ConnectorMutationFailure, ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    LakePublicationFamily, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    CatalogHandle, CatalogProperties, ConnectorCommittedVersion, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
+    ConnectorExecutionDistribution, ConnectorMutationFailure, ConnectorProviderId,
+    ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationFamily,
+    LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 
 pub const CONNECTOR_WRITE_CONTRACT_VERSION: u32 = 1;
@@ -318,6 +319,10 @@ pub struct ConnectorWriterIdentity {
     fragment_id: i32,
     backend_num: i32,
     sink_ordinal: u32,
+    /// Exact immutable catalog runtime selected by the query lifecycle for
+    /// this writer. It is intentionally independent from the legacy effect
+    /// generation below: backend capability lookup uses this handle only.
+    catalog_handle: CatalogHandle,
     binding_key: ConnectorExecutionBindingKey,
 }
 
@@ -331,6 +336,7 @@ impl ConnectorWriterIdentity {
         fragment_id: i32,
         backend_num: i32,
         sink_ordinal: u32,
+        catalog_handle: CatalogHandle,
         binding_key: ConnectorExecutionBindingKey,
     ) -> Self {
         Self {
@@ -341,6 +347,7 @@ impl ConnectorWriterIdentity {
             fragment_id,
             backend_num,
             sink_ordinal,
+            catalog_handle,
             binding_key,
         }
     }
@@ -371,6 +378,10 @@ impl ConnectorWriterIdentity {
 
     pub const fn sink_ordinal(&self) -> u32 {
         self.sink_ordinal
+    }
+
+    pub const fn catalog_handle(&self) -> &CatalogHandle {
+        &self.catalog_handle
     }
 
     pub fn binding_key(&self) -> &ConnectorExecutionBindingKey {
@@ -4125,7 +4136,7 @@ mod tests {
 
     use super::*;
     use crate::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
+        CatalogVersion, ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
         ConnectorTableObjectId,
     };
 
@@ -4143,6 +4154,13 @@ mod tests {
         }
     }
 
+    fn catalog_handle(owner: &ConnectorExecutionBindingKey) -> CatalogHandle {
+        CatalogHandle::new(
+            owner.instance_id.clone(),
+            CatalogVersion::from_bytes([1; 32]),
+        )
+    }
+
     fn writer() -> ConnectorWriterIdentity {
         let operation_id = ConnectorWriteOperationId::new();
         ConnectorWriterIdentity::new(
@@ -4153,6 +4171,7 @@ mod tests {
             4,
             5,
             0,
+            catalog_handle(&key()),
             key(),
         )
     }

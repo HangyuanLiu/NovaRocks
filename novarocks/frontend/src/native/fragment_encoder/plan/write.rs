@@ -17,6 +17,7 @@
 
 use super::type_mapping::{encode_data_partition, encode_row_mutation_effect, usize_to_u64};
 use super::{NativePlanEncodeContext, required_context_ref};
+use novarocks_proto_codec::catalog::encode_catalog_handle;
 use novarocks_proto_models::{common, plan};
 use novarocks_sql::plan_read::{
     ChangeStreamRouterSink, ConnectorWriteFragmentSink, ConnectorWriteInputBinding, FragmentId,
@@ -46,6 +47,7 @@ pub(super) fn encode_connector_write_fragment_sink(
                     sink_ordinal: writer.sink_ordinal(),
                     connector_instance_id: writer.binding_key().instance_id.as_str().to_string(),
                     connector_incarnation: writer.binding_key().incarnation.to_bytes().to_vec(),
+                    catalog_handle: Some(encode_catalog_handle(writer.catalog_handle())),
                 }),
                 payload: handle.payload().to_vec(),
                 payload_sha256: handle.payload_digest().to_vec(),

@@ -27,9 +27,9 @@
 use std::collections::BTreeSet;
 
 use novarocks_spi::connector::{
-    CatalogProperties, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
-    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlan,
+    CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorWriteCohortDescriptor,
+    ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlan,
     ConnectorWritePlanningRequest, ConnectorWriterIdentity,
 };
 use sha2::{Digest, Sha256};
@@ -58,6 +58,7 @@ impl ConnectorWriteManifest {
         terminal_write_fragment_ids: &BTreeSet<FragmentId>,
         operation_id: ConnectorWriteOperationId,
         cohort_id: ConnectorWriteCohortId,
+        catalog_handle: CatalogHandle,
         owner: ConnectorExecutionBindingKey,
         execution_id: QueryExecutionId,
     ) -> Result<Self, ConnectorError> {
@@ -87,6 +88,7 @@ impl ConnectorWriteManifest {
                     fragment_id,
                     backend_num,
                     0,
+                    catalog_handle.clone(),
                     owner.clone(),
                 ));
             }
@@ -333,6 +335,9 @@ fn writer_manifest_digest(
         hasher.update(writer.fragment_id().to_be_bytes());
         hasher.update(writer.backend_num().to_be_bytes());
         hasher.update(writer.sink_ordinal().to_be_bytes());
+        hasher.update((writer.catalog_handle().catalog_name().as_str().len() as u64).to_be_bytes());
+        hasher.update(writer.catalog_handle().catalog_name().as_str().as_bytes());
+        hasher.update(writer.catalog_handle().version().as_bytes());
     }
     hasher.finalize().into()
 }

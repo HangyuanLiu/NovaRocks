@@ -50,6 +50,7 @@ use crate::fragment::decode::plan::layout::Layout;
 #[derive(Clone)]
 pub(crate) struct TypedScanRuntime {
     catalog_read_execution: CatalogReadExecutionResolver,
+    catalog_write_execution: CatalogWriteExecutionResolver,
     queues: Arc<
         novarocks_execution::connector::TaskAttemptSplitQueues<
             crate::fragment::ingress::ReceivedReadSplit,
@@ -86,9 +87,20 @@ pub(crate) type CatalogReadExecutionResolver = Arc<
         + Sync,
 >;
 
+/// Resolves one writer only through this attempt's query-leased immutable
+/// catalog runtime.
+pub(crate) type CatalogWriteExecutionResolver = Arc<
+    dyn Fn(
+            &novarocks_spi::connector::CatalogHandle,
+        ) -> Result<crate::connector::typed_registry::InstalledWriteExecution, String>
+        + Send
+        + Sync,
+>;
+
 impl TypedScanRuntime {
     pub(crate) fn new(
         catalog_read_execution: CatalogReadExecutionResolver,
+        catalog_write_execution: CatalogWriteExecutionResolver,
         queues: Arc<
             novarocks_execution::connector::TaskAttemptSplitQueues<
                 crate::fragment::ingress::ReceivedReadSplit,
@@ -100,6 +112,7 @@ impl TypedScanRuntime {
     ) -> Self {
         Self {
             catalog_read_execution,
+            catalog_write_execution,
             queues,
             session,
             runtime_filter,
@@ -112,6 +125,13 @@ impl TypedScanRuntime {
         handle: &novarocks_spi::connector::CatalogHandle,
     ) -> Result<crate::connector::typed_registry::InstalledReadExecution, String> {
         (self.catalog_read_execution)(handle)
+    }
+
+    pub(crate) fn catalog_write_execution(
+        &self,
+        handle: &novarocks_spi::connector::CatalogHandle,
+    ) -> Result<crate::connector::typed_registry::InstalledWriteExecution, String> {
+        (self.catalog_write_execution)(handle)
     }
 
     pub(crate) fn queues(

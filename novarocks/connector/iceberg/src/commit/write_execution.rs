@@ -121,6 +121,12 @@ impl CatalogWriteExecution for IcebergCatalogWriteExecution {
         &self,
         request: ConnectorOpenWriterRequest,
     ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+        if request.handle.writer().catalog_handle() != &self.catalog_handle {
+            return Err(error(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg connector writer handle does not belong to this exact query-leased catalog",
+            ));
+        }
         // The catalog lease above selects this provider runtime. The legacy
         // owner on the opaque writer handle remains only an operation/report
         // consistency check inside the compatibility implementation; it is

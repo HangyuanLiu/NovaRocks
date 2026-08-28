@@ -119,9 +119,10 @@ impl ConnectorStagedReportCollector {
 mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorStagedReportSummary, ConnectorWriteCohortId, ConnectorWriteExecutionId,
-        ConnectorWriteOperationId, ConnectorWriterIdentity, ConnectorWriterTerminalState,
+        CatalogHandle, CatalogVersion, ConnectorExecutionBindingKey, ConnectorInstanceId,
+        ConnectorInstanceIncarnation, ConnectorStagedReportSummary, ConnectorWriteCohortId,
+        ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriterIdentity,
+        ConnectorWriterTerminalState,
     };
 
     use super::*;
@@ -136,6 +137,10 @@ mod tests {
             5,
             6,
             7,
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("test-connector").expect("instance"),
+                CatalogVersion::from_bytes([9; 32]),
+            ),
             ConnectorExecutionBindingKey {
                 instance_id: ConnectorInstanceId::parse("test-connector").expect("instance"),
                 incarnation: ConnectorInstanceIncarnation::from_bytes([8; 16]),

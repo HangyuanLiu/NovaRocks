@@ -1301,6 +1301,7 @@ mod tests {
             &[],
             &[],
             &[],
+            &[],
         )
         .expect("compose backend application services");
 

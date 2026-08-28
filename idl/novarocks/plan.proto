@@ -25,6 +25,7 @@ syntax = "proto3";
 package novarocks.plan;
 
 import "common.proto";
+import "catalog.proto";
 import "connector_read.proto";
 import "expr.proto";
 
@@ -502,6 +503,7 @@ message ConnectorWriterIdentity {
   string connector_instance_id = 8;
   bytes connector_incarnation = 9;                // exact connector generation UUID bytes.
   bytes cohort_id = 10;                           // stable 32-byte semantic cohort identity.
+  novarocks.catalog.CatalogHandle catalog_handle = 11; // exact query-leased BE runtime identity.
 }
 
 // Bounded opaque handle produced by FE control planning and consumed only by

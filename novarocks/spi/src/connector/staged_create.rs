@@ -1430,9 +1430,9 @@ mod tests {
 
     use super::*;
     use crate::connector::{
-        CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorSealedWriteCohortSet, ConnectorStagedReport,
-        ConnectorStagedReportSummary, ConnectorWriteAttemptCompletion,
+        CONNECTOR_WRITE_CONTRACT_VERSION, CatalogHandle, CatalogVersion, ConnectorCancellation,
+        ConnectorInstanceId, ConnectorProviderId, ConnectorSealedWriteCohortSet,
+        ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorWriteAttemptCompletion,
         ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
         ConnectorWriteExecutionId, ConnectorWriteIntent, ConnectorWriteOperationId,
         ConnectorWriterIdentity, ConnectorWriterTerminalState,
@@ -1799,6 +1799,10 @@ mod tests {
             1,
             0,
             0,
+            CatalogHandle::new(
+                owner.instance_id.clone(),
+                CatalogVersion::from_bytes([1; 32]),
+            ),
             owner.clone(),
         );
         let report = ConnectorStagedReport::try_new(
