@@ -1297,6 +1297,7 @@ struct BackendTopologyRow {
     alive: bool,
     scheduled_fragments: u64,
     build_identity: String,
+    native_compatibility_id: String,
     status_detail: String,
 }
 
@@ -1305,6 +1306,7 @@ impl BackendTopologyRow {
         self.state == "Live"
             && self.alive
             && !self.build_identity.is_empty()
+            && !self.native_compatibility_id.is_empty()
             && self.status_detail.is_empty()
     }
 }
@@ -1328,8 +1330,12 @@ fn parse_frontend_show_backends_values(values: &[String]) -> Result<BackendTopol
         .context("SHOW BACKENDS row missing Eligible")?
         .parse::<bool>()
         .context("parse SHOW BACKENDS Eligible")?;
-    let state = values
+    let native_compatibility_id = values
         .get(12)
+        .context("SHOW BACKENDS row missing NativeCompatibilityId")?
+        .clone();
+    let state = values
+        .get(13)
         .context("SHOW BACKENDS row missing DiagnosticStatus")?
         .clone();
     let scheduled_fragments = values
@@ -1342,7 +1348,7 @@ fn parse_frontend_show_backends_values(values: &[String]) -> Result<BackendTopol
         .context("SHOW BACKENDS row missing BuildIdentity")?
         .clone();
     let status_detail = values
-        .get(13)
+        .get(14)
         .context("SHOW BACKENDS row missing StatusDetail")?
         .clone();
     Ok(BackendTopologyRow {
@@ -1352,6 +1358,7 @@ fn parse_frontend_show_backends_values(values: &[String]) -> Result<BackendTopol
         alive,
         scheduled_fragments,
         build_identity,
+        native_compatibility_id,
         status_detail,
     })
 }
@@ -1378,7 +1385,7 @@ fn query_frontend_backend_topology(
         .context("query SHOW BACKENDS from cross-process FE")?;
     rows.into_iter()
         .map(|row| {
-            let values = (0..14)
+            let values = (0..15)
                 .map(|index| {
                     row.get::<String, usize>(index)
                         .with_context(|| format!("SHOW BACKENDS row missing column {index}"))
@@ -1538,9 +1545,9 @@ fn validate_live_backend_topology(
         .filter(|row| row.is_eligible_live())
         .collect::<Vec<_>>();
     let live = live_rows.len();
-    let identities = live_rows
+    let compatibility_ids = live_rows
         .iter()
-        .map(|row| row.build_identity.as_str())
+        .map(|row| row.native_compatibility_id.as_str())
         .collect::<BTreeSet<_>>();
     let mut configured_ports = expected_ports.to_vec();
     configured_ports.sort_unstable();
@@ -1551,7 +1558,7 @@ fn validate_live_backend_topology(
     observed_ports.sort_unstable();
     if live == expected
         && observed_ports == configured_ports
-        && (expected == 0 || identities.len() == 1)
+        && (expected == 0 || compatibility_ids.len() == 1)
     {
         return Ok(());
     }
@@ -1560,14 +1567,19 @@ fn validate_live_backend_topology(
         .iter()
         .map(|row| {
             format!(
-                "{}:{}:{}:{}:{}",
-                row.grpc_port, row.state, row.alive, row.build_identity, row.status_detail
+                "{}:{}:{}:{}:{}:{}",
+                row.grpc_port,
+                row.state,
+                row.alive,
+                row.build_identity,
+                row.native_compatibility_id,
+                row.status_detail
             )
         })
         .collect::<Vec<_>>()
         .join(",");
     bail!(
-        "SHOW BACKENDS topology is not ready: registered={} expected={}; live={} expected={}; identities={identities:?}; configured_ports={configured_ports:?} observed_ports={observed_ports:?}; rows=[{}]",
+        "SHOW BACKENDS topology is not ready: registered={} expected={}; live={} expected={}; compatibility_ids={compatibility_ids:?}; configured_ports={configured_ports:?} observed_ports={observed_ports:?}; rows=[{}]",
         rows.len(),
         expected,
         live,
@@ -1662,12 +1674,16 @@ fn wait_for_live_backend_topology(
         .iter()
         .map(|row| row.build_identity.as_str())
         .collect::<BTreeSet<_>>();
+    let native_compatibility_ids = rows
+        .iter()
+        .map(|row| row.native_compatibility_id.as_str())
+        .collect::<BTreeSet<_>>();
     let status_details = rows
         .iter()
         .map(|row| row.status_detail.as_str())
         .collect::<BTreeSet<_>>();
     println!(
-        "cross-process topology barrier PASS: SHOW BACKENDS {}/{} Live; build_identities={build_identities:?}; status_details={status_details:?}; {}",
+        "cross-process topology barrier PASS: SHOW BACKENDS {}/{} Live; build_identities={build_identities:?}; native_compatibility_ids={native_compatibility_ids:?}; status_details={status_details:?}; {}",
         rows.len(),
         expected,
         diagnostics
@@ -4938,6 +4954,7 @@ mod tests {
             alive,
             scheduled_fragments: 0,
             build_identity: "test-build-identity".to_string(),
+            native_compatibility_id: "test-native-compatibility".to_string(),
             status_detail: String::new(),
         }
     }
@@ -4957,6 +4974,7 @@ mod tests {
             "1000".to_string(),
             "1001".to_string(),
             "test-build-identity".to_string(),
+            "test-native-compatibility".to_string(),
             "Live".to_string(),
             "".to_string(),
         ])
@@ -4968,6 +4986,7 @@ mod tests {
         assert!(row.alive);
         assert_eq!(row.scheduled_fragments, 41);
         assert_eq!(row.build_identity, "test-build-identity");
+        assert_eq!(row.native_compatibility_id, "test-native-compatibility");
         assert!(row.status_detail.is_empty());
     }
 
@@ -5010,25 +5029,36 @@ mod tests {
             "{err}"
         );
 
-        let identity_split = vec![
+        let same_island_different_builds = vec![
             backend_row(19070, "Live", true),
             BackendTopologyRow {
                 build_identity: "other-build-identity".to_string(),
                 ..backend_row(19071, "Live", true)
             },
         ];
-        let err = validate_live_backend_topology(&expected, &identity_split)
-            .expect_err("mixed Native build identities must fail the barrier");
+        validate_live_backend_topology(&expected, &same_island_different_builds)
+            .expect("different builds in one compatibility island must pass the barrier");
+
+        let island_split = vec![
+            backend_row(19070, "Live", true),
+            BackendTopologyRow {
+                native_compatibility_id: "other-native-compatibility".to_string(),
+                ..backend_row(19071, "Live", true)
+            },
+        ];
+        let err = validate_live_backend_topology(&expected, &island_split)
+            .expect_err("mixed native compatibility islands must fail the barrier");
         assert!(
-            err.to_string()
-                .contains("identities={\"other-build-identity\", \"test-build-identity\"}"),
+            err.to_string().contains(
+                "compatibility_ids={\"other-native-compatibility\", \"test-native-compatibility\"}"
+            ),
             "{err}"
         );
 
         let empty_identity = vec![
             backend_row(19070, "Live", true),
             BackendTopologyRow {
-                build_identity: String::new(),
+                native_compatibility_id: String::new(),
                 ..backend_row(19071, "Live", true)
             },
         ];
@@ -5064,6 +5094,7 @@ mod tests {
                 alive: false,
                 scheduled_fragments: 0,
                 build_identity: "test-build-identity".to_string(),
+                native_compatibility_id: "test-native-compatibility".to_string(),
                 status_detail: "heartbeat expected backend process id does not match this backend"
                     .to_string(),
             },
