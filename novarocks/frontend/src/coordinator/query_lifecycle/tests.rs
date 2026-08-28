@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -710,6 +711,53 @@ struct RecordingTransportState {
         VecDeque<Result<protocol_lifecycle::QueryTerminationAck, QueryLifecycleTransportError>>,
     >,
     cancel_on_init: Option<QueryCancellationSource>,
+    fanout_probe: Option<Arc<FanoutProbe>>,
+}
+
+/// Test-only concurrent-call probe.  The deliberate short delay makes each
+/// fanout wave overlap enough calls to prove that the implementation is
+/// concurrent without coupling the assertion to thread scheduling details.
+struct FanoutProbe {
+    hold_for: Duration,
+    init_in_flight: AtomicUsize,
+    init_peak: AtomicUsize,
+    attach_in_flight: AtomicUsize,
+    attach_peak: AtomicUsize,
+}
+
+impl FanoutProbe {
+    fn new(hold_for: Duration) -> Self {
+        Self {
+            hold_for,
+            init_in_flight: AtomicUsize::new(0),
+            init_peak: AtomicUsize::new(0),
+            attach_in_flight: AtomicUsize::new(0),
+            attach_peak: AtomicUsize::new(0),
+        }
+    }
+
+    fn observe_call(&self, in_flight: &AtomicUsize, peak: &AtomicUsize) {
+        let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(current, Ordering::SeqCst);
+        std::thread::sleep(self.hold_for);
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn observe_init(&self) {
+        self.observe_call(&self.init_in_flight, &self.init_peak);
+    }
+
+    fn observe_attach(&self) {
+        self.observe_call(&self.attach_in_flight, &self.attach_peak);
+    }
+
+    fn init_peak(&self) -> usize {
+        self.init_peak.load(Ordering::SeqCst)
+    }
+
+    fn attach_peak(&self) -> usize {
+        self.attach_peak.load(Ordering::SeqCst)
+    }
 }
 
 impl RecordingTransport {
@@ -789,6 +837,15 @@ impl RecordingTransport {
             .map(|(target, _)| target.backend_idx())
             .collect()
     }
+
+    fn enable_fanout_probe(&self, hold_for: Duration) -> Arc<FanoutProbe> {
+        let probe = Arc::new(FanoutProbe::new(hold_for));
+        self.state
+            .lock()
+            .expect("recording transport lock")
+            .fanout_probe = Some(Arc::clone(&probe));
+        probe
+    }
 }
 
 impl QueryLifecycleTransport for RecordingTransport {
@@ -811,7 +868,11 @@ impl QueryLifecycleTransport for RecordingTransport {
                 ))
             });
         let cancellation = state.cancel_on_init.take();
+        let probe = state.fanout_probe.clone();
         drop(state);
+        if let Some(probe) = probe {
+            probe.observe_init();
+        }
         if let Some(cancellation) = cancellation {
             cancellation.request(QueryCancellationReason::ClientDisconnected);
         }
@@ -826,7 +887,7 @@ impl QueryLifecycleTransport for RecordingTransport {
     ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
         let mut state = self.state.lock().expect("recording transport lock");
         state.attach_calls.push((target.clone(), attach));
-        state
+        let result = state
             .attach_results
             .get_mut(&target.backend_idx())
             .and_then(VecDeque::pop_front)
@@ -835,7 +896,13 @@ impl QueryLifecycleTransport for RecordingTransport {
                     QueryLifecycleTransportErrorKind::InvalidResponse,
                     "unexpected control attach call",
                 ))
-            })
+            });
+        let probe = state.fanout_probe.clone();
+        drop(state);
+        if let Some(probe) = probe {
+            probe.observe_attach();
+        }
+        result
     }
 
     fn abort_query(
@@ -968,10 +1035,17 @@ fn manifest(
 }
 
 fn query_init_plan(service_only_backend: Option<usize>) -> QueryInitPlan {
+    query_init_plan_with_participants(3, service_only_backend)
+}
+
+fn query_init_plan_with_participants(
+    participant_count: usize,
+    service_only_backend: Option<usize>,
+) -> QueryInitPlan {
     let execution_id = query_execution_id();
     QueryInitPlan::from_manifests_for_contract_test(
         execution_id,
-        (0..3).map(|backend_idx| {
+        (0..participant_count).map(|backend_idx| {
             (
                 backend_idx,
                 manifest(
@@ -1693,6 +1767,33 @@ fn frontend_query_lifecycle_all_participant_barrier_aborts_attempted_targets() {
         "{error}"
     );
     assert_eq!(sorted(transport.abort_targets()), vec![0, 1, 2]);
+}
+
+#[test]
+fn frontend_query_lifecycle_bounds_init_and_attach_fanout_for_ninety_seven_participants() {
+    let plan = query_init_plan_with_participants(97, None);
+    let (transport, _) = RecordingTransport::ready(&plan);
+    let probe = transport.enable_fanout_probe(Duration::from_millis(10));
+    let (registry, _query) = registry_for(&plan);
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config());
+
+    barrier
+        .initialize_all(plan)
+        .expect("all participant waves must initialize and attach")
+        .finalize()
+        .expect("fixture finalize");
+
+    let init_peak = probe.init_peak();
+    let attach_peak = probe.attach_peak();
+    assert!(
+        (2..=32).contains(&init_peak),
+        "InitQuery fanout must be concurrent but bounded: {init_peak}"
+    );
+    assert!(
+        (2..=32).contains(&attach_peak),
+        "control attach fanout must be concurrent but bounded: {attach_peak}"
+    );
 }
 
 #[test]
