@@ -372,8 +372,14 @@ impl NativeFragmentService {
                 .map_err(|error| format!("resolve typed scan runtime-filter session: {error}"))
         });
 
+        let lifecycle = Arc::clone(&self.lifecycle);
+        use crate::fragment::decode::plan::context::CatalogReadExecutionResolver;
+        let catalog_read_execution: CatalogReadExecutionResolver = Arc::new(move |handle| {
+            lifecycle.catalog_read_execution_for_query(execution_id, handle)
+        });
+
         crate::fragment::decode::plan::context::TypedScanRuntime::new(
-            self.execution_host.read_executions(),
+            catalog_read_execution,
             queues,
             session,
             runtime_filter,

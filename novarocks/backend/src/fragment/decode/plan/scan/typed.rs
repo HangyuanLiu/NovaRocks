@@ -35,14 +35,11 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_proto_codec::connector_read::{ConnectorRelation, ConnectorRelationKind};
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{connector_read as dto, plan};
+use novarocks_spi::connector::CatalogHandle;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
-use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
-};
 use novarocks_types::SlotId;
 
 use crate::connector::runtime::ConnectorBatchTransform;
-use crate::connector::typed_registry::InstalledReadExecutionRegistry;
 use crate::connector::typed_runtime::{
     TypedConnectorScanSource, TypedConnectorSystemTableScanSource,
 };
@@ -55,9 +52,6 @@ use super::common::{
     parse_scan_limit, validate_variant_path_read_slots,
 };
 use super::variant_path::NativeVariantPathPlan;
-
-/// Bytes of a connector instance incarnation, mirrored from the wire contract.
-const INSTANCE_INCARNATION_BYTES: usize = 16;
 
 /// Lower one `ScanSource.typed_connector_read` into an execution scan node.
 pub(super) fn lower_typed_connector_scan(
@@ -109,19 +103,12 @@ pub(super) fn lower_typed_connector_scan(
     let output_materialization =
         output_materialization(&read_slot_ids, &output_schema, variant_path_plan)?;
 
-    let binding_key = binding_key(table)?;
     let inputs = typed_scan_runtime_inputs(ctx)?;
-    let execution = inputs
-        .read_executions
-        .resolve(&binding_key)
-        .ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "table",
-                "no exact installed connector read execution exists for this binding",
-            )
+    let catalog_handle = catalog_handle(table);
+    let execution = (inputs.catalog_read_execution)(&catalog_handle).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "table", error)
             .append_field("catalog_name")
-        })?;
+    })?;
     let decoded_scan = novarocks_proto_codec::connector_read::DecodedConnectorReadScan::decode(
         execution.codec().as_ref(),
         &scan_source,
@@ -224,7 +211,7 @@ pub(super) fn lower_typed_connector_scan(
 
 /// The fragment-local runtime inputs a typed scan needs beyond its carrier.
 struct TypedScanRuntimeInputs {
-    read_executions: Arc<InstalledReadExecutionRegistry>,
+    catalog_read_execution: super::super::context::CatalogReadExecutionResolver,
     queues: Arc<
         novarocks_execution::connector::TaskAttemptSplitQueues<
             crate::fragment::ingress::ReceivedReadSplit,
@@ -272,7 +259,10 @@ fn typed_scan_runtime_inputs(
         )
     })?;
     Ok(TypedScanRuntimeInputs {
-        read_executions: runtime.read_executions(),
+        catalog_read_execution: Arc::new({
+            let runtime = runtime.clone();
+            move |handle| runtime.catalog_read_execution(handle)
+        }),
         queues: runtime.queues(),
         session: runtime.session(),
         request,
@@ -389,31 +379,11 @@ fn provider_refusal(
     .append_field("catalog_name")
 }
 
-/// The exact connector binding generation this relation belongs to.
-fn binding_key(
+/// The exact immutable catalog runtime identity this relation belongs to.
+fn catalog_handle(
     table: &novarocks_proto_codec::connector_read::CatalogTableHandle,
-) -> Result<ConnectorExecutionBindingKey, NativeFragmentLeafDecodeError> {
-    // The carrier already proved the catalog name is a normalized instance id
-    // and the incarnation is exactly 16 bytes; both conversions below therefore
-    // restate the same fact in the SPI's own types rather than re-validating.
-    let instance_id =
-        ConnectorInstanceId::try_from_canonical(table.catalog_name()).map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "table",
-                error.to_string(),
-            )
-            .append_field("catalog_name")
-        })?;
-    let incarnation = ConnectorInstanceIncarnation::from_bytes(table.instance_incarnation());
-    debug_assert_eq!(
-        table.instance_incarnation().len(),
-        INSTANCE_INCARNATION_BYTES
-    );
-    Ok(ConnectorExecutionBindingKey {
-        instance_id,
-        incarnation,
-    })
+) -> CatalogHandle {
+    table.catalog_handle().clone()
 }
 
 /// The stable refusal for a relation kind this slice does not read yet.

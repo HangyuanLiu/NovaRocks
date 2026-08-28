@@ -190,6 +190,7 @@ impl IcebergSystemRelation {
 pub struct IcebergTypedBoundary {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
+    catalog_handle: novarocks_spi::connector::CatalogHandle,
     transaction: HiveTransactionHandle,
     runtime: Arc<IcebergMetadataContext>,
     split_source_options: IcebergSplitSourceOptions,
@@ -204,12 +205,14 @@ impl IcebergTypedBoundary {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ConnectorInstanceIncarnation,
+        catalog_handle: novarocks_spi::connector::CatalogHandle,
         transaction: HiveTransactionHandle,
         runtime: Arc<IcebergMetadataContext>,
     ) -> Self {
         Self {
             descriptor,
             incarnation,
+            catalog_handle,
             transaction,
             runtime,
             split_source_options: IcebergSplitSourceOptions::default(),
@@ -496,8 +499,8 @@ impl ProviderReadRuntime for IcebergTypedBoundary {
         &self.descriptor
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
-        self.incarnation
+    fn catalog_handle(&self) -> &novarocks_spi::connector::CatalogHandle {
+        &self.catalog_handle
     }
 
     fn transaction(&self) -> Self::Transaction {

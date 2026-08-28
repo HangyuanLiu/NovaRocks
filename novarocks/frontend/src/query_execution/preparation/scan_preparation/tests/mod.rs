@@ -128,8 +128,8 @@ fn fixture_scan_preparation_options(
 
 /// Install one typed control per catalog instance the sealed plan scans.
 ///
-/// The key is the exact generation the fixture lease already froze, so the
-/// registry answers precisely what production would answer.
+/// The handle is the exact desired-state identity the fixture lease already
+/// froze, so the registry answers precisely what production would answer.
 fn fixture_typed_control_registry(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
@@ -162,11 +162,12 @@ fn fixture_typed_control_registry(
         let Ok(lease) = controls.acquire_current(&instance_id) else {
             continue;
         };
-        let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
-            instance_id: lease.binding().descriptor().instance_id.clone(),
-            incarnation: lease.binding().incarnation(),
-        };
-        let control = Arc::new(FixtureTypedControl::new(catalog.clone(), key.incarnation));
+        let catalog_handle = lease
+            .binding()
+            .catalog_handle()
+            .expect("fixture control binding has a catalog handle")
+            .clone();
+        let control = Arc::new(FixtureTypedControl::new(catalog_handle.clone()));
         let adapter = Arc::new(
             novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter::new(Arc::clone(
                 &control,
@@ -174,7 +175,7 @@ fn fixture_typed_control_registry(
         );
         let lease = registry
             .install_read_control(
-                key,
+                catalog_handle,
                 crate::connector::typed_control_registry::InstalledReadControl::new(
                     Arc::clone(&adapter) as _,
                     adapter as _,
@@ -216,7 +217,7 @@ struct FixtureTransaction;
 /// split, so a test observes exactly what preparation itself decided.
 struct FixtureTypedControl {
     descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
-    incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation,
+    catalog_handle: novarocks_spi::connector::CatalogHandle,
     registration_lease: std::sync::Mutex<
         Option<
             std::sync::Arc<
@@ -245,18 +246,14 @@ impl FixtureTypedControl {
         "__change_op",
     ];
 
-    fn new(
-        catalog: String,
-        incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation,
-    ) -> Self {
+    fn new(catalog_handle: novarocks_spi::connector::CatalogHandle) -> Self {
         Self {
             descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor {
                 provider_id: novarocks_spi::connector::ConnectorProviderId::parse("fixture")
                     .expect("fixture provider ID"),
-                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(&catalog)
-                    .expect("fixture catalog instance ID"),
+                instance_id: catalog_handle.catalog_name().clone(),
             },
-            incarnation,
+            catalog_handle,
             registration_lease: std::sync::Mutex::new(None),
             pinned_requests: std::sync::Mutex::new(Vec::new()),
         }
@@ -316,8 +313,8 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime for Fixt
         &self.descriptor
     }
 
-    fn incarnation(&self) -> novarocks_spi::connector::ConnectorInstanceIncarnation {
-        self.incarnation
+    fn catalog_handle(&self) -> &novarocks_spi::connector::CatalogHandle {
+        &self.catalog_handle
     }
 
     fn transaction(&self) -> Self::Transaction {

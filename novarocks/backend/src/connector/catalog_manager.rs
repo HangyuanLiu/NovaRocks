@@ -43,15 +43,33 @@ pub const DEFAULT_MAX_RETAINED_CATALOGS: usize = 64;
 #[derive(Clone)]
 pub struct MaterializedCatalogRuntime {
     runtime: Arc<dyn CatalogRuntime>,
+    read_execution: Option<super::typed_registry::InstalledReadExecution>,
 }
 
 impl MaterializedCatalogRuntime {
     pub fn new(runtime: Arc<dyn CatalogRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            read_execution: None,
+        }
+    }
+
+    fn with_read_execution(
+        runtime: Arc<dyn CatalogRuntime>,
+        read_execution: super::typed_registry::InstalledReadExecution,
+    ) -> Self {
+        Self {
+            runtime,
+            read_execution: Some(read_execution),
+        }
     }
 
     pub fn runtime(&self) -> Arc<dyn CatalogRuntime> {
         Arc::clone(&self.runtime)
+    }
+
+    pub fn read_execution(&self) -> Option<super::typed_registry::InstalledReadExecution> {
+        self.read_execution.clone()
     }
 }
 
@@ -62,6 +80,12 @@ pub struct CatalogRuntimeMaterializerSet {
         BTreeMap<
             novarocks_spi::connector::CatalogProviderKind,
             Arc<dyn CatalogRuntimeMaterializer>,
+        >,
+    >,
+    read_bundle_factories: Arc<
+        BTreeMap<
+            novarocks_spi::connector::CatalogProviderKind,
+            Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
         >,
     >,
 }
@@ -81,7 +105,33 @@ impl CatalogRuntimeMaterializerSet {
         }
         Ok(Self {
             materializers: Arc::new(sealed),
+            read_bundle_factories: Arc::new(BTreeMap::new()),
         })
+    }
+
+    /// Seal the provider read factories alongside catalog materializers.  The
+    /// factory is invoked only after the exact immutable catalog has been
+    /// materialized and identity-checked below.
+    pub fn try_new_with_read_execution_factories(
+        materializers: impl IntoIterator<Item = Arc<dyn CatalogRuntimeMaterializer>>,
+        factories: impl IntoIterator<
+            Item = (
+                novarocks_spi::connector::CatalogProviderKind,
+                Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
+            ),
+        >,
+    ) -> Result<Self, CatalogManagerError> {
+        let mut result = Self::try_new(materializers)?;
+        let mut sealed = BTreeMap::new();
+        for (provider_kind, factory) in factories {
+            if sealed.insert(provider_kind, factory).is_some() {
+                return Err(CatalogManagerError::InvalidConfiguration(
+                    "duplicate catalog read execution provider kind",
+                ));
+            }
+        }
+        result.read_bundle_factories = Arc::new(sealed);
+        Ok(result)
     }
 
     pub fn materialize(
@@ -103,7 +153,27 @@ impl CatalogRuntimeMaterializerSet {
                 "catalog runtime materializer returned an incompatible runtime",
             ));
         }
-        Ok(MaterializedCatalogRuntime::new(runtime))
+        let read_execution = self
+            .read_bundle_factories
+            .get(&properties.provider_kind())
+            .map(|factory| {
+                factory
+                    .build(properties.handle())
+                    .map(|bundle| {
+                        super::typed_registry::InstalledReadExecution::new(
+                            bundle.provider_factory(),
+                            bundle.codec(),
+                        )
+                    })
+                    .map_err(|error| CatalogManagerError::materialization_failed(error.to_string()))
+            })
+            .transpose()?;
+        Ok(match read_execution {
+            Some(read_execution) => {
+                MaterializedCatalogRuntime::with_read_execution(runtime, read_execution)
+            }
+            None => MaterializedCatalogRuntime::new(runtime),
+        })
     }
 }
 
@@ -418,6 +488,30 @@ impl<T> CatalogManager<T> {
         }
     }
 
+    /// Resolve a runtime only when the exact handle remains leased by the
+    /// admitted query. Decode uses this rather than the retained-cache lookup,
+    /// so retention can never become an authority path.
+    pub fn resolve_for_query(
+        &self,
+        query: QueryExecutionId,
+        handle: &CatalogHandle,
+    ) -> Option<Arc<T>> {
+        let cell = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state
+                .query_reachability
+                .get(&query)
+                .filter(|handles| handles.contains(handle))
+                .and_then(|_| state.entries.get(handle))
+                .cloned()
+        }?;
+        let state = cell.state.lock().unwrap_or_else(|error| error.into_inner());
+        match &*state {
+            CatalogCellState::Ready { runtime, .. } => Some(Arc::clone(runtime)),
+            CatalogCellState::Materializing | CatalogCellState::Failed(_) => None,
+        }
+    }
+
     pub fn retained_handles(&self) -> BTreeSet<CatalogHandle> {
         self.state
             .lock()
@@ -705,6 +799,31 @@ mod tests {
         assert!(manager.resolve(&handle).is_none());
         assert!(manager.retained_handles().is_empty());
         assert!(manager.query_handles(query(1)).is_empty());
+    }
+
+    #[test]
+    fn retained_runtime_does_not_bypass_the_query_catalog_lease() {
+        let manager = CatalogManager::<usize>::default();
+        let catalog = properties(1);
+        let handle = catalog.handle().clone();
+        manager
+            .ensure(query(1), catalog, |_| Ok(7))
+            .expect("materialize runtime");
+        assert_eq!(
+            *manager
+                .resolve_for_query(query(1), &handle)
+                .expect("query owns exact handle"),
+            7
+        );
+        manager.release_query(query(1));
+        assert!(
+            manager.resolve(&handle).is_some(),
+            "retention keeps the runtime"
+        );
+        assert!(
+            manager.resolve_for_query(query(1), &handle).is_none(),
+            "retention must not grant decode authority after terminal release"
+        );
     }
 
     #[test]

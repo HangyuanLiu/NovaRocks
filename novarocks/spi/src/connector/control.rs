@@ -227,6 +227,8 @@ pub struct ConnectorControlBinding {
     /// Immutable execution identity assigned by the FE desired-state owner
     /// before this control binding becomes query-admissible.
     catalog_handle: Option<CatalogHandle>,
+    catalog_handle_installer:
+        Option<Arc<dyn Fn(&CatalogHandle) -> Result<(), ConnectorError> + Send + Sync>>,
     metadata: Arc<dyn ConnectorMetadata>,
     planning: Arc<dyn ConnectorScanPlanning>,
     distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -413,6 +415,7 @@ impl ConnectorControlBinding {
             descriptor,
             incarnation,
             catalog_handle: None,
+            catalog_handle_installer: None,
             metadata,
             planning,
             distribution,
@@ -641,8 +644,21 @@ impl ConnectorControlBinding {
                 "catalog handle owner does not match its control binding",
             ));
         }
+        if let Some(installer) = self.catalog_handle_installer.as_ref() {
+            installer(&catalog_handle)?;
+        }
         self.catalog_handle = Some(catalog_handle);
         Ok(self)
+    }
+
+    /// Attach provider-owned, FE-local work which can only be installed after
+    /// desired state has frozen the immutable catalog identity.
+    pub fn with_catalog_handle_installer(
+        mut self,
+        installer: Arc<dyn Fn(&CatalogHandle) -> Result<(), ConnectorError> + Send + Sync>,
+    ) -> Self {
+        self.catalog_handle_installer = Some(installer);
+        self
     }
 
     /// Returns the desired-state-derived execution identity. A binding which

@@ -478,21 +478,6 @@ impl ScanExecutionBindings {
             .find_map(|(&(_, candidate), scan)| (candidate == node_id).then_some(scan))
     }
 
-    /// Every typed connector scan of one fragment.
-    ///
-    /// Backend binding installation reads this: a fragment's scan nodes decide
-    /// which instances a backend must have installed, because any admitted
-    /// task may later receive a runtime split for any of them.
-    pub(crate) fn typed_scans_for_fragment(
-        &self,
-        fragment_id: FragmentId,
-    ) -> impl Iterator<Item = (i32, &PreparedTypedConnectorScan)> + '_ {
-        self.typed_scans
-            .iter()
-            .filter(move |((candidate, _), _)| *candidate == fragment_id)
-            .map(|(&(_, node_id), scan)| (node_id, scan))
-    }
-
     pub(crate) fn typed_scan_keys(&self) -> impl Iterator<Item = (FragmentId, i32)> + '_ {
         self.typed_scans.keys().copied()
     }

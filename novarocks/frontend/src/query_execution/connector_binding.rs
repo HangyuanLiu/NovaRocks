@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend-owned connector instance installation barrier.
+//! Frontend-owned legacy write connector installation barrier.
 //!
 //! A declaration is control-plane state, never fragment-carrier data.  The
-//! compiler derives one declaration set for each BE that will host a connector
-//! scan and requires all installs to ACK before native submissions exist.
+//! compiler derives declarations only for legacy write attachments and requires
+//! their installs to ACK before native submissions exist. Typed reads carry
+//! their `CatalogSet` in the existing Init lifecycle round instead.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,7 +31,6 @@ use novarocks_spi::connector::{
 };
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
@@ -208,20 +208,12 @@ pub trait ConnectorBindingInstallBarrier: Send + Sync + 'static {
     ) -> Result<ConnectorBindingInstallLease, DistributedQueryError>;
 }
 
-/// Derive the only permitted instance distribution plan from prepared reads
-/// and placement-frozen writers at their actual BE placements.
-///
-/// The read half is derived from the connector scan nodes of each placed
-/// fragment, not from any split placement: splits are assigned at runtime, so
-/// every backend that runs a fragment with a connector scan may later receive
-/// a split for it and must already have that instance installed. A scan node
-/// with no assigned split is therefore still installed — an empty source can
-/// be opened by the fragment and must resolve its real instance without a
-/// query-local fallback. Write-only fragments install the exact declaration
-/// retained by their planning lease, never a declaration for a later current
-/// incarnation.
+/// Derive the legacy write installation plan from placement-frozen writers at
+/// their actual BE placements. Typed reads are deliberately absent: their
+/// exact `CatalogHandle`s are already attached to the participant Init manifest
+/// and readiness is reported on that same control stream, so adding them here
+/// would impose a second warm-path RPC barrier.
 pub(crate) fn compile_install_plan(
-    prepared: &PreparedFragmentSet,
     schedule: &SchedulingPlan,
     connector_write_plans: &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 ) -> Result<ConnectorBindingInstallPlan, DistributedQueryError> {
@@ -232,40 +224,6 @@ pub(crate) fn compile_install_plan(
             BTreeMap<ConnectorInstanceId, ConnectorExecutionDeclaration>,
         ),
     > = BTreeMap::new();
-
-    for (&fragment_id, placements) in &schedule.by_fragment {
-        for placement in placements {
-            let endpoint = placement.endpoint.clone();
-            let entry = by_backend
-                .entry(placement.backend_idx)
-                .or_insert_with(|| (endpoint.clone(), BTreeMap::new()));
-            if entry.0 != endpoint {
-                return Err(contract_error(format!(
-                    "connector binding schedule assigns backend {} to conflicting endpoints {} and {}",
-                    placement.backend_idx, entry.0, endpoint
-                )));
-            }
-            for (_, scan) in prepared
-                .scan_bindings()
-                .typed_scans_for_fragment(fragment_id)
-            {
-                let instance_id = scan.declaration.binding_key().instance_id.clone();
-                match entry.1.get(&instance_id) {
-                    Some(existing) if existing != &scan.declaration => {
-                        return Err(contract_error(format!(
-                            "connector instance '{}' has conflicting declarations for backend {}",
-                            instance_id.as_str(),
-                            placement.backend_idx
-                        )));
-                    }
-                    Some(_) => {}
-                    None => {
-                        entry.1.insert(instance_id, scan.declaration.clone());
-                    }
-                }
-            }
-        }
-    }
 
     for attachment in connector_write_plans.values() {
         let declaration = attachment.execution_declaration();
@@ -581,5 +539,21 @@ mod tests {
             AttemptId::new(1).expect("nonzero attempt"),
         )
         .expect("valid execution id")
+    }
+
+    #[test]
+    fn read_only_queries_have_no_legacy_install_barrier_work() {
+        let schedule = SchedulingPlan {
+            root_fragment_id: 3,
+            by_fragment: BTreeMap::new(),
+            root_finst_id: novarocks_types::UniqueId::new(3, 30),
+            root_backend_idx: 0,
+        };
+
+        let plan = compile_install_plan(&schedule, &BTreeMap::new())
+            .expect("read-only query has no legacy write installation");
+
+        assert_eq!(plan.backend_count(), 0);
+        assert_eq!(plan.declaration_count(), 0);
     }
 }

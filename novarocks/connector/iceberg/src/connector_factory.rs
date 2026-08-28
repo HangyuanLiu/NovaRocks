@@ -36,12 +36,13 @@ use crate::execution_declaration::IcebergInstanceDistribution;
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
 use crate::resources::IcebergMetadataResources;
+use crate::typed_boundary::IcebergTypedBoundary;
 use novarocks_proto_codec::connector_read::ConnectorReadCodec;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadMetadata, ConnectorReadRegistrationLease, ConnectorReadSplitManager,
 };
 use novarocks_spi::connector::{
-    ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
+    CatalogHandle, ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
     ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
     ConnectorProviderId,
@@ -59,7 +60,7 @@ use std::sync::Arc;
 /// registration.
 pub type IcebergReadControlInstaller = Arc<
     dyn Fn(
-            ConnectorExecutionBindingKey,
+            CatalogHandle,
             Arc<dyn ConnectorReadMetadata>,
             Arc<dyn ConnectorReadSplitManager>,
             Arc<dyn ConnectorReadCodec>,
@@ -215,7 +216,7 @@ impl ConnectorControlFactory for IcebergConnectorFactory {
             Err(error) if error.kind() == ConnectorErrorKind::Unsupported => None,
             Err(error) => return Err(error),
         };
-        let binding = ConnectorControlBinding::try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
+        let mut binding = ConnectorControlBinding::try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
                 descriptor.clone(),
                 incarnation,
                 provider.clone(),
@@ -235,35 +236,45 @@ impl ConnectorControlFactory for IcebergConnectorFactory {
             }))?
             .try_with_staged_publication_recovery(Some(provider.clone()))?
             .try_with_view_metadata(Some(provider.clone()))?;
-        // Validate the completed control binding before the composition root
-        // can publish the matching read unit.  If that installation fails,
-        // this factory returns the error and never hands the binding back.
+        // Desired state, not this FE-local control generation, owns the
+        // immutable catalog version. Defer typed-read registration until that
+        // owner stamps the binding with its exact CatalogHandle.
+        if let Some(installer) = self.read_control_installer.as_ref() {
+            let installer = Arc::clone(installer);
+            let runtime = Arc::clone(unpublished.runtime());
+            let descriptor = descriptor.clone();
+            let provider = Arc::clone(&provider);
+            binding = binding.with_catalog_handle_installer(Arc::new(move |catalog_handle| {
+                let boundary = Arc::new(IcebergTypedBoundary::new(
+                    descriptor.clone(),
+                    incarnation,
+                    catalog_handle.clone(),
+                    crate::typed_read::table_handle::HiveTransactionHandle::new(
+                        true,
+                        catalog_handle.version().as_bytes()[..16]
+                            .try_into()
+                            .expect("a CatalogVersion always has 32 bytes"),
+                    ),
+                    Arc::clone(&runtime),
+                ));
+                let adapter = Arc::new(boundary.read_runtime_adapter());
+                let codec: Arc<dyn ConnectorReadCodec> = Arc::new(
+                    crate::typed_read::IcebergConnectorReadCodec::new(adapter.as_ref().clone()),
+                );
+                let lease = installer(
+                    catalog_handle.clone(),
+                    Arc::clone(&adapter) as Arc<dyn ConnectorReadMetadata>,
+                    adapter as Arc<dyn ConnectorReadSplitManager>,
+                    codec,
+                )?;
+                provider.install_read_registration_lease(lease)
+            }));
+        }
         let creation = ConnectorControlCreation::try_new(
             &request,
             binding,
             unpublished.durable_properties().to_vec(),
         )?;
-        if let Some(installer) = self.read_control_installer.as_ref() {
-            let boundary = Arc::new(unpublished.typed_boundary(
-                descriptor,
-                incarnation,
-                crate::typed_read::table_handle::HiveTransactionHandle::new(
-                    true,
-                    incarnation.to_bytes(),
-                ),
-            ));
-            let adapter = Arc::new(boundary.read_runtime_adapter());
-            let codec: Arc<dyn ConnectorReadCodec> = Arc::new(
-                crate::typed_read::IcebergConnectorReadCodec::new(adapter.as_ref().clone()),
-            );
-            let lease = installer(
-                key,
-                Arc::clone(&adapter) as Arc<dyn ConnectorReadMetadata>,
-                adapter as Arc<dyn ConnectorReadSplitManager>,
-                codec,
-            )?;
-            provider.install_read_registration_lease(lease)?;
-        }
         Ok(creation)
     }
 }
@@ -275,29 +286,9 @@ pub struct IcebergUnpublishedControl {
     durable_properties: Vec<(String, String)>,
 }
 
-#[allow(dead_code)]
 impl IcebergUnpublishedControl {
     pub(crate) fn runtime(&self) -> &Arc<IcebergMetadataContext> {
         &self.runtime
-    }
-
-    /// Mint the coordinator-side typed boundary for this control generation.
-    ///
-    /// The runtime handle stays crate-private: the composition root gets a
-    /// ready boundary rather than the runtime it is built from, so nothing
-    /// outside this crate can assemble a second control path over it.
-    pub fn typed_boundary(
-        &self,
-        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
-        incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation,
-        transaction: crate::typed_read::table_handle::HiveTransactionHandle,
-    ) -> crate::typed_boundary::IcebergTypedBoundary {
-        crate::typed_boundary::IcebergTypedBoundary::new(
-            descriptor,
-            incarnation,
-            transaction,
-            Arc::clone(self.runtime()),
-        )
     }
 
     pub fn durable_properties(&self) -> &[(String, String)] {
@@ -344,8 +335,8 @@ mod tests {
     use std::sync::{Arc, Mutex, Weak};
 
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
-    use novarocks_spi::connector::ConnectorInstanceId;
     use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
+    use novarocks_spi::connector::{CatalogHandle, CatalogVersion, ConnectorInstanceId};
 
     use super::*;
 
@@ -692,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn read_registration_is_fallible_and_is_owned_by_the_completed_generation() {
+    fn read_registration_is_fallible_and_is_owned_by_the_completed_catalog_handle() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let binding = crate::access_binding::IcebergReadBinding::new(
@@ -710,12 +701,12 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ))
-        .with_read_control_installer(Arc::new(move |key, metadata, splits, codec| {
+        .with_read_control_installer(Arc::new(move |handle, metadata, splits, codec| {
             // The installer receives one complete matching unit, never an
             // exposed provider boundary or a separately selected codec.
-            assert_eq!(codec.owner(), key.instance_id.as_str());
+            assert_eq!(codec.owner(), handle.catalog_name().as_str());
             let _ = (metadata, splits);
-            *key_sink.lock().expect("key lock") = Some(key);
+            *key_sink.lock().expect("key lock") = Some(handle);
             let lease: Arc<dyn ConnectorReadRegistrationLease> =
                 Arc::new(TestReadRegistrationLease);
             *lease_sink.lock().expect("lease lock") = Some(Arc::downgrade(&lease));
@@ -732,13 +723,18 @@ mod tests {
         .expect("request");
 
         let creation = factory.create_control(request).expect("control creation");
-        let expected_key = ConnectorExecutionBindingKey {
-            instance_id: creation.binding().descriptor().instance_id.clone(),
-            incarnation: creation.binding().incarnation(),
-        };
+        assert!(observed_key.lock().expect("key lock").is_none());
+        let (binding, _) = creation.into_parts();
+        let expected_handle = CatalogHandle::new(
+            binding.descriptor().instance_id.clone(),
+            CatalogVersion::from_bytes([7; 32]),
+        );
+        let binding = binding
+            .with_catalog_handle(expected_handle.clone())
+            .expect("desired state stamps the catalog handle");
         assert_eq!(
             observed_key.lock().expect("key lock").as_ref(),
-            Some(&expected_key)
+            Some(&expected_handle)
         );
         let lease = observed_lease
             .lock()
@@ -748,14 +744,14 @@ mod tests {
         assert!(lease.upgrade().is_some());
 
         // The callback's local strong reference is gone.  The only remaining
-        // strong edge is the private GenerationOwner carried by metadata and
+        // strong edge is the private generation owner carried by metadata and
         // planning capabilities in the returned binding.
-        drop(creation);
+        drop(binding);
         assert!(lease.upgrade().is_none());
     }
 
     #[test]
-    fn read_registration_error_prevents_control_creation() {
+    fn read_registration_error_prevents_catalog_handle_stamping() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let binding = crate::access_binding::IcebergReadBinding::new(
@@ -784,8 +780,13 @@ mod tests {
         )
         .expect("request");
 
-        let error = match factory.create_control(request) {
-            Ok(_) => panic!("registration failure must prevent binding return"),
+        let creation = factory.create_control(request).expect("control creation");
+        let (binding, _) = creation.into_parts();
+        let error = match binding.with_catalog_handle(CatalogHandle::new(
+            ConnectorInstanceId::parse("ice").expect("instance ID"),
+            CatalogVersion::from_bytes([8; 32]),
+        )) {
+            Ok(_) => panic!("registration failure must prevent catalog-handle stamping"),
             Err(error) => error,
         };
         assert_eq!(error.kind(), ConnectorErrorKind::Internal);

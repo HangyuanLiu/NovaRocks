@@ -494,22 +494,17 @@ fn compose_backend_application_services(
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
         BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
     );
-    // One registry per backend: the execution host writes it on ensure and the
-    // fragment runtime reads it at decode, so both agree on which generation is
-    // installed.
-    let read_executions = Arc::new(crate::connector::InstalledReadExecutionRegistry::default());
-    let execution_host = seal_connector_execution_host(
-        execution_installers,
-        read_execution_bundle_factories,
-        Arc::clone(&read_executions),
-    )?;
+    let execution_host = seal_connector_execution_host(execution_installers)?;
     let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(
         Arc::clone(&controls),
         Arc::clone(&execution_host),
     ));
     let catalog_runtime_materializers = Arc::new(
-        crate::connector::catalog_manager::CatalogRuntimeMaterializerSet::try_new(
+        crate::connector::catalog_manager::CatalogRuntimeMaterializerSet::try_new_with_read_execution_factories(
             catalog_runtime_materializers.iter().cloned(),
+            read_execution_bundle_factories.iter().map(|(kind, factory)| {
+                (catalog_provider_kind(*kind), Arc::clone(factory))
+            }),
         )
         .map_err(|error| {
             BackendApplicationError::new(
@@ -563,13 +558,21 @@ fn compose_backend_application_services(
     })
 }
 
+fn catalog_provider_kind(
+    kind: novarocks_spi::connector::ConnectorExecutionProviderKind,
+) -> novarocks_spi::connector::CatalogProviderKind {
+    match kind {
+        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg => {
+            novarocks_spi::connector::CatalogProviderKind::Iceberg
+        }
+        novarocks_spi::connector::ConnectorExecutionProviderKind::StarRocks => {
+            novarocks_spi::connector::CatalogProviderKind::StarRocks
+        }
+    }
+}
+
 fn seal_connector_execution_host(
     execution_installers: &[Arc<dyn ConnectorExecutionInstaller>],
-    read_execution_bundle_factories: &[(
-        novarocks_spi::connector::ConnectorExecutionProviderKind,
-        Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
-    )],
-    read_executions: Arc<crate::connector::InstalledReadExecutionRegistry>,
 ) -> Result<Arc<crate::ConnectorExecutionHost>, BackendApplicationError> {
     #[cfg(test)]
     if execution_installers.is_empty() {
@@ -577,18 +580,14 @@ fn seal_connector_execution_host(
         // composition root. Production startup never takes this branch.
         return Ok(Arc::new(crate::ConnectorExecutionHost::empty_for_tests()));
     }
-    crate::ConnectorExecutionHost::try_new(
-        execution_installers.iter().cloned(),
-        read_execution_bundle_factories.iter().cloned(),
-        read_executions,
-    )
-    .map(Arc::new)
-    .map_err(|error| {
-        BackendApplicationError::new(
-            BackendApplicationErrorKind::Configuration,
-            format!("seal connector execution installer set: {error}"),
-        )
-    })
+    crate::ConnectorExecutionHost::try_new(execution_installers.iter().cloned())
+        .map(Arc::new)
+        .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("seal connector execution installer set: {error}"),
+            )
+        })
 }
 
 impl BackendApplicationHost {

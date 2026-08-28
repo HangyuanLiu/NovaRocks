@@ -1497,6 +1497,33 @@ impl QueryLifecycleRegistry {
         self.local_process_id
     }
 
+    /// Resolve the typed read capability only through an admitted query's
+    /// exact catalog lease. Retained catalog runtimes are intentionally not an
+    /// authority path for fragment decode.
+    pub(crate) fn catalog_read_execution_for_query(
+        &self,
+        execution_id: QueryExecutionId,
+        handle: &novarocks_spi::connector::CatalogHandle,
+    ) -> Result<crate::connector::typed_registry::InstalledReadExecution, String> {
+        let runtime = self
+            .catalog_manager
+            .resolve_for_query(execution_id, handle)
+            .ok_or_else(|| {
+                format!(
+                    "no query-leased catalog runtime exists for {}@{}",
+                    handle.catalog_name().as_str(),
+                    handle.version().short_hex()
+                )
+            })?;
+        runtime.read_execution().ok_or_else(|| {
+            format!(
+                "catalog runtime for {}@{} has no typed read capability",
+                handle.catalog_name().as_str(),
+                handle.version().short_hex()
+            )
+        })
+    }
+
     /// Install the backend-local cleanup owner after application composition
     /// has created the fragment service. The registry holds only a weak link:
     /// the service already owns this registry, so a strong link would form a

@@ -36,24 +36,24 @@ use crate::connector::read_stack::{
     SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
 };
 use crate::connector::{
-    ConnectorError, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorPinnedFileSet, ConnectorRequestContext,
+    CatalogHandle, ConnectorError, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
+    ConnectorRequestContext,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorReadBinding {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    catalog_handle: CatalogHandle,
 }
 
 impl ConnectorReadBinding {
     pub const fn new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        catalog_handle: CatalogHandle,
     ) -> Self {
         Self {
             descriptor,
-            incarnation,
+            catalog_handle,
         }
     }
 
@@ -61,8 +61,8 @@ impl ConnectorReadBinding {
         &self.descriptor
     }
 
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
-        self.incarnation
+    pub const fn catalog_handle(&self) -> &CatalogHandle {
+        &self.catalog_handle
     }
 }
 
@@ -208,12 +208,12 @@ impl Ord for ConnectorReadColumnHandle {
         (
             self.binding.descriptor.provider_id.as_str(),
             self.binding.descriptor.instance_id.as_str(),
-            self.binding.incarnation.to_bytes(),
+            self.binding.catalog_handle.version().as_bytes(),
         )
             .cmp(&(
                 other.binding.descriptor.provider_id.as_str(),
                 other.binding.descriptor.instance_id.as_str(),
-                other.binding.incarnation.to_bytes(),
+                other.binding.catalog_handle.version().as_bytes(),
             ))
             .then_with(|| {
                 self.comparison

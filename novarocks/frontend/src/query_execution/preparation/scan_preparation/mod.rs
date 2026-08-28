@@ -39,12 +39,12 @@ use crate::query_execution::preparation::scan::{
     ResolvedScanColumn, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
 };
 use crate::query_execution::preparation::typed_scan::{TypedRelationFreeze, prepare_typed_scan};
+use novarocks_spi::connector::ConnectorReadSelector;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadChangeWindow, ConnectorReadFrozenRewriteGroup, ConnectorReadRelationKind,
     ConnectorReadRelationVersion, ConnectorReadTableExecuteProcedure, ConnectorSession,
     SchemaTableName,
 };
-use novarocks_spi::connector::{ConnectorExecutionBindingKey, ConnectorReadSelector};
 use novarocks_sql::plan_read::PlanScanNode;
 use novarocks_sql::plan_read::{DistributedNode, DistributedNodeKind, DistributedPlan, FragmentId};
 use novarocks_sql::planning::query_execution::{
@@ -724,13 +724,9 @@ fn prepare_typed_relation_scan(
             "typed connector scan node_id={node_id} has a catalog handle owned by another instance than its planning lease"
         ));
     }
-    let binding_key = ConnectorExecutionBindingKey {
-        instance_id: binding.descriptor().instance_id.clone(),
-        incarnation: binding.incarnation(),
-    };
-    let control: InstalledReadControl = typed.control.resolve_read_control(&binding_key).ok_or_else(|| {
+    let control: InstalledReadControl = typed.control.resolve_read_control(catalog_handle).ok_or_else(|| {
         format!(
-            "typed connector scan node_id={node_id}: no installed read control for exact binding"
+            "typed connector scan node_id={node_id}: no installed read control for exact catalog handle"
         )
     })?;
     let declaration = binding

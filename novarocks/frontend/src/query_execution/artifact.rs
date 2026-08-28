@@ -728,7 +728,6 @@ impl ControlReadyDistributedQuery {
         barrier: &dyn ConnectorBindingInstallBarrier,
     ) -> Result<ConnectorBindingReadyDistributedQuery, DistributedQueryError> {
         let plan = crate::query_execution::connector_binding::compile_install_plan(
-            &self.prepared,
             &self.schedule.inner,
             &self.connector_write_plans,
         )?;

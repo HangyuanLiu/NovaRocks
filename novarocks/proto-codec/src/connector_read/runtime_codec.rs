@@ -33,7 +33,7 @@ use novarocks_spi::connector::read_stack::{
     Assignment, ConnectorReadColumnHandle, ConnectorReadProviderFactory, ConnectorReadRelation,
     ConnectorReadSplit, ConnectorReadTransactionHandle, ConnectorReadWorkSource, TupleDomain,
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorExecutionBindingKey};
+use novarocks_spi::connector::{CatalogHandle, ConnectorError};
 
 use super::{
     CatalogTableHandle, ConnectorTableScanSource, ScheduledSplit, ValidatedColumnHandle,
@@ -128,12 +128,12 @@ impl fmt::Debug for ConnectorReadExecutionBundle {
 /// Provider-owned constructor for a worker read bundle.
 ///
 /// Server composition supplies implementations by provider kind. The backend
-/// invokes it only for a Host-admitted exact key and owns all subsequent
+/// invokes it only for a CatalogManager-admitted immutable catalog handle and owns all subsequent
 /// installation, retirement, and query lifecycle state.
 pub trait ConnectorReadExecutionBundleFactory: Send + Sync {
     fn build(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        catalog_handle: &CatalogHandle,
     ) -> Result<ConnectorReadExecutionBundle, ConnectorError>;
 }
 

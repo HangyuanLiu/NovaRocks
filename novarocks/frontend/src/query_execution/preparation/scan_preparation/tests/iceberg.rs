@@ -327,16 +327,16 @@ fn a_pre_pinned_opaque_read_fails_closed() {
     );
 }
 
-/// A scan whose binding generation is not installed must fail closed: an
-/// absent typed control is never permission to reach some other generation.
+/// A scan whose exact catalog handle is not installed must fail closed: an
+/// absent typed control is never permission to reach another catalog version.
 #[test]
-fn a_scan_whose_binding_generation_does_not_resolve_fails_closed() {
+fn a_scan_whose_catalog_handle_does_not_resolve_fails_closed() {
     let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
         .expect("sealed ordinary iceberg fixture");
     let connectors = registry(vec![data_file("s3://bucket/data.parquet")]);
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     let query_bindings = fixture_query_table_bindings(&plan, &controls);
-    // An empty registry stands for "this generation was never installed".
+    // An empty registry stands for "this catalog handle was never installed".
     let empty =
         Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new());
     let error = expect_preparation_error(
@@ -349,10 +349,10 @@ fn a_scan_whose_binding_generation_does_not_resolve_fails_closed() {
             &fixture_scan_preparation_options(empty),
             &[],
         ),
-        "an uninstalled generation cannot be planned",
+        "an uninstalled catalog handle cannot be planned",
     );
     assert!(
-        error.contains("no installed read control for exact binding"),
+        error.contains("no installed read control for exact catalog handle"),
         "unexpected error: {error}"
     );
 }

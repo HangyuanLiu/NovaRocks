@@ -49,7 +49,7 @@ use crate::fragment::decode::plan::layout::Layout;
 /// not keep growing one parameter at a time.
 #[derive(Clone)]
 pub(crate) struct TypedScanRuntime {
-    read_executions: Arc<crate::connector::typed_registry::InstalledReadExecutionRegistry>,
+    catalog_read_execution: CatalogReadExecutionResolver,
     queues: Arc<
         novarocks_execution::connector::TaskAttemptSplitQueues<
             crate::fragment::ingress::ReceivedReadSplit,
@@ -75,9 +75,20 @@ pub(crate) type RuntimeFilterSessionResolver = Arc<
         + Sync,
 >;
 
+/// Resolves one typed reader only through this attempt's query-leased immutable
+/// catalog runtime. It intentionally cannot look through retained BE catalog
+/// cache entries or re-install a provider runtime during fragment decode.
+pub(crate) type CatalogReadExecutionResolver = Arc<
+    dyn Fn(
+            &novarocks_spi::connector::CatalogHandle,
+        ) -> Result<crate::connector::typed_registry::InstalledReadExecution, String>
+        + Send
+        + Sync,
+>;
+
 impl TypedScanRuntime {
     pub(crate) fn new(
-        read_executions: Arc<crate::connector::typed_registry::InstalledReadExecutionRegistry>,
+        catalog_read_execution: CatalogReadExecutionResolver,
         queues: Arc<
             novarocks_execution::connector::TaskAttemptSplitQueues<
                 crate::fragment::ingress::ReceivedReadSplit,
@@ -88,7 +99,7 @@ impl TypedScanRuntime {
         read_context: Arc<crate::fragment::ingress::TypedReadAttemptContext>,
     ) -> Self {
         Self {
-            read_executions,
+            catalog_read_execution,
             queues,
             session,
             runtime_filter,
@@ -96,10 +107,11 @@ impl TypedScanRuntime {
         }
     }
 
-    pub(crate) fn read_executions(
+    pub(crate) fn catalog_read_execution(
         &self,
-    ) -> Arc<crate::connector::typed_registry::InstalledReadExecutionRegistry> {
-        Arc::clone(&self.read_executions)
+        handle: &novarocks_spi::connector::CatalogHandle,
+    ) -> Result<crate::connector::typed_registry::InstalledReadExecution, String> {
+        (self.catalog_read_execution)(handle)
     }
 
     pub(crate) fn queues(
