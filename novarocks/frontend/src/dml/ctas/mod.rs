@@ -429,7 +429,7 @@ fn validate_target_facts(
     if target.publication_id == publication_id
         && target.provider_id == preflight.provider_id
         && target.instance_id == preflight.instance_id
-        && target.incarnation == preflight.incarnation
+        && target.control_runtime_id == preflight.control_runtime_id
     {
         Ok(())
     } else {
@@ -469,7 +469,6 @@ fn validate_completion(
     let matching = execution_identity == source.facts.execution_identity
         && execution_identity == prepared.execution_identity
         && completion.owner().instance_id.as_str() == target.facts.instance_id
-        && completion.owner().incarnation.to_bytes() == target.facts.incarnation
         && completion.sealed().operation_id().to_bytes() == publication_id.to_bytes()
         && completion.sealed().cohorts().len() == 1;
     if matching {
@@ -586,7 +585,7 @@ mod tests {
             &CtasTargetPreflightFacts {
                 provider_id: "iceberg".to_string(),
                 instance_id: "iceberg".to_string(),
-                incarnation: [1; 16],
+                control_runtime_id: [1; 16],
                 capability_version: 1,
                 target_namespace: "db".to_string(),
                 target_table: "target".to_string(),
@@ -606,7 +605,7 @@ mod tests {
             facts: StandardCtasTargetFacts {
                 provider_id: "iceberg".to_string(),
                 instance_id: "iceberg".to_string(),
-                incarnation: [1; 16],
+                control_runtime_id: [1; 16],
                 publication_id: attempt.header().publication_id(),
                 target_handle_digest: [2; 32],
             },

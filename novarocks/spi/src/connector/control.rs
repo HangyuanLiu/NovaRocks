@@ -969,12 +969,17 @@ impl ConnectorControlPlanningLease {
                 "connector control generation has no atomic staged-create capability",
             )
         })?;
-        let owner = ConnectorExecutionBindingKey {
-            instance_id: self.binding.descriptor().instance_id.clone(),
-            incarnation: self.binding.incarnation(),
-        };
+        let descriptor = self.binding.descriptor().clone();
+        let control_runtime_id = self.binding.control_runtime_id();
+        let provider_incarnation = self.binding.incarnation();
         let retained_planning_lease = self.clone();
-        ConnectorStagedCreateLease::new(owner, capability, move || drop(retained_planning_lease))
+        ConnectorStagedCreateLease::new_with_control_runtime(
+            descriptor,
+            control_runtime_id,
+            provider_incarnation,
+            capability,
+            move || drop(retained_planning_lease),
+        )
     }
 
     /// Derive the catalog-wide unanchored CTAS cleanup capability from this
@@ -993,14 +998,17 @@ impl ConnectorControlPlanningLease {
                     "connector control generation has no unanchored CTAS cleanup capability",
                 )
             })?;
-        let owner = ConnectorExecutionBindingKey {
-            instance_id: self.binding.descriptor().instance_id.clone(),
-            incarnation: self.binding.incarnation(),
-        };
+        let descriptor = self.binding.descriptor().clone();
+        let control_runtime_id = self.binding.control_runtime_id();
+        let provider_incarnation = self.binding.incarnation();
         let retained_planning_lease = self.clone();
-        ConnectorUnanchoredCtasCleanupLease::new(owner, capability, move || {
-            drop(retained_planning_lease)
-        })
+        ConnectorUnanchoredCtasCleanupLease::new_with_control_runtime(
+            descriptor,
+            control_runtime_id,
+            provider_incarnation,
+            capability,
+            move || drop(retained_planning_lease),
+        )
     }
 }
 
