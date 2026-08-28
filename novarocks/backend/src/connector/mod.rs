@@ -16,7 +16,6 @@
 // under the License.
 
 pub mod catalog_manager;
-mod execution_host;
 pub(crate) mod runtime;
 pub mod typed_registry;
 pub mod typed_runtime;
@@ -24,9 +23,6 @@ pub mod typed_runtime;
 #[cfg(test)]
 mod runtime_test;
 
-pub use execution_host::{
-    ConnectorExecutionHost, ConnectorExecutionLease, ConnectorExecutionQueryResolver,
-};
 pub use typed_registry::{InstalledReadExecution, InstalledWriteExecution};
 
 /// Backend-local token passed through native plan decoding.
