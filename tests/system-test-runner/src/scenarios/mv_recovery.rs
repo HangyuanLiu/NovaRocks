@@ -767,7 +767,7 @@ fn assert_mv_not_recovered_after_base_replacement(
     };
     let message = error.to_string();
     if !message.contains("MV target is unavailable")
-        || !message.contains("base table identity changed")
+        || !message.contains("published MV base object identities no longer match the live catalog")
     {
         bail!(
             "refresh after same-name base replacement returned unexpected error {message:?}; {}",
