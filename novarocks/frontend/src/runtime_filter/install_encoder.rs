@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use arrow::datatypes::DataType;
 use novarocks_proto_models::{filter, novarocks as service};
+use novarocks_types::BackendProcessId;
 
 use super::model::{FrontendRuntimeFilterDeployment, FrontendRuntimeFilterParticipant};
 
@@ -16,6 +18,112 @@ fn encoding_error(message: impl Into<String>) -> DistributedQueryError {
 /// arbitrary query artifact.
 pub(crate) struct EncodedRuntimeFilterDeployment {
     contributions: BTreeMap<usize, service::RuntimeFilterContribution>,
+    feedback_declaration: FrontendRuntimeFilterFeedbackDeclaration,
+}
+
+/// FE-private authority compiled from the same sealed deployment as the BE
+/// install.  It is intentionally not a protocol DTO: later lifecycle
+/// admission owns its mutable terminal state, while this value remains a
+/// query-attempt-local immutable declaration.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FrontendRuntimeFilterFeedbackDeclaration {
+    channels: BTreeMap<u32, FrontendRuntimeFilterFeedbackChannel>,
+}
+
+impl FrontendRuntimeFilterFeedbackDeclaration {
+    pub(crate) fn new(
+        channels: impl IntoIterator<Item = FrontendRuntimeFilterFeedbackChannel>,
+    ) -> Result<Self, DistributedQueryError> {
+        let mut by_channel = BTreeMap::new();
+        for channel in channels {
+            if by_channel.insert(channel.channel_id, channel).is_some() {
+                return Err(encoding_error(
+                    "runtime filter feedback declaration repeats a channel",
+                ));
+            }
+        }
+        Ok(Self {
+            channels: by_channel,
+        })
+    }
+
+    pub(crate) fn channels(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &FrontendRuntimeFilterFeedbackChannel> {
+        self.channels.values()
+    }
+
+    pub(crate) fn channel(&self, channel_id: u32) -> Option<&FrontendRuntimeFilterFeedbackChannel> {
+        self.channels.get(&channel_id)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FrontendRuntimeFilterFeedbackChannel {
+    pub(crate) channel_id: u32,
+    pub(crate) contract_digest: [u8; 32],
+    pub(crate) max_encoded_domain_bytes: u64,
+    pub(crate) publishers: Vec<FrontendRuntimeFilterFeedbackPublisherSlot>,
+    pub(crate) scan_bindings: Vec<FrontendRuntimeFilterFeedbackScanBinding>,
+    pub(crate) wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility,
+}
+
+impl FrontendRuntimeFilterFeedbackChannel {
+    pub(crate) const fn channel_id(&self) -> u32 {
+        self.channel_id
+    }
+
+    pub(crate) const fn contract_digest(&self) -> [u8; 32] {
+        self.contract_digest
+    }
+
+    pub(crate) const fn max_encoded_domain_bytes(&self) -> u64 {
+        self.max_encoded_domain_bytes
+    }
+
+    pub(crate) fn publishers(&self) -> &[FrontendRuntimeFilterFeedbackPublisherSlot] {
+        &self.publishers
+    }
+
+    pub(crate) fn scan_bindings(&self) -> &[FrontendRuntimeFilterFeedbackScanBinding] {
+        &self.scan_bindings
+    }
+
+    pub(crate) const fn wait_eligibility(&self) -> &FrontendRuntimeFilterFeedbackWaitEligibility {
+        &self.wait_eligibility
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FrontendRuntimeFilterFeedbackPublisherOwner {
+    DirectSource,
+    Aggregator,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FrontendRuntimeFilterFeedbackPublisherSlot {
+    pub(crate) participant_id: u32,
+    pub(crate) backend_process_id: BackendProcessId,
+    pub(crate) owner: FrontendRuntimeFilterFeedbackPublisherOwner,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FrontendRuntimeFilterFeedbackScanBinding {
+    pub(crate) fragment_id: u32,
+    pub(crate) plan_node_id: i32,
+    pub(crate) binding_id: u32,
+    pub(crate) data_type: DataType,
+    pub(crate) nullable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FrontendRuntimeFilterFeedbackWaitEligibility {
+    Eligible,
+    IneligibleCycle { witness: Vec<u32> },
 }
 
 #[allow(
@@ -34,6 +142,10 @@ impl EncodedRuntimeFilterDeployment {
     pub(crate) fn is_empty(&self) -> bool {
         self.contributions.is_empty()
     }
+
+    pub(crate) fn feedback_declaration(&self) -> &FrontendRuntimeFilterFeedbackDeclaration {
+        &self.feedback_declaration
+    }
 }
 
 /// Encode the already-validated Frontend deployment into the canonical
@@ -42,6 +154,7 @@ impl EncodedRuntimeFilterDeployment {
 /// traversal; the contribution carries content only.
 pub(crate) fn encode_install_contributions(
     deployment: &FrontendRuntimeFilterDeployment,
+    feedback_declaration: FrontendRuntimeFilterFeedbackDeclaration,
 ) -> Result<EncodedRuntimeFilterDeployment, DistributedQueryError> {
     let mut contributions = BTreeMap::new();
     let lifecycle = deployment.lifecycle().to_wire();
@@ -57,7 +170,10 @@ pub(crate) fn encode_install_contributions(
             )));
         }
     }
-    Ok(EncodedRuntimeFilterDeployment { contributions })
+    Ok(EncodedRuntimeFilterDeployment {
+        contributions,
+        feedback_declaration,
+    })
 }
 
 fn encode_participant(
