@@ -1,6 +1,6 @@
 use crate::cli::Cli;
 use crate::config::RunnerConfig;
-use crate::scenario::{Scenario, ScenarioContext};
+use crate::scenario::{Scenario, ScenarioContext, resolve_backend_binaries, resolve_binary};
 use crate::scenarios;
 use anyhow::{Context, Result, bail};
 use novarocks_cluster_harness::{CrossProcessClusterOptions, CrossProcessServerHandle};
@@ -57,6 +57,19 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         .with_context(|| format!("prepare launch configuration for {}", scenario.name()))?;
     let handle = CrossProcessServerHandle::launch(CrossProcessClusterOptions {
         binary: config.binary.clone(),
+        fe_binary: resolve_binary(
+            launch_config.binary_layout.frontend,
+            config.compatible_binary.as_ref(),
+            config.other_island_binary.as_ref(),
+        )?,
+        be_binaries: resolve_backend_binaries(
+            &launch_config.binary_layout.backends,
+            &config.binary,
+            config.compatible_binary.as_ref(),
+            config.other_island_binary.as_ref(),
+            config.cluster_size,
+        )?,
+        expected_eligible_backend_count: launch_config.expected_eligible_backend_count,
         base_config_path: config.base_config_path.clone(),
         runtime_root: scenario_root.clone(),
         cluster_size: config.cluster_size,
@@ -74,6 +87,8 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         scenario_root,
         config.timeout,
         config.binary.clone(),
+        config.compatible_binary.clone(),
+        config.other_island_binary.clone(),
         config.base_config_path.clone(),
         config.cluster_size,
     );

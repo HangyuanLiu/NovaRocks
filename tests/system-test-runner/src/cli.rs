@@ -6,6 +6,8 @@ pub struct Cli {
     pub list: bool,
     pub only: Vec<String>,
     pub binary: Option<PathBuf>,
+    pub compatible_binary: Option<PathBuf>,
+    pub other_island_binary: Option<PathBuf>,
     pub config: Option<PathBuf>,
     pub artifact_root: Option<PathBuf>,
     pub cluster_size: usize,
@@ -22,6 +24,8 @@ impl Cli {
             list: false,
             only: Vec::new(),
             binary: None,
+            compatible_binary: None,
+            other_island_binary: None,
             config: None,
             artifact_root: None,
             cluster_size: 3,
@@ -38,6 +42,12 @@ impl Cli {
                 "--list" => cli.list = true,
                 "--only" => cli.only.push(value("--only")?),
                 "--binary" => cli.binary = Some(PathBuf::from(value("--binary")?)),
+                "--compatible-binary" => {
+                    cli.compatible_binary = Some(PathBuf::from(value("--compatible-binary")?));
+                }
+                "--other-island-binary" => {
+                    cli.other_island_binary = Some(PathBuf::from(value("--other-island-binary")?));
+                }
                 "--config" => cli.config = Some(PathBuf::from(value("--config")?)),
                 "--artifact-root" => {
                     cli.artifact_root = Some(PathBuf::from(value("--artifact-root")?));
@@ -66,7 +76,7 @@ impl Cli {
     }
 
     pub const fn usage() -> &'static str {
-        "usage: novarocks-system-tests [--list] [--only <exact-name>]... \\\n+         [--binary <path> --config <path> --artifact-root <path>] \\\n+         [--cluster-size <N>] [--timeout-secs <N>]"
+        "usage: novarocks-system-tests [--list] [--only <exact-name>]... \\\n+         [--binary <path> [--compatible-binary <path>] [--other-island-binary <path>] \\\n+          --config <path> --artifact-root <path>] \\\n+         [--cluster-size <N>] [--timeout-secs <N>]"
     }
 }
 
@@ -91,5 +101,24 @@ mod tests {
         ])
         .expect("parse repeated selectors");
         assert_eq!(cli.only.len(), 2);
+    }
+
+    #[test]
+    fn parses_optional_compatibility_island_binaries() {
+        let cli = Cli::parse(vec![
+            "--compatible-binary".to_string(),
+            "/tmp/compatible".to_string(),
+            "--other-island-binary".to_string(),
+            "/tmp/other-island".to_string(),
+        ])
+        .expect("parse optional island binaries");
+        assert_eq!(
+            cli.compatible_binary,
+            Some(PathBuf::from("/tmp/compatible"))
+        );
+        assert_eq!(
+            cli.other_island_binary,
+            Some(PathBuf::from("/tmp/other-island"))
+        );
     }
 }

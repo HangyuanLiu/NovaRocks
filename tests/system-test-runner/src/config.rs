@@ -6,6 +6,8 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
     pub binary: PathBuf,
+    pub compatible_binary: Option<PathBuf>,
+    pub other_island_binary: Option<PathBuf>,
     pub base_config_path: PathBuf,
     pub artifact_root: PathBuf,
     pub cluster_size: usize,
@@ -21,6 +23,10 @@ impl RunnerConfig {
         if !binary.is_file() {
             bail!("--binary path does not name a file: {}", binary.display());
         }
+        let compatible_binary =
+            validate_optional_binary(cli.compatible_binary.clone(), "--compatible-binary")?;
+        let other_island_binary =
+            validate_optional_binary(cli.other_island_binary.clone(), "--other-island-binary")?;
         let base_config_path = cli
             .config
             .clone()
@@ -37,10 +43,23 @@ impl RunnerConfig {
             .context("--artifact-root is required when running scenarios")?;
         Ok(Self {
             binary,
+            compatible_binary,
+            other_island_binary,
             base_config_path,
             artifact_root,
             cluster_size: cli.cluster_size,
             timeout: Duration::from_secs(cli.timeout_secs),
         })
+    }
+}
+
+fn validate_optional_binary(binary: Option<PathBuf>, flag: &str) -> Result<Option<PathBuf>> {
+    if let Some(binary) = binary {
+        if !binary.is_file() {
+            bail!("{flag} path does not name a file: {}", binary.display());
+        }
+        Ok(Some(binary))
+    } else {
+        Ok(None)
     }
 }

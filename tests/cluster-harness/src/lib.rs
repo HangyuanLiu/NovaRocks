@@ -689,6 +689,14 @@ pub struct CrossProcessConfigOverlay {
 #[derive(Debug, Clone)]
 pub struct CrossProcessClusterOptions {
     pub binary: PathBuf,
+    /// Optional frontend override. `None` preserves the primary `binary`.
+    pub fe_binary: Option<PathBuf>,
+    /// Optional per-index backend overrides. An empty vector preserves the
+    /// primary `binary` for every backend.
+    pub be_binaries: Vec<PathBuf>,
+    /// Number of same-island backends required by the startup topology
+    /// barrier. `None` preserves the normal `cluster_size` requirement.
+    pub expected_eligible_backend_count: Option<usize>,
     pub base_config_path: PathBuf,
     pub runtime_root: PathBuf,
     pub cluster_size: usize,
@@ -1290,19 +1298,19 @@ impl QueryLifecyclePhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BackendTopologyRow {
-    process_id: String,
-    grpc_port: u16,
-    state: String,
-    alive: bool,
-    scheduled_fragments: u64,
-    build_identity: String,
-    native_compatibility_id: String,
-    status_detail: String,
+pub struct BackendTopologyRow {
+    pub process_id: String,
+    pub grpc_port: u16,
+    pub state: String,
+    pub alive: bool,
+    pub scheduled_fragments: u64,
+    pub build_identity: String,
+    pub native_compatibility_id: String,
+    pub status_detail: String,
 }
 
 impl BackendTopologyRow {
-    fn is_eligible_live(&self) -> bool {
+    pub fn is_eligible_live(&self) -> bool {
         self.state == "Live"
             && self.alive
             && !self.build_identity.is_empty()
@@ -1537,9 +1545,10 @@ fn remaining_until(deadline: Instant, operation: &str) -> Result<Duration> {
 
 fn validate_live_backend_topology(
     expected_ports: &[u16],
+    expected_eligible_backend_count: usize,
     rows: &[BackendTopologyRow],
 ) -> Result<()> {
-    let expected = expected_ports.len();
+    let expected = expected_eligible_backend_count;
     let live_rows = rows
         .iter()
         .filter(|row| row.is_eligible_live())
@@ -1557,7 +1566,7 @@ fn validate_live_backend_topology(
         .collect::<Vec<_>>();
     observed_ports.sort_unstable();
     if live == expected
-        && observed_ports == configured_ports
+        && (expected != expected_ports.len() || observed_ports == configured_ports)
         && (expected == 0 || compatibility_ids.len() == 1)
     {
         return Ok(());
@@ -1590,6 +1599,7 @@ fn validate_live_backend_topology(
 
 fn wait_for_live_backend_topology_with<Q, S, H>(
     expected_ports: &[u16],
+    expected_eligible_backend_count: usize,
     timeout: Duration,
     mut process_health: H,
     mut query: Q,
@@ -1608,7 +1618,11 @@ where
         let remaining = deadline.saturating_duration_since(Instant::now());
         let io_timeout = topology_mysql_io_timeout(remaining);
         let last_observation = match query(io_timeout) {
-            Ok(rows) => match validate_live_backend_topology(expected_ports, &rows) {
+            Ok(rows) => match validate_live_backend_topology(
+                expected_ports,
+                expected_eligible_backend_count,
+                &rows,
+            ) {
                 Ok(()) => return Ok(rows),
                 Err(error) => error.to_string(),
             },
@@ -1635,6 +1649,7 @@ struct LiveBackendTopologyWait<'a> {
     mysql_user: &'a str,
     runtime: &'a CrossProcessRuntime,
     expected_ports: &'a [u16],
+    expected_eligible_backend_count: usize,
     fe_config_path: &'a Path,
     be_config_paths: &'a [PathBuf],
     timeout: Duration,
@@ -1645,11 +1660,12 @@ fn wait_for_live_backend_topology(
     fe_process: &mut ManagedProcess,
     be_processes: &mut [ManagedProcess],
 ) -> Result<()> {
-    let expected = wait.expected_ports.len();
+    let expected = wait.expected_eligible_backend_count;
     let host = "127.0.0.1";
     let port = wait.runtime.fe_mysql_port;
     let rows = wait_for_live_backend_topology_with(
         wait.expected_ports,
+        wait.expected_eligible_backend_count,
         wait.timeout,
         || {
             process_runtime_diagnostics(
@@ -2780,7 +2796,9 @@ pub struct CrossProcessServerHandle {
     runtime_dir: PathBuf,
     runtime: CrossProcessRuntime,
     native_trust_fixture: PreparedNativeTrustFixture,
-    novarocks_bin: PathBuf,
+    fe_binary: PathBuf,
+    be_binaries: Vec<PathBuf>,
+    expected_eligible_backend_count: usize,
     be_config_paths: Vec<PathBuf>,
     fe_config_path: PathBuf,
     be_processes: Vec<ManagedProcess>,
@@ -2826,6 +2844,9 @@ impl CrossProcessServerHandle {
     pub fn launch(options: CrossProcessClusterOptions) -> Result<Self> {
         let CrossProcessClusterOptions {
             binary: novarocks_bin,
+            fe_binary,
+            be_binaries,
+            expected_eligible_backend_count,
             base_config_path,
             runtime_root,
             cluster_size,
@@ -2836,6 +2857,25 @@ impl CrossProcessServerHandle {
             config_overlay,
             native_trust_fixture,
         } = options;
+        let fe_binary = fe_binary.unwrap_or_else(|| novarocks_bin.clone());
+        let be_binaries = if be_binaries.is_empty() {
+            vec![novarocks_bin; cluster_size]
+        } else {
+            if be_binaries.len() != cluster_size {
+                bail!(
+                    "expected {cluster_size} backend binaries, got {}",
+                    be_binaries.len()
+                );
+            }
+            be_binaries
+        };
+        let expected_eligible_backend_count =
+            expected_eligible_backend_count.unwrap_or(cluster_size);
+        if expected_eligible_backend_count > cluster_size {
+            bail!(
+                "expected eligible backend count {expected_eligible_backend_count} exceeds cluster size {cluster_size}"
+            );
+        }
         let mut fe_environment = child_environment.fe;
         let mut be_environments = resolve_be_environments(
             &child_environment.be,
@@ -2942,7 +2982,7 @@ impl CrossProcessServerHandle {
         let _ = reserved.fe_grpc_port.release();
         let _ = reserved.fe_mysql_port.release();
         let mut fe_process = spawn_novarocks_process(ProcessLaunch {
-            binary: &novarocks_bin,
+            binary: &fe_binary,
             role: "fe",
             config_path: &fe_config_path,
             marker: "NOVAROCKS_READY mysql_port=",
@@ -2973,7 +3013,7 @@ impl CrossProcessServerHandle {
             let _ = reserved_be.http.release();
             let _ = reserved_be.grpc.release();
             let be_process = spawn_novarocks_process(ProcessLaunch {
-                binary: &novarocks_bin,
+                binary: &be_binaries[i],
                 role: "be",
                 config_path: be_config_path,
                 marker: "NOVAROCKS_READY role=be",
@@ -2999,6 +3039,7 @@ impl CrossProcessServerHandle {
                 mysql_user: &mysql_user,
                 runtime: &runtime,
                 expected_ports: &runtime.be.iter().map(|be| be.grpc).collect::<Vec<_>>(),
+                expected_eligible_backend_count,
                 fe_config_path: &fe_config_path,
                 be_config_paths: &be_config_paths,
                 timeout: startup_timeout,
@@ -3025,7 +3066,9 @@ impl CrossProcessServerHandle {
             runtime_dir: runtime_dir.into_path(),
             runtime,
             native_trust_fixture,
-            novarocks_bin,
+            fe_binary,
+            be_binaries,
+            expected_eligible_backend_count,
             be_config_paths,
             fe_config_path,
             be_processes,
@@ -3042,6 +3085,18 @@ impl CrossProcessServerHandle {
     /// Frozen runtime ports and endpoints for this launched cluster.
     pub fn runtime(&self) -> &CrossProcessRuntime {
         &self.runtime
+    }
+
+    /// Read the frontend's current `SHOW BACKENDS` projection without changing
+    /// cluster state. Scenarios use this to assert compatibility-island
+    /// diagnostics after the launch barrier has completed.
+    pub fn frontend_backend_topology(&self) -> Result<Vec<BackendTopologyRow>> {
+        query_frontend_backend_topology(
+            &self.mysql_user,
+            &self.target_host,
+            self.target_port,
+            TOPOLOGY_MYSQL_IO_TIMEOUT_CAP,
+        )
     }
 
     /// The selected harness-owned Native transport profile.
@@ -3976,7 +4031,11 @@ impl ServerHandle for CrossProcessServerHandle {
             })?
             .clone();
         let marker = "NOVAROCKS_READY role=be";
-        let mut command = build_novarocks_command(&self.novarocks_bin, "be", &config_path);
+        let binary = self
+            .be_binaries
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("missing binary for cross-process BE[{index}]"))?;
+        let mut command = build_novarocks_command(binary, "be", &config_path);
         command.env(
             "NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE",
             &self.fragment_failure_trigger_paths[index],
@@ -4005,7 +4064,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 remaining_until(deadline, "BE readiness")?,
                 log_path,
             )
-            .map_err(|error| map_novarocks_process_error(&self.novarocks_bin, "be", marker, error))
+            .map_err(|error| map_novarocks_process_error(binary, "be", marker, error))
             .with_context(|| format!("restart cross-process BE[{index}]"))?;
         println!(
             "restarted cross-process BE[{index}] pid={} config={}",
@@ -4018,6 +4077,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 mysql_user: &self.mysql_user,
                 runtime: &self.runtime,
                 expected_ports: &expected_ports,
+                expected_eligible_backend_count: self.expected_eligible_backend_count,
                 fe_config_path: &self.fe_config_path,
                 be_config_paths: &self.be_config_paths,
                 timeout: remaining_until(deadline, "BE topology barrier")?,
@@ -4122,7 +4182,7 @@ impl ServerHandle for CrossProcessServerHandle {
             .context("preserve cross-process FE log before restart")?;
         self.fe_log_history.push_str(&prior_log);
         let marker = "NOVAROCKS_READY mysql_port=";
-        let mut command = build_novarocks_command(&self.novarocks_bin, "fe", &self.fe_config_path);
+        let mut command = build_novarocks_command(&self.fe_binary, "fe", &self.fe_config_path);
         if self.query_lifecycle_faults_enabled {
             command.env(
                 novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
@@ -4144,7 +4204,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 remaining_until(deadline, "FE readiness")?,
                 self.runtime_dir.join("fe.log"),
             )
-            .map_err(|error| map_novarocks_process_error(&self.novarocks_bin, "fe", marker, error))
+            .map_err(|error| map_novarocks_process_error(&self.fe_binary, "fe", marker, error))
             .context("restart cross-process FE")?;
         println!(
             "restarted cross-process FE pid={} config={}",
@@ -4157,6 +4217,7 @@ impl ServerHandle for CrossProcessServerHandle {
                 mysql_user: &self.mysql_user,
                 runtime: &self.runtime,
                 expected_ports: &expected_ports,
+                expected_eligible_backend_count: self.expected_eligible_backend_count,
                 fe_config_path: &self.fe_config_path,
                 be_config_paths: &self.be_config_paths,
                 timeout: remaining_until(deadline, "FE topology barrier")?,
@@ -4997,14 +5058,15 @@ mod tests {
             backend_row(19070, "Live", true),
             backend_row(19071, "Live", true),
         ];
-        validate_live_backend_topology(&expected, &ready).expect("2/2 Live should pass");
+        validate_live_backend_topology(&expected, expected.len(), &ready)
+            .expect("2/2 Live should pass");
 
         let extra = vec![
             backend_row(19070, "Live", true),
             backend_row(19071, "Live", true),
             backend_row(19072, "Live", true),
         ];
-        let err = validate_live_backend_topology(&expected, &extra)
+        let err = validate_live_backend_topology(&expected, expected.len(), &extra)
             .expect_err("an extra registered backend must fail the exact topology");
         assert!(err.to_string().contains("registered=3 expected=2"), "{err}");
 
@@ -5012,7 +5074,7 @@ mod tests {
             backend_row(19070, "Live", true),
             backend_row(19071, "Registering", false),
         ];
-        let err = validate_live_backend_topology(&expected, &registering)
+        let err = validate_live_backend_topology(&expected, expected.len(), &registering)
             .expect_err("a non-Live configured backend must fail readiness");
         assert!(err.to_string().contains("live=1 expected=2"), "{err}");
         assert!(err.to_string().contains("19071:Registering:false"), "{err}");
@@ -5021,7 +5083,7 @@ mod tests {
             backend_row(19070, "Live", true),
             backend_row(19072, "Live", true),
         ];
-        let err = validate_live_backend_topology(&expected, &stale_replacement)
+        let err = validate_live_backend_topology(&expected, expected.len(), &stale_replacement)
             .expect_err("a stale Live backend must not replace a configured endpoint");
         assert!(
             err.to_string()
@@ -5036,7 +5098,7 @@ mod tests {
                 ..backend_row(19071, "Live", true)
             },
         ];
-        validate_live_backend_topology(&expected, &same_island_different_builds)
+        validate_live_backend_topology(&expected, expected.len(), &same_island_different_builds)
             .expect("different builds in one compatibility island must pass the barrier");
 
         let island_split = vec![
@@ -5046,7 +5108,7 @@ mod tests {
                 ..backend_row(19071, "Live", true)
             },
         ];
-        let err = validate_live_backend_topology(&expected, &island_split)
+        let err = validate_live_backend_topology(&expected, expected.len(), &island_split)
             .expect_err("mixed native compatibility islands must fail the barrier");
         assert!(
             err.to_string().contains(
@@ -5062,7 +5124,9 @@ mod tests {
                 ..backend_row(19071, "Live", true)
             },
         ];
-        assert!(validate_live_backend_topology(&expected, &empty_identity).is_err());
+        assert!(
+            validate_live_backend_topology(&expected, expected.len(), &empty_identity).is_err()
+        );
 
         let detail_on_live = vec![
             backend_row(19070, "Live", true),
@@ -5071,7 +5135,9 @@ mod tests {
                 ..backend_row(19071, "Live", true)
             },
         ];
-        assert!(validate_live_backend_topology(&expected, &detail_on_live).is_err());
+        assert!(
+            validate_live_backend_topology(&expected, expected.len(), &detail_on_live).is_err()
+        );
 
         let incompatible = vec![
             backend_row(19070, "Live", true),
@@ -5082,7 +5148,7 @@ mod tests {
                 ..backend_row(19071, "Live", true)
             },
         ];
-        assert!(validate_live_backend_topology(&expected, &incompatible).is_err());
+        assert!(validate_live_backend_topology(&expected, expected.len(), &incompatible).is_err());
 
         let retained_replacement = vec![
             backend_row(19070, "Live", true),
@@ -5099,7 +5165,7 @@ mod tests {
                     .to_string(),
             },
         ];
-        validate_live_backend_topology(&expected, &retained_replacement)
+        validate_live_backend_topology(&expected, expected.len(), &retained_replacement)
             .expect("a retained replaced process must not alter the live topology");
         let selected = retained_replacement
             .iter()
@@ -5109,12 +5175,29 @@ mod tests {
     }
 
     #[test]
+    fn topology_barrier_allows_an_explicit_smaller_compatibility_island() {
+        let expected_ports = [19070, 19071, 19072];
+        let mut other_island = backend_row(19072, "OtherIsland", false);
+        other_island.native_compatibility_id = "other-native-compatibility".to_string();
+        validate_live_backend_topology(
+            &expected_ports,
+            2,
+            &[
+                backend_row(19070, "Live", true),
+                backend_row(19071, "Live", true),
+                other_island,
+            ],
+        )
+        .expect("two same-island backends may satisfy an explicit two-backend barrier");
+    }
+
+    #[test]
     fn empty_backend_topology_is_ready_only_when_show_backends_is_empty() {
-        validate_live_backend_topology(&[], &[])
+        validate_live_backend_topology(&[], 0, &[])
             .expect("an empty self-registration registry should be ready before any BE announces");
 
         let unexpected = vec![backend_row(19070, "Live", true)];
-        let error = validate_live_backend_topology(&[], &unexpected)
+        let error = validate_live_backend_topology(&[], 0, &unexpected)
             .expect_err("an empty topology expectation must reject an announced backend row");
         assert!(
             error.to_string().contains("registered=1 expected=0"),
@@ -5128,6 +5211,7 @@ mod tests {
         let mut io_timeouts = Vec::new();
         let snapshot = wait_for_live_backend_topology_with(
             &[19070, 19071],
+            2,
             Duration::from_secs(1),
             || Ok("fe=running be=[running,running]".to_string()),
             |io_timeout| {
@@ -5163,6 +5247,7 @@ mod tests {
     fn backend_topology_barrier_timeout_includes_pid_and_endpoint_diagnostics() {
         let err = wait_for_live_backend_topology_with(
             &[19070, 19071, 19072],
+            3,
             Duration::ZERO,
             || Ok("fe_pid=11 be_pids=[21,22,23] fe_mysql=127.0.0.1:29030 be_grpc=[127.0.0.1:19070,127.0.0.1:19071,127.0.0.1:19072]".to_string()),
             |_| Ok(vec![backend_row(19070, "Live", true)]),
@@ -5187,6 +5272,7 @@ mod tests {
         let mut queries = 0;
         let err = wait_for_live_backend_topology_with(
             &[19070],
+            1,
             Duration::from_secs(30),
             || {
                 bail!(
@@ -5216,6 +5302,7 @@ mod tests {
         let mut health_checks = 0;
         let err = wait_for_live_backend_topology_with(
             &[19070],
+            1,
             Duration::ZERO,
             || {
                 health_checks += 1;
