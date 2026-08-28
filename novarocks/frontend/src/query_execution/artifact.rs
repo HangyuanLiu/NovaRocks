@@ -39,7 +39,7 @@ use crate::query_execution::contract::QueryId;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch, StageParticipantBinding};
 use crate::query_execution::lifecycle_plan::{
-    QueryInitBarrier, QueryInitOptions, QueryLifecycleLease,
+    QueryCatalogLease, QueryInitBarrier, QueryInitOptions, QueryLifecycleLease,
 };
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::{
@@ -610,12 +610,12 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
                 "query initialization execution id does not match validated schedule",
             ));
         }
-        let catalog_set = merge_prepared_catalog_set(
+        let query_catalog_lease = freeze_query_catalog_lease(
             &self.prepared,
             &self.connector_write_plans,
             options.catalog_set(),
         )?;
-        let options = options.with_catalog_set(catalog_set);
+        let options = options.with_catalog_set(query_catalog_lease.catalog_set().clone());
         let runtime_filters = self
             .runtime_filter_contributions
             .into_iter()
@@ -631,7 +631,9 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             &options,
         )?;
         let stage_bindings = plan.stage_participant_bindings()?;
-        let query_lifecycle_lease = barrier.initialize_all(plan)?;
+        let query_lifecycle_lease = barrier
+            .initialize_all(plan)?
+            .with_catalog_lease(query_catalog_lease);
         Ok(ControlReadyDistributedQuery {
             handoff_id: self.handoff_id,
             prepared: self.prepared,
@@ -649,15 +651,21 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
 /// contribution. `CatalogSet` is the sole BE materialization input: never
 /// recover these values from the current FE control host after query assembly
 /// has started.
-fn merge_prepared_catalog_set(
+/// Freeze every catalog-bound execution artifact into one exact query set and
+/// retain the FE control leases that produced typed reads.  Write attachments
+/// retain their source planning leases through `ConnectorWriteLease`; keeping
+/// those attachments in the existing query typestates therefore supplies the
+/// same terminal ownership without reopening SPI internals here.
+fn freeze_query_catalog_lease(
     prepared: &PreparedFragmentSet,
     connector_write_plans: &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
     existing: &CatalogSet,
-) -> Result<CatalogSet, DistributedQueryError> {
+) -> Result<QueryCatalogLease, DistributedQueryError> {
     let typed_reads = prepared
         .scan_bindings()
         .typed_scans()
-        .map(|(_, _, scan)| scan.catalog_properties.clone());
+        .map(|(_, _, scan)| (scan.catalog_properties.clone(), scan.planning_lease.clone()))
+        .collect::<Vec<_>>();
     let writes = connector_write_plans.values().map(|attachment| {
         attachment.catalog_properties().cloned().ok_or_else(|| {
             contract_error(
@@ -665,10 +673,20 @@ fn merge_prepared_catalog_set(
             )
         })
     });
-    merge_catalog_properties(
+    let catalog_set = merge_catalog_properties(
         existing,
-        typed_reads.chain(writes.collect::<Result<Vec<_>, _>>()?),
-    )
+        typed_reads
+            .iter()
+            .map(|(properties, _)| properties.clone())
+            .chain(writes.collect::<Result<Vec<_>, _>>()?),
+    )?;
+    Ok(QueryCatalogLease::new(
+        catalog_set,
+        typed_reads
+            .into_iter()
+            .map(|(_, planning_lease)| planning_lease)
+            .collect(),
+    ))
 }
 
 fn merge_catalog_properties(

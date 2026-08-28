@@ -33,6 +33,7 @@ use novarocks_proto_codec::lifecycle::{
 };
 use novarocks_proto_models::common;
 use novarocks_proto_models::novarocks;
+use novarocks_spi::connector::ConnectorControlPlanningLease;
 use novarocks_types::BackendProcessId;
 use novarocks_types::NativeCompatibilityId;
 
@@ -492,14 +493,66 @@ pub trait QueryLifecycleLeaseGuard: Send + 'static {
     fn abort_preserving(self: Box<Self>, primary_error: String) -> QueryLifecycleAbortOutcome;
 }
 
+/// FE-local ownership retained for every catalog dependency frozen into one
+/// query Init contribution.  The catalog set is immutable once this lease is
+/// constructed; the control leases keep the exact FE runtimes that produced
+/// those artifacts alive until the attempt reaches a terminal path.
+///
+/// This is deliberately attached to [`QueryLifecycleLease`] instead of a
+/// transport or fragment carrier.  Catalog materialization is already frozen
+/// in Init, while control-runtime lifetime remains a Frontend-local concern.
+pub(crate) struct QueryCatalogLease {
+    catalog_set: CatalogSet,
+    #[allow(
+        dead_code,
+        reason = "Drop retains these exact FE control leases until lifecycle termination."
+    )]
+    control_leases: Vec<ConnectorControlPlanningLease>,
+}
+
+impl QueryCatalogLease {
+    pub(crate) fn new(
+        catalog_set: CatalogSet,
+        control_leases: Vec<ConnectorControlPlanningLease>,
+    ) -> Self {
+        Self {
+            catalog_set,
+            control_leases,
+        }
+    }
+
+    pub(crate) fn catalog_set(&self) -> &CatalogSet {
+        &self.catalog_set
+    }
+
+    #[cfg(test)]
+    pub(crate) fn control_lease_count(&self) -> usize {
+        self.control_leases.len()
+    }
+}
+
 #[must_use = "query lifecycle must be finalized or aborted"]
 pub struct QueryLifecycleLease {
     guard: Option<Box<dyn QueryLifecycleLeaseGuard>>,
+    catalog_lease: Option<QueryCatalogLease>,
 }
 
 impl QueryLifecycleLease {
     pub fn new(guard: Box<dyn QueryLifecycleLeaseGuard>) -> Self {
-        Self { guard: Some(guard) }
+        Self {
+            guard: Some(guard),
+            catalog_lease: None,
+        }
+    }
+
+    /// Attach the query-wide FE catalog ownership after the exact Init plan
+    /// has been accepted by the barrier.  Finalize, explicit abort, and the
+    /// drop-time abort path all consume this wrapper, so the control leases
+    /// cannot drain while an attempt is still live.
+    pub(crate) fn with_catalog_lease(mut self, catalog_lease: QueryCatalogLease) -> Self {
+        debug_assert!(self.catalog_lease.is_none());
+        self.catalog_lease = Some(catalog_lease);
+        self
     }
 
     pub fn finalize(mut self) -> Result<QueryTerminalSet, DistributedQueryError> {
@@ -649,11 +702,15 @@ pub(crate) fn compile_query_init_plan(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::OnceLock;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
 
-    use super::{QueryInitOptions, compile_query_init_plan};
+    use super::{
+        QueryCatalogLease, QueryInitOptions, QueryLifecycleAbortOutcome, QueryLifecycleLease,
+        QueryLifecycleLeaseGuard, compile_query_init_plan,
+    };
     use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
     use crate::query_execution::contract::{QueryId, ResolvedQueryOptions};
     use crate::query_execution::schedule::FragmentLifecycleProjection;
@@ -664,9 +721,30 @@ mod tests {
     use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_proto_models::novarocks;
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
+        CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogVersion,
+        ConnectorControlPlanningLease, ConnectorInstanceId,
     };
     use novarocks_types::{BackendProcessId, UniqueId};
+
+    struct CountingLifecycleGuard;
+
+    impl QueryLifecycleLeaseGuard for CountingLifecycleGuard {
+        fn finalize(
+            self: Box<Self>,
+        ) -> Result<
+            crate::query_execution::terminal_set::QueryTerminalSet,
+            crate::query_execution::contract::DistributedQueryError,
+        > {
+            Ok(
+                crate::query_execution::terminal_set::QueryTerminalSet::new(Vec::new())
+                    .expect("empty terminal set"),
+            )
+        }
+
+        fn abort_preserving(self: Box<Self>, primary_error: String) -> QueryLifecycleAbortOutcome {
+            QueryLifecycleAbortOutcome::new(primary_error, None)
+        }
+    }
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(
@@ -729,6 +807,47 @@ mod tests {
         )
         .expect("catalog properties")])
         .expect("catalog set")
+    }
+
+    #[test]
+    fn query_catalog_lease_drains_only_after_lifecycle_finalize_or_abort() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let binding = crate::connector::scan_model::planned_files_fixture_binding(
+            "catalog.lease",
+            HashMap::new(),
+            None,
+        );
+        let release_counter = Arc::clone(&releases);
+        let planning_lease = ConnectorControlPlanningLease::new(binding.into(), move || {
+            release_counter.fetch_add(1, Ordering::SeqCst);
+        });
+        let catalog_lease = QueryCatalogLease::new(catalog_set(), vec![planning_lease]);
+        assert_eq!(catalog_lease.control_lease_count(), 1);
+
+        QueryLifecycleLease::new(Box::new(CountingLifecycleGuard))
+            .with_catalog_lease(catalog_lease)
+            .finalize()
+            .expect("lifecycle finalizes");
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+
+        let release_counter = Arc::clone(&releases);
+        let planning_lease = ConnectorControlPlanningLease::new(
+            crate::connector::scan_model::planned_files_fixture_binding(
+                "catalog.abort",
+                HashMap::new(),
+                None,
+            )
+            .into(),
+            move || {
+                release_counter.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let catalog_lease = QueryCatalogLease::new(catalog_set(), vec![planning_lease]);
+        drop(
+            QueryLifecycleLease::new(Box::new(CountingLifecycleGuard))
+                .with_catalog_lease(catalog_lease),
+        );
+        assert_eq!(releases.load(Ordering::SeqCst), 2);
     }
 
     #[test]
