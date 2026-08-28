@@ -20,17 +20,18 @@ use std::sync::{Arc, Mutex};
 use super::{
     CatalogHandle, CatalogProperties, ConnectorBeginScanRequest, ConnectorCatalogMutation,
     ConnectorCatalogMutationResolver, ConnectorCleanupMaintenance,
-    ConnectorCleanupMaintenanceResolver, ConnectorDataMutation, ConnectorDataMutationResolver,
-    ConnectorDistributedRewrite, ConnectorDistributedRewriteResolver, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStagedCreate,
-    ConnectorStagedCreateLease, ConnectorStagedPublicationRecovery, ConnectorStatistics,
-    ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorTableHandle,
-    ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata,
-    ConnectorWriteControl, ConnectorWriteLease,
+    ConnectorCleanupMaintenanceResolver, ConnectorControlRuntimeId, ConnectorDataMutation,
+    ConnectorDataMutationResolver, ConnectorDistributedRewrite,
+    ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
+    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorProviderId,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
+    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsLease,
+    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorUnanchoredCtasCleanup,
+    ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata, ConnectorWriteControl,
+    ConnectorWriteLease,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -220,10 +221,12 @@ pub trait ConnectorControlFactoryResolver: Send + Sync {
 
 /// A control-plane Connector generation. Metadata, scan planning, and
 /// execution distribution must all describe the same logical descriptor and
-/// incarnation. It is deliberately unable to open a batch reader.
+/// legacy effect generation. Its separately minted control-runtime ID is an
+/// FE-local owner and is deliberately unable to open a batch reader.
 pub struct ConnectorControlBinding {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ConnectorInstanceIncarnation,
+    control_runtime_id: ConnectorControlRuntimeId,
     /// Immutable BE materialization input assigned by the FE desired-state
     /// owner before this control binding becomes query-admissible.
     ///
@@ -418,6 +421,7 @@ impl ConnectorControlBinding {
         Ok(Self {
             descriptor,
             incarnation,
+            control_runtime_id: ConnectorControlRuntimeId::new(),
             catalog_properties: None,
             catalog_handle_installer: None,
             metadata,
@@ -634,6 +638,13 @@ impl ConnectorControlBinding {
         self.incarnation
     }
 
+    /// Returns this process-local FE control runtime identity. It is distinct
+    /// from the provider's legacy effect generation and from the BE-visible
+    /// `CatalogHandle`; neither may be derived from the other.
+    pub fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
+        self.control_runtime_id
+    }
+
     /// Stamps this FE-local control generation with the exact immutable BE
     /// materialization input derived from authoritative desired state. Provider
     /// factories cannot mint this value because it must not depend on a
@@ -830,6 +841,14 @@ pub trait ConnectorControlResolver: Send + Sync {
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorExecutionBindingKey, ConnectorError>;
 
+    /// Observe the active FE-local control runtime without retaining it.
+    /// This identity is intentionally separate from the legacy effect key and
+    /// must never be sent to a backend catalog lookup.
+    fn observe_current_control_runtime(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorControlRuntimeId, ConnectorError>;
+
     fn acquire_current(
         &self,
         instance_id: &ConnectorInstanceId,
@@ -880,6 +899,12 @@ impl ConnectorControlPlanningLease {
 
     pub fn binding(&self) -> &Arc<ConnectorControlBinding> {
         &self.binding
+    }
+
+    /// Returns the FE-local control runtime fenced by this lease. It is not a
+    /// BE catalog identity or a write operation identity.
+    pub fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
+        self.binding.control_runtime_id()
     }
 
     /// Derive a writer lease from this retained planning generation.

@@ -72,6 +72,16 @@ impl novarocks_spi::connector::ConnectorControlResolver for RejectCurrentControl
         panic!("topology-only re-planning must not observe a current connector binding")
     }
 
+    fn observe_current_control_runtime(
+        &self,
+        _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorControlRuntimeId,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        panic!("topology-only re-planning must not observe a current control runtime")
+    }
+
     fn acquire_current(
         &self,
         _instance_id: &novarocks_spi::connector::ConnectorInstanceId,

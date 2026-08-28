@@ -286,6 +286,36 @@ impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControl
         })
     }
 
+    fn observe_current_control_runtime(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorControlRuntimeId,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
+                )
+            })?;
+        Ok(binding.control_runtime_id())
+    }
+
     fn acquire_current(
         &self,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,

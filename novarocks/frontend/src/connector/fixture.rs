@@ -100,6 +100,13 @@ impl ConnectorControlResolver for FixtureControlResolver {
         })
     }
 
+    fn observe_current_control_runtime(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<novarocks_spi::connector::ConnectorControlRuntimeId, ConnectorError> {
+        Ok(self.registry.binding(instance_id)?.control_runtime_id())
+    }
+
     fn acquire_current(
         &self,
         instance_id: &ConnectorInstanceId,
