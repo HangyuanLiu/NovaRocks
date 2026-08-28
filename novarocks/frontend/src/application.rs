@@ -1112,7 +1112,6 @@ impl FrontendApplicationHost {
                 execution.task_update_retry_policy,
                 execution.connector_split_initial_dynamic_filter_wait_cap,
                 self.backend_topology_port(),
-                Arc::clone(&self.connector_control),
                 self.data_runtime.clone(),
             )
             .map_err(FrontendApplicationError::server)?,

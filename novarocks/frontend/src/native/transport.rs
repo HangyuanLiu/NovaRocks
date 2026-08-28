@@ -15,10 +15,6 @@ use crate::metrics::observe_backend_heartbeat_rtt;
 use crate::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, decode_fetched_query_batch,
 };
-use crate::query_execution::artifact::ConnectorBindingDispatcher;
-use crate::query_execution::connector_binding::{
-    ConnectorBindingDispatchError, ConnectorBindingRetirementError,
-};
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_native_trust::{
@@ -28,9 +24,6 @@ use novarocks_native_trust::{
 use novarocks_proto_codec::catalog::{
     PruneCatalogsOutcome, PruneCatalogsRequest, PruneCatalogsResponse,
 };
-use novarocks_proto_codec::connector::{
-    encode_connector_execution_binding_key, encode_connector_execution_declaration,
-};
 use novarocks_proto_codec::lifecycle::{
     QueryAbortRequest, QueryControlAttach, QueryControlCommand, QueryControlEvent, QueryInitAck,
     QueryInitRequest, QueryStageAck, QueryStageRequest, QueryStartAck, QueryStartRequest,
@@ -39,14 +32,9 @@ use novarocks_proto_codec::lifecycle::{
 use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId, parse_reported_state,
 };
-use novarocks_proto_codec::provider::{
-    EnsureConnectorExecutionBindingOutcome, EnsureConnectorExecutionBindingResult,
-    RetireConnectorExecutionBindingOutcome, RetireConnectorExecutionBindingResult,
-};
 use novarocks_proto_models::common::UniqueId as ProtoUniqueId;
 use novarocks_proto_models::novarocks::{
-    EnsureConnectorExecutionBindingRequest, FetchResultRequest,
-    QueryExecutionId as ProtoQueryExecutionId, RetireConnectorExecutionBindingRequest,
+    FetchResultRequest, QueryExecutionId as ProtoQueryExecutionId,
     fetch_result_response::Status as FetchStatus,
 };
 use novarocks_types::{BackendProcessId, NativeEndpoint, UniqueId};
@@ -359,136 +347,6 @@ impl FragmentDispatcher for RemoteDispatcher {
     }
     fn backend_count(&self) -> usize {
         self.clients.len()
-    }
-}
-
-pub(crate) fn new_connector_binding_dispatcher(
-    backends: &[(usize, RuntimeEndpoint)],
-    data_runtime: FrontendDataRuntime,
-) -> Result<Arc<dyn ConnectorBindingDispatcher>, String> {
-    Ok(Arc::new(ConnectorBindingControl::new(
-        backends,
-        data_runtime,
-    )?))
-}
-struct ConnectorBindingControl {
-    clients: BTreeMap<usize, Client>,
-    endpoints: BTreeMap<usize, RuntimeEndpoint>,
-}
-impl ConnectorBindingControl {
-    fn new(
-        backends: &[(usize, RuntimeEndpoint)],
-        data_runtime: FrontendDataRuntime,
-    ) -> Result<Self, String> {
-        if backends.is_empty() {
-            return Err("GrpcConnectorBindingControl requires at least one backend".to_string());
-        }
-        let mut clients = BTreeMap::new();
-        let mut endpoints = BTreeMap::new();
-        for (id, endpoint) in backends {
-            if clients
-                .insert(
-                    *id,
-                    Client::new(endpoint.native_endpoint().clone(), data_runtime.clone()),
-                )
-                .is_some()
-            {
-                return Err(format!("duplicate connector binding backend {id}"));
-            }
-            endpoints.insert(*id, endpoint.clone());
-        }
-        Ok(Self { clients, endpoints })
-    }
-    fn client(&self, backend_idx: usize, endpoint: RuntimeEndpoint) -> Result<&Client, String> {
-        if self.endpoints.get(&backend_idx) != Some(&endpoint) {
-            return Err(format!(
-                "connector binding endpoint mismatch for backend {backend_idx}"
-            ));
-        }
-        self.clients
-            .get(&backend_idx)
-            .ok_or_else(|| format!("connector binding client for backend {backend_idx} is missing"))
-    }
-}
-impl ConnectorBindingDispatcher for ConnectorBindingControl {
-    fn install(
-        &self,
-        execution_id: novarocks_proto_codec::lifecycle::QueryExecutionId,
-        backend_idx: usize,
-        endpoint: RuntimeEndpoint,
-        declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
-    ) -> Result<(), ConnectorBindingDispatchError> {
-        let client = self
-            .client(backend_idx, endpoint.clone())
-            .map_err(ConnectorBindingDispatchError::Transport)?;
-        let request = EnsureConnectorExecutionBindingRequest {
-            execution_id: Some(ProtoQueryExecutionId {
-                query_id: Some(ProtoUniqueId {
-                    hi: execution_id.query_id().high(),
-                    lo: execution_id.query_id().low(),
-                }),
-                attempt_id: execution_id.attempt_id().get(),
-            }),
-            declaration: Some(encode_connector_execution_declaration(declaration)),
-        };
-        let response = client
-            .data_runtime
-            .block_on(async {
-                let mut grpc = client.grpc().await?;
-                grpc.ensure_connector_execution_binding(request)
-                    .await
-                    .map(|value| value.into_inner())
-                    .map_err(|error| {
-                        format!("ensure_connector_execution_binding rpc failed: {error}")
-                    })
-            })
-            .map_err(ConnectorBindingDispatchError::Transport)?
-            .map_err(ConnectorBindingDispatchError::Transport)?;
-        match EnsureConnectorExecutionBindingResult::try_from_proto(response)
-            .map_err(|error| ConnectorBindingDispatchError::Transport(format!(
-                "BE[{backend_idx}] ({endpoint}) returned an invalid ensure connector execution binding outcome: {error}"
-            )))?
-            .outcome()
-        {
-            EnsureConnectorExecutionBindingOutcome::Ensured => Ok(()),
-            EnsureConnectorExecutionBindingOutcome::Rejected(rejection) => {
-                Err(ConnectorBindingDispatchError::Rejected(rejection.clone()))
-            }
-        }
-    }
-    fn retire(
-        &self,
-        endpoint: RuntimeEndpoint,
-        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
-    ) -> Result<(), ConnectorBindingRetirementError> {
-        let client = self.endpoints.iter().find_map(|(id, configured)| (*configured == endpoint).then(|| self.clients.get(id))).flatten().ok_or_else(|| ConnectorBindingRetirementError::Transport(format!("connector retirement endpoint {endpoint} is absent from configured backend snapshot")))?;
-        let (instance_id, incarnation) = encode_connector_execution_binding_key(key);
-        let request = RetireConnectorExecutionBindingRequest {
-            instance_id,
-            incarnation,
-        };
-        let response = client
-            .data_runtime
-            .block_on(async {
-                let mut grpc = client.grpc().await?;
-                grpc.retire_connector_execution_binding(request)
-                    .await
-                    .map(|value| value.into_inner())
-                    .map_err(|error| {
-                        format!("retire_connector_execution_binding rpc failed: {error}")
-                    })
-            })
-            .map_err(ConnectorBindingRetirementError::Transport)?
-            .map_err(ConnectorBindingRetirementError::Transport)?;
-        match RetireConnectorExecutionBindingResult::try_from_proto(response)
-            .map_err(|error| ConnectorBindingRetirementError::Transport(format!(
-                "{endpoint} returned an invalid retire connector execution binding outcome: {error}"
-            )))?
-            .outcome()
-        {
-            RetireConnectorExecutionBindingOutcome::Accepted => Ok(()),
-            outcome => Err(ConnectorBindingRetirementError::Outcome(outcome)),
-        }
     }
 }
 

@@ -804,35 +804,21 @@ pub struct ControlReadyDistributedQuery {
 }
 
 impl ControlReadyDistributedQuery {
-    pub fn prepare_connector_bindings(
-        self,
-        barrier: &dyn ConnectorBindingInstallBarrier,
-    ) -> Result<ConnectorBindingReadyDistributedQuery, DistributedQueryError> {
-        let plan = crate::query_execution::connector_binding::compile_install_plan(
-            &self.schedule.inner,
-            &self.connector_write_plans,
-        )?;
-        let connector_binding_lease = match barrier.install_all(self.schedule.execution_id, plan) {
-            Ok(lease) => lease,
-            Err(error) => {
-                let kind = error.kind();
-                let message = self
-                    .query_lifecycle_lease
-                    .abort_preserving(error.message().to_string());
-                return Err(DistributedQueryError::new(kind, message));
-            }
-        };
-        Ok(ConnectorBindingReadyDistributedQuery {
+    pub fn catalog_ready(self) -> ConnectorBindingReadyDistributedQuery {
+        ConnectorBindingReadyDistributedQuery {
             handoff_id: self.handoff_id,
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule: self.schedule,
             options: self.options,
             query_lifecycle_lease: self.query_lifecycle_lease,
-            connector_binding_lease,
+            // Catalog readiness is owned by Init and its control stream.  This
+            // compatibility-only lease has no remote action and will be
+            // removed together with the legacy typestate names.
+            connector_binding_lease: ConnectorBindingInstallLease,
             stage_bindings: self.stage_bindings,
             connector_write_plans: self.connector_write_plans,
-        })
+        }
     }
 }
 

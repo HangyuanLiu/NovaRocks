@@ -32,9 +32,7 @@ use crate::common::backend_topology::{
 use crate::native::fragment_transport::{FetchOutcome, FragmentDispatcher};
 use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::artifact::{
-    ConnectorBindingDispatcher, ConnectorBindingInstallObserver,
-    DispatchingConnectorBindingBarrier, PreparedDistributedQuery, RunningNativeExecutionParts,
-    ValidatedFragmentSchedule,
+    PreparedDistributedQuery, RunningNativeExecutionParts, ValidatedFragmentSchedule,
 };
 use crate::query_execution::completion::PreReadyRetryBoundary;
 use crate::query_execution::contract::{
@@ -51,7 +49,6 @@ use crate::query_execution::split_assignment::RoundSplitSource;
 use crate::query_execution::write::WriteTerminalBuilder;
 use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::runtime::statement_result::StatementResult;
-use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
 use novarocks_spi::connector::ConnectorWriteLease;
 use novarocks_types::{
@@ -72,7 +69,6 @@ use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use super::split_assignment_round::{
     RoundSplitAssignmentPlan, SplitAssignmentRoundGuard, assignment_endpoints, assignment_targets,
 };
-use crate::connector::ConnectorControlHost;
 use crate::metrics::{
     observe_pre_ready_replan, observe_waiting_for_backend, record_pre_ready_effect_gate,
     record_pre_ready_replan,
@@ -81,8 +77,7 @@ use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_encoder::instance::encode_query_options;
 use crate::native::fragment_encoder::submission::encode_native_submission;
 use crate::native::transport::{
-    GrpcTaskUpdateTransport, new_connector_binding_dispatcher, new_fragment_dispatcher,
-    new_query_lifecycle_transport,
+    GrpcTaskUpdateTransport, new_fragment_dispatcher, new_query_lifecycle_transport,
 };
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
@@ -172,54 +167,6 @@ struct FixedQueryIdSource(QueryId);
 impl QueryIdSource for FixedQueryIdSource {
     fn next_query_id(&self) -> Result<QueryId, DistributedQueryError> {
         Ok(self.0)
-    }
-}
-
-#[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Shared coordinator test fixture provides a no-op connector binding dispatcher."
-)]
-struct TestConnectorBindingDispatcher;
-
-#[cfg(test)]
-impl ConnectorBindingDispatcher for TestConnectorBindingDispatcher {
-    fn install(
-        &self,
-        _execution_id: QueryExecutionId,
-        _backend_idx: usize,
-        _endpoint: RuntimeEndpoint,
-        _declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
-    ) -> Result<(), crate::query_execution::connector_binding::ConnectorBindingDispatchError> {
-        Ok(())
-    }
-
-    fn retire(
-        &self,
-        _endpoint: RuntimeEndpoint,
-        _key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
-    ) -> Result<(), crate::query_execution::connector_binding::ConnectorBindingRetirementError>
-    {
-        Ok(())
-    }
-}
-
-struct FrontendConnectorBindingInstallObserver {
-    control: Arc<ConnectorControlHost>,
-}
-
-impl ConnectorBindingInstallObserver for FrontendConnectorBindingInstallObserver {
-    fn installed(
-        &self,
-        endpoint: RuntimeEndpoint,
-        declaration: &novarocks_spi::connector::ConnectorExecutionDeclaration,
-    ) -> Result<(), String> {
-        self.control
-            .record_installed_backend(
-                &novarocks_spi::connector::ConnectorExecutionBindingKey::from(declaration),
-                endpoint.as_host_port(),
-            )
-            .map_err(|error| error.to_string())
     }
 }
 
@@ -339,14 +286,12 @@ enum BackendServicesSource {
         scheduler: FrontendFragmentScheduler,
         dispatcher: Arc<dyn FragmentDispatcher>,
         lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
-        connector_binding_dispatcher: Arc<dyn ConnectorBindingDispatcher>,
     },
     #[cfg(test)]
     Sequence {
         schedulers: Mutex<VecDeque<FrontendFragmentScheduler>>,
         dispatcher: Arc<dyn FragmentDispatcher>,
         lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
-        connector_binding_dispatcher: Arc<dyn ConnectorBindingDispatcher>,
     },
 }
 
@@ -355,7 +300,6 @@ struct QueryBackendServices {
     dispatcher: Arc<dyn FragmentDispatcher>,
     lifecycle_transport: Arc<dyn QueryLifecycleTransport>,
     live_backends: Vec<LiveBackendTarget>,
-    connector_binding_dispatcher: Arc<dyn ConnectorBindingDispatcher>,
 }
 
 #[cfg(test)]
@@ -565,20 +509,17 @@ impl BackendServicesSource {
                 scheduler,
                 dispatcher,
                 lifecycle_transport,
-                connector_binding_dispatcher,
             } => Ok(QueryBackendServices {
                 scheduler: scheduler.clone(),
                 dispatcher: Arc::clone(dispatcher),
                 lifecycle_transport: Arc::clone(lifecycle_transport),
                 live_backends: topology.to_vec(),
-                connector_binding_dispatcher: Arc::clone(connector_binding_dispatcher),
             }),
             #[cfg(test)]
             Self::Sequence {
                 schedulers,
                 dispatcher,
                 lifecycle_transport,
-                connector_binding_dispatcher,
             } => {
                 let scheduler = schedulers
                     .lock()
@@ -590,7 +531,6 @@ impl BackendServicesSource {
                     dispatcher: Arc::clone(dispatcher),
                     lifecycle_transport: Arc::clone(lifecycle_transport),
                     live_backends: topology.to_vec(),
-                    connector_binding_dispatcher: Arc::clone(connector_binding_dispatcher),
                 })
             }
         }
@@ -617,8 +557,6 @@ fn production_backend_services(
         lifecycle_transport: new_query_lifecycle_transport(topology, data_runtime.clone())
             .map_err(failed)?,
         live_backends: topology.to_vec(),
-        connector_binding_dispatcher: new_connector_binding_dispatcher(&entries, data_runtime)
-            .map_err(failed)?,
     })
 }
 
@@ -630,7 +568,6 @@ pub struct FrontendDistributedQueryCoordinator {
     runtime_filter_worker_count: NonZeroUsize,
     query_ids: Arc<dyn QueryIdSource>,
     registry: Arc<FrontendQueryRegistry>,
-    connector_control: Arc<ConnectorControlHost>,
     data_runtime: FrontendDataRuntime,
     /// Validated once at startup from the timeouts the composition root froze;
     /// query admission consumes it rather than re-reading configuration.
@@ -675,7 +612,6 @@ impl FrontendDistributedQueryCoordinator {
         task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
         connector_split_initial_dynamic_filter_wait_cap: Duration,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
-        connector_control: Arc<ConnectorControlHost>,
         data_runtime: FrontendDataRuntime,
     ) -> Result<Self, DistributedQueryError> {
         // Reject an unusable `[runtime]` query-control section at startup rather
@@ -705,7 +641,6 @@ impl FrontendDistributedQueryCoordinator {
             runtime_filter_worker_count,
             query_ids: Arc::new(query_id_source),
             registry: Arc::new(FrontendQueryRegistry::new(query_namespace)),
-            connector_control,
             data_runtime,
             lifecycle_config,
             pre_start_timeout: Duration::from_millis(query_control_timeouts.pre_start_timeout_ms),
@@ -773,14 +708,12 @@ impl FrontendDistributedQueryCoordinator {
                 scheduler,
                 dispatcher,
                 lifecycle_transport,
-                connector_binding_dispatcher: Arc::new(TestConnectorBindingDispatcher),
             }),
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
             registry: Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(
                 query_id.high() as u64,
             ))),
-            connector_control: Arc::new(ConnectorControlHost::new()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             lifecycle_config: build_lifecycle_config(test_timeouts)
                 .expect("default query-control timeouts validate"),
@@ -850,14 +783,12 @@ impl FrontendDistributedQueryCoordinator {
                 schedulers: Mutex::new(schedulers.into()),
                 dispatcher,
                 lifecycle_transport,
-                connector_binding_dispatcher: Arc::new(TestConnectorBindingDispatcher),
             }),
             runtime_filter_worker_count,
             query_ids: Arc::new(FixedQueryIdSource(query_id)),
             registry: Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(
                 query_id.high() as u64,
             ))),
-            connector_control: Arc::new(ConnectorControlHost::new()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             lifecycle_config: build_lifecycle_config(test_timeouts)
                 .expect("default query-control timeouts validate"),
@@ -1080,14 +1011,6 @@ impl FrontendDistributedQueryCoordinator {
             self.pre_start_timeout,
             self.report_endpoint.resolve()?,
         )?;
-        let connector_binding_dispatcher =
-            Arc::clone(&backend_services.connector_binding_dispatcher);
-        let connector_bindings = DispatchingConnectorBindingBarrier::with_observer(
-            Arc::clone(&connector_binding_dispatcher),
-            Arc::new(FrontendConnectorBindingInstallObserver {
-                control: Arc::clone(&self.connector_control),
-            }),
-        );
         let connector_binding_ready = runtime_filter_ready
             .initialize_query(init_options, &lifecycle_barrier)
             .map_err(|error| {
@@ -1102,7 +1025,7 @@ impl FrontendDistributedQueryCoordinator {
                     ),
                 )
             })?
-            .prepare_connector_bindings(&connector_bindings)?;
+            .catalog_ready();
         if let Some(retry_boundary) = retry_boundary {
             retry_boundary.close_after_control_ready();
         }
