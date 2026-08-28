@@ -33,6 +33,29 @@ pub struct CatalogSet {
     raw: wire::CatalogSet,
 }
 
+/// One complete, validated reachability snapshot for one backend.
+///
+/// The snapshot intentionally carries the full `CatalogHandle` rather than a
+/// catalog name: pruning a newly installed incarnation from an older query's
+/// reachability set would otherwise be possible.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PruneCatalogsRequest {
+    raw: wire::PruneCatalogsRequest,
+}
+
+/// The closed outcome of a catalog reachability prune request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PruneCatalogsOutcome {
+    Accepted,
+    Rejected { safe_detail: String },
+}
+
+/// Validated response to a reachability prune request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PruneCatalogsResponse {
+    raw: wire::PruneCatalogsResponse,
+}
+
 /// Validates the closed catalog state carried by the first control-stream
 /// response. The generated oneof remains the only representation so future
 /// wire variants cannot be accepted by accident.
@@ -147,6 +170,146 @@ impl CatalogSet {
                 )
             })
             .collect()
+    }
+}
+
+impl PruneCatalogsRequest {
+    pub fn new(
+        reachable_catalogs: impl IntoIterator<Item = CatalogHandle>,
+    ) -> Result<Self, ProtocolError> {
+        Self::parse(wire::PruneCatalogsRequest {
+            reachable_catalogs: reachable_catalogs
+                .into_iter()
+                .map(|handle| encode_catalog_handle(&handle))
+                .collect(),
+        })
+    }
+
+    pub fn parse(raw: wire::PruneCatalogsRequest) -> Result<Self, ProtocolError> {
+        if raw.encoded_len() > MAX_CATALOG_SET_BYTES {
+            return Err(resource_exhausted(
+                FieldPath::root("prune_catalogs_request"),
+                "encoded reachable catalog snapshot exceeds 1 MiB",
+            ));
+        }
+        if raw.reachable_catalogs.len() > MAX_CATALOGS_PER_QUERY {
+            return Err(resource_exhausted(
+                FieldPath::root("prune_catalogs_request").field("reachable_catalogs"),
+                "reachable catalog snapshot exceeds 256 entries",
+            ));
+        }
+
+        let mut previous = None;
+        for (index, handle) in raw.reachable_catalogs.iter().cloned().enumerate() {
+            let handle = decode_catalog_handle(
+                handle,
+                FieldPath::root("prune_catalogs_request")
+                    .field("reachable_catalogs")
+                    .index(index),
+            )?;
+            if previous
+                .as_ref()
+                .is_some_and(|previous: &CatalogHandle| previous >= &handle)
+            {
+                return Err(invalid(
+                    FieldPath::root("prune_catalogs_request")
+                        .field("reachable_catalogs")
+                        .index(index),
+                    "reachable catalogs must be strictly sorted by catalog handle with no duplicate",
+                ));
+            }
+            previous = Some(handle);
+        }
+        Ok(Self { raw })
+    }
+
+    pub const fn as_proto(&self) -> &wire::PruneCatalogsRequest {
+        &self.raw
+    }
+
+    pub fn reachable_catalogs(&self) -> Result<Vec<CatalogHandle>, ProtocolError> {
+        self.raw
+            .reachable_catalogs
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, handle)| {
+                decode_catalog_handle(
+                    handle,
+                    FieldPath::root("prune_catalogs_request")
+                        .field("reachable_catalogs")
+                        .index(index),
+                )
+            })
+            .collect()
+    }
+}
+
+impl PruneCatalogsResponse {
+    pub fn accepted() -> Self {
+        Self {
+            raw: wire::PruneCatalogsResponse {
+                outcome: Some(wire::prune_catalogs_response::Outcome::Accepted(
+                    wire::PruneCatalogsAccepted {},
+                )),
+            },
+        }
+    }
+
+    pub fn rejected(safe_detail: impl Into<String>) -> Result<Self, ProtocolError> {
+        let safe_detail = safe_detail.into();
+        validate_safe_text(
+            &safe_detail,
+            FieldPath::root("prune_catalogs_response")
+                .field("rejected")
+                .field("safe_detail"),
+        )?;
+        Ok(Self {
+            raw: wire::PruneCatalogsResponse {
+                outcome: Some(wire::prune_catalogs_response::Outcome::Rejected(
+                    wire::PruneCatalogsRejected { safe_detail },
+                )),
+            },
+        })
+    }
+
+    pub fn parse(raw: wire::PruneCatalogsResponse) -> Result<Self, ProtocolError> {
+        use wire::prune_catalogs_response::Outcome;
+
+        match raw.outcome.as_ref() {
+            Some(Outcome::Accepted(_)) => Ok(Self { raw }),
+            Some(Outcome::Rejected(rejected)) => {
+                validate_safe_text(
+                    &rejected.safe_detail,
+                    FieldPath::root("prune_catalogs_response")
+                        .field("rejected")
+                        .field("safe_detail"),
+                )?;
+                Ok(Self { raw })
+            }
+            None => Err(missing(
+                FieldPath::root("prune_catalogs_response").field("outcome"),
+                "prune catalogs outcome is required and must be known",
+            )),
+        }
+    }
+
+    pub const fn as_proto(&self) -> &wire::PruneCatalogsResponse {
+        &self.raw
+    }
+
+    pub fn outcome(&self) -> PruneCatalogsOutcome {
+        match self.raw.outcome.as_ref() {
+            Some(wire::prune_catalogs_response::Outcome::Accepted(_)) => {
+                PruneCatalogsOutcome::Accepted
+            }
+            Some(wire::prune_catalogs_response::Outcome::Rejected(rejected)) => {
+                PruneCatalogsOutcome::Rejected {
+                    safe_detail: rejected.safe_detail.clone(),
+                }
+            }
+            None => unreachable!("PruneCatalogsResponse::parse validates the required outcome"),
+        }
     }
 }
 
@@ -389,5 +552,79 @@ mod tests {
         )
         .expect_err("unspecified reason is invalid");
         assert!(error.detail().contains("must be known"));
+    }
+
+    #[test]
+    fn prune_catalogs_request_round_trips_a_complete_sorted_snapshot() {
+        let request = PruneCatalogsRequest::new([
+            properties("alpha", 1).handle().clone(),
+            properties("beta", 2).handle().clone(),
+        ])
+        .unwrap();
+
+        let decoded = PruneCatalogsRequest::parse(request.as_proto().clone())
+            .unwrap()
+            .reachable_catalogs()
+            .unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].catalog_name().as_str(), "alpha");
+        assert_eq!(decoded[1].catalog_name().as_str(), "beta");
+    }
+
+    #[test]
+    fn prune_catalogs_request_rejects_duplicate_and_malformed_handles() {
+        let duplicate = wire::PruneCatalogsRequest {
+            reachable_catalogs: vec![
+                encode_catalog_handle(properties("alpha", 1).handle()),
+                encode_catalog_handle(properties("alpha", 1).handle()),
+            ],
+        };
+        let duplicate_error = PruneCatalogsRequest::parse(duplicate)
+            .expect_err("duplicate catalog handles must be rejected");
+        assert!(duplicate_error.detail().contains("strictly sorted"));
+
+        let malformed = wire::PruneCatalogsRequest {
+            reachable_catalogs: vec![wire::CatalogHandle {
+                catalog_name: "alpha".into(),
+                version: vec![1],
+            }],
+        };
+        let malformed_error = PruneCatalogsRequest::parse(malformed)
+            .expect_err("catalog handles require exactly 32 version bytes");
+        assert!(malformed_error.detail().contains("exactly 32 bytes"));
+    }
+
+    #[test]
+    fn prune_catalogs_response_is_closed_and_safe() {
+        assert_eq!(
+            PruneCatalogsResponse::parse(PruneCatalogsResponse::accepted().as_proto().clone())
+                .unwrap()
+                .outcome(),
+            PruneCatalogsOutcome::Accepted
+        );
+        assert_eq!(
+            PruneCatalogsResponse::rejected("manager is shutting down")
+                .unwrap()
+                .outcome(),
+            PruneCatalogsOutcome::Rejected {
+                safe_detail: "manager is shutting down".into(),
+            }
+        );
+
+        let unsafe_detail = wire::PruneCatalogsResponse {
+            outcome: Some(wire::prune_catalogs_response::Outcome::Rejected(
+                wire::PruneCatalogsRejected {
+                    safe_detail: "line one\nline two".into(),
+                },
+            )),
+        };
+        assert!(PruneCatalogsResponse::parse(unsafe_detail).is_err());
+
+        // Prost discards unknown oneof tags. The validated carrier must still
+        // reject that decoded result instead of interpreting it as accepted.
+        let unknown_oneof = wire::PruneCatalogsResponse::decode([0x1a, 0x00].as_slice()).unwrap();
+        let unknown_error = PruneCatalogsResponse::parse(unknown_oneof)
+            .expect_err("an unknown outcome must fail closed");
+        assert!(unknown_error.detail().contains("must be known"));
     }
 }
