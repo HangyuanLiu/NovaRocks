@@ -50,9 +50,7 @@ pub use application::{
     metadata_read_reference_facts_with_planning_lease, metadata_table_exists_with_planning_lease,
     validate_request_context,
 };
-pub use control_host::{
-    ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
-};
+pub use control_host::ConnectorControlHost;
 pub use unified_statistics::UnifiedStatisticsResolver;
 
 #[cfg(test)]

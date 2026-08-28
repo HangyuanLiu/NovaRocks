@@ -35,7 +35,6 @@ use novarocks_spi::connector::{
 #[derive(Clone, Default)]
 pub struct ConnectorControlHost {
     state: Arc<Mutex<ControlHostState>>,
-    retirement_sink: Arc<Mutex<Option<Arc<dyn ConnectorControlRetirementSink>>>>,
     factories: Arc<BTreeMap<ConnectorProviderId, Arc<dyn ConnectorControlFactory>>>,
 }
 
@@ -44,9 +43,11 @@ struct ControlHostState {
     active: BTreeMap<ConnectorInstanceId, ConnectorControlRuntimeId>,
     generations: BTreeMap<ConnectorControlRuntimeId, ControlGeneration>,
     retired: BTreeSet<ConnectorControlRuntimeId>,
-    /// Temporary bridge for the legacy write/Ensure/Retire effect contract.
+    /// Temporary bridge for the legacy FE effect contract.
     /// It is not a control-generation owner and is removed with that contract.
     legacy_execution_index: BTreeMap<ConnectorExecutionBindingKey, ConnectorControlRuntimeId>,
+    /// Compatibility-only evidence retained until the FE effect contract stops
+    /// carrying legacy execution keys. It never drives BE retirement.
     installed_backends: BTreeMap<ConnectorExecutionBindingKey, BTreeSet<String>>,
     ready_retires: Vec<ConnectorControlRetirement>,
 }
@@ -126,19 +127,13 @@ enum ControlGenerationState {
     Retiring,
 }
 
-/// A retiring generation plus the BE endpoints that successfully ensured it.
-/// The frontend dispatcher owns the best-effort remote retirement dispatch.
+/// Compatibility-only retirement evidence for the remaining FE effect bridge.
+/// It is local bookkeeping; BE catalog eviction is driven only by complete
+/// reachability snapshots and `PruneCatalogs`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorControlRetirement {
     pub key: ConnectorExecutionBindingKey,
     pub installed_backends: Vec<String>,
-}
-
-/// Frontend-composed best-effort transport for a retired execution binding.
-/// It deliberately receives only an exact binding key and previously ACKed
-/// endpoints; no connector control or execution object crosses this seam.
-pub trait ConnectorControlRetirementSink: Send + Sync + 'static {
-    fn retire(&self, retirement: ConnectorControlRetirement);
 }
 
 #[allow(
@@ -168,30 +163,8 @@ impl ConnectorControlHost {
         }
         Ok(Self {
             state: Arc::new(Mutex::new(ControlHostState::default())),
-            retirement_sink: Arc::new(Mutex::new(None)),
             factories: Arc::new(factory_map),
         })
-    }
-
-    pub fn set_retirement_sink(&self, sink: Arc<dyn ConnectorControlRetirementSink>) {
-        let Ok(mut slot) = self.retirement_sink.lock() else {
-            return;
-        };
-        *slot = Some(Arc::clone(&sink));
-        // Keep the sink lock while taking the fallback queue. A concurrent
-        // retirement either observes this sink or queues itself before this
-        // drain; it cannot be stranded between the two operations.
-        let ready = match self.lock_state() {
-            Ok(mut state) => std::mem::take(&mut state.ready_retires),
-            Err(error) => {
-                tracing::warn!(%error, "connector control retirement sink was not installed");
-                return;
-            }
-        };
-        drop(slot);
-        for retirement in ready {
-            sink.retire(retirement);
-        }
     }
 
     /// Every exact catalog handle still protected by this FE process.
@@ -270,8 +243,9 @@ impl ConnectorControlHost {
     }
 
     /// Prevents new planning immediately. Existing leases retain their exact
-    /// binding through the ensure barrier; once the last lease drops, callers
-    /// may dispatch the returned best-effort BE retire work.
+    /// effect owner until their final local release, after which the control
+    /// generation is removed. BE catalog eviction is independently driven by
+    /// the complete desired-state snapshot.
     pub fn retire_current(&self, instance_id: &ConnectorInstanceId) -> Result<(), ConnectorError> {
         let mut state = self.lock_state()?;
         let key = state.active.remove(instance_id).ok_or_else(|| {
@@ -290,18 +264,17 @@ impl ConnectorControlHost {
             )
         })?;
         generation.state = ControlGenerationState::Retiring;
-        let retirement = generation
-            .all_leases_released()
-            .then(|| queue_retirement(&mut state, key))
-            .flatten();
-        drop(state);
-        self.dispatch_retirement(retirement);
+        let should_retire = generation.all_leases_released();
+        if should_retire {
+            if let Some(retirement) = queue_retirement(&mut state, key) {
+                state.ready_retires.push(retirement);
+            }
+        }
         Ok(())
     }
 
-    /// Records a successful BE ensure acknowledgement. This is accepted for a
-    /// retiring generation because the planning lease that caused it is allowed
-    /// to finish its barrier before best-effort retirement is dispatched.
+    /// Records compatibility evidence from the retired FE effect bridge. This
+    /// data is not used to manage BE catalog lifetime.
     pub fn record_installed_backend(
         &self,
         key: &ConnectorExecutionBindingKey,
@@ -317,6 +290,8 @@ impl ConnectorControlHost {
         Ok(())
     }
 
+    /// Returns compatibility retirement evidence. There is deliberately no
+    /// production dispatch sink for it.
     pub fn take_ready_retires(&self) -> Result<Vec<ConnectorControlRetirement>, ConnectorError> {
         let mut state = self.lock_state()?;
         Ok(std::mem::take(&mut state.ready_retires))
@@ -353,9 +328,8 @@ impl ConnectorControlHost {
             (Arc::clone(&generation.binding), key)
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
         Ok(ConnectorControlPlanningLease::new(binding, move || {
-            release_lease(&state, &retirement_sink, key, LeaseKind::Planning);
+            release_lease(&state, key, LeaseKind::Planning);
         }))
     }
 
@@ -401,9 +375,8 @@ impl ConnectorControlHost {
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
         ConnectorCatalogMutationLease::new(descriptor, incarnation, mutation, move || {
-            release_lease(&state, &retirement_sink, key, LeaseKind::Mutation);
+            release_lease(&state, key, LeaseKind::Mutation);
         })
     }
 
@@ -460,15 +433,9 @@ impl ConnectorControlHost {
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
         let lease_runtime_id = runtime_id;
         ConnectorDataMutationLease::new(descriptor, key.clone(), metadata, mutation, move || {
-            release_lease(
-                &state,
-                &retirement_sink,
-                lease_runtime_id,
-                LeaseKind::DataMutation,
-            );
+            release_lease(&state, lease_runtime_id, LeaseKind::DataMutation);
         })
     }
 
@@ -530,7 +497,6 @@ impl ConnectorControlHost {
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
         let lease_runtime_id = runtime_id;
         ConnectorMetadataMaintenanceLease::new(
             descriptor,
@@ -538,12 +504,7 @@ impl ConnectorControlHost {
             metadata,
             maintenance,
             move || {
-                release_lease(
-                    &state,
-                    &retirement_sink,
-                    lease_runtime_id,
-                    LeaseKind::MetadataMaintenance,
-                );
+                release_lease(&state, lease_runtime_id, LeaseKind::MetadataMaintenance);
             },
         )
     }
@@ -609,7 +570,6 @@ impl ConnectorControlHost {
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
         let lease_runtime_id = runtime_id;
         ConnectorCleanupMaintenanceLease::new(
             descriptor,
@@ -617,12 +577,7 @@ impl ConnectorControlHost {
             metadata,
             cleanup,
             move || {
-                release_lease(
-                    &state,
-                    &retirement_sink,
-                    lease_runtime_id,
-                    LeaseKind::CleanupMaintenance,
-                );
+                release_lease(&state, lease_runtime_id, LeaseKind::CleanupMaintenance);
             },
         )
     }
@@ -701,18 +656,11 @@ impl ConnectorControlHost {
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
         let lease_runtime_id = runtime_id;
         let planning_state = Arc::downgrade(&self.state);
-        let planning_retirement_sink = Arc::downgrade(&self.retirement_sink);
         let planning_runtime_id = runtime_id;
         let planning_lease = ConnectorControlPlanningLease::new(binding, move || {
-            release_lease(
-                &planning_state,
-                &planning_retirement_sink,
-                planning_runtime_id,
-                LeaseKind::Planning,
-            );
+            release_lease(&planning_state, planning_runtime_id, LeaseKind::Planning);
         });
         ConnectorDistributedRewriteLease::new(
             descriptor,
@@ -724,12 +672,7 @@ impl ConnectorControlHost {
             write,
             distribution,
             move || {
-                release_lease(
-                    &state,
-                    &retirement_sink,
-                    lease_runtime_id,
-                    LeaseKind::DistributedRewrite,
-                );
+                release_lease(&state, lease_runtime_id, LeaseKind::DistributedRewrite);
             },
         )
     }
@@ -781,13 +724,12 @@ impl ConnectorControlHost {
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
         ConnectorWriteLease::new_with_execution_distribution(
             legacy_key,
             write,
             provider_id,
             distribution,
-            move || release_lease(&state, &retirement_sink, runtime_id, LeaseKind::Write),
+            move || release_lease(&state, runtime_id, LeaseKind::Write),
         )
         .and_then(|lease| lease.with_catalog_properties(catalog_properties))
     }
@@ -834,9 +776,8 @@ impl ConnectorControlHost {
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
         ConnectorStatisticsLease::new(descriptor, incarnation, statistics, move || {
-            release_lease(&state, &retirement_sink, runtime_id, LeaseKind::Statistics);
+            release_lease(&state, runtime_id, LeaseKind::Statistics);
         })
     }
 
@@ -849,23 +790,7 @@ impl ConnectorControlHost {
         })
     }
 
-    fn dispatch_retirement(&self, retirement: Option<ConnectorControlRetirement>) {
-        let Some(retirement) = retirement else { return };
-        let Ok(slot) = self.retirement_sink.lock() else {
-            return;
-        };
-        let sink = slot.clone();
-        if let Some(sink) = sink {
-            drop(slot);
-            sink.retire(retirement);
-        } else if let Ok(mut state) = self.lock_state() {
-            // Keep the sink lock while publishing the fallback so a sink
-            // installation cannot drain the queue before this push.
-            state.ready_retires.push(retirement);
-        }
-    }
 }
-
 impl ConnectorControlResolver for ConnectorControlHost {
     fn observe_current_binding(
         &self,
@@ -1073,7 +998,6 @@ enum LeaseKind {
 
 fn release_lease(
     state: &Weak<Mutex<ControlHostState>>,
-    retirement_sink: &Weak<Mutex<Option<Arc<dyn ConnectorControlRetirementSink>>>>,
     runtime_id: ConnectorControlRuntimeId,
     kind: LeaseKind,
 ) {
@@ -1115,28 +1039,10 @@ fn release_lease(
             generation.statistics_leases = generation.statistics_leases.saturating_sub(1);
         }
     }
-    let retirement = (generation.state == ControlGenerationState::Retiring
-        && generation.all_leases_released())
-    .then(|| queue_retirement(&mut state, runtime_id))
-    .flatten();
-    drop(state);
-    let Some(retirement) = retirement else {
-        return;
-    };
-    let Some(slot) = retirement_sink.upgrade() else {
-        return;
-    };
-    let Ok(slot) = slot.lock() else {
-        return;
-    };
-    let sink = slot.clone();
-    if let Some(sink) = sink {
-        drop(slot);
-        sink.retire(retirement);
-    } else if let Ok(mut state) = host_state.lock() {
-        // See ConnectorControlHost::dispatch_retirement: keep the sink lock
-        // while publishing the fallback queue entry.
-        state.ready_retires.push(retirement);
+    if generation.state == ControlGenerationState::Retiring && generation.all_leases_released() {
+        if let Some(retirement) = queue_retirement(&mut state, runtime_id) {
+            state.ready_retires.push(retirement);
+        }
     }
 }
 
@@ -1144,7 +1050,9 @@ fn queue_retirement(
     state: &mut ControlHostState,
     runtime_id: ConnectorControlRuntimeId,
 ) -> Option<ConnectorControlRetirement> {
-    let generation = state.generations.remove(&runtime_id)?;
+    let Some(generation) = state.generations.remove(&runtime_id) else {
+        return None;
+    };
     debug_assert_eq!(generation.state, ControlGenerationState::Retiring);
     state.retired.insert(runtime_id);
     state
@@ -1564,45 +1472,6 @@ pub(crate) mod tests {
                 .to_bytes(),
             [8; 16]
         );
-    }
-
-    #[derive(Default)]
-    struct RecordingRetirementSink(Mutex<Vec<ConnectorControlRetirement>>);
-
-    impl ConnectorControlRetirementSink for RecordingRetirementSink {
-        fn retire(&self, retirement: ConnectorControlRetirement) {
-            self.0.lock().expect("retirement sink").push(retirement);
-        }
-    }
-
-    #[test]
-    fn retiring_generation_dispatches_when_the_last_planning_lease_drains() {
-        let host = ConnectorControlHost::new();
-        let sink = Arc::new(RecordingRetirementSink::default());
-        host.set_retirement_sink(sink.clone());
-        let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-        host.register(binding(7)).expect("register old generation");
-        let lease = host.acquire_current(&instance_id).expect("planning lease");
-        let old_key = ConnectorExecutionBindingKey {
-            instance_id: instance_id.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
-        };
-        host.record_installed_backend(&old_key, "127.0.0.1:18080")
-            .expect("record ensure ack");
-        host.retire_current(&instance_id)
-            .expect("retire old generation");
-        assert!(sink.0.lock().expect("retirement sink").is_empty());
-
-        drop(lease);
-
-        let dispatched = sink.0.lock().expect("retirement sink");
-        assert_eq!(dispatched.len(), 1);
-        assert_eq!(dispatched[0].key, old_key);
-        assert_eq!(
-            dispatched[0].installed_backends,
-            vec![String::from("127.0.0.1:18080")]
-        );
-        assert!(host.take_ready_retires().expect("retire queue").is_empty());
     }
 
     #[test]

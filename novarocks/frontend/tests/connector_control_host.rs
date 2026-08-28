@@ -15,12 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
-use novarocks_frontend::connector::{
-    ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
-};
+use novarocks_frontend::connector::ConnectorControlHost;
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
@@ -570,45 +568,6 @@ fn binding_with_statistics(incarnation: u8) -> ConnectorControlBinding {
         })),
     )
     .expect("control binding with statistics")
-}
-
-#[derive(Default)]
-struct RecordingRetirementSink(Mutex<Vec<ConnectorControlRetirement>>);
-
-impl ConnectorControlRetirementSink for RecordingRetirementSink {
-    fn retire(&self, retirement: ConnectorControlRetirement) {
-        self.0.lock().expect("retirement sink").push(retirement);
-    }
-}
-
-#[test]
-fn lease_drain_dispatches_retirement_to_installed_backends() {
-    let host = ConnectorControlHost::new();
-    let sink = Arc::new(RecordingRetirementSink::default());
-    host.set_retirement_sink(sink.clone());
-    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-    host.register(binding(7)).expect("register old generation");
-    let lease = host.acquire_current(&instance_id).expect("planning lease");
-    let old_key = ConnectorExecutionBindingKey {
-        instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
-    };
-    host.record_installed_backend(&old_key, "127.0.0.1:18080")
-        .expect("record ensure acknowledgement");
-    host.retire_current(&instance_id)
-        .expect("retire old generation");
-    assert!(sink.0.lock().expect("retirement sink").is_empty());
-
-    drop(lease);
-
-    let dispatched = sink.0.lock().expect("retirement sink");
-    assert_eq!(dispatched.len(), 1);
-    assert_eq!(dispatched[0].key, old_key);
-    assert_eq!(
-        dispatched[0].installed_backends,
-        vec![String::from("127.0.0.1:18080")]
-    );
-    assert!(host.take_ready_retires().expect("retire queue").is_empty());
 }
 
 #[test]
