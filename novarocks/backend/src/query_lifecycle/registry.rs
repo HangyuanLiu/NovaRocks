@@ -1493,6 +1493,7 @@ impl QueryLifecycleRegistry {
             self_weak: self_weak.clone(),
         });
         registry.publish_metrics();
+        registry.publish_catalog_lease_metrics();
         registry
     }
 
@@ -1599,7 +1600,14 @@ impl QueryLifecycleRegistry {
     /// to its own bounded policy, but this attempt no longer protects it.
     fn release_query_resources(&self, execution_id: QueryExecutionId) {
         self.catalog_manager.release_query(execution_id);
+        self.publish_catalog_lease_metrics();
         self.local_runtime.release_query_resources(execution_id);
+    }
+
+    fn publish_catalog_lease_metrics(&self) {
+        let snapshot = self.catalog_manager.lease_snapshot();
+        publish_backend_query_execution_resource("catalog_query_leases", snapshot.query_leases);
+        publish_backend_query_execution_resource("catalog_handle_leases", snapshot.handle_leases);
     }
 
     /// Admission-derived authorization for the native exchange data plane.
@@ -1775,6 +1783,7 @@ impl QueryLifecycleRegistry {
                         })
                         .map(|_| ())
                 });
+                registry.publish_catalog_lease_metrics();
                 let (event, release) = {
                     let mut state = entry.state.lock().expect("query lifecycle entry lock");
                     if state.termination_reason.is_some()
@@ -1804,6 +1813,7 @@ impl QueryLifecycleRegistry {
                 };
                 if release {
                     registry.catalog_manager.release_query(execution_id);
+                    registry.publish_catalog_lease_metrics();
                     return;
                 }
                 if let Some(event) = event
@@ -4332,6 +4342,7 @@ impl QueryLifecycleRegistry {
         }
         self.release_terminal_record(execution_id);
         self.catalog_manager.release_query(execution_id);
+        self.publish_catalog_lease_metrics();
         let mut state = self.state.lock().expect("query lifecycle registry lock");
         state.active_entries = state.active_entries.saturating_sub(1);
         state.tombstones.push_back(execution_id);
@@ -5140,7 +5151,7 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
         &self,
         reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,
     ) -> CatalogPruneOutcome {
-        match self.catalog_manager.prune_unreachable(&reachable) {
+        let outcome = match self.catalog_manager.prune_unreachable(&reachable) {
             crate::connector::catalog_manager::CatalogPruneResult::Pruned { .. } => {
                 CatalogPruneOutcome::Accepted
             }
@@ -5150,7 +5161,9 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
                         .to_string(),
                 }
             }
-        }
+        };
+        self.publish_catalog_lease_metrics();
+        outcome
     }
 
     fn authorize_exchange(

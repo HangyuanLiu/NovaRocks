@@ -1424,10 +1424,10 @@ const HEAVY_QUERY_EXECUTION_RESOURCES: [&str; 10] = [
     "native_query_contexts_second_chance",
     "native_query_active_fragments",
     "native_runtime_filter_services",
-    "connector_query_leases",
+    "catalog_query_leases",
 ];
 
-const QUERY_EXECUTION_RESOURCE_BINDING_LEASE: &str = "connector_binding_leases";
+const QUERY_EXECUTION_RESOURCE_CATALOG_HANDLE_LEASE: &str = "catalog_handle_leases";
 const TERMINAL_RETAINED_OUTCOME: &str = "terminal_retained";
 const TERMINAL_RETAINED_BYTES_OUTCOME: &str = "terminal_retained_bytes";
 const TERMINAL_RETAINED_CAPACITY_OUTCOME: &str = "terminal_retained_capacity";
@@ -3369,7 +3369,9 @@ impl CrossProcessServerHandle {
             let mut resources = BTreeMap::new();
             for resource in HEAVY_QUERY_EXECUTION_RESOURCES
                 .into_iter()
-                .chain(std::iter::once(QUERY_EXECUTION_RESOURCE_BINDING_LEASE))
+                .chain(std::iter::once(
+                    QUERY_EXECUTION_RESOURCE_CATALOG_HANDLE_LEASE,
+                ))
             {
                 let value = prometheus_labeled_gauge(
                     &metrics,

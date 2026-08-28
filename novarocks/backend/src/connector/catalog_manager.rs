@@ -329,6 +329,15 @@ pub struct CatalogManager<T> {
     max_retained_catalogs: usize,
 }
 
+/// A bounded, provider-neutral view of catalog leases held by admitted
+/// queries. Retained warm runtimes are deliberately excluded: cache retention
+/// is not an execution authority.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CatalogLeaseSnapshot {
+    pub query_leases: usize,
+    pub handle_leases: usize,
+}
+
 struct CatalogManagerState<T> {
     entries: BTreeMap<CatalogHandle, Arc<CatalogCell<T>>>,
     query_reachability: BTreeMap<QueryExecutionId, BTreeSet<CatalogHandle>>,
@@ -596,6 +605,16 @@ impl<T> CatalogManager<T> {
             .get(&query)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Return lease cardinalities without exposing the query-to-handle map.
+    /// Metrics consume this snapshot after the manager lock is released.
+    pub fn lease_snapshot(&self) -> CatalogLeaseSnapshot {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        CatalogLeaseSnapshot {
+            query_leases: state.query_reachability.len(),
+            handle_leases: state.query_reachability.values().map(BTreeSet::len).sum(),
+        }
     }
 
     fn remove_query_handle(&self, query: QueryExecutionId, handle: &CatalogHandle) {
@@ -963,6 +982,40 @@ mod tests {
         assert_eq!(manager.release_query(query(1)), BTreeSet::new());
         assert!(manager.resolve(old.handle()).is_some());
         assert!(manager.resolve(new.handle()).is_some());
+    }
+
+    #[test]
+    fn lease_snapshot_counts_queries_and_exact_catalog_handles() {
+        let manager = CatalogManager::<usize>::default();
+        let first = properties(1);
+        let second = properties(2);
+
+        manager
+            .ensure(query(1), first, |_| Ok(1))
+            .expect("first catalog is leased to query one");
+        manager
+            .ensure(query(1), second.clone(), |_| Ok(2))
+            .expect("second catalog is leased to query one");
+        manager
+            .ensure(query(2), second, |_| Ok(2))
+            .expect("second catalog is leased to query two");
+
+        assert_eq!(
+            manager.lease_snapshot(),
+            super::CatalogLeaseSnapshot {
+                query_leases: 2,
+                handle_leases: 3,
+            }
+        );
+
+        manager.release_query(query(1));
+        assert_eq!(
+            manager.lease_snapshot(),
+            super::CatalogLeaseSnapshot {
+                query_leases: 1,
+                handle_leases: 1,
+            }
+        );
     }
 
     #[test]
