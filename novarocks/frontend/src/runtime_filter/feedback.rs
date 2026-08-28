@@ -448,3 +448,144 @@ fn connector_values(
     }
     Some(values)
 }
+
+#[cfg(test)]
+mod tests {
+    use arrow::datatypes::DataType;
+    use novarocks_execution::runtime_filter::contribution::ValueDomainDelta;
+    use novarocks_proto_codec::lifecycle::{AttemptId, encode_query_execution_id};
+    use novarocks_proto_models::novarocks;
+    use novarocks_types::{BackendProcessId, QueryId};
+
+    use super::super::install_encoder::{
+        FrontendRuntimeFilterFeedbackChannel, FrontendRuntimeFilterFeedbackPublisherOwner,
+        FrontendRuntimeFilterFeedbackScanBinding,
+    };
+    use super::*;
+
+    fn execution_id() -> QueryExecutionId {
+        QueryExecutionId::new(
+            QueryId::new(11, 12),
+            AttemptId::new(3).expect("valid attempt"),
+        )
+        .expect("valid execution id")
+    }
+
+    fn declaration(process: BackendProcessId) -> FrontendRuntimeFilterFeedbackDeclaration {
+        FrontendRuntimeFilterFeedbackDeclaration::new([FrontendRuntimeFilterFeedbackChannel {
+            channel_id: 7,
+            contract_digest: [9; 32],
+            max_encoded_domain_bytes: 64 * 1024,
+            publishers: vec![FrontendRuntimeFilterFeedbackPublisherSlot {
+                participant_id: 5,
+                backend_process_id: process,
+                owner: FrontendRuntimeFilterFeedbackPublisherOwner::Aggregator,
+            }],
+            scan_bindings: vec![FrontendRuntimeFilterFeedbackScanBinding {
+                fragment_id: 2,
+                plan_node_id: 17,
+                binding_id: 7,
+                data_type: DataType::Int64,
+                nullable: false,
+            }],
+            wait_eligibility: FrontendRuntimeFilterFeedbackWaitEligibility::Eligible,
+        }])
+        .expect("valid declaration")
+    }
+
+    fn event(
+        execution_id: QueryExecutionId,
+        process: BackendProcessId,
+        encoded: Vec<u8>,
+    ) -> QueryControlEvent {
+        QueryControlEvent::parse(novarocks::QueryControlResponse {
+            event: Some(
+                novarocks::query_control_response::Event::RuntimeFilterFeedback(
+                    novarocks::RuntimeFilterFeedbackEvent {
+                        execution_id: Some(encode_query_execution_id(execution_id)),
+                        init_digest: vec![4; 32],
+                        backend: Some(novarocks::ParticipantBackendIdentity {
+                            endpoint: Some(novarocks::QueryControlEndpoint {
+                                host: "127.0.0.1".into(),
+                                port: 9030,
+                            }),
+                            process_id: Some(novarocks::BackendProcessId {
+                                value: process.to_bytes().to_vec(),
+                            }),
+                        }),
+                        participant_id: 5,
+                        deployment_epoch: execution_id.attempt_id().get(),
+                        channel_id: 7,
+                        contract_digest: vec![9; 32],
+                        terminal_outcome: Some(
+                            novarocks::runtime_filter_feedback_event::TerminalOutcome::CanonicalDomain(
+                                encoded,
+                            ),
+                        ),
+                    },
+                ),
+            ),
+        })
+        .expect("valid event")
+    }
+
+    fn exact(value: i64) -> Vec<u8> {
+        RuntimeFilterFeedbackDomain::Exact(ValueDomainDelta::new(
+            MembershipValues::int64([value]),
+            false,
+        ))
+        .encode(64 * 1024)
+        .expect("canonical domain")
+    }
+
+    #[test]
+    fn admits_only_the_first_authorized_terminal_domain_for_the_active_attempt() {
+        let execution_id = execution_id();
+        let process = BackendProcessId::new_v7();
+        let state = RuntimeFilterFeedbackState::new(execution_id, declaration(process))
+            .expect("feedback state");
+        let first = exact(41);
+
+        state
+            .admit(
+                &event(execution_id, process, first.clone()),
+                process,
+                &[4; 32],
+            )
+            .expect("first terminal domain is admitted");
+        state
+            .admit(
+                &event(execution_id, process, first.clone()),
+                process,
+                &[4; 32],
+            )
+            .expect("identical duplicate is idempotent");
+        let conflict = state
+            .admit(&event(execution_id, process, exact(42)), process, &[4; 32])
+            .expect_err("a distinct terminal domain cannot replace the winner");
+        assert!(conflict.contains("conflicts with first winner"));
+
+        let state = state.state.0.lock().expect("feedback state");
+        assert_eq!(state.channels[&7].winner.as_deref(), Some(first.as_slice()));
+        assert!(state.channels[&7].is_terminal());
+    }
+
+    #[test]
+    fn ignores_a_retired_attempt_before_authorizing_any_slot() {
+        let execution_id = execution_id();
+        let process = BackendProcessId::new_v7();
+        let state = RuntimeFilterFeedbackState::new(execution_id, declaration(process))
+            .expect("feedback state");
+        let retired = QueryExecutionId::new(
+            QueryId::new(11, 12),
+            AttemptId::new(2).expect("valid attempt"),
+        )
+        .expect("valid execution id");
+
+        state
+            .admit(&event(retired, process, exact(41)), process, &[4; 32])
+            .expect("retired event is ignored");
+        let state = state.state.0.lock().expect("feedback state");
+        assert!(state.channels[&7].winner.is_none());
+    }
+}
