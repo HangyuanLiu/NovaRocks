@@ -16,7 +16,6 @@ novarocks-failpoint = { path = "../novarocks/failpoint", default-features = fals
 novarocks-frontend = { path = "../novarocks/frontend" }
 novarocks-fs = { path = "../novarocks/fs" }
 novarocks-native-trust = { path = "../novarocks/native-trust" }
-novarocks-proto-models = { path = "../novarocks/proto-models" }
 novarocks-secret = { path = "../novarocks/secret" }
 novarocks-spi = { path = "../novarocks/spi" }
 novarocks-state-store-sqlite = { path = "../novarocks/state-store/sqlite" }
