@@ -926,6 +926,12 @@ impl FrontendApplicationHost {
         Arc::clone(self.topology())
     }
 
+    pub(crate) fn backend_island_snapshot_reader(
+        &self,
+    ) -> Arc<dyn crate::topology::BackendIslandSnapshotReader> {
+        Arc::clone(self.topology()) as Arc<dyn crate::topology::BackendIslandSnapshotReader>
+    }
+
     pub fn start_report_server(
         &self,
         bind_addr: std::net::SocketAddr,

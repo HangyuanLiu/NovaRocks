@@ -23,7 +23,7 @@
 //! reconciliation path.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -52,6 +52,104 @@ pub struct ClusterBackendOpenConfig {
     heartbeat_interval: Duration,
     heartbeat_timeout_retries: u32,
     announce_lease_ttl: Duration,
+}
+
+/// Sanitized compatibility-island facts read from the topology authority.
+///
+/// The topology lock supplies the revision and all counts as one observation.
+/// Management owns how these facts are composed with FE-local serving state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BackendIslandSnapshot {
+    native_compatibility_id: NativeCompatibilityId,
+    topology_revision: u64,
+    compatible_eligible_backend_count: usize,
+    other_island_backend_count: usize,
+    unknown_or_invalid_backend_count: usize,
+}
+
+impl BackendIslandSnapshot {
+    pub(crate) const fn new(
+        native_compatibility_id: NativeCompatibilityId,
+        topology_revision: u64,
+        compatible_eligible_backend_count: usize,
+        other_island_backend_count: usize,
+        unknown_or_invalid_backend_count: usize,
+    ) -> Self {
+        Self {
+            native_compatibility_id,
+            topology_revision,
+            compatible_eligible_backend_count,
+            other_island_backend_count,
+            unknown_or_invalid_backend_count,
+        }
+    }
+
+    pub const fn starting(native_compatibility_id: NativeCompatibilityId) -> Self {
+        Self::new(native_compatibility_id, 0, 0, 0, 0)
+    }
+
+    pub const fn native_compatibility_id(&self) -> NativeCompatibilityId {
+        self.native_compatibility_id
+    }
+
+    pub const fn topology_revision(&self) -> u64 {
+        self.topology_revision
+    }
+
+    pub const fn compatible_eligible_backend_count(&self) -> usize {
+        self.compatible_eligible_backend_count
+    }
+
+    pub const fn other_island_backend_count(&self) -> usize {
+        self.other_island_backend_count
+    }
+
+    pub const fn unknown_or_invalid_backend_count(&self) -> usize {
+        self.unknown_or_invalid_backend_count
+    }
+}
+
+/// Read-only topology capability used only by the Frontend management surface.
+pub trait BackendIslandSnapshotReader: Send + Sync {
+    fn backend_island_snapshot(&self) -> BackendIslandSnapshot;
+}
+
+/// Starts management observability with the Server-materialized local identity,
+/// then installs the topology owner exactly once after application open.
+pub struct LateBoundBackendIslandSnapshotReader {
+    starting: BackendIslandSnapshot,
+    reader: RwLock<Option<Arc<dyn BackendIslandSnapshotReader>>>,
+}
+
+impl LateBoundBackendIslandSnapshotReader {
+    pub fn new(native_compatibility_id: NativeCompatibilityId) -> Self {
+        Self {
+            starting: BackendIslandSnapshot::starting(native_compatibility_id),
+            reader: RwLock::new(None),
+        }
+    }
+
+    pub fn install(&self, reader: Arc<dyn BackendIslandSnapshotReader>) -> Result<(), String> {
+        let mut slot = self
+            .reader
+            .write()
+            .expect("frontend island reader lock poisoned");
+        if slot.is_some() {
+            return Err("frontend island snapshot reader is already installed".to_string());
+        }
+        *slot = Some(reader);
+        Ok(())
+    }
+}
+
+impl BackendIslandSnapshotReader for LateBoundBackendIslandSnapshotReader {
+    fn backend_island_snapshot(&self) -> BackendIslandSnapshot {
+        self.reader
+            .read()
+            .expect("frontend island reader lock poisoned")
+            .as_ref()
+            .map_or(self.starting, |reader| reader.backend_island_snapshot())
+    }
 }
 
 impl ClusterBackendOpenConfig {
@@ -695,6 +793,36 @@ impl ClusterBackendService {
         }
         BackendTopologySnapshot::try_new(state.revision, live_targets(&state))
     }
+
+    fn island_snapshot_inner(&self) -> BackendIslandSnapshot {
+        let state = self.state.lock().expect("frontend topology lock poisoned");
+        let mut snapshot = BackendIslandSnapshot {
+            native_compatibility_id: self.native_compatibility_id,
+            topology_revision: state.revision,
+            compatible_eligible_backend_count: 0,
+            other_island_backend_count: 0,
+            unknown_or_invalid_backend_count: 0,
+        };
+        for facts in state.processes.values() {
+            match facts.compatibility {
+                Compatibility::Compatible => {
+                    snapshot.compatible_eligible_backend_count += usize::from(facts.eligible());
+                }
+                Compatibility::OtherIsland { .. } => snapshot.other_island_backend_count += 1,
+                Compatibility::Unknown | Compatibility::Incompatible(_) => {
+                    snapshot.unknown_or_invalid_backend_count += 1;
+                }
+            }
+        }
+        snapshot
+    }
+}
+
+impl BackendIslandSnapshotReader for ClusterBackendService {
+    fn backend_island_snapshot(&self) -> BackendIslandSnapshot {
+        self.refresh_expired_announce_leases(std::time::Instant::now());
+        self.island_snapshot_inner()
+    }
 }
 
 impl BackendTopologyPort for ClusterBackendService {
@@ -973,10 +1101,10 @@ fn metrics_snapshot(state: &TopologyState) -> BackendTopologyMetricsSnapshot {
         }
         match facts.compatibility {
             Compatibility::Compatible => metrics.compatibility_compatible += 1,
-            Compatibility::OtherIsland { .. } | Compatibility::Incompatible(_) => {
-                metrics.compatibility_incompatible += 1
+            Compatibility::OtherIsland { .. } => metrics.compatibility_other_island += 1,
+            Compatibility::Unknown | Compatibility::Incompatible(_) => {
+                metrics.compatibility_unknown_or_invalid += 1
             }
-            Compatibility::Unknown => metrics.compatibility_unknown += 1,
         }
         metrics.endpoint_owned += usize::from(facts.endpoint_owned);
         metrics.endpoint_unowned += usize::from(!facts.endpoint_owned);
@@ -1032,7 +1160,7 @@ fn revision_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, Runtim
 
 #[cfg(test)]
 mod tests {
-    use super::ClusterBackendService;
+    use super::{BackendIslandSnapshotReader, ClusterBackendService};
     use crate::common::backend_topology::BackendTopologyPort;
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
@@ -1081,6 +1209,38 @@ mod tests {
         assert!(service.snapshot().unwrap().targets().is_empty());
         verify(&service, &descriptor);
         assert_eq!(service.snapshot().unwrap().targets().len(), 1);
+    }
+
+    #[test]
+    fn island_snapshot_counts_exact_eligible_and_other_island_from_one_revision() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let compatible = descriptor("127.0.0.1:9070".parse().unwrap());
+        let other = descriptor_with(
+            "127.0.0.1:9071".parse().unwrap(),
+            native_build_identity(),
+            novarocks_types::NativeCompatibilityId::new([0x72; 32]),
+        );
+        service
+            .record_announce(compatible.clone(), BackendReportedState::Running)
+            .expect("announce compatible backend");
+        service
+            .record_announce(other.clone(), BackendReportedState::Running)
+            .expect("announce other-island backend");
+        verify(&service, &compatible);
+        verify(&service, &other);
+
+        let snapshot = service.backend_island_snapshot();
+        assert_eq!(
+            snapshot.native_compatibility_id(),
+            novarocks_types::NativeCompatibilityId::new([0x71; 32])
+        );
+        assert_eq!(snapshot.compatible_eligible_backend_count(), 1);
+        assert_eq!(snapshot.other_island_backend_count(), 1);
+        assert_eq!(snapshot.unknown_or_invalid_backend_count(), 0);
+        assert_eq!(
+            snapshot.topology_revision(),
+            service.snapshot().unwrap().revision()
+        );
     }
 
     #[test]

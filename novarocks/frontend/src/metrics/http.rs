@@ -24,6 +24,7 @@ use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 
 use crate::coordinator::{QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot};
+use crate::topology::BackendIslandSnapshotReader;
 use crate::workload_lifecycle::FrontendServingSnapshotReader;
 
 use super::FrontendMetricsRegistry;
@@ -76,6 +77,7 @@ impl MetricsHttpServer {
         port: u16,
         registry: Arc<FrontendMetricsRegistry>,
         serving_reader: Arc<dyn FrontendServingSnapshotReader>,
+        island_reader: Arc<dyn BackendIslandSnapshotReader>,
         convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
     ) -> Result<Self, String> {
         let bind_addr = parse_metrics_bind_addr(host, port)
@@ -105,6 +107,7 @@ impl MetricsHttpServer {
                     let app = super::management::frontend_management_router_with_readers(
                         registry,
                         serving_reader,
+                        island_reader,
                         convergence_reader,
                         crate::native::report_server::lifecycle_convergence_debug_enabled(),
                     );
