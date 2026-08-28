@@ -25,7 +25,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use novarocks_proto_codec::connector_read::ConnectorReadCodec;
-use novarocks_spi::connector::read_stack::ConnectorReadProviderFactory;
+use novarocks_spi::connector::{CatalogWriteExecution, read_stack::ConnectorReadProviderFactory};
 
 /// One exact binding's complete worker read unit. The factory and codec must
 /// travel together because every recovered handle belongs to the factory that
@@ -57,6 +57,32 @@ impl fmt::Debug for InstalledReadExecution {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("InstalledReadExecution")
+            .finish_non_exhaustive()
+    }
+}
+
+/// One exact catalog-scoped writer capability retained by a materialized
+/// catalog runtime. Query lifecycle lookup is deliberately the only way a
+/// fragment can obtain it.
+#[derive(Clone)]
+pub struct InstalledWriteExecution {
+    execution: Arc<dyn CatalogWriteExecution>,
+}
+
+impl InstalledWriteExecution {
+    pub fn new(execution: Arc<dyn CatalogWriteExecution>) -> Self {
+        Self { execution }
+    }
+
+    pub fn execution(&self) -> Arc<dyn CatalogWriteExecution> {
+        Arc::clone(&self.execution)
+    }
+}
+
+impl fmt::Debug for InstalledWriteExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledWriteExecution")
             .finish_non_exhaustive()
     }
 }

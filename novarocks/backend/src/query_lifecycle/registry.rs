@@ -1524,6 +1524,33 @@ impl QueryLifecycleRegistry {
         })
     }
 
+    /// Resolve the catalog-scoped writer capability only through an admitted
+    /// query's exact catalog lease. Retained catalog materializations are not
+    /// a fragment-decode authority path.
+    pub(crate) fn catalog_write_execution_for_query(
+        &self,
+        execution_id: QueryExecutionId,
+        handle: &novarocks_spi::connector::CatalogHandle,
+    ) -> Result<crate::connector::typed_registry::InstalledWriteExecution, String> {
+        let runtime = self
+            .catalog_manager
+            .resolve_for_query(execution_id, handle)
+            .ok_or_else(|| {
+                format!(
+                    "no query-leased catalog runtime exists for {}@{}",
+                    handle.catalog_name().as_str(),
+                    handle.version().short_hex()
+                )
+            })?;
+        runtime.write_execution().ok_or_else(|| {
+            format!(
+                "catalog runtime for {}@{} has no catalog-scoped write capability",
+                handle.catalog_name().as_str(),
+                handle.version().short_hex()
+            )
+        })
+    }
+
     /// Install the backend-local cleanup owner after application composition
     /// has created the fragment service. The registry holds only a weak link:
     /// the service already owns this registry, so a strong link would form a

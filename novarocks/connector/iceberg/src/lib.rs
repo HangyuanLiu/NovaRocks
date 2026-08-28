@@ -82,6 +82,7 @@ pub mod write_codec;
 pub mod write_descriptor;
 pub mod write_payload;
 
+pub use commit::write_execution::IcebergCatalogWriteExecutionFactory;
 pub use file_reader::execution_installer::IcebergCatalogRuntimeMaterializer;
 
 pub mod iceberg {

@@ -24,14 +24,16 @@
 //! equivalence adapters are implemented.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{Array, Int64Array, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{
-    ConnectorBatchWriter, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorOpenWriterRequest, ConnectorStagedReport, ConnectorStagedReportSummary,
-    ConnectorWriteExecution, ConnectorWriterTerminalState,
+    CatalogHandle, CatalogWriteExecution, CatalogWriteExecutionBundle,
+    CatalogWriteExecutionBundleFactory, ConnectorBatchWriter, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBindingKey, ConnectorOpenWriterRequest, ConnectorStagedReport,
+    ConnectorStagedReportSummary, ConnectorWriteExecution, ConnectorWriterTerminalState,
 };
 
 use crate as novarocks_connector_iceberg;
@@ -81,6 +83,82 @@ impl IcebergDataWriteExecution {
             binding,
             runtime,
         }
+    }
+}
+
+/// Catalog-keyed worker writer capability. The backend obtains this value only
+/// from a query lease for the exact catalog handle; unlike the legacy
+/// generation binding, it is not selected from the process-wide execution
+/// host. Existing writer identity stays in the opaque request because it owns
+/// operation/cohort reporting, not catalog runtime selection.
+#[derive(Clone)]
+pub struct IcebergCatalogWriteExecution {
+    catalog_handle: CatalogHandle,
+    binding: IcebergReadBinding,
+    runtime: IcebergExecutionRuntime,
+}
+
+impl IcebergCatalogWriteExecution {
+    fn new(
+        catalog_handle: CatalogHandle,
+        binding: IcebergReadBinding,
+        runtime: IcebergExecutionRuntime,
+    ) -> Self {
+        Self {
+            catalog_handle,
+            binding,
+            runtime,
+        }
+    }
+}
+
+impl CatalogWriteExecution for IcebergCatalogWriteExecution {
+    fn catalog_handle(&self) -> &CatalogHandle {
+        &self.catalog_handle
+    }
+
+    fn open_writer(
+        &self,
+        request: ConnectorOpenWriterRequest,
+    ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+        // The catalog lease above selects this provider runtime. The legacy
+        // owner on the opaque writer handle remains only an operation/report
+        // consistency check inside the compatibility implementation; it is
+        // never used for backend capability lookup.
+        IcebergDataWriteExecution::new(
+            request.handle.owner().clone(),
+            self.binding.clone(),
+            self.runtime.clone(),
+        )
+        .open_writer(request)
+    }
+}
+
+/// Startup-sealed provider factory for catalog-keyed Iceberg writers.
+#[derive(Clone)]
+pub struct IcebergCatalogWriteExecutionFactory {
+    binding: IcebergReadBinding,
+    runtime: IcebergExecutionRuntime,
+}
+
+impl IcebergCatalogWriteExecutionFactory {
+    pub fn new(binding: IcebergReadBinding, runtime: IcebergExecutionRuntime) -> Self {
+        Self { binding, runtime }
+    }
+}
+
+impl CatalogWriteExecutionBundleFactory for IcebergCatalogWriteExecutionFactory {
+    fn build(
+        &self,
+        catalog_handle: &CatalogHandle,
+    ) -> Result<CatalogWriteExecutionBundle, ConnectorError> {
+        Ok(CatalogWriteExecutionBundle::new(Arc::new(
+            IcebergCatalogWriteExecution::new(
+                catalog_handle.clone(),
+                self.binding.clone(),
+                self.runtime.clone(),
+            ),
+        )))
     }
 }
 

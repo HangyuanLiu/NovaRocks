@@ -475,6 +475,10 @@ pub fn compose_backend_server_config(
             runtime.clone(),
         )?,
         read_execution_bundle_factories: compose_backend_read_execution_bundle_factories(
+            config,
+            runtime.clone(),
+        )?,
+        write_execution_bundle_factories: compose_backend_write_execution_bundle_factories(
             config, runtime,
         )?,
     })
@@ -764,6 +768,31 @@ pub fn compose_backend_read_execution_bundle_factories(
         novarocks_connector_iceberg::typed_provider_factory::IcebergTypedProviderFactory::new(
             binding,
             novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::with_default_budget(),
+        ),
+    );
+    Ok(vec![(
+        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg,
+        factory,
+    )])
+}
+
+/// The worker-side catalog-keyed writer factory of every built-in provider.
+/// StarRocks contributes none because it has no native distributed writer
+/// contract; a request for one therefore fails closed during catalog lookup.
+pub fn compose_backend_write_execution_bundle_factories(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<
+    Vec<(
+        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        std::sync::Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
+    )>,
+> {
+    let resources = compose_iceberg_execution_resources(config, runtime)?;
+    let factory = std::sync::Arc::new(
+        novarocks_connector_iceberg::IcebergCatalogWriteExecutionFactory::new(
+            resources.binding().clone(),
+            resources.runtime().clone(),
         ),
     );
     Ok(vec![(

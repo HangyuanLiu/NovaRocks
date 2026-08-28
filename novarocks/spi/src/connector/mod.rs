@@ -56,7 +56,10 @@ pub use catalog::{
     MAX_CATALOG_SET_BYTES, MAX_CATALOGS_PER_QUERY, MAX_PRUNE_CATALOG_SET_BYTES,
     MAX_REACHABLE_CATALOGS_PER_PRUNE,
 };
-pub use catalog_runtime::{CatalogRuntime, CatalogRuntimeMaterializer};
+pub use catalog_runtime::{
+    CatalogRuntime, CatalogRuntimeMaterializer, CatalogWriteExecution, CatalogWriteExecutionBundle,
+    CatalogWriteExecutionBundleFactory,
+};
 pub use cleanup_maintenance::{
     BatchReceipt, BatchReceiptSummary, CONNECTOR_CLEANUP_MAINTENANCE_CONTRACT_VERSION,
     CandidatePage, ConnectorCleanupCandidate, ConnectorCleanupCandidatePageRequest,

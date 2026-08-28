@@ -25,7 +25,10 @@
 
 use std::sync::Arc;
 
-use super::{CatalogHandle, CatalogProperties, CatalogProviderKind, ConnectorError};
+use super::{
+    CatalogHandle, CatalogProperties, CatalogProviderKind, ConnectorBatchWriter, ConnectorError,
+    ConnectorOpenWriterRequest,
+};
 
 /// One exact backend-local catalog materialization.
 ///
@@ -49,4 +52,61 @@ pub trait CatalogRuntimeMaterializer: Send + Sync {
         &self,
         properties: &CatalogProperties,
     ) -> Result<Arc<dyn CatalogRuntime>, ConnectorError>;
+}
+
+/// One exact backend-local catalog-scoped writer capability.
+///
+/// The capability is created only after the backend has materialized and
+/// identity-checked its `CatalogHandle`. Fragment decode must first resolve it
+/// through the admitted query lease; it must not reconstruct a writer from a
+/// retained catalog or an effect-generation registry. The request retains the
+/// existing opaque writer facts because those identify the operation and its
+/// report cohort, not this catalog runtime.
+pub trait CatalogWriteExecution: Send + Sync {
+    fn catalog_handle(&self) -> &CatalogHandle;
+
+    fn open_writer(
+        &self,
+        request: ConnectorOpenWriterRequest,
+    ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError>;
+}
+
+/// Complete catalog-scoped writer unit for one exact immutable handle.
+///
+/// Keeping the execution behind a bundle mirrors the typed-read installation
+/// boundary: provider composition creates it once while catalog materializes,
+/// and the backend lifecycle owns every later lease and retirement decision.
+#[derive(Clone)]
+pub struct CatalogWriteExecutionBundle {
+    execution: Arc<dyn CatalogWriteExecution>,
+}
+
+impl CatalogWriteExecutionBundle {
+    pub fn new(execution: Arc<dyn CatalogWriteExecution>) -> Self {
+        Self { execution }
+    }
+
+    pub fn execution(&self) -> Arc<dyn CatalogWriteExecution> {
+        Arc::clone(&self.execution)
+    }
+}
+
+impl std::fmt::Debug for CatalogWriteExecutionBundle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CatalogWriteExecutionBundle")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Provider-owned constructor for a catalog-scoped writer unit.
+///
+/// Server composition seals one factory per catalog provider kind. The
+/// `CatalogManager` invokes the factory only for an immutable handle that its
+/// matching materializer has already accepted.
+pub trait CatalogWriteExecutionBundleFactory: Send + Sync {
+    fn build(
+        &self,
+        catalog_handle: &CatalogHandle,
+    ) -> Result<CatalogWriteExecutionBundle, ConnectorError>;
 }

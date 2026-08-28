@@ -28,7 +28,7 @@ mod runtime_test;
 pub use execution_host::{
     ConnectorExecutionHost, ConnectorExecutionLease, ConnectorExecutionQueryResolver,
 };
-pub use typed_registry::InstalledReadExecution;
+pub use typed_registry::{InstalledReadExecution, InstalledWriteExecution};
 
 /// Backend-local token passed through native plan decoding.
 ///

@@ -81,6 +81,14 @@ pub struct BackendServerConfig {
         novarocks_spi::connector::ConnectorExecutionProviderKind,
         Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
     )>,
+    /// Provider-owned constructors for catalog-scoped writer capabilities,
+    /// one per provider kind. Catalog materialization installs them before a
+    /// query becomes ControlReady; decode must resolve the result through the
+    /// query's exact catalog lease.
+    pub write_execution_bundle_factories: Vec<(
+        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
+    )>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -486,6 +494,10 @@ fn compose_backend_application_services(
         novarocks_spi::connector::ConnectorExecutionProviderKind,
         Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
     )],
+    write_execution_bundle_factories: &[(
+        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
+    )],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let execution_runtime = Arc::new(ExecutionRuntime::new(execution_runtime_config).map_err(
         |error| BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error),
@@ -500,9 +512,12 @@ fn compose_backend_application_services(
         Arc::clone(&execution_host),
     ));
     let catalog_runtime_materializers = Arc::new(
-        crate::connector::catalog_manager::CatalogRuntimeMaterializerSet::try_new_with_read_execution_factories(
+        crate::connector::catalog_manager::CatalogRuntimeMaterializerSet::try_new_with_execution_factories(
             catalog_runtime_materializers.iter().cloned(),
             read_execution_bundle_factories.iter().map(|(kind, factory)| {
+                (catalog_provider_kind(*kind), Arc::clone(factory))
+            }),
+            write_execution_bundle_factories.iter().map(|(kind, factory)| {
                 (catalog_provider_kind(*kind), Arc::clone(factory))
             }),
         )
@@ -701,6 +716,7 @@ impl BackendApplicationHost {
             execution_installers,
             catalog_runtime_materializers,
             read_execution_bundle_factories,
+            write_execution_bundle_factories,
         } = config;
         let readiness_endpoint =
             NativeEndpoint::from_host_port(&advertise_endpoint.host, advertise_endpoint.port)
@@ -720,6 +736,7 @@ impl BackendApplicationHost {
             &execution_installers,
             &catalog_runtime_materializers,
             &read_execution_bundle_factories,
+            &write_execution_bundle_factories,
         )?;
         let process_descriptor = BackendProcessDescriptor::new(
             services.query_lifecycle_ingress.backend_process_id(),
@@ -1141,6 +1158,7 @@ mod tests {
             execution_installers: Vec::new(),
             catalog_runtime_materializers: Vec::new(),
             read_execution_bundle_factories: Vec::new(),
+            write_execution_bundle_factories: Vec::new(),
         }
     }
 

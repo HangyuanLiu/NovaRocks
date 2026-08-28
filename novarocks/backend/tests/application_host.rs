@@ -106,6 +106,7 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         execution_installers: Vec::new(),
         catalog_runtime_materializers: Vec::new(),
         read_execution_bundle_factories: Vec::new(),
+        write_execution_bundle_factories: Vec::new(),
     }
 }
 

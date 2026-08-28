@@ -44,6 +44,7 @@ pub const DEFAULT_MAX_RETAINED_CATALOGS: usize = 64;
 pub struct MaterializedCatalogRuntime {
     runtime: Arc<dyn CatalogRuntime>,
     read_execution: Option<super::typed_registry::InstalledReadExecution>,
+    write_execution: Option<super::typed_registry::InstalledWriteExecution>,
 }
 
 impl MaterializedCatalogRuntime {
@@ -51,16 +52,19 @@ impl MaterializedCatalogRuntime {
         Self {
             runtime,
             read_execution: None,
+            write_execution: None,
         }
     }
 
-    fn with_read_execution(
+    fn with_executions(
         runtime: Arc<dyn CatalogRuntime>,
-        read_execution: super::typed_registry::InstalledReadExecution,
+        read_execution: Option<super::typed_registry::InstalledReadExecution>,
+        write_execution: Option<super::typed_registry::InstalledWriteExecution>,
     ) -> Self {
         Self {
             runtime,
-            read_execution: Some(read_execution),
+            read_execution,
+            write_execution,
         }
     }
 
@@ -70,6 +74,10 @@ impl MaterializedCatalogRuntime {
 
     pub fn read_execution(&self) -> Option<super::typed_registry::InstalledReadExecution> {
         self.read_execution.clone()
+    }
+
+    pub fn write_execution(&self) -> Option<super::typed_registry::InstalledWriteExecution> {
+        self.write_execution.clone()
     }
 }
 
@@ -86,6 +94,12 @@ pub struct CatalogRuntimeMaterializerSet {
         BTreeMap<
             novarocks_spi::connector::CatalogProviderKind,
             Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
+        >,
+    >,
+    write_bundle_factories: Arc<
+        BTreeMap<
+            novarocks_spi::connector::CatalogProviderKind,
+            Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
         >,
     >,
 }
@@ -106,6 +120,7 @@ impl CatalogRuntimeMaterializerSet {
         Ok(Self {
             materializers: Arc::new(sealed),
             read_bundle_factories: Arc::new(BTreeMap::new()),
+            write_bundle_factories: Arc::new(BTreeMap::new()),
         })
     }
 
@@ -131,6 +146,39 @@ impl CatalogRuntimeMaterializerSet {
             }
         }
         result.read_bundle_factories = Arc::new(sealed);
+        Ok(result)
+    }
+
+    /// Seal catalog-scoped writer factories alongside the immutable catalog
+    /// materializers and typed-read factories. Each factory is selected only
+    /// by the closed catalog provider kind and receives the exact handle that
+    /// materialization has just verified.
+    pub fn try_new_with_execution_factories(
+        materializers: impl IntoIterator<Item = Arc<dyn CatalogRuntimeMaterializer>>,
+        read_factories: impl IntoIterator<
+            Item = (
+                novarocks_spi::connector::CatalogProviderKind,
+                Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
+            ),
+        >,
+        write_factories: impl IntoIterator<
+            Item = (
+                novarocks_spi::connector::CatalogProviderKind,
+                Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
+            ),
+        >,
+    ) -> Result<Self, CatalogManagerError> {
+        let mut result =
+            Self::try_new_with_read_execution_factories(materializers, read_factories)?;
+        let mut sealed = BTreeMap::new();
+        for (provider_kind, factory) in write_factories {
+            if sealed.insert(provider_kind, factory).is_some() {
+                return Err(CatalogManagerError::InvalidConfiguration(
+                    "duplicate catalog write execution provider kind",
+                ));
+            }
+        }
+        result.write_bundle_factories = Arc::new(sealed);
         Ok(result)
     }
 
@@ -168,11 +216,29 @@ impl CatalogRuntimeMaterializerSet {
                     .map_err(|error| CatalogManagerError::materialization_failed(error.to_string()))
             })
             .transpose()?;
-        Ok(match read_execution {
-            Some(read_execution) => {
-                MaterializedCatalogRuntime::with_read_execution(runtime, read_execution)
-            }
-            None => MaterializedCatalogRuntime::new(runtime),
+        let write_execution =
+            self.write_bundle_factories
+                .get(&properties.provider_kind())
+                .map(|factory| {
+                    factory
+                    .build(properties.handle())
+                    .and_then(|bundle| {
+                        let execution = bundle.execution();
+                        if execution.catalog_handle() != properties.handle() {
+                            return Err(novarocks_spi::connector::ConnectorError::new(
+                                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                                "catalog writer factory returned an incompatible catalog handle",
+                            ));
+                        }
+                        Ok(super::typed_registry::InstalledWriteExecution::new(execution))
+                    })
+                    .map_err(|error| CatalogManagerError::materialization_failed(error.to_string()))
+                })
+                .transpose()?;
+        Ok(if read_execution.is_some() || write_execution.is_some() {
+            MaterializedCatalogRuntime::with_executions(runtime, read_execution, write_execution)
+        } else {
+            MaterializedCatalogRuntime::new(runtime)
         })
     }
 }
