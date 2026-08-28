@@ -274,20 +274,31 @@ mod tests {
     }
 
     #[test]
-    fn frontend_semantic_encoder_preserves_membership_and_ordered_contracts() {
-        let membership =
-            semantic_encoder::encode_logical_domain(RuntimeFilterLogicalDomainFacts::Membership {
-                value_type: DataType::Int32,
-                null_semantics: RuntimeFilterNullSemantics::NeverMatches,
-            })
+    fn frontend_semantic_encoder_preserves_typed_membership_and_ordered_contracts() {
+        for (null_semantics, expected) in [
+            (
+                RuntimeFilterNullSemantics::NeverMatches,
+                plan::RuntimeFilterMembershipNullSemantics::NeverMatches,
+            ),
+            (
+                RuntimeFilterNullSemantics::NullSafeEqual,
+                plan::RuntimeFilterMembershipNullSemantics::NullSafeEqual,
+            ),
+        ] {
+            let membership = semantic_encoder::encode_logical_domain(
+                RuntimeFilterLogicalDomainFacts::Membership {
+                    value_type: DataType::Int32,
+                    null_semantics,
+                },
+            )
             .expect("membership contract")
             .contract();
-        let Some(plan::runtime_filter_contract::Kind::Membership(membership)) = membership.kind
-        else {
-            panic!("membership kind");
-        };
-        assert!(!membership.canonical_schema.is_empty());
-        assert_eq!(membership.schema_digest.len(), 32);
+            let Some(plan::runtime_filter_contract::Kind::Membership(membership)) = membership.kind
+            else {
+                panic!("membership kind");
+            };
+            assert_eq!(membership.null_semantics, i32::from(expected));
+        }
 
         let ordered =
             semantic_encoder::encode_logical_domain(RuntimeFilterLogicalDomainFacts::Ordered {

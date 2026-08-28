@@ -777,15 +777,13 @@ fn attach_hash_join_producers(
                 ),
             )
         })?;
-        if condition.null_safe {
-            return Err(NativeFragmentDecodeError::inconsistent(
-                join_key_path.clone().field("null_safe"),
-                format!(
-                    "native runtime-filter producer binding_id={} targets null-safe join key ordinal={build_key_index}",
-                    binding.binding_id
-                ),
-            ));
-        }
+        validate_hash_join_membership_null_semantics(
+            binding.binding_id,
+            build_key_index,
+            condition.null_safe,
+            contract,
+            join_key_path.clone(),
+        )?;
         let (raw_build, raw_build_path) =
             if join.join_type == novarocks_execution::exec::node::join::JoinType::RightSemi {
                 (condition.left.as_ref(), join_key_path.clone().field("left"))
@@ -836,6 +834,46 @@ fn attach_hash_join_producers(
         ));
     }
     join.runtime_filter_execution = JoinRuntimeFilterExecution::new(producers);
+    Ok(())
+}
+
+fn validate_hash_join_membership_null_semantics(
+    binding_id: u32,
+    build_key_index: usize,
+    join_key_null_safe: bool,
+    contract: &execution::RuntimeFilterProducerContract,
+    join_key_path: FieldPath,
+) -> Result<(), NativeFragmentDecodeError> {
+    if contract.kind() != execution::RuntimeFilterProducerKind::Membership {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            join_key_path,
+            format!(
+                "native runtime-filter producer binding_id={binding_id} on HashJoin requires a membership producer contract"
+            ),
+        ));
+    }
+    let execution::RuntimeFilterExecutionContract::Membership(schema) = contract.contract() else {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            join_key_path,
+            format!(
+                "native runtime-filter producer binding_id={binding_id} on HashJoin requires a membership execution contract"
+            ),
+        ));
+    };
+    let expected = if join_key_null_safe {
+        execution::RuntimeFilterNullSemantics::NullSafeEqual
+    } else {
+        execution::RuntimeFilterNullSemantics::NeverMatches
+    };
+    if schema.null_semantics() != expected {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            join_key_path.field("null_safe"),
+            format!(
+                "native runtime-filter producer binding_id={binding_id} join key ordinal={build_key_index} null semantics mismatch: join expects {expected:?}, contract declares {:?}",
+                schema.null_semantics()
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -2033,6 +2071,96 @@ mod tests {
             }
             AssertNumRowsMode::PerKeyAtMostOne { .. } => panic!("expected global assert"),
         }
+    }
+
+    #[test]
+    fn hash_join_producer_requires_exact_membership_null_semantics() {
+        fn contract(
+            null_semantics: execution::RuntimeFilterNullSemantics,
+        ) -> execution::RuntimeFilterProducerContract {
+            execution::RuntimeFilterProducerContract::membership(
+                execution::RuntimeFilterBindingId::new(1),
+                execution::RuntimeFilterChannelId::new(9),
+                execution::RuntimeFilterExecutionContract::Membership(
+                    execution::RuntimeFilterMembershipSchema::new(&DataType::Int64, null_semantics)
+                        .expect("membership schema"),
+                ),
+            )
+            .expect("membership producer contract")
+        }
+
+        let path = FieldPath::root("plan_fragment")
+            .field("root")
+            .field("payload")
+            .field("physical")
+            .field("hash_join")
+            .field("eq_conditions")
+            .index(0);
+        for (join_null_safe, contract_null_semantics, succeeds) in [
+            (
+                false,
+                execution::RuntimeFilterNullSemantics::NeverMatches,
+                true,
+            ),
+            (
+                true,
+                execution::RuntimeFilterNullSemantics::NullSafeEqual,
+                true,
+            ),
+            (
+                false,
+                execution::RuntimeFilterNullSemantics::NullSafeEqual,
+                false,
+            ),
+            (
+                true,
+                execution::RuntimeFilterNullSemantics::NeverMatches,
+                false,
+            ),
+        ] {
+            let result = validate_hash_join_membership_null_semantics(
+                1,
+                0,
+                join_null_safe,
+                &contract(contract_null_semantics),
+                path.clone(),
+            );
+            assert_eq!(
+                result.is_ok(),
+                succeeds,
+                "join_null_safe={join_null_safe}, contract={contract_null_semantics:?}"
+            );
+            if !succeeds {
+                let error = result.expect_err("mismatched semantics must fail");
+                let protocol = error.protocol().expect("protocol error");
+                assert_eq!(
+                    protocol.path().to_string(),
+                    "plan_fragment.root.payload.physical.hash_join.eq_conditions[0].null_safe"
+                );
+                assert!(protocol.detail().contains("null semantics mismatch"));
+            }
+        }
+
+        let schema = execution::RuntimeFilterMembershipSchema::new(
+            &DataType::Int64,
+            execution::RuntimeFilterNullSemantics::NeverMatches,
+        )
+        .expect("membership schema");
+        let final_domain = execution::RuntimeFilterProducerContract::final_domain(
+            execution::RuntimeFilterBindingId::new(1),
+            execution::RuntimeFilterChannelId::new(9),
+            execution::RuntimeFilterExecutionContract::Membership(schema),
+        )
+        .expect("final-domain producer contract");
+        let error = validate_hash_join_membership_null_semantics(1, 0, false, &final_domain, path)
+            .expect_err("non-membership producer kind must fail");
+        assert!(
+            error
+                .protocol()
+                .expect("protocol error")
+                .detail()
+                .contains("requires a membership producer contract")
+        );
     }
 
     #[test]

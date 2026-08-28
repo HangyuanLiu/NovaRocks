@@ -207,9 +207,17 @@ message RuntimeFilterContract {
   }
 }
 
+enum RuntimeFilterMembershipNullSemantics {
+  RUNTIME_FILTER_MEMBERSHIP_NULL_SEMANTICS_UNSPECIFIED = 0;
+  RUNTIME_FILTER_MEMBERSHIP_NULL_SEMANTICS_NEVER_MATCHES = 1;
+  RUNTIME_FILTER_MEMBERSHIP_NULL_SEMANTICS_NULL_SAFE_EQUAL = 2;
+}
+
 message RuntimeFilterMembershipContract {
-  bytes canonical_schema = 1;
-  bytes schema_digest = 2;
+  reserved 1, 2;
+  reserved "canonical_schema", "schema_digest";
+
+  RuntimeFilterMembershipNullSemantics null_semantics = 3;
 }
 
 message RuntimeFilterOrderedContract {

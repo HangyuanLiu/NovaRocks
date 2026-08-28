@@ -27,6 +27,10 @@ use novarocks_execution::runtime_filter as execution;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{expr, plan};
 
+use crate::runtime_filter::membership_contract_decode::{
+    MembershipContractDecodeError, decode_membership_contract,
+};
+
 /// Backend-local producer attachment target decoded from the native fragment
 /// binding table. It is translated into the corresponding neutral execution
 /// constructor at the physical node boundary.
@@ -565,55 +569,28 @@ fn decode_contract(
     })?;
     match kind {
         plan::runtime_filter_contract::Kind::Membership(membership) => {
-            let path = path.field("membership");
-            if membership.canonical_schema.is_empty() {
-                return Err(NativeFragmentDecodeError::invalid_value(
-                    path.clone().field("canonical_schema"),
-                    format!(
-                        "native runtime-filter binding_id={binding_id} membership schema is empty"
-                    ),
-                ));
-            }
-            let digest = digest32(
-                binding_id,
-                "membership schema_digest",
-                &membership.schema_digest,
-            )
-            .map_err(|error| {
-                NativeFragmentDecodeError::invalid_value(path.clone().field("schema_digest"), error)
-            })?;
-            let schema = execution::RuntimeFilterMembershipSchema::from_canonical(
-                &membership.canonical_schema,
-                digest,
-            )
-            .map_err(|error| {
-                NativeFragmentDecodeError::invalid_value(
-                    path.clone().field("canonical_schema"),
-                    format!(
-                        "native runtime-filter binding_id={binding_id} membership schema is noncanonical: {error}"
-                    ),
-                )
-            })?;
-            let expected = execution::RuntimeFilterMembershipSchema::new(
-                expression_type,
-                schema.null_semantics(),
-            )
-            .map_err(|error| {
-                NativeFragmentDecodeError::invalid_value(
-                    path.clone().field("canonical_schema"),
-                    format!(
-                        "native runtime-filter binding_id={binding_id} expression type cannot form membership schema: {error}"
-                    ),
-                )
-            })?;
-            if expected.canonical_bytes() != membership.canonical_schema {
-                return Err(NativeFragmentDecodeError::inconsistent(
-                    path.field("canonical_schema"),
-                    format!(
-                        "native runtime-filter binding_id={binding_id} membership schema does not match expression type"
-                    ),
-                ));
-            }
+            let path = path.field("membership").field("null_semantics");
+            let schema = decode_membership_contract(expression_type, membership).map_err(
+                |decode_error| match decode_error {
+                    MembershipContractDecodeError::UnspecifiedNullSemantics
+                    | MembershipContractDecodeError::UnknownNullSemantics { .. } => {
+                        NativeFragmentDecodeError::invalid_enum(
+                            path,
+                            format!(
+                                "native runtime-filter binding_id={binding_id} invalid membership null semantics: {decode_error}"
+                            ),
+                        )
+                    }
+                    MembershipContractDecodeError::InvalidExecutionSchema { .. } => {
+                        NativeFragmentDecodeError::invalid_value(
+                            path,
+                            format!(
+                                "native runtime-filter binding_id={binding_id} invalid membership schema: {decode_error}"
+                            ),
+                        )
+                    }
+                },
+            )?;
             Ok(execution::RuntimeFilterExecutionContract::Membership(
                 schema,
             ))
@@ -1261,11 +1238,6 @@ mod tests {
     }
 
     fn membership_binding(binding_id: u32, node_id: i32) -> plan::RuntimeFilterBinding {
-        let schema = execution::RuntimeFilterMembershipSchema::new(
-            &DataType::Int64,
-            execution::RuntimeFilterNullSemantics::NeverMatches,
-        )
-        .expect("schema");
         plan::RuntimeFilterBinding {
             binding_id,
             channel_id: 9,
@@ -1275,8 +1247,8 @@ mod tests {
             contract: Some(plan::RuntimeFilterContract {
                 kind: Some(plan::runtime_filter_contract::Kind::Membership(
                     plan::RuntimeFilterMembershipContract {
-                        canonical_schema: schema.canonical_bytes().to_vec(),
-                        schema_digest: schema.digest().to_vec(),
+                        null_semantics: plan::RuntimeFilterMembershipNullSemantics::NeverMatches
+                            as i32,
                     },
                 )),
             }),
@@ -1685,6 +1657,37 @@ mod tests {
     }
 
     #[test]
+    fn membership_null_semantics_error_uses_exact_path_and_kind() {
+        for raw in [
+            plan::RuntimeFilterMembershipNullSemantics::Unspecified as i32,
+            99,
+        ] {
+            let mut binding = membership_binding(1, 11);
+            let plan::runtime_filter_contract::Kind::Membership(membership) = binding
+                .contract
+                .as_mut()
+                .and_then(|contract| contract.kind.as_mut())
+                .expect("membership contract")
+            else {
+                panic!("membership contract");
+            };
+            membership.null_semantics = raw;
+
+            let error =
+                match NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![binding]))) {
+                    Ok(_) => panic!("invalid membership null semantics must fail"),
+                    Err(error) => error,
+                };
+            let protocol = error.protocol().expect("protocol error");
+            assert_eq!(
+                protocol.path().to_string(),
+                "plan_fragment.runtime_filter_bindings.bindings[0].contract.membership.null_semantics"
+            );
+            assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidEnum);
+        }
+    }
+
+    #[test]
     fn topk_reduction_k_error_uses_exact_path_and_kind() {
         let mut binding = ordered_topk_binding(1, 11);
         let plan::runtime_filter_reduction_contract::Kind::MergeTopkSummary(topk) = binding
@@ -1814,7 +1817,7 @@ mod tests {
         else {
             panic!("membership")
         };
-        contract.schema_digest[0] ^= 1;
+        contract.null_semantics = 99;
         assert!(
             NativeRuntimeFilterDecodeLedger::decode(7, Some(&table(7, vec![membership]))).is_err()
         );

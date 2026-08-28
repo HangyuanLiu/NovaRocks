@@ -113,8 +113,7 @@ fn shuffle_join_eq_condition_is_supported(
     arena: &ScalarArena,
     eq: &PhysicalHashJoinEqCondition,
 ) -> bool {
-    !eq.null_safe
-        && scalar_expr_to_column_id(arena, eq.left).is_some()
+    scalar_expr_to_column_id(arena, eq.left).is_some()
         && scalar_expr_to_column_id(arena, eq.right).is_some()
         && hash_partition_types_are_compatible(arena.data_type(eq.left), arena.data_type(eq.right))
 }
@@ -673,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_join_unknown_distribution_skips_shuffle_for_null_safe_keys() {
+    fn hash_join_unknown_distribution_includes_shuffle_for_null_safe_keys() {
         let op = join_op(
             JoinKind::Inner,
             vec![null_safe_eq(col(10), col(20)), eq(col(11), col(21))],
@@ -681,8 +680,17 @@ mod tests {
         );
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
-        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives.len(), 2);
         assert_eq!(alternatives[0].kind, PropertyAlternativeKind::BroadcastJoin);
+        assert_eq!(alternatives[1].kind, PropertyAlternativeKind::ShuffleJoin);
+        assert_eq!(
+            alternatives[1].child_props[0].distribution,
+            DistributionSpec::shuffle_join([ColumnId(10), ColumnId(11)])
+        );
+        assert_eq!(
+            alternatives[1].child_props[1].distribution,
+            DistributionSpec::shuffle_join([ColumnId(20), ColumnId(21)])
+        );
     }
 
     #[test]

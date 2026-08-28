@@ -666,6 +666,7 @@ fn build_distributed_plan_seals_partitioned_join_progress_certificate() {
                 probe_expr: probe_expr.clone(),
                 expr_order: 3,
                 execution_mode: JoinExecutionMode::Partitioned,
+                null_semantics: NullSemantics::NeverMatches,
             }],
             output_columns: vec![
                 output_col(1, "l_k", DataType::Int64, false),
@@ -801,7 +802,7 @@ fn rfd_5a_join_population_is_deterministic_and_node_carried_only_by_binding_id()
             eq_conditions: vec![PhysicalHashJoinEqCondition {
                 left: probe_expr.clone(),
                 right: build_expr.clone(),
-                null_safe: false,
+                null_safe: true,
             }],
             other_condition: None,
             distribution: JoinDistribution::Broadcast,
@@ -812,6 +813,7 @@ fn rfd_5a_join_population_is_deterministic_and_node_carried_only_by_binding_id()
                 probe_expr,
                 expr_order: 0,
                 execution_mode: JoinExecutionMode::Broadcast,
+                null_semantics: NullSemantics::NullSafeEqual,
             }],
             output_columns: vec![
                 output_col(1, "probe", DataType::Int64, false),
@@ -833,6 +835,13 @@ fn rfd_5a_join_population_is_deterministic_and_node_carried_only_by_binding_id()
     assert_eq!(graph.binding_count(), 2);
     let channel = graph.channels().next().expect("runtime-filter channel");
     assert_ne!(channel.channel_id.get(), 0);
+    assert!(matches!(
+        &channel.logical_domain,
+        RuntimeFilterLogicalDomain::Membership {
+            null_semantics: NullSemantics::NullSafeEqual,
+            ..
+        }
+    ));
     let producer = graph
         .bindings()
         .find(|binding| matches!(binding.role, RuntimeFilterBindingRole::Producer(_)))
@@ -919,7 +928,7 @@ fn rfd_5a_graph_disambiguates_duplicate_build_expressions_by_binding_order() {
                 PhysicalHashJoinEqCondition {
                     left: probe_expr_2.clone(),
                     right: build_expr.clone(),
-                    null_safe: false,
+                    null_safe: true,
                 },
             ],
             other_condition: None,
@@ -932,6 +941,7 @@ fn rfd_5a_graph_disambiguates_duplicate_build_expressions_by_binding_order() {
                     probe_expr: probe_expr_1,
                     expr_order: 0,
                     execution_mode: JoinExecutionMode::Broadcast,
+                    null_semantics: NullSemantics::NeverMatches,
                 },
                 RuntimeFilterBuildIntent {
                     filter_id: 42,
@@ -939,6 +949,7 @@ fn rfd_5a_graph_disambiguates_duplicate_build_expressions_by_binding_order() {
                     probe_expr: probe_expr_2,
                     expr_order: 1,
                     execution_mode: JoinExecutionMode::Broadcast,
+                    null_semantics: NullSemantics::NullSafeEqual,
                 },
             ],
             output_columns: vec![
@@ -971,6 +982,18 @@ fn rfd_5a_graph_disambiguates_duplicate_build_expressions_by_binding_order() {
 
     assert_eq!((producers.len(), consumers.len()), (2, 2));
     assert_eq!(join_node.runtime_filter_binding_ids.len(), 2);
+    assert_eq!(
+        graph
+            .channels()
+            .map(|channel| match &channel.logical_domain {
+                RuntimeFilterLogicalDomain::Membership { null_semantics, .. } => *null_semantics,
+                RuntimeFilterLogicalDomain::OrderedBound(_) => {
+                    panic!("join channel must be membership")
+                }
+            })
+            .collect::<Vec<_>>(),
+        vec![NullSemantics::NeverMatches, NullSemantics::NullSafeEqual]
+    );
     let producer_key_ordinals = producers
         .iter()
         .map(|binding| match &binding.role {
@@ -1170,6 +1193,7 @@ fn build_distributed_plan_keeps_runtime_filter_probe_on_filter() {
                 probe_expr: probe_expr.clone(),
                 expr_order: 0,
                 execution_mode: JoinExecutionMode::Partitioned,
+                null_semantics: NullSemantics::NeverMatches,
             }],
             output_columns: vec![
                 output_col(1, "l_k", DataType::Int64, false),
@@ -1967,6 +1991,7 @@ fn fragment_cut_seam_preserves_exchange_topology_before_rf_binding() {
                 probe_expr,
                 expr_order: 0,
                 execution_mode: JoinExecutionMode::Partitioned,
+                null_semantics: NullSemantics::NeverMatches,
             }],
             output_columns: vec![
                 output_col(1, "l_k", DataType::Int64, false),
@@ -3908,6 +3933,7 @@ fn test_build_binding(node_id: i32, fragment_id: u32, filter_id: i32) -> BuildBi
             probe_expr: column_ref_expr(1, "probe", DataType::Int64, false),
             expr_order: 0,
             execution_mode: JoinExecutionMode::Partitioned,
+            null_semantics: NullSemantics::NeverMatches,
         },
     }
 }

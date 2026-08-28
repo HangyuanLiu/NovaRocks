@@ -84,18 +84,29 @@ impl NativeMembershipProducerBinding {
                 spec.build_key_index
             ));
         }
-        if eq_null_safe.get(spec.build_key_index).copied() != Some(false) {
-            return Err(format!(
-                "native runtime-filter binding_id={} requires a non-null-safe equality join key",
-                spec.binding_id()
-            ));
-        }
+        let expected_null_semantics = match eq_null_safe.get(spec.build_key_index).copied() {
+            Some(false) => execution::RuntimeFilterNullSemantics::NeverMatches,
+            Some(true) => execution::RuntimeFilterNullSemantics::NullSafeEqual,
+            None => {
+                return Err(format!(
+                    "native runtime-filter binding_id={} join key ordinal {} has no null-safe equality flag",
+                    spec.binding_id(),
+                    spec.build_key_index
+                ));
+            }
+        };
         let data_type = arena.data_type(spec.build_expr_id).ok_or_else(|| {
             format!(
                 "native runtime-filter binding_id={} build expression has no frozen data type",
                 spec.binding_id()
             )
         })?;
+        if spec.contract().kind() != execution::RuntimeFilterProducerKind::Membership {
+            return Err(format!(
+                "native runtime-filter binding_id={} hash join producer requires a membership producer contract",
+                spec.binding_id()
+            ));
+        }
         let RuntimeFilterExecutionContract::Membership(membership_schema) =
             spec.contract().contract()
         else {
@@ -105,8 +116,7 @@ impl NativeMembershipProducerBinding {
             ));
         };
         if membership_schema.data_type() != data_type
-            || membership_schema.null_semantics()
-                != execution::RuntimeFilterNullSemantics::NeverMatches
+            || membership_schema.null_semantics() != expected_null_semantics
         {
             return Err(format!(
                 "native runtime-filter binding_id={} membership schema does not match build key ordinal {}",
@@ -519,18 +529,24 @@ impl NativeMembershipProducerStream {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use arrow::array::{ArrayRef, Int32Array};
+    use arrow::datatypes::DataType;
 
     use super::{NativeRuntimeFilterProducerFactory, execution};
+    use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::node::join::JoinRuntimeFilterProducerBinding;
+    use crate::exec::node::runtime_filter::RuntimeFilterExecutionContract;
+    use novarocks_types::SlotId;
 
     #[derive(Debug, Eq, PartialEq)]
     enum Event {
         Submit {
             partition: u32,
             sequence: u64,
-            kind: execution::RuntimeFilterContributionKind,
+            contribution: execution::RuntimeFilterContribution,
         },
         Close {
             partition: u32,
@@ -567,7 +583,7 @@ mod tests {
                 .push(Event::Submit {
                     partition: partition.get(),
                     sequence: sequence.get(),
-                    kind: contribution.kind(),
+                    contribution,
                 });
             Ok(execution::RuntimeFilterSubmitOutcome::Applied)
         }
@@ -596,6 +612,13 @@ mod tests {
 
     struct Session {
         producer: Arc<RecordingProducer>,
+        producer_open_count: AtomicUsize,
+    }
+
+    impl Session {
+        fn producer_open_count(&self) -> usize {
+            self.producer_open_count.load(Ordering::Acquire)
+        }
     }
 
     impl execution::RuntimeFilterSession for Session {
@@ -606,6 +629,7 @@ mod tests {
             execution::RuntimeFilterBindOutcome<execution::RuntimeFilterProducerHandle>,
             execution::RuntimeFilterContractViolation,
         > {
+            self.producer_open_count.fetch_add(1, Ordering::AcqRel);
             let producer = self.producer.clone() as execution::RuntimeFilterProducerHandle;
             Ok(execution::RuntimeFilterBindOutcome::Bound(producer))
         }
@@ -639,11 +663,121 @@ mod tests {
         }
     }
 
+    fn producer_binding(
+        build_expr_id: crate::exec::expr::ExprId,
+        null_semantics: execution::RuntimeFilterNullSemantics,
+    ) -> JoinRuntimeFilterProducerBinding {
+        let schema =
+            execution::RuntimeFilterMembershipSchema::new(&DataType::Int32, null_semantics)
+                .expect("test membership schema");
+        let contract = execution::RuntimeFilterProducerContract::membership(
+            execution::RuntimeFilterBindingId::new(17),
+            execution::RuntimeFilterChannelId::new(23),
+            RuntimeFilterExecutionContract::Membership(schema),
+        )
+        .expect("test membership producer contract");
+        JoinRuntimeFilterProducerBinding::new(build_expr_id, 0, contract)
+    }
+
+    fn build_key_arena() -> (ExprArena, crate::exec::expr::ExprId) {
+        let mut arena = ExprArena::default();
+        let build_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        (arena, build_key)
+    }
+
+    #[test]
+    fn membership_producer_requires_exact_null_semantics_for_join_key() {
+        for (eq_null_safe, null_semantics, accepted) in [
+            (
+                false,
+                execution::RuntimeFilterNullSemantics::NeverMatches,
+                true,
+            ),
+            (
+                true,
+                execution::RuntimeFilterNullSemantics::NullSafeEqual,
+                true,
+            ),
+            (
+                false,
+                execution::RuntimeFilterNullSemantics::NullSafeEqual,
+                false,
+            ),
+            (
+                true,
+                execution::RuntimeFilterNullSemantics::NeverMatches,
+                false,
+            ),
+        ] {
+            let recording = Arc::new(RecordingProducer::default());
+            let session = Arc::new(Session {
+                producer: Arc::clone(&recording),
+                producer_open_count: AtomicUsize::new(0),
+            });
+            let session_ref: execution::RuntimeFilterSessionRef = session.clone();
+            let (arena, build_key) = build_key_arena();
+            let spec = producer_binding(build_key, null_semantics);
+
+            let factory = NativeRuntimeFilterProducerFactory::from_plan(
+                &[spec],
+                &[build_key],
+                &[eq_null_safe],
+                &arena,
+                session_ref,
+                1,
+            );
+
+            assert_eq!(factory.is_ok(), accepted);
+            assert_eq!(session.producer_open_count(), 0);
+            assert!(recording.events().is_empty());
+        }
+    }
+
+    #[test]
+    fn membership_producer_rejects_non_membership_kind_before_open() {
+        let recording = Arc::new(RecordingProducer::default());
+        let session = Arc::new(Session {
+            producer: Arc::clone(&recording),
+            producer_open_count: AtomicUsize::new(0),
+        });
+        let session_ref: execution::RuntimeFilterSessionRef = session.clone();
+        let (arena, build_key) = build_key_arena();
+        let schema = execution::RuntimeFilterMembershipSchema::new(
+            &DataType::Int32,
+            execution::RuntimeFilterNullSemantics::NeverMatches,
+        )
+        .expect("membership schema");
+        let contract = execution::RuntimeFilterProducerContract::final_domain(
+            execution::RuntimeFilterBindingId::new(17),
+            execution::RuntimeFilterChannelId::new(23),
+            RuntimeFilterExecutionContract::Membership(schema),
+        )
+        .expect("final-domain producer contract");
+        let spec = JoinRuntimeFilterProducerBinding::new(build_key, 0, contract);
+
+        let error = match NativeRuntimeFilterProducerFactory::from_plan(
+            &[spec],
+            &[build_key],
+            &[false],
+            &arena,
+            session_ref,
+            1,
+        ) {
+            Ok(_) => panic!("non-membership producer kind must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("requires a membership producer contract"));
+        assert_eq!(session.producer_open_count(), 0);
+        assert!(recording.events().is_empty());
+    }
+
     #[test]
     fn membership_producer_encodes_and_closes_through_execution_capability() {
         let recording = Arc::new(RecordingProducer::default());
         let session: execution::RuntimeFilterSessionRef = Arc::new(Session {
             producer: Arc::clone(&recording),
+            producer_open_count: AtomicUsize::new(0),
         });
         let factory = NativeRuntimeFilterProducerFactory::for_test(session, 1)
             .expect("test producer factory");
@@ -655,19 +789,94 @@ mod tests {
         producers.submit(&arrays).expect("submit membership");
         producers.finish().expect("close producer");
 
+        let events = recording.events();
+        let [
+            Event::Submit {
+                partition,
+                sequence,
+                contribution,
+            },
+            Event::Close {
+                partition: close_partition,
+                sequence: close_sequence,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected one membership contribution followed by close: {events:?}");
+        };
+        assert_eq!((*partition, *sequence), (0, 0));
         assert_eq!(
-            recording.events(),
-            vec![
-                Event::Submit {
-                    partition: 0,
-                    sequence: 0,
-                    kind: execution::RuntimeFilterContributionKind::Membership,
-                },
-                Event::Close {
-                    partition: 0,
-                    sequence: 1,
-                },
-            ]
+            contribution.kind(),
+            execution::RuntimeFilterContributionKind::Membership
+        );
+        assert_eq!((*close_partition, *close_sequence), (0, 1));
+    }
+
+    #[test]
+    fn null_safe_membership_producer_preserves_null_in_contribution() {
+        let recording = Arc::new(RecordingProducer::default());
+        let session = Arc::new(Session {
+            producer: Arc::clone(&recording),
+            producer_open_count: AtomicUsize::new(0),
+        });
+        let session_ref: execution::RuntimeFilterSessionRef = session;
+        let (arena, build_key) = build_key_arena();
+        let spec = producer_binding(
+            build_key,
+            execution::RuntimeFilterNullSemantics::NullSafeEqual,
+        );
+        let factory = NativeRuntimeFilterProducerFactory::from_plan(
+            &[spec],
+            &[build_key],
+            &[true],
+            &arena,
+            session_ref,
+            1,
+        )
+        .expect("null-safe membership binding is accepted");
+        let mut producers = factory
+            .create_for_driver(1, 0)
+            .expect("test producer stream");
+        producers.bind(1).expect("bind producer");
+        let arrays = vec![Arc::new(Int32Array::from(vec![Some(2), None])) as ArrayRef];
+        producers.submit(&arrays).expect("submit membership");
+        producers.finish().expect("close producer");
+
+        let events = recording.events();
+        let [
+            Event::Submit {
+                partition,
+                sequence,
+                contribution,
+            },
+            Event::Close {
+                partition: close_partition,
+                sequence: close_sequence,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("expected one membership contribution followed by close: {events:?}");
+        };
+        assert_eq!((*partition, *sequence), (0, 0));
+        assert_eq!((*close_partition, *close_sequence), (0, 1));
+        let decoded = execution::contribution::decode_contribution(
+            contribution.canonical_bytes(),
+            &contribution.contract_digest(),
+            execution::contribution::ContributionCodecExpectation::membership(
+                &DataType::Int32,
+                contribution.contract_digest(),
+            ),
+            usize::MAX,
+        )
+        .expect("decode null-safe membership contribution");
+        assert_eq!(
+            decoded,
+            execution::contribution::RuntimeFilterContribution::membership(
+                execution::contribution::ValueDomainDelta::new(
+                    execution::contribution::MembershipValues::int32([2]),
+                    true,
+                ),
+            )
         );
     }
 }

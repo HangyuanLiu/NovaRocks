@@ -130,3 +130,51 @@ SELECT 'partitioned_probe' AS scenario, COUNT(*) AS row_count, COALESCE(SUM(p.id
 FROM ${case_db}.rf_dist_part_probe p
 JOIN ${case_db}.rf_dist_part_build b ON p.k = b.k
 WHERE b.flag = 'Y';
+
+-- Add nullable rows only after the existing ordinary-equality proof so its
+-- stable row-count and RuntimeFilterApply assertions remain unchanged.
+INSERT INTO ${case_db}.rf_dist_part_probe VALUES
+    (2001, NULL),
+    (2002, NULL);
+
+INSERT INTO ${case_db}.rf_dist_part_build VALUES
+    (NULL, 'Y');
+
+ANALYZE TABLE ${case_db}.rf_dist_part_probe;
+ANALYZE TABLE ${case_db}.rf_dist_part_build;
+
+SET disable_optimizer_rules = 'RuntimeFilterPushDown';
+-- @result_contains=partitioned_null_safe_ok
+SELECT CASE
+         WHEN COUNT(*) = 2 AND COALESCE(SUM(p.id), 0) = 4003
+           THEN 'partitioned_null_safe_ok'
+         ELSE 'partitioned_null_safe_bad'
+       END AS verdict
+FROM ${case_db}.rf_dist_part_probe p
+JOIN ${case_db}.rf_dist_part_build b ON p.k <=> b.k
+WHERE p.id >= 2001 AND b.flag = 'Y';
+
+SET disable_optimizer_rules = '';
+-- @result_contains=partitioned_null_safe_ok
+-- @explain_contains=HASH JOIN (PARTITIONED
+-- @explain_contains=HASH_PARTITIONED (k)
+-- @explain_contains=producer binding
+-- @explain_contains=consumer binding
+-- @expect_runtime_filter_available=available
+-- @expect_runtime_filter_detail=completed-channel
+-- @expect_runtime_filter_detail=accepted-producer
+-- @expect_runtime_filter_detail=sent-acked-transport
+-- @expect_runtime_filter_detail=delivered-applied-consumer
+-- @expect_runtime_filter_total_at_least=channel_completed_count,1
+-- @expect_runtime_filter_total_at_least=producer_accepted_count,1
+-- @expect_runtime_filter_total_at_least=transport_sent_count,1
+-- @expect_runtime_filter_total_at_least=transport_acked_count,1
+-- @expect_runtime_filter_total_at_least=consumer_input_rows,1
+SELECT CASE
+         WHEN COUNT(*) = 2 AND COALESCE(SUM(p.id), 0) = 4003
+           THEN 'partitioned_null_safe_ok'
+         ELSE 'partitioned_null_safe_bad'
+       END AS verdict
+FROM ${case_db}.rf_dist_part_probe p
+JOIN ${case_db}.rf_dist_part_build b ON p.k <=> b.k
+WHERE p.id >= 2001 AND b.flag = 'Y';
