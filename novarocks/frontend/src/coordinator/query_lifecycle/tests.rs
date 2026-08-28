@@ -3150,31 +3150,14 @@ async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unkn
             Duration::from_secs(2),
         )
         .expect("warm the channel before the delayed request");
-    let gate = Arc::new(LiveInitGate::default());
-    *ingress.init_gate.lock().expect("init gate") = Some(Arc::clone(&gate));
-    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let request_transport = Arc::clone(&transport);
-    let request_backend = backend.clone();
-    let requester = std::thread::spawn(move || {
-        result_tx
-            .send(request_transport.init_query(
-                target,
-                live_init_request(&request_backend, 808),
-                Duration::from_millis(20),
-            ))
-            .expect("test result receiver remains live");
-    });
-    wait_until(Duration::from_secs(2), || {
-        gate.entered.load(std::sync::atomic::Ordering::Acquire)
-    });
-    let result = tokio::time::timeout(Duration::from_secs(2), result_rx).await;
-    gate.release
-        .store(true, std::sync::atomic::Ordering::Release);
-    requester.join().expect("join deadline requester");
-    let error = result
-        .expect("submitted InitQuery must time out while the server is handling it")
-        .expect("deadline requester must return a result")
-        .expect_err("submitted InitQuery must have an unknown outcome");
+    *ingress.init_delay.lock().expect("init delay") = Some(Duration::from_millis(100));
+    let error = transport
+        .init_query(
+            target,
+            live_init_request(&backend, 808),
+            Duration::from_millis(20),
+        )
+        .expect_err("submitted InitQuery must time out while the server is handling it");
     assert!(matches!(
         error.kind(),
         QueryLifecycleTransportErrorKind::DeadlineExceeded
@@ -3182,10 +3165,8 @@ async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unkn
     ));
     assert!(error.is_unknown_init_outcome());
 
-    drop(transport);
-    drop(shutdown_tx);
-    server.abort();
-    tokio::task::yield_now().await;
+    let _ = shutdown_tx.send(());
+    server.await.expect("join live lifecycle server");
 }
 
 fn live_init_request(
@@ -3471,7 +3452,7 @@ struct LiveLifecycleIngress {
     gate: Option<Arc<LiveHeartbeatGate>>,
     manual_heartbeat_acks: bool,
     manual_terminal_acks: bool,
-    init_gate: Mutex<Option<Arc<LiveInitGate>>>,
+    init_delay: Mutex<Option<Duration>>,
     control_events: Mutex<Option<tokio::sync::mpsc::Sender<protocol_lifecycle::QueryControlEvent>>>,
 }
 
@@ -3492,13 +3473,8 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
         &self,
         request: protocol_lifecycle::QueryInitRequest,
     ) -> protocol_lifecycle::QueryInitAck {
-        let init_gate = self.init_gate.lock().expect("init gate").clone();
-        if let Some(gate) = init_gate {
-            gate.entered
-                .store(true, std::sync::atomic::Ordering::Release);
-            while !gate.release.load(std::sync::atomic::Ordering::Acquire) {
-                std::thread::yield_now();
-            }
+        if let Some(delay) = *self.init_delay.lock().expect("init delay") {
+            std::thread::sleep(delay);
         }
         let manifest = request
             .manifest()
@@ -3650,12 +3626,6 @@ impl BackendQueryControl for LiveBackendControl {
 
 #[derive(Default)]
 struct LiveHeartbeatGate {
-    entered: std::sync::atomic::AtomicBool,
-    release: std::sync::atomic::AtomicBool,
-}
-
-#[derive(Default)]
-struct LiveInitGate {
     entered: std::sync::atomic::AtomicBool,
     release: std::sync::atomic::AtomicBool,
 }
