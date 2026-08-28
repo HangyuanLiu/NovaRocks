@@ -47,9 +47,7 @@ pub(crate) const DEFAULT_PUMP_BATCH_SIZE: usize = 256;
 
 /// How long the pump waits when no source could make progress.
 const IDLE_PUMP_BACKOFF: std::time::Duration = std::time::Duration::from_millis(2);
-/// Until the server configuration surface is wired, this is the documented
-/// default and hard safety ceiling for a connector's optional request.
-const DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP: Duration = Duration::from_secs(1);
+pub(crate) const DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP: Duration = Duration::from_secs(1);
 
 /// One typed scan's split source, with the plan node it feeds.
 pub(crate) struct RoundSplitSource {
@@ -85,6 +83,7 @@ impl RoundSplitAssignment {
         max_queued_splits_per_task: u64,
         sources: Vec<RoundSplitSource>,
         retry_policy: TaskUpdateRetryPolicy,
+        initial_dynamic_filter_wait_cap: Duration,
     ) -> Self {
         let stop = SplitAssignmentStop::default();
         let started_at = Instant::now();
@@ -93,7 +92,7 @@ impl RoundSplitAssignment {
             let requested = source
                 .source
                 .initial_dynamic_filter_wait_request()
-                .min(DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP);
+                .min(initial_dynamic_filter_wait_cap);
             source.initial_wait_deadline = (!requested.is_zero()).then(|| started_at + requested);
         }
         Self {
@@ -393,6 +392,7 @@ mod tests {
                 initial_wait_deadline: None,
             }],
             TaskUpdateRetryPolicy::default(),
+            DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
         )
     }
 

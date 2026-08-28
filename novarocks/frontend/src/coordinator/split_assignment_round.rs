@@ -95,6 +95,7 @@ pub(crate) struct RoundSplitAssignmentPlan {
     targets: BTreeMap<i32, Vec<AssignmentTarget>>,
     sources: Vec<RoundSplitSource>,
     retry_policy: TaskUpdateRetryPolicy,
+    initial_dynamic_filter_wait_cap: std::time::Duration,
 }
 
 impl RoundSplitAssignmentPlan {
@@ -103,12 +104,14 @@ impl RoundSplitAssignmentPlan {
         targets: BTreeMap<i32, Vec<AssignmentTarget>>,
         sources: Vec<RoundSplitSource>,
         retry_policy: TaskUpdateRetryPolicy,
+        initial_dynamic_filter_wait_cap: std::time::Duration,
     ) -> Self {
         Self {
             transport,
             targets,
             sources,
             retry_policy,
+            initial_dynamic_filter_wait_cap,
         }
     }
 
@@ -166,6 +169,7 @@ impl SplitAssignmentRoundGuard {
             DEFAULT_MAX_QUEUED_SPLITS_PER_TASK,
             sources,
             plan.retry_policy,
+            plan.initial_dynamic_filter_wait_cap,
         );
         let stop = assignment.stop_handle();
         let worker = std::thread::Builder::new()
@@ -255,6 +259,7 @@ mod tests {
                     BTreeMap::new(),
                     Vec::new(),
                     TaskUpdateRetryPolicy::default(),
+                    std::time::Duration::ZERO,
                 ),
             )
             .is_none()
