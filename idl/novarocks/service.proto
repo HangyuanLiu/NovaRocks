@@ -26,6 +26,7 @@ syntax = "proto3";
 package novarocks;
 
 import "common.proto";
+import "catalog.proto";
 import "connector_read.proto";
 import "filter.proto";
 import "plan.proto";
@@ -79,6 +80,10 @@ service NovaRocksGrpc {
   // binding generation. Existing query leases may drain.
   rpc RetireConnectorExecutionBinding(RetireConnectorExecutionBindingRequest)
       returns (RetireConnectorExecutionBindingResponse);
+  // Coordinator publishes one complete catalog reachability snapshot. This is
+  // best effort cache management and never carries a retire delta.
+  rpc PruneCatalogs(novarocks.catalog.PruneCatalogsRequest)
+      returns (novarocks.catalog.PruneCatalogsResponse);
   // Backend registration lease. The FE verifies the claimed endpoint through
   // the separate FE-pull Heartbeat path before the backend is eligible.
   rpc AnnounceBackend(AnnounceBackendRequest) returns (AnnounceBackendResponse);
@@ -183,6 +188,7 @@ message ParticipantManifest {
   uint64 pre_start_timeout_ms = 9;
   QueryControlEndpoint report_endpoint = 10;
   NativeCompatibilityId native_compatibility_id = 11;
+  novarocks.catalog.CatalogSet catalog_set = 12;
 }
 
 enum QueryInitOutcome {
@@ -329,7 +335,11 @@ message QueryControlRequest {
   }
 }
 
-message QueryControlReady {}
+// The first response after a successful attach. It always carries the closed
+// state of the catalog contribution frozen by InitQuery.
+message QueryControlReady {
+  novarocks.catalog.CatalogLoadState catalog_load_state = 1;
+}
 
 message QueryControlHeartbeatAck {
   uint64 sequence = 1;
@@ -396,6 +406,10 @@ message QueryControlResponse {
     ParticipantTerminalOutcome terminal_outcome = 6;
     FragmentLiveObservation fragment_observation = 7;
     RuntimeFilterFeedbackEvent runtime_filter_feedback = 8;
+    // Cold-only completion frames. A Loading ControlReady is followed by one
+    // of these on the same active stream.
+    novarocks.catalog.CatalogReady catalog_ready = 9;
+    novarocks.catalog.CatalogLoadFailed catalog_load_failed = 10;
   }
 }
 

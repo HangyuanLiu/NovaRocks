@@ -7,6 +7,7 @@
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
 use super::manifest::{ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest};
 use super::terminal::ParticipantTerminalOutcome;
+use crate::catalog::{validate_catalog_load_failed, validate_catalog_load_state};
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, novarocks};
 
@@ -202,9 +203,35 @@ impl QueryControlEvent {
         use novarocks::query_control_response::Event;
 
         match raw.event.as_ref() {
-            Some(Event::ControlReady(_))
+            Some(Event::ControlReady(ready)) => {
+                let state = ready.catalog_load_state.as_ref().ok_or_else(|| {
+                    missing(
+                        FieldPath::root("query_control_response")
+                            .field("event")
+                            .field("control_ready")
+                            .field("catalog_load_state"),
+                        "catalog load state is required",
+                    )
+                })?;
+                validate_catalog_load_state(
+                    state,
+                    FieldPath::root("query_control_response")
+                        .field("event")
+                        .field("control_ready")
+                        .field("catalog_load_state"),
+                )?;
+            }
+            Some(Event::CatalogReady(_))
             | Some(Event::HeartbeatAck(_))
             | Some(Event::LocalDrained(_)) => {}
+            Some(Event::CatalogLoadFailed(failure)) => {
+                validate_catalog_load_failed(
+                    failure,
+                    FieldPath::root("query_control_response")
+                        .field("event")
+                        .field("catalog_load_failed"),
+                )?;
+            }
             Some(Event::LocalFailure(failure))
                 if !failure.code.trim().is_empty() && !failure.detail.trim().is_empty() => {}
             Some(Event::TerminationAccepted(accepted)) => {
@@ -686,7 +713,7 @@ mod tests {
         QueryTerminationReason,
     };
     use crate::lifecycle::manifest::ParticipantManifest;
-    use novarocks_proto_models::{common, novarocks};
+    use novarocks_proto_models::{catalog, common, novarocks};
 
     fn id(hi: i64, lo: i64) -> common::UniqueId {
         common::UniqueId { hi, lo }
@@ -719,6 +746,7 @@ mod tests {
             native_compatibility_id: Some(novarocks::NativeCompatibilityId {
                 value: vec![0x71; 32],
             }),
+            catalog_set: Some(catalog::CatalogSet { catalogs: vec![] }),
             ..Default::default()
         }
     }

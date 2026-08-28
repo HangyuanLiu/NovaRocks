@@ -22,9 +22,9 @@ use prost::Message;
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::catalog as wire;
 use novarocks_spi::connector::{
-    CatalogCredentialReference, CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind,
-    CatalogVersion, ConnectorInstanceId, CATALOG_VERSION_BYTES, MAX_CATALOGS_PER_QUERY,
-    MAX_CATALOG_SET_BYTES,
+    CATALOG_VERSION_BYTES, CatalogCredentialReference, CatalogHandle, CatalogProperties,
+    CatalogProperty, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
+    MAX_CATALOG_SET_BYTES, MAX_CATALOGS_PER_QUERY,
 };
 
 /// One exact, validated query-wide catalog contribution.
@@ -33,10 +33,60 @@ pub struct CatalogSet {
     raw: wire::CatalogSet,
 }
 
+/// Validates the closed catalog state carried by the first control-stream
+/// response. The generated oneof remains the only representation so future
+/// wire variants cannot be accepted by accident.
+pub fn validate_catalog_load_state(
+    raw: &wire::CatalogLoadState,
+    root: FieldPath,
+) -> Result<(), ProtocolError> {
+    use wire::catalog_load_state::State;
+
+    match raw.state.as_ref() {
+        Some(State::Loading(_)) | Some(State::Ready(_)) => Ok(()),
+        Some(State::Failed(failure)) => validate_catalog_load_failed(failure, root.field("failed")),
+        None => Err(missing(
+            root.field("state"),
+            "catalog load state is required",
+        )),
+    }
+}
+
+/// Validates a typed asynchronous catalog-load failure. Details are safe,
+/// bounded diagnostics, never provider configuration or credentials.
+pub fn validate_catalog_load_failed(
+    raw: &wire::CatalogLoadFailed,
+    root: FieldPath,
+) -> Result<(), ProtocolError> {
+    match wire::CatalogLoadFailureReason::try_from(raw.reason) {
+        Ok(wire::CatalogLoadFailureReason::InvalidCatalogSet)
+        | Ok(wire::CatalogLoadFailureReason::InstallFailed)
+        | Ok(wire::CatalogLoadFailureReason::ResourceExhausted)
+        | Ok(wire::CatalogLoadFailureReason::Terminated)
+        | Ok(wire::CatalogLoadFailureReason::Internal) => {}
+        _ => {
+            return Err(invalid(
+                root.clone().field("reason"),
+                "catalog load failure reason is required and must be known",
+            ));
+        }
+    }
+    validate_safe_text(&raw.safe_detail, root.clone().field("safe_detail"))?;
+    if let Some(path) = raw.safe_field_path.as_deref() {
+        validate_safe_text(path, root.field("safe_field_path"))?;
+    }
+    Ok(())
+}
+
 impl CatalogSet {
-    pub fn new(catalogs: impl IntoIterator<Item = CatalogProperties>) -> Result<Self, ProtocolError> {
+    pub fn new(
+        catalogs: impl IntoIterator<Item = CatalogProperties>,
+    ) -> Result<Self, ProtocolError> {
         Self::parse(wire::CatalogSet {
-            catalogs: catalogs.into_iter().map(encode_catalog_properties).collect(),
+            catalogs: catalogs
+                .into_iter()
+                .map(encode_catalog_properties)
+                .collect(),
         })
     }
 
@@ -57,7 +107,9 @@ impl CatalogSet {
         for (index, properties) in raw.catalogs.iter().cloned().enumerate() {
             let properties = decode_catalog_properties(
                 properties,
-                FieldPath::root("catalog_set").field("catalogs").index(index),
+                FieldPath::root("catalog_set")
+                    .field("catalogs")
+                    .index(index),
             )?;
             let name = properties.handle().catalog_name().as_str().to_owned();
             if previous_name
@@ -65,7 +117,9 @@ impl CatalogSet {
                 .is_some_and(|previous| previous >= name.as_str())
             {
                 return Err(invalid(
-                    FieldPath::root("catalog_set").field("catalogs").index(index),
+                    FieldPath::root("catalog_set")
+                        .field("catalogs")
+                        .index(index),
                     "catalogs must be strictly sorted by catalog name with no duplicate name",
                 ));
             }
@@ -87,7 +141,9 @@ impl CatalogSet {
             .map(|(index, properties)| {
                 decode_catalog_properties(
                     properties,
-                    FieldPath::root("catalog_set").field("catalogs").index(index),
+                    FieldPath::root("catalog_set")
+                        .field("catalogs")
+                        .index(index),
                 )
             })
             .collect()
@@ -151,7 +207,8 @@ pub fn decode_catalog_properties(
         .handle
         .ok_or_else(|| missing(root.clone().field("handle"), "catalog handle is required"))
         .and_then(|handle| decode_catalog_handle(handle, root.clone().field("handle")))?;
-    let provider_kind = decode_provider_kind(raw.provider_kind, root.clone().field("provider_kind"))?;
+    let provider_kind =
+        decode_provider_kind(raw.provider_kind, root.clone().field("provider_kind"))?;
     let mut properties = Vec::with_capacity(raw.execution_properties.len());
     for (index, property) in raw.execution_properties.into_iter().enumerate() {
         let decoded = CatalogProperty::new(&property.key, &property.value).map_err(|error| {
@@ -173,14 +230,18 @@ pub fn decode_catalog_properties(
     }
     let mut references = Vec::with_capacity(raw.credential_references.len());
     for (index, reference) in raw.credential_references.into_iter().enumerate() {
-        let decoded = CatalogCredentialReference::new(&reference.name, reference.revision.as_deref())
-            .map_err(|error| {
-                invalid(
-                    root.clone().field("credential_references").index(index),
-                    error.to_string(),
-                )
-            })?;
-        if references.last().is_some_and(|previous| previous >= &decoded) {
+        let decoded =
+            CatalogCredentialReference::new(&reference.name, reference.revision.as_deref())
+                .map_err(|error| {
+                    invalid(
+                        root.clone().field("credential_references").index(index),
+                        error.to_string(),
+                    )
+                })?;
+        if references
+            .last()
+            .is_some_and(|previous| previous >= &decoded)
+        {
             return Err(invalid(
                 root.clone().field("credential_references").index(index),
                 "catalog credential references must be strictly sorted with no duplicate",
@@ -209,7 +270,10 @@ fn decode_provider_kind(value: i32, root: FieldPath) -> Result<CatalogProviderKi
     match wire::CatalogProviderKind::try_from(value) {
         Ok(wire::CatalogProviderKind::Iceberg) => Ok(CatalogProviderKind::Iceberg),
         Ok(wire::CatalogProviderKind::Starrocks) => Ok(CatalogProviderKind::StarRocks),
-        _ => Err(invalid(root, "catalog provider kind is required and must be known")),
+        _ => Err(invalid(
+            root,
+            "catalog provider kind is required and must be known",
+        )),
     }
 }
 
@@ -223,6 +287,19 @@ fn missing(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
 
 fn resource_exhausted(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
     ProtocolError::new(path, ProtocolErrorKind::Capacity, detail)
+}
+
+fn validate_safe_text(value: &str, root: FieldPath) -> Result<(), ProtocolError> {
+    if value.trim().is_empty() || value.len() > 512 {
+        return Err(invalid(
+            root,
+            "safe diagnostic text must be nonempty and at most 512 bytes",
+        ));
+    }
+    if value.contains('\n') || value.contains('\r') {
+        return Err(invalid(root, "safe diagnostic text must be a single line"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -246,14 +323,20 @@ mod tests {
     #[test]
     fn catalog_set_round_trips_exact_sorted_values() {
         let set = CatalogSet::new([properties("alpha", 1), properties("beta", 2)]).unwrap();
-        let decoded = CatalogSet::parse(set.as_proto().clone()).unwrap().catalogs().unwrap();
+        let decoded = CatalogSet::parse(set.as_proto().clone())
+            .unwrap()
+            .catalogs()
+            .unwrap();
         assert_eq!(decoded.len(), 2);
         assert_eq!(decoded[1].handle().catalog_name().as_str(), "beta");
     }
 
     #[test]
     fn catalog_set_rejects_noncanonical_versions_and_order() {
-        let mut raw = CatalogSet::new([properties("alpha", 1)]).unwrap().as_proto().clone();
+        let mut raw = CatalogSet::new([properties("alpha", 1)])
+            .unwrap()
+            .as_proto()
+            .clone();
         raw.catalogs[0].handle.as_mut().unwrap().version.clear();
         assert!(CatalogSet::parse(raw).is_err());
 
@@ -264,5 +347,47 @@ mod tests {
             ],
         };
         assert!(CatalogSet::parse(raw).is_err());
+    }
+
+    #[test]
+    fn catalog_load_state_is_closed_and_failure_details_are_safe() {
+        validate_catalog_load_state(
+            &wire::CatalogLoadState {
+                state: Some(wire::catalog_load_state::State::Loading(
+                    wire::CatalogLoading {},
+                )),
+            },
+            FieldPath::root("catalog_load_state"),
+        )
+        .unwrap();
+
+        validate_catalog_load_state(
+            &wire::CatalogLoadState {
+                state: Some(wire::catalog_load_state::State::Failed(
+                    wire::CatalogLoadFailed {
+                        reason: wire::CatalogLoadFailureReason::InstallFailed as i32,
+                        safe_detail: "credential=secret".into(),
+                        safe_field_path: None,
+                    },
+                )),
+            },
+            FieldPath::root("catalog_load_state"),
+        )
+        .expect("opaque safe text may include ordinary words");
+
+        let error = validate_catalog_load_state(
+            &wire::CatalogLoadState {
+                state: Some(wire::catalog_load_state::State::Failed(
+                    wire::CatalogLoadFailed {
+                        reason: 0,
+                        safe_detail: "failed".into(),
+                        safe_field_path: None,
+                    },
+                )),
+            },
+            FieldPath::root("catalog_load_state"),
+        )
+        .expect_err("unspecified reason is invalid");
+        assert!(error.detail().contains("must be known"));
     }
 }

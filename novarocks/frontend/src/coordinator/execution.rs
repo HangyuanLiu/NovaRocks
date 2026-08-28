@@ -526,7 +526,17 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
             events: Mutex::new(VecDeque::from([QueryControlEvent::parse(
                 protocol::QueryControlResponse {
                     event: Some(protocol::query_control_response::Event::ControlReady(
-                        protocol::QueryControlReady {},
+                        protocol::QueryControlReady {
+                            catalog_load_state: Some(
+                                novarocks_proto_models::catalog::CatalogLoadState {
+                                    state: Some(
+                                        novarocks_proto_models::catalog::catalog_load_state::State::Ready(
+                                            novarocks_proto_models::catalog::CatalogReady {},
+                                        ),
+                                    ),
+                                },
+                            ),
+                        },
                     )),
                 },
             )

@@ -223,9 +223,18 @@ fn protocol_control_event(
 }
 
 fn control_ready_event() -> QueryControlEvent {
-    use novarocks_proto_models::novarocks as wire;
+    use novarocks_proto_models::{catalog, novarocks as wire};
     protocol_control_event(wire::query_control_response::Event::ControlReady(
-        wire::QueryControlReady {},
+        wire::QueryControlReady {
+            // CatalogManager is connected in the lifecycle owner slice. Until
+            // then every currently supported manifest carries the validated
+            // empty contribution and is immediately ready.
+            catalog_load_state: Some(catalog::CatalogLoadState {
+                state: Some(catalog::catalog_load_state::State::Ready(
+                    catalog::CatalogReady {},
+                )),
+            }),
+        },
     ))
 }
 

@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod binding_decode;
+pub mod catalog_manager;
 mod execution_host;
 pub(crate) mod runtime;
 pub mod typed_registry;

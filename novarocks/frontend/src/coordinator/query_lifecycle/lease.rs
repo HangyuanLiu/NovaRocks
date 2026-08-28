@@ -1732,6 +1732,19 @@ impl AttemptControl {
                     session.target.backend_idx()
                 ))
             }
+            Some(novarocks_proto_models::novarocks::query_control_response::Event::CatalogReady(_)) => {
+                Err(format!(
+                    "backend {} emitted CatalogReady before catalog lifecycle support was enabled",
+                    session.target.backend_idx()
+                ))
+            }
+            Some(novarocks_proto_models::novarocks::query_control_response::Event::CatalogLoadFailed(
+                failure,
+            )) => Err(format!(
+                "backend {} reported catalog load failure ({}): {}",
+                session.target.backend_idx(),
+                failure.reason, failure.safe_detail
+            )),
             None => Err("validated query control event is missing its oneof".to_string()),
         }
     }

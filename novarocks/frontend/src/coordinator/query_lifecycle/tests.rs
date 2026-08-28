@@ -39,7 +39,7 @@ use novarocks_proto_codec::lifecycle::{
     RuntimeFilterContribution,
 };
 use novarocks_proto_codec::membership::BackendProcessDescriptor;
-use novarocks_proto_models::{common as proto_common, filter, novarocks as proto};
+use novarocks_proto_models::{catalog, common as proto_common, filter, novarocks as proto};
 use novarocks_types::{BackendProcessId, QueryId, UniqueId};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -294,7 +294,13 @@ fn protocol_abort_for(
 
 fn protocol_event_control_ready() -> protocol_lifecycle::QueryControlEvent {
     protocol_event(proto::query_control_response::Event::ControlReady(
-        proto::QueryControlReady {},
+        proto::QueryControlReady {
+            catalog_load_state: Some(catalog::CatalogLoadState {
+                state: Some(catalog::catalog_load_state::State::Ready(
+                    catalog::CatalogReady {},
+                )),
+            }),
+        },
     ))
 }
 
@@ -3398,6 +3404,13 @@ impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
         _request: Request<proto::RetireConnectorExecutionBindingRequest>,
     ) -> Result<Response<proto::RetireConnectorExecutionBindingResponse>, Status> {
         Err(Self::rejected("RetireConnectorExecutionBinding"))
+    }
+
+    async fn prune_catalogs(
+        &self,
+        _request: Request<catalog::PruneCatalogsRequest>,
+    ) -> Result<Response<catalog::PruneCatalogsResponse>, Status> {
+        Err(Self::rejected("PruneCatalogs"))
     }
 
     async fn heartbeat(

@@ -112,7 +112,10 @@ pub struct CatalogCredentialReference {
 }
 
 impl CatalogCredentialReference {
-    pub fn new(name: impl AsRef<str>, revision: Option<impl AsRef<str>>) -> Result<Self, ConnectorError> {
+    pub fn new(
+        name: impl AsRef<str>,
+        revision: Option<impl AsRef<str>>,
+    ) -> Result<Self, ConnectorError> {
         let name = bounded_ascii("catalog credential reference", name.as_ref())?;
         let revision = revision
             .map(|value| bounded_ascii("catalog credential reference revision", value.as_ref()))
@@ -197,7 +200,10 @@ impl CatalogProperties {
             return Err(invalid("duplicate catalog property key"));
         }
         credential_references.sort();
-        if credential_references.windows(2).any(|pair| pair[0] == pair[1]) {
+        if credential_references
+            .windows(2)
+            .any(|pair| pair[0] == pair[1])
+        {
             return Err(invalid("duplicate catalog credential reference"));
         }
         Ok(Self {
@@ -255,7 +261,8 @@ impl Default for ConnectorControlRuntimeId {
 }
 
 fn bounded_ascii(subject: &str, value: &str) -> Result<Arc<str>, ConnectorError> {
-    if value.is_empty() || value.len() > MAX_CATALOG_CREDENTIAL_REFERENCE_BYTES || !value.is_ascii() {
+    if value.is_empty() || value.len() > MAX_CATALOG_CREDENTIAL_REFERENCE_BYTES || !value.is_ascii()
+    {
         return Err(invalid(subject));
     }
     Ok(Arc::from(value))
@@ -265,9 +272,9 @@ fn is_property_key(value: &str) -> bool {
     value.len() <= MAX_CATALOG_PROPERTY_KEY_BYTES
         && !value.is_empty()
         && value.as_bytes()[0].is_ascii_lowercase()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-'))
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
+        })
 }
 
 fn is_sensitive_property_key(value: &str) -> bool {
@@ -316,23 +323,28 @@ mod tests {
         .unwrap();
         assert_eq!(properties.execution_properties()[0].key(), "catalog_uri");
         assert!(CatalogProperty::new("password", "leak").is_err());
-        assert!(CatalogProperties::new(
-            handle(1),
-            CatalogProviderKind::Iceberg,
-            1,
-            vec![
-                CatalogProperty::new("warehouse", "one").unwrap(),
-                CatalogProperty::new("warehouse", "two").unwrap(),
-            ],
-            vec![],
-        )
-        .is_err());
+        assert!(
+            CatalogProperties::new(
+                handle(1),
+                CatalogProviderKind::Iceberg,
+                1,
+                vec![
+                    CatalogProperty::new("warehouse", "one").unwrap(),
+                    CatalogProperty::new("warehouse", "two").unwrap(),
+                ],
+                vec![],
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn control_runtime_identity_is_not_catalog_version() {
         let control = ConnectorControlRuntimeId::from_bytes([7; 16]);
         assert_eq!(control.to_bytes(), [7; 16]);
-        assert_ne!(handle(7).version().as_bytes().len(), control.to_bytes().len());
+        assert_ne!(
+            handle(7).version().as_bytes().len(),
+            control.to_bytes().len()
+        );
     }
 }

@@ -10,6 +10,7 @@ use std::time::Duration;
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
 use super::query_options::QueryOptions;
 use crate::canonical;
+use crate::catalog::CatalogSet;
 use crate::membership::{BackendProcessId, required_native_compatibility_id};
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, novarocks};
@@ -304,6 +305,35 @@ impl ParticipantManifest {
         pre_start_timeout: Duration,
         report_endpoint: QueryControlEndpoint,
     ) -> Result<Self, ProtocolError> {
+        Self::new_with_catalog_set(
+            execution_id,
+            backend,
+            native_compatibility_id,
+            expected_fragment_instance_ids,
+            query_options,
+            query_deadline_unix_ms,
+            exchange_routes,
+            runtime_filter,
+            pre_start_timeout,
+            report_endpoint,
+            CatalogSet::new([])?,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_catalog_set(
+        execution_id: QueryExecutionId,
+        backend: ParticipantBackendIdentity,
+        native_compatibility_id: NativeCompatibilityId,
+        expected_fragment_instance_ids: impl IntoIterator<Item = common::UniqueId>,
+        query_options: QueryOptions,
+        query_deadline_unix_ms: u64,
+        exchange_routes: impl IntoIterator<Item = ExchangeRouteManifest>,
+        runtime_filter: Option<RuntimeFilterContribution>,
+        pre_start_timeout: Duration,
+        report_endpoint: QueryControlEndpoint,
+        catalog_set: CatalogSet,
+    ) -> Result<Self, ProtocolError> {
         let pre_start_timeout_ms = u64::try_from(pre_start_timeout.as_millis()).map_err(|_| {
             out_of_range(
                 FieldPath::root("participant_manifest").field("pre_start_timeout_ms"),
@@ -326,6 +356,7 @@ impl ParticipantManifest {
             runtime_filter: runtime_filter.map(|contribution| contribution.as_proto().clone()),
             pre_start_timeout_ms,
             report_endpoint: Some(report_endpoint.as_proto().clone()),
+            catalog_set: Some(catalog_set.as_proto().clone()),
         })
     }
 
@@ -348,6 +379,18 @@ impl ParticipantManifest {
             &raw.native_compatibility_id,
             FieldPath::root("participant_manifest").field("native_compatibility_id"),
         )?;
+        let catalog_set = raw.catalog_set.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("participant_manifest").field("catalog_set"),
+                "catalog set is required",
+            )
+        })?;
+        CatalogSet::parse(catalog_set).map_err(|error| {
+            prefix_path(
+                FieldPath::root("participant_manifest").field("catalog_set"),
+                error,
+            )
+        })?;
 
         let mut fragment_ids = BTreeSet::new();
         for (index, fragment_id) in raw
@@ -475,6 +518,21 @@ impl ParticipantManifest {
             &self.raw.native_compatibility_id,
             FieldPath::root("participant_manifest").field("native_compatibility_id"),
         )
+    }
+
+    pub fn catalog_set(&self) -> Result<CatalogSet, ProtocolError> {
+        let raw = self.raw.catalog_set.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("participant_manifest").field("catalog_set"),
+                "catalog set is required",
+            )
+        })?;
+        CatalogSet::parse(raw).map_err(|error| {
+            prefix_path(
+                FieldPath::root("participant_manifest").field("catalog_set"),
+                error,
+            )
+        })
     }
 
     pub fn expected_fragment_instance_ids(&self) -> Vec<common::UniqueId> {
@@ -624,7 +682,7 @@ mod tests {
         QueryControlEndpoint, RuntimeFilterContribution,
     };
     use crate::ProtocolErrorKind;
-    use novarocks_proto_models::{common, novarocks};
+    use novarocks_proto_models::{catalog, common, novarocks};
     use novarocks_types::{NativeCompatibilityId, QueryId};
 
     fn id(hi: i64, lo: i64) -> common::UniqueId {
@@ -685,6 +743,7 @@ mod tests {
             exchange_routes: vec![route()],
             pre_start_timeout_ms: 30_000,
             report_endpoint: Some(endpoint(9031)),
+            catalog_set: Some(catalog::CatalogSet { catalogs: vec![] }),
             ..Default::default()
         }
     }

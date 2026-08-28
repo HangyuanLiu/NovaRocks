@@ -39,7 +39,7 @@ pub mod plan {
 
 #[allow(clippy::large_enum_variant)]
 pub mod novarocks {
-    use super::{common, connector_read, filter, plan};
+    pub use super::{catalog, common, connector_read, filter, plan};
 
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
 }

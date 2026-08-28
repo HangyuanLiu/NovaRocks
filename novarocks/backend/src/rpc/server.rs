@@ -40,7 +40,7 @@ use novarocks_native_trust::{NativeIncomingAdapter, NativeServerAdmission, Nativ
 use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId,
 };
-use novarocks_proto_models::{filter, novarocks as proto};
+use novarocks_proto_models::{catalog, filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
@@ -287,6 +287,15 @@ impl NovaRocksGrpc for BackendRpcService {
                 ))
             })?;
         Ok(tonic::Response::new(result.to_proto()))
+    }
+
+    async fn prune_catalogs(
+        &self,
+        _request: tonic::Request<catalog::PruneCatalogsRequest>,
+    ) -> Result<tonic::Response<catalog::PruneCatalogsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented(
+            "catalog reachability pruning is not connected yet",
+        ))
     }
 
     async fn heartbeat(

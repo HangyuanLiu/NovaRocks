@@ -19,7 +19,7 @@ use novarocks_proto_codec::membership::{
     BackendAnnounceRejectionReason, BackendAnnounceRequest, BackendAnnounceResult,
 };
 use novarocks_proto_codec::{ProtocolError, ProtocolErrorKind};
-use novarocks_proto_models::{filter, novarocks as proto};
+use novarocks_proto_models::{catalog, filter, novarocks as proto};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
@@ -824,6 +824,13 @@ impl NovaRocksGrpc for FrontendReportService {
     ) -> Result<tonic::Response<proto::RetireConnectorExecutionBindingResponse>, tonic::Status>
     {
         Err(Self::rejected("RetireConnectorExecutionBinding"))
+    }
+
+    async fn prune_catalogs(
+        &self,
+        _request: tonic::Request<catalog::PruneCatalogsRequest>,
+    ) -> Result<tonic::Response<catalog::PruneCatalogsResponse>, tonic::Status> {
+        Err(Self::rejected("PruneCatalogs"))
     }
 
     async fn heartbeat(

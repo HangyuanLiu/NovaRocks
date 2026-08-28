@@ -49,7 +49,10 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
-use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
+use novarocks_spi::connector::{
+    CatalogCredentialReference as ExecutionCredentialReference, CatalogHandle, CatalogProperties,
+    CatalogProperty, CatalogProviderKind, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
+};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -59,6 +62,14 @@ use crate::state_family::StateFamily;
 
 /// Domain separator for the snapshot identity digest.
 const SNAPSHOT_IDENTITY_DOMAIN: &[u8] = b"novarocks/frontend/catalog/desired-state/snapshot/v1";
+
+/// Domain separator for a catalog execution definition version.
+///
+/// This deliberately differs from [`SNAPSHOT_IDENTITY_DOMAIN`]: a snapshot
+/// identity describes the complete desired set for diagnostics, while a
+/// catalog version identifies one credential-free execution definition that a
+/// backend may materialize and retain after a Frontend restart.
+const CATALOG_VERSION_DOMAIN: &[u8] = b"novarocks/frontend/catalog/execution-definition/v1";
 
 /// The config format version the dynamic StateStore mode stamps on every entry
 /// it enumerates.
@@ -315,6 +326,104 @@ impl CatalogDesiredStateEntry {
             },
         }
     }
+
+    /// Projects one located desired-state entry into the immutable execution
+    /// definition a Backend may materialize.
+    ///
+    /// Dynamic StateStore uses its durable attachment identity so a
+    /// DROP/recreate with the same SQL name and configuration is still a new
+    /// catalog version. StaticFile intentionally omits its entry identity:
+    /// that identity is minted while parsing and is not part of the file's
+    /// logical configuration. Neither path carries a resolved secret, a CAS
+    /// version, a creation timestamp, or a process-local runtime generation.
+    pub fn catalog_properties(
+        &self,
+        mode: CatalogDesiredStateSourceMode,
+    ) -> Result<CatalogProperties, CatalogApplicationError> {
+        if mode == CatalogDesiredStateSourceMode::ManagedController {
+            return Err(unsupported_mode(
+                mode,
+                "project catalog execution properties",
+            ));
+        }
+
+        let config = self.config();
+        let provider_kind = catalog_provider_kind(config.provider_id())?;
+        let mut execution_properties = config
+            .durable_properties()
+            .iter()
+            .map(|(key, value)| CatalogProperty::new(key, value))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| projection_error(config, error))?;
+        execution_properties.sort_by(|left, right| left.key().cmp(right.key()));
+
+        let mut credential_references = config
+            .credential_references()
+            .iter()
+            .map(|reference| ExecutionCredentialReference::new(reference.as_str(), None::<&str>))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| projection_error(config, error))?;
+        credential_references.sort();
+
+        let version = CatalogVersion::from_bytes(self.execution_definition_digest(
+            mode,
+            provider_kind,
+            &execution_properties,
+            &credential_references,
+        ));
+        let handle = CatalogHandle::new(config.instance_id().clone(), version);
+        CatalogProperties::new(
+            handle,
+            provider_kind,
+            u32::from(config.config_format_version()),
+            execution_properties,
+            credential_references,
+        )
+        .map_err(|error| projection_error(config, error))
+    }
+
+    fn execution_definition_digest(
+        &self,
+        mode: CatalogDesiredStateSourceMode,
+        provider_kind: CatalogProviderKind,
+        execution_properties: &[CatalogProperty],
+        credential_references: &[ExecutionCredentialReference],
+    ) -> [u8; 32] {
+        let config = self.config();
+        let mut hasher = Sha256::new();
+        hasher.update(CATALOG_VERSION_DOMAIN);
+        update_framed(&mut hasher, mode.as_str().as_bytes());
+        update_framed(&mut hasher, config.instance_id().as_str().as_bytes());
+        update_framed(&mut hasher, provider_kind.provider_id().as_bytes());
+        hasher.update(u32::from(config.config_format_version()).to_be_bytes());
+        hasher.update((execution_properties.len() as u64).to_be_bytes());
+        for property in execution_properties {
+            update_framed(&mut hasher, property.key().as_bytes());
+            update_framed(&mut hasher, property.value().as_bytes());
+        }
+        hasher.update((credential_references.len() as u64).to_be_bytes());
+        for reference in credential_references {
+            update_framed(&mut hasher, reference.name().as_bytes());
+            match reference.revision() {
+                Some(revision) => {
+                    hasher.update([1]);
+                    update_framed(&mut hasher, revision.as_bytes());
+                }
+                None => hasher.update([0]),
+            }
+        }
+        match mode {
+            CatalogDesiredStateSourceMode::DynamicStateStore => {
+                hasher.update(b"dynamic-attachment-id");
+                hasher.update(self.identity().as_uuid().as_bytes());
+            }
+            CatalogDesiredStateSourceMode::StaticFile => hasher.update(b"static-file-config"),
+            CatalogDesiredStateSourceMode::ManagedController => {
+                unreachable!("ManagedController is rejected before version derivation")
+            }
+        }
+        hasher.finalize().into()
+    }
 }
 
 /// A content identity for one snapshot, for diagnostics and logical export.
@@ -443,6 +552,19 @@ impl CatalogDesiredStateSnapshot {
     /// The logical export: what a `SemanticRebind` clone carries.
     pub fn logical_configs(&self) -> impl Iterator<Item = &CatalogLogicalConfig> {
         self.entries.values().map(CatalogDesiredStateEntry::config)
+    }
+
+    /// Projects the exact complete desired-state snapshot into stable,
+    /// credential-free catalog materialization inputs in catalog-name order.
+    ///
+    /// Callers that need a query-wide subset choose from this complete set;
+    /// they must not re-read a source or re-derive an individual version from
+    /// a different snapshot.
+    pub fn catalog_properties(&self) -> Result<Vec<CatalogProperties>, CatalogApplicationError> {
+        self.entries
+            .values()
+            .map(|entry| entry.catalog_properties(self.mode()))
+            .collect()
     }
 
     /// The located entries, in catalog-name order, for materialization.
@@ -720,9 +842,38 @@ fn update_framed(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
+fn catalog_provider_kind(
+    provider_id: &ConnectorProviderId,
+) -> Result<CatalogProviderKind, CatalogApplicationError> {
+    match provider_id.as_str() {
+        "iceberg" => Ok(CatalogProviderKind::Iceberg),
+        "starrocks" => Ok(CatalogProviderKind::StarRocks),
+        provider => Err(CatalogApplicationError::new(
+            CatalogApplicationErrorKind::InvalidRequest,
+            format!(
+                "catalog provider `{provider}` has no supported distributed catalog materialization kind"
+            ),
+        )),
+    }
+}
+
+fn projection_error(
+    config: &CatalogLogicalConfig,
+    error: novarocks_spi::connector::ConnectorError,
+) -> CatalogApplicationError {
+    CatalogApplicationError::new(
+        CatalogApplicationErrorKind::InvalidRequest,
+        format!(
+            "catalog `{}` cannot be projected into distributed execution properties: {error}",
+            config.instance_id().as_str()
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog_attachment::CatalogAttachment;
 
     fn config(name: &str, display: &str) -> CatalogLogicalConfig {
         CatalogLogicalConfig::new(
@@ -739,6 +890,23 @@ mod tests {
         CatalogDesiredStateEntry::new(
             CatalogSourceEntryIdentity::new(Uuid::now_v7()),
             config(name, display),
+        )
+    }
+
+    fn entry_with_identity(
+        identity: Uuid,
+        properties: Vec<(String, String)>,
+    ) -> CatalogDesiredStateEntry {
+        CatalogDesiredStateEntry::new(
+            CatalogSourceEntryIdentity::new(identity),
+            CatalogLogicalConfig::new(
+                ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
+                ConnectorProviderId::parse("iceberg").expect("provider ID"),
+                "analytics",
+                properties,
+                vec![CatalogCredentialReference::new("connector.object_store")],
+                DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION,
+            ),
         )
     }
 
@@ -843,6 +1011,112 @@ mod tests {
             StateFamily::CatalogDesiredState
                 .record_version()
                 .expect("the catalog desired-state family declares a record version")
+        );
+    }
+
+    #[test]
+    fn dynamic_catalog_version_uses_attachment_identity_but_not_store_metadata() {
+        let properties = vec![
+            ("catalog_uri".to_string(), "http://catalog".to_string()),
+            ("warehouse".to_string(), "s3://warehouse".to_string()),
+        ];
+        let first = entry_with_identity(Uuid::from_bytes([1; 16]), properties.clone());
+        let recreated = entry_with_identity(Uuid::from_bytes([2; 16]), properties.clone());
+        assert_ne!(
+            first
+                .catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)
+                .expect("first properties")
+                .handle(),
+            recreated
+                .catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)
+                .expect("recreated properties")
+                .handle(),
+            "DROP/recreate must change a dynamic catalog version even with identical config"
+        );
+
+        let attachment = CatalogAttachment {
+            attachment_id: Uuid::from_bytes([3; 16]),
+            instance_id: ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            display_name: "analytics".to_string(),
+            durable_properties: properties,
+            created_at_ms: 1,
+        };
+        let mut later_attachment = attachment.clone();
+        later_attachment.created_at_ms = 2;
+        let first_entry = CatalogDesiredStateEntry::from_attachment(&attachment);
+        let later_entry = CatalogDesiredStateEntry::from_attachment(&later_attachment);
+        assert_eq!(
+            first_entry
+                .catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)
+                .expect("first attachment properties")
+                .handle(),
+            later_entry
+                .catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)
+                .expect("later attachment properties")
+                .handle(),
+            "creation time and StateStore revision metadata must not affect the catalog version"
+        );
+    }
+
+    #[test]
+    fn static_catalog_version_ignores_reminted_identity_and_property_order() {
+        let first = entry_with_identity(
+            Uuid::from_bytes([4; 16]),
+            vec![
+                ("warehouse".to_string(), "s3://warehouse".to_string()),
+                ("catalog_uri".to_string(), "http://catalog".to_string()),
+            ],
+        );
+        let second = entry_with_identity(
+            Uuid::from_bytes([5; 16]),
+            vec![
+                ("catalog_uri".to_string(), "http://catalog".to_string()),
+                ("warehouse".to_string(), "s3://warehouse".to_string()),
+            ],
+        );
+        let first_properties = first
+            .catalog_properties(CatalogDesiredStateSourceMode::StaticFile)
+            .expect("first static properties");
+        let second_properties = second
+            .catalog_properties(CatalogDesiredStateSourceMode::StaticFile)
+            .expect("second static properties");
+        assert_eq!(first_properties.handle(), second_properties.handle());
+        assert_eq!(
+            first_properties.execution_properties()[0].key(),
+            "catalog_uri",
+            "projection must carry canonical property order"
+        );
+    }
+
+    #[test]
+    fn unsupported_source_mode_and_provider_fail_closed_before_materialization() {
+        let entry = entry("catalog.analytics", "analytics");
+        assert_eq!(
+            entry
+                .catalog_properties(CatalogDesiredStateSourceMode::ManagedController)
+                .expect_err("ManagedController has no version authority")
+                .kind(),
+            CatalogApplicationErrorKind::UnsupportedSourceMode
+        );
+
+        let unsupported = CatalogDesiredStateEntry::new(
+            CatalogSourceEntryIdentity::new(Uuid::from_bytes([6; 16])),
+            CatalogLogicalConfig::new(
+                ConnectorInstanceId::parse("catalog.fixture").expect("instance ID"),
+                ConnectorProviderId::parse("fixture").expect("provider ID"),
+                "fixture",
+                vec![("endpoint".to_string(), "http://fixture".to_string())],
+                Vec::new(),
+                DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION,
+            ),
+        );
+        assert_eq!(
+            unsupported
+                .catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)
+                .expect_err("unknown provider cannot produce a BE catalog definition")
+                .kind(),
+            CatalogApplicationErrorKind::InvalidRequest
         );
     }
 

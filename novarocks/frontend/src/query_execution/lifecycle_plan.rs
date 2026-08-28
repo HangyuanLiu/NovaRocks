@@ -30,8 +30,8 @@ use novarocks_proto_codec::lifecycle::{
     QueryControlEndpoint, QueryExecutionId, QueryOptions as ProtocolQueryOptions,
     RuntimeFilterContribution,
 };
-use novarocks_proto_models::common;
 use novarocks_proto_models::novarocks;
+use novarocks_proto_models::{catalog, common};
 use novarocks_types::BackendProcessId;
 use novarocks_types::NativeCompatibilityId;
 
@@ -608,6 +608,7 @@ pub(crate) fn compile_query_init_plan(
             runtime_filter: runtime_filter.map(|contribution| contribution.as_proto().clone()),
             pre_start_timeout_ms: duration_millis(options.pre_start_timeout)?,
             report_endpoint: Some(options.report_endpoint.as_proto().clone()),
+            catalog_set: Some(catalog::CatalogSet { catalogs: vec![] }),
         })
         .map_err(|error| {
             contract_error(format!(
