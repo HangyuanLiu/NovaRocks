@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_backend::{
-    BackendApplicationErrorKind, BackendApplicationHost, BackendDataRuntime,
-    BackendNativeTransport, BackendServerConfig, QueryLifecycleRegistryConfig,
+    BackendApplicationHost, BackendDataRuntime, BackendNativeTransport, BackendServerConfig,
+    QueryLifecycleRegistryConfig,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
@@ -103,7 +103,6 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
             sink_io_worker_threads: 1,
             sink_io_max_blocking_threads: 1,
         },
-        execution_installers: Vec::new(),
         catalog_runtime_materializers: Vec::new(),
         read_execution_bundle_factories: Vec::new(),
         write_execution_bundle_factories: Vec::new(),
@@ -111,14 +110,14 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
 }
 
 #[test]
-fn host_rejects_an_unsealed_connector_installer_set() {
+fn host_accepts_an_empty_sealed_catalog_runtime_set() {
     let grpc_port = unused_port();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .worker_threads(1)
         .build()
         .expect("build Backend application host runtime");
-    let error = BackendApplicationHost::open(
+    let host = BackendApplicationHost::open(
         backend_config(grpc_port, grpc_port),
         BackendDataRuntime::new(
             runtime.handle().clone(),
@@ -126,6 +125,7 @@ fn host_rejects_an_unsealed_connector_installer_set() {
             BackendNativeTransport::Plaintext,
         ),
     )
-    .expect_err("unsealed connector installer set must fail startup");
-    assert_eq!(error.kind(), BackendApplicationErrorKind::Configuration);
+    .expect("empty sealed catalog runtime set must start");
+    host.shutdown()
+        .expect("empty catalog runtime host shuts down");
 }

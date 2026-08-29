@@ -458,7 +458,8 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorControlRuntimeId, ConnectorDataMutation,
-        ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary, ConnectorInstanceDescriptor,
+        ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
+        ConnectorDataMutationPlanningRequest, ConnectorInstanceDescriptor,
         ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
         ConnectorProviderBindingKey, ConnectorProviderId, ConnectorTableMetadata,
         ConnectorTablePlanningFacts, ProviderBindingEpoch,

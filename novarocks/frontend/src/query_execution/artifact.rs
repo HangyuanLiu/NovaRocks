@@ -2012,16 +2012,17 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
-        ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution, ConnectorInstanceId,
-        ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorRequestContext,
-        ConnectorSplit, ConnectorTableHandle, ConnectorWriteAbortOutcome,
-        ConnectorWriteAbortRequest, ConnectorWriteBaseVersion, ConnectorWriteCohortId,
-        ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteExecutionId,
-        ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-        ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlan,
-        ConnectorWritePlanningRequest, ConnectorWritePreparation, ConnectorWriteReceipt,
-        ConnectorWriteReconcileRequest, ConnectorWriterHandle, ProviderBindingEpoch,
+        CONNECTOR_WRITE_CONTRACT_VERSION, CatalogHandle, CatalogProperties, CatalogProperty,
+        CatalogProviderKind, CatalogVersion, ConnectorError, ConnectorErrorKind,
+        ConnectorExecutionDistribution, ConnectorInstanceId, ConnectorProviderBinding,
+        ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorSplit, ConnectorTableHandle,
+        ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest, ConnectorWriteBaseVersion,
+        ConnectorWriteCohortId, ConnectorWriteCommitRequest, ConnectorWriteControl,
+        ConnectorWriteExecutionId, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+        ConnectorWriteInputShape, ConnectorWriteLease, ConnectorWriteOperationId,
+        ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
+        ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ConnectorWriterHandle,
+        ProviderBindingEpoch,
     };
 
     use super::{
