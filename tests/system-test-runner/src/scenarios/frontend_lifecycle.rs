@@ -40,12 +40,12 @@ impl Scenario for CatalogPartialReadiness {
         fs::write(
             &snapshot,
             format!(
-                "format_version = 1\n\
+                "format_version = 3\n\
                  [[catalogs]]\n\
                  instance_id = \"lnp8_healthy\"\n\
                  provider_id = \"iceberg\"\n\
                  display_name = \"lnp8_healthy\"\n\
-                 config_format_version = 1\n\
+                 config_format_version = 3\n\
                  [catalogs.properties]\n\
                  type = \"iceberg\"\n\
                  \"iceberg.catalog.type\" = \"hadoop\"\n\
@@ -54,7 +54,7 @@ impl Scenario for CatalogPartialReadiness {
                  instance_id = \"lnp8_unavailable\"\n\
                  provider_id = \"iceberg\"\n\
                  display_name = \"lnp8_unavailable\"\n\
-                 config_format_version = 1\n\
+                 config_format_version = 3\n\
                  [catalogs.properties]\n\
                  type = \"iceberg\"\n\
                  \"iceberg.catalog.type\" = \"hadoop\"\n",
@@ -124,12 +124,12 @@ impl Scenario for StaticFileDisposableCarrier {
         fs::write(
             &snapshot,
             format!(
-                "format_version = 1\n\
+                "format_version = 3\n\
                  [[catalogs]]\n\
                  instance_id = \"lnp8_static\"\n\
                  provider_id = \"iceberg\"\n\
                  display_name = \"lnp8_static\"\n\
-                 config_format_version = 1\n\
+                 config_format_version = 3\n\
                  [catalogs.properties]\n\
                  type = \"iceberg\"\n\
                  \"iceberg.catalog.type\" = \"hadoop\"\n\
@@ -482,24 +482,23 @@ fn assert_idle_session_statement_is_rejected(connection: &mut mysql::Conn) -> Re
 }
 
 fn static_snapshot_launch_config(snapshot: &Path) -> ScenarioLaunchConfig {
-    let object_store = r#"
-[connector.object_store]
-endpoint = "${ENV:AWS_S3_ENDPOINT}"
+    let object_store_data_credential = r#"
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "iceberg-test-data"
+generation = "v1"
+kind = "s3"
 access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"
 access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
-region = "us-east-1"
-enable_path_style_access = true
 "#;
     ScenarioLaunchConfig {
         config_overlay: CrossProcessConfigOverlay {
             fe: Some(format!(
-                "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n{object_store}",
+                "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n{}",
                 snapshot.display(),
+                object_store_data_credential,
             )),
-            // The StaticFile catalog points at a REST warehouse on S3. Both
-            // application roles resolve that process-local binding; no
-            // credential may cross the native plan boundary.
-            be: Some(object_store.to_string()),
+            be: Some(object_store_data_credential.to_string()),
             ..Default::default()
         },
         ..Default::default()
@@ -513,20 +512,31 @@ fn write_rest_static_snapshot(snapshot: &Path, instance_id: &str) -> Result<()> 
     let warehouse = std::env::var("NOVAROCKS_ICEBERG_REST_WAREHOUSE").context(
         "blue/green scenario requires NOVAROCKS_ICEBERG_REST_WAREHOUSE; source docker/iceberg-rest/runtime/current/env.sh",
     )?;
+    let s3_endpoint = std::env::var("AWS_S3_ENDPOINT").context(
+        "blue/green scenario requires AWS_S3_ENDPOINT; source docker/iceberg-rest/runtime/current/env.sh",
+    )?;
     fs::write(
         snapshot,
         format!(
-            "format_version = 1\n\
+            "format_version = 3\n\
              [[catalogs]]\n\
              instance_id = \"{instance_id}\"\n\
              provider_id = \"iceberg\"\n\
              display_name = \"{instance_id}\"\n\
-             config_format_version = 1\n\
+             config_format_version = 3\n\
              [catalogs.properties]\n\
              type = \"iceberg\"\n\
              \"iceberg.catalog.type\" = \"rest\"\n\
              uri = \"{rest_uri}\"\n\
-             warehouse = \"{warehouse}\"\n"
+             warehouse = \"{warehouse}\"\n\
+             \"aws.s3.endpoint\" = \"{s3_endpoint}\"\n\
+             \"aws.s3.enable_path_style_access\" = \"true\"\n\
+             [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-data\"\n\
+             consumer_role = \"frontend-and-backend\"\n\
+             mode = \"static\"\n\
+             name = \"iceberg-test-data\"\n\
+             generation = \"v1\"\n"
         ),
     )
     .with_context(|| {
