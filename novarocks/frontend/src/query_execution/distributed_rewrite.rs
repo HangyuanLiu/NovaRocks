@@ -487,6 +487,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_spi::connector::{
+        CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
         ConnectorCancellation, ConnectorControlBinding, ConnectorDistributedRewrite,
         ConnectorDistributedRewriteCohortPlan, ConnectorDistributedRewritePlanSummary,
         ConnectorDistributedRewritePlanningRequest, ConnectorExecutionDistribution,
@@ -518,6 +519,19 @@ mod tests {
             4096,
         )
         .unwrap()
+    }
+
+    fn catalog_properties(instance: ConnectorInstanceId) -> CatalogProperties {
+        CatalogProperties::new(
+            CatalogHandle::new(instance, CatalogVersion::from_bytes([3; 32])),
+            CatalogProviderKind::Iceberg,
+            1,
+            vec![
+                CatalogProperty::new("warehouse", "s3://rewrite-session").expect("valid warehouse"),
+            ],
+            Vec::new(),
+        )
+        .expect("valid catalog properties")
     }
 
     fn preparation(
@@ -822,7 +836,9 @@ mod tests {
                         }),
                         None,
                     )
-                    .unwrap(),
+                    .unwrap()
+                    .with_catalog_properties(catalog_properties(instance.clone()))
+                    .expect("control binding has catalog execution properties"),
                 ),
                 || {},
             ),

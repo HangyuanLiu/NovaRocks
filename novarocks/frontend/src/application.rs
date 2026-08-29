@@ -1161,11 +1161,6 @@ impl FrontendApplicationHost {
             .map(|error| format!("shutdown frontend table-maintenance service failed: {error}"));
         self.query_execution.take();
         self.coordinator.take();
-        if let Some(prune) = self.catalog_prune.take() {
-            prune
-                .shutdown(deadline.saturating_duration_since(Instant::now()))
-                .await;
-        }
         let heartbeat_result = self
             .topology
             .as_ref()
@@ -1215,6 +1210,15 @@ impl FrontendApplicationHost {
             }
             None => None,
         };
+        // The controller owns the durable desired-state projection. The prune
+        // worker is best effort and may be asleep between rounds, so it must
+        // not consume the whole shared cleanup deadline before the controller
+        // gets a chance to stop and unpublish that projection.
+        if let Some(prune) = self.catalog_prune.take() {
+            prune
+                .shutdown(deadline.saturating_duration_since(Instant::now()))
+                .await;
+        }
         self.catalog_application_port.take();
         self.view_service.take();
         self.mv_application_service.take();

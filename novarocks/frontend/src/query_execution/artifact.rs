@@ -2363,7 +2363,11 @@ mod tests {
             || {},
         )
         .expect("valid exact control lease")
-        .with_catalog_properties(catalog_properties("test-write", 3, "s3://test-write"))
+        .with_catalog_properties(catalog_properties(
+            owner.instance_id.as_str(),
+            3,
+            "s3://test-write",
+        ))
         .expect("write catalog properties match the exact effect owner");
         let query_id = execution_id.query_id();
         let mut query_id_bytes = [0; 16];

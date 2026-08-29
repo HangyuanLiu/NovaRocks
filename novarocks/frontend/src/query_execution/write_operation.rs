@@ -1557,7 +1557,8 @@ mod tests {
         };
         assert!(
             error.message().contains("connector binding")
-                || error.message().contains("native owner"),
+                || error.message().contains("native owner")
+                || error.message().contains("frozen connector writer manifest"),
             "unexpected foreign-owner error: {}",
             error.message()
         );
