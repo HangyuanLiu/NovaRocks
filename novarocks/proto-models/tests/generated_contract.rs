@@ -214,6 +214,78 @@ fn retired_starrocks_native_scan_wire_fields_fail_closed() {
 }
 
 #[test]
+fn runtime_filter_membership_contract_is_closed_and_legacy_fields_stay_reserved() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let membership = pool
+        .get_message_by_name("novarocks.plan.RuntimeFilterMembershipContract")
+        .expect("RuntimeFilterMembershipContract descriptor");
+
+    for (field_number, field_name) in [(1, "canonical_schema"), (2, "schema_digest")] {
+        assert!(
+            membership
+                .reserved_ranges()
+                .any(|range| range.contains(&field_number)),
+            "RuntimeFilterMembershipContract field {field_number} must remain reserved"
+        );
+        assert!(
+            membership.reserved_names().any(|name| name == field_name),
+            "RuntimeFilterMembershipContract {field_name} must remain reserved"
+        );
+        assert!(
+            membership
+                .fields()
+                .all(|field| field.number() != field_number),
+            "RuntimeFilterMembershipContract must not reuse tag {field_number}"
+        );
+        assert!(
+            membership.fields().all(|field| field.name() != field_name),
+            "RuntimeFilterMembershipContract must not reuse name {field_name}"
+        );
+    }
+
+    let null_semantics = membership
+        .get_field_by_name("null_semantics")
+        .expect("RuntimeFilterMembershipContract.null_semantics descriptor");
+    assert_eq!(null_semantics.number(), 3);
+    assert_eq!(
+        null_semantics.kind().as_enum().unwrap().full_name(),
+        "novarocks.plan.RuntimeFilterMembershipNullSemantics"
+    );
+
+    let semantics = pool
+        .get_enum_by_name("novarocks.plan.RuntimeFilterMembershipNullSemantics")
+        .expect("RuntimeFilterMembershipNullSemantics descriptor");
+    let values = semantics
+        .values()
+        .map(|value| (value.name().to_owned(), value.number()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        [
+            (
+                "RUNTIME_FILTER_MEMBERSHIP_NULL_SEMANTICS_UNSPECIFIED".to_owned(),
+                0,
+            ),
+            (
+                "RUNTIME_FILTER_MEMBERSHIP_NULL_SEMANTICS_NEVER_MATCHES".to_owned(),
+                1,
+            ),
+            (
+                "RUNTIME_FILTER_MEMBERSHIP_NULL_SEMANTICS_NULL_SAFE_EQUAL".to_owned(),
+                2,
+            ),
+        ]
+    );
+
+    for encoded in [&[0x0a, 0x00][..], &[0x12, 0x00][..]] {
+        let membership = plan::RuntimeFilterMembershipContract::decode(encoded)
+            .expect("retired membership field remains decodable as an unknown field");
+        assert_eq!(membership.null_semantics, 0);
+    }
+}
+
+#[test]
 fn retired_terminal_self_attestation_fields_remain_reserved() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");

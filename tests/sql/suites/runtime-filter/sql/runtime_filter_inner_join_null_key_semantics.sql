@@ -49,6 +49,8 @@ INSERT INTO ${case_db}.t_rf_inner_null_key_r VALUES
     (NULL, 'rnull'),
     (30, 'r30');
 
+-- @explain_contains=producer binding
+-- @explain_contains=consumer binding
 SELECT l.id, l.k, r.tag
 FROM ${case_db}.t_rf_inner_null_key_l l
 INNER JOIN ${case_db}.t_rf_inner_null_key_r r

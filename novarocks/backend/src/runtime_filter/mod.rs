@@ -6,6 +6,7 @@ pub(crate) mod codec;
 pub(crate) mod domain;
 pub(crate) mod install_decode;
 pub(crate) mod materializer;
+pub(crate) mod membership_contract_decode;
 pub(crate) mod observation;
 pub(crate) mod participant;
 pub(crate) mod reliable_transport;

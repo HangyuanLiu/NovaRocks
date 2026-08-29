@@ -791,6 +791,76 @@ fn init_compatibility_mismatch_has_no_lifecycle_side_effect() {
     assert_eq!(runtime.runtime_filter_install_calls(), 0);
 }
 
+fn init_request_with_invalid_membership_null_semantics(
+    query_low: i64,
+    raw_null_semantics: i32,
+) -> QueryInitRequest {
+    let request = init_request_fixture(query_low, ATTEMPT_1, 10_000);
+    let mut raw = request.as_proto().clone();
+    let install = raw
+        .manifest
+        .as_mut()
+        .expect("fixture manifest")
+        .runtime_filter
+        .as_mut()
+        .expect("fixture runtime-filter contribution")
+        .install
+        .as_mut()
+        .expect("fixture participant install");
+    install
+        .core_channels
+        .push(filter::RuntimeFilterChannelDeployment {
+            channel_id: 1,
+            logical_domain: Some(filter::RuntimeFilterLogicalDomain {
+                value_type: Some(common::TypeDesc {
+                    kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+                        r#type: common::PrimitiveType::Bigint as i32,
+                        ..Default::default()
+                    })),
+                }),
+                contract: Some(plan::RuntimeFilterContract {
+                    kind: Some(plan::runtime_filter_contract::Kind::Membership(
+                        plan::RuntimeFilterMembershipContract {
+                            null_semantics: raw_null_semantics,
+                        },
+                    )),
+                }),
+            }),
+            ..Default::default()
+        });
+    QueryInitRequest::parse(raw).expect("manifest carrier defers runtime-filter semantic decode")
+}
+
+#[test]
+fn invalid_membership_null_semantics_rejects_init_before_runtime_filter_install() {
+    for (query_low, raw_null_semantics) in [
+        (
+            703,
+            plan::RuntimeFilterMembershipNullSemantics::Unspecified as i32,
+        ),
+        (704, 99),
+    ] {
+        let runtime = RecordingLocalRuntime::default();
+        let registry = registry_with(runtime.clone(), 8);
+        let request =
+            init_request_with_invalid_membership_null_semantics(query_low, raw_null_semantics);
+        let execution_id = request.manifest().execution_id();
+
+        assert_eq!(
+            registry
+                .init_query(request)
+                .outcome()
+                .expect("validated lifecycle acknowledgement"),
+            QueryInitOutcome::QueryInitRejectedInvalidManifest
+        );
+        assert_eq!(runtime.runtime_filter_install_calls(), 0);
+        assert_eq!(
+            registry.phase(execution_id),
+            Some(QueryLifecyclePhase::Tombstone)
+        );
+    }
+}
+
 #[test]
 fn attach_reserves_p0_before_control_ready_and_releases_on_terminal_cleanup() {
     let runtime = RecordingLocalRuntime::default();

@@ -55,6 +55,8 @@ INSERT INTO ${case_db}.t_rf_inner_mixed_null_safe_r VALUES
     ('b', NULL, 'rbn'),
     ('b', 1, 'rb1');
 
+-- @explain_contains=producer binding
+-- @explain_contains=consumer binding
 SELECT l.id, l.v, r.tag
 FROM ${case_db}.t_rf_inner_mixed_null_safe_l l
 INNER JOIN ${case_db}.t_rf_inner_mixed_null_safe_r r

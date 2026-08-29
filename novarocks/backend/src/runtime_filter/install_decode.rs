@@ -28,8 +28,8 @@ use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime_filter::{
     ConsumerActivation, RuntimeFilterBindingId, RuntimeFilterChannelId,
     RuntimeFilterConsumerContract, RuntimeFilterExecutionContract,
-    RuntimeFilterLateApplyGranularity, RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics,
-    RuntimeFilterProducerContract, RuntimeFilterProducerKind, RuntimeFilterReduction, contribution,
+    RuntimeFilterLateApplyGranularity, RuntimeFilterNullSemantics, RuntimeFilterProducerContract,
+    RuntimeFilterProducerKind, RuntimeFilterReduction, contribution,
 };
 use novarocks_proto_codec::lifecycle::{QueryExecutionId, RuntimeFilterContribution};
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
@@ -46,6 +46,9 @@ use crate::runtime_filter::domain::{
     BackendParticipantIdentity, BackendParticipantInstall, BackendProducerInstall,
     BackendRouteEdgeId, BackendRouteEndpoint, BackendRoutePeer, BackendRouteRole,
     BackendRoutingChannel, BackendRoutingEdge, BackendRoutingShard,
+};
+use crate::runtime_filter::membership_contract_decode::{
+    MembershipContractDecodeError, decode_membership_contract,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,44 +258,27 @@ fn decode_contract(
     })?;
     match kind {
         plan::runtime_filter_contract::Kind::Membership(membership) => {
-            let path = path.field("membership");
-            if membership.canonical_schema.is_empty() {
-                return Err(contract_invalid(
-                    path.clone().field("canonical_schema"),
-                    format!(
-                        "native runtime-filter binding_id={binding_id} membership schema is empty"
+            let path = path.field("membership").field("null_semantics");
+            let schema = decode_membership_contract(expression_type, membership).map_err(|decode_error| {
+                match decode_error {
+                    MembershipContractDecodeError::UnspecifiedNullSemantics
+                    | MembershipContractDecodeError::UnknownNullSemantics { .. } => error(
+                        path,
+                        ProtocolErrorKind::InvalidEnum,
+                        format!(
+                            "native runtime-filter binding_id={binding_id} contract_invalid {decode_error}"
+                        ),
                     ),
-                ));
-            }
-            let digest = contract_digest32(
-                binding_id,
-                "membership schema_digest",
-                &membership.schema_digest,
-            )
-            .map_err(|detail| contract_invalid(path.clone().field("schema_digest"), detail))?;
-            let schema = RuntimeFilterMembershipSchema::from_canonical(
-                membership.canonical_schema.clone(),
-                digest,
-            )
-            .map_err(|reason| {
-                contract_invalid(
-                    path.clone().field("canonical_schema"),
-                    format!("native runtime-filter binding_id={binding_id} membership schema is noncanonical: {reason}"),
-                )
+                    MembershipContractDecodeError::InvalidExecutionSchema { .. } => {
+                        contract_invalid(
+                            path,
+                            format!(
+                                "native runtime-filter binding_id={binding_id} contract_invalid {decode_error}"
+                            ),
+                        )
+                    }
+                }
             })?;
-            let expected =
-                RuntimeFilterMembershipSchema::new(expression_type, schema.null_semantics())
-                    .map_err(|error| {
-                        contract_invalid(path.clone().field("canonical_schema"), error.to_string())
-                    })?;
-            if expected.canonical_bytes() != schema.canonical_bytes() {
-                return Err(contract_inconsistent(
-                    path.field("canonical_schema"),
-                    format!(
-                        "native runtime-filter binding_id={binding_id} membership schema does not match expression type"
-                    ),
-                ));
-            }
             Ok(RuntimeFilterExecutionContract::Membership(schema))
         }
         plan::runtime_filter_contract::Kind::Ordered(ordered) => {
@@ -1790,7 +1776,11 @@ pub(crate) fn validate_participant_install(
 }
 #[cfg(test)]
 mod tests {
-    use super::{decode_runtime_filter_contribution, validate_participant_install};
+    use arrow::datatypes::DataType;
+
+    use super::{
+        decode_contract, decode_runtime_filter_contribution, validate_participant_install,
+    };
     use crate::query_lifecycle::{QueryLifecycleError, QueryLifecycleErrorCode};
     use crate::runtime_filter::{
         domain::{
@@ -1799,10 +1789,11 @@ mod tests {
         },
         test_support::BackendRuntimeFilterFixture,
     };
-    use novarocks_proto_codec::lifecycle::{
-        AttemptId, QueryExecutionId, RuntimeFilterContribution,
+    use novarocks_proto_codec::{
+        FieldPath, ProtocolErrorKind,
+        lifecycle::{AttemptId, QueryExecutionId, RuntimeFilterContribution},
     };
-    use novarocks_proto_models::{filter, novarocks as proto_novarocks};
+    use novarocks_proto_models::{filter, novarocks as proto_novarocks, plan};
     use novarocks_types::QueryId;
 
     fn execution_id() -> QueryExecutionId {
@@ -1853,6 +1844,33 @@ mod tests {
             "rejection must explain {reason}, got {}",
             error.detail()
         );
+    }
+
+    #[test]
+    fn init_membership_null_semantics_rejects_unspecified_and_unknown_before_install() {
+        for raw in [
+            plan::RuntimeFilterMembershipNullSemantics::Unspecified as i32,
+            99,
+        ] {
+            let error = decode_contract(
+                7,
+                &DataType::Int64,
+                Some(&plan::RuntimeFilterContract {
+                    kind: Some(plan::runtime_filter_contract::Kind::Membership(
+                        plan::RuntimeFilterMembershipContract {
+                            null_semantics: raw,
+                        },
+                    )),
+                }),
+                FieldPath::root("logical_domain").field("contract"),
+            )
+            .expect_err("invalid membership null semantics must fail before participant install");
+            assert_eq!(
+                error.path().to_string(),
+                "logical_domain.contract.membership.null_semantics"
+            );
+            assert_eq!(error.kind(), ProtocolErrorKind::InvalidEnum);
+        }
     }
 
     #[test]

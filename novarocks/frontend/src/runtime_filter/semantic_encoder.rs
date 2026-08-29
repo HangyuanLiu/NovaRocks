@@ -1,8 +1,8 @@
 //! Frontend-owned runtime-filter semantic encoding.
 //!
 //! Core exposes sealed SQL facts only.  This module is the sole owner of the
-//! native runtime-filter canonical schema and digest construction used by both
-//! fragment bindings and participant deployment/install contributions.
+//! native runtime-filter plan-contract construction used by both fragment
+//! bindings and participant deployment/install contributions.
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::{
@@ -14,7 +14,6 @@ use novarocks_proto_models::{common, plan};
 use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 use sha2::{Digest, Sha256};
 
-const MEMBERSHIP_SCHEMA_DOMAIN: &[u8] = b"novarocks.runtime-filter.artifact-schema";
 const ORDER_CONTRACT_DOMAIN: &[u8] = b"novarocks.runtime-filter.order-contract";
 const TOPK_CONTRACT_DOMAIN: &[u8] = b"novarocks.runtime-filter.top-k-summary-contract";
 const CONTRACT_VERSION: u16 = 1;
@@ -90,21 +89,18 @@ pub(crate) fn encode_logical_domain(
             null_semantics,
         } => {
             let value_type_wire = encode_type(&value_type)?;
-            let mut canonical = Vec::with_capacity(48);
-            canonical.extend_from_slice(MEMBERSHIP_SCHEMA_DOMAIN);
-            canonical.push(1);
-            encode_membership_schema_type(&value_type, &mut canonical)?;
-            canonical.push(match null_semantics {
-                RuntimeFilterNullSemantics::NeverMatches => 1,
-                RuntimeFilterNullSemantics::NullSafeEqual => 2,
-            });
-            let schema_digest = Sha256::digest(&canonical);
             Ok(EncodedRuntimeFilterDomain {
                 value_type: value_type_wire,
                 contract: plan::RuntimeFilterContract {
                     kind: Some(Kind::Membership(plan::RuntimeFilterMembershipContract {
-                        canonical_schema: canonical,
-                        schema_digest: schema_digest.to_vec(),
+                        null_semantics: match null_semantics {
+                            RuntimeFilterNullSemantics::NeverMatches => {
+                                i32::from(plan::RuntimeFilterMembershipNullSemantics::NeverMatches)
+                            }
+                            RuntimeFilterNullSemantics::NullSafeEqual => {
+                                i32::from(plan::RuntimeFilterMembershipNullSemantics::NullSafeEqual)
+                            }
+                        },
                     })),
                 },
                 order_contract_digest: None,
@@ -337,24 +333,33 @@ mod tests {
     }
 
     #[test]
-    fn membership_schema_keeps_the_v1_fixture_bytes_and_digest() {
-        let encoded = encode_logical_domain(RuntimeFilterLogicalDomainFacts::Membership {
-            value_type: DataType::Int32,
-            null_semantics: RuntimeFilterNullSemantics::NeverMatches,
-        })
-        .expect("membership facts are encodable");
-        let Some(plan::runtime_filter_contract::Kind::Membership(contract)) = encoded.contract.kind
-        else {
-            panic!("membership contract")
-        };
-        assert_eq!(
-            contract.canonical_schema,
-            b"novarocks.runtime-filter.artifact-schema\x01\x04\x01"
-        );
-        assert_eq!(
-            contract.schema_digest,
-            digest("24641ad04e80af8aacdebd06f291d49d2610497b187a02986fbb1dd84cff5d35").to_vec()
-        );
+    fn membership_schema_encodes_typed_null_semantics_and_retains_value_type() {
+        for (null_semantics, expected) in [
+            (
+                RuntimeFilterNullSemantics::NeverMatches,
+                plan::RuntimeFilterMembershipNullSemantics::NeverMatches,
+            ),
+            (
+                RuntimeFilterNullSemantics::NullSafeEqual,
+                plan::RuntimeFilterMembershipNullSemantics::NullSafeEqual,
+            ),
+        ] {
+            let encoded = encode_logical_domain(RuntimeFilterLogicalDomainFacts::Membership {
+                value_type: DataType::Int32,
+                null_semantics,
+            })
+            .expect("membership facts are encodable");
+            assert_eq!(
+                encoded.value_type(),
+                encode_type(&DataType::Int32).expect("type is encodable")
+            );
+            let Some(plan::runtime_filter_contract::Kind::Membership(contract)) =
+                encoded.contract.kind
+            else {
+                panic!("membership contract")
+            };
+            assert_eq!(contract.null_semantics, i32::from(expected));
+        }
     }
 
     #[test]

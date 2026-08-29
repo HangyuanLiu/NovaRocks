@@ -22,9 +22,9 @@ use crate::analysis::{ExprKind, OutputColumn, SortItem, TypedExpr};
 use crate::column_id::ColumnId;
 use crate::planner::runtime_filter::contract::{
     ArtifactCapability, BindingId, ChannelId, CompletionRequirement, ContributionKind,
-    CoverageWitnessId, LateApplyGranularity, NullSemantics, OrderContract, OrderKeyContract,
-    PlanFragmentId, PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle,
-    RuntimeFilterLogicalDomain, RuntimeFilterPolicyRequirement,
+    CoverageWitnessId, LateApplyGranularity, OrderContract, OrderKeyContract, PlanFragmentId,
+    PlanNodeId, ReductionRequirement, RuntimeFilterLifecycle, RuntimeFilterLogicalDomain,
+    RuntimeFilterPolicyRequirement,
 };
 use crate::planner::runtime_filter::coverage::Coverage;
 use crate::planner::runtime_filter::graph::{
@@ -525,7 +525,7 @@ fn collect_join_runtime_filter_candidates<A>(
                 channel_id: ChannelId::new(0),
                 logical_domain: RuntimeFilterLogicalDomain::Membership {
                     value_type: build.intent.build_expr.data_type.clone(),
-                    null_semantics: NullSemantics::NeverMatches,
+                    null_semantics: build.intent.null_semantics,
                 },
                 lifecycle: RuntimeFilterLifecycle::CompleteOnce,
                 availability_coverage: coverage.clone(),
@@ -1065,7 +1065,7 @@ mod tests {
     };
     use crate::planner::runtime_filter::contract::{
         ComparatorDigest, CompletionFenceKind, ConsumerActivation, LateApplyGranularity, NullOrder,
-        OrderContract, OrderKeyContract, SortDirection,
+        NullSemantics, OrderContract, OrderKeyContract, SortDirection,
     };
     use crate::planner::runtime_filter::graph::{RuntimeFilterBindingRole, RuntimeFilterGraph};
     use crate::planner::runtime_filter::validation::GraphValidationErrorKind;
@@ -1187,12 +1187,22 @@ mod tests {
     }
 
     fn join_graph(modes: &[(i32, JoinExecutionMode)]) -> DraftRuntimeFilterGraph {
+        let modes = modes
+            .iter()
+            .map(|(filter_id, mode)| (*filter_id, *mode, NullSemantics::NeverMatches))
+            .collect::<Vec<_>>();
+        join_graph_with_semantics(&modes)
+    }
+
+    fn join_graph_with_semantics(
+        modes: &[(i32, JoinExecutionMode, NullSemantics)],
+    ) -> DraftRuntimeFilterGraph {
         let mut fragments = vec![
             fragment(0, values_node(1, 0), Vec::new()),
             fragment(1, values_node(2, 1), Vec::new()),
         ];
         let mut bindings = RuntimeFilterBindings::new();
-        for (filter_id, execution_mode) in modes {
+        for (filter_id, execution_mode, null_semantics) in modes {
             bindings.builds.push(RuntimeFilterBuildBinding {
                 node_id: 1,
                 fragment_id: 0,
@@ -1202,6 +1212,7 @@ mod tests {
                     probe_expr: expression(),
                     expr_order: 0,
                     execution_mode: *execution_mode,
+                    null_semantics: *null_semantics,
                 },
             });
             bindings.probes.push(RuntimeFilterProbeBinding {
@@ -1239,6 +1250,32 @@ mod tests {
         let expected = Coverage::AnyOf(vec![Coverage::Leaf(witness)]);
         assert_eq!(channel.availability_coverage, expected);
         assert_eq!(channel.terminal_coverage, expected);
+    }
+
+    #[test]
+    fn join_channels_preserve_build_intent_null_semantics() {
+        let graph = join_graph_with_semantics(&[
+            (7, JoinExecutionMode::Broadcast, NullSemantics::NeverMatches),
+            (
+                8,
+                JoinExecutionMode::Broadcast,
+                NullSemantics::NullSafeEqual,
+            ),
+        ]);
+        let semantics = graph
+            .channels()
+            .map(|channel| match &channel.logical_domain {
+                RuntimeFilterLogicalDomain::Membership { null_semantics, .. } => *null_semantics,
+                RuntimeFilterLogicalDomain::OrderedBound(_) => {
+                    panic!("join channel must be membership")
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            semantics,
+            vec![NullSemantics::NeverMatches, NullSemantics::NullSafeEqual]
+        );
     }
 
     #[test]
@@ -1375,6 +1412,7 @@ mod tests {
                 probe_expr: expression(),
                 expr_order: 0,
                 execution_mode: JoinExecutionMode::Broadcast,
+                null_semantics: NullSemantics::NeverMatches,
             },
         });
         bindings.probes.push(RuntimeFilterProbeBinding {

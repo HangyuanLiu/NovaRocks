@@ -19,6 +19,7 @@ use crate::planner::physical::{
     JoinDistribution, JoinExecutionMode, PhysicalHashJoinEqCondition, PhysicalHashJoinNode,
     PhysicalPlanKind, PhysicalPlanNode, PhysicalPlanStats, PlanSetOpKind, RedistributeMode,
 };
+use crate::planner::runtime_filter::contract::NullSemantics;
 use std::collections::{HashMap, HashSet};
 
 /// Rule name recognized by `SET disable_optimizer_rules='RuntimeFilterPushDown'`.
@@ -811,9 +812,6 @@ fn place_current_node(
     let mut descs = Vec::new();
 
     for (expr_order, eq) in eq_conditions.iter().enumerate() {
-        if eq.null_safe {
-            continue;
-        }
         if !rf_key_types_match(eq) {
             continue;
         }
@@ -834,6 +832,11 @@ fn place_current_node(
             probe_expr: oriented.probe_expr,
             expr_order: oriented.expr_order,
             execution_mode,
+            null_semantics: if eq.null_safe {
+                NullSemantics::NullSafeEqual
+            } else {
+                NullSemantics::NeverMatches
+            },
         });
     }
 
@@ -915,8 +918,19 @@ mod tests {
                 build_child: 0
             })
         );
+        assert_eq!(
+            rf_sides_for_join(JoinKind::LeftSemi),
+            Some(JoinRfSides {
+                probe_child: 0,
+                build_child: 1
+            })
+        );
         assert_eq!(rf_sides_for_join(JoinKind::LeftOuter), None);
         assert_eq!(rf_sides_for_join(JoinKind::FullOuter), None);
+        assert_eq!(rf_sides_for_join(JoinKind::LeftAnti), None);
+        assert_eq!(rf_sides_for_join(JoinKind::RightAnti), None);
+        assert_eq!(rf_sides_for_join(JoinKind::NullAwareLeftAnti), None);
+        assert_eq!(rf_sides_for_join(JoinKind::Cross), None);
     }
 
     #[test]
@@ -999,6 +1013,7 @@ mod tests {
                 probe_expr: col_ref(1, "a"),
                 expr_order: 0,
                 execution_mode: JoinExecutionMode::Broadcast,
+                null_semantics: NullSemantics::NeverMatches,
             });
         join.children[0]
             .probe_runtime_filters
@@ -1037,6 +1052,7 @@ mod tests {
                 probe_expr: col_ref(1, "a"),
                 expr_order: 0,
                 execution_mode: JoinExecutionMode::Broadcast,
+                null_semantics: NullSemantics::NeverMatches,
             });
 
         place_runtime_filters(&mut join, &settings);
@@ -1311,6 +1327,47 @@ mod tests {
         assert_eq!(nid, 1);
         assert_probe_filter(&join.children[0], 0, 1);
         assert!(join.children[1].probe_runtime_filters.is_empty());
+    }
+
+    #[test]
+    fn null_safe_direct_intent_respects_all_existing_join_sides() {
+        for (join_type, expected_build, expected_probe) in [
+            (JoinKind::Inner, 2, 1),
+            (JoinKind::RightOuter, 2, 1),
+            (JoinKind::LeftSemi, 2, 1),
+            (JoinKind::RightSemi, 1, 2),
+        ] {
+            let left = leaf(vec![out_col(1, "left_key")]);
+            let right = leaf(vec![out_col(2, "right_key")]);
+            let mut join = hash_join_node(
+                join_type,
+                JoinDistribution::Broadcast,
+                Some(JoinExecutionMode::Broadcast),
+                vec![eq_cond(
+                    col_ref(1, "left_key"),
+                    col_ref(2, "right_key"),
+                    true,
+                )],
+                vec![left, right],
+                stats_with_columns(10.0, &[(1, 8.0), (2, 8.0)]),
+            );
+            match join_type {
+                JoinKind::LeftSemi => set_hash_join_output(&mut join, vec![out_col(1, "left_key")]),
+                JoinKind::RightSemi => {
+                    set_hash_join_output(&mut join, vec![out_col(2, "right_key")])
+                }
+                _ => {}
+            }
+            let cfg = permissive_config(1024);
+            let mut next_filter_id = 0;
+
+            place_node(&mut join, &cfg, &mut next_filter_id);
+
+            let intent = &expect_hash_join(&join).build_runtime_filters[0];
+            assert_eq!(intent.null_semantics, NullSemantics::NullSafeEqual);
+            assert_column_ref(&intent.build_expr, expected_build);
+            assert_column_ref(&intent.probe_expr, expected_probe);
+        }
     }
 
     #[test]
@@ -1635,6 +1692,45 @@ mod tests {
     }
 
     #[test]
+    fn null_safe_equality_does_not_expand_probe_equivalence() {
+        let left = leaf(vec![out_col(1, "left_key")]);
+        let right = leaf(vec![out_col(3, "right_key")]);
+        let lower = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Unknown,
+            None,
+            vec![eq_cond(
+                col_ref(1, "left_key"),
+                col_ref(3, "right_key"),
+                true,
+            )],
+            vec![left, right],
+            stats_with_columns(10.0, &[(1, 8.0), (3, 8.0)]),
+        );
+        let build = leaf(vec![out_col(2, "build_key")]);
+        let mut join = hash_join_node(
+            JoinKind::Inner,
+            JoinDistribution::Broadcast,
+            Some(JoinExecutionMode::Broadcast),
+            vec![eq_cond(
+                col_ref(1, "left_key"),
+                col_ref(2, "build_key"),
+                false,
+            )],
+            vec![lower, build],
+            stats_with_columns(10.0, &[(1, 8.0), (2, 8.0), (3, 8.0)]),
+        );
+        let cfg = permissive_config(1024);
+        let mut nid = 0;
+
+        place_node(&mut join, &cfg, &mut nid);
+
+        let lower_join = &join.children[0];
+        assert_probe_filter(&lower_join.children[0], 0, 1);
+        assert!(lower_join.children[1].probe_runtime_filters.is_empty());
+    }
+
+    #[test]
     fn semi_join_survival_gate_blocks_existence_only_side() {
         let left = leaf(vec![out_col(1, "surviving_key")]);
         let right = leaf(vec![out_col(3, "existence_key")]);
@@ -1757,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    fn build_intent_skips_null_safe_type_mismatch_and_max_count() {
+    fn build_intent_maps_null_safe_and_respects_type_and_count_guards() {
         let probe = leaf(vec![out_col(1, "probe_key")]);
         let build = leaf(vec![
             out_col(2, "null_safe_build"),
@@ -1786,19 +1882,26 @@ mod tests {
             vec![probe, build],
             stats_with_columns(10.0, &[(1, 8.0), (2, 8.0), (3, 8.0), (4, 8.0), (5, 8.0)]),
         );
-        let cfg = permissive_config(1);
+        let cfg = permissive_config(2);
         let mut nid = 0;
 
         place_node(&mut join, &cfg, &mut nid);
 
         let join_kind = expect_hash_join(&join);
-        assert_eq!(join_kind.build_runtime_filters.len(), 1);
-        let rf = &join_kind.build_runtime_filters[0];
-        assert_eq!(rf.filter_id, 0);
-        assert_eq!(rf.expr_order, 2);
-        assert_column_ref(&rf.build_expr, 4);
-        assert_column_ref(&rf.probe_expr, 1);
-        assert_eq!(nid, 1);
+        assert_eq!(join_kind.build_runtime_filters.len(), 2);
+        let null_safe = &join_kind.build_runtime_filters[0];
+        assert_eq!(null_safe.filter_id, 0);
+        assert_eq!(null_safe.expr_order, 0);
+        assert_eq!(null_safe.null_semantics, NullSemantics::NullSafeEqual);
+        assert_column_ref(&null_safe.build_expr, 2);
+        assert_column_ref(&null_safe.probe_expr, 1);
+        let ordinary = &join_kind.build_runtime_filters[1];
+        assert_eq!(ordinary.filter_id, 1);
+        assert_eq!(ordinary.expr_order, 2);
+        assert_eq!(ordinary.null_semantics, NullSemantics::NeverMatches);
+        assert_column_ref(&ordinary.build_expr, 4);
+        assert_column_ref(&ordinary.probe_expr, 1);
+        assert_eq!(nid, 2);
     }
 
     #[test]

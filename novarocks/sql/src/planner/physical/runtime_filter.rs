@@ -24,7 +24,7 @@
 use std::num::NonZeroU32;
 
 use crate::analysis::TypedExpr;
-use crate::planner::runtime_filter::contract::{NullOrder, SortDirection};
+use crate::planner::runtime_filter::contract::{NullOrder, NullSemantics, SortDirection};
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeFilterBuildIntent {
@@ -33,6 +33,7 @@ pub(crate) struct RuntimeFilterBuildIntent {
     pub probe_expr: TypedExpr,
     pub expr_order: usize,
     pub execution_mode: JoinExecutionMode,
+    pub null_semantics: NullSemantics,
 }
 
 #[derive(Clone, Debug)]
