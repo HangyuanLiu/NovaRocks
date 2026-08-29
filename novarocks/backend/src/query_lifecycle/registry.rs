@@ -1772,6 +1772,19 @@ impl QueryLifecycleRegistry {
         std::thread::Builder::new()
             .name("catalog-lifecycle-install".to_owned())
             .spawn(move || {
+                if crate::config::debug_emit_catalog_lifecycle_marker() {
+                    println!(
+                        "NOVAROCKS_CATALOG_LOADING execution_id={} process_id={} catalog_count={}",
+                        format_execution_id(execution_id),
+                        registry.local_process_id,
+                        catalogs.len(),
+                    );
+                }
+                if let Some(hold_file) = crate::config::debug_catalog_install_hold_file() {
+                    while hold_file.exists() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
                 let result = catalogs.into_iter().try_for_each(|properties| {
                     let materializers = Arc::clone(&registry.catalog_materializers);
                     registry
@@ -1797,6 +1810,13 @@ impl QueryLifecycleRegistry {
                         match result {
                             Ok(()) => {
                                 state.catalog_load = QueryCatalogLoadState::Ready;
+                                if crate::config::debug_emit_catalog_lifecycle_marker() {
+                                    println!(
+                                        "NOVAROCKS_CATALOG_READY execution_id={} process_id={}",
+                                        format_execution_id(execution_id),
+                                        registry.local_process_id,
+                                    );
+                                }
                                 (Some(catalog_ready_event()), false)
                             }
                             Err(error) => {
@@ -2313,6 +2333,13 @@ impl QueryLifecycleRegistry {
         let (outcome, detail, build) = match state.phase {
             QueryLifecyclePhase::ControlAttached => {
                 if !matches!(state.catalog_load, QueryCatalogLoadState::Ready) {
+                    if crate::config::debug_emit_catalog_lifecycle_marker() {
+                        println!(
+                            "NOVAROCKS_CATALOG_STAGE_BLOCKED execution_id={} process_id={} reason=catalog_not_ready",
+                            format_execution_id(execution_id),
+                            self.local_process_id,
+                        );
+                    }
                     (
                         QueryStageOutcome::RejectedInvalidState,
                         "catalog materialization is not ready for staging",
@@ -4747,7 +4774,13 @@ impl InitWorkspace {
 
         let participant = install_result.expect("runtime-filter install result was checked");
         let catalogs = validated(validated(self.entry.manifest.catalog_set()).catalogs());
-        let catalog_load = if catalogs.is_empty() {
+        let catalogs_ready = !catalogs.is_empty()
+            && self
+                .registry
+                .catalog_manager
+                .try_acquire_ready_catalogs(self.execution_id, &catalogs)
+                .unwrap_or(false);
+        let catalog_load = if catalogs.is_empty() || catalogs_ready {
             QueryCatalogLoadState::Ready
         } else {
             QueryCatalogLoadState::Loading {
@@ -4803,7 +4836,7 @@ impl InitWorkspace {
             )
         };
 
-        if !terminated && !catalogs.is_empty() {
+        if !terminated && !catalogs.is_empty() && !catalogs_ready {
             self.registry.begin_catalog_install(
                 Arc::clone(&self.entry),
                 self.execution_id,
@@ -4857,6 +4890,15 @@ impl StageBuildPermit {
         self.entry.stage_completed.notify_all();
         drop(state);
         self.committed = true;
+        if outcome == QueryStageOutcome::Applied
+            && crate::config::debug_emit_catalog_lifecycle_marker()
+        {
+            println!(
+                "NOVAROCKS_CATALOG_STAGE_ADMITTED execution_id={} process_id={}",
+                format_execution_id(self.execution_id),
+                self.registry.local_process_id,
+            );
+        }
         QueryStageAck::new(
             self.execution_id,
             StageDigestVersion::V1,

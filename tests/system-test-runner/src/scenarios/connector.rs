@@ -22,6 +22,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(DistributedReaderCancel),
         Box::new(DistributedReaderKillConnection),
         Box::new(CatalogFeRestartCache),
+        Box::new(CatalogReadyLifecycle),
         Box::new(CatalogReadWriteRuntime),
         Box::new(CatalogVersionDrain),
         Box::new(PredicatePageIndexPruning),
@@ -349,6 +350,157 @@ impl Scenario for DistributedReaderKillConnection {
 }
 
 struct CatalogVersionDrain;
+
+/// Drives one CatalogSet through its observable cold and warm lifecycle on
+/// the real control stream, including cancellation while installation is held.
+struct CatalogReadyLifecycle;
+
+impl Scenario for CatalogReadyLifecycle {
+    fn name(&self) -> &'static str {
+        "connector/catalog-ready-lifecycle"
+    }
+
+    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        let mut config = connector_launch_config();
+        let hold_file = scenario_root.join("catalog-install-hold");
+        config.child_environment.be.insert(
+            "NOVAROCKS_SQL_TEST_CATALOG_INSTALL_HOLD_FILE".to_string(),
+            hold_file.to_string_lossy().into_owned(),
+        );
+        config.child_environment.be.insert(
+            "NOVAROCKS_SQL_TEST_EMIT_CATALOG_LIFECYCLE_MARKER".to_string(),
+            "1".to_string(),
+        );
+        Ok(config)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect catalog ready lifecycle control session")?,
+        )?;
+
+        const CATALOG: &str = "catalog_ready_lifecycle";
+        const DATABASE: &str = "catalog_ready_db";
+        const TABLE: &str = "catalog_ready_data";
+        let warehouse = create_warehouse(context, "catalog-ready-lifecycle")?;
+        create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
+
+        control
+            .query_drop(format!("DROP CATALOG {CATALOG}"))
+            .context("replace warm catalog before held cancellation")?;
+        create_catalog(&mut control, CATALOG, &warehouse)?;
+        let hold_file = context.scenario_root().join("catalog-install-hold");
+        let before_cancel = backend_log_snapshots(context)?;
+        std::fs::write(&hold_file, "hold\n")
+            .with_context(|| format!("create catalog-install hold file {}", hold_file.display()))?;
+        context.action("hold cold catalog install, then cancel before CatalogReady");
+        let cancelled = start_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
+        let connection_id = cancelled
+            .ready
+            .recv_timeout(context.remaining("receive held catalog query connection id")?)
+            .context("held catalog query terminated before publishing connection id")?;
+        wait_for_catalog_lifecycle_marker(
+            context,
+            &before_cancel,
+            "NOVAROCKS_CATALOG_LOADING",
+            "observe Loading on every Backend before cancellation",
+        )?;
+        assert_no_appended_catalog_stage_admitted(context, &before_cancel)?;
+        control
+            .query_drop(format!("KILL QUERY {connection_id}"))
+            .context("cancel query while catalog install is held")?;
+        assert_cancelled_query(
+            &cancelled.done,
+            context.remaining("await held catalog query cancellation")?,
+        )?;
+        assert_target_connection_remains_usable(
+            &cancelled,
+            context.remaining("verify KILL QUERY preserves held client connection")?,
+        )?;
+        release_catalog_install_hold(&hold_file)?;
+        release_connector_read(&cancelled)?;
+        cancelled
+            .thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("held catalog reader thread panicked"))??;
+        await_resource_convergence(context, &baseline, "cancelled catalog install")?;
+        assert_no_appended_catalog_ready(context, &before_cancel)?;
+
+        control
+            .query_drop(format!("DROP CATALOG {CATALOG}"))
+            .context("replace cancelled catalog before cold ready path")?;
+        create_catalog(&mut control, CATALOG, &warehouse)?;
+        let before_cold = backend_log_snapshots(context)?;
+        std::fs::write(&hold_file, "hold\n").with_context(|| {
+            format!("recreate catalog-install hold file {}", hold_file.display())
+        })?;
+        context.action("hold cold catalog install until all Backends report Loading");
+        let cold = start_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
+        let cold_connection_id = cold
+            .ready
+            .recv_timeout(context.remaining("receive cold catalog query connection id")?)
+            .context("cold catalog query terminated before publishing connection id")?;
+        wait_for_catalog_lifecycle_marker(
+            context,
+            &before_cold,
+            "NOVAROCKS_CATALOG_LOADING",
+            "observe Loading on every Backend before releasing cold install",
+        )?;
+        assert_no_appended_catalog_stage_admitted(context, &before_cold)?;
+        context.action("release cold catalog install and require Ready before Stage");
+        release_catalog_install_hold(&hold_file)?;
+        wait_for_catalog_lifecycle_marker(
+            context,
+            &before_cold,
+            "NOVAROCKS_CATALOG_READY",
+            "observe CatalogReady on every Backend",
+        )?;
+        wait_for_catalog_lifecycle_marker(
+            context,
+            &before_cold,
+            "NOVAROCKS_CATALOG_STAGE_ADMITTED",
+            "observe Stage only after CatalogReady",
+        )?;
+        wait_for_open_reader_on_every_backend(
+            context,
+            CATALOG,
+            "observe readers after cold CatalogReady",
+        )?;
+        control
+            .query_drop(format!("KILL QUERY {cold_connection_id}"))
+            .context("cancel cold catalog reader after Ready")?;
+        assert_cancelled_query(
+            &cold.done,
+            context.remaining("await cold catalog reader cancellation")?,
+        )?;
+        assert_target_connection_remains_usable(
+            &cold,
+            context.remaining("verify cold catalog KILL QUERY connection")?,
+        )?;
+        release_connector_read(&cold)?;
+        cold.thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("cold catalog reader thread panicked"))??;
+
+        let before_warm = backend_log_snapshots(context)?;
+        context.action("execute a warm query without another catalog load event");
+        let rows: Vec<i64> = control
+            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            .context("run warm catalog query")?;
+        if rows != [300_000] {
+            bail!("warm catalog query returned {rows:?}, expected [300000]");
+        }
+        let after_warm = backend_log_snapshots(context)?;
+        assert_no_new_catalog_lifecycle_markers(&before_warm, &after_warm)?;
+        await_resource_convergence(context, &baseline, "catalog ready lifecycle")?;
+        Ok(())
+    }
+}
 
 /// Exercises distributed writes and reads through one exact catalog runtime,
 /// then proves a replacement Backend can rebuild that runtime from the frozen
@@ -1208,6 +1360,67 @@ fn wait_for_backend_logs(
         let remaining = context.remaining(operation)?;
         thread::sleep(remaining.min(Duration::from_millis(50)));
     }
+}
+
+fn backend_log_snapshots(context: &mut ScenarioContext) -> Result<Vec<String>> {
+    (0..context.handle().be_count())
+        .map(|index| context.handle().be_current_log_contents(index))
+        .collect::<Result<Vec<_>>>()
+        .context("read Backend log snapshots")
+}
+
+fn wait_for_catalog_lifecycle_marker(
+    context: &mut ScenarioContext,
+    before: &[String],
+    marker: &str,
+    operation: &str,
+) -> Result<Vec<String>> {
+    wait_for_backend_logs(context, operation, |logs| {
+        logs.iter().zip(before).all(|(log, previous)| {
+            log.get(previous.len()..)
+                .is_some_and(|appended| appended.contains(marker))
+        })
+    })
+}
+
+fn assert_no_appended_catalog_stage_admitted(
+    context: &mut ScenarioContext,
+    before: &[String],
+) -> Result<()> {
+    let logs = backend_log_snapshots(context)?;
+    assert_no_new_catalog_marker(before, &logs, "NOVAROCKS_CATALOG_STAGE_ADMITTED")
+}
+
+fn assert_no_appended_catalog_ready(
+    context: &mut ScenarioContext,
+    before: &[String],
+) -> Result<()> {
+    let logs = backend_log_snapshots(context)?;
+    assert_no_new_catalog_marker(before, &logs, "NOVAROCKS_CATALOG_READY")
+}
+
+fn assert_no_new_catalog_lifecycle_markers(before: &[String], after: &[String]) -> Result<()> {
+    for marker in ["NOVAROCKS_CATALOG_LOADING", "NOVAROCKS_CATALOG_READY"] {
+        assert_no_new_catalog_marker(before, after, marker)?;
+    }
+    Ok(())
+}
+
+fn assert_no_new_catalog_marker(before: &[String], after: &[String], marker: &str) -> Result<()> {
+    for (index, (previous, current)) in before.iter().zip(after).enumerate() {
+        let appended = current.get(previous.len()..).with_context(|| {
+            format!("BE[{index}] log was truncated while checking marker {marker}")
+        })?;
+        if appended.contains(marker) {
+            bail!("BE[{index}] emitted unexpected catalog lifecycle marker {marker}");
+        }
+    }
+    Ok(())
+}
+
+fn release_catalog_install_hold(hold_file: &std::path::Path) -> Result<()> {
+    std::fs::remove_file(hold_file)
+        .with_context(|| format!("release catalog-install hold file {}", hold_file.display()))
 }
 
 fn assert_readers_are_in_flight(logs: &[String], phase: &str) -> Result<()> {

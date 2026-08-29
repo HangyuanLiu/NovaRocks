@@ -525,6 +525,42 @@ impl<T> CatalogManager<T> {
         result
     }
 
+    /// Atomically lease a complete catalog set when every exact runtime is
+    /// already Ready.  A caller that receives `false` must use `ensure` for
+    /// the ordinary cold/single-flight path; it receives no partial lease.
+    pub fn try_acquire_ready_catalogs(
+        &self,
+        query: QueryExecutionId,
+        catalogs: &[CatalogProperties],
+    ) -> Result<bool, CatalogManagerError> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut cells = Vec::with_capacity(catalogs.len());
+        for properties in catalogs {
+            let handle = properties.handle().clone();
+            let Some(cell) = state.entries.get(&handle).cloned() else {
+                return Ok(false);
+            };
+            if cell.properties != *properties {
+                return Err(CatalogManagerError::ConflictingProperties { handle });
+            }
+            cells.push(cell);
+        }
+        if cells.iter().any(|cell| {
+            !matches!(
+                &*cell.state.lock().unwrap_or_else(|error| error.into_inner()),
+                CatalogCellState::Ready { .. }
+            )
+        }) {
+            return Ok(false);
+        }
+        state.query_reachability.entry(query).or_default().extend(
+            catalogs
+                .iter()
+                .map(|properties| properties.handle().clone()),
+        );
+        Ok(true)
+    }
+
     /// Release every catalog lease held by a terminal query.  The configured
     /// retention bound is then enforced without evicting a still-reachable
     /// catalog or a materialization that is still in progress.
