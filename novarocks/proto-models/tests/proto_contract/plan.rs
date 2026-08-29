@@ -17,7 +17,7 @@
 
 use prost::Message;
 
-use novarocks_proto_models::{common, expr, plan};
+use novarocks_proto_models::{common, connector_read, expr, plan};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IPlan {
@@ -130,30 +130,17 @@ fn literal_bool(value: bool) -> expr::Expr {
     }
 }
 
-fn iceberg_table(table: &str, file_count: usize) -> plan::TableDef {
+fn iceberg_table(table: &str) -> plan::TableDef {
     plan::TableDef {
         name: table.to_string(),
         columns: vec![column_def("id", common::PrimitiveType::Bigint)],
         iceberg_row_lineage_metadata_columns: vec![],
         source: Some(plan::ScanSource {
-            kind: Some(plan::scan_source::Kind::ConnectorRead(
-                plan::ConnectorReadSource {
-                    instance_id: "rest".to_string(),
-                    instance_incarnation: vec![1; 16],
-                    scan_payload: table.as_bytes().to_vec(),
-                    splits: (0..file_count)
-                        .map(|idx| plan::ConnectorReadSplit {
-                            split_id: format!("{table}-{idx}"),
-                            split_payload: Vec::new(),
-                            estimated_bytes: Some(1024),
-                        })
-                        .collect(),
-                    max_batch_rows: 1024,
-                    max_batch_bytes: 1_048_576,
-                    max_handle_payload_bytes: 1_048_576,
-                    max_total_payload_bytes: 8_388_608,
-                    expected_schema_ipc: Vec::new(),
-                },
+            // Typed scan work arrives through TaskUpdate rather than a
+            // fragment-local split vector; this proto contract only asserts
+            // that the carrier round-trips byte-for-byte.
+            kind: Some(plan::scan_source::Kind::TypedConnectorRead(
+                connector_read::ConnectorTableScanSource::default(),
             )),
         }),
     }
@@ -181,12 +168,12 @@ fn node_to_proto(node: &INode) -> plan::DistributedNode {
         IPayload::Scan {
             database,
             table,
-            file_count,
+            file_count: _,
         } => plan::distributed_node::Payload::Physical(plan::PlanNode {
             output_columns: vec![output_column(1, "id", common::PrimitiveType::Bigint)],
             kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
                 database: database.clone(),
-                table: Some(iceberg_table(table, *file_count)),
+                table: Some(iceberg_table(table)),
                 alias: Some("t".to_string()),
                 columns: vec![output_column(1, "id", common::PrimitiveType::Bigint)],
                 predicates: vec![literal_bool(true)],
@@ -250,10 +237,8 @@ fn node_to_proto(node: &INode) -> plan::DistributedNode {
         nullable_tuple_ids: vec![],
         limit: -1,
         runtime_filter_binding_ids: match &node.payload {
-            IPayload::HashJoin { runtime_filter_id } => vec![
-                u32::try_from(*runtime_filter_id)
-                    .expect("runtime-filter fixture id must fit a binding id"),
-            ],
+            IPayload::HashJoin { runtime_filter_id } => vec![u32::try_from(*runtime_filter_id)
+                .expect("runtime-filter fixture id must fit a binding id")],
             _ => Vec::new(),
         },
         children: node.children.iter().map(node_to_proto).collect(),
@@ -272,10 +257,9 @@ fn node_from_proto(proto: &plan::DistributedNode) -> Result<INode, String> {
                 plan::plan_node::Kind::Scan(scan) => {
                     let table = scan.table.as_ref().ok_or("ScanNode.table missing")?;
                     let source = table.source.as_ref().ok_or("TableDef.source missing")?;
+                    // Typed scan work never embeds splits: they arrive at
+                    // runtime through TaskUpdate.
                     let file_count = match source.kind.as_ref().ok_or("ScanSource.kind missing")? {
-                        plan::scan_source::Kind::ConnectorRead(source) => source.splits.len(),
-                        // The typed scan source never embeds splits: they
-                        // arrive at runtime through TaskUpdate.
                         plan::scan_source::Kind::TypedConnectorRead(_) => 0,
                     };
                     IPayload::Scan {
@@ -424,7 +408,7 @@ fn sample_internal_plan() -> IPlan {
                             payload: IPayload::Scan {
                                 database: "tpch".to_string(),
                                 table: "orders".to_string(),
-                                file_count: 2,
+                                file_count: 0,
                             },
                             children: vec![],
                         },
@@ -452,7 +436,7 @@ fn sample_internal_plan() -> IPlan {
                         payload: IPayload::Scan {
                             database: "tpch".to_string(),
                             table: "lineitem".to_string(),
-                            file_count: 1,
+                            file_count: 0,
                         },
                         children: vec![],
                     }],
