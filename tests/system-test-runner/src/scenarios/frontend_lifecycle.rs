@@ -69,6 +69,7 @@ impl Scenario for CatalogPartialReadiness {
                     snapshot.display()
                 )),
                 be: None,
+                ..Default::default()
             },
             ..Default::default()
         })
@@ -144,6 +145,7 @@ impl Scenario for StaticFileDisposableCarrier {
                     snapshot.display()
                 )),
                 be: None,
+                ..Default::default()
             },
             ..Default::default()
         })
@@ -282,6 +284,7 @@ impl Scenario for ForcedDrain {
                         .to_string(),
                 ),
                 be: None,
+                ..Default::default()
             },
             ..Default::default()
         })
@@ -497,6 +500,7 @@ enable_path_style_access = true
             // application roles resolve that process-local binding; no
             // credential may cross the native plan boundary.
             be: Some(object_store.to_string()),
+            ..Default::default()
         },
         ..Default::default()
     }

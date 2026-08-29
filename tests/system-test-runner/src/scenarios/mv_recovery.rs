@@ -135,6 +135,7 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
                     .to_string(),
                 ),
                 be: None,
+                ..Default::default()
             },
             native_trust_fixture: Default::default(),
             ..Default::default()
