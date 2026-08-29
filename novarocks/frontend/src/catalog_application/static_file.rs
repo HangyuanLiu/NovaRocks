@@ -39,7 +39,7 @@ use novarocks_spi::connector::{
 const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CATALOGS: usize = 1024;
 const MAX_DISPLAY_NAME_BYTES: usize = 256;
-const STATIC_FILE_FORMAT_VERSION: u8 = 2;
+const STATIC_FILE_FORMAT_VERSION: u8 = 3;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -208,7 +208,7 @@ fn parse_credential_binding(
     };
     let consumer_role = match wire.consumer_role.as_str() {
         "frontend" => CredentialConsumerRole::Frontend,
-        "backend" => CredentialConsumerRole::Backend,
+        "frontend-and-backend" => CredentialConsumerRole::FrontendAndBackend,
         _ => return Err(whole_file_error("unknown catalog credential consumer role")),
     };
     let mode = match wire.mode.as_str() {
@@ -259,15 +259,15 @@ mod tests {
     #[test]
     fn canonicalizes_logical_configuration_and_remints_process_identity() {
         let first = write_file(
-            br#"format_version = 2
+            br#"format_version = 3
 [[catalogs]]
 instance_id = "catalog.analytics"
 provider_id = "iceberg"
 display_name = "Analytics"
-config_format_version = 2
+config_format_version = 3
 [[catalogs.credential_bindings]]
 purpose = "object-store-data"
-consumer_role = "backend"
+consumer_role = "frontend-and-backend"
 mode = "static"
 name = "warehouse-data"
 generation = "blue"
@@ -283,12 +283,12 @@ a = "first"
 "#,
         );
         let second = write_file(
-            br#"format_version = 2
+            br#"format_version = 3
 [[catalogs]]
 instance_id = "catalog.analytics"
 provider_id = "iceberg"
 display_name = "Analytics"
-config_format_version = 2
+config_format_version = 3
 [[catalogs.credential_bindings]]
 purpose = "catalog-control"
 consumer_role = "frontend"
@@ -297,7 +297,7 @@ name = "rest-control"
 generation = "blue"
 [[catalogs.credential_bindings]]
 purpose = "object-store-data"
-consumer_role = "backend"
+consumer_role = "frontend-and-backend"
 mode = "static"
 name = "warehouse-data"
 generation = "blue"
@@ -336,12 +336,12 @@ z = "last"
     #[test]
     fn local_catalog_may_explicitly_declare_zero_bindings() {
         let file = write_file(
-            br#"format_version = 2
+            br#"format_version = 3
 [[catalogs]]
 instance_id = "catalog.local"
 provider_id = "local"
 display_name = "Local"
-config_format_version = 2
+config_format_version = 3
 credential_bindings = []
 [catalogs.properties]
 type = "local"
@@ -353,13 +353,42 @@ type = "local"
     }
 
     #[test]
+    fn rejects_v2_backend_only_binding_without_migration() {
+        let file = write_file(
+            br#"format_version = 2
+[[catalogs]]
+instance_id = "catalog.analytics"
+provider_id = "iceberg"
+display_name = "Analytics"
+config_format_version = 2
+[[catalogs.credential_bindings]]
+purpose = "object-store-data"
+consumer_role = "backend"
+mode = "static"
+name = "warehouse-data"
+generation = "blue"
+[catalogs.properties]
+type = "iceberg"
+"#,
+        );
+        let error = load_static_file_snapshot(file.path())
+            .expect_err("v2 Backend-only definition must fail closed");
+        assert_eq!(
+            error.kind(),
+            CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete
+        );
+        assert!(error.to_string().contains("unsupported format_version 2"));
+    }
+
+    #[test]
     fn structural_errors_fail_the_whole_snapshot() {
         for contents in [
             b"format_version = 1\ncatalogs = []\n".as_slice(),
-            b"format_version = 2\nunknown = true\ncatalogs = []\n".as_slice(),
-            b"format_version = 2\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 2\n[[catalogs.credential_bindings]]\npurpose = 'object-store-data'\nconsumer_role = 'backend'\nmode = 'static'\nname = 'BAD'\ngeneration = 'blue'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
-            b"format_version = 2\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 2\n[[catalogs.credential_bindings]]\npurpose = 'object-store-data'\nconsumer_role = 'backend'\nmode = 'vended'\nname = 'forbidden'\ngeneration = 'blue'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
-            b"format_version = 2\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 2\ncredential_bindings = []\n[catalogs.properties]\ncredential.secret = 'nope'\n".as_slice(),
+            b"format_version = 3\nunknown = true\ncatalogs = []\n".as_slice(),
+            b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\n[[catalogs.credential_bindings]]\npurpose = 'object-store-data'\nconsumer_role = 'frontend-and-backend'\nmode = 'static'\nname = 'BAD'\ngeneration = 'blue'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
+            b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\n[[catalogs.credential_bindings]]\npurpose = 'object-store-data'\nconsumer_role = 'backend'\nmode = 'static'\nname = 'warehouse-data'\ngeneration = 'blue'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
+            b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\n[[catalogs.credential_bindings]]\npurpose = 'object-store-data'\nconsumer_role = 'frontend-and-backend'\nmode = 'vended'\nname = 'forbidden'\ngeneration = 'blue'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
+            b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\ncredential_bindings = []\n[catalogs.properties]\ncredential.secret = 'nope'\n".as_slice(),
         ] {
             let file = write_file(contents);
             assert_eq!(

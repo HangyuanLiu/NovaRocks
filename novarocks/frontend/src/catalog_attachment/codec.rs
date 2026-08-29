@@ -117,7 +117,7 @@ mod tests {
             }],
             credential_bindings: vec![StoredCredentialBinding {
                 purpose: "object-store-data".to_string(),
-                consumer_role: "backend".to_string(),
+                consumer_role: "frontend-and-backend".to_string(),
                 mode: "static".to_string(),
                 name: Some("warehouse-data".to_string()),
                 generation: Some("blue".to_string()),
@@ -127,7 +127,7 @@ mod tests {
     }
 
     #[test]
-    fn codec_round_trips_v2_with_stable_bytes() {
+    fn codec_round_trips_v3_with_stable_bytes() {
         let value = stored_attachment();
         let store = DurableRecordStore::with_limits(
             novarocks_spi::state_store::StateStoreLimits::default(),
@@ -136,15 +136,15 @@ mod tests {
         assert_eq!(decode(encoded.as_bytes()).expect("decode"), value);
         assert_eq!(
             encoded.as_bytes(),
-            br#"{"schema_version":2,"attachment_id":"01991d9f-939d-7a20-8000-000000000001","instance_id":"warehouse","provider_id":"iceberg","display_name":"Warehouse","durable_properties":[{"key":"type","value":"iceberg"}],"credential_bindings":[{"purpose":"object-store-data","consumer_role":"backend","mode":"static","name":"warehouse-data","generation":"blue"}],"created_at_ms":42}"#
+            br#"{"schema_version":3,"attachment_id":"01991d9f-939d-7a20-8000-000000000001","instance_id":"warehouse","provider_id":"iceberg","display_name":"Warehouse","durable_properties":[{"key":"type","value":"iceberg"}],"credential_bindings":[{"purpose":"object-store-data","consumer_role":"frontend-and-backend","mode":"static","name":"warehouse-data","generation":"blue"}],"created_at_ms":42}"#
         );
     }
 
     #[test]
-    fn codec_rejects_v1_instead_of_defaulting_missing_bindings() {
-        let old = br#"{"schema_version":1,"attachment_id":"01991d9f-939d-7a20-8000-000000000001","instance_id":"warehouse","provider_id":"iceberg","display_name":"Warehouse","durable_properties":[{"key":"type","value":"iceberg"}],"created_at_ms":42}"#;
-        let error = decode(old).expect_err("v1 must fail closed");
-        assert!(error.contains("unsupported schema version 1"), "{error}");
+    fn codec_rejects_v2_instead_of_upgrading_backend_only_bindings() {
+        let old = br#"{"schema_version":2,"attachment_id":"01991d9f-939d-7a20-8000-000000000001","instance_id":"warehouse","provider_id":"iceberg","display_name":"Warehouse","durable_properties":[{"key":"type","value":"iceberg"}],"credential_bindings":[{"purpose":"object-store-data","consumer_role":"backend","mode":"static","name":"warehouse-data","generation":"blue"}],"created_at_ms":42}"#;
+        let error = decode(old).expect_err("v2 must fail closed");
+        assert!(error.contains("unsupported schema version 2"), "{error}");
     }
 
     #[test]

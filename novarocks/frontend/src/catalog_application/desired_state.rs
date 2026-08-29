@@ -63,7 +63,7 @@ use crate::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
 use crate::state_family::StateFamily;
 
 /// Domain separator for the snapshot identity digest.
-const SNAPSHOT_IDENTITY_DOMAIN: &[u8] = b"novarocks/frontend/catalog/desired-state/snapshot/v2";
+const SNAPSHOT_IDENTITY_DOMAIN: &[u8] = b"novarocks/frontend/catalog/desired-state/snapshot/v3";
 
 /// Domain separator for a catalog execution definition version.
 ///

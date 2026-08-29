@@ -614,7 +614,10 @@ fn stored_binding_from(binding: &CatalogCredentialBinding) -> StoredCredentialBi
         .to_string(),
         consumer_role: match binding.consumer_role() {
             CredentialConsumerRole::Frontend => "frontend",
-            CredentialConsumerRole::Backend => "backend",
+            CredentialConsumerRole::FrontendAndBackend => "frontend-and-backend",
+            CredentialConsumerRole::Backend => {
+                unreachable!("validated catalog credential binding cannot target backend alone")
+            }
         }
         .to_string(),
         mode: mode.to_string(),
@@ -633,7 +636,7 @@ fn binding_from_stored(
     };
     let consumer_role = match stored.consumer_role.as_str() {
         "frontend" => CredentialConsumerRole::Frontend,
-        "backend" => CredentialConsumerRole::Backend,
+        "frontend-and-backend" => CredentialConsumerRole::FrontendAndBackend,
         _ => return Err(corruption("unknown catalog credential consumer role")),
     };
     let mode = match stored.mode.as_str() {
@@ -728,7 +731,7 @@ mod tests {
     fn object_store_binding(generation: &str) -> CatalogCredentialBinding {
         CatalogCredentialBinding::try_new(
             CatalogCredentialPurpose::ObjectStoreData,
-            CredentialConsumerRole::Backend,
+            CredentialConsumerRole::FrontendAndBackend,
             CatalogCredentialMode::Static(
                 StaticCredentialReference::try_new("warehouse-data", generation)
                     .expect("credential reference"),
@@ -935,7 +938,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("catalog-attachment schema version 2")
+                .contains("catalog-attachment schema version 3")
         );
         assert!(error.to_string().contains("256-byte budget"));
         assert!(

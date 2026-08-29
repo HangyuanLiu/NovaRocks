@@ -110,7 +110,7 @@ impl StateFamily {
                     SnapshotIdentity::CompleteEnumeration,
                     BootstrapFailureScope::GlobalEnumerationPerEntryMaterialization,
                     PersistentKeyPrefix::new(CATALOG_ATTACHMENT_PREFIX),
-                    2,
+                    3,
                     ClonePolicy::SemanticRebind,
                 ))
             }
