@@ -29,46 +29,45 @@ use novarocks_spi::connector::{
     ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBinding, ConnectorExecutionBindingKey, ConnectorExecutionDeclaration,
-    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorListViewsRequest,
-    ConnectorMetadata, ConnectorNamespaceRequest, ConnectorOpenReaderRequest,
-    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest,
-    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
-    ConnectorProviderId, ConnectorReadExecution, ConnectorReadNamedReference,
-    ConnectorReadReferenceFacts, ConnectorReadReferenceKind, ConnectorReadSnapshotLogEntry,
-    ConnectorReaderMetricsSnapshot, ConnectorScalarType, ConnectorScalarValue, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorScanUnitDomainFacts,
-    ConnectorScanUnitFactsMissingReason, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
-    ConnectorStaticPredicate, ConnectorStaticPredicateColumn, ConnectorStaticPredicateId,
-    ConnectorStaticPredicateKind, ConnectorStatistics, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest, ConnectorViewIdentity,
-    ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest,
-    ExternalMutationOutcome, StatisticsBasisRelation, StatisticsDataVersion, StatisticsEvidence,
-    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
+    ConnectorExecutionBinding, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorListTablesRequest, ConnectorListViewsRequest, ConnectorMetadata,
+    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPredicateDisposition,
+    ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
+    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderBinding,
+    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorReadExecution,
+    ConnectorReadNamedReference, ConnectorReadReferenceFacts, ConnectorReadReferenceKind,
+    ConnectorReadSnapshotLogEntry, ConnectorReaderMetricsSnapshot, ConnectorScalarType,
+    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason, ConnectorSplit,
+    ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorStaticComparisonOp, ConnectorStaticPredicate, ConnectorStaticPredicateColumn,
+    ConnectorStaticPredicateId, ConnectorStaticPredicateKind, ConnectorStatistics,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
+    ConnectorViewIdentity, ConnectorViewMetadata, ConnectorViewMetadataValue, ConnectorViewRequest,
+    ExternalMutationOutcome, ProviderBindingEpoch, StatisticsBasisRelation, StatisticsDataVersion,
+    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
     StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue, StatisticsNumericNature,
     StatisticsReadRequest, StatisticsRowCoverage, normalize_predicate_dispositions,
     validate_static_predicates,
 };
 
 struct OwnerExecution {
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl OwnerExecution {
     fn new(instance_id: &str) -> Self {
         Self {
-            key: ConnectorExecutionBindingKey {
+            key: ConnectorProviderBindingKey {
                 instance_id: ConnectorInstanceId::parse(instance_id).expect("instance ID"),
-                incarnation: ConnectorInstanceIncarnation::from_bytes([1; 16]),
+                incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
             },
         }
     }
 }
 
 impl ConnectorReadExecution for OwnerExecution {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -519,9 +518,9 @@ fn prepared_unit_set_digest_is_deterministic_and_binding_sensitive() {
     .expect("identical sealed set");
     assert_eq!(first.membership_digest(), second.membership_digest());
 
-    let foreign_binding = ConnectorExecutionBindingKey {
+    let foreign_binding = ConnectorProviderBindingKey {
         instance_id: execution.key.instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([2; 16]),
     };
     let foreign = ConnectorPreparedScanUnitSet::try_new(
         foreign_binding,
@@ -565,15 +564,15 @@ impl ConnectorScanPlanning for OwnerPlanning {
 
 struct OwnerDistribution {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
 }
 
 impl ConnectorExecutionDistribution for OwnerDistribution {
     fn declaration(
         &self,
         _: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-        ConnectorExecutionDeclaration::iceberg(
+    ) -> Result<ConnectorProviderBinding, ConnectorError> {
+        ConnectorProviderBinding::iceberg(
             self.descriptor.instance_id.as_str(),
             self.incarnation.to_bytes(),
             "owner-fixture",
@@ -634,9 +633,9 @@ fn descriptor(instance_id: &str) -> ConnectorInstanceDescriptor {
 
 #[test]
 fn execution_bindings_are_valid_without_control_capabilities() {
-    let key = ConnectorExecutionBindingKey {
+    let key = ConnectorProviderBindingKey {
         instance_id: ConnectorInstanceId::parse("file").expect("instance ID"),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([1; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
     };
     let binding = ConnectorExecutionBinding::try_new(
         ConnectorProviderId::parse("file").expect("provider ID"),
@@ -650,9 +649,9 @@ fn execution_bindings_are_valid_without_control_capabilities() {
 
 #[test]
 fn execution_binding_rejects_a_read_capability_owned_by_another_generation() {
-    let key = ConnectorExecutionBindingKey {
+    let key = ConnectorProviderBindingKey {
         instance_id: ConnectorInstanceId::parse("file").expect("instance ID"),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([1; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
     };
     assert_eq!(
         ConnectorExecutionBinding::try_new(
@@ -673,14 +672,14 @@ fn control_binding_rejects_metadata_owned_by_another_instance() {
     assert_eq!(
         ConnectorControlBinding::try_new(
             descriptor.clone(),
-            ConnectorInstanceIncarnation::from_bytes([1; 16]),
+            ProviderBindingEpoch::from_bytes([1; 16]),
             Arc::new(OwnerMetadata::new("foreign")),
             Arc::new(OwnerPlanning {
                 instance_id: descriptor.instance_id.clone(),
             }),
             Arc::new(OwnerDistribution {
                 descriptor,
-                incarnation: ConnectorInstanceIncarnation::from_bytes([1; 16]),
+                incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
             }),
             None,
         )
@@ -693,7 +692,7 @@ fn control_binding_rejects_metadata_owned_by_another_instance() {
 
 struct OwnerStatistics {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
 }
 
 impl novarocks_spi::connector::StatisticsReader for OwnerStatistics {
@@ -701,7 +700,7 @@ impl novarocks_spi::connector::StatisticsReader for OwnerStatistics {
         &self.descriptor
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
 
@@ -766,10 +765,10 @@ fn no_provider_can_present_a_theta_sketch_as_an_exact_value() {
 #[test]
 fn control_binding_rejects_statistics_owned_by_another_generation() {
     let descriptor = descriptor("file");
-    let incarnation = ConnectorInstanceIncarnation::from_bytes([1; 16]);
+    let incarnation = ProviderBindingEpoch::from_bytes([1; 16]);
     let foreign = Arc::new(OwnerStatistics {
         descriptor: descriptor.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([2; 16]),
     });
     assert_eq!(
         ConnectorControlBinding::try_new_with_statistics(
@@ -895,7 +894,7 @@ fn spi5b_reference_facts_enforce_the_request_total_payload_budget() {
 
 struct OwnerViewMetadata {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
 }
 
 impl ConnectorViewMetadata for OwnerViewMetadata {
@@ -903,7 +902,7 @@ impl ConnectorViewMetadata for OwnerViewMetadata {
         &self.descriptor
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
 
@@ -929,7 +928,7 @@ impl ConnectorViewMetadata for OwnerViewMetadata {
 #[test]
 fn spi5b_control_binding_rejects_view_capability_owned_by_another_generation() {
     let descriptor = descriptor("file");
-    let incarnation = ConnectorInstanceIncarnation::from_bytes([1; 16]);
+    let incarnation = ProviderBindingEpoch::from_bytes([1; 16]);
     let binding = ConnectorControlBinding::try_new(
         descriptor.clone(),
         incarnation,
@@ -946,7 +945,7 @@ fn spi5b_control_binding_rejects_view_capability_owned_by_another_generation() {
     .expect("base binding");
     let foreign = Arc::new(OwnerViewMetadata {
         descriptor,
-        incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([2; 16]),
     });
 
     let error = match binding.try_with_view_metadata(Some(foreign)) {
@@ -958,7 +957,7 @@ fn spi5b_control_binding_rejects_view_capability_owned_by_another_generation() {
 
 struct OwnerDataMutation {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl ConnectorDataMutation for OwnerDataMutation {
@@ -966,7 +965,7 @@ impl ConnectorDataMutation for OwnerDataMutation {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -995,12 +994,12 @@ impl ConnectorDataMutation for OwnerDataMutation {
 #[test]
 fn control_binding_rejects_data_mutation_owned_by_another_generation() {
     let descriptor = descriptor("file");
-    let incarnation = ConnectorInstanceIncarnation::from_bytes([1; 16]);
+    let incarnation = ProviderBindingEpoch::from_bytes([1; 16]);
     let foreign = Arc::new(OwnerDataMutation {
         descriptor: descriptor.clone(),
-        key: ConnectorExecutionBindingKey {
+        key: ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([2; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([2; 16]),
         },
     });
     assert_eq!(

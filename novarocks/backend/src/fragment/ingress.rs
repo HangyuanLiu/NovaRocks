@@ -22,12 +22,7 @@ use std::fmt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use novarocks_proto_codec::connector::AdmittedConnectorExecutionDeclaration;
-use novarocks_proto_codec::provider::{
-    EnsureConnectorExecutionBindingResult, RetireConnectorExecutionBindingResult,
-};
-use novarocks_spi::connector::ConnectorExecutionBindingKey;
-use novarocks_types::{QueryExecutionId, QueryId, UniqueId};
+use novarocks_types::{QueryId, UniqueId};
 
 /// A split received by this backend after the exact binding codec recovered
 /// its provider-private SPI payload. Scheduling retains only sequence and
@@ -175,15 +170,6 @@ impl std::error::Error for NativeFragmentIngressError {}
     reason = "Retained for target-specific native integration and regression coverage."
 )]
 pub(crate) trait NativeFragmentIngress: Send + Sync + 'static {
-    fn ensure_connector_execution_binding(
-        &self,
-        execution_id: QueryExecutionId,
-        declaration: AdmittedConnectorExecutionDeclaration,
-    ) -> EnsureConnectorExecutionBindingResult;
-    fn retire_connector_execution_binding(
-        &self,
-        key: ConnectorExecutionBindingKey,
-    ) -> RetireConnectorExecutionBindingResult;
     fn cancel(
         &self,
         request: NativeFragmentCancelRequest,

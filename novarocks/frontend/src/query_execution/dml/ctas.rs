@@ -30,8 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorColumnDefinition, ConnectorCtasUnanchoredCleanupRequest,
-    ConnectorCtasUnanchoredDiscoveryRequest, ConnectorMutationFailure, ConnectorPartitionTransform,
+    ConnectorColumnDefinition, ConnectorMutationFailure, ConnectorPartitionTransform,
     ConnectorStagedCreateLease, ConnectorStagedCreatePrepareOutcome,
     ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublicationAdjudicationOutcome,
     ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublishOutcome,
@@ -250,7 +249,7 @@ pub enum CtasTargetPreflightOutcome {
 pub struct CtasTargetPreflightFacts {
     pub provider_id: String,
     pub instance_id: String,
-    pub incarnation: [u8; 16],
+    pub control_runtime_id: [u8; 16],
     pub capability_version: u32,
     pub target_namespace: String,
     pub target_table: String,
@@ -389,7 +388,7 @@ impl CtasNativeEncoding<'_> {
 pub struct StandardCtasTargetFacts {
     pub provider_id: String,
     pub instance_id: String,
-    pub incarnation: [u8; 16],
+    pub control_runtime_id: [u8; 16],
     pub publication_id: LakePublicationId,
     pub target_handle_digest: [u8; 32],
 }
@@ -822,8 +821,8 @@ impl CoreStandardCtasTargetSession {
     fn facts(&self) -> StandardCtasTargetFacts {
         StandardCtasTargetFacts {
             provider_id: "iceberg".to_string(),
-            instance_id: self.lease.owner().instance_id.as_str().to_string(),
-            incarnation: self.lease.owner().incarnation.to_bytes(),
+            instance_id: self.lease.instance_id().as_str().to_string(),
+            control_runtime_id: self.lease.control_runtime_id().to_bytes(),
             publication_id: self.publication_id,
             target_handle_digest: self.handle.digest(),
         }
@@ -930,23 +929,22 @@ impl CtasWriteTarget for CoreStandardCtasTargetSession {
             input_schema: Arc::clone(&input_schema),
             context,
         })?;
-        let outcome =
-            self.write_lease
-                .control()
-                .prepare_write(ConnectorWritePreparationRequest {
-                    table: binding.table().clone(),
-                    target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-                    intent: binding.intent(),
-                    purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-                    input: ConnectorWriteInputRequest::Data {
-                        fields: input_schema
-                            .fields()
-                            .iter()
-                            .map(|field| ConnectorWriteFieldRequest::new(field.as_ref().clone()))
-                            .collect(),
-                    },
-                    context: binding.context().clone(),
-                })?;
+        let outcome = self
+            .write_lease
+            .prepare_write(ConnectorWritePreparationRequest {
+                table: binding.table().clone(),
+                target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+                intent: binding.intent(),
+                purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                input: ConnectorWriteInputRequest::Data {
+                    fields: input_schema
+                        .fields()
+                        .iter()
+                        .map(|field| ConnectorWriteFieldRequest::new(field.as_ref().clone()))
+                        .collect(),
+                },
+                context: binding.context().clone(),
+            })?;
         let preparation = match outcome {
             ConnectorWritePreparationOutcome::Prepared(preparation) => preparation,
             ConnectorWritePreparationOutcome::Denied(error) => return Err(error),
@@ -1189,28 +1187,20 @@ fn sweep_unanchored_ctas_roots(
         .checked_sub(safe_age_ms)
         .ok_or_else(|| internal_failure("lake publication safe GC cutoff underflows"))?;
     let warehouse_root = lease.warehouse_root().map_err(connector_failure)?;
-    let discovery = ConnectorCtasUnanchoredDiscoveryRequest::try_new(
-        lease.owner().clone(),
-        warehouse_root.clone(),
-        cutoff_ms,
-    )
-    .map_err(connector_failure)?;
     let candidates = lease
-        .discover_unanchored_ctas(discovery, context.clone())
+        .discover_unanchored_ctas(warehouse_root.clone(), cutoff_ms, context.clone())
         .map_err(connector_failure)?;
     for provenance in candidates {
-        let cleanup = ConnectorCtasUnanchoredCleanupRequest::try_new(
-            lease.owner().clone(),
-            warehouse_root.clone(),
-            cutoff_ms,
-            provenance,
-        )
-        .map_err(connector_failure)?;
         // An exact delete whose acknowledgement is uncertain stays an aged
         // residue for a later GC pass. It never grants this new CTAS attempt
         // authority to reconcile, retry, or infer the old publication.
         let _ = lease
-            .inspect_then_delete_unanchored_ctas(cleanup, context.clone())
+            .inspect_then_delete_unanchored_ctas(
+                warehouse_root.clone(),
+                cutoff_ms,
+                provenance,
+                context.clone(),
+            )
             .map_err(connector_failure)?;
     }
     Ok(())
@@ -1416,8 +1406,8 @@ impl CtasEngine for DmlExecutionKernel {
             .derive_unanchored_ctas_cleanup_lease()
             .map_err(connector_failure)?;
         let write_lease = planning.derive_write_lease().map_err(connector_failure)?;
-        if lease.owner() != write_lease.binding_key()
-            || lease.owner() != unanchored_ctas_cleanup_lease.owner()
+        if !lease.matches_write_lease(&write_lease)
+            || lease.control_runtime_id() != unanchored_ctas_cleanup_lease.control_runtime_id()
         {
             return Err(internal_failure(
                 "standard CTAS staged-create, cleanup, and writer leases do not share one exact generation",
@@ -1434,7 +1424,7 @@ impl CtasEngine for DmlExecutionKernel {
                 facts: CtasTargetPreflightFacts {
                     provider_id: binding.descriptor().provider_id.as_str().to_string(),
                     instance_id: binding.descriptor().instance_id.as_str().to_string(),
-                    incarnation: binding.incarnation().to_bytes(),
+                    control_runtime_id: lease.control_runtime_id().to_bytes(),
                     capability_version:
                         novarocks_spi::connector::CONNECTOR_STAGED_CREATE_CONTRACT_VERSION,
                     target_namespace: target.namespace.clone(),
@@ -1585,23 +1575,22 @@ impl CtasEngine for DmlExecutionKernel {
                 user_error: None,
             });
         }
-        let request = ConnectorStagedCreatePrepareRequest {
-            owner: source.preflight.lease.owner().clone(),
+        let request = source.preflight.lease.prepare_request(
             publication_id,
-            operation_id: novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
+            novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
                 publication_id.to_bytes(),
             ),
-            table: novarocks_spi::connector::ConnectorTableIdentity {
-                instance_id: source.preflight.lease.owner().instance_id.clone(),
+            novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: source.preflight.lease.instance_id().clone(),
                 namespace: Arc::from(source.target.namespace.as_str()),
                 table: Arc::from(source.target.table.as_str()),
             },
-            columns: source.output_columns.clone(),
-            partitioning: source.command.partitioning.clone(),
-            properties: source.command.properties.clone(),
+            source.output_columns.clone(),
+            source.command.partitioning.clone(),
+            source.command.properties.clone(),
             policy,
-            context: source.connector_context.clone(),
-        };
+            source.connector_context.clone(),
+        );
         Ok(PreparedStandardCtasCatalogAction {
             input_digest: standard_stage_input_digest(&request),
             handle: Arc::new(CoreCtasCatalogAction {

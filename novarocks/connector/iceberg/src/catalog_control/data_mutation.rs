@@ -34,8 +34,8 @@ use novarocks_spi::connector::{
     ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorMutationFailure,
-    ConnectorMutationFailureKind, ConnectorMutationOperationId, ExternalMutationEffect,
+    ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorMutationOperationId, ConnectorProviderBindingKey, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
@@ -561,7 +561,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
 }
 
 pub struct IcebergDataMutationAdapter {
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
     backend: Arc<dyn IcebergDataMutationBackend>,
     plans: Mutex<HashMap<ConnectorMutationOperationId, CachedPlan>>,
@@ -570,7 +570,7 @@ pub struct IcebergDataMutationAdapter {
 
 impl IcebergDataMutationAdapter {
     pub(crate) fn try_new(provider: Arc<IcebergMetadata>) -> Result<Self, ConnectorError> {
-        let key = ConnectorExecutionBindingKey {
+        let key = ConnectorProviderBindingKey {
             instance_id: provider.descriptor().instance_id.clone(),
             incarnation: provider.incarnation(),
         };
@@ -581,7 +581,7 @@ impl IcebergDataMutationAdapter {
     }
 
     fn new_with_backend(
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         backend: Arc<dyn IcebergDataMutationBackend>,
     ) -> Result<Self, ConnectorError> {
         let descriptor = ConnectorInstanceDescriptor {
@@ -597,7 +597,7 @@ impl IcebergDataMutationAdapter {
         })
     }
 
-    fn ensure_owner(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
+    fn ensure_owner(&self, owner: &ConnectorProviderBindingKey) -> Result<(), ConnectorError> {
         if owner != &self.key {
             return Err(invalid(
                 "Iceberg data mutation does not match the exact connector generation",
@@ -756,7 +756,7 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -1203,7 +1203,7 @@ fn target_snapshot_id(
 
 fn identity_digest(
     descriptor: &ConnectorInstanceDescriptor,
-    key: &ConnectorExecutionBindingKey,
+    key: &ConnectorProviderBindingKey,
     plan: &ConnectorDataMutationPlan,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -1345,9 +1345,9 @@ mod tests {
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorDataMutationExecuteRequest,
         ConnectorDataMutationPlanningRequest, ConnectorDataMutationReconcileRequest,
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorMetadata, ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle,
-        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata, ConnectorProviderId,
+        ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity,
+        ConnectorTableRequest, ConnectorTableResolution, ProviderBindingEpoch,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -1528,7 +1528,7 @@ mod tests {
         };
         let provider = Arc::new(IcebergMetadata::new(
             descriptor,
-            ConnectorInstanceIncarnation::from_bytes([8; 16]),
+            ProviderBindingEpoch::from_bytes([8; 16]),
             runtime,
         ));
         (executor, warehouse, provider)
@@ -1538,13 +1538,13 @@ mod tests {
         backend: Arc<FakeBackend>,
     ) -> (
         IcebergDataMutationAdapter,
-        ConnectorExecutionBindingKey,
+        ConnectorProviderBindingKey,
         ConnectorInstanceId,
     ) {
         let instance_id = ConnectorInstanceId::parse("ice").expect("instance");
-        let key = ConnectorExecutionBindingKey {
+        let key = ConnectorProviderBindingKey {
             instance_id: instance_id.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([3; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([3; 16]),
         };
         (
             IcebergDataMutationAdapter::new_with_backend(key.clone(), backend).expect("adapter"),
@@ -1554,7 +1554,7 @@ mod tests {
     }
 
     fn truncate_request(
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         instance_id: ConnectorInstanceId,
         operation_id: ConnectorMutationOperationId,
         target_ref: &str,

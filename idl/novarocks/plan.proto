@@ -25,6 +25,7 @@ syntax = "proto3";
 package novarocks.plan;
 
 import "common.proto";
+import "catalog.proto";
 import "connector_read.proto";
 import "expr.proto";
 
@@ -499,13 +500,14 @@ message ConnectorWriterIdentity {
   int32 fragment_id = 5;
   int32 backend_num = 6;
   uint32 sink_ordinal = 7;
-  string connector_instance_id = 8;
-  bytes connector_incarnation = 9;                // exact connector generation UUID bytes.
+  reserved 8, 9;
+  reserved "connector_instance_id", "connector_incarnation";
   bytes cohort_id = 10;                           // stable 32-byte semantic cohort identity.
+  novarocks.catalog.CatalogHandle catalog_handle = 11; // exact query-leased BE runtime identity.
 }
 
 // Bounded opaque handle produced by FE control planning and consumed only by
-// the exact BE execution binding.
+// the exact query-leased BE catalog runtime.
 message ConnectorWriterHandleEnvelope {
   uint32 contract_version = 1;
   ConnectorWriterIdentity writer = 2;
@@ -1075,12 +1077,11 @@ message ColumnDef {
 // future BE/native plan prepare layer.
 message ScanSource {
   oneof kind {
-    ConnectorReadSource connector_read = 8; // provider-owned opaque scan and splits.
     // Typed connector scan: closed handle oneof, ordered assignments, and
     // predicates. Splits arrive at runtime through TaskUpdate, never here.
     novarocks.connector_read.ConnectorTableScanSource typed_connector_read = 9;
   }
-  reserved 1, 2, 3, 4, 5, 6, 7;
+  reserved 1, 2, 3, 4, 5, 6, 7, 8;
   reserved "iceberg_data_files";
   reserved "iceberg_metadata_table";
   reserved "iceberg_version_table";
@@ -1089,35 +1090,9 @@ message ScanSource {
   // encoder; delta scans are planned by the Iceberg connector instead.
   reserved "iceberg_delta_table";
   reserved "starrocks_table"; // former Core-owned StarRocks tablet carrier.
+  reserved "connector_read"; // former opaque execution-binding scan carrier.
   reserved "iceberg_mv_target_state"; // former MV target-state carrier.
   reserved "iceberg_mv_target_locator"; // former MV target-locator carrier.
-}
-
-// A provider-neutral, already-planned connector read. The opaque handles are
-// decoded only by the selected ConnectorExecutionBinding. Metadata resolution and
-// split planning occur before this carrier is emitted; core retains split
-// scheduling, batching, cancellation, and Chunk adaptation ownership.
-message ConnectorReadSource {
-  string instance_id = 1;              // normalized ConnectorInstanceId.
-  bytes scan_payload = 2;              // bounded provider-owned scan handle.
-  repeated ConnectorReadSplit splits = 3; // provider-owned executable splits.
-  uint64 max_batch_rows = 4;           // required nonzero reader batch budget.
-  uint64 max_batch_bytes = 5;          // required nonzero reader batch budget.
-  uint64 max_handle_payload_bytes = 6; // required bounded provider-handle budget.
-  uint64 max_total_payload_bytes = 7;  // required bounded request aggregate budget.
-  reserved 8;
-  reserved "provider_id"; // host lookup uses instance_id plus incarnation.
-  bytes expected_schema_ipc = 9; // bounded Arrow IPC schema expected from the provider.
-  bytes instance_incarnation = 10; // exactly 16 bytes; resolves one execution binding generation.
-}
-
-// One scheduled split in a ConnectorReadSource.
-message ConnectorReadSplit {
-  string split_id = 1;                 // provider-assigned stable split identity.
-  bytes split_payload = 2;             // bounded provider-owned split handle.
-  optional uint64 estimated_bytes = 3; // optional scheduler hint.
-  reserved 4;
-  reserved "file_execution"; // provider payload owns file semantics.
 }
 
 // Iceberg table identity, schema, and serialized metadata.

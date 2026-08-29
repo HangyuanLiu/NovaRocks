@@ -64,7 +64,7 @@ impl StatisticsReader for IcebergMetadata {
         self.descriptor()
     }
 
-    fn incarnation(&self) -> novarocks_spi::connector::ConnectorInstanceIncarnation {
+    fn incarnation(&self) -> novarocks_spi::connector::ProviderBindingEpoch {
         self.incarnation()
     }
 
@@ -326,7 +326,7 @@ impl StatisticsCollection for IcebergMetadata {
         self.descriptor()
     }
 
-    fn incarnation(&self) -> novarocks_spi::connector::ConnectorInstanceIncarnation {
+    fn incarnation(&self) -> novarocks_spi::connector::ProviderBindingEpoch {
         self.incarnation()
     }
 
@@ -1015,8 +1015,8 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 mod tests {
     use super::*;
     use novarocks_spi::connector::{
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorMutationOperationId, ConnectorProviderId,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationOperationId,
+        ConnectorProviderId, ProviderBindingEpoch,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -1058,7 +1058,7 @@ mod tests {
         };
         let provider = IcebergMetadata::new(
             descriptor,
-            ConnectorInstanceIncarnation::from_bytes([4; 16]),
+            ProviderBindingEpoch::from_bytes([4; 16]),
             runtime,
         );
         (executor, warehouse, provider)

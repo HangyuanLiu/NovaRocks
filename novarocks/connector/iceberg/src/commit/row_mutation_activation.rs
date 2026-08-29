@@ -31,8 +31,8 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorMutationRouteInput,
-    ConnectorMutationTargetField, ConnectorPinnedFileSet, ConnectorRowMutationActivationRequest,
+    ConnectorError, ConnectorErrorKind, ConnectorMutationRouteInput, ConnectorMutationTargetField,
+    ConnectorPinnedFileSet, ConnectorProviderBindingKey, ConnectorRowMutationActivationRequest,
     ConnectorRowMutationCohortRecipe, ConnectorRowMutationEffect,
     ConnectorRowMutationExecutionPlan, ConnectorRowMutationPreparation, ConnectorRowMutationRoute,
     ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
@@ -58,7 +58,7 @@ use crate::row_mutation_payload::encode_cow_recipe;
 /// contract and every physical choice remains inside the Iceberg provider.
 pub(crate) fn activate_row_mutation(
     request: ConnectorRowMutationActivationRequest,
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     runtime: &IcebergMetadataContext,
 ) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError> {
     request.validate(owner)?;
@@ -1278,14 +1278,14 @@ mod tests {
     use arrow::array::{ArrayRef, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorMutationEffectField, ConnectorMutationMatchContract, ConnectorMutationSourceField,
-        ConnectorRequestContext, ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationIntent,
-        ConnectorTableHandle, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
-        ConnectorWriteBaseVersion, ConnectorWriteCommitRequest, ConnectorWriteControl,
-        ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlan,
-        ConnectorWritePlanningRequest, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
-        ConnectorWriteTargetRef, ExternalMutationOutcome,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorMutationEffectField,
+        ConnectorMutationMatchContract, ConnectorMutationSourceField, ConnectorRequestContext,
+        ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationIntent, ConnectorTableHandle,
+        ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest, ConnectorWriteBaseVersion,
+        ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteLease,
+        ConnectorWriteOperationId, ConnectorWritePlan, ConnectorWritePlanningRequest,
+        ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ConnectorWriteTargetRef,
+        ExternalMutationOutcome, ProviderBindingEpoch,
     };
 
     use crate::iceberg::spec::{
@@ -1318,12 +1318,12 @@ mod tests {
     /// the rest of `ConnectorWriteControl` exists so the SPI lease — and its
     /// cohort/route validation — can be exercised without a catalog runtime.
     struct ActivationOnlyControl {
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         tamper: bool,
     }
 
     impl ConnectorWriteControl for ActivationOnlyControl {
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
 
@@ -1407,14 +1407,14 @@ mod tests {
         )
     }
 
-    fn owner() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn owner() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         }
     }
 
-    fn lease(owner: &ConnectorExecutionBindingKey, tamper: bool) -> ConnectorWriteLease {
+    fn lease(owner: &ConnectorProviderBindingKey, tamper: bool) -> ConnectorWriteLease {
         ConnectorWriteLease::new(
             owner.clone(),
             Arc::new(ActivationOnlyControl {
@@ -1472,7 +1472,7 @@ mod tests {
 
     fn activate_for_test(
         request: ConnectorRowMutationActivationRequest,
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
     ) -> Result<ConnectorRowMutationExecutionPlan, ConnectorError> {
         request.validate(owner)?;
         if request.context().cancellation().is_cancelled() {
@@ -1556,7 +1556,7 @@ mod tests {
         .metadata
     }
 
-    fn table_handle(owner: &ConnectorExecutionBindingKey) -> ConnectorTableHandle {
+    fn table_handle(owner: &ConnectorProviderBindingKey) -> ConnectorTableHandle {
         let metadata = table_metadata();
         let payload = IcebergTablePayload {
             namespace: "db".to_string(),
@@ -1601,7 +1601,7 @@ mod tests {
     /// ordinals first, then the before/after target block, then the effect
     /// field. The activation port depends on exactly these ordinals.
     fn preparation(
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         strategy: ConnectorRowMutationStrategy,
         intent: ConnectorRowMutationIntent,
     ) -> ConnectorRowMutationPreparation {

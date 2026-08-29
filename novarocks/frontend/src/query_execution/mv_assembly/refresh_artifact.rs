@@ -26,10 +26,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorCommittedPartitioning, ConnectorCommittedVersion, ConnectorExecutionBindingKey,
+    ConnectorCommittedPartitioning, ConnectorCommittedVersion,
     ConnectorManagedDescriptorProperties, ConnectorManagedPartitionSpecReplacement,
-    ConnectorTableHandle, ConnectorTableObjectId, ConnectorWriteCohortId,
-    ConnectorWriteOperationId, ConnectorWriteReceipt, LakePublicationId,
+    ConnectorProviderBindingKey, ConnectorTableHandle, ConnectorTableObjectId,
+    ConnectorWriteCohortId, ConnectorWriteOperationId, ConnectorWriteReceipt, LakePublicationId,
 };
 
 use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
@@ -397,7 +397,7 @@ pub(crate) struct MvFirstRefreshWriteRequest {
     expected_target_snapshot_id: Option<i64>,
     target_table: ConnectorTableHandle,
     write_input_fields: Arc<[arrow::datatypes::Field]>,
-    observed_binding: ConnectorExecutionBindingKey,
+    observed_binding: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
 }
 
@@ -413,7 +413,7 @@ impl MvFirstRefreshWriteRequest {
         expected_target_snapshot_id: Option<i64>,
         target_table: ConnectorTableHandle,
         write_input_fields: Arc<[arrow::datatypes::Field]>,
-        observed_binding: ConnectorExecutionBindingKey,
+        observed_binding: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<Self, String> {
         if target_catalog.is_empty()
@@ -479,7 +479,7 @@ impl MvFirstRefreshWriteRequest {
         &self.write_input_fields
     }
 
-    pub(crate) fn observed_binding(&self) -> &ConnectorExecutionBindingKey {
+    pub(crate) fn observed_binding(&self) -> &ConnectorProviderBindingKey {
         &self.observed_binding
     }
 
@@ -506,7 +506,7 @@ impl PreparedMvFirstRefreshWrite {
         self.primary_cohort
     }
 
-    pub(crate) fn observed_binding(&self) -> &ConnectorExecutionBindingKey {
+    pub(crate) fn observed_binding(&self) -> &ConnectorProviderBindingKey {
         self.request.observed_binding()
     }
 
@@ -675,7 +675,7 @@ pub(crate) struct MvIncrementalWriteRequest {
     pub(crate) current_catalog: Option<String>,
     pub(crate) current_database: String,
     pub(crate) expected_target_snapshot_id: Option<i64>,
-    pub(crate) observed_binding: ConnectorExecutionBindingKey,
+    pub(crate) observed_binding: ConnectorProviderBindingKey,
     pub(crate) operation_id: ConnectorWriteOperationId,
 }
 
@@ -689,7 +689,7 @@ impl MvIncrementalWriteRequest {
         current_catalog: Option<String>,
         current_database: String,
         expected_target_snapshot_id: Option<i64>,
-        observed_binding: ConnectorExecutionBindingKey,
+        observed_binding: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<Self, String> {
         if target_catalog.is_empty()
@@ -843,12 +843,10 @@ mod incremental_tests {
             Some("ice".to_string()),
             "db".to_string(),
             Some(7),
-            ConnectorExecutionBindingKey {
+            ConnectorProviderBindingKey {
                 instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("ice")
                     .expect("instance"),
-                incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation::from_bytes(
-                    [1; 16],
-                ),
+                incarnation: novarocks_spi::connector::ProviderBindingEpoch::from_bytes([1; 16]),
             },
             ConnectorWriteOperationId::from_bytes([2; 16]),
         );

@@ -18,19 +18,19 @@
 use std::sync::{Arc, Mutex};
 
 use super::{
-    ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationResolver,
-    ConnectorCleanupMaintenance, ConnectorCleanupMaintenanceResolver, ConnectorDataMutation,
+    CatalogHandle, CatalogProperties, ConnectorBeginScanRequest, ConnectorCatalogMutation,
+    ConnectorCatalogMutationResolver, ConnectorCleanupMaintenance,
+    ConnectorCleanupMaintenanceResolver, ConnectorControlRuntimeId, ConnectorDataMutation,
     ConnectorDataMutationResolver, ConnectorDistributedRewrite,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata,
-    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorStagedCreate, ConnectorStagedCreateLease,
-    ConnectorStagedPublicationRecovery, ConnectorStatistics, ConnectorStatisticsLease,
-    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorUnanchoredCtasCleanup,
-    ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata, ConnectorWriteControl,
-    ConnectorWriteLease,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata,
+    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorProviderBinding,
+    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
+    ConnectorStagedCreate, ConnectorStagedCreateLease, ConnectorStatistics,
+    ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorTableHandle,
+    ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata,
+    ConnectorWriteControl, ConnectorWriteLease, ProviderBindingEpoch,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -57,7 +57,7 @@ pub trait ConnectorExecutionDistribution: Send + Sync {
     fn declaration(
         &self,
         context: &ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError>;
+    ) -> Result<ConnectorProviderBinding, ConnectorError>;
 }
 
 /// Process-local input used by a frontend composition root when a catalog
@@ -220,10 +220,21 @@ pub trait ConnectorControlFactoryResolver: Send + Sync {
 
 /// A control-plane Connector generation. Metadata, scan planning, and
 /// execution distribution must all describe the same logical descriptor and
-/// incarnation. It is deliberately unable to open a batch reader.
+/// legacy effect generation. Its separately minted control-runtime ID is an
+/// FE-local owner and is deliberately unable to open a batch reader.
 pub struct ConnectorControlBinding {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
+    control_runtime_id: ConnectorControlRuntimeId,
+    /// Immutable BE materialization input assigned by the FE desired-state
+    /// owner before this control binding becomes query-admissible.
+    ///
+    /// Retaining the complete value, rather than only its handle, is what lets
+    /// query assembly carry one exact `CatalogSet` in Init without re-reading
+    /// desired state or reconstructing provider configuration.
+    catalog_properties: Option<CatalogProperties>,
+    catalog_handle_installer:
+        Option<Arc<dyn Fn(&CatalogHandle) -> Result<(), ConnectorError> + Send + Sync>>,
     metadata: Arc<dyn ConnectorMetadata>,
     planning: Arc<dyn ConnectorScanPlanning>,
     distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -236,14 +247,13 @@ pub struct ConnectorControlBinding {
     unanchored_ctas_cleanup: Option<Arc<dyn ConnectorUnanchoredCtasCleanup>>,
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
-    staged_publication_recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
     view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
 }
 
 impl ConnectorControlBinding {
     pub fn try_new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -264,7 +274,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_write(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -285,7 +295,7 @@ impl ConnectorControlBinding {
 
     pub fn try_new_with_statistics(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -307,7 +317,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_data_mutation(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -330,7 +340,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_capabilities(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -354,7 +364,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_capabilities(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -409,6 +419,9 @@ impl ConnectorControlBinding {
         Ok(Self {
             descriptor,
             incarnation,
+            control_runtime_id: ConnectorControlRuntimeId::new(),
+            catalog_properties: None,
+            catalog_handle_installer: None,
             metadata,
             planning,
             distribution,
@@ -421,7 +434,6 @@ impl ConnectorControlBinding {
             unanchored_ctas_cleanup: None,
             write,
             statistics,
-            staged_publication_recovery: None,
             view_metadata: None,
         })
     }
@@ -429,7 +441,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_capabilities_and_metadata_maintenance(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -457,7 +469,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_capabilities_and_staged_create(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -502,7 +514,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_maintenance_capabilities(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -532,7 +544,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_maintenance_capabilities_and_staged_create(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -566,7 +578,7 @@ impl ConnectorControlBinding {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_all_maintenance_capabilities_cleanup_and_staged_create(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         metadata: Arc<dyn ConnectorMetadata>,
         planning: Arc<dyn ConnectorScanPlanning>,
         distribution: Arc<dyn ConnectorExecutionDistribution>,
@@ -587,7 +599,7 @@ impl ConnectorControlBinding {
             )?;
         }
         if let Some(cleanup) = &cleanup_maintenance {
-            let key = ConnectorExecutionBindingKey {
+            let key = ConnectorProviderBindingKey {
                 instance_id: descriptor.instance_id.clone(),
                 incarnation,
             };
@@ -619,8 +631,66 @@ impl ConnectorControlBinding {
         &self.descriptor
     }
 
-    pub fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    pub fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
+    }
+
+    /// Returns this process-local FE control runtime identity. It is distinct
+    /// from the provider's legacy effect generation and from the BE-visible
+    /// `CatalogHandle`; neither may be derived from the other.
+    pub fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
+        self.control_runtime_id
+    }
+
+    /// Stamps this FE-local control generation with the exact immutable BE
+    /// materialization input derived from authoritative desired state. Provider
+    /// factories cannot mint this value because it must not depend on a
+    /// process-local control incarnation.
+    pub fn with_catalog_properties(
+        mut self,
+        catalog_properties: CatalogProperties,
+    ) -> Result<Self, ConnectorError> {
+        let catalog_handle = catalog_properties.handle();
+        if catalog_handle.catalog_name() != &self.descriptor.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "catalog handle owner does not match its control binding",
+            ));
+        }
+        if let Some(installer) = self.catalog_handle_installer.as_ref() {
+            installer(catalog_handle)?;
+        }
+        self.catalog_properties = Some(catalog_properties);
+        Ok(self)
+    }
+
+    /// Attach provider-owned, FE-local work which can only be installed after
+    /// desired state has frozen the immutable catalog identity.
+    pub fn with_catalog_handle_installer(
+        mut self,
+        installer: Arc<dyn Fn(&CatalogHandle) -> Result<(), ConnectorError> + Send + Sync>,
+    ) -> Self {
+        self.catalog_handle_installer = Some(installer);
+        self
+    }
+
+    /// Returns the desired-state-derived execution identity. A binding which
+    /// was not admitted through the catalog application owner must fail
+    /// closed instead of deriving an identity from its control incarnation.
+    pub fn catalog_handle(&self) -> Result<&CatalogHandle, ConnectorError> {
+        self.catalog_properties().map(CatalogProperties::handle)
+    }
+
+    /// Returns the complete frozen materialization input for the exact catalog
+    /// handle. Query assembly must carry this value verbatim in its Init
+    /// `CatalogSet`; it must not derive a substitute from a control runtime.
+    pub fn catalog_properties(&self) -> Result<&CatalogProperties, ConnectorError> {
+        self.catalog_properties.as_ref().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector control binding has no catalog execution properties",
+            )
+        })
     }
 
     pub fn metadata(&self) -> &Arc<dyn ConnectorMetadata> {
@@ -692,24 +762,6 @@ impl ConnectorControlBinding {
         Ok(self)
     }
 
-    /// Installs the provider-owned historical staged-publication inspector.
-    /// It is a builder to preserve existing control-binding constructors and
-    /// to keep recovery independent from ordinary write capability setup.
-    pub fn try_with_staged_publication_recovery(
-        mut self,
-        recovery: Option<Arc<dyn ConnectorStagedPublicationRecovery>>,
-    ) -> Result<Self, ConnectorError> {
-        if let Some(recovery) = &recovery {
-            super::staged_publication_recovery::validate_staged_publication_recovery_owner(
-                &self.descriptor,
-                self.incarnation,
-                recovery.as_ref(),
-            )?;
-        }
-        self.staged_publication_recovery = recovery;
-        Ok(self)
-    }
-
     /// Attaches the catalog-wide CTAS staging-root collector to this exact
     /// generation. The capability is independent from table-owned cleanup:
     /// before a CREATE publishes its target, no table location can anchor the
@@ -731,16 +783,10 @@ impl ConnectorControlBinding {
         Ok(self)
     }
 
-    pub fn staged_publication_recovery(
-        &self,
-    ) -> Option<&Arc<dyn ConnectorStagedPublicationRecovery>> {
-        self.staged_publication_recovery.as_ref()
-    }
-
-    pub fn execution_declaration(
+    pub fn provider_binding(
         &self,
         context: &ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+    ) -> Result<ConnectorProviderBinding, ConnectorError> {
         let declaration = self.distribution.declaration(context)?;
         let key = declaration.binding_key();
         if declaration.provider_id() != self.descriptor.provider_id.as_str()
@@ -749,7 +795,7 @@ impl ConnectorControlBinding {
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "connector execution declaration does not match its control binding generation",
+                "connector provider binding does not match its control binding generation",
             ));
         }
         Ok(declaration)
@@ -766,7 +812,15 @@ pub trait ConnectorControlResolver: Send + Sync {
     fn observe_current_binding(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorExecutionBindingKey, ConnectorError>;
+    ) -> Result<ConnectorProviderBindingKey, ConnectorError>;
+
+    /// Observe the active FE-local control runtime without retaining it.
+    /// This identity is intentionally separate from the legacy effect key and
+    /// must never be sent to a backend catalog lookup.
+    fn observe_current_control_runtime(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorControlRuntimeId, ConnectorError>;
 
     fn acquire_current(
         &self,
@@ -820,6 +874,12 @@ impl ConnectorControlPlanningLease {
         &self.binding
     }
 
+    /// Returns the FE-local control runtime fenced by this lease. It is not a
+    /// BE catalog identity or a write operation identity.
+    pub fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
+        self.binding.control_runtime_id()
+    }
+
     /// Derive a writer lease from this retained planning generation.
     ///
     /// A refresh preparation may observe and retain a connector generation
@@ -836,15 +896,18 @@ impl ConnectorControlPlanningLease {
         })?;
         let distribution = self.binding.execution_distribution().clone();
         let provider_id = self.binding.descriptor().provider_id.clone();
+        let catalog_properties = self.binding.catalog_properties()?.clone();
         let key = write.binding_key().clone();
         let retained_planning_lease = self.clone();
         ConnectorWriteLease::new_with_execution_distribution(
+            self.control_runtime_id(),
             key,
             write,
             provider_id,
             distribution,
             move || drop(retained_planning_lease),
         )
+        .and_then(|lease| lease.with_catalog_properties(catalog_properties))
         .map(|lease| lease.with_metadata(Arc::clone(&self.binding.metadata)))
     }
 
@@ -885,11 +948,16 @@ impl ConnectorControlPlanningLease {
             )
         })?;
         let descriptor = self.binding.descriptor().clone();
-        let incarnation = self.binding.incarnation();
+        let control_runtime_id = self.binding.control_runtime_id();
+        let provider_incarnation = self.binding.incarnation();
         let retained_planning_lease = self.clone();
-        super::ConnectorCatalogMutationLease::new(descriptor, incarnation, mutation, move || {
-            drop(retained_planning_lease)
-        })
+        super::ConnectorCatalogMutationLease::new(
+            descriptor,
+            control_runtime_id,
+            provider_incarnation,
+            mutation,
+            move || drop(retained_planning_lease),
+        )
     }
 
     /// Derive the exact-generation atomic staged-publication capability.
@@ -902,12 +970,17 @@ impl ConnectorControlPlanningLease {
                 "connector control generation has no atomic staged-create capability",
             )
         })?;
-        let owner = ConnectorExecutionBindingKey {
-            instance_id: self.binding.descriptor().instance_id.clone(),
-            incarnation: self.binding.incarnation(),
-        };
+        let descriptor = self.binding.descriptor().clone();
+        let control_runtime_id = self.binding.control_runtime_id();
+        let provider_incarnation = self.binding.incarnation();
         let retained_planning_lease = self.clone();
-        ConnectorStagedCreateLease::new(owner, capability, move || drop(retained_planning_lease))
+        ConnectorStagedCreateLease::new_with_control_runtime(
+            descriptor,
+            control_runtime_id,
+            provider_incarnation,
+            capability,
+            move || drop(retained_planning_lease),
+        )
     }
 
     /// Derive the catalog-wide unanchored CTAS cleanup capability from this
@@ -926,14 +999,17 @@ impl ConnectorControlPlanningLease {
                     "connector control generation has no unanchored CTAS cleanup capability",
                 )
             })?;
-        let owner = ConnectorExecutionBindingKey {
-            instance_id: self.binding.descriptor().instance_id.clone(),
-            incarnation: self.binding.incarnation(),
-        };
+        let descriptor = self.binding.descriptor().clone();
+        let control_runtime_id = self.binding.control_runtime_id();
+        let provider_incarnation = self.binding.incarnation();
         let retained_planning_lease = self.clone();
-        ConnectorUnanchoredCtasCleanupLease::new(owner, capability, move || {
-            drop(retained_planning_lease)
-        })
+        ConnectorUnanchoredCtasCleanupLease::new_with_control_runtime(
+            descriptor,
+            control_runtime_id,
+            provider_incarnation,
+            capability,
+            move || drop(retained_planning_lease),
+        )
     }
 }
 

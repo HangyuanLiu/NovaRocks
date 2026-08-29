@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::Field;
-use novarocks_spi::connector::ConnectorWriteCohortId;
+use novarocks_spi::connector::{CatalogHandle, CatalogProperties, ConnectorWriteCohortId};
 use sha2::{Digest, Sha256};
 
 use crate::common::backend_topology::LiveBackendTarget;
@@ -39,7 +39,7 @@ use crate::query_execution::contract::QueryId;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::launch::{QueryLaunchBarrier, StageBatch, StageParticipantBinding};
 use crate::query_execution::lifecycle_plan::{
-    QueryInitBarrier, QueryInitOptions, QueryLifecycleLease,
+    QueryCatalogLease, QueryInitBarrier, QueryInitOptions, QueryLifecycleLease,
 };
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::{
@@ -53,6 +53,7 @@ use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploym
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::{
     AttemptId as ProtocolAttemptId, QueryExecutionId as ProtocolQueryExecutionId,
 };
@@ -62,11 +63,6 @@ use novarocks_proto_models::{common, novarocks};
 use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
 use novarocks_types::{BackendProcessId, SlotId, UniqueId};
 
-pub use crate::query_execution::connector_binding::{
-    ConnectorBindingBackendInstallPlan, ConnectorBindingDispatcher, ConnectorBindingInstallBarrier,
-    ConnectorBindingInstallLease, ConnectorBindingInstallObserver, ConnectorBindingInstallPlan,
-    DispatchingConnectorBindingBarrier, NoopConnectorBindingInstallObserver,
-};
 pub type FragmentId = u32;
 pub type PlanNodeId = i32;
 
@@ -417,13 +413,15 @@ impl ScheduleBoundDistributedQuery {
         terminal_write_fragment_ids: &BTreeSet<FragmentId>,
         operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
         cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
-        owner: novarocks_spi::connector::ConnectorExecutionBindingKey,
+        catalog_handle: novarocks_spi::connector::CatalogHandle,
+        owner: novarocks_spi::connector::ConnectorProviderBindingKey,
     ) -> Result<ConnectorWriteManifest, DistributedQueryError> {
         ConnectorWriteManifest::freeze(
             self.schedule.planning_schedule(),
             terminal_write_fragment_ids,
             operation_id,
             cohort_id,
+            catalog_handle,
             owner,
             self.schedule.execution_id(),
         )
@@ -607,6 +605,12 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
                 "query initialization execution id does not match validated schedule",
             ));
         }
+        let query_catalog_lease = freeze_query_catalog_lease(
+            &self.prepared,
+            &self.connector_write_plans,
+            options.catalog_set(),
+        )?;
+        let options = options.with_catalog_set(query_catalog_lease.catalog_set().clone());
         let runtime_filters = self
             .runtime_filter_contributions
             .into_iter()
@@ -622,7 +626,9 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             &options,
         )?;
         let stage_bindings = plan.stage_participant_bindings()?;
-        let query_lifecycle_lease = barrier.initialize_all(plan)?;
+        let query_lifecycle_lease = barrier
+            .initialize_all(plan)?
+            .with_catalog_lease(query_catalog_lease);
         Ok(ControlReadyDistributedQuery {
             handoff_id: self.handoff_id,
             prepared: self.prepared,
@@ -634,6 +640,76 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             connector_write_plans: self.connector_write_plans,
         })
     }
+}
+
+/// Freeze every catalog required by typed reads into the exact query-wide Init
+/// contribution. `CatalogSet` is the sole BE materialization input: never
+/// recover these values from the current FE control host after query assembly
+/// has started.
+/// Freeze every catalog-bound execution artifact into one exact query set and
+/// retain the FE control leases that produced typed reads.  Write attachments
+/// retain their source planning leases through `ConnectorWriteLease`; keeping
+/// those attachments in the existing query typestates therefore supplies the
+/// same terminal ownership without reopening SPI internals here.
+fn freeze_query_catalog_lease(
+    prepared: &PreparedFragmentSet,
+    connector_write_plans: &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
+    existing: &CatalogSet,
+) -> Result<QueryCatalogLease, DistributedQueryError> {
+    let typed_reads = prepared
+        .scan_bindings()
+        .typed_scans()
+        .map(|(_, _, scan)| (scan.catalog_properties.clone(), scan.planning_lease.clone()))
+        .collect::<Vec<_>>();
+    let writes = connector_write_plans.values().map(|attachment| {
+        attachment.catalog_properties().cloned().ok_or_else(|| {
+            contract_error(
+                "native connector write attachment has no desired-state catalog properties",
+            )
+        })
+    });
+    let catalog_set = merge_catalog_properties(
+        existing,
+        typed_reads
+            .iter()
+            .map(|(properties, _)| properties.clone())
+            .chain(writes.collect::<Result<Vec<_>, _>>()?),
+    )?;
+    Ok(QueryCatalogLease::new(
+        catalog_set,
+        typed_reads
+            .into_iter()
+            .map(|(_, planning_lease)| planning_lease)
+            .collect(),
+    ))
+}
+
+fn merge_catalog_properties(
+    existing: &CatalogSet,
+    additional: impl IntoIterator<Item = CatalogProperties>,
+) -> Result<CatalogSet, DistributedQueryError> {
+    let mut by_handle: BTreeMap<CatalogHandle, CatalogProperties> = existing
+        .catalogs()
+        .map_err(|error| contract_error(format!("invalid existing query catalog set: {error}")))?
+        .into_iter()
+        .map(|properties| (properties.handle().clone(), properties))
+        .collect();
+    for properties in additional {
+        let handle = properties.handle().clone();
+        match by_handle.get(&handle) {
+            Some(existing) if existing != &properties => {
+                return Err(contract_error(
+                    "typed scans freeze conflicting materialization inputs for one catalog handle",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                by_handle.insert(handle, properties);
+            }
+        }
+    }
+    CatalogSet::new(by_handle.into_values())
+        .map_err(|error| contract_error(format!("invalid query catalog set: {error}")))
 }
 
 fn attach_connector_write_plans(
@@ -708,9 +784,8 @@ fn attach_connector_write_plans(
     Ok(())
 }
 
-/// Query lifecycle is ready, but connector instances still require their
-/// independent process-scoped install/ACK barrier before preparing native
-/// Stage batches.
+/// Query lifecycle is ready and the complete CatalogSet was established during
+/// Init, before Stage becomes admissible.
 pub struct ControlReadyDistributedQuery {
     handoff_id: u64,
     prepared: PreparedFragmentSet,
@@ -723,55 +798,35 @@ pub struct ControlReadyDistributedQuery {
 }
 
 impl ControlReadyDistributedQuery {
-    pub fn prepare_connector_bindings(
-        self,
-        barrier: &dyn ConnectorBindingInstallBarrier,
-    ) -> Result<ConnectorBindingReadyDistributedQuery, DistributedQueryError> {
-        let plan = crate::query_execution::connector_binding::compile_install_plan(
-            &self.prepared,
-            &self.schedule.inner,
-            &self.connector_write_plans,
-        )?;
-        let connector_binding_lease = match barrier.install_all(self.schedule.execution_id, plan) {
-            Ok(lease) => lease,
-            Err(error) => {
-                let kind = error.kind();
-                let message = self
-                    .query_lifecycle_lease
-                    .abort_preserving(error.message().to_string());
-                return Err(DistributedQueryError::new(kind, message));
-            }
-        };
-        Ok(ConnectorBindingReadyDistributedQuery {
+    pub fn catalog_ready(self) -> CatalogReadyDistributedQuery {
+        CatalogReadyDistributedQuery {
             handoff_id: self.handoff_id,
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule: self.schedule,
             options: self.options,
             query_lifecycle_lease: self.query_lifecycle_lease,
-            connector_binding_lease,
             stage_bindings: self.stage_bindings,
             connector_write_plans: self.connector_write_plans,
-        })
+        }
     }
 }
 
 /// The only typestate that can prepare native Stage batches. In particular,
-/// it is impossible to create a submission before every selected BE has ACKed
-/// the connector declarations it will resolve by instance id.
-pub struct ConnectorBindingReadyDistributedQuery {
+/// it is impossible to create a submission before every selected BE has
+/// reported its Init-carried catalog set ready.
+pub struct CatalogReadyDistributedQuery {
     handoff_id: u64,
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
     options: QueryInitOptions,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_binding_lease: ConnectorBindingInstallLease,
     stage_bindings: Vec<StageParticipantBinding>,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
-impl ConnectorBindingReadyDistributedQuery {
+impl CatalogReadyDistributedQuery {
     pub fn connector_write_plans(
         &self,
     ) -> &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment> {
@@ -802,14 +857,13 @@ impl ConnectorBindingReadyDistributedQuery {
         self,
         attachment: NativeSubmissionAttachment,
     ) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
-        let ConnectorBindingReadyDistributedQuery {
+        let CatalogReadyDistributedQuery {
             handoff_id,
             prepared,
             native_bundle: _,
             schedule,
             options: _,
             query_lifecycle_lease,
-            connector_binding_lease,
             stage_bindings,
             connector_write_plans,
         } = self;
@@ -819,7 +873,6 @@ impl ConnectorBindingReadyDistributedQuery {
             schedule.execution_id,
             stage_bindings,
             query_lifecycle_lease,
-            connector_binding_lease,
             connector_write_plans,
         )
     }
@@ -1643,7 +1696,6 @@ pub struct StagePreparedDistributedQuery {
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
@@ -1712,7 +1764,6 @@ fn finish_sealed_native_submission(
     execution_id: QueryExecutionId,
     stage_bindings: Vec<StageParticipantBinding>,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 ) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
     if !attachment.matches(handoff_id, execution_id) {
@@ -1720,7 +1771,6 @@ fn finish_sealed_native_submission(
             contract_error("native submission attachment does not match the sealed query handoff");
         let kind = error.kind();
         let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-        let message = connector_binding_lease.abort_preserving(message);
         return Err(DistributedQueryError::new(kind, message));
     }
     let (submissions, root_fetch, writer_registrations, expected_output) = attachment.into_parts();
@@ -1731,7 +1781,6 @@ fn finish_sealed_native_submission(
             Err(error) => {
                 let kind = error.kind();
                 let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-                let message = connector_binding_lease.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
@@ -1750,7 +1799,6 @@ fn finish_sealed_native_submission(
             Err(error) => {
                 let kind = error.kind();
                 let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-                let message = connector_binding_lease.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
@@ -1760,7 +1808,6 @@ fn finish_sealed_native_submission(
                 let error = contract_error(error.to_string());
                 let kind = error.kind();
                 let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-                let message = connector_binding_lease.abort_preserving(message);
                 return Err(DistributedQueryError::new(kind, message));
             }
         };
@@ -1773,7 +1820,6 @@ fn finish_sealed_native_submission(
         ));
         let kind = error.kind();
         let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
-        let message = connector_binding_lease.abort_preserving(message);
         return Err(DistributedQueryError::new(kind, message));
     }
     Ok(StagePreparedDistributedQuery {
@@ -1782,7 +1828,6 @@ fn finish_sealed_native_submission(
         writer_registrations,
         expected_output,
         query_lifecycle_lease,
-        connector_binding_lease,
         connector_write_plans,
     })
 }
@@ -1829,7 +1874,6 @@ impl StagePreparedDistributedQuery {
             let message = self
                 .query_lifecycle_lease
                 .abort_preserving(error.message().to_string());
-            let message = self.connector_binding_lease.abort_preserving(message);
             return Err(DistributedQueryError::new(kind, message));
         }
         Ok(StagedDistributedQuery {
@@ -1838,7 +1882,6 @@ impl StagePreparedDistributedQuery {
             writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
-            connector_binding_lease: self.connector_binding_lease,
             connector_write_plans: self.connector_write_plans,
         })
     }
@@ -1867,7 +1910,6 @@ pub struct StagedDistributedQuery {
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
@@ -1885,7 +1927,6 @@ impl StagedDistributedQuery {
             let message = self
                 .query_lifecycle_lease
                 .abort_preserving(error.message().to_string());
-            let message = self.connector_binding_lease.abort_preserving(message);
             return Err(DistributedQueryError::new(kind, message));
         }
         Ok(RunningDistributedQuery {
@@ -1893,7 +1934,6 @@ impl StagedDistributedQuery {
             writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
-            connector_binding_lease: self.connector_binding_lease,
             connector_write_plans: self.connector_write_plans,
         })
     }
@@ -1906,7 +1946,6 @@ pub struct RunningDistributedQuery {
     writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_binding_lease: ConnectorBindingInstallLease,
     connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
@@ -1917,7 +1956,6 @@ impl RunningDistributedQuery {
             writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
-            connector_binding_lease: self.connector_binding_lease,
             connector_write_plans: self.connector_write_plans,
         }
     }
@@ -1928,7 +1966,6 @@ pub struct RunningNativeExecutionParts {
     pub writer_registrations: WriterRegistrationSet,
     pub expected_output: ExpectedOutputSchema,
     pub query_lifecycle_lease: QueryLifecycleLease,
-    pub connector_binding_lease: ConnectorBindingInstallLease,
     pub connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
@@ -1975,26 +2012,28 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorRequestContext, ConnectorSplit,
-        ConnectorTableHandle, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
-        ConnectorWriteBaseVersion, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
-        ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteFieldBinding,
-        ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteLease,
-        ConnectorWriteOperationId, ConnectorWritePlan, ConnectorWritePlanningRequest,
-        ConnectorWritePreparation, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
-        ConnectorWriterHandle,
+        CONNECTOR_WRITE_CONTRACT_VERSION, CatalogHandle, CatalogProperties, CatalogProperty,
+        CatalogProviderKind, CatalogVersion, ConnectorError, ConnectorErrorKind,
+        ConnectorExecutionDistribution, ConnectorInstanceId, ConnectorProviderBinding,
+        ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorSplit, ConnectorTableHandle,
+        ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest, ConnectorWriteBaseVersion,
+        ConnectorWriteCohortId, ConnectorWriteCommitRequest, ConnectorWriteControl,
+        ConnectorWriteExecutionId, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+        ConnectorWriteInputShape, ConnectorWriteLease, ConnectorWriteOperationId,
+        ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
+        ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ConnectorWriterHandle,
+        ProviderBindingEpoch,
     };
 
     use super::{
         attach_connector_write_plans, build_fragment_lifecycle_projection,
-        derive_fragment_instance_id,
+        derive_fragment_instance_id, merge_catalog_properties,
     };
     use crate::common::backend_topology::LiveBackendTarget;
     use crate::query_execution::contract::QueryId;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+    use novarocks_proto_codec::catalog::CatalogSet;
     use novarocks_proto_codec::lifecycle::{
         AttemptId, ExchangeRouteManifest, QueryControlEndpoint, QueryExecutionId,
     };
@@ -2004,6 +2043,20 @@ mod tests {
         DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
     };
     use novarocks_types::{BackendProcessId, UniqueId};
+
+    fn catalog_properties(name: &str, version: u8, warehouse: &str) -> CatalogProperties {
+        CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse(name).expect("valid catalog name"),
+                CatalogVersion::from_bytes([version; 32]),
+            ),
+            CatalogProviderKind::Iceberg,
+            1,
+            vec![CatalogProperty::new("warehouse", warehouse).expect("valid warehouse")],
+            Vec::new(),
+        )
+        .expect("valid catalog properties")
+    }
 
     fn live_backend(backend_idx: usize, endpoint: std::net::SocketAddr) -> LiveBackendTarget {
         let descriptor = BackendProcessDescriptor::new(
@@ -2045,6 +2098,43 @@ mod tests {
             estimated_bytes,
         )
         .expect("valid split")
+    }
+
+    #[test]
+    fn catalog_set_merges_exact_typed_read_materializations_once() {
+        let existing = CatalogSet::new([catalog_properties("catalog.alpha", 1, "s3://alpha")])
+            .expect("valid initial catalog set");
+        let merged = merge_catalog_properties(
+            &existing,
+            [
+                catalog_properties("catalog.alpha", 1, "s3://alpha"),
+                catalog_properties("catalog.beta", 2, "s3://beta"),
+            ],
+        )
+        .expect("exact duplicate typed read materialization is idempotent");
+        let catalogs = merged.catalogs().expect("valid merged catalog set");
+        assert_eq!(catalogs.len(), 2);
+        assert_eq!(
+            catalogs[0].handle().catalog_name().as_str(),
+            "catalog.alpha"
+        );
+        assert_eq!(catalogs[1].handle().catalog_name().as_str(), "catalog.beta");
+    }
+
+    #[test]
+    fn catalog_set_rejects_conflicting_typed_read_materialization() {
+        let existing = CatalogSet::new([catalog_properties("catalog.alpha", 1, "s3://alpha")])
+            .expect("valid initial catalog set");
+        let error = merge_catalog_properties(
+            &existing,
+            [catalog_properties("catalog.alpha", 1, "s3://other-alpha")],
+        )
+        .expect_err("one catalog handle cannot name two materialization inputs");
+        assert!(
+            error
+                .message()
+                .contains("conflicting materialization inputs")
+        );
     }
 
     fn placed_split_ids(placements: Vec<Vec<ConnectorSplit>>) -> Vec<Vec<String>> {
@@ -2103,19 +2193,19 @@ mod tests {
     }
 
     struct TestWriteControl {
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
     }
 
     struct TestWriteDistribution {
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
     }
 
     impl ConnectorExecutionDistribution for TestWriteDistribution {
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,
-        ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-            ConnectorExecutionDeclaration::iceberg(
+        ) -> Result<ConnectorProviderBinding, ConnectorError> {
+            ConnectorProviderBinding::iceberg(
                 self.key.instance_id.as_str(),
                 self.key.incarnation.to_bytes(),
                 "test-write-binding",
@@ -2127,7 +2217,7 @@ mod tests {
     }
 
     impl ConnectorWriteControl for TestWriteControl {
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
 
@@ -2140,9 +2230,8 @@ mod tests {
                 .into_iter()
                 .map(|writer| {
                     ConnectorWriterHandle::try_new(
-                        self.key.clone(),
                         writer,
-                        1,
+                        CONNECTOR_WRITE_CONTRACT_VERSION,
                         Bytes::from_static(b"test-handle"),
                     )
                 })
@@ -2194,10 +2283,10 @@ mod tests {
         }
     }
 
-    fn write_owner() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn write_owner() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("test-write").expect("valid instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         }
     }
 
@@ -2229,11 +2318,24 @@ mod tests {
         )
     }
 
+    #[test]
+    fn planned_write_attachment_retains_catalog_materialization() {
+        let attachment = planned_attachment(&write_schedule(UniqueId::new(3, 30)));
+        let catalog_properties = attachment
+            .catalog_properties()
+            .expect("native write attachment retains desired-state catalog properties");
+        assert_eq!(
+            catalog_properties.handle().catalog_name().as_str(),
+            "test-write"
+        );
+        assert_eq!(catalog_properties.handle().version().as_bytes(), &[3; 32]);
+    }
+
     fn planned_attachment_for(
         schedule: &SchedulingPlan,
         fragment_ids: &BTreeSet<u32>,
         cohort_id: ConnectorWriteCohortId,
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
     ) -> super::ConnectorWritePlanAttachment {
         let execution_id = write_execution();
@@ -2242,6 +2344,10 @@ mod tests {
             fragment_ids,
             operation_id,
             cohort_id,
+            novarocks_spi::connector::CatalogHandle::new(
+                owner.instance_id.clone(),
+                novarocks_spi::connector::CatalogVersion::from_bytes([3; 32]),
+            ),
             owner.clone(),
             execution_id,
         )
@@ -2249,13 +2355,20 @@ mod tests {
         let control: Arc<dyn ConnectorWriteControl> =
             Arc::new(TestWriteControl { key: owner.clone() });
         let lease = ConnectorWriteLease::new_with_execution_distribution(
+            novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             owner.clone(),
             control,
             novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),
             Arc::new(TestWriteDistribution { key: owner.clone() }),
             || {},
         )
-        .expect("valid exact control lease");
+        .expect("valid exact control lease")
+        .with_catalog_properties(catalog_properties(
+            owner.instance_id.as_str(),
+            3,
+            "s3://test-write",
+        ))
+        .expect("write catalog properties match the exact effect owner");
         let query_id = execution_id.query_id();
         let mut query_id_bytes = [0; 16];
         query_id_bytes[..8].copy_from_slice(&query_id.high().to_be_bytes());
@@ -2485,9 +2598,9 @@ mod tests {
         .expect_err("overlapping cohort attachments must fail closed");
         assert!(error.message().contains("overlap"));
 
-        let foreign_owner = ConnectorExecutionBindingKey {
+        let foreign_owner = ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("foreign-write").expect("foreign instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([8; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([8; 16]),
         };
         let owner_first = planned_attachment_for(
             &schedule,

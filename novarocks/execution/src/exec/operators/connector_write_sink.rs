@@ -73,11 +73,8 @@ fn open_writer(
     program: &ConnectorWriteSinkProgram,
     request: ConnectorOpenWriterRequest,
 ) -> Result<Box<dyn ConnectorBatchWriter>, String> {
-    let execution = program.binding().write().ok_or_else(|| {
-        "resolved connector execution binding has no write capability during sink materialization"
-            .to_string()
-    })?;
-    let writer = execution
+    let writer = program
+        .execution()
         .open_writer(request)
         .map_err(|error| format!("open connector batch writer: {error}"))?;
     eprintln!("NOVAROCKS_CONNECTOR_WRITER_OPENED");
@@ -288,16 +285,15 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorError, ConnectorExecutionBinding,
-        ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorProviderId, ConnectorRequestContext, ConnectorStagedReport,
-        ConnectorStagedReportSummary, ConnectorWriteExecution, ConnectorWriteExecutionId,
-        ConnectorWriteOperationId, ConnectorWriterHandle, ConnectorWriterIdentity,
-        ConnectorWriterTerminalState,
+        ConnectorCancellation, ConnectorError, ConnectorInstanceId, ConnectorProviderBindingKey,
+        ConnectorRequestContext, ConnectorStagedReport, ConnectorStagedReportSummary,
+        ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriterHandle,
+        ConnectorWriterIdentity, ConnectorWriterTerminalState, ProviderBindingEpoch,
     };
 
     use super::*;
     use crate::exec::chunk::ChunkSchema;
+    use crate::exec::fragment::error::ExecPlanBuildError;
     use novarocks_types::SlotId;
 
     #[derive(Default)]
@@ -317,13 +313,13 @@ mod tests {
     }
 
     struct TestWriteExecution {
-        key: ConnectorExecutionBindingKey,
+        catalog_handle: novarocks_spi::connector::CatalogHandle,
         stats: Arc<WriterStats>,
     }
 
-    impl ConnectorWriteExecution for TestWriteExecution {
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-            &self.key
+    impl novarocks_spi::connector::CatalogWriteExecution for TestWriteExecution {
+        fn catalog_handle(&self) -> &novarocks_spi::connector::CatalogHandle {
+            &self.catalog_handle
         }
 
         fn open_writer(
@@ -354,7 +350,7 @@ mod tests {
             self.stats.finished.fetch_add(1, Ordering::Relaxed);
             ConnectorStagedReport::try_new(
                 self.writer.clone(),
-                1,
+                novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
                 ConnectorWriterTerminalState::Staged,
                 ConnectorStagedReportSummary {
                     input_rows: self.stats.appended_rows.load(Ordering::Relaxed) as u64,
@@ -371,12 +367,19 @@ mod tests {
         }
     }
 
-    fn test_program(stats: Arc<WriterStats>) -> ConnectorWriteSinkProgram {
-        let key = ConnectorExecutionBindingKey {
+    fn test_program_with_execution_catalog_version(
+        stats: Arc<WriterStats>,
+        execution_catalog_version: [u8; 32],
+    ) -> Result<ConnectorWriteSinkProgram, ExecPlanBuildError> {
+        let key = ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("test.connector").expect("instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         };
         let operation_id = ConnectorWriteOperationId::from_bytes([1; 16]);
+        let catalog_handle = novarocks_spi::connector::CatalogHandle::new(
+            key.instance_id.clone(),
+            novarocks_spi::connector::CatalogVersion::from_bytes([9; 32]),
+        );
         let writer = ConnectorWriterIdentity::new(
             operation_id,
             novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id),
@@ -385,22 +388,21 @@ mod tests {
             5,
             6,
             0,
-            key.clone(),
+            catalog_handle.clone(),
         );
-        let handle =
-            ConnectorWriterHandle::try_new(key.clone(), writer, 1, Bytes::new()).expect("handle");
-        let binding = Arc::new(
-            ConnectorExecutionBinding::try_new_capabilities(
-                ConnectorProviderId::parse("test").expect("provider"),
-                key,
-                None,
-                Some(Arc::new(TestWriteExecution {
-                    key: handle.owner().clone(),
-                    stats,
-                })),
-            )
-            .expect("binding"),
-        );
+        let handle = ConnectorWriterHandle::try_new(
+            writer,
+            novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
+            Bytes::new(),
+        )
+        .expect("handle");
+        let execution = Arc::new(TestWriteExecution {
+            catalog_handle: novarocks_spi::connector::CatalogHandle::new(
+                key.instance_id.clone(),
+                novarocks_spi::connector::CatalogVersion::from_bytes(execution_catalog_version),
+            ),
+            stats,
+        });
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let context = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
@@ -410,7 +412,7 @@ mod tests {
         )
         .expect("context");
         ConnectorWriteSinkProgram::try_new(
-            binding,
+            execution,
             ConnectorOpenWriterRequest {
                 handle,
                 expected_schema: schema,
@@ -419,7 +421,22 @@ mod tests {
             1,
             None,
         )
-        .expect("program")
+    }
+
+    fn test_program(stats: Arc<WriterStats>) -> ConnectorWriteSinkProgram {
+        test_program_with_execution_catalog_version(stats, [9; 32]).expect("program")
+    }
+
+    #[test]
+    fn catalog_writer_runtime_must_match_the_frozen_writer_handle() {
+        let error =
+            test_program_with_execution_catalog_version(Arc::new(WriterStats::default()), [8; 32])
+                .expect_err("foreign catalog runtime must be rejected before the writer opens");
+        assert!(
+            error
+                .to_string()
+                .contains("catalog handle does not match query-leased write execution")
+        );
     }
 
     fn int_chunk(values: Vec<i32>) -> Chunk {

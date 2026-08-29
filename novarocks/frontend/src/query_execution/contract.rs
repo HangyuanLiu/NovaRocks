@@ -39,9 +39,8 @@ use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
-use novarocks_proto_codec::provider::EnsureConnectorExecutionBindingRejection;
 use novarocks_spi::connector::{
-    ConnectorActivatedWriteCohort, ConnectorError, ConnectorExecutionBindingKey,
+    ConnectorActivatedWriteCohort, ConnectorError, ConnectorProviderBindingKey,
     ConnectorRequestContext, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
     ConnectorWriteActivationSource, ConnectorWriteCohortId, ConnectorWriteExecutionId,
     ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlanningRequest,
@@ -255,7 +254,7 @@ impl ConnectorWritePlanningTemplate {
         lease: ConnectorWriteLease,
     ) -> Result<Self, ConnectorError> {
         activation.validate()?;
-        if activation.owner() != lease.binding_key() {
+        if !lease.matches_provider_binding_key(activation.owner()) {
             return Err(ConnectorError::new(
                 novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
                 "activated connector write cohort does not match its exact write lease",
@@ -385,7 +384,7 @@ impl ConnectorWritePlanningTemplate {
 
     pub fn stable_digest(
         &self,
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
     ) -> Result<[u8; 32], ConnectorError> {
         self.clone()
             .into_request(ConnectorWriteExecutionId::new([0; 16], 0))
@@ -413,7 +412,7 @@ impl ConnectorWritePlanningTemplate {
 #[derive(Clone)]
 pub struct ConnectorWriteOperationRegistration {
     operation_id: ConnectorWriteOperationId,
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     cohorts: Vec<ConnectorWritePlanningTemplate>,
 }
 
@@ -471,7 +470,7 @@ impl ConnectorWriteOperationRegistration {
         self.operation_id
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -850,7 +849,6 @@ pub(crate) enum PreReadyTopologyOutcome {
 pub struct DistributedQueryError {
     kind: DistributedQueryErrorKind,
     message: String,
-    connector_binding_rejection: Option<EnsureConnectorExecutionBindingRejection>,
     pre_ready_topology_outcome: Option<PreReadyTopologyOutcome>,
     pre_ready_topology_observation: bool,
 }
@@ -860,33 +858,6 @@ impl DistributedQueryError {
         Self {
             kind,
             message: message.into(),
-            connector_binding_rejection: None,
-            pre_ready_topology_outcome: None,
-            pre_ready_topology_observation: false,
-        }
-    }
-
-    /// Preserves a BE-provided, Protocol-validated binding rejection without
-    /// reducing its reason or retry semantics to display text.
-    pub fn connector_binding_rejected(
-        context: impl Into<String>,
-        rejection: EnsureConnectorExecutionBindingRejection,
-    ) -> Self {
-        let context = context.into();
-        let field_path = rejection
-            .safe_field_path()
-            .map(|value| format!(" field_path={value}"))
-            .unwrap_or_default();
-        Self {
-            kind: DistributedQueryErrorKind::Rejected,
-            message: format!(
-                "{context}: connector execution binding rejected: reason={:?} retryable_before_progress={} detail={}{}",
-                rejection.reason(),
-                rejection.retryable_before_progress(),
-                rejection.safe_detail(),
-                field_path,
-            ),
-            connector_binding_rejection: Some(rejection),
             pre_ready_topology_outcome: None,
             pre_ready_topology_observation: false,
         }
@@ -902,7 +873,6 @@ impl DistributedQueryError {
         Self {
             kind: DistributedQueryErrorKind::Rejected,
             message: message.into(),
-            connector_binding_rejection: None,
             pre_ready_topology_outcome: Some(outcome),
             pre_ready_topology_observation: false,
         }
@@ -916,7 +886,6 @@ impl DistributedQueryError {
         Self {
             kind: DistributedQueryErrorKind::Failed,
             message: message.into(),
-            connector_binding_rejection: None,
             pre_ready_topology_outcome: None,
             pre_ready_topology_observation: true,
         }
@@ -933,7 +902,6 @@ impl DistributedQueryError {
         Self {
             kind: DistributedQueryErrorKind::TopologyRetryUnsupported,
             message: message.into(),
-            connector_binding_rejection: None,
             pre_ready_topology_outcome: Some(outcome),
             pre_ready_topology_observation: false,
         }
@@ -945,10 +913,6 @@ impl DistributedQueryError {
 
     pub fn message(&self) -> &str {
         &self.message
-    }
-
-    pub fn connector_binding_rejection(&self) -> Option<&EnsureConnectorExecutionBindingRejection> {
-        self.connector_binding_rejection.as_ref()
     }
 
     pub(crate) const fn pre_ready_topology_outcome(&self) -> Option<PreReadyTopologyOutcome> {

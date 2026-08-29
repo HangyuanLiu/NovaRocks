@@ -527,7 +527,9 @@ fn ensure_backend_metric_label_families() {
     ] {
         let _ = BACKEND_QUERY_LIFECYCLE_TERMINAL.get_metric_with_label_values(&[outcome]);
     }
-    let _ = BACKEND_QUERY_EXECUTION_RESOURCES.get_metric_with_label_values(&["active"]);
+    for resource in ["catalog_query_leases", "catalog_handle_leases"] {
+        let _ = BACKEND_QUERY_EXECUTION_RESOURCES.get_metric_with_label_values(&[resource]);
+    }
 }
 #[cfg(test)]
 mod tests {

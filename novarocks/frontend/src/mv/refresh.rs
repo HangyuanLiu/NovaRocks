@@ -37,12 +37,12 @@ use crate::query_execution::mv_native_write::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationOperation, ConnectorControlRegistry, ConnectorExecutionBindingKey,
-    ConnectorInstanceId, ConnectorMutationOperationId, ConnectorMvMetadataOnlyBaseFact,
-    ConnectorMvMetadataOnlyProvenance, ConnectorRefAction, ConnectorRefKind,
-    ConnectorRefreshPublicationGuard, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorWriteReceipt, CreateOrReplacePolicy, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ConnectorCatalogMutationOperation, ConnectorControlRegistry, ConnectorInstanceId,
+    ConnectorMutationOperationId, ConnectorMvMetadataOnlyBaseFact,
+    ConnectorMvMetadataOnlyProvenance, ConnectorProviderBindingKey, ConnectorRefAction,
+    ConnectorRefKind, ConnectorRefreshPublicationGuard, ConnectorRequestContext,
+    ConnectorTableIdentity, ConnectorWriteReceipt, CreateOrReplacePolicy,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 #[derive(Clone)]
@@ -169,7 +169,7 @@ pub(super) fn execute(
         .connector_control
         .acquire_current(&instance_id)
         .map_err(|error| unavailable(error.to_string()))?;
-    if (ConnectorExecutionBindingKey {
+    if (ConnectorProviderBindingKey {
         instance_id: planning.binding().descriptor().instance_id.clone(),
         incarnation: planning.binding().incarnation(),
     }) != refresh.observed_binding

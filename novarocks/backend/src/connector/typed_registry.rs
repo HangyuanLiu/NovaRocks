@@ -15,19 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-local mirror of an admitted connector read execution.
+//! Backend-local typed catalog read execution value.
 //!
-//! The Host owns admission and retirement. This registry only retains the
-//! exact provider factory and codec selected by that Host admission, so plan
-//! decode and TaskUpdate recover SPI handles from the same binding generation.
+//! A catalog materialization retains this exact factory and codec pair. Query
+//! lifecycle lookup is owned by `CatalogManager`, so this module deliberately
+//! contains no second registry or lifecycle authority.
 
-use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use novarocks_proto_codec::connector_read::ConnectorReadCodec;
-use novarocks_spi::connector::ConnectorExecutionBindingKey;
-use novarocks_spi::connector::read_stack::ConnectorReadProviderFactory;
+use novarocks_spi::connector::{CatalogWriteExecution, read_stack::ConnectorReadProviderFactory};
 
 /// One exact binding's complete worker read unit. The factory and codec must
 /// travel together because every recovered handle belongs to the factory that
@@ -63,65 +61,28 @@ impl fmt::Debug for InstalledReadExecution {
     }
 }
 
-/// Passive exact-key BE mirror. It has no provider discovery or generation
-/// authority; callers obtain the key from existing Host admission first.
-#[derive(Default)]
-pub struct InstalledReadExecutionRegistry {
-    installed: Mutex<BTreeMap<ConnectorExecutionBindingKey, InstalledReadExecution>>,
+/// One exact catalog-scoped writer capability retained by a materialized
+/// catalog runtime. Query lifecycle lookup is deliberately the only way a
+/// fragment can obtain it.
+#[derive(Clone)]
+pub struct InstalledWriteExecution {
+    execution: Arc<dyn CatalogWriteExecution>,
 }
 
-impl InstalledReadExecutionRegistry {
-    /// Keep the first bundle installed for this exact key. Host admission is
-    /// idempotent, so a replay returns the same registered pair.
-    pub fn install_or_resolve(
-        &self,
-        key: ConnectorExecutionBindingKey,
-        execution: InstalledReadExecution,
-    ) -> InstalledReadExecution {
-        let mut installed = self
-            .installed
-            .lock()
-            .expect("installed read execution registry lock");
-        installed.entry(key).or_insert(execution).clone()
+impl InstalledWriteExecution {
+    pub fn new(execution: Arc<dyn CatalogWriteExecution>) -> Self {
+        Self { execution }
     }
 
-    pub fn resolve(&self, key: &ConnectorExecutionBindingKey) -> Option<InstalledReadExecution> {
-        self.installed
-            .lock()
-            .expect("installed read execution registry lock")
-            .get(key)
-            .cloned()
-    }
-
-    pub fn retire(&self, key: &ConnectorExecutionBindingKey) -> bool {
-        self.installed
-            .lock()
-            .expect("installed read execution registry lock")
-            .remove(key)
-            .is_some()
+    pub fn execution(&self) -> Arc<dyn CatalogWriteExecution> {
+        Arc::clone(&self.execution)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::InstalledReadExecutionRegistry;
-    use novarocks_spi::connector::{
-        ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    };
-
-    fn key() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
-            instance_id: ConnectorInstanceId::try_from_canonical("catalog.analytics")
-                .expect("canonical instance id"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
-        }
-    }
-
-    #[test]
-    fn empty_registry_has_no_exact_execution_and_retire_is_idempotent() {
-        let registry = InstalledReadExecutionRegistry::default();
-        let key = key();
-        assert!(registry.resolve(&key).is_none());
-        assert!(!registry.retire(&key));
+impl fmt::Debug for InstalledWriteExecution {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstalledWriteExecution")
+            .finish_non_exhaustive()
     }
 }

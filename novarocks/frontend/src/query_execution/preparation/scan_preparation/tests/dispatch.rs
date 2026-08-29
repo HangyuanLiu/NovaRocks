@@ -66,10 +66,20 @@ impl novarocks_spi::connector::ConnectorControlResolver for RejectCurrentControl
         &self,
         _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorExecutionBindingKey,
+        novarocks_spi::connector::ConnectorProviderBindingKey,
         novarocks_spi::connector::ConnectorError,
     > {
         panic!("topology-only re-planning must not observe a current connector binding")
+    }
+
+    fn observe_current_control_runtime(
+        &self,
+        _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorControlRuntimeId,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        panic!("topology-only re-planning must not observe a current control runtime")
     }
 
     fn acquire_current(
@@ -225,20 +235,19 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
     let expected = bindings
         .exact_planning_lease(scan_preparation_facts(scan).binding())
         .expect("fixture exact lease");
-    // The lease preparation retained, the generation its declaration installs,
-    // and the generation the frozen relation names are all the one the query
-    // already admitted -- never a generation acquired now.
+    // The lease preparation retained and the catalog content the frozen
+    // relation names are all the one the query already admitted -- never a
+    // generation acquired now.
     assert_eq!(
         typed.planning_lease.binding().incarnation(),
         expected.binding().incarnation()
     );
     assert_eq!(
-        typed.declaration.binding_key().incarnation,
-        expected.binding().incarnation()
-    );
-    assert_eq!(
-        typed.prepared.table_scan.table().catalog().incarnation(),
-        expected.binding().incarnation().to_bytes()
+        typed.prepared.table_scan.table().catalog(),
+        expected
+            .binding()
+            .catalog_handle()
+            .expect("fixture lease carries a catalog handle")
     );
 }
 
@@ -375,20 +384,16 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
     // replacement registered above.
     let first_typed = first.typed_scan(0, 10).expect("first typed scan");
     let second_typed = second.typed_scan(0, 10).expect("second typed scan");
-    let admitted_incarnation = admitted
+    let admitted_catalog = admitted
         .admission
         .exact_planning_lease()
         .expect("first admission lease")
         .binding()
-        .incarnation();
-    assert_eq!(
-        first_typed.declaration.binding_key().incarnation,
-        admitted_incarnation
-    );
-    assert_eq!(
-        second_typed.declaration.binding_key().incarnation,
-        admitted_incarnation
-    );
+        .catalog_handle()
+        .expect("first admission has catalog handle")
+        .clone();
+    assert_eq!(first_typed.catalog_properties.handle(), &admitted_catalog);
+    assert_eq!(second_typed.catalog_properties.handle(), &admitted_catalog);
     let first_relation = first_typed.prepared.table_scan.table().relation();
     let second_relation = second_typed.prepared.table_scan.table().relation();
     assert_eq!(second_relation.kind(), first_relation.kind());

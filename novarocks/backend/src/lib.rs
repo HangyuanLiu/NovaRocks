@@ -15,9 +15,6 @@ pub use application::{
     BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
     BackendServerConfig, run_backend_server_until_shutdown, run_backend_server_until_signal,
 };
-pub use connector::{
-    ConnectorExecutionHost, ConnectorExecutionLease, ConnectorExecutionQueryResolver,
-};
 pub use fragment::NativeFragmentService;
 pub use novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory;
 pub use query_lifecycle::QueryLifecycleRegistryConfig;

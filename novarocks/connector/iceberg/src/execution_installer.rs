@@ -22,17 +22,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
-    ConnectorExecutionProviderKind, ConnectorInstanceId, ConnectorOpenReaderRequest,
-    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
-    ConnectorPreparedScanUnitSet, ConnectorProviderId, ConnectorReadExecution,
-    ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorSplit,
+    CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogRuntime,
+    CatalogRuntimeMaterializer, ConnectorBatchReader, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBinding, ConnectorExecutionInstaller, ConnectorInstanceId,
+    ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
+    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderBinding,
+    ConnectorProviderBindingKey, ConnectorProviderBindingKind, ConnectorProviderId,
+    ConnectorReadExecution, ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorSplit,
 };
 
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::write_execution::IcebergDataWriteExecution;
-use crate::execution_declaration::prepare_iceberg_execution_binding;
 use crate::file_reader::batch_reader::IcebergBatchReader;
 use crate::file_reader::delta_reader::IcebergDeltaBatchReader;
 use crate::file_reader::execution_payload::{
@@ -43,6 +43,7 @@ use crate::file_reader::execution_payload::{
     validate_split_payload,
 };
 use crate::metadata_batch_reader::open_metadata_connector_reader;
+use crate::provider_binding::prepare_iceberg_execution_binding;
 use crate::resources::IcebergExecutionResources;
 
 const PROVIDER_ID: &str = "iceberg";
@@ -57,6 +58,58 @@ pub struct IcebergConnectorInstaller {
     resources: IcebergExecutionResources,
 }
 
+/// Startup-composed materializer for immutable catalog properties received by
+/// a BE query lifecycle.  The filesystem binding is process-local and is
+/// deliberately not derived from, or returned through, `CatalogProperties`.
+pub struct IcebergCatalogRuntimeMaterializer {
+    binding: IcebergReadBinding,
+}
+
+impl IcebergCatalogRuntimeMaterializer {
+    pub fn new(resources: IcebergExecutionResources) -> Self {
+        Self {
+            binding: resources.binding().clone(),
+        }
+    }
+}
+
+struct IcebergCatalogRuntime {
+    handle: CatalogHandle,
+    _binding: IcebergReadBinding,
+}
+
+impl CatalogRuntime for IcebergCatalogRuntime {
+    fn handle(&self) -> &CatalogHandle {
+        &self.handle
+    }
+
+    fn provider_kind(&self) -> CatalogProviderKind {
+        CatalogProviderKind::Iceberg
+    }
+}
+
+impl CatalogRuntimeMaterializer for IcebergCatalogRuntimeMaterializer {
+    fn provider_kind(&self) -> CatalogProviderKind {
+        CatalogProviderKind::Iceberg
+    }
+
+    fn materialize(
+        &self,
+        properties: &CatalogProperties,
+    ) -> Result<Arc<dyn CatalogRuntime>, ConnectorError> {
+        if properties.provider_kind() != CatalogProviderKind::Iceberg {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg catalog materializer received another provider kind",
+            ));
+        }
+        Ok(Arc::new(IcebergCatalogRuntime {
+            handle: properties.handle().clone(),
+            _binding: self.binding.clone(),
+        }))
+    }
+}
+
 impl IcebergConnectorInstaller {
     pub fn new(resources: IcebergExecutionResources) -> Self {
         Self {
@@ -68,13 +121,13 @@ impl IcebergConnectorInstaller {
 }
 
 impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
-    fn provider_kind(&self) -> ConnectorExecutionProviderKind {
-        ConnectorExecutionProviderKind::Iceberg
+    fn provider_kind(&self) -> ConnectorProviderBindingKind {
+        ConnectorProviderBindingKind::Iceberg
     }
 
     fn install(
         &self,
-        declaration: &ConnectorExecutionDeclaration,
+        declaration: &ConnectorProviderBinding,
         _context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionBinding, ConnectorError> {
         let prepared = prepare_iceberg_execution_binding(declaration)?;
@@ -93,7 +146,6 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
                 binding: self.resources.binding().clone(),
             })),
             Some(Arc::new(IcebergDataWriteExecution::new(
-                key,
                 self.resources.binding().clone(),
                 self.resources.runtime().clone(),
             ))),
@@ -104,7 +156,7 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
 /// Materializes only FE-frozen membership into local read units. Catalog
 /// access and all planning remain outside this BE execution object.
 struct IcebergReadOnlyConnectorInstance {
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
     binding: IcebergReadBinding,
 }
 
@@ -350,7 +402,7 @@ impl IcebergReadOnlyConnectorInstance {
 }
 
 impl ConnectorReadExecution for IcebergReadOnlyConnectorInstance {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 

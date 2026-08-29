@@ -31,15 +31,19 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorMutationFailure,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationFamily,
-    LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    CatalogHandle, CatalogProperties, ConnectorCommittedVersion, ConnectorControlRuntimeId,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution, ConnectorMutationFailure,
+    ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderId,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableObjectId,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    LakePublicationFamily, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
 };
 
-pub const CONNECTOR_WRITE_CONTRACT_VERSION: u32 = 1;
+/// Version 2 removes the legacy FE connector-generation identity from the
+/// native writer and terminal-report carriers.  BE runtime selection is
+/// exclusively the exact query-leased catalog handle.
+pub const CONNECTOR_WRITE_CONTRACT_VERSION: u32 = 2;
 pub const MAX_CONNECTOR_STAGED_REPORT_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_CONNECTOR_STAGED_REPORT_PARTS: u32 = 48;
 pub const MAX_CONNECTOR_STAGED_REPORT_PAYLOAD_BYTES: usize =
@@ -57,6 +61,7 @@ pub const MAX_CONNECTOR_MANAGED_PARTITION_SPEC_FIELDS: usize = 4096;
 pub const MAX_CONNECTOR_MANAGED_PARTITION_FIELD_TEXT_BYTES: usize = 4096;
 pub const DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_WRITE_COMMIT_EVIDENCE_MAX_ENTRIES: usize = 16_384;
+pub const MAX_CONNECTOR_STAGED_PUBLICATION_BASE_FACTS: usize = 4096;
 
 const CONNECTOR_WRITE_COHORT_ID_DOMAIN: &[u8] = b"novarocks.connector-write-cohort.v1\0";
 const CONNECTOR_WRITE_COHORT_SET_DOMAIN: &[u8] = b"novarocks.connector-write-cohort-set.v1\0";
@@ -68,6 +73,19 @@ const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_ID_DOMAIN: &[u8] =
     b"novarocks.connector-managed-partition-spec-replacement-id.v1\0";
 const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_DOMAIN: &[u8] =
     b"novarocks.connector-managed-partition-spec-replacement.v1\0";
+
+/// Provider-owned base-table provenance for a managed publication.
+///
+/// The distributed writer carries these value facts as part of its immutable
+/// publication intent. Only the provider that owns the on-lake provenance may
+/// render the opaque object identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorStagedPublicationBaseFact {
+    pub table: Arc<str>,
+    pub object_id: ConnectorTableObjectId,
+    pub from_version: Option<i64>,
+    pub to_version: i64,
+}
 
 /// Resolved per-fragment bounds for evidence returned by a distributed write.
 ///
@@ -318,7 +336,9 @@ pub struct ConnectorWriterIdentity {
     fragment_id: i32,
     backend_num: i32,
     sink_ordinal: u32,
-    binding_key: ConnectorExecutionBindingKey,
+    /// Exact immutable catalog runtime selected by the query lifecycle for
+    /// this writer. Backend capability lookup uses this handle only.
+    catalog_handle: CatalogHandle,
 }
 
 impl ConnectorWriterIdentity {
@@ -331,7 +351,7 @@ impl ConnectorWriterIdentity {
         fragment_id: i32,
         backend_num: i32,
         sink_ordinal: u32,
-        binding_key: ConnectorExecutionBindingKey,
+        catalog_handle: CatalogHandle,
     ) -> Self {
         Self {
             operation_id,
@@ -341,7 +361,7 @@ impl ConnectorWriterIdentity {
             fragment_id,
             backend_num,
             sink_ordinal,
-            binding_key,
+            catalog_handle,
         }
     }
 
@@ -373,8 +393,8 @@ impl ConnectorWriterIdentity {
         self.sink_ordinal
     }
 
-    pub fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-        &self.binding_key
+    pub const fn catalog_handle(&self) -> &CatalogHandle {
+        &self.catalog_handle
     }
 }
 
@@ -599,7 +619,7 @@ pub struct ConnectorWritePreparationRequest {
 }
 
 impl ConnectorWritePreparationRequest {
-    pub fn validate(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
+    pub fn validate(&self, owner: &ConnectorProviderBindingKey) -> Result<(), ConnectorError> {
         if self.table.owner() != &owner.instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -649,7 +669,7 @@ impl ConnectorWriteTargetRef {
 /// to application callers; only the provider may interpret them.
 #[derive(Clone)]
 pub struct ConnectorWritePreparation {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     table: ConnectorTableHandle,
     target_ref: ConnectorWriteTargetRef,
     intent: ConnectorWriteIntent,
@@ -661,7 +681,7 @@ pub struct ConnectorWritePreparation {
 
 impl ConnectorWritePreparation {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         table: ConnectorTableHandle,
         target_ref: ConnectorWriteTargetRef,
         intent: ConnectorWriteIntent,
@@ -719,7 +739,7 @@ impl ConnectorWritePreparation {
         Ok(())
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub fn table(&self) -> &ConnectorTableHandle {
@@ -768,7 +788,7 @@ pub enum ConnectorWriteActivationSource {
 impl ConnectorWriteActivationSource {
     fn validate(
         &self,
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<[u8; 32], ConnectorError> {
         match self {
@@ -1130,7 +1150,7 @@ impl ConnectorManagedPartitionSpecPreviewRequest {
         &self.context
     }
 
-    pub fn validate(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
+    pub fn validate(&self, owner: &ConnectorProviderBindingKey) -> Result<(), ConnectorError> {
         if self.table.owner() != &owner.instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -1146,14 +1166,14 @@ impl ConnectorManagedPartitionSpecPreviewRequest {
 /// it again from the same admitted table and reject any mismatch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorManagedPartitionSpecPreview {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     committed_partitioning: ConnectorCommittedPartitioning,
 }
 
 impl ConnectorManagedPartitionSpecPreview {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
         committed_partitioning: ConnectorCommittedPartitioning,
     ) -> Result<Self, ConnectorError> {
@@ -1165,7 +1185,7 @@ impl ConnectorManagedPartitionSpecPreview {
         })
     }
 
-    pub const fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub const fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -1179,7 +1199,7 @@ impl ConnectorManagedPartitionSpecPreview {
 
     fn validate_for_request(
         &self,
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<(), ConnectorError> {
         self.committed_partitioning.validate()?;
@@ -1520,7 +1540,7 @@ pub struct ConnectorManagedPublicationIntent {
     publication_id: LakePublicationId,
     target: ConnectorManagedPublicationTarget,
     technique: ConnectorManagedPublicationTechnique,
-    bases: Vec<super::ConnectorStagedPublicationBaseFact>,
+    bases: Vec<ConnectorStagedPublicationBaseFact>,
     definition_fingerprint: Arc<str>,
     empty_input: ConnectorManagedPublicationEmptyInputDisposition,
     partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
@@ -1534,7 +1554,7 @@ impl ConnectorManagedPublicationIntent {
         publication_id: LakePublicationId,
         target: ConnectorManagedPublicationTarget,
         technique: ConnectorManagedPublicationTechnique,
-        bases: Vec<super::ConnectorStagedPublicationBaseFact>,
+        bases: Vec<ConnectorStagedPublicationBaseFact>,
         definition_fingerprint: impl Into<Arc<str>>,
         empty_input: ConnectorManagedPublicationEmptyInputDisposition,
         descriptor_properties: ConnectorManagedDescriptorProperties,
@@ -1557,7 +1577,7 @@ impl ConnectorManagedPublicationIntent {
         publication_id: LakePublicationId,
         target: ConnectorManagedPublicationTarget,
         technique: ConnectorManagedPublicationTechnique,
-        bases: Vec<super::ConnectorStagedPublicationBaseFact>,
+        bases: Vec<ConnectorStagedPublicationBaseFact>,
         definition_fingerprint: impl Into<Arc<str>>,
         empty_input: ConnectorManagedPublicationEmptyInputDisposition,
         partition_spec_replacement: ConnectorManagedPartitionSpecReplacement,
@@ -1582,7 +1602,7 @@ impl ConnectorManagedPublicationIntent {
         publication_id: LakePublicationId,
         target: ConnectorManagedPublicationTarget,
         technique: ConnectorManagedPublicationTechnique,
-        bases: Vec<super::ConnectorStagedPublicationBaseFact>,
+        bases: Vec<ConnectorStagedPublicationBaseFact>,
         definition_fingerprint: Arc<str>,
         empty_input: ConnectorManagedPublicationEmptyInputDisposition,
         partition_spec_replacement: Option<ConnectorManagedPartitionSpecReplacement>,
@@ -1591,7 +1611,7 @@ impl ConnectorManagedPublicationIntent {
     ) -> Result<Self, ConnectorError> {
         if definition_fingerprint.is_empty()
             || bases.is_empty()
-            || bases.len() > super::MAX_CONNECTOR_STAGED_PUBLICATION_BASE_FACTS
+            || bases.len() > MAX_CONNECTOR_STAGED_PUBLICATION_BASE_FACTS
             || definition_fingerprint.len() > MAX_CONNECTOR_MANAGED_PUBLICATION_TEXT_BYTES
             || bases.iter().any(|base| {
                 base.table.is_empty()
@@ -1655,7 +1675,7 @@ impl ConnectorManagedPublicationIntent {
     pub const fn technique(&self) -> ConnectorManagedPublicationTechnique {
         self.technique
     }
-    pub fn bases(&self) -> &[super::ConnectorStagedPublicationBaseFact] {
+    pub fn bases(&self) -> &[ConnectorStagedPublicationBaseFact] {
         &self.bases
     }
     pub fn definition_fingerprint(&self) -> &str {
@@ -1781,7 +1801,7 @@ pub struct ConnectorWriteActivationRequest {
 impl ConnectorWriteActivationRequest {
     pub fn validate(
         &self,
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
     ) -> Result<[u8; 32], ConnectorError> {
         self.intent.validate_for_operation(self.operation_id)?;
         self.source.validate(owner, self.operation_id)
@@ -1808,7 +1828,7 @@ impl ConnectorPreReadyWritePlanningRequest {
 
     pub fn validate(
         &self,
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
     ) -> Result<[u8; 32], ConnectorError> {
         self.activation.validate(owner)
     }
@@ -1820,14 +1840,14 @@ impl ConnectorPreReadyWritePlanningRequest {
 /// retry instead of inheriting an Iceberg-specific assumption.
 #[derive(Clone)]
 pub struct ConnectorPreReadyWritePlanningProof {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     activation_source_digest: [u8; 32],
 }
 
 impl ConnectorPreReadyWritePlanningProof {
     pub fn try_issue(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         request: &ConnectorPreReadyWritePlanningRequest,
     ) -> Result<Self, ConnectorError> {
         Ok(Self {
@@ -1837,7 +1857,7 @@ impl ConnectorPreReadyWritePlanningProof {
         })
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -1847,7 +1867,7 @@ impl ConnectorPreReadyWritePlanningProof {
 
     pub fn validates(
         &self,
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         request: &ConnectorPreReadyWritePlanningRequest,
     ) -> Result<(), ConnectorError> {
         if &self.owner != owner || self.operation_id != request.activation.operation_id {
@@ -1869,7 +1889,7 @@ impl ConnectorPreReadyWritePlanningProof {
 /// One provider-signed activated cohort. Only this value may enter planning.
 #[derive(Clone)]
 pub struct ConnectorActivatedWriteCohort {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     cohort_id: ConnectorWriteCohortId,
     preparation: ConnectorWritePreparation,
@@ -1877,7 +1897,7 @@ pub struct ConnectorActivatedWriteCohort {
 }
 
 impl ConnectorActivatedWriteCohort {
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub const fn operation_id(&self) -> ConnectorWriteOperationId {
@@ -1907,7 +1927,7 @@ impl ConnectorActivatedWriteCohort {
 /// Operation-scoped result of exact-generation service reservation.
 #[derive(Clone)]
 pub struct ConnectorWriteActivation {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     source_digest: [u8; 32],
     activation_digest: [u8; 32],
@@ -1917,7 +1937,7 @@ pub struct ConnectorWriteActivation {
 
 impl ConnectorWriteActivation {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         request: &ConnectorWriteActivationRequest,
         mut cohorts: Vec<(ConnectorWriteCohortId, ConnectorWritePreparation)>,
     ) -> Result<Self, ConnectorError> {
@@ -1989,7 +2009,7 @@ impl ConnectorWriteActivation {
             sealed_cohorts,
         })
     }
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
     pub const fn operation_id(&self) -> ConnectorWriteOperationId {
@@ -2080,7 +2100,7 @@ pub struct ConnectorWritePlanningRequest {
 }
 
 impl ConnectorWritePlanningRequest {
-    pub fn validate(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
+    pub fn validate(&self, owner: &ConnectorProviderBindingKey) -> Result<(), ConnectorError> {
         self.activation.validate()?;
         if self.activation.owner() != owner
             || self.activation.operation_id() != self.operation_id
@@ -2102,7 +2122,7 @@ impl ConnectorWritePlanningRequest {
             if writer.operation_id != self.operation_id
                 || writer.cohort_id != self.cohort_id
                 || writer.execution_id != self.execution_id
-                || &writer.binding_key != owner
+                || writer.catalog_handle.catalog_name() != &owner.instance_id
             {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -2121,7 +2141,7 @@ impl ConnectorWritePlanningRequest {
 
     pub fn stable_digest(
         &self,
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
     ) -> Result<[u8; 32], ConnectorError> {
         // This digest is also used while sealing a preparation, before the
         // placement-frozen writer set exists. Writer validation remains
@@ -2147,7 +2167,7 @@ impl ConnectorWritePlanningRequest {
 }
 
 fn write_planning_digest(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     cohort_id: ConnectorWriteCohortId,
     activation_digest: [u8; 32],
@@ -2163,7 +2183,6 @@ fn write_planning_digest(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorWriterHandle {
-    owner: ConnectorExecutionBindingKey,
     writer: ConnectorWriterIdentity,
     version: u32,
     payload: Bytes,
@@ -2172,20 +2191,18 @@ pub struct ConnectorWriterHandle {
 
 impl ConnectorWriterHandle {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
         writer: ConnectorWriterIdentity,
         version: u32,
         payload: Bytes,
     ) -> Result<Self, ConnectorError> {
         validate_handle_payload(&payload)?;
-        if version == 0 || writer.binding_key != owner {
+        if version != CONNECTOR_WRITE_CONTRACT_VERSION {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "connector writer handle owner or version is invalid",
+                "connector writer handle contract version is unsupported",
             ));
         }
         Ok(Self {
-            owner,
             writer,
             version,
             payload_digest: sha256(&payload),
@@ -2194,8 +2211,7 @@ impl ConnectorWriterHandle {
     }
 
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        if self.version == 0
-            || self.writer.binding_key != self.owner
+        if self.version != CONNECTOR_WRITE_CONTRACT_VERSION
             || self.payload_digest != sha256(&self.payload)
         {
             return Err(ConnectorError::new(
@@ -2204,10 +2220,6 @@ impl ConnectorWriterHandle {
             ));
         }
         validate_handle_payload(&self.payload)
-    }
-
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
-        &self.owner
     }
 
     pub fn writer(&self) -> &ConnectorWriterIdentity {
@@ -2229,7 +2241,7 @@ impl ConnectorWriterHandle {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorWritePlan {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     cohort_id: ConnectorWriteCohortId,
     execution_id: ConnectorWriteExecutionId,
@@ -2239,7 +2251,7 @@ pub struct ConnectorWritePlan {
 
 impl ConnectorWritePlan {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
         cohort_id: ConnectorWriteCohortId,
         execution_id: ConnectorWriteExecutionId,
@@ -2250,7 +2262,7 @@ impl ConnectorWritePlan {
         let mut writers = HashSet::with_capacity(handles.len());
         for handle in &handles {
             handle.validate()?;
-            if handle.owner != owner
+            if handle.writer.catalog_handle.catalog_name() != &owner.instance_id
                 || handle.writer.operation_id != operation_id
                 || handle.writer.cohort_id != cohort_id
                 || handle.writer.execution_id != execution_id
@@ -2278,7 +2290,7 @@ impl ConnectorWritePlan {
         })
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -2336,10 +2348,10 @@ impl ConnectorStagedReport {
         payload: Bytes,
     ) -> Result<Self, ConnectorError> {
         validate_report_payload(&payload)?;
-        if version == 0 {
+        if version != CONNECTOR_WRITE_CONTRACT_VERSION {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "connector staged report version must be nonzero",
+                "connector staged report contract version is unsupported",
             ));
         }
         Ok(Self {
@@ -2353,7 +2365,9 @@ impl ConnectorStagedReport {
     }
 
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        if self.version == 0 || self.payload_digest != sha256(&self.payload) {
+        if self.version != CONNECTOR_WRITE_CONTRACT_VERSION
+            || self.payload_digest != sha256(&self.payload)
+        {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
                 "connector staged report integrity validation failed",
@@ -2526,7 +2540,7 @@ impl ConnectorStagedReportFrame {
         logical_payload_digest: [u8; 32],
         frame_payload: Bytes,
     ) -> Result<Self, ConnectorError> {
-        if version == 0
+        if version != CONNECTOR_WRITE_CONTRACT_VERSION
             || part_count == 0
             || part_count > MAX_CONNECTOR_STAGED_REPORT_PARTS
             || part_index >= part_count
@@ -2617,7 +2631,7 @@ impl ConnectorStagedReportFrame {
             + 8 // execution attempt
             + 1 + 16 // fragment instance presence + value
             + 4 + 4 + 4 // fragment/backend/sink ids
-            + LENGTH_PREFIX_BYTES + 16 // connector incarnation
+            + LENGTH_PREFIX_BYTES + 32 // catalog name and exact version
             + 4 // terminal state
             + 8 * 3 // summary
             + 4 + 4 // part index/count
@@ -2625,7 +2639,7 @@ impl ConnectorStagedReportFrame {
             + (LENGTH_PREFIX_BYTES + DIGEST_BYTES) * 2 // payload digests
             + LENGTH_PREFIX_BYTES; // frame payload length
         fixed
-            .checked_add(writer.binding_key().instance_id.as_str().len())
+            .checked_add(writer.catalog_handle().catalog_name().as_str().len())
             .and_then(|total| total.checked_add(self.frame_payload.len()))
             .ok_or_else(|| {
                 ConnectorError::new(
@@ -3079,7 +3093,7 @@ impl ConnectorSealedWriteCohortSet {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorWriteAttemptCompletion {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     cohort_id: ConnectorWriteCohortId,
     execution_id: ConnectorWriteExecutionId,
@@ -3092,7 +3106,7 @@ pub struct ConnectorWriteAttemptCompletion {
 impl ConnectorWriteAttemptCompletion {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
         cohort_id: ConnectorWriteCohortId,
         execution_id: ConnectorWriteExecutionId,
@@ -3111,7 +3125,7 @@ impl ConnectorWriteAttemptCompletion {
         for report in &reports {
             report.validate()?;
             let writer = report.writer();
-            if writer.binding_key() != &owner
+            if writer.catalog_handle().catalog_name() != &owner.instance_id
                 || writer.operation_id() != operation_id
                 || writer.cohort_id() != cohort_id
                 || writer.execution_id() != execution_id
@@ -3146,7 +3160,7 @@ impl ConnectorWriteAttemptCompletion {
         })
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -3231,7 +3245,7 @@ impl ConnectorWriteCohortCompletion {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorWriteOperationCompletion {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     sealed: ConnectorSealedWriteCohortSet,
     cohorts: Vec<ConnectorWriteCohortCompletion>,
     aggregate_digest: [u8; 32],
@@ -3239,7 +3253,7 @@ pub struct ConnectorWriteOperationCompletion {
 
 impl ConnectorWriteOperationCompletion {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         sealed: ConnectorSealedWriteCohortSet,
         cohorts: Vec<ConnectorWriteCohortCompletion>,
     ) -> Result<Self, ConnectorError> {
@@ -3253,7 +3267,7 @@ impl ConnectorWriteOperationCompletion {
         })
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -3285,7 +3299,7 @@ pub struct ConnectorWriteCommitRequest {
 }
 
 impl ConnectorWriteCommitRequest {
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         self.completion.owner()
     }
     pub const fn operation_id(&self) -> ConnectorWriteOperationId {
@@ -3304,7 +3318,7 @@ impl ConnectorWriteCommitRequest {
 
 #[derive(Clone)]
 pub struct ConnectorWriteAbortRequest {
-    pub owner: ConnectorExecutionBindingKey,
+    pub owner: ConnectorProviderBindingKey,
     pub sealed: ConnectorSealedWriteCohortSet,
     pub cohorts: Vec<ConnectorWriteCohortCompletion>,
     pub aggregate_digest: [u8; 32],
@@ -3313,7 +3327,7 @@ pub struct ConnectorWriteAbortRequest {
 
 impl ConnectorWriteAbortRequest {
     pub fn try_new(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         sealed: ConnectorSealedWriteCohortSet,
         cohorts: Vec<ConnectorWriteCohortCompletion>,
         context: ConnectorRequestContext,
@@ -3335,7 +3349,7 @@ impl ConnectorWriteAbortRequest {
 
 #[derive(Clone)]
 pub struct ConnectorWriteReconcileRequest {
-    pub owner: ConnectorExecutionBindingKey,
+    pub owner: ConnectorProviderBindingKey,
     pub operation_id: ConnectorWriteOperationId,
     pub cohort_set_digest: [u8; 32],
     pub aggregate_digest: [u8; 32],
@@ -3359,7 +3373,7 @@ pub enum ConnectorWriteAbortOutcome {
 }
 
 pub trait ConnectorWriteControl: Send + Sync {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey;
+    fn binding_key(&self) -> &ConnectorProviderBindingKey;
 
     fn prepare_write(
         &self,
@@ -3460,7 +3474,17 @@ pub trait ConnectorWriteControl: Send + Sync {
 
 #[derive(Clone)]
 pub struct ConnectorWriteLease {
-    binding_key: ConnectorExecutionBindingKey,
+    /// FE-local effect owner.  This identity never crosses the native BE
+    /// boundary and is deliberately independent of the BE-visible catalog
+    /// handle and the provider-private generation key below.
+    control_runtime_id: ConnectorControlRuntimeId,
+    /// Provider-private proof used only to validate opaque provider facts.
+    /// Frontend application code must use `control_runtime_id` for ownership;
+    /// it must not select a provider generation directly.
+    provider_binding_key: ConnectorProviderBindingKey,
+    /// Exact immutable BE runtime materialization input. This remains separate
+    /// from the FE effect-generation key that fences commit/abort.
+    catalog_properties: Option<CatalogProperties>,
     control: Arc<dyn ConnectorWriteControl>,
     execution_provider_id: Option<ConnectorProviderId>,
     execution_distribution: Option<Arc<dyn ConnectorExecutionDistribution>>,
@@ -3474,7 +3498,25 @@ struct ConnectorWriteLeaseRelease {
 
 impl ConnectorWriteLease {
     pub fn new(
-        binding_key: ConnectorExecutionBindingKey,
+        binding_key: ConnectorProviderBindingKey,
+        control: Arc<dyn ConnectorWriteControl>,
+        release: impl FnOnce() + Send + Sync + 'static,
+    ) -> Result<Self, ConnectorError> {
+        Self::new_with_control_runtime_id(
+            ConnectorControlRuntimeId::new(),
+            binding_key,
+            control,
+            release,
+        )
+    }
+
+    /// Construct a lease with an already-frozen FE control-runtime owner.
+    /// Production acquisition paths must use this constructor (or the
+    /// execution-distribution variant); `new` is retained for isolated
+    /// provider-conformance fixtures only.
+    pub fn new_with_control_runtime_id(
+        control_runtime_id: ConnectorControlRuntimeId,
+        binding_key: ConnectorProviderBindingKey,
         control: Arc<dyn ConnectorWriteControl>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
@@ -3485,7 +3527,9 @@ impl ConnectorWriteLease {
             ));
         }
         Ok(Self {
-            binding_key,
+            control_runtime_id,
+            provider_binding_key: binding_key,
+            catalog_properties: None,
             control,
             execution_provider_id: None,
             execution_distribution: None,
@@ -3501,35 +3545,176 @@ impl ConnectorWriteLease {
     /// callers must use this constructor; the narrower `new` remains useful
     /// for isolated control-only conformance tests.
     pub fn new_with_execution_distribution(
-        binding_key: ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
+        binding_key: ConnectorProviderBindingKey,
         control: Arc<dyn ConnectorWriteControl>,
         execution_provider_id: ConnectorProviderId,
         execution_distribution: Arc<dyn ConnectorExecutionDistribution>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
-        let mut lease = Self::new(binding_key, control, release)?;
+        let mut lease =
+            Self::new_with_control_runtime_id(control_runtime_id, binding_key, control, release)?;
         lease.execution_provider_id = Some(execution_provider_id);
         lease.execution_distribution = Some(execution_distribution);
         Ok(lease)
     }
 
-    pub fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-        &self.binding_key
+    /// Return the FE-local effect owner retained by this exact lease.
+    pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
+        self.control_runtime_id
     }
 
-    pub fn control(&self) -> &Arc<dyn ConnectorWriteControl> {
-        &self.control
+    /// Validate a provider-signed legacy fact without exposing the provider
+    /// generation as an FE effect owner.
+    pub fn matches_provider_binding_key(&self, key: &ConnectorProviderBindingKey) -> bool {
+        key == &self.provider_binding_key
+    }
+
+    /// Validate a provider table handle without exposing an incarnation.
+    pub fn matches_provider_instance(&self, instance_id: &super::ConnectorInstanceId) -> bool {
+        instance_id == &self.provider_binding_key.instance_id
+    }
+
+    /// Return the provider instance name for FE-local identity construction.
+    /// This deliberately does not disclose the provider incarnation.
+    pub fn provider_instance_id(&self) -> &super::ConnectorInstanceId {
+        &self.provider_binding_key.instance_id
+    }
+
+    /// Validate a pre-ready proof against this lease's private provider
+    /// generation without requiring its caller to observe that generation.
+    pub fn validate_pre_ready_write_planning_proof(
+        &self,
+        proof: &ConnectorPreReadyWritePlanningProof,
+        request: &ConnectorPreReadyWritePlanningRequest,
+    ) -> Result<(), ConnectorError> {
+        proof.validates(&self.provider_binding_key, request)
+    }
+
+    /// Attach the desired-state-frozen runtime input retained by the FE
+    /// control lease. Direct control-only fixtures may omit it, but a native
+    /// write attachment must carry it into the query-wide Init CatalogSet.
+    pub fn with_catalog_properties(
+        mut self,
+        catalog_properties: CatalogProperties,
+    ) -> Result<Self, ConnectorError> {
+        if catalog_properties.handle().catalog_name() != &self.provider_binding_key.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "write catalog properties do not match the effect generation owner",
+            ));
+        }
+        self.catalog_properties = Some(catalog_properties);
+        Ok(self)
+    }
+
+    pub fn catalog_properties(&self) -> Option<&CatalogProperties> {
+        self.catalog_properties.as_ref()
+    }
+
+    /// Call provider admission only after validating that the table handle
+    /// belongs to this lease's private provider generation.
+    pub fn prepare_write(
+        &self,
+        request: ConnectorWritePreparationRequest,
+    ) -> Result<ConnectorWritePreparationOutcome, ConnectorError> {
+        request.validate(&self.provider_binding_key)?;
+        let outcome = self.control.prepare_write(request)?;
+        if let ConnectorWritePreparationOutcome::Prepared(preparation) = &outcome {
+            preparation.validate()?;
+            if preparation.owner() != &self.provider_binding_key {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "connector write preparation does not retain the exact lease generation",
+                ));
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Plan an exact write through the retained provider capability.
+    pub fn plan_write(
+        &self,
+        request: ConnectorWritePlanningRequest,
+    ) -> Result<ConnectorWritePlan, ConnectorError> {
+        request.validate(&self.provider_binding_key)?;
+        let plan = self.control.plan_write(request)?;
+        if plan.owner() != &self.provider_binding_key {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "connector write plan does not retain the exact lease generation",
+            ));
+        }
+        Ok(plan)
+    }
+
+    /// Submit a provider terminal commit through the exact retained lease.
+    pub fn commit(
+        &self,
+        request: ConnectorWriteCommitRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        if request.owner() != &self.provider_binding_key {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write commit does not match the exact lease generation",
+            ));
+        }
+        self.control.commit(request)
+    }
+
+    /// Submit a provider terminal abort through the exact retained lease.
+    pub fn abort(
+        &self,
+        request: ConnectorWriteAbortRequest,
+    ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+        if request.owner != self.provider_binding_key {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write abort does not match the exact lease generation",
+            ));
+        }
+        self.control.abort(request)
+    }
+
+    /// Build and submit an abort for an activated but unplanned write using
+    /// the provider-private owner retained by this lease.
+    pub fn abort_activated(
+        &self,
+        sealed: ConnectorSealedWriteCohortSet,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+        let request = ConnectorWriteAbortRequest::try_new(
+            self.provider_binding_key.clone(),
+            sealed,
+            Vec::new(),
+            context,
+        )?;
+        self.abort(request)
+    }
+
+    /// Submit a provider reconciliation through the exact retained lease.
+    pub fn reconcile(
+        &self,
+        request: ConnectorWriteReconcileRequest,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        if request.owner != self.provider_binding_key {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write reconciliation does not match the exact lease generation",
+            ));
+        }
+        self.control.reconcile(request)
     }
 
     pub fn prepare_row_mutation(
         &self,
         request: super::ConnectorRowMutationPreparationRequest,
     ) -> Result<super::ConnectorRowMutationPreparationOutcome, ConnectorError> {
-        request.validate(&self.binding_key)?;
+        request.validate(&self.provider_binding_key)?;
         let outcome = self.control.prepare_row_mutation(request)?;
         if let super::ConnectorRowMutationPreparationOutcome::Prepared(preparation) = &outcome {
             preparation.validate()?;
-            if preparation.owner() != &self.binding_key {
+            if preparation.owner() != &self.provider_binding_key {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::CorruptData,
                     "row-mutation preparation does not retain the lease generation",
@@ -3543,10 +3728,10 @@ impl ConnectorWriteLease {
         &self,
         request: ConnectorManagedPartitionSpecPreviewRequest,
     ) -> Result<ConnectorManagedPartitionSpecPreview, ConnectorError> {
-        request.validate(&self.binding_key)?;
+        request.validate(&self.provider_binding_key)?;
         let operation_id = request.operation_id();
         let preview = self.control.preview_managed_partition_spec(request)?;
-        preview.validate_for_request(&self.binding_key, operation_id)?;
+        preview.validate_for_request(&self.provider_binding_key, operation_id)?;
         Ok(preview)
     }
 
@@ -3554,14 +3739,14 @@ impl ConnectorWriteLease {
         &self,
         request: super::ConnectorRowMutationActivationRequest,
     ) -> Result<super::ConnectorRowMutationExecutionPlan, ConnectorError> {
-        request.validate(&self.binding_key)?;
+        request.validate(&self.provider_binding_key)?;
         let expected_request = request.clone();
         let preparation = request.preparation().clone();
         let plan = self.control.activate_row_mutation(request)?;
         let contract = preparation.match_contract();
         for route in plan.routes() {
             route.validate()?;
-            if route.preparation().owner() != &self.binding_key {
+            if route.preparation().owner() != &self.provider_binding_key {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::CorruptData,
                     "row-mutation route preparation does not retain the lease generation",
@@ -3599,7 +3784,7 @@ impl ConnectorWriteLease {
                 ));
             }
         }
-        plan.validate_against_activation(&expected_request, &self.binding_key)?;
+        plan.validate_against_activation(&expected_request, &self.provider_binding_key)?;
         Ok(plan)
     }
 
@@ -3607,11 +3792,11 @@ impl ConnectorWriteLease {
         &self,
         request: ConnectorWriteActivationRequest,
     ) -> Result<ConnectorWriteActivation, ConnectorError> {
-        let source_digest = request.validate(&self.binding_key)?;
+        let source_digest = request.validate(&self.provider_binding_key)?;
         let operation_id = request.operation_id;
         let activation = self.control.activate_write(request)?;
         activation.validate()?;
-        if activation.owner() != &self.binding_key
+        if activation.owner() != &self.provider_binding_key
             || activation.operation_id() != operation_id
             || activation.source_digest() != source_digest
         {
@@ -3627,11 +3812,11 @@ impl ConnectorWriteLease {
         &self,
         request: ConnectorPreReadyWritePlanningRequest,
     ) -> Result<ConnectorPreReadyWritePlanningProof, ConnectorError> {
-        request.validate(&self.binding_key)?;
+        request.validate(&self.provider_binding_key)?;
         let proof = self
             .control
             .certify_pre_ready_write_planning(request.clone())?;
-        proof.validates(&self.binding_key, &request)?;
+        proof.validates(&self.provider_binding_key, &request)?;
         Ok(proof)
     }
 
@@ -3639,7 +3824,9 @@ impl ConnectorWriteLease {
     /// Clones of one lease compare equal here; independently-derived leases
     /// compare equal only when they retain the same exact control capability.
     pub fn retains_same_generation(&self, other: &Self) -> bool {
-        self.binding_key == other.binding_key && Arc::ptr_eq(&self.control, &other.control)
+        self.provider_binding_key == other.provider_binding_key
+            && self.control_runtime_id == other.control_runtime_id
+            && Arc::ptr_eq(&self.control, &other.control)
     }
 
     /// Retain metadata from the same control generation as this writer.
@@ -3667,10 +3854,10 @@ impl ConnectorWriteLease {
 
     /// Materialize a declaration only through the exact generation held by
     /// this lease. A later active incarnation is deliberately unreachable.
-    pub fn execution_declaration(
+    pub fn provider_binding(
         &self,
         context: &ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+    ) -> Result<ConnectorProviderBinding, ConnectorError> {
         let distribution = self.execution_distribution.as_ref().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -3685,7 +3872,7 @@ impl ConnectorWriteLease {
         })?;
         let declaration = distribution.declaration(context)?;
         let key = declaration.binding_key();
-        if declaration.provider_id() != provider_id.as_str() || key != &self.binding_key {
+        if declaration.provider_id() != provider_id.as_str() || key != &self.provider_binding_key {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector write declaration does not match its retained binding generation",
@@ -3707,8 +3894,6 @@ impl Drop for ConnectorWriteLeaseRelease {
 }
 
 pub trait ConnectorWriteExecution: Send + Sync {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey;
-
     fn open_writer(
         &self,
         request: ConnectorOpenWriterRequest,
@@ -3782,7 +3967,7 @@ fn validate_receipt_payload(payload: &Bytes) -> Result<(), ConnectorError> {
 }
 
 fn validate_operation_cohorts(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     sealed: &ConnectorSealedWriteCohortSet,
     cohorts: &[ConnectorWriteCohortCompletion],
     require_complete: bool,
@@ -3884,7 +4069,7 @@ fn cohort_set_digest(
 
 #[allow(clippy::too_many_arguments)]
 fn attempt_completion_digest(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     cohort_id: ConnectorWriteCohortId,
     execution_id: ConnectorWriteExecutionId,
@@ -3915,7 +4100,7 @@ fn attempt_completion_digest(
 }
 
 fn operation_completion_digest(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     sealed: &ConnectorSealedWriteCohortSet,
     cohorts: &[ConnectorWriteCohortCompletion],
 ) -> [u8; 32] {
@@ -3944,7 +4129,7 @@ fn operation_completion_digest(
     hasher.finalize().into()
 }
 
-fn digest_owner(hasher: &mut Sha256, owner: &ConnectorExecutionBindingKey) {
+fn digest_owner(hasher: &mut Sha256, owner: &ConnectorProviderBindingKey) {
     digest_bytes(hasher, owner.instance_id.as_str().as_bytes());
     hasher.update(owner.incarnation.to_bytes());
 }
@@ -3958,7 +4143,12 @@ fn digest_writer(hasher: &mut Sha256, writer: &ConnectorWriterIdentity) {
     hasher.update(writer.fragment_id.to_be_bytes());
     hasher.update(writer.backend_num.to_be_bytes());
     hasher.update(writer.sink_ordinal.to_be_bytes());
-    digest_owner(hasher, &writer.binding_key);
+    digest_catalog_handle(hasher, writer.catalog_handle());
+}
+
+fn digest_catalog_handle(hasher: &mut Sha256, handle: &CatalogHandle) {
+    digest_bytes(hasher, handle.catalog_name().as_str().as_bytes());
+    hasher.update(handle.version().as_bytes());
 }
 
 fn digest_bytes(hasher: &mut Sha256, bytes: &[u8]) {
@@ -4008,7 +4198,7 @@ fn validate_input_request(request: &ConnectorWriteInputRequest) -> Result<(), Co
 }
 
 fn preparation_digest(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     table: &ConnectorTableHandle,
     target_ref: &ConnectorWriteTargetRef,
     intent: ConnectorWriteIntent,
@@ -4100,8 +4290,8 @@ mod tests {
 
     use super::*;
     use crate::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorTableObjectId,
+        CatalogVersion, ConnectorCancellation, ConnectorInstanceId, ConnectorTableObjectId,
+        ProviderBindingEpoch,
     };
 
     struct NotCancelled;
@@ -4111,11 +4301,18 @@ mod tests {
         }
     }
 
-    fn key() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn key() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("unit").expect("instance ID"),
-            incarnation: ConnectorInstanceIncarnation::new(),
+            incarnation: ProviderBindingEpoch::new(),
         }
+    }
+
+    fn catalog_handle(owner: &ConnectorProviderBindingKey) -> CatalogHandle {
+        CatalogHandle::new(
+            owner.instance_id.clone(),
+            CatalogVersion::from_bytes([1; 32]),
+        )
     }
 
     fn writer() -> ConnectorWriterIdentity {
@@ -4128,12 +4325,12 @@ mod tests {
             4,
             5,
             0,
-            key(),
+            catalog_handle(&key()),
         )
     }
 
-    fn base_facts() -> Vec<super::super::ConnectorStagedPublicationBaseFact> {
-        vec![super::super::ConnectorStagedPublicationBaseFact {
+    fn base_facts() -> Vec<super::ConnectorStagedPublicationBaseFact> {
+        vec![super::ConnectorStagedPublicationBaseFact {
             table: Arc::from("db.base"),
             object_id: ConnectorTableObjectId::try_new(Bytes::from_static(b"base-uuid"))
                 .expect("bounded base object ID"),
@@ -4492,14 +4689,13 @@ mod tests {
     fn plan_rejects_conflicting_writer_manifest() {
         let writer = writer();
         let handle = ConnectorWriterHandle::try_new(
-            writer.binding_key().clone(),
             writer.clone(),
             CONNECTOR_WRITE_CONTRACT_VERSION,
             Bytes::new(),
         )
         .expect("handle");
         let error = ConnectorWritePlan::try_new(
-            writer.binding_key().clone(),
+            key(),
             writer.operation_id(),
             writer.cohort_id(),
             writer.execution_id(),
@@ -4513,10 +4709,9 @@ mod tests {
     #[test]
     fn planning_request_requires_exact_writer_owner() {
         let writer = writer();
-        let owner = writer.binding_key().clone();
-        let table =
-            ConnectorTableHandle::try_new(writer.binding_key().instance_id.clone(), Bytes::new())
-                .expect("table handle");
+        let owner = key();
+        let table = ConnectorTableHandle::try_new(owner.instance_id.clone(), Bytes::new())
+            .expect("table handle");
         let preparation = ConnectorWritePreparation::try_new(
             owner.clone(),
             table,
@@ -4674,7 +4869,7 @@ mod tests {
         let writer = writer();
         let operation_id = writer.operation_id();
         let cohort_id = writer.cohort_id();
-        let owner = writer.binding_key().clone();
+        let owner = key();
         let report = ConnectorStagedReport::try_new(
             writer.clone(),
             CONNECTOR_WRITE_CONTRACT_VERSION,

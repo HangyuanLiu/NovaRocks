@@ -22,13 +22,13 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{
     ConnectorDataMutationExecuteRequest, ConnectorDataMutationLease,
-    ConnectorDataMutationOperation, ConnectorDataMutationPlanningRequest,
-    ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest,
-    ConnectorDataMutationResolver, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
-    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorDataMutationOperation, ConnectorDataMutationReceipt,
+    ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver, ConnectorError,
+    ConnectorErrorKind, ConnectorInstanceId, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorRequestContext,
+    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 
 use crate::common::engine_error::EngineError;
@@ -256,8 +256,7 @@ impl DataMutationSession {
             .map_err(|error| ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Planning(error),
             })?;
-        if metadata.identity != table || metadata.table.owner() != &lease.binding_key().instance_id
-        {
+        if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
             return Err(contract_failure(
                 ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -271,20 +270,11 @@ impl DataMutationSession {
                 failure: KnownUncommittedDataMutation::Planning(error),
             }
         })?;
-        let request = ConnectorDataMutationPlanningRequest::try_new(
-            operation_id,
-            lease.binding_key().clone(),
-            operation,
-            context.clone(),
-        )
-        .map_err(|error| ResolvedDataMutation::KnownUncommitted {
-            failure: KnownUncommittedDataMutation::Planning(error),
-        })?;
-        let plan = lease.plan_mutation(request).map_err(|error| {
-            ResolvedDataMutation::KnownUncommitted {
+        let plan = lease
+            .plan_operation(operation_id, operation, context.clone())
+            .map_err(|error| ResolvedDataMutation::KnownUncommitted {
                 failure: KnownUncommittedDataMutation::Planning(error),
-            }
-        })?;
+            })?;
         Ok(Self {
             lease,
             table,
@@ -467,11 +457,12 @@ mod tests {
     use arrow::datatypes::Schema;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorDataMutation, ConnectorDataMutationPlan,
-        ConnectorDataMutationPlanSummary, ConnectorExecutionBindingKey,
-        ConnectorInstanceDescriptor, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-        ConnectorMetadata, ConnectorNamespaceRequest, ConnectorProviderId, ConnectorTableMetadata,
-        ConnectorTablePlanningFacts,
+        ConnectorCancellation, ConnectorControlRuntimeId, ConnectorDataMutation,
+        ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
+        ConnectorDataMutationPlanningRequest, ConnectorInstanceDescriptor,
+        ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+        ConnectorProviderBindingKey, ConnectorProviderId, ConnectorTableMetadata,
+        ConnectorTablePlanningFacts, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -497,7 +488,8 @@ mod tests {
 
     struct FakeProvider {
         descriptor: ConnectorInstanceDescriptor,
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
         mode: Mode,
         metadata_calls: AtomicUsize,
         plan_calls: AtomicUsize,
@@ -515,10 +507,11 @@ mod tests {
             };
             Arc::new(Self {
                 descriptor,
-                key: ConnectorExecutionBindingKey {
+                key: ConnectorProviderBindingKey {
                     instance_id,
-                    incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+                    incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
                 },
+                control_runtime_id: ConnectorControlRuntimeId::from_bytes([8; 16]),
                 mode,
                 metadata_calls: AtomicUsize::new(0),
                 plan_calls: AtomicUsize::new(0),
@@ -610,7 +603,7 @@ mod tests {
             &self.descriptor
         }
 
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
 
@@ -743,7 +736,8 @@ mod tests {
             let releases = self.releases.clone();
             ConnectorDataMutationLease::new(
                 self.provider.descriptor.clone(),
-                self.provider.key.clone(),
+                self.provider.control_runtime_id,
+                self.provider.key.incarnation,
                 self.provider.clone(),
                 self.provider.clone(),
                 move || {
@@ -754,7 +748,7 @@ mod tests {
 
         fn acquire_exact_data_mutation(
             &self,
-            _key: &ConnectorExecutionBindingKey,
+            _control_runtime_id: ConnectorControlRuntimeId,
         ) -> Result<ConnectorDataMutationLease, ConnectorError> {
             unreachable!()
         }
@@ -775,7 +769,7 @@ mod tests {
 
         fn acquire_exact_data_mutation(
             &self,
-            _key: &ConnectorExecutionBindingKey,
+            _control_runtime_id: ConnectorControlRuntimeId,
         ) -> Result<ConnectorDataMutationLease, ConnectorError> {
             unreachable!()
         }

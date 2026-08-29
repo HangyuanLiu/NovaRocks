@@ -24,12 +24,14 @@
 //! equivalence adapters are implemented.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{Array, Int64Array, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{
-    ConnectorBatchWriter, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
+    CatalogHandle, CatalogWriteExecution, CatalogWriteExecutionBundle,
+    CatalogWriteExecutionBundleFactory, ConnectorBatchWriter, ConnectorError, ConnectorErrorKind,
     ConnectorOpenWriterRequest, ConnectorStagedReport, ConnectorStagedReportSummary,
     ConnectorWriteExecution, ConnectorWriterTerminalState,
 };
@@ -65,30 +67,91 @@ use crate::write_codec::{
 /// BE execution capability rooted only in process-startup storage bindings.
 #[derive(Clone)]
 pub struct IcebergDataWriteExecution {
-    key: ConnectorExecutionBindingKey,
     binding: IcebergReadBinding,
     runtime: IcebergExecutionRuntime,
 }
 
 impl IcebergDataWriteExecution {
-    pub fn new(
-        key: ConnectorExecutionBindingKey,
+    pub fn new(binding: IcebergReadBinding, runtime: IcebergExecutionRuntime) -> Self {
+        Self { binding, runtime }
+    }
+}
+
+/// Catalog-keyed worker writer capability. The backend obtains this value only
+/// from a query lease for the exact catalog handle; unlike the legacy
+/// generation binding, it is not selected from the process-wide execution
+/// host. Existing writer identity stays in the opaque request because it owns
+/// operation/cohort reporting, not catalog runtime selection.
+#[derive(Clone)]
+pub struct IcebergCatalogWriteExecution {
+    catalog_handle: CatalogHandle,
+    binding: IcebergReadBinding,
+    runtime: IcebergExecutionRuntime,
+}
+
+impl IcebergCatalogWriteExecution {
+    fn new(
+        catalog_handle: CatalogHandle,
         binding: IcebergReadBinding,
         runtime: IcebergExecutionRuntime,
     ) -> Self {
         Self {
-            key,
+            catalog_handle,
             binding,
             runtime,
         }
     }
 }
 
-impl ConnectorWriteExecution for IcebergDataWriteExecution {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
-        &self.key
+impl CatalogWriteExecution for IcebergCatalogWriteExecution {
+    fn catalog_handle(&self) -> &CatalogHandle {
+        &self.catalog_handle
     }
 
+    fn open_writer(
+        &self,
+        request: ConnectorOpenWriterRequest,
+    ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+        if request.handle.writer().catalog_handle() != &self.catalog_handle {
+            return Err(error(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg connector writer handle does not belong to this exact query-leased catalog",
+            ));
+        }
+        IcebergDataWriteExecution::new(self.binding.clone(), self.runtime.clone())
+            .open_writer(request)
+    }
+}
+
+/// Startup-sealed provider factory for catalog-keyed Iceberg writers.
+#[derive(Clone)]
+pub struct IcebergCatalogWriteExecutionFactory {
+    binding: IcebergReadBinding,
+    runtime: IcebergExecutionRuntime,
+}
+
+impl IcebergCatalogWriteExecutionFactory {
+    pub fn new(binding: IcebergReadBinding, runtime: IcebergExecutionRuntime) -> Self {
+        Self { binding, runtime }
+    }
+}
+
+impl CatalogWriteExecutionBundleFactory for IcebergCatalogWriteExecutionFactory {
+    fn build(
+        &self,
+        catalog_handle: &CatalogHandle,
+    ) -> Result<CatalogWriteExecutionBundle, ConnectorError> {
+        Ok(CatalogWriteExecutionBundle::new(Arc::new(
+            IcebergCatalogWriteExecution::new(
+                catalog_handle.clone(),
+                self.binding.clone(),
+                self.runtime.clone(),
+            ),
+        )))
+    }
+}
+
+impl ConnectorWriteExecution for IcebergDataWriteExecution {
     fn open_writer(
         &self,
         request: ConnectorOpenWriterRequest,
@@ -103,13 +166,6 @@ impl ConnectorWriteExecution for IcebergDataWriteExecution {
             return Err(error(
                 ConnectorErrorKind::DeadlineExceeded,
                 "connector writer open deadline elapsed",
-            ));
-        }
-        if request.handle.owner() != &self.key || request.handle.writer().binding_key() != &self.key
-        {
-            return Err(error(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg connector writer handle does not belong to this exact BE binding",
             ));
         }
         match write_handle_mode(request.handle.payload())

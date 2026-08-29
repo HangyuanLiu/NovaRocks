@@ -72,6 +72,7 @@ pub fn connector_query_binding_from_materialization(
                 snapshot_id,
                 QueryScanMaterialization {
                     table: materialization.read_table.clone(),
+                    catalog_handle: materialization.catalog_handle.clone(),
                     schema: materialization.read_schema.clone(),
                     selector: novarocks_spi::connector::ConnectorReadSelector::SnapshotId(
                         snapshot_id,
@@ -88,6 +89,7 @@ pub fn connector_query_binding_from_materialization(
         admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
         scan_materialization: Some(QueryScanMaterialization {
             table: materialization.read_table,
+            catalog_handle: materialization.catalog_handle,
             schema: materialization.read_schema,
             selector: materialization.read_selector,
             statistics_pin: materialization.statistics_pin,
@@ -582,6 +584,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             admission: QueryTableBindingAdmission::Exact(materialization.planning_lease.clone()),
             scan_materialization: Some(QueryScanMaterialization {
                 table: materialization.read_table,
+                catalog_handle: materialization.catalog_handle,
                 schema: materialization.read_schema,
                 selector: materialization.read_selector,
                 statistics_pin: materialization.statistics_pin,

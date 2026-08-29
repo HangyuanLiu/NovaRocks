@@ -54,8 +54,8 @@ use novarocks_spi::connector::read_stack::{
     SystemTableDistribution, TupleDomain, ValueSet,
 };
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorPinnedFileSet, REWRITE_POSITION_DELETES_KIND,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
+    ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
 };
 
 use crate::file_pruning::file_may_satisfy_physical_predicates;
@@ -189,7 +189,8 @@ impl IcebergSystemRelation {
 #[derive(Clone)]
 pub struct IcebergTypedBoundary {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
+    catalog_handle: novarocks_spi::connector::CatalogHandle,
     transaction: HiveTransactionHandle,
     runtime: Arc<IcebergMetadataContext>,
     split_source_options: IcebergSplitSourceOptions,
@@ -203,13 +204,15 @@ impl IcebergTypedBoundary {
     /// observe one catalog client and one physical-table cache.
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
+        catalog_handle: novarocks_spi::connector::CatalogHandle,
         transaction: HiveTransactionHandle,
         runtime: Arc<IcebergMetadataContext>,
     ) -> Self {
         Self {
             descriptor,
             incarnation,
+            catalog_handle,
             transaction,
             runtime,
             split_source_options: IcebergSplitSourceOptions::default(),
@@ -227,7 +230,7 @@ impl IcebergTypedBoundary {
         &self.descriptor
     }
 
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    pub const fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
 
@@ -496,8 +499,8 @@ impl ProviderReadRuntime for IcebergTypedBoundary {
         &self.descriptor
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
-        self.incarnation
+    fn catalog_handle(&self) -> &novarocks_spi::connector::CatalogHandle {
+        &self.catalog_handle
     }
 
     fn transaction(&self) -> Self::Transaction {

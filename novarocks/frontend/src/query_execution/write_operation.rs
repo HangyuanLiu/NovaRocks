@@ -42,7 +42,7 @@ pub struct ConnectorWriteOperationSession {
 
 struct ConnectorWriteOperationSessionInner {
     operation_id: ConnectorWriteOperationId,
-    owner: novarocks_spi::connector::ConnectorExecutionBindingKey,
+    owner: novarocks_spi::connector::ConnectorProviderBindingKey,
     sealed: ConnectorSealedWriteCohortSet,
     cohorts: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanningTemplate>,
     lease: ConnectorWriteLease,
@@ -95,7 +95,7 @@ impl ConnectorWriteOperationSession {
         lease: ConnectorWriteLease,
     ) -> Result<Self, ConnectorError> {
         let operation_id = registration.operation_id();
-        if registration.owner() != lease.binding_key() {
+        if !lease.matches_provider_binding_key(registration.owner()) {
             return Err(invalid(
                 "connector write operation registration does not match the exact write lease",
             ));
@@ -110,7 +110,7 @@ impl ConnectorWriteOperationSession {
                 "connector write operation registration does not retain the supplied exact lease generation",
             ));
         }
-        let owner = lease.binding_key().clone();
+        let owner = registration.owner().clone();
         let mut cohorts = BTreeMap::new();
         let sealed = registration.sealed_cohorts()?;
         let mut context = None;
@@ -157,8 +157,20 @@ impl ConnectorWriteOperationSession {
         self.inner.operation_id
     }
 
-    pub fn owner(&self) -> &novarocks_spi::connector::ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &novarocks_spi::connector::ConnectorProviderBindingKey {
         &self.inner.owner
+    }
+
+    pub fn catalog_handle(
+        &self,
+    ) -> Result<novarocks_spi::connector::CatalogHandle, ConnectorError> {
+        self.inner
+            .lease
+            .catalog_properties()
+            .map(|properties| properties.handle().clone())
+            .ok_or_else(|| {
+                invalid("connector write operation has no immutable catalog runtime identity")
+            })
     }
 
     pub fn sealed(&self) -> &ConnectorSealedWriteCohortSet {
@@ -239,7 +251,7 @@ impl ConnectorWriteOperationSession {
             }
             request
         };
-        match self.inner.lease.control().abort(request)? {
+        match self.inner.lease.abort(request)? {
             ConnectorWriteAbortOutcome::KnownUncommitted { .. } => Ok(()),
             ConnectorWriteAbortOutcome::KnownCommitted { .. } => Err(invalid(
                 "connector provider reported a known-empty operation already committed",
@@ -527,7 +539,7 @@ impl ConnectorWriteOperationSession {
             completion,
             context,
         };
-        self.inner.lease.control().commit(request)
+        self.inner.lease.commit(request)
     }
 
     pub fn abort(
@@ -564,7 +576,7 @@ impl ConnectorWriteOperationSession {
             }
             request
         };
-        self.inner.lease.control().abort(request)
+        self.inner.lease.abort(request)
     }
 
     pub fn reconcile(
@@ -592,7 +604,7 @@ impl ConnectorWriteOperationSession {
             evidence,
             context,
         };
-        self.inner.lease.control().reconcile(request)
+        self.inner.lease.reconcile(request)
     }
 
     /// One same-session, read-only publication adjudication for ordinary DML.
@@ -681,7 +693,6 @@ impl ConnectorWriteOperationSession {
         let manifest = attachment.manifest();
         if manifest.owner() != &self.inner.owner
             || manifest.operation_id() != self.inner.operation_id
-            || input.owner() != &self.inner.owner
             || input.operation_id() != self.inner.operation_id
             || input.cohort_id() != manifest.cohort_id()
             || input.execution_id() != manifest.execution_id()
@@ -774,15 +785,15 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorExecutionBindingKey,
-        ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
-        ConnectorExecutionProviderKind, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorRequestContext, ConnectorStagedReport, ConnectorStagedReportSummary,
-        ConnectorTableHandle, ConnectorWriteBaseVersion, ConnectorWriteControl,
-        ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-        ConnectorWriteIntent, ConnectorWritePlan, ConnectorWritePlanningRequest,
-        ConnectorWritePreparation, ConnectorWriterHandle, ConnectorWriterIdentity,
-        ConnectorWriterTerminalState, ExternalMutationFinalization,
+        CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorExecutionDistribution,
+        ConnectorInstanceId, ConnectorProviderBinding, ConnectorProviderBindingKey,
+        ConnectorProviderBindingKind, ConnectorRequestContext, ConnectorStagedReport,
+        ConnectorStagedReportSummary, ConnectorTableHandle, ConnectorWriteBaseVersion,
+        ConnectorWriteControl, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+        ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWritePlan,
+        ConnectorWritePlanningRequest, ConnectorWritePreparation, ConnectorWriterHandle,
+        ConnectorWriterIdentity, ConnectorWriterTerminalState, ExternalMutationFinalization,
+        ProviderBindingEpoch,
     };
 
     use super::*;
@@ -804,28 +815,26 @@ mod tests {
     }
 
     struct TestDistribution {
-        key: ConnectorExecutionBindingKey,
-        provider_kind: ConnectorExecutionProviderKind,
+        key: ConnectorProviderBindingKey,
+        provider_kind: ConnectorProviderBindingKind,
     }
 
     impl ConnectorExecutionDistribution for TestDistribution {
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,
-        ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+        ) -> Result<ConnectorProviderBinding, ConnectorError> {
             match self.provider_kind {
-                ConnectorExecutionProviderKind::Iceberg => ConnectorExecutionDeclaration::iceberg(
+                ConnectorProviderBindingKind::Iceberg => ConnectorProviderBinding::iceberg(
                     self.key.instance_id.as_str(),
                     self.key.incarnation.to_bytes(),
                     "session-test-binding",
                 ),
-                ConnectorExecutionProviderKind::StarRocks => {
-                    ConnectorExecutionDeclaration::starrocks(
-                        self.key.instance_id.as_str(),
-                        self.key.incarnation.to_bytes(),
-                        "session-test-binding",
-                    )
-                }
+                ConnectorProviderBindingKind::StarRocks => ConnectorProviderBinding::starrocks(
+                    self.key.instance_id.as_str(),
+                    self.key.incarnation.to_bytes(),
+                    "session-test-binding",
+                ),
             }
             .map_err(|error| {
                 ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
@@ -834,14 +843,14 @@ mod tests {
     }
 
     struct TestControl {
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         plan_calls: Arc<AtomicUsize>,
         commit_calls: Arc<AtomicUsize>,
         abort_calls: Arc<AtomicUsize>,
     }
 
     impl ConnectorWriteControl for TestControl {
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
 
@@ -858,9 +867,8 @@ mod tests {
                 .into_iter()
                 .map(|writer| {
                     ConnectorWriterHandle::try_new(
-                        self.key.clone(),
                         writer,
-                        1,
+                        CONNECTOR_WRITE_CONTRACT_VERSION,
                         Bytes::from_static(b"session-test-handle"),
                     )
                 })
@@ -907,10 +915,10 @@ mod tests {
         }
     }
 
-    fn owner() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn owner() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("session-test").expect("instance ID"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         }
     }
 
@@ -989,12 +997,13 @@ mod tests {
             abort_calls,
         });
         ConnectorWriteLease::new_with_execution_distribution(
+            novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             key.clone(),
             control,
             novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),
             Arc::new(TestDistribution {
                 key,
-                provider_kind: ConnectorExecutionProviderKind::Iceberg,
+                provider_kind: ConnectorProviderBindingKind::Iceberg,
             }),
             move || {
                 release_calls.fetch_add(1, Ordering::SeqCst);
@@ -1004,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn write_lease_rejects_execution_declaration_from_another_provider() {
+    fn write_lease_rejects_provider_binding_from_another_provider() {
         let key = owner();
         let control: Arc<dyn ConnectorWriteControl> = Arc::new(TestControl {
             key: key.clone(),
@@ -1013,19 +1022,20 @@ mod tests {
             abort_calls: Arc::new(AtomicUsize::new(0)),
         });
         let lease = ConnectorWriteLease::new_with_execution_distribution(
+            novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             key.clone(),
             control,
             novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),
             Arc::new(TestDistribution {
                 key,
-                provider_kind: ConnectorExecutionProviderKind::StarRocks,
+                provider_kind: ConnectorProviderBindingKind::StarRocks,
             }),
             || {},
         )
         .expect("exact write lease");
 
         let error = lease
-            .execution_declaration(&context())
+            .provider_binding(&context())
             .expect_err("a declaration from another provider must be rejected");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
@@ -1036,6 +1046,13 @@ mod tests {
             AttemptId::new(attempt).expect("nonzero attempt"),
         )
         .expect("query execution ID")
+    }
+
+    fn catalog_handle() -> novarocks_spi::connector::CatalogHandle {
+        novarocks_spi::connector::CatalogHandle::new(
+            owner().instance_id,
+            novarocks_spi::connector::CatalogVersion::from_bytes([1; 32]),
+        )
     }
 
     fn schedule(fragment_instance: UniqueId) -> SchedulingPlan {
@@ -1068,6 +1085,7 @@ mod tests {
             &BTreeSet::from([3]),
             operation_id,
             cohort_id,
+            catalog_handle(),
             owner(),
             execution(attempt),
         )
@@ -1121,6 +1139,7 @@ mod tests {
             fragments,
             operation_id,
             cohort_id,
+            catalog_handle(),
             owner(),
             execution(3),
         )
@@ -1182,7 +1201,7 @@ mod tests {
             3,
             8,
             0,
-            owner(),
+            catalog_handle(),
         );
         let report = ConnectorStagedReport::try_new(
             writer,
@@ -1517,7 +1536,10 @@ mod tests {
             .writer
             .as_mut()
             .expect("writer identity")
-            .connector_instance_id = "foreign-session".to_string();
+            .catalog_handle
+            .as_mut()
+            .expect("catalog handle")
+            .catalog_name = "foreign-session".to_string();
         let error = match ConnectorWriteCompletion::from_write_commits(
             session.clone(),
             [
@@ -1535,7 +1557,8 @@ mod tests {
         };
         assert!(
             error.message().contains("connector binding")
-                || error.message().contains("native owner"),
+                || error.message().contains("native owner")
+                || error.message().contains("frozen connector writer manifest"),
             "unexpected foreign-owner error: {}",
             error.message()
         );

@@ -33,7 +33,7 @@ use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadRuntime, ProviderReadSystemTableProvider, ReadRuntimeAdapter,
 };
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorProviderId,
+    CatalogHandle, ConnectorError, ConnectorInstanceDescriptor, ConnectorProviderId,
     ConnectorRequestContext,
 };
 
@@ -47,7 +47,7 @@ use crate::typed_read::{
     IcebergExecutionReadRuntime, IcebergReadSplit, IcebergRuntimeRelation,
 };
 
-/// Builds Iceberg worker readers for one installed execution binding.
+/// Builds Iceberg worker readers for one immutable catalog runtime.
 #[derive(Clone)]
 pub struct IcebergTypedProviderFactory {
     binding: IcebergReadBinding,
@@ -142,6 +142,7 @@ fn apply_reader_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_spi::connector::{CatalogVersion, ConnectorInstanceId};
 
     #[test]
     fn query_reader_policy_overrides_the_generation_default() {
@@ -161,17 +162,31 @@ mod tests {
         );
         assert!(!options.reader_options.enable_parquet_reader_page_index);
     }
+
+    #[test]
+    fn transaction_marker_is_a_fixed_width_derivative_not_catalog_identity() {
+        let handle = CatalogHandle::new(
+            ConnectorInstanceId::try_from_canonical("lake.analytics")
+                .expect("canonical catalog name"),
+            CatalogVersion::from_bytes(std::array::from_fn(|index| index as u8)),
+        );
+
+        assert_eq!(
+            catalog_transaction_marker(&handle),
+            std::array::from_fn(|index| index as u8),
+        );
+    }
 }
 
 impl ConnectorReadExecutionBundleFactory for IcebergTypedProviderFactory {
     fn build(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        catalog_handle: &CatalogHandle,
     ) -> Result<ConnectorReadExecutionBundle, ConnectorError> {
         let runtime = IcebergExecutionReadRuntime::new(
-            iceberg_descriptor(key),
-            key.incarnation,
-            HiveTransactionHandle::new(true, key.incarnation.to_bytes()),
+            iceberg_descriptor(catalog_handle),
+            catalog_handle.clone(),
+            HiveTransactionHandle::new(true, catalog_transaction_marker(catalog_handle)),
         );
 
         let adapter = ReadRuntimeAdapter::new(Arc::new(runtime));
@@ -184,13 +199,24 @@ impl ConnectorReadExecutionBundleFactory for IcebergTypedProviderFactory {
     }
 }
 
-/// Rebuild the descriptor from the Host-admitted exact binding key. The
+/// Rebuild the provider descriptor from the catalog runtime identity. The
 /// provider is static because this factory is installed only in Iceberg's
-/// sealed provider-kind slot; the key supplies the per-generation facts.
-fn iceberg_descriptor(key: &ConnectorExecutionBindingKey) -> ConnectorInstanceDescriptor {
+/// sealed provider-kind slot; only the catalog name belongs in this diagnostic
+/// descriptor. The full 32-byte content version remains in `CatalogHandle`.
+fn iceberg_descriptor(catalog_handle: &CatalogHandle) -> ConnectorInstanceDescriptor {
     ConnectorInstanceDescriptor {
         provider_id: ConnectorProviderId::parse(crate::PROVIDER_ID)
             .expect("static Iceberg provider ID is valid"),
-        instance_id: key.instance_id.clone(),
+        instance_id: catalog_handle.catalog_name().clone(),
     }
+}
+
+/// Iceberg's pre-existing transaction marker is a fixed 16-byte field, while
+/// catalog identity is the complete 32-byte content version. This value is
+/// only the marker required by the Iceberg transaction handle; all catalog
+/// lookup and relation validation use the untruncated `CatalogHandle` above.
+fn catalog_transaction_marker(catalog_handle: &CatalogHandle) -> [u8; 16] {
+    let mut marker = [0; 16];
+    marker.copy_from_slice(&catalog_handle.version().as_bytes()[..16]);
+    marker
 }

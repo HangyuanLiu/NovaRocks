@@ -37,6 +37,7 @@ use crate::catalog_application::{
 };
 use crate::catalog_attachment::CatalogAttachmentRepository;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
+use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
 use crate::common::admitted_query_context::LakePublicationRuntimePolicy;
 use crate::connector::ConnectorControlHost;
 use crate::coordinator::{FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader};
@@ -152,6 +153,7 @@ pub struct FrontendApplicationHost {
     statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
     catalog_application_port: Option<Arc<FrontendCatalogApplicationPort>>,
     catalog_controller: Option<Arc<FrontendCatalogController>>,
+    catalog_prune: Option<Arc<FrontendCatalogPruneService>>,
     view_service: Option<Arc<dyn crate::view::ViewService>>,
     table_maintenance_service: Option<Arc<dyn TableMaintenanceService>>,
     mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
@@ -185,6 +187,7 @@ pub struct FrontendQueryControlTimeouts {
     pub heartbeat_timeout_ms: u64,
     pub init_rpc_timeout_ms: u64,
     pub attach_timeout_ms: u64,
+    pub participant_fanout_max_inflight: usize,
     pub stage_rpc_timeout_ms: u64,
     pub start_rpc_timeout_ms: u64,
     pub terminal_drain_timeout_ms: u64,
@@ -199,6 +202,7 @@ impl Default for FrontendQueryControlTimeouts {
             heartbeat_timeout_ms: 5_000,
             init_rpc_timeout_ms: 5_000,
             attach_timeout_ms: 5_000,
+            participant_fanout_max_inflight: 32,
             stage_rpc_timeout_ms: 5_000,
             start_rpc_timeout_ms: 2_000,
             terminal_drain_timeout_ms: 30_000,
@@ -230,6 +234,7 @@ pub struct FrontendExecutionConfig {
     connector_split_initial_dynamic_filter_wait_cap: Duration,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     catalog_projection: CatalogProjectionConfig,
+    catalog_prune: CatalogPruneConfig,
     /// The deployment's catalog desired-state authority, selected and validated
     /// once before this application opens any runtime resource.
     ///
@@ -267,6 +272,12 @@ impl FrontendExecutionConfig {
             )
             .expect("default lake publication policy is safe"),
             catalog_projection: CatalogProjectionConfig::default(),
+            catalog_prune: CatalogPruneConfig::try_new(
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+                16,
+            )
+            .expect("default catalog prune configuration is safe"),
             // This constructor remains an in-process test convenience. Server
             // composition always replaces it with its preflighted closed input.
             catalog_desired_state_source: CatalogDesiredStateSourceInput::StaticFile(
@@ -335,6 +346,11 @@ impl FrontendExecutionConfig {
         config: CatalogProjectionConfig,
     ) -> Self {
         self.catalog_projection = config;
+        self
+    }
+
+    pub fn with_catalog_prune_config(mut self, config: CatalogPruneConfig) -> Self {
+        self.catalog_prune = config;
         self
     }
 
@@ -457,6 +473,7 @@ impl FrontendApplicationHost {
             statistics_application_port: None,
             catalog_application_port: None,
             catalog_controller: None,
+            catalog_prune: None,
             view_service: None,
             table_maintenance_service: None,
             mv_repository: None,
@@ -636,6 +653,25 @@ impl FrontendApplicationHost {
                     .await);
             }
         }
+        let catalog_prune = FrontendCatalogPruneService::new(
+            Arc::clone(
+                host.catalog_application_port
+                    .as_ref()
+                    .expect("catalog application is installed"),
+            ),
+            host.backend_topology_port(),
+            host.data_runtime.clone(),
+            execution.catalog_prune.clone(),
+        );
+        if let Err(error) = catalog_prune.start() {
+            return Err(host
+                .cleanup_open_error(FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::CatalogApplicationServiceOpen,
+                    error,
+                ))
+                .await);
+        }
+        host.catalog_prune = Some(catalog_prune);
         host.statistics_service = Some(Arc::new(FrontendStatisticsService::new()));
         let statistics = host.statistics_service();
         host.dml_service = Some(Arc::new(DmlService::new(statistics)));
@@ -1076,7 +1112,6 @@ impl FrontendApplicationHost {
                 execution.task_update_retry_policy,
                 execution.connector_split_initial_dynamic_filter_wait_cap,
                 self.backend_topology_port(),
-                Arc::clone(&self.connector_control),
                 self.data_runtime.clone(),
             )
             .map_err(FrontendApplicationError::server)?,
@@ -1175,6 +1210,15 @@ impl FrontendApplicationHost {
             }
             None => None,
         };
+        // The controller owns the durable desired-state projection. The prune
+        // worker is best effort and may be asleep between rounds, so it must
+        // not consume the whole shared cleanup deadline before the controller
+        // gets a chance to stop and unpublish that projection.
+        if let Some(prune) = self.catalog_prune.take() {
+            prune
+                .shutdown(deadline.saturating_duration_since(Instant::now()))
+                .await;
+        }
         self.catalog_application_port.take();
         self.view_service.take();
         self.mv_application_service.take();

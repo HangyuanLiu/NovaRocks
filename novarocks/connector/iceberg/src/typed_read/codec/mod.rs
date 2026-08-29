@@ -24,6 +24,7 @@
 use std::sync::Arc;
 
 use novarocks_proto_codec::FieldPath;
+use novarocks_proto_codec::catalog::encode_catalog_handle;
 use novarocks_proto_codec::connector_read::{
     CatalogTableHandle, ConnectorReadCodec, ConnectorReadCodecError, ConnectorRelation,
     ValidatedColumnHandle, ValidatedConnectorSplit, ValidatedTransactionHandle,
@@ -82,16 +83,18 @@ where
         relation: &CatalogTableHandle,
     ) -> Result<(), ConnectorReadCodecError> {
         let binding = self.adapter.binding();
-        if relation.catalog_name() != binding.descriptor().instance_id.as_str() {
+        if relation.catalog_handle().catalog_name() != binding.catalog_handle().catalog_name() {
             return Err(self.invalid(
-                FieldPath::root("catalog_table_handle").field("catalog_name"),
+                FieldPath::root("catalog_table_handle")
+                    .field("catalog_handle")
+                    .field("catalog_name"),
                 "iceberg catalog table handle names another catalog",
             ));
         }
-        if relation.instance_incarnation() != binding.incarnation().to_bytes() {
+        if relation.catalog_handle() != binding.catalog_handle() {
             return Err(self.invalid(
-                FieldPath::root("catalog_table_handle").field("instance_incarnation"),
-                "iceberg catalog table handle names another instance incarnation",
+                FieldPath::root("catalog_table_handle").field("catalog_handle"),
+                "iceberg catalog table handle names another catalog version",
             ));
         }
         Ok(())
@@ -111,14 +114,9 @@ where
         relation: dto::catalog_table_handle::Relation,
     ) -> dto::CatalogTableHandle {
         dto::CatalogTableHandle {
-            catalog_name: self
-                .adapter
-                .binding()
-                .descriptor()
-                .instance_id
-                .as_str()
-                .to_string(),
-            instance_incarnation: self.adapter.binding().incarnation().to_bytes().to_vec(),
+            catalog_handle: Some(encode_catalog_handle(
+                self.adapter.binding().catalog_handle(),
+            )),
             transaction: Some(transaction.to_transaction_handle_proto()),
             relation: Some(relation),
         }

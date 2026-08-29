@@ -278,6 +278,8 @@ pub struct QueryScanMaterialization {
     /// schema is the single projection-ordinal authority and the lease keeps
     /// the exact control generation alive until native preparation finishes.
     pub table: ConnectorTableHandle,
+    /// Exact desired-state identity of the catalog that owns `table`.
+    pub catalog_handle: novarocks_spi::connector::CatalogHandle,
     pub schema: SchemaRef,
     pub selector: ConnectorReadSelector,
     pub statistics_pin: Option<ResolvedTableStatisticsPin>,
@@ -458,7 +460,9 @@ impl QueryTableBindingStore {
                 material.push(0);
                 material.extend_from_slice(descriptor.instance_id.as_str().as_bytes());
                 material.push(0);
-                material.extend_from_slice(&lease.binding().incarnation().to_bytes());
+                // Prepared-artifact identity is fenced by the FE-local
+                // control runtime, never by the BE legacy execution key.
+                material.extend_from_slice(&lease.control_runtime_id().to_bytes());
             }
             material.push(0xff);
         }

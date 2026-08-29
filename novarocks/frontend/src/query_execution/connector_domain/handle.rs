@@ -17,38 +17,10 @@
 
 //! Catalog-scoped engine wrappers around validated connector carriers.
 
-use std::sync::Arc;
-
+use novarocks_spi::connector::CatalogHandle;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadSplit,
 };
-
-/// The catalog a relation or split belongs to.
-///
-/// Identity is the exact connector instance plus its incarnation: a handle
-/// frozen against one control generation can never be replayed into another.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct CatalogHandle {
-    instance_id: Arc<str>,
-    incarnation: [u8; 16],
-}
-
-impl CatalogHandle {
-    pub(crate) fn new(instance_id: impl AsRef<str>, incarnation: [u8; 16]) -> Self {
-        Self {
-            instance_id: Arc::from(instance_id.as_ref()),
-            incarnation,
-        }
-    }
-
-    pub(crate) fn instance_id(&self) -> &str {
-        &self.instance_id
-    }
-
-    pub(crate) const fn incarnation(&self) -> [u8; 16] {
-        self.incarnation
-    }
-}
 
 /// One relation a scan reads: catalog, connector transaction, and the concrete
 /// connector handle, already validated by the protocol layer.
@@ -121,12 +93,20 @@ impl Split {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_spi::connector::{CatalogVersion, ConnectorInstanceId};
+
+    fn handle(version: u8) -> CatalogHandle {
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("ice").expect("fixture catalog name"),
+            CatalogVersion::from_bytes([version; 32]),
+        )
+    }
 
     #[test]
-    fn a_catalog_handle_is_identified_by_instance_and_incarnation() {
-        let first = CatalogHandle::new("ice", [1; 16]);
-        let same = CatalogHandle::new("ice", [1; 16]);
-        let replaced = CatalogHandle::new("ice", [2; 16]);
+    fn a_catalog_handle_is_identified_by_name_and_immutable_version() {
+        let first = handle(1);
+        let same = handle(1);
+        let replaced = handle(2);
         assert_eq!(first, same);
         assert_ne!(first, replaced);
     }

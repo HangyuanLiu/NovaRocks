@@ -19,8 +19,8 @@
 //!
 //! The frontend cannot link a provider crate, so the server composition root
 //! installs the provider's control and split-enumeration entry points here at
-//! binding time. Resolution is keyed by the exact execution binding generation,
-//! so a stale generation can never be reached and there is no name-based
+//! catalog materialization time. Resolution is keyed by the exact catalog handle,
+//! so a stale catalog version can never be reached and there is no name-based
 //! lookup, dynamic resolver, or fallback.
 
 use std::collections::BTreeMap;
@@ -28,7 +28,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_proto_codec::connector_read::ConnectorReadCodec;
-use novarocks_spi::connector::ConnectorExecutionBindingKey;
+use novarocks_spi::connector::CatalogHandle;
 use novarocks_spi::connector::read_stack::{ConnectorReadMetadata, ConnectorReadSplitManager};
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
@@ -108,7 +108,7 @@ pub struct InstalledReadControlRegistry {
 
 #[derive(Default)]
 struct InstalledReadControlRegistryState {
-    installed: BTreeMap<ConnectorExecutionBindingKey, InstalledReadControlEntry>,
+    installed: BTreeMap<CatalogHandle, InstalledReadControlEntry>,
     next_ticket: u64,
 }
 
@@ -122,7 +122,7 @@ struct InstalledReadControlEntry {
 /// authority beyond conditionally removing the exact entry it installed.
 struct InstalledReadControlLease {
     state: Weak<Mutex<InstalledReadControlRegistryState>>,
-    key: ConnectorExecutionBindingKey,
+    key: CatalogHandle,
     ticket: u64,
 }
 
@@ -164,7 +164,7 @@ impl InstalledReadControlRegistry {
     /// replacement lease is issued for the same preserved unit.
     pub fn install_or_resolve(
         &self,
-        key: ConnectorExecutionBindingKey,
+        key: CatalogHandle,
         control: InstalledReadControl,
     ) -> Result<Arc<dyn ReadControlRegistrationLease>, ConnectorError> {
         let mut state = self.state.lock().map_err(|_| {
@@ -211,7 +211,7 @@ impl InstalledReadControlRegistry {
         Ok(lease)
     }
 
-    pub fn resolve(&self, key: &ConnectorExecutionBindingKey) -> Option<InstalledReadControl> {
+    pub fn resolve(&self, key: &CatalogHandle) -> Option<InstalledReadControl> {
         self.state
             .lock()
             .expect("installed read control registry lock")
@@ -221,7 +221,7 @@ impl InstalledReadControlRegistry {
     }
 
     /// Conditional retirement leaves a concurrent replacement untouched.
-    pub fn retire(&self, key: &ConnectorExecutionBindingKey) -> bool {
+    pub fn retire(&self, key: &CatalogHandle) -> bool {
         self.state
             .lock()
             .expect("installed read control registry lock")
@@ -231,7 +231,7 @@ impl InstalledReadControlRegistry {
     }
 }
 
-/// Frontend-owned map from an exact binding generation to its read services.
+/// Frontend-owned map from an exact catalog handle to its read services.
 #[derive(Default)]
 pub struct ConnectorReadControlRegistry {
     read_controls: InstalledReadControlRegistry,
@@ -245,16 +245,13 @@ impl ConnectorReadControlRegistry {
     /// Install the complete SPI read unit for an exact provider generation.
     pub fn install_read_control(
         &self,
-        key: ConnectorExecutionBindingKey,
+        key: CatalogHandle,
         control: InstalledReadControl,
     ) -> Result<Arc<dyn ReadControlRegistrationLease>, ConnectorError> {
         self.read_controls.install_or_resolve(key, control)
     }
 
-    pub fn resolve_read_control(
-        &self,
-        key: &ConnectorExecutionBindingKey,
-    ) -> Option<InstalledReadControl> {
+    pub fn resolve_read_control(&self, key: &CatalogHandle) -> Option<InstalledReadControl> {
         self.read_controls.resolve(key)
     }
 }
@@ -269,17 +266,15 @@ mod tests {
     use novarocks_spi::connector::read_stack::{
         ConnectorReadMetadata, ConnectorReadSplitManager, ConnectorSession, SchemaTableName,
     };
-    use novarocks_spi::connector::{
-        ConnectorError, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    };
+    use novarocks_spi::connector::{CatalogVersion, ConnectorError, ConnectorInstanceId};
 
     use super::*;
 
-    fn key(instance: &str, incarnation: u8) -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
-            instance_id: ConnectorInstanceId::try_from_canonical(instance).expect("instance id"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([incarnation; 16]),
-        }
+    fn key(instance: &str, version: u8) -> CatalogHandle {
+        CatalogHandle::new(
+            ConnectorInstanceId::try_from_canonical(instance).expect("instance id"),
+            CatalogVersion::from_bytes([version; 32]),
+        )
     }
 
     struct StubReadControl;

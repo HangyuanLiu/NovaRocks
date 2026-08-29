@@ -24,6 +24,7 @@ use novarocks_proto_codec::lifecycle::{
     ParticipantManifestDigest, ParticipantTerminalOutcome, QueryControlEvent, QueryInitOutcome,
     QueryTerminalSnapshot, QueryTerminationReason, StageDigest, TerminalOutcomeContentId,
 };
+use novarocks_spi::connector::CatalogProperties;
 use novarocks_types::UniqueId;
 use prost::Message;
 
@@ -43,6 +44,17 @@ pub(crate) enum QueryLifecyclePhase {
     TerminalRetained,
     Terminating,
     Tombstone,
+}
+
+/// Catalog materialization is a substate of one immutable query attempt, not
+/// a second query lifecycle.  The exact properties remain frozen in the
+/// manifest; this state only records whether their BE-local references are
+/// ready for Stage admission.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum QueryCatalogLoadState {
+    Ready,
+    Loading { catalogs: Vec<CatalogProperties> },
+    Failed { safe_detail: String },
 }
 
 pub(crate) struct QueryLifecycleEntry {
@@ -101,6 +113,7 @@ pub(crate) struct QueryLifecycleEntryState {
     pub(crate) phase: QueryLifecyclePhase,
     pub(crate) init_outcome: Option<QueryInitOutcome>,
     pub(crate) termination_reason: Option<QueryTerminationReason>,
+    pub(crate) catalog_load: QueryCatalogLoadState,
     /// Published with a successful Init and owned by this full execution
     /// attempt. No process-global context owns a second Service.
     pub(crate) runtime_filter: Option<Arc<RuntimeFilterParticipant>>,
@@ -182,6 +195,7 @@ impl QueryLifecycleEntry {
                 phase: QueryLifecyclePhase::Initializing,
                 init_outcome: None,
                 termination_reason: None,
+                catalog_load: QueryCatalogLoadState::Ready,
                 runtime_filter: None,
                 runtime_filter_installed: false,
                 runtime_filter_close_in_flight: false,

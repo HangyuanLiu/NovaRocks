@@ -32,21 +32,21 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::{
-    ConnectorDistributedRewrite, ConnectorDistributedRewriteAttemptCheckpoint,
-    ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewriteCohortPlan,
-    ConnectorDistributedRewriteOperation, ConnectorDistributedRewritePlan,
-    ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
-    ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorFrozenRewriteGroup,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorPinnedFileSet, ConnectorRequestContext, ConnectorRewriteCohortRead,
-    ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorTableHandle,
-    ConnectorWriteActivation, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
-    ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
-    ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
-    ConnectorWritePreparation, ConnectorWriteReceipt, ConnectorWriteTargetRef,
-    ConnectorWriterIdentity, ConnectorWriterTerminalState, REWRITE_DATA_FILES_KIND,
-    REWRITE_POSITION_DELETES_KIND,
+    CatalogHandle, CatalogVersion, ConnectorDistributedRewrite,
+    ConnectorDistributedRewriteAttemptCheckpoint, ConnectorDistributedRewriteAttemptDisposition,
+    ConnectorDistributedRewriteCohortPlan, ConnectorDistributedRewriteOperation,
+    ConnectorDistributedRewritePlan, ConnectorDistributedRewritePlanSummary,
+    ConnectorDistributedRewritePlanningRequest, ConnectorDistributedRewriteReceipt,
+    ConnectorDistributedRewriteReceiptSummary, ConnectorError, ConnectorErrorKind,
+    ConnectorFrozenRewriteGroup, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorPinnedFileSet, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorRewriteCohortRead, ConnectorStagedReport, ConnectorStagedReportSummary,
+    ConnectorTableHandle, ConnectorWriteActivation, ConnectorWriteAttemptCompletion,
+    ConnectorWriteBaseVersion, ConnectorWriteCohortId, ConnectorWriteControl,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
+    ConnectorWriteIntent, ConnectorWritePreparation, ConnectorWriteReceipt,
+    ConnectorWriteTargetRef, ConnectorWriterIdentity, ConnectorWriterTerminalState,
+    ProviderBindingEpoch, REWRITE_DATA_FILES_KIND, REWRITE_POSITION_DELETES_KIND,
 };
 
 use crate::commit::write_control::{
@@ -61,7 +61,7 @@ use crate::scan_model::{
     IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat, IcebergDeleteFileInfo,
 };
 
-pub(crate) const ARTIFACT_VERSION: u16 = 1;
+pub(crate) const ARTIFACT_VERSION: u16 = 2;
 pub(crate) const GROUP_PAYLOAD_VERSION: u16 = 1;
 pub(crate) const REWRITE_ARTIFACT_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const REWRITE_ARTIFACT_MAX_GROUPS: usize = 4096;
@@ -70,7 +70,7 @@ pub(crate) const REWRITE_ARTIFACT_MAX_PART_BYTES: usize = 1024 * 1024;
 pub(crate) const REWRITE_ARTIFACT_MAX_ROOT_BYTES: usize = 64 * 1024;
 
 const ATTEMPT_ARTIFACT_MAGIC: &[u8; 8] = b"NRRWAT01";
-const ATTEMPT_ARTIFACT_VERSION: u16 = 1;
+const ATTEMPT_ARTIFACT_VERSION: u16 = 2;
 const GROUP_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.group.v1\0";
 const STATE_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.state.v1\0";
 
@@ -92,7 +92,7 @@ struct PlannedRewrite {
 
 /// Complete distributed-rewrite capability for one provider generation.
 pub struct IcebergDistributedRewriteControl {
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
     runtime: Arc<IcebergMetadataContext>,
     provider: Arc<IcebergMetadata>,
@@ -103,12 +103,12 @@ pub struct IcebergDistributedRewriteControl {
 impl IcebergDistributedRewriteControl {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         runtime: Arc<IcebergMetadataContext>,
         provider: Arc<IcebergMetadata>,
         write: Arc<IcebergWriteControl>,
     ) -> Result<Self, ConnectorError> {
-        let key = ConnectorExecutionBindingKey {
+        let key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation,
         };
@@ -312,7 +312,7 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -975,7 +975,7 @@ fn bounded_groups(
 
 #[allow(clippy::too_many_arguments)]
 fn cohort_plans_from_artifact(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     request: &ConnectorDistributedRewritePlanningRequest,
     artifact_digest: [u8; 32],
     artifact_location: &str,
@@ -1052,7 +1052,7 @@ fn cohort_plans_from_artifact(
 }
 
 fn rewrite_preparation(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     request: &ConnectorDistributedRewritePlanningRequest,
     intent: ConnectorWriteIntent,
     scan_schema: &Schema,
@@ -1135,7 +1135,7 @@ fn rewrite_preparation(
 }
 
 fn partition_source_bindings(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     table: &ConnectorTableHandle,
     intent: ConnectorWriteIntent,
     metadata: &crate::iceberg::spec::TableMetadata,
@@ -1177,7 +1177,7 @@ fn partition_source_bindings(
 }
 
 fn rewrite_field_token(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     table: &ConnectorTableHandle,
     intent: ConnectorWriteIntent,
     ordinal: usize,
@@ -1642,7 +1642,7 @@ fn put_blob(out: &mut Vec<u8>, value: &[u8]) -> Result<(), ConnectorError> {
 
 fn put_binding_key(
     out: &mut Vec<u8>,
-    key: &ConnectorExecutionBindingKey,
+    key: &ConnectorProviderBindingKey,
 ) -> Result<(), ConnectorError> {
     let instance = key.instance_id.as_str().as_bytes();
     let length = u16::try_from(instance.len())
@@ -1669,7 +1669,17 @@ fn put_writer(out: &mut Vec<u8>, writer: &ConnectorWriterIdentity) -> Result<(),
     out.extend_from_slice(&writer.fragment_id().to_be_bytes());
     out.extend_from_slice(&writer.backend_num().to_be_bytes());
     put_u32(out, writer.sink_ordinal());
-    put_binding_key(out, writer.binding_key())
+    put_catalog_handle(out, writer.catalog_handle())
+}
+
+fn put_catalog_handle(out: &mut Vec<u8>, handle: &CatalogHandle) -> Result<(), ConnectorError> {
+    let name = handle.catalog_name().as_str().as_bytes();
+    let length = u16::try_from(name.len())
+        .map_err(|_| exhausted("Iceberg rewrite catalog name exceeds u16 width"))?;
+    out.extend_from_slice(&length.to_be_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(handle.version().as_bytes());
+    Ok(())
 }
 
 struct AttemptCursor<'a> {
@@ -1727,14 +1737,24 @@ impl<'a> AttemptCursor<'a> {
         Ok(Bytes::copy_from_slice(self.take_exact(length)?))
     }
 
-    fn take_binding_key(&mut self) -> Result<ConnectorExecutionBindingKey, ConnectorError> {
+    fn take_binding_key(&mut self) -> Result<ConnectorProviderBindingKey, ConnectorError> {
         let length = self.take_u16()? as usize;
         let instance = std::str::from_utf8(self.take_exact(length)?)
             .map_err(|_| invalid("Iceberg rewrite instance ID is not UTF-8"))?;
-        Ok(ConnectorExecutionBindingKey {
+        Ok(ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse(instance)?,
-            incarnation: ConnectorInstanceIncarnation::from_bytes(self.take_array()?),
+            incarnation: ProviderBindingEpoch::from_bytes(self.take_array()?),
         })
+    }
+
+    fn take_catalog_handle(&mut self) -> Result<CatalogHandle, ConnectorError> {
+        let length = self.take_u16()? as usize;
+        let instance = std::str::from_utf8(self.take_exact(length)?)
+            .map_err(|_| invalid("Iceberg rewrite catalog name is not UTF-8"))?;
+        Ok(CatalogHandle::new(
+            ConnectorInstanceId::parse(instance)?,
+            CatalogVersion::from_bytes(self.take_array()?),
+        ))
     }
 
     fn take_execution_id(
@@ -1755,7 +1775,7 @@ impl<'a> AttemptCursor<'a> {
             i32::from_be_bytes(self.take_array()?),
             i32::from_be_bytes(self.take_array()?),
             self.take_u32()?,
-            self.take_binding_key()?,
+            self.take_catalog_handle()?,
         ))
     }
 }
@@ -2224,9 +2244,9 @@ mod tests {
 
     #[test]
     fn attempt_artifact_round_trips_exact_writer_reports() {
-        let owner = ConnectorExecutionBindingKey {
+        let owner = ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("iceberg.rewrite").unwrap(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([9; 16]),
         };
         let operation = novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([7; 16]);
         let cohort = ConnectorWriteCohortId::from_bytes([8; 32]);
@@ -2240,9 +2260,12 @@ mod tests {
                 4,
                 2,
                 1,
-                owner.clone(),
+                CatalogHandle::new(
+                    owner.instance_id.clone(),
+                    CatalogVersion::from_bytes([1; 32]),
+                ),
             ),
-            1,
+            novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
             ConnectorWriterTerminalState::Staged,
             ConnectorStagedReportSummary {
                 input_rows: 11,

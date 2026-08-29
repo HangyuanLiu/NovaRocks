@@ -22,7 +22,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::connector::ConnectorRegistry;
 use crate::fragment::decode::expression::NativeExpressionInputLayout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
@@ -35,7 +34,7 @@ use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{common, expr};
-use novarocks_spi::connector::{ConnectorCancellation, ConnectorExecutionResolver};
+use novarocks_spi::connector::ConnectorCancellation;
 use novarocks_types::QueryId;
 
 use crate::fragment::decode::plan::error::{
@@ -49,7 +48,8 @@ use crate::fragment::decode::plan::layout::Layout;
 /// not keep growing one parameter at a time.
 #[derive(Clone)]
 pub(crate) struct TypedScanRuntime {
-    read_executions: Arc<crate::connector::typed_registry::InstalledReadExecutionRegistry>,
+    catalog_read_execution: CatalogReadExecutionResolver,
+    catalog_write_execution: CatalogWriteExecutionResolver,
     queues: Arc<
         novarocks_execution::connector::TaskAttemptSplitQueues<
             crate::fragment::ingress::ReceivedReadSplit,
@@ -75,9 +75,31 @@ pub(crate) type RuntimeFilterSessionResolver = Arc<
         + Sync,
 >;
 
+/// Resolves one typed reader only through this attempt's query-leased immutable
+/// catalog runtime. It intentionally cannot look through retained BE catalog
+/// cache entries or re-install a provider runtime during fragment decode.
+pub(crate) type CatalogReadExecutionResolver = Arc<
+    dyn Fn(
+            &novarocks_spi::connector::CatalogHandle,
+        ) -> Result<crate::connector::typed_registry::InstalledReadExecution, String>
+        + Send
+        + Sync,
+>;
+
+/// Resolves one writer only through this attempt's query-leased immutable
+/// catalog runtime.
+pub(crate) type CatalogWriteExecutionResolver = Arc<
+    dyn Fn(
+            &novarocks_spi::connector::CatalogHandle,
+        ) -> Result<crate::connector::typed_registry::InstalledWriteExecution, String>
+        + Send
+        + Sync,
+>;
+
 impl TypedScanRuntime {
     pub(crate) fn new(
-        read_executions: Arc<crate::connector::typed_registry::InstalledReadExecutionRegistry>,
+        catalog_read_execution: CatalogReadExecutionResolver,
+        catalog_write_execution: CatalogWriteExecutionResolver,
         queues: Arc<
             novarocks_execution::connector::TaskAttemptSplitQueues<
                 crate::fragment::ingress::ReceivedReadSplit,
@@ -88,7 +110,8 @@ impl TypedScanRuntime {
         read_context: Arc<crate::fragment::ingress::TypedReadAttemptContext>,
     ) -> Self {
         Self {
-            read_executions,
+            catalog_read_execution,
+            catalog_write_execution,
             queues,
             session,
             runtime_filter,
@@ -96,10 +119,18 @@ impl TypedScanRuntime {
         }
     }
 
-    pub(crate) fn read_executions(
+    pub(crate) fn catalog_read_execution(
         &self,
-    ) -> Arc<crate::connector::typed_registry::InstalledReadExecutionRegistry> {
-        Arc::clone(&self.read_executions)
+        handle: &novarocks_spi::connector::CatalogHandle,
+    ) -> Result<crate::connector::typed_registry::InstalledReadExecution, String> {
+        (self.catalog_read_execution)(handle)
+    }
+
+    pub(crate) fn catalog_write_execution(
+        &self,
+        handle: &novarocks_spi::connector::CatalogHandle,
+    ) -> Result<crate::connector::typed_registry::InstalledWriteExecution, String> {
+        (self.catalog_write_execution)(handle)
     }
 
     pub(crate) fn queues(
@@ -143,8 +174,6 @@ pub(crate) struct NativePlanDecodeContext {
     raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
     captured_scan_ranges: RefCell<BTreeMap<FragmentNodeId, BoundScanRanges>>,
     query_options: Option<QueryOptions>,
-    connectors: Option<Arc<ConnectorRegistry>>,
-    execution_resolver: Option<Arc<dyn ConnectorExecutionResolver>>,
     connector_cancellation: Option<Arc<dyn ConnectorCancellation>>,
     query_id: Option<QueryId>,
     fragment_instance_id: FragmentInstanceId,
@@ -162,8 +191,6 @@ impl Default for NativePlanDecodeContext {
             raw_scan_ranges: BTreeMap::new(),
             captured_scan_ranges: RefCell::new(BTreeMap::new()),
             query_options: None,
-            connectors: None,
-            execution_resolver: None,
             connector_cancellation: None,
             query_id: None,
             fragment_instance_id: FragmentInstanceId::new(novarocks_types::UniqueId::new(0, 0)),
@@ -183,8 +210,6 @@ impl NativePlanDecodeContext {
         exchange_inputs: ExchangeInputAssignments,
         raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
         query_options: QueryOptions,
-        connectors: Arc<ConnectorRegistry>,
-        execution_resolver: Arc<dyn ConnectorExecutionResolver>,
         connector_cancellation: Arc<dyn ConnectorCancellation>,
         query_id: QueryId,
         fragment_instance_id: FragmentInstanceId,
@@ -195,8 +220,6 @@ impl NativePlanDecodeContext {
             raw_scan_ranges,
             captured_scan_ranges: RefCell::new(BTreeMap::new()),
             query_options: Some(query_options),
-            connectors: Some(connectors),
-            execution_resolver: Some(execution_resolver),
             connector_cancellation: Some(connector_cancellation),
             query_id: Some(query_id),
             fragment_instance_id,
@@ -285,28 +308,6 @@ impl NativePlanDecodeContext {
         self.fragment_instance_id
     }
 
-    pub(crate) fn connectors(&self) -> Result<&ConnectorRegistry, NativeFragmentLeafDecodeError> {
-        self.connectors.as_deref().ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                novarocks_proto_codec::ProtocolErrorKind::MissingField,
-                "connector_registry",
-                "native ScanNode requires ConnectorRegistry in NativePlanDecodeContext",
-            )
-        })
-    }
-
-    pub(crate) fn execution_resolver(
-        &self,
-    ) -> Result<&dyn ConnectorExecutionResolver, NativeFragmentLeafDecodeError> {
-        self.execution_resolver.as_deref().ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                novarocks_proto_codec::ProtocolErrorKind::MissingField,
-                "connector_execution_resolver",
-                "native ConnectorReadSource requires a query-scoped execution resolver",
-            )
-        })
-    }
-
     pub(crate) fn connector_cancellation(
         &self,
     ) -> Result<Arc<dyn ConnectorCancellation>, NativeFragmentLeafDecodeError> {
@@ -314,7 +315,7 @@ impl NativePlanDecodeContext {
             NativeFragmentLeafDecodeError::at_field(
                 novarocks_proto_codec::ProtocolErrorKind::MissingField,
                 "connector_cancellation",
-                "native ConnectorReadSource requires an execution cancellation capability",
+                "native typed connector scan requires an execution cancellation capability",
             )
         })
     }
@@ -355,21 +356,6 @@ impl NativePlanDecodeContext {
             FragmentNodeId::new(key.node_id),
             ExchangeInputAssignment::new(count),
         )]));
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_execution_resolver(
-        mut self,
-        resolver: Arc<dyn ConnectorExecutionResolver>,
-    ) -> Self {
-        self.execution_resolver = Some(resolver);
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_connector_registry(mut self, connectors: Arc<ConnectorRegistry>) -> Self {
-        self.connectors = Some(connectors);
         self
     }
 

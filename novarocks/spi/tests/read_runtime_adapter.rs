@@ -30,8 +30,8 @@ use novarocks_spi::connector::read_stack::{
     ConnectorReadTableExecuteProcedure, ConnectorSession, Constraint, SchemaTableName, TupleDomain,
 };
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorPinnedFileSet, ConnectorProviderId,
+    CatalogHandle, CatalogVersion, ConnectorError, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorPinnedFileSet, ConnectorProviderId,
 };
 
 #[derive(Clone, Debug)]
@@ -48,7 +48,7 @@ impl ColumnHandle for BetaColumn {}
 
 struct FakeProvider<T, C> {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    catalog_handle: CatalogHandle,
     table: T,
     column: C,
     metadata_calls: AtomicUsize,
@@ -63,7 +63,10 @@ impl<T, C> FakeProvider<T, C> {
                 provider_id: ConnectorProviderId::parse("fake").expect("provider ID"),
                 instance_id: ConnectorInstanceId::parse("catalog").expect("instance ID"),
             },
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            catalog_handle: CatalogHandle::new(
+                ConnectorInstanceId::parse("catalog").expect("instance ID"),
+                CatalogVersion::from_bytes([7; 32]),
+            ),
             table,
             column,
             metadata_calls: AtomicUsize::new(0),
@@ -87,8 +90,8 @@ where
         &self.descriptor
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
-        self.incarnation
+    fn catalog_handle(&self) -> &CatalogHandle {
+        &self.catalog_handle
     }
 
     fn transaction(&self) -> Self::Transaction {}
@@ -337,7 +340,10 @@ fn binding_and_real_type_mismatch_are_rejected_before_provider_calls() {
     assert_eq!(beta_provider.metadata_calls.load(Ordering::SeqCst), before);
 
     let mut other_provider = FakeProvider::new(AlphaTable, AlphaColumn(3));
-    other_provider.incarnation = ConnectorInstanceIncarnation::from_bytes([8; 16]);
+    other_provider.catalog_handle = CatalogHandle::new(
+        ConnectorInstanceId::parse("catalog").expect("instance ID"),
+        CatalogVersion::from_bytes([8; 32]),
+    );
     let other = ReadRuntimeAdapter::new(Arc::new(other_provider));
     let error = other
         .get_column_bindings(&session(), &alpha_table)

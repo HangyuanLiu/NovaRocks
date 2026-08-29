@@ -368,13 +368,12 @@ pub(crate) fn prepare_iceberg_connector_write_with_table(
     purpose: ConnectorWriteAdmissionPurpose,
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<ConnectorWritePreparation, String> {
-    if table.owner() != &exact_lease.binding_key().instance_id {
+    if !exact_lease.matches_provider_instance(table.owner()) {
         return Err(
             "frozen Iceberg write target belongs to a different connector instance".to_string(),
         );
     }
     let outcome = exact_lease
-        .control()
         .prepare_write(ConnectorWritePreparationRequest {
             table,
             target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::parse(target_ref)
@@ -639,11 +638,9 @@ impl FrozenIcebergWriteSemanticBinding {
                     "Iceberg write topology replan has no effect-free planning proof: {error}"
                 ))
             })?;
-        proof
-            .validates(
-                self.connector_write.lease().binding_key(),
-                &self.pre_ready_planning_request,
-            )
+        self.connector_write
+            .lease()
+            .validate_pre_ready_write_planning_proof(&proof, &self.pre_ready_planning_request)
             .map_err(|error| {
                 crate::dml::error::DmlExecutionError::from(format!(
                     "Iceberg write topology replan lost its effect-free planning proof: {error}"

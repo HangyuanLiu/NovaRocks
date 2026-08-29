@@ -21,8 +21,7 @@ use crate::common::query_cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
 };
 use crate::query_execution::artifact::{
-    BackendPlacement, ConnectorBindingInstallBarrier, ConnectorBindingInstallLease,
-    FragmentScheduleDraft, ValidatedFragmentSchedule, ValidatedNativeSubmission,
+    BackendPlacement, FragmentScheduleDraft, ValidatedFragmentSchedule, ValidatedNativeSubmission,
     WriterRegistrationSet,
 };
 use crate::query_execution::contract::{
@@ -81,18 +80,6 @@ impl QueryLifecycleLeaseGuard for RecordingQueryLifecycleGuard {
             format!("{primary_error}; query lifecycle rollback completed"),
             None,
         )
-    }
-}
-
-struct NoopConnectorBindingBarrier;
-
-impl ConnectorBindingInstallBarrier for NoopConnectorBindingBarrier {
-    fn install_all(
-        &self,
-        _execution_id: novarocks_proto_codec::lifecycle::QueryExecutionId,
-        _plan: crate::query_execution::artifact::ConnectorBindingInstallPlan,
-    ) -> Result<ConnectorBindingInstallLease, DistributedQueryError> {
-        Ok(ConnectorBindingInstallLease)
     }
 }
 
@@ -329,8 +316,7 @@ fn query_control_typestate_initializes_before_native_assembly() {
         .expect("attach empty runtime-filter deployment")
         .initialize_query(options, &barrier)
         .expect("initialize query")
-        .prepare_connector_bindings(&NoopConnectorBindingBarrier)
-        .expect("install empty connector bindings");
+        .catalog_ready();
     let submission_view = ready
         .native_submission_view()
         .expect("obtain sealed native submission view");
@@ -377,7 +363,6 @@ fn query_control_typestate_initializes_before_native_assembly() {
         .query_lifecycle_lease
         .finalize()
         .expect("finalize lifecycle");
-    execution.connector_binding_lease.release();
     assert_eq!(finalizes.load(Ordering::SeqCst), 1);
 }
 

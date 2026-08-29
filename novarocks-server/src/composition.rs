@@ -25,20 +25,25 @@ use crate::state_store_limits::resolve_state_store_limits;
 use novarocks_backend::{BackendServerConfig, QueryLifecycleRegistryConfig};
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::connector_factory::IcebergConnectorFactory;
-use novarocks_connector_iceberg::file_reader::execution_installer::IcebergConnectorInstaller;
+use novarocks_connector_iceberg::file_reader::execution_installer::{
+    IcebergCatalogRuntimeMaterializer, IcebergConnectorInstaller,
+};
 use novarocks_connector_iceberg::resources::{IcebergExecutionResources, IcebergMetadataResources};
 use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStorageLakePublication,
     IcebergStorageLakeTargetSnapshotObservation, IcebergStoragePartitionTransform,
     IcebergStorageRefreshTechnique,
 };
-use novarocks_connector_starrocks::StarRocksExecutionInstaller;
+use novarocks_connector_starrocks::{
+    StarRocksCatalogRuntimeMaterializer, StarRocksExecutionInstaller,
+};
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
 use novarocks_frontend::{
-    ClusterBackendOpenConfig, FrontendExecutionConfig, FrontendQueryControlTimeouts,
-    FrontendServerConfig, LakePublicationRuntimePolicy, TaskUpdateRetryPolicy,
+    CatalogPruneConfig, ClusterBackendOpenConfig, FrontendExecutionConfig,
+    FrontendQueryControlTimeouts, FrontendServerConfig, LakePublicationRuntimePolicy,
+    TaskUpdateRetryPolicy,
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
     },
@@ -46,7 +51,7 @@ use novarocks_frontend::{
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
 use novarocks_spi::connector::{
     ConnectorControlFactory, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionInstaller, ConnectorExecutionProviderKind, ConnectorRequestContext,
+    ConnectorExecutionInstaller, ConnectorProviderBindingKind, ConnectorRequestContext,
     ConnectorTableMetadata, MvCreatedTargetObservation, MvLakeDescriptorProjection,
     MvLakePackageObservation, MvLakePublicationObservation, MvLakeTargetSnapshotObservation,
     MvMaintenanceMetadataObservation, MvObservedField, MvObservedMaintenancePolicy,
@@ -377,7 +382,7 @@ pub fn compose_backend_execution_installers(
         vec![std::sync::Arc::new(IcebergConnectorInstaller::new(
             iceberg_resources,
         ))];
-    let expected = ConnectorExecutionProviderKind::Iceberg;
+    let expected = ConnectorProviderBindingKind::Iceberg;
     let mut installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
         vec![std::sync::Arc::new(StarRocksExecutionInstaller::new())];
     for installer in &iceberg_installers {
@@ -465,11 +470,32 @@ pub fn compose_backend_server_config(
         )
         .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
-        execution_installers: compose_backend_execution_installers(config, runtime.clone())?,
+        catalog_runtime_materializers: compose_backend_catalog_runtime_materializers(
+            config,
+            runtime.clone(),
+        )?,
         read_execution_bundle_factories: compose_backend_read_execution_bundle_factories(
+            config,
+            runtime.clone(),
+        )?,
+        write_execution_bundle_factories: compose_backend_write_execution_bundle_factories(
             config, runtime,
         )?,
     })
+}
+
+/// Assemble provider-local materializers for immutable CatalogSet entries.
+/// The materializers receive only credential-free frontend properties; all
+/// credentials and I/O resources remain in this startup composition path.
+pub fn compose_backend_catalog_runtime_materializers(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<Vec<std::sync::Arc<dyn novarocks_spi::connector::CatalogRuntimeMaterializer>>> {
+    let iceberg_resources = compose_iceberg_execution_resources(config, runtime)?;
+    Ok(vec![
+        std::sync::Arc::new(StarRocksCatalogRuntimeMaterializer),
+        std::sync::Arc::new(IcebergCatalogRuntimeMaterializer::new(iceberg_resources)),
+    ])
 }
 
 /// Resolve every Frontend startup input from the application wire configuration.
@@ -499,6 +525,14 @@ pub fn compose_frontend_server_config(
         native_compatibility_id,
     )
     .with_catalog_desired_state_source(catalog_source)
+    .with_catalog_prune_config(
+        CatalogPruneConfig::try_new(
+            Duration::from_millis(runtime_config.catalog_prune_interval_ms),
+            Duration::from_millis(runtime_config.catalog_prune_rpc_timeout_ms),
+            runtime_config.catalog_prune_max_inflight,
+        )
+        .map_err(|error| anyhow::anyhow!("construct catalog prune configuration: {error}"))?,
+    )
     .with_lake_publication_runtime_policy(
         LakePublicationRuntimePolicy::try_new(
             Duration::from_millis(runtime_config.lake_publication_max_attempt_duration_ms),
@@ -518,6 +552,8 @@ pub fn compose_frontend_server_config(
         heartbeat_timeout_ms: runtime_config.query_control_heartbeat_timeout_ms,
         init_rpc_timeout_ms: runtime_config.query_control_init_rpc_timeout_ms,
         attach_timeout_ms: runtime_config.query_control_attach_timeout_ms,
+        participant_fanout_max_inflight: runtime_config
+            .query_control_participant_fanout_max_inflight,
         stage_rpc_timeout_ms: runtime_config.query_control_stage_rpc_timeout_ms,
         start_rpc_timeout_ms: runtime_config.query_control_start_rpc_timeout_ms,
         terminal_drain_timeout_ms: runtime_config.query_control_terminal_drain_timeout_ms,
@@ -729,7 +765,7 @@ pub fn compose_backend_read_execution_bundle_factories(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<
     Vec<(
-        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        novarocks_spi::connector::ConnectorProviderBindingKind,
         std::sync::Arc<dyn novarocks_backend::ConnectorReadExecutionBundleFactory>,
     )>,
 > {
@@ -743,7 +779,32 @@ pub fn compose_backend_read_execution_bundle_factories(
         ),
     );
     Ok(vec![(
-        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg,
+        novarocks_spi::connector::ConnectorProviderBindingKind::Iceberg,
+        factory,
+    )])
+}
+
+/// The worker-side catalog-keyed writer factory of every built-in provider.
+/// StarRocks contributes none because it has no native distributed writer
+/// contract; a request for one therefore fails closed during catalog lookup.
+pub fn compose_backend_write_execution_bundle_factories(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<
+    Vec<(
+        novarocks_spi::connector::ConnectorProviderBindingKind,
+        std::sync::Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
+    )>,
+> {
+    let resources = compose_iceberg_execution_resources(config, runtime)?;
+    let factory = std::sync::Arc::new(
+        novarocks_connector_iceberg::IcebergCatalogWriteExecutionFactory::new(
+            resources.binding().clone(),
+            resources.runtime().clone(),
+        ),
+    );
+    Ok(vec![(
+        novarocks_spi::connector::ConnectorProviderBindingKind::Iceberg,
         factory,
     )])
 }
@@ -816,7 +877,7 @@ mod tests {
         IcebergStorageLakeTargetSnapshotObservation, compose_backend_execution_installers,
         compose_frontend_control_factories, mv_lake_target_snapshot_observation,
     };
-    use novarocks_spi::connector::ConnectorExecutionProviderKind;
+    use novarocks_spi::connector::ConnectorProviderBindingKind;
 
     #[test]
     fn lake_target_snapshot_adapter_preserves_provider_metadata() {
@@ -855,8 +916,9 @@ mod tests {
         assert_eq!(
             installers
                 .iter()
-                .filter(|installer| installer.provider_kind()
-                    == ConnectorExecutionProviderKind::Iceberg)
+                .filter(
+                    |installer| installer.provider_kind() == ConnectorProviderBindingKind::Iceberg
+                )
                 .count(),
             1
         );

@@ -32,7 +32,7 @@ use novarocks_spi::connector::{
     ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance, ConnectorCleanupOperationId,
     ConnectorCleanupOwnedRefIdentity, ConnectorCleanupOwnedRefSelection, ConnectorCleanupPlan,
     ConnectorCleanupPlanSummary, ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorProviderBindingKey,
     PreparedBatch,
 };
 use serde::{Deserialize, Serialize};
@@ -213,7 +213,7 @@ struct CachedPlan {
 }
 
 pub struct IcebergCleanupMaintenanceAdapter {
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
     runtime: Arc<IcebergMetadataContext>,
     plans: Mutex<HashMap<ConnectorCleanupOperationId, CachedPlan>>,
@@ -221,7 +221,7 @@ pub struct IcebergCleanupMaintenanceAdapter {
 
 impl IcebergCleanupMaintenanceAdapter {
     pub fn new(
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         runtime: Arc<IcebergMetadataContext>,
     ) -> Result<Self, ConnectorError> {
         Ok(Self {
@@ -235,7 +235,7 @@ impl IcebergCleanupMaintenanceAdapter {
         })
     }
 
-    fn ensure_owner(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
+    fn ensure_owner(&self, owner: &ConnectorProviderBindingKey) -> Result<(), ConnectorError> {
         if owner != &self.key {
             return Err(invalid(
                 "Iceberg cleanup does not match the exact connector generation",
@@ -417,7 +417,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -1204,7 +1204,7 @@ fn read(
 
 fn receipt_value(
     descriptor: &ConnectorInstanceDescriptor,
-    key: &ConnectorExecutionBindingKey,
+    key: &ConnectorProviderBindingKey,
     plan: &ConnectorCleanupPlan,
     prepared: &PreparedBatch,
     location: String,
@@ -1478,9 +1478,8 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorCleanupFinalizeRequest, ConnectorCleanupOperation,
-        ConnectorCleanupPlanningRequest, ConnectorExecutionBindingKey, ConnectorInstanceId,
-        ConnectorInstanceIncarnation, ConnectorProviderId, ConnectorRequestContext,
-        ConnectorTableHandle,
+        ConnectorCleanupPlanningRequest, ConnectorInstanceId, ConnectorProviderBindingKey,
+        ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -1508,14 +1507,14 @@ mod tests {
 
     fn contract_values() -> (
         ConnectorInstanceDescriptor,
-        ConnectorExecutionBindingKey,
+        ConnectorProviderBindingKey,
         ConnectorCleanupPlan,
         PreparedBatch,
     ) {
         let instance_id = ConnectorInstanceId::parse("cleanup-test").expect("instance");
-        let key = ConnectorExecutionBindingKey {
+        let key = ConnectorProviderBindingKey {
             instance_id: instance_id.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([4; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([4; 16]),
         };
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),

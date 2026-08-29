@@ -15,23 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Provider-owned declaration for one installed Iceberg execution binding.
+//! Provider-owned binding facts for one installed Iceberg catalog runtime.
 //!
-//! The declaration is intentionally secret-free: it names a startup-composed
+//! The binding is intentionally secret-free: it names a startup-composed
 //! access binding, while credentials, catalog clients, and runtime objects
 //! remain process local to the execution installer.
 
 use std::time::Instant;
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionDeclaration,
-    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorRequestContext,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution,
+    ConnectorInstanceDescriptor, ConnectorProviderBinding, ConnectorRequestContext,
+    ProviderBindingEpoch,
 };
 
 const DEFAULT_ACCESS_BINDING: &str = "default";
 
-/// Iceberg-only facts parsed from an SPI-validated domain declaration.
+/// Iceberg-only facts parsed from an SPI-validated provider binding.
 ///
 /// This is deliberately resource-free. Installation performs this preparation
 /// before it reaches any BE-local credential, object-store, or runtime state.
@@ -46,18 +46,15 @@ impl PreparedIcebergExecutionBinding {
     }
 }
 
-/// Declaration producer for one exact Iceberg instance generation.
+/// Provider-binding producer for one exact Iceberg instance generation.
 #[derive(Clone)]
 pub struct IcebergInstanceDistribution {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
 }
 
 impl IcebergInstanceDistribution {
-    pub fn new(
-        descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
-    ) -> Self {
+    pub fn new(descriptor: ConnectorInstanceDescriptor, incarnation: ProviderBindingEpoch) -> Self {
         Self {
             descriptor,
             incarnation,
@@ -69,7 +66,7 @@ impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
     fn declaration(
         &self,
         context: &ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+    ) -> Result<ConnectorProviderBinding, ConnectorError> {
         if context.cancellation().is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
@@ -82,7 +79,7 @@ impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
                 "connector request deadline elapsed",
             ));
         }
-        ConnectorExecutionDeclaration::iceberg(
+        ConnectorProviderBinding::iceberg(
             self.descriptor.instance_id.as_str(),
             self.incarnation.to_bytes(),
             DEFAULT_ACCESS_BINDING,
@@ -90,17 +87,17 @@ impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
         .map_err(|error| {
             ConnectorError::new(
                 ConnectorErrorKind::Internal,
-                format!("build Iceberg execution declaration: {error}"),
+                format!("build Iceberg provider binding: {error}"),
             )
         })
     }
 }
 
-/// Extracts Iceberg's typed declaration facts without touching local resources.
+/// Extracts Iceberg's typed provider-binding facts without touching local resources.
 pub(crate) fn prepare_iceberg_execution_binding(
-    declaration: &ConnectorExecutionDeclaration,
+    binding: &ConnectorProviderBinding,
 ) -> Result<PreparedIcebergExecutionBinding, ConnectorError> {
-    declaration
+    binding
         .iceberg_access_binding()
         .map(|access_binding| PreparedIcebergExecutionBinding {
             access_binding: access_binding.to_string(),
@@ -108,7 +105,7 @@ pub(crate) fn prepare_iceberg_execution_binding(
         .ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "Iceberg installer received a declaration for another provider",
+                "Iceberg installer received a binding for another provider",
             )
         })
 }
@@ -134,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn declaration_carries_the_default_access_binding_in_the_domain_variant() {
+    fn binding_carries_the_default_access_binding_in_the_domain_variant() {
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").expect("valid provider ID"),
             instance_id: ConnectorInstanceId::parse("catalog").expect("valid instance ID"),
@@ -146,20 +143,18 @@ mod tests {
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .expect("valid request context");
-        let declaration = IcebergInstanceDistribution::new(
-            descriptor,
-            ConnectorInstanceIncarnation::from_bytes([7; 16]),
-        )
-        .declaration(&context)
-        .expect("declaration");
+        let binding =
+            IcebergInstanceDistribution::new(descriptor, ProviderBindingEpoch::from_bytes([7; 16]))
+                .declaration(&context)
+                .expect("provider binding");
 
         assert_eq!(
-            declaration.provider_kind(),
-            novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg
+            binding.provider_kind(),
+            novarocks_spi::connector::ConnectorProviderBindingKind::Iceberg
         );
         assert_eq!(
-            prepare_iceberg_execution_binding(&declaration)
-                .expect("typed declaration")
+            prepare_iceberg_execution_binding(&binding)
+                .expect("typed provider binding")
                 .access_binding(),
             "default"
         );
@@ -167,10 +162,10 @@ mod tests {
 
     #[test]
     fn prepare_rejects_another_provider_without_local_resources() {
-        let declaration = ConnectorExecutionDeclaration::starrocks("catalog", [7; 16], "local")
-            .expect("valid StarRocks declaration");
+        let binding = ConnectorProviderBinding::starrocks("catalog", [7; 16], "local")
+            .expect("valid StarRocks provider binding");
 
-        let error = prepare_iceberg_execution_binding(&declaration)
+        let error = prepare_iceberg_execution_binding(&binding)
             .expect_err("another provider must not prepare as Iceberg");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }

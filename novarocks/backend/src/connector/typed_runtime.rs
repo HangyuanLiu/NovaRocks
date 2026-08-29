@@ -23,7 +23,7 @@
 //! - Drives the runtime split stream: one split becomes one page source, whose
 //!   pages become `Chunk`s through the execution-owned page adapter.
 //! - Owns terminal cleanup for the page sources it opened, mirroring the
-//!   opaque `ConnectorReadScanSource` reader-group discipline.
+//!   the same explicit reader-group discipline as the retired opaque carrier.
 //!
 //! Key exported interfaces:
 //! - Types: `TypedConnectorScanSource`, `TypedConnectorScanOp`.
@@ -46,7 +46,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::connector::runtime::ConnectorBatchTransform;
+use crate::connector::batch_transform::ConnectorBatchTransform;
 use crate::fragment::decode::plan::context::RuntimeFilterSessionResolver;
 use crate::runtime_filter::typed_dynamic_filter::scan_dynamic_filter_spi;
 use novarocks_execution::connector::{
@@ -214,7 +214,7 @@ fn emit_page_source_marker(marker: &str, plan_node_id: i32, sequence_id: Option<
 struct TypedConnectorReaderMarker {
     provider_id: String,
     instance_id: String,
-    incarnation: String,
+    catalog_version: String,
     scheduled_split_sequence_id: u64,
 }
 
@@ -227,15 +227,18 @@ impl TypedConnectorReaderMarker {
         Some(Self {
             provider_id: binding.descriptor().provider_id.as_str().to_string(),
             instance_id: binding.descriptor().instance_id.as_str().to_string(),
-            incarnation: hex::encode(binding.incarnation().to_bytes()),
+            catalog_version: hex::encode(binding.catalog_handle().version().as_bytes()),
             scheduled_split_sequence_id: split.sequence_id(),
         })
     }
 
     fn emit(&self, event: &str) {
         println!(
-            "NOVAROCKS_CONNECTOR_UNIT_READER_{event} provider={} instance={} incarnation={} scheduled_split_sequence_id={}",
-            self.provider_id, self.instance_id, self.incarnation, self.scheduled_split_sequence_id,
+            "NOVAROCKS_CONNECTOR_UNIT_READER_{event} provider={} instance={} catalog_version={} scheduled_split_sequence_id={}",
+            self.provider_id,
+            self.instance_id,
+            self.catalog_version,
+            self.scheduled_split_sequence_id,
         );
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
@@ -1120,8 +1123,10 @@ pub(crate) mod test_support {
 
     pub(crate) fn catalog_table_handle() -> dto::CatalogTableHandle {
         dto::CatalogTableHandle {
-            catalog_name: "test.typed".to_owned(),
-            instance_incarnation: vec![1; 16],
+            catalog_handle: Some(novarocks_proto_models::catalog::CatalogHandle {
+                catalog_name: "test.typed".to_owned(),
+                version: vec![1; 32],
+            }),
             transaction: Some(dto::ConnectorTransactionHandle {
                 handle: Some(dto::connector_transaction_handle::Handle::Iceberg(
                     dto::HiveTransactionHandle {
@@ -1156,19 +1161,25 @@ pub(crate) mod test_support {
 
     struct FixtureRuntime {
         descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+        catalog_handle: novarocks_spi::connector::CatalogHandle,
     }
 
     impl FixtureRuntime {
         fn new() -> Self {
+            let descriptor = novarocks_spi::connector::ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("fixture")
+                    .expect("provider id"),
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::try_from_canonical(
+                    "test.typed",
+                )
+                .expect("instance id"),
+            };
             Self {
-                descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor {
-                    provider_id: novarocks_spi::connector::ConnectorProviderId::parse("fixture")
-                        .expect("provider id"),
-                    instance_id: novarocks_spi::connector::ConnectorInstanceId::try_from_canonical(
-                        "test.typed",
-                    )
-                    .expect("instance id"),
-                },
+                catalog_handle: novarocks_spi::connector::CatalogHandle::new(
+                    descriptor.instance_id.clone(),
+                    novarocks_spi::connector::CatalogVersion::from_bytes([1; 32]),
+                ),
+                descriptor,
             }
         }
     }
@@ -1182,8 +1193,8 @@ pub(crate) mod test_support {
         fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
             &self.descriptor
         }
-        fn incarnation(&self) -> novarocks_spi::connector::ConnectorInstanceIncarnation {
-            novarocks_spi::connector::ConnectorInstanceIncarnation::from_bytes([1; 16])
+        fn catalog_handle(&self) -> &novarocks_spi::connector::CatalogHandle {
+            &self.catalog_handle
         }
         fn transaction(&self) -> Self::Transaction {}
     }
@@ -1398,18 +1409,12 @@ pub(crate) mod test_support {
     /// generation `catalog_table_handle` names.
     pub(crate) fn typed_scan_runtime() -> crate::fragment::decode::plan::context::TypedScanRuntime {
         use novarocks_types::{AttemptId, QueryId};
-        let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
-            instance_id: novarocks_spi::connector::ConnectorInstanceId::try_from_canonical(
-                "test.typed",
-            )
-            .expect("canonical instance id"),
-            incarnation: novarocks_spi::connector::ConnectorInstanceIncarnation::from_bytes(
-                [1; 16],
-            ),
-        };
-        let executions =
-            std::sync::Arc::new(crate::connector::InstalledReadExecutionRegistry::default());
-        executions.install_or_resolve(key, installed_read_execution());
+        let catalog_handle = novarocks_spi::connector::CatalogHandle::new(
+            novarocks_spi::connector::ConnectorInstanceId::try_from_canonical("test.typed")
+                .expect("canonical instance id"),
+            novarocks_spi::connector::CatalogVersion::from_bytes([1; 32]),
+        );
+        let execution = installed_read_execution();
         let execution_id = novarocks_proto_codec::lifecycle::QueryExecutionId::new(
             QueryId::new(1, 2),
             AttemptId::new(1).expect("attempt"),
@@ -1431,7 +1436,14 @@ pub(crate) mod test_support {
         )
         .expect("session");
         crate::fragment::decode::plan::context::TypedScanRuntime::new(
-            executions,
+            std::sync::Arc::new(move |handle| {
+                if handle == &catalog_handle {
+                    Ok(execution.clone())
+                } else {
+                    Err("no query-leased test catalog runtime".to_owned())
+                }
+            }),
+            std::sync::Arc::new(|_| Err("no query-leased test writer runtime".to_owned())),
             queues,
             session,
             std::sync::Arc::new(|| Ok(None)),

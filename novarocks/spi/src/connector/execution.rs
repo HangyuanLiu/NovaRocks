@@ -21,8 +21,8 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorExecutionProviderKind, ConnectorOpenReaderRequest,
+    ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
+    ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderBindingKind,
     ConnectorProviderId, ConnectorRequestContext, ConnectorScanUnitDomainFacts,
     ConnectorScanUnitFactsSummary, ConnectorSplit, ConnectorWriteExecution,
 };
@@ -80,7 +80,7 @@ struct PreparedScanUnitData {
 }
 
 struct PreparedScanUnitSetInner {
-    binding_key: ConnectorExecutionBindingKey,
+    binding_key: ConnectorProviderBindingKey,
     split_id: Arc<str>,
     membership_digest: [u8; 32],
     shared_payload: Bytes,
@@ -109,7 +109,7 @@ impl std::fmt::Debug for ConnectorPreparedScanUnitSet {
 
 impl ConnectorPreparedScanUnitSet {
     pub fn try_new(
-        binding_key: ConnectorExecutionBindingKey,
+        binding_key: ConnectorProviderBindingKey,
         split: &ConnectorSplit,
         shared_payload: Bytes,
         descriptors: Vec<ConnectorPreparedScanUnitDescriptor>,
@@ -129,7 +129,7 @@ impl ConnectorPreparedScanUnitSet {
     /// observability label. This label is never part of reader authorization
     /// or membership identity and must not expose provider payload contents.
     pub fn try_new_with_preparation_evidence(
-        binding_key: ConnectorExecutionBindingKey,
+        binding_key: ConnectorProviderBindingKey,
         split: &ConnectorSplit,
         shared_payload: Bytes,
         descriptors: Vec<ConnectorPreparedScanUnitDescriptor>,
@@ -245,7 +245,7 @@ impl ConnectorPreparedScanUnitSet {
         })
     }
 
-    pub fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    pub fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.inner.binding_key
     }
 
@@ -323,7 +323,7 @@ impl ConnectorPreparedScanUnit {
         &self.inner.units[self.ordinal as usize]
     }
 
-    pub fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    pub fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.inner.binding_key
     }
 
@@ -381,7 +381,7 @@ impl ConnectorPrepareSplitRequest {
 }
 
 fn membership_digest(
-    binding_key: &ConnectorExecutionBindingKey,
+    binding_key: &ConnectorProviderBindingKey,
     split_id: &str,
     shared_payload: &Bytes,
     units: &[PreparedScanUnitData],
@@ -413,7 +413,7 @@ fn digest_bytes(hasher: &mut Sha256, value: &[u8]) {
 /// BE-only read capability. A provider implementation cannot perform metadata
 /// lookup or split planning through this trait.
 pub trait ConnectorReadExecution: Send + Sync {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey;
+    fn binding_key(&self) -> &ConnectorProviderBindingKey;
 
     fn prepare_split(
         &self,
@@ -433,7 +433,7 @@ pub trait ConnectorReadExecution: Send + Sync {
 /// a fragment carrier.
 pub struct ConnectorExecutionBinding {
     provider_id: ConnectorProviderId,
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
     read: Option<Arc<dyn ConnectorReadExecution>>,
     write: Option<Arc<dyn ConnectorWriteExecution>>,
 }
@@ -441,7 +441,7 @@ pub struct ConnectorExecutionBinding {
 impl ConnectorExecutionBinding {
     pub fn try_new(
         provider_id: ConnectorProviderId,
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         read: Arc<dyn ConnectorReadExecution>,
     ) -> Result<Self, ConnectorError> {
         Self::try_new_capabilities(provider_id, key, Some(read), None)
@@ -449,7 +449,7 @@ impl ConnectorExecutionBinding {
 
     pub fn try_new_capabilities(
         provider_id: ConnectorProviderId,
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         read: Option<Arc<dyn ConnectorReadExecution>>,
         write: Option<Arc<dyn ConnectorWriteExecution>>,
     ) -> Result<Self, ConnectorError> {
@@ -465,15 +465,6 @@ impl ConnectorExecutionBinding {
                 "connector read execution owner does not match its execution binding",
             ));
         }
-        if write
-            .as_ref()
-            .is_some_and(|write| write.binding_key() != &key)
-        {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector write execution owner does not match its execution binding",
-            ));
-        }
         Ok(Self {
             provider_id,
             key,
@@ -486,7 +477,7 @@ impl ConnectorExecutionBinding {
         &self.provider_id
     }
 
-    pub fn key(&self) -> &ConnectorExecutionBindingKey {
+    pub fn key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -503,11 +494,11 @@ impl ConnectorExecutionBinding {
 /// credential-free domain declaration and use only local process bindings for
 /// credentials and clients.
 pub trait ConnectorExecutionInstaller: Send + Sync {
-    fn provider_kind(&self) -> ConnectorExecutionProviderKind;
+    fn provider_kind(&self) -> ConnectorProviderBindingKind;
 
     fn install(
         &self,
-        declaration: &ConnectorExecutionDeclaration,
+        declaration: &ConnectorProviderBinding,
         context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionBinding, ConnectorError>;
 }
@@ -517,6 +508,6 @@ pub trait ConnectorExecutionInstaller: Send + Sync {
 pub trait ConnectorExecutionResolver: Send + Sync {
     fn resolve(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        key: &ConnectorProviderBindingKey,
     ) -> Result<Arc<ConnectorExecutionBinding>, ConnectorError>;
 }

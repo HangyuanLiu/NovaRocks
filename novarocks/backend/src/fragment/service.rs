@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use crate::connector::ConnectorRegistry;
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 use crate::runtime::sink_commit::{BackendSinkCommitPort, ConfiguredBackendSinkCommitPort};
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
@@ -37,9 +36,8 @@ use novarocks_execution::runtime::fragment::{
     FragmentCancelReason, FragmentOutcome, RunningFragmentHandle, prepare_fragment,
 };
 use novarocks_execution::runtime::profile::Profiler;
-use novarocks_proto_codec::connector::AdmittedConnectorExecutionDeclaration;
 use novarocks_proto_codec::lifecycle::{QueryExecutionId, StageFragment};
-use novarocks_spi::connector::{ConnectorExecutionBindingKey, WriteCommitEvidenceLimits};
+use novarocks_spi::connector::WriteCommitEvidenceLimits;
 use tracing::error;
 
 use super::control::{FragmentControlHandle, FragmentControlRegistry};
@@ -48,7 +46,6 @@ use super::failure_injection::start_with_configured_fragment_failure_trigger;
 use super::failure_injection::{
     FRAGMENT_EXECUTOR_FAILURE_MESSAGE, claim_configured_fragment_failure_trigger,
 };
-use crate::ConnectorExecutionHost;
 use crate::fragment::decode::request::NativeFragmentRequest;
 use crate::fragment::ingress::{
     NativeFragmentCancelRequest, NativeFragmentIngress, NativeFragmentIngressError,
@@ -146,8 +143,6 @@ pub struct NativeFragmentService {
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
     lookup_client: Arc<dyn FragmentLookupClient>,
     result_writer: Arc<dyn FragmentResultWriter>,
-    connector_registry: Arc<ConnectorRegistry>,
-    execution_host: Arc<ConnectorExecutionHost>,
     execution_runtime: Arc<ExecutionRuntime>,
     commit_port: Arc<dyn FragmentCommitPort>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
@@ -191,7 +186,6 @@ impl NativeFragmentService {
         lookup_client: Arc<dyn FragmentLookupClient>,
         result_writer: Arc<dyn FragmentResultWriter>,
         lifecycle: Arc<QueryLifecycleRegistry>,
-        connector_registry: Arc<ConnectorRegistry>,
     ) -> Self {
         Self::new_with_controls(
             exchange_transmitter,
@@ -199,8 +193,6 @@ impl NativeFragmentService {
             result_writer,
             Arc::new(FragmentControlRegistry::default()),
             lifecycle,
-            connector_registry,
-            Arc::new(ConnectorExecutionHost::empty_for_tests()),
             test_execution_runtime(),
         )
     }
@@ -215,8 +207,6 @@ impl NativeFragmentService {
         result_writer: Arc<dyn FragmentResultWriter>,
         controls: Arc<FragmentControlRegistry>,
         lifecycle: Arc<QueryLifecycleRegistry>,
-        connector_registry: Arc<ConnectorRegistry>,
-        execution_host: Arc<ConnectorExecutionHost>,
         execution_runtime: Arc<ExecutionRuntime>,
     ) -> Self {
         Self {
@@ -226,8 +216,6 @@ impl NativeFragmentService {
             exchange_transmitter,
             lookup_client,
             result_writer,
-            connector_registry,
-            execution_host,
             execution_runtime,
             commit_port: Arc::new(BackendSinkCommitPort),
             exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
@@ -275,8 +263,6 @@ impl NativeFragmentService {
             crate::fragment::native_result_writer(),
             controls,
             lifecycle,
-            Arc::new(ConnectorRegistry::new()),
-            Arc::new(ConnectorExecutionHost::empty_for_tests()),
             test_execution_runtime(),
         );
         service.lifecycle_observer = Some(Arc::new(observer));
@@ -372,8 +358,20 @@ impl NativeFragmentService {
                 .map_err(|error| format!("resolve typed scan runtime-filter session: {error}"))
         });
 
+        let lifecycle = Arc::clone(&self.lifecycle);
+        use crate::fragment::decode::plan::context::CatalogReadExecutionResolver;
+        let catalog_read_execution: CatalogReadExecutionResolver = Arc::new(move |handle| {
+            lifecycle.catalog_read_execution_for_query(execution_id, handle)
+        });
+        let lifecycle = Arc::clone(&self.lifecycle);
+        use crate::fragment::decode::plan::context::CatalogWriteExecutionResolver;
+        let catalog_write_execution: CatalogWriteExecutionResolver = Arc::new(move |handle| {
+            lifecycle.catalog_write_execution_for_query(execution_id, handle)
+        });
+
         crate::fragment::decode::plan::context::TypedScanRuntime::new(
-            self.execution_host.read_executions(),
+            catalog_read_execution,
+            catalog_write_execution,
             queues,
             session,
             runtime_filter,
@@ -581,12 +579,10 @@ impl NativeFragmentService {
                 ),
             );
             let typed_runtime = self.typed_scan_runtime(execution_id, fragment.instance_params());
-            let request = NativeFragmentRequest::try_decode_with_execution_resolver(
+            let request = NativeFragmentRequest::try_decode_with_runtime(
                 execution_id,
                 fragment.plan().clone(),
                 fragment.instance_params().clone(),
-                Arc::clone(&self.connector_registry),
-                Arc::new(self.execution_host.resolver_for(execution_id)),
                 self.queries
                     .connector_cancellation_for_execution(execution_id),
                 std::time::Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
@@ -944,21 +940,6 @@ impl NativeFragmentService {
 }
 
 impl NativeFragmentIngress for NativeFragmentService {
-    fn ensure_connector_execution_binding(
-        &self,
-        execution_id: QueryExecutionId,
-        declaration: AdmittedConnectorExecutionDeclaration,
-    ) -> novarocks_proto_codec::provider::EnsureConnectorExecutionBindingResult {
-        self.execution_host.ensure(execution_id, &declaration)
-    }
-
-    fn retire_connector_execution_binding(
-        &self,
-        key: ConnectorExecutionBindingKey,
-    ) -> novarocks_proto_codec::provider::RetireConnectorExecutionBindingResult {
-        self.execution_host.retire(&key)
-    }
-
     fn cancel(
         &self,
         request: NativeFragmentCancelRequest,
@@ -1213,12 +1194,7 @@ fn profiler_for_native_fragment(root_plan_node_id: i32) -> Profiler {
 fn test_lifecycle_registry(controls: Arc<FragmentControlRegistry>) -> Arc<QueryLifecycleRegistry> {
     QueryLifecycleRegistry::new_with_process_id(
         novarocks_types::BackendProcessId::new_v7(),
-        Arc::new(
-            crate::query_lifecycle::NativeQueryLifecycleLocalRuntime::new(
-                controls,
-                Arc::new(ConnectorExecutionHost::empty_for_tests()),
-            ),
-        ),
+        Arc::new(crate::query_lifecycle::NativeQueryLifecycleLocalRuntime::new(controls)),
         crate::query_lifecycle::QueryLifecycleRegistryConfig::new(
             4_096,
             16_384,
@@ -1249,7 +1225,6 @@ mod tests {
     use std::sync::{Arc, Mutex, mpsc};
     use std::time::{Duration, Instant};
 
-    use crate::connector::ConnectorRegistry;
     use novarocks_execution::runtime::fragment::{
         DormantFragmentHandle, FragmentOutcome, prepare_fragment,
     };
@@ -1409,7 +1384,6 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            Arc::new(ConnectorRegistry::new()),
             std::time::Duration::from_millis(120_000),
         )
         .expect("valid native fragment request")
@@ -1715,7 +1689,6 @@ mod tests {
             ),
             crate::fragment::native_result_writer(),
             test_lifecycle_registry(Arc::new(FragmentControlRegistry::default())),
-            Arc::new(ConnectorRegistry::new()),
         );
 
         let execution_id = QueryExecutionId::new(
@@ -1793,7 +1766,6 @@ mod tests {
             ),
             crate::fragment::native_result_writer(),
             test_lifecycle_registry(Arc::new(FragmentControlRegistry::default())),
-            Arc::new(ConnectorRegistry::new()),
         );
         let first = values_result_request(82_000, 82_002);
         let finst_id = first.fragment_instance_id();

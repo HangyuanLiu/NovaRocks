@@ -2,7 +2,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 const IDL_DIR: &str = "../../idl/novarocks";
-const PROTO_FILES: [&str; 6] = [
+const PROTO_FILES: [&str; 7] = [
+    "catalog.proto",
     "common.proto",
     "connector_read.proto",
     "expr.proto",

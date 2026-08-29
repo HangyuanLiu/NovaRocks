@@ -2,7 +2,7 @@ use prost::Message;
 use prost_reflect::DescriptorPool;
 
 use novarocks_proto_models::{
-    FILE_DESCRIPTOR_SET, SCHEMA_LEDGER_VERSION, common, expr, filter, novarocks, plan,
+    FILE_DESCRIPTOR_SET, SCHEMA_LEDGER_VERSION, catalog, common, expr, filter, novarocks, plan,
 };
 
 #[test]
@@ -10,6 +10,7 @@ fn generated_dtos_and_descriptor_match_the_native_schema_contract() {
     assert_eq!(SCHEMA_LEDGER_VERSION, 1);
 
     let _ = common::UniqueId::default();
+    let _ = catalog::CatalogSet::default();
     let _ = expr::Expr::default();
     let _ = filter::LookupRequest::default();
     let _ = plan::PlanFragment::default();
@@ -24,6 +25,65 @@ fn generated_dtos_and_descriptor_match_the_native_schema_contract() {
     assert!(
         pool.get_service_by_name("novarocks.NovaRocksGrpc")
             .is_some()
+    );
+}
+
+#[test]
+fn catalog_lifecycle_contract_is_carried_by_init_and_the_existing_control_stream() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let manifest = pool
+        .get_message_by_name("novarocks.ParticipantManifest")
+        .expect("ParticipantManifest descriptor");
+    let catalog_set = manifest
+        .get_field_by_name("catalog_set")
+        .expect("catalog contribution field");
+    assert_eq!(catalog_set.number(), 12);
+    assert_eq!(
+        catalog_set
+            .kind()
+            .as_message()
+            .expect("CatalogSet message")
+            .full_name(),
+        "novarocks.catalog.CatalogSet"
+    );
+
+    let ready = pool
+        .get_message_by_name("novarocks.QueryControlReady")
+        .expect("QueryControlReady descriptor");
+    assert_eq!(
+        ready
+            .get_field_by_name("catalog_load_state")
+            .expect("closed catalog state")
+            .number(),
+        1
+    );
+    let response = pool
+        .get_message_by_name("novarocks.QueryControlResponse")
+        .expect("QueryControlResponse descriptor");
+    assert_eq!(
+        response
+            .get_field_by_name("catalog_ready")
+            .expect("cold completion")
+            .number(),
+        8
+    );
+    assert_eq!(
+        response
+            .get_field_by_name("catalog_load_failed")
+            .expect("cold failure")
+            .number(),
+        9
+    );
+
+    let service = pool
+        .get_service_by_name("novarocks.NovaRocksGrpc")
+        .expect("service descriptor");
+    assert!(
+        service
+            .methods()
+            .any(|method| method.name() == "PruneCatalogs"),
+        "catalog pruning has one explicit best-effort control-plane RPC"
     );
 }
 

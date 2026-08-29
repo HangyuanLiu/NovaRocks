@@ -26,11 +26,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use novarocks_spi::connector::{
-    ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorExecutionBinding,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionInstaller,
-    ConnectorExecutionProviderKind, ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest,
-    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitSet, ConnectorProviderId,
-    ConnectorReadExecution, ConnectorRequestContext, ConnectorSplit,
+    CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogRuntime,
+    CatalogRuntimeMaterializer, ConnectorBatchReader, ConnectorError, ConnectorErrorKind,
+    ConnectorExecutionBinding, ConnectorExecutionInstaller, ConnectorOpenReaderRequest,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitSet,
+    ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderBindingKind,
+    ConnectorProviderId, ConnectorReadExecution, ConnectorRequestContext, ConnectorSplit,
 };
 
 use crate::domain::StarRocksLocalBindingRef;
@@ -38,6 +39,47 @@ use crate::{STARROCKS_PROVIDER_ID, starrocks_read_unsupported};
 
 pub struct StarRocksExecutionInstaller {
     provider_id: ConnectorProviderId,
+}
+
+/// Startup-composed materializer for the closed StarRocks catalog family.
+/// StarRocks read execution remains unsupported, but its catalog lifecycle is
+/// still explicit and keyed by the immutable catalog handle.
+#[derive(Default)]
+pub struct StarRocksCatalogRuntimeMaterializer;
+
+struct StarRocksCatalogRuntime {
+    handle: CatalogHandle,
+}
+
+impl CatalogRuntime for StarRocksCatalogRuntime {
+    fn handle(&self) -> &CatalogHandle {
+        &self.handle
+    }
+
+    fn provider_kind(&self) -> CatalogProviderKind {
+        CatalogProviderKind::StarRocks
+    }
+}
+
+impl CatalogRuntimeMaterializer for StarRocksCatalogRuntimeMaterializer {
+    fn provider_kind(&self) -> CatalogProviderKind {
+        CatalogProviderKind::StarRocks
+    }
+
+    fn materialize(
+        &self,
+        properties: &CatalogProperties,
+    ) -> Result<Arc<dyn CatalogRuntime>, ConnectorError> {
+        if properties.provider_kind() != CatalogProviderKind::StarRocks {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "StarRocks catalog materializer received another provider kind",
+            ));
+        }
+        Ok(Arc::new(StarRocksCatalogRuntime {
+            handle: properties.handle().clone(),
+        }))
+    }
 }
 
 impl StarRocksExecutionInstaller {
@@ -54,8 +96,8 @@ impl StarRocksExecutionInstaller {
     /// consumes it: an ill-formed declaration must fail here rather than
     /// survive as far as the read refusal and look like a supported binding.
     fn prepare(
-        declaration: &ConnectorExecutionDeclaration,
-    ) -> Result<ConnectorExecutionBindingKey, ConnectorError> {
+        declaration: &ConnectorProviderBinding,
+    ) -> Result<ConnectorProviderBindingKey, ConnectorError> {
         let local_binding = declaration.starrocks_local_binding().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -74,13 +116,13 @@ impl Default for StarRocksExecutionInstaller {
 }
 
 impl ConnectorExecutionInstaller for StarRocksExecutionInstaller {
-    fn provider_kind(&self) -> ConnectorExecutionProviderKind {
-        ConnectorExecutionProviderKind::StarRocks
+    fn provider_kind(&self) -> ConnectorProviderBindingKind {
+        ConnectorProviderBindingKind::StarRocks
     }
 
     fn install(
         &self,
-        declaration: &ConnectorExecutionDeclaration,
+        declaration: &ConnectorProviderBinding,
         context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionBinding, ConnectorError> {
         let key = Self::prepare(declaration)?;
@@ -100,11 +142,11 @@ impl ConnectorExecutionInstaller for StarRocksExecutionInstaller {
 /// looks at its argument, so no split payload is decoded and no reader is
 /// opened on the way to a refusal that is certain from the start.
 struct UnsupportedReadExecution {
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl ConnectorReadExecution for UnsupportedReadExecution {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -177,7 +219,7 @@ mod tests {
     fn installed() -> ConnectorExecutionBinding {
         StarRocksExecutionInstaller::new()
             .install(
-                &ConnectorExecutionDeclaration::starrocks("catalog.starrocks", [7; 16], "default")
+                &ConnectorProviderBinding::starrocks("catalog.starrocks", [7; 16], "default")
                     .expect("valid StarRocks declaration"),
                 &context(),
             )
@@ -200,7 +242,7 @@ mod tests {
     #[test]
     fn a_declaration_for_another_provider_kind_is_rejected() {
         let error = match StarRocksExecutionInstaller::new().install(
-            &ConnectorExecutionDeclaration::iceberg("catalog", [7; 16], "default")
+            &ConnectorProviderBinding::iceberg("catalog", [7; 16], "default")
                 .expect("valid foreign declaration"),
             &context(),
         ) {

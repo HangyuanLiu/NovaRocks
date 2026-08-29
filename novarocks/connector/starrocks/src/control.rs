@@ -28,13 +28,13 @@ use std::time::Instant;
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorNamespaceRequest, ConnectorProviderId, ConnectorRequestContext,
-    ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+    ConnectorProviderBinding, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest,
     ConnectorSplitPlanningResult, ConnectorTableDefinitionFacts, ConnectorTableHandle,
     ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
-    ConnectorTableRequest, StatisticsDataVersion,
+    ConnectorTableRequest, ProviderBindingEpoch, StatisticsDataVersion,
 };
 use serde::Serialize;
 
@@ -82,7 +82,7 @@ impl StarRocksControlGeneration {
             provider_id: ConnectorProviderId::parse(STARROCKS_PROVIDER_ID)?,
             instance_id: config.instance_id.clone(),
         };
-        let incarnation = ConnectorInstanceIncarnation::new();
+        let incarnation = ProviderBindingEpoch::new();
         let provider = Arc::new(Provider {
             descriptor: descriptor.clone(),
             incarnation,
@@ -102,7 +102,7 @@ impl StarRocksControlGeneration {
 
 struct Provider {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     config: StarRocksConnectorConfig,
     metadata: Arc<dyn StarRocksMetadataSource>,
 }
@@ -268,9 +268,9 @@ impl ConnectorExecutionDistribution for Provider {
     fn declaration(
         &self,
         context: &ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+    ) -> Result<ConnectorProviderBinding, ConnectorError> {
         self.active(context)?;
-        ConnectorExecutionDeclaration::starrocks(
+        ConnectorProviderBinding::starrocks(
             self.descriptor.instance_id.as_str(),
             self.incarnation.to_bytes(),
             self.config.local_binding.as_str(),
@@ -278,7 +278,7 @@ impl ConnectorExecutionDistribution for Provider {
         .map_err(|error| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                format!("build StarRocks execution declaration: {error}"),
+                format!("build StarRocks provider binding: {error}"),
             )
         })
     }
@@ -291,7 +291,7 @@ mod tests {
     use std::time::Duration;
 
     use novarocks_spi::connector::{
-        ConnectorBatchBudget, ConnectorCancellation, ConnectorExecutionProviderKind,
+        ConnectorBatchBudget, ConnectorCancellation, ConnectorProviderBindingKind,
         ConnectorReadSelector, ConnectorScanSelection, ConnectorTableObjectCaptureRequest,
         ConnectorTableObjectId, ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector,
         ConnectorTableResolution,
@@ -374,15 +374,15 @@ mod tests {
     }
 
     #[test]
-    fn execution_declaration_is_the_typed_starrocks_local_binding() {
+    fn provider_binding_is_the_typed_starrocks_local_binding() {
         let (binding, _) = binding();
         let declaration = binding
-            .execution_declaration(&context())
+            .provider_binding(&context())
             .expect("typed declaration");
 
         assert_eq!(
             declaration.provider_kind(),
-            ConnectorExecutionProviderKind::StarRocks
+            ConnectorProviderBindingKind::StarRocks
         );
         assert_eq!(declaration.starrocks_local_binding(), Some("default"));
     }

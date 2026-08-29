@@ -25,7 +25,7 @@ use novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadRelationKind, ConnectorSplit, HostAddress, SplitWeight,
 };
-use novarocks_spi::connector::{ConnectorInstanceDescriptor, ConnectorInstanceIncarnation};
+use novarocks_spi::connector::{CatalogHandle, ConnectorInstanceDescriptor};
 
 use super::{
     FilesTableSplit, IcebergChangeSplit, IcebergChangeWindowHandle, IcebergMergeTableHandle,
@@ -67,26 +67,26 @@ pub enum IcebergReadSplit {
 
 /// The backend-only half of Iceberg's read type family.
 ///
-/// It carries only the exact connector identity and the frozen transaction
-/// marker required to make opaque SPI handles coherent with the selected
-/// codec. It deliberately does not hold an `IcebergMetadataContext`, catalog
-/// client, table cache, or any other frontend planning authority.
+/// It carries only the exact immutable catalog identity and the frozen
+/// transaction marker required to make opaque SPI handles coherent with the
+/// selected codec. It deliberately does not hold an `IcebergMetadataContext`,
+/// catalog client, table cache, or any other frontend planning authority.
 #[derive(Clone, Debug)]
 pub struct IcebergExecutionReadRuntime {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    catalog_handle: CatalogHandle,
     transaction: super::HiveTransactionHandle,
 }
 
 impl IcebergExecutionReadRuntime {
     pub const fn new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        catalog_handle: CatalogHandle,
         transaction: super::HiveTransactionHandle,
     ) -> Self {
         Self {
             descriptor,
-            incarnation,
+            catalog_handle,
             transaction,
         }
     }
@@ -95,8 +95,8 @@ impl IcebergExecutionReadRuntime {
         &self.descriptor
     }
 
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
-        self.incarnation
+    pub const fn catalog_handle(&self) -> &CatalogHandle {
+        &self.catalog_handle
     }
 }
 
@@ -110,8 +110,8 @@ impl ProviderReadRuntime for IcebergExecutionReadRuntime {
         &self.descriptor
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
-        self.incarnation
+    fn catalog_handle(&self) -> &CatalogHandle {
+        &self.catalog_handle
     }
 
     fn transaction(&self) -> Self::Transaction {
@@ -172,5 +172,35 @@ impl ConnectorSplit for IcebergReadSplit {
             Self::SystemFiles(split) => split.retained_size_in_bytes(),
             Self::RewritePositionDeleteFiles(split) => split.retained_size_in_bytes(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_spi::connector::{CatalogVersion, ConnectorInstanceId, ConnectorProviderId};
+
+    #[test]
+    fn execution_runtime_retains_the_full_catalog_version() {
+        let catalog_handle = CatalogHandle::new(
+            ConnectorInstanceId::try_from_canonical("lake.analytics")
+                .expect("canonical catalog name"),
+            CatalogVersion::from_bytes(std::array::from_fn(|index| index as u8)),
+        );
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("static provider"),
+            instance_id: catalog_handle.catalog_name().clone(),
+        };
+        let runtime = IcebergExecutionReadRuntime::new(
+            descriptor,
+            catalog_handle.clone(),
+            super::super::HiveTransactionHandle::new(true, [0; 16]),
+        );
+
+        assert_eq!(runtime.catalog_handle(), &catalog_handle);
+        assert_eq!(
+            runtime.catalog_handle().version().as_bytes(),
+            &std::array::from_fn(|index| index as u8),
+        );
     }
 }

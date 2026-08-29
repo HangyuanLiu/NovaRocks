@@ -182,10 +182,10 @@ pub(crate) fn activate_first_refresh_connector_write(
     connector_context: ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
 ) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
-    if prepared.observed_binding() != exact_lease.binding_key() {
+    if !exact_lease.matches_provider_binding_key(prepared.observed_binding()) {
         return Err("MV first-refresh write lease drifted from prepared binding".to_string());
     }
-    if prepared.target_table().owner() != &exact_lease.binding_key().instance_id {
+    if !exact_lease.matches_provider_instance(prepared.target_table().owner()) {
         return Err(
             "MV first-refresh staging table belongs to a different connector instance".to_string(),
         );

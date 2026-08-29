@@ -54,17 +54,18 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    CONNECTOR_FIELD_HIDDEN_FROM_SQL, ConnectorBeginScanRequest, ConnectorChangeWindowAdmission,
-    ConnectorControlBinding, ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorExecutionProviderKind,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
-    ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorProviderId,
-    ConnectorReadPurpose, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    CONNECTOR_FIELD_HIDDEN_FROM_SQL, CatalogHandle, CatalogProperties, CatalogProviderKind,
+    CatalogVersion, ConnectorBeginScanRequest, ConnectorChangeWindowAdmission,
+    ConnectorControlBinding, ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorListTablesRequest,
+    ConnectorMetadata, ConnectorNamespaceRequest, ConnectorPredicateDisposition,
+    ConnectorPredicateDispositionKind, ConnectorProviderBinding, ConnectorProviderBindingKey,
+    ConnectorProviderBindingKind, ConnectorProviderId, ConnectorReadPurpose,
+    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableHandle,
-    ConnectorTableMetadata, ConnectorTableRequest,
+    ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
 };
 use serde::{Deserialize, Serialize};
 
@@ -470,7 +471,7 @@ fn required_physical_columns(files: &[FixtureScanFile]) -> Vec<String> {
 
 struct Fixture {
     instance_id: ConnectorInstanceId,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     files_by_table: HashMap<String, Vec<FixtureScanFile>>,
     seen_projections: Option<Arc<Mutex<Vec<Vec<usize>>>>>,
 }
@@ -541,7 +542,7 @@ impl ConnectorScanPlanning for Fixture {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let owner = ConnectorExecutionBindingKey {
+        let owner = ConnectorProviderBindingKey {
             instance_id: self.instance_id.clone(),
             incarnation: self.incarnation,
         };
@@ -711,21 +712,21 @@ fn unsupported_metadata() -> ConnectorError {
 /// Declaration producer for one exact fixture instance generation.
 struct FixtureDistribution {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
 }
 
 impl ConnectorExecutionDistribution for FixtureDistribution {
     fn declaration(
         &self,
         context: &ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
+    ) -> Result<ConnectorProviderBinding, ConnectorError> {
         if context.cancellation().is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "read fixture observed caller cancellation",
             ));
         }
-        ConnectorExecutionDeclaration::iceberg(
+        ConnectorProviderBinding::iceberg(
             self.descriptor.instance_id.as_str(),
             self.incarnation.to_bytes(),
             "fixture",
@@ -769,7 +770,9 @@ pub fn planned_files_fixture_binding_for_provider(
     seen_projections: Option<Arc<Mutex<Vec<Vec<usize>>>>>,
 ) -> ConnectorControlBinding {
     let instance_id = ConnectorInstanceId::parse(catalog).expect("fixture instance ID");
-    let incarnation = ConnectorInstanceIncarnation::from_bytes([0; 16]);
+    let catalog_handle =
+        CatalogHandle::new(instance_id.clone(), CatalogVersion::from_bytes([0; 32]));
+    let incarnation = ProviderBindingEpoch::from_bytes([0; 16]);
     let read = Arc::new(Fixture {
         instance_id: instance_id.clone(),
         incarnation,
@@ -792,6 +795,17 @@ pub fn planned_files_fixture_binding_for_provider(
         None,
     )
     .expect("fixture connector control binding")
+    .with_catalog_properties(
+        CatalogProperties::new(
+            catalog_handle,
+            CatalogProviderKind::Iceberg,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("valid fixture catalog properties"),
+    )
+    .expect("fixture catalog properties belong to the fixture binding")
 }
 
 /// Register a fixture that answers for every table name with the same units.
@@ -1438,11 +1452,11 @@ mod tests {
             .binding()
             .execution_distribution()
             .declaration(&crate::connector::test_request_context())
-            .expect("fixture execution declaration");
+            .expect("fixture provider binding");
 
         assert_eq!(
             declaration.provider_kind(),
-            ConnectorExecutionProviderKind::Iceberg
+            ConnectorProviderBindingKind::Iceberg
         );
         assert_eq!(declaration.binding_key().instance_id(), CATALOG);
     }

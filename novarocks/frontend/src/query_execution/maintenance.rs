@@ -1625,7 +1625,7 @@ fn rewrite_target_identity(
     novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::new(
         session
             .lease()
-            .binding_key()
+            .descriptor()
             .instance_id
             .as_str()
             .to_string(),

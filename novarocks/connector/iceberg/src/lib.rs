@@ -40,7 +40,6 @@ pub mod default_value;
 pub mod delete_file;
 pub mod delta;
 pub mod distributed_rewrite;
-pub mod execution_declaration;
 pub mod file_pruning;
 pub mod file_reader;
 pub mod fs_io;
@@ -55,6 +54,7 @@ pub mod metadata_read;
 pub mod planning_facts;
 pub mod position_delete;
 pub mod position_delete_descriptor;
+pub mod provider_binding;
 pub mod read_snapshot;
 pub mod reconcile_payload;
 pub mod ref_snapshot;
@@ -81,6 +81,9 @@ pub mod write_activation;
 pub mod write_codec;
 pub mod write_descriptor;
 pub mod write_payload;
+
+pub use commit::write_execution::IcebergCatalogWriteExecutionFactory;
+pub use file_reader::execution_installer::IcebergCatalogRuntimeMaterializer;
 
 pub mod iceberg {
     pub use ::iceberg::*;

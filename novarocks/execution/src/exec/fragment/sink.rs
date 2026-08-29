@@ -28,7 +28,7 @@ use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::runtime::connector_write_report::ConnectorStagedReportCollector;
 use crate::runtime::endpoint::FragmentDestination;
 use novarocks_spi::connector::{
-    ConnectorExecutionBinding, ConnectorOpenWriterRequest, StatisticsMetricRequest,
+    CatalogWriteExecution, ConnectorOpenWriterRequest, StatisticsMetricRequest,
 };
 use novarocks_types::SlotId;
 
@@ -174,12 +174,12 @@ impl DataStreamSinkFactoryInput {
 }
 
 /// Provider-neutral terminal writer.  The program carries an already-resolved
-/// BE execution binding and a FE-issued opaque handle; it has no provider
+/// query-leased catalog writer capability and a FE-issued opaque handle; it has no provider
 /// control capability and cannot commit external table state.
 #[derive(Clone)]
 pub struct ConnectorWriteSinkProgram {
     name: String,
-    binding: Arc<ConnectorExecutionBinding>,
+    execution: Arc<dyn CatalogWriteExecution>,
     request: ConnectorOpenWriterRequest,
     root_input_width: usize,
     input_ordinals: Option<Vec<usize>>,
@@ -256,7 +256,10 @@ impl std::fmt::Debug for ConnectorWriteSinkProgram {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ConnectorWriteSinkProgram")
-            .field("owner", self.request.handle.owner())
+            .field(
+                "catalog_handle",
+                self.request.handle.writer().catalog_handle(),
+            )
             .field("writer", self.request.handle.writer())
             .field("input_ordinals", &self.input_ordinals)
             .finish_non_exhaustive()
@@ -265,14 +268,14 @@ impl std::fmt::Debug for ConnectorWriteSinkProgram {
 
 impl ConnectorWriteSinkProgram {
     pub fn try_new(
-        binding: Arc<ConnectorExecutionBinding>,
+        execution: Arc<dyn CatalogWriteExecution>,
         request: ConnectorOpenWriterRequest,
         root_input_width: usize,
         input_ordinals: Option<Vec<usize>>,
     ) -> Result<Self, ExecPlanBuildError> {
         let program = Self {
             name: "CONNECTOR_WRITE_SINK".to_string(),
-            binding,
+            execution,
             request,
             root_input_width,
             input_ordinals,
@@ -284,7 +287,7 @@ impl ConnectorWriteSinkProgram {
     }
 
     pub fn try_new_with_expression_projection(
-        binding: Arc<ConnectorExecutionBinding>,
+        execution: Arc<dyn CatalogWriteExecution>,
         request: ConnectorOpenWriterRequest,
         root_input_width: usize,
         arena: ExprArena,
@@ -299,7 +302,7 @@ impl ConnectorWriteSinkProgram {
         }
         let program = Self {
             name: "CONNECTOR_WRITE_SINK".to_string(),
-            binding,
+            execution,
             request,
             root_input_width,
             input_ordinals: None,
@@ -319,16 +322,10 @@ impl ConnectorWriteSinkProgram {
                 format!("connector writer handle: {error}"),
             )
         })?;
-        if self.binding.key() != self.request.handle.owner() {
+        if self.execution.catalog_handle() != self.request.handle.writer().catalog_handle() {
             return Err(ExecPlanBuildError::new(
                 ExecPlanInvariant::Sink,
-                "connector writer handle owner does not match resolved execution binding",
-            ));
-        }
-        if self.binding.write().is_none() {
-            return Err(ExecPlanBuildError::new(
-                ExecPlanInvariant::Sink,
-                "resolved connector execution binding has no write capability",
+                "connector writer catalog handle does not match query-leased write execution",
             ));
         }
         if let Some(ordinals) = &self.input_ordinals {
@@ -353,8 +350,8 @@ impl ConnectorWriteSinkProgram {
         Ok(())
     }
 
-    pub fn binding(&self) -> &Arc<ConnectorExecutionBinding> {
-        &self.binding
+    pub fn execution(&self) -> &Arc<dyn CatalogWriteExecution> {
+        &self.execution
     }
 
     pub fn request(&self) -> &ConnectorOpenWriterRequest {

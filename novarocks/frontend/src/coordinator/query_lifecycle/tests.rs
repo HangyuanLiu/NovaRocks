@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -39,7 +40,7 @@ use novarocks_proto_codec::lifecycle::{
     RuntimeFilterContribution,
 };
 use novarocks_proto_codec::membership::BackendProcessDescriptor;
-use novarocks_proto_models::{common as proto_common, filter, novarocks as proto};
+use novarocks_proto_models::{catalog, common as proto_common, filter, novarocks as proto};
 use novarocks_types::{BackendProcessId, QueryId, UniqueId};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -294,7 +295,43 @@ fn protocol_abort_for(
 
 fn protocol_event_control_ready() -> protocol_lifecycle::QueryControlEvent {
     protocol_event(proto::query_control_response::Event::ControlReady(
-        proto::QueryControlReady {},
+        proto::QueryControlReady {
+            catalog_load_state: Some(catalog::CatalogLoadState {
+                state: Some(catalog::catalog_load_state::State::Ready(
+                    catalog::CatalogReady {},
+                )),
+            }),
+        },
+    ))
+}
+
+fn protocol_event_control_ready_loading() -> protocol_lifecycle::QueryControlEvent {
+    protocol_event(proto::query_control_response::Event::ControlReady(
+        proto::QueryControlReady {
+            catalog_load_state: Some(catalog::CatalogLoadState {
+                state: Some(catalog::catalog_load_state::State::Loading(
+                    catalog::CatalogLoading {},
+                )),
+            }),
+        },
+    ))
+}
+
+fn protocol_event_catalog_ready() -> protocol_lifecycle::QueryControlEvent {
+    protocol_event(proto::query_control_response::Event::CatalogReady(
+        catalog::CatalogReady {},
+    ))
+}
+
+fn protocol_event_catalog_load_failed(
+    safe_detail: impl Into<String>,
+) -> protocol_lifecycle::QueryControlEvent {
+    protocol_event(proto::query_control_response::Event::CatalogLoadFailed(
+        catalog::CatalogLoadFailed {
+            reason: catalog::CatalogLoadFailureReason::InstallFailed as i32,
+            safe_detail: safe_detail.into(),
+            safe_field_path: None,
+        },
     ))
 }
 
@@ -704,6 +741,53 @@ struct RecordingTransportState {
         VecDeque<Result<protocol_lifecycle::QueryTerminationAck, QueryLifecycleTransportError>>,
     >,
     cancel_on_init: Option<QueryCancellationSource>,
+    fanout_probe: Option<Arc<FanoutProbe>>,
+}
+
+/// Test-only concurrent-call probe.  The deliberate short delay makes each
+/// fanout wave overlap enough calls to prove that the implementation is
+/// concurrent without coupling the assertion to thread scheduling details.
+struct FanoutProbe {
+    hold_for: Duration,
+    init_in_flight: AtomicUsize,
+    init_peak: AtomicUsize,
+    attach_in_flight: AtomicUsize,
+    attach_peak: AtomicUsize,
+}
+
+impl FanoutProbe {
+    fn new(hold_for: Duration) -> Self {
+        Self {
+            hold_for,
+            init_in_flight: AtomicUsize::new(0),
+            init_peak: AtomicUsize::new(0),
+            attach_in_flight: AtomicUsize::new(0),
+            attach_peak: AtomicUsize::new(0),
+        }
+    }
+
+    fn observe_call(&self, in_flight: &AtomicUsize, peak: &AtomicUsize) {
+        let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(current, Ordering::SeqCst);
+        std::thread::sleep(self.hold_for);
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn observe_init(&self) {
+        self.observe_call(&self.init_in_flight, &self.init_peak);
+    }
+
+    fn observe_attach(&self) {
+        self.observe_call(&self.attach_in_flight, &self.attach_peak);
+    }
+
+    fn init_peak(&self) -> usize {
+        self.init_peak.load(Ordering::SeqCst)
+    }
+
+    fn attach_peak(&self) -> usize {
+        self.attach_peak.load(Ordering::SeqCst)
+    }
 }
 
 impl RecordingTransport {
@@ -783,6 +867,15 @@ impl RecordingTransport {
             .map(|(target, _)| target.backend_idx())
             .collect()
     }
+
+    fn enable_fanout_probe(&self, hold_for: Duration) -> Arc<FanoutProbe> {
+        let probe = Arc::new(FanoutProbe::new(hold_for));
+        self.state
+            .lock()
+            .expect("recording transport lock")
+            .fanout_probe = Some(Arc::clone(&probe));
+        probe
+    }
 }
 
 impl QueryLifecycleTransport for RecordingTransport {
@@ -805,7 +898,11 @@ impl QueryLifecycleTransport for RecordingTransport {
                 ))
             });
         let cancellation = state.cancel_on_init.take();
+        let probe = state.fanout_probe.clone();
         drop(state);
+        if let Some(probe) = probe {
+            probe.observe_init();
+        }
         if let Some(cancellation) = cancellation {
             cancellation.request(QueryCancellationReason::ClientDisconnected);
         }
@@ -820,7 +917,7 @@ impl QueryLifecycleTransport for RecordingTransport {
     ) -> Result<Arc<dyn QueryControlSession>, QueryLifecycleTransportError> {
         let mut state = self.state.lock().expect("recording transport lock");
         state.attach_calls.push((target.clone(), attach));
-        state
+        let result = state
             .attach_results
             .get_mut(&target.backend_idx())
             .and_then(VecDeque::pop_front)
@@ -829,7 +926,13 @@ impl QueryLifecycleTransport for RecordingTransport {
                     QueryLifecycleTransportErrorKind::InvalidResponse,
                     "unexpected control attach call",
                 ))
-            })
+            });
+        let probe = state.fanout_probe.clone();
+        drop(state);
+        if let Some(probe) = probe {
+            probe.observe_attach();
+        }
+        result
     }
 
     fn abort_query(
@@ -962,10 +1065,17 @@ fn manifest(
 }
 
 fn query_init_plan(service_only_backend: Option<usize>) -> QueryInitPlan {
+    query_init_plan_with_participants(3, service_only_backend)
+}
+
+fn query_init_plan_with_participants(
+    participant_count: usize,
+    service_only_backend: Option<usize>,
+) -> QueryInitPlan {
     let execution_id = query_execution_id();
     QueryInitPlan::from_manifests_for_contract_test(
         execution_id,
-        (0..3).map(|backend_idx| {
+        (0..participant_count).map(|backend_idx| {
             (
                 backend_idx,
                 manifest(
@@ -1036,6 +1146,7 @@ fn observation_control(
     control.set_init_attempted(&materialized.participants);
     for participant in &materialized.participants {
         control.mark_control_ready(participant.target.backend_idx());
+        control.mark_catalog_ready(participant.target.backend_idx());
     }
     control
         .freeze_admitted()
@@ -1318,6 +1429,15 @@ fn frontend_query_lifecycle_config_requires_three_heartbeat_intervals() {
 }
 
 #[test]
+fn frontend_query_lifecycle_config_rejects_zero_participant_fanout() {
+    let error = match config().with_participant_fanout_max_inflight(0) {
+        Ok(_) => panic!("zero participant fanout must fail closed"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("participant fanout"));
+}
+
+#[test]
 fn query_control_barrier_initializes_every_participant() {
     let plan = query_init_plan(Some(2));
     let (transport, _) = RecordingTransport::ready(&plan);
@@ -1332,6 +1452,84 @@ fn query_control_barrier_initializes_every_participant() {
     assert_eq!(sorted(transport.attach_targets()), vec![0, 1, 2]);
     assert_eq!(transport.init_calls().len(), 3);
     lease.finalize().expect("finalize lifecycle fixture");
+}
+
+#[test]
+fn catalog_loading_control_ready_waits_for_in_stream_catalog_ready_before_freezing() {
+    let plan = query_init_plan(None);
+    let (transport, sessions) = RecordingTransport::ready(&plan);
+    for session in sessions.values() {
+        session
+            .state
+            .0
+            .lock()
+            .expect("recording session lock")
+            .events = VecDeque::from([
+            Ok(protocol_event_control_ready_loading()),
+            Ok(protocol_event_catalog_ready()),
+            Ok(protocol_event_local_drained()),
+        ]);
+    }
+    let (registry, _query) = registry_for(&plan);
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config());
+
+    barrier
+        .initialize_all(plan)
+        .expect("every Loading ControlReady must wait for its CatalogReady completion")
+        .finalize()
+        .expect("catalog-ready participants form the finalized admitted lifecycle");
+
+    assert_eq!(sorted(transport.attach_targets()), vec![0, 1, 2]);
+    for session in sessions.values() {
+        assert!(
+            session
+                .commands()
+                .iter()
+                .any(|command| matches!(command, QueryControlCommand::Finalize)),
+            "a lease can finalize only after every Loading participant becomes CatalogReady"
+        );
+    }
+}
+
+#[test]
+fn catalog_load_failed_before_ready_aborts_without_freezing_an_admitted_lifecycle() {
+    let plan = query_init_plan(None);
+    let (transport, sessions) = RecordingTransport::ready(&plan);
+    sessions
+        .get(&1)
+        .expect("fixture session")
+        .state
+        .0
+        .lock()
+        .expect("recording session lock")
+        .events = VecDeque::from([
+        Ok(protocol_event_control_ready_loading()),
+        Ok(protocol_event_catalog_load_failed("catalog install failed")),
+    ]);
+    let (registry, _query) = registry_for(&plan);
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config());
+
+    let error = match barrier.initialize_all(plan) {
+        Ok(_) => panic!("CatalogLoadFailed must reject the query lifecycle before admission"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error.message().contains("catalog load failure"),
+        "unexpected lifecycle error: {error}"
+    );
+    assert_eq!(sorted(transport.abort_targets()), vec![0, 1, 2]);
+    for session in sessions.values() {
+        let commands = session.commands();
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, QueryControlCommand::Finalize)),
+            "CatalogLoadFailed must not leave a finalized admitted lifecycle: {commands:?}"
+        );
+    }
 }
 
 #[test]
@@ -1686,6 +1884,33 @@ fn frontend_query_lifecycle_all_participant_barrier_aborts_attempted_targets() {
         "{error}"
     );
     assert_eq!(sorted(transport.abort_targets()), vec![0, 1, 2]);
+}
+
+#[test]
+fn frontend_query_lifecycle_bounds_init_and_attach_fanout_for_ninety_seven_participants() {
+    let plan = query_init_plan_with_participants(97, None);
+    let (transport, _) = RecordingTransport::ready(&plan);
+    let probe = transport.enable_fanout_probe(Duration::from_millis(10));
+    let (registry, _query) = registry_for(&plan);
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config());
+
+    barrier
+        .initialize_all(plan)
+        .expect("all participant waves must initialize and attach")
+        .finalize()
+        .expect("fixture finalize");
+
+    let init_peak = probe.init_peak();
+    let attach_peak = probe.attach_peak();
+    assert!(
+        (2..=32).contains(&init_peak),
+        "InitQuery fanout must be concurrent but bounded: {init_peak}"
+    );
+    assert!(
+        (2..=32).contains(&attach_peak),
+        "control attach fanout must be concurrent but bounded: {attach_peak}"
+    );
 }
 
 #[test]
@@ -3386,18 +3611,11 @@ impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
         Err(Self::rejected("ReportQueryTerminal"))
     }
 
-    async fn ensure_connector_execution_binding(
+    async fn prune_catalogs(
         &self,
-        _request: Request<proto::EnsureConnectorExecutionBindingRequest>,
-    ) -> Result<Response<proto::EnsureConnectorExecutionBindingResponse>, Status> {
-        Err(Self::rejected("EnsureConnectorExecutionBinding"))
-    }
-
-    async fn retire_connector_execution_binding(
-        &self,
-        _request: Request<proto::RetireConnectorExecutionBindingRequest>,
-    ) -> Result<Response<proto::RetireConnectorExecutionBindingResponse>, Status> {
-        Err(Self::rejected("RetireConnectorExecutionBinding"))
+        _request: Request<catalog::PruneCatalogsRequest>,
+    ) -> Result<Response<catalog::PruneCatalogsResponse>, Status> {
+        Err(Self::rejected("PruneCatalogs"))
     }
 
     async fn heartbeat(

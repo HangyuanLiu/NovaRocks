@@ -29,8 +29,8 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorInstanceIncarnation, ConnectorMutationOperationId, ConnectorRequestContext,
-    ConnectorTableHandle, ExternalMutationEvidence, ExternalMutationOutcome,
+    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
+    ExternalMutationEvidence, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 
 /// Maximum size of one provider-owned data-version, evidence-revision, plan,
@@ -629,7 +629,7 @@ pub struct StatisticsPublishPreparationRequest {
 #[derive(Clone, Eq, PartialEq)]
 pub struct StatisticsReceipt {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     operation_id: ConnectorMutationOperationId,
     data_version: StatisticsDataVersion,
     evidence_revision: StatisticsEvidenceRevision,
@@ -639,7 +639,7 @@ pub struct StatisticsReceipt {
 impl StatisticsReceipt {
     pub fn try_new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         operation_id: ConnectorMutationOperationId,
         data_version: StatisticsDataVersion,
         evidence_revision: StatisticsEvidenceRevision,
@@ -658,7 +658,7 @@ impl StatisticsReceipt {
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    pub const fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
     pub const fn operation_id(&self) -> ConnectorMutationOperationId {
@@ -692,7 +692,7 @@ impl fmt::Debug for StatisticsReceipt {
 /// Read-only half of the FE-only statistics capability.
 pub trait StatisticsReader: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
-    fn incarnation(&self) -> ConnectorInstanceIncarnation;
+    fn incarnation(&self) -> ProviderBindingEpoch;
     fn read_statistics(
         &self,
         request: StatisticsReadRequest,
@@ -703,7 +703,7 @@ pub trait StatisticsReader: Send + Sync {
 /// capability. Providers without this trait remain valid readers.
 pub trait StatisticsCollection: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
-    fn incarnation(&self) -> ConnectorInstanceIncarnation;
+    fn incarnation(&self) -> ProviderBindingEpoch;
     fn prepare_collection(
         &self,
         request: StatisticsCollectionRequest,
@@ -741,7 +741,7 @@ pub trait ConnectorStatisticsResolver: Send + Sync {
 #[derive(Clone)]
 pub struct ConnectorStatisticsLease {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     statistics: Arc<dyn ConnectorStatistics>,
     _release: Arc<StatisticsLeaseRelease>,
 }
@@ -753,7 +753,7 @@ struct StatisticsLeaseRelease {
 impl ConnectorStatisticsLease {
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         statistics: Arc<dyn ConnectorStatistics>,
         release: impl FnOnce() + Send + Sync + 'static,
     ) -> Result<Self, ConnectorError> {
@@ -771,7 +771,7 @@ impl ConnectorStatisticsLease {
     pub fn descriptor(&self) -> &ConnectorInstanceDescriptor {
         &self.descriptor
     }
-    pub const fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    pub const fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
     pub fn supports_collection(&self) -> bool {
@@ -928,7 +928,7 @@ impl Drop for StatisticsLeaseRelease {
 
 pub(crate) fn validate_statistics_owner(
     descriptor: &ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     statistics: &dyn ConnectorStatistics,
 ) -> Result<(), ConnectorError> {
     if statistics.descriptor() != descriptor || statistics.incarnation() != incarnation {

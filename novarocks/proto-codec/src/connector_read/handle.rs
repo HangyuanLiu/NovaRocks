@@ -8,8 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_proto_models::connector_read as dto;
-use novarocks_spi::connector::ConnectorInstanceId;
+use novarocks_spi::connector::CatalogHandle;
 
+use crate::catalog::decode_catalog_handle;
 use crate::{FieldPath, ProtocolError};
 
 use super::{
@@ -25,7 +26,6 @@ const MAX_PARTITION_SPECS: usize = 4096;
 const MAX_STORAGE_PROPERTIES: usize = 256;
 const MAX_PINNED_DATA_FILES: usize = 4096;
 
-const INSTANCE_INCARNATION_BYTES: usize = 16;
 const TRANSACTION_UUID_BYTES: usize = 16;
 const ARTIFACT_DIGEST_HEX_CHARS: usize = 64;
 const UUID_TEXT_CHARS: usize = 36;
@@ -1158,30 +1158,25 @@ impl ConnectorRelation<'_> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CatalogTableHandle {
     raw: dto::CatalogTableHandle,
+    catalog_handle: CatalogHandle,
 }
 
 impl CatalogTableHandle {
     pub fn parse(raw: dto::CatalogTableHandle, path: FieldPath) -> Result<Self, ProtocolError> {
-        bounded_text(
-            &raw.catalog_name,
-            MAX_NAME_BYTES,
-            path.field("catalog_name"),
-            false,
-        )?;
-        // The wire ingress accepts only the already-normalized instance id and
-        // never normalizes here: two spellings of one catalog would otherwise
-        // be two different admission decisions for the same catalog.
-        ConnectorInstanceId::try_from_canonical(&raw.catalog_name).map_err(|_| {
-            invalid(
-                path.field("catalog_name"),
-                "catalog name must already be a normalized connector instance id",
+        let raw_catalog_handle = raw.catalog_handle.clone().ok_or_else(|| {
+            missing(
+                path.clone().field("catalog_handle"),
+                "catalog table handle requires a catalog handle",
             )
         })?;
-        exact_bytes(
-            &raw.instance_incarnation,
-            INSTANCE_INCARNATION_BYTES,
-            path.field("instance_incarnation"),
+        bounded_text(
+            &raw_catalog_handle.catalog_name,
+            MAX_NAME_BYTES,
+            path.clone().field("catalog_handle").field("catalog_name"),
+            false,
         )?;
+        let catalog_handle =
+            decode_catalog_handle(raw_catalog_handle, path.clone().field("catalog_handle"))?;
         let transaction = raw.transaction.as_ref().ok_or_else(|| {
             missing(
                 path.field("transaction"),
@@ -1215,7 +1210,10 @@ impl CatalogTableHandle {
                 validate_connector_merge_table_handle(handle, path.field("merge_table"))?;
             }
         }
-        Ok(Self { raw })
+        Ok(Self {
+            raw,
+            catalog_handle,
+        })
     }
 
     pub const fn as_proto(&self) -> &dto::CatalogTableHandle {
@@ -1226,15 +1224,14 @@ impl CatalogTableHandle {
         self.raw
     }
 
-    /// The already-normalized connector instance id this relation belongs to.
-    pub fn catalog_name(&self) -> &str {
-        &self.raw.catalog_name
+    /// The immutable catalog content identity this relation belongs to.
+    pub const fn catalog_handle(&self) -> &CatalogHandle {
+        &self.catalog_handle
     }
 
-    pub fn instance_incarnation(&self) -> [u8; INSTANCE_INCARNATION_BYTES] {
-        let mut bytes = [0_u8; INSTANCE_INCARNATION_BYTES];
-        bytes.copy_from_slice(&self.raw.instance_incarnation);
-        bytes
+    /// The already-normalized connector instance id this relation belongs to.
+    pub fn catalog_name(&self) -> &str {
+        self.catalog_handle.catalog_name().as_str()
     }
 
     pub fn transaction(&self) -> &dto::ConnectorTransactionHandle {
@@ -1460,8 +1457,10 @@ mod tests {
 
     fn catalog_handle(relation: dto::catalog_table_handle::Relation) -> dto::CatalogTableHandle {
         dto::CatalogTableHandle {
-            catalog_name: "lake.analytics".to_owned(),
-            instance_incarnation: vec![4_u8; INSTANCE_INCARNATION_BYTES],
+            catalog_handle: Some(novarocks_proto_models::catalog::CatalogHandle {
+                catalog_name: "lake.analytics".to_owned(),
+                version: vec![4_u8; 32],
+            }),
             transaction: Some(transaction()),
             relation: Some(relation),
         }
@@ -1507,10 +1506,7 @@ mod tests {
                 .expect("every handle family is valid");
             assert_eq!(parsed.relation_kind(), kind);
             assert_eq!(parsed.catalog_name(), "lake.analytics");
-            assert_eq!(
-                parsed.instance_incarnation(),
-                [4_u8; INSTANCE_INCARNATION_BYTES]
-            );
+            assert_eq!(parsed.catalog_handle().version().as_bytes(), &[4_u8; 32]);
             assert_eq!(parsed.transaction(), &transaction());
             assert_eq!(parsed.as_proto(), &raw);
             assert_eq!(parsed.into_proto(), raw);
@@ -1590,6 +1586,18 @@ mod tests {
 
     #[test]
     fn an_absent_oneof_variant_is_a_missing_field_at_its_own_path() {
+        let no_catalog_handle = dto::CatalogTableHandle {
+            catalog_handle: None,
+            ..catalog_handle(dto::catalog_table_handle::Relation::Table(table_handle()))
+        };
+        let error = CatalogTableHandle::parse(no_catalog_handle, catalog_root())
+            .expect_err("catalog handle");
+        assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(
+            error.path().to_string(),
+            "catalog_table_handle.catalog_handle"
+        );
+
         let no_relation = dto::CatalogTableHandle {
             relation: None,
             ..catalog_handle(dto::catalog_table_handle::Relation::Table(table_handle()))
@@ -1947,17 +1955,20 @@ mod tests {
     }
 
     #[test]
-    fn fixed_width_identities_must_be_exactly_sixteen_bytes() {
-        for incarnation in [vec![4_u8; 15], vec![4_u8; 17], Vec::new()] {
+    fn fixed_width_catalog_versions_must_be_exactly_thirty_two_bytes() {
+        for version in [vec![4_u8; 31], vec![4_u8; 33], Vec::new()] {
             let raw = dto::CatalogTableHandle {
-                instance_incarnation: incarnation,
+                catalog_handle: Some(novarocks_proto_models::catalog::CatalogHandle {
+                    catalog_name: "lake.analytics".to_owned(),
+                    version,
+                }),
                 ..catalog_handle(dto::catalog_table_handle::Relation::Table(table_handle()))
             };
-            let error = CatalogTableHandle::parse(raw, catalog_root()).expect_err("incarnation");
+            let error = CatalogTableHandle::parse(raw, catalog_root()).expect_err("version");
             assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
             assert_eq!(
                 error.path().to_string(),
-                "catalog_table_handle.instance_incarnation"
+                "catalog_table_handle.catalog_handle.version"
             );
         }
 
@@ -2160,19 +2171,25 @@ mod tests {
     fn a_catalog_name_must_arrive_already_normalized() {
         for catalog_name in ["Lake.Analytics", "LAKE", "lake analytics", "1lake", ""] {
             let raw = dto::CatalogTableHandle {
-                catalog_name: catalog_name.to_owned(),
+                catalog_handle: Some(novarocks_proto_models::catalog::CatalogHandle {
+                    catalog_name: catalog_name.to_owned(),
+                    version: vec![4_u8; 32],
+                }),
                 ..catalog_handle(dto::catalog_table_handle::Relation::Table(table_handle()))
             };
             let error = CatalogTableHandle::parse(raw, catalog_root()).expect_err("catalog name");
             assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
             assert_eq!(
                 error.path().to_string(),
-                "catalog_table_handle.catalog_name"
+                "catalog_table_handle.catalog_handle.catalog_name"
             );
         }
 
         let oversized = dto::CatalogTableHandle {
-            catalog_name: "a".repeat(MAX_NAME_BYTES + 1),
+            catalog_handle: Some(novarocks_proto_models::catalog::CatalogHandle {
+                catalog_name: "a".repeat(MAX_NAME_BYTES + 1),
+                version: vec![4_u8; 32],
+            }),
             ..catalog_handle(dto::catalog_table_handle::Relation::Table(table_handle()))
         };
         assert_eq!(

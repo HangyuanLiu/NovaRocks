@@ -15,35 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod binding_decode;
-mod execution_host;
-pub(crate) mod runtime;
+pub(crate) mod batch_transform;
+pub mod catalog_manager;
 pub mod typed_registry;
 pub mod typed_runtime;
 
-#[cfg(test)]
-mod runtime_test;
-
-pub use execution_host::{
-    ConnectorExecutionHost, ConnectorExecutionLease, ConnectorExecutionQueryResolver,
-};
-pub use typed_registry::{InstalledReadExecution, InstalledReadExecutionRegistry};
-
-/// Backend-local token passed through native plan decoding.
-///
-/// Connector execution bindings are resolved by the backend execution host;
-/// this value only preserves the established decode assembly boundary.
-#[derive(Clone, Default)]
-pub(crate) struct ConnectorRegistry;
-
-impl ConnectorRegistry {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-}
-
-impl std::fmt::Debug for ConnectorRegistry {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("ConnectorRegistry").finish()
-    }
-}
+pub use typed_registry::{InstalledReadExecution, InstalledWriteExecution};

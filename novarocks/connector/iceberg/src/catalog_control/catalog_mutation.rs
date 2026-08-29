@@ -28,13 +28,13 @@ use novarocks_spi::connector::{
     ConnectorColumnAggregation, ConnectorColumnDefinition, ConnectorColumnPath,
     ConnectorColumnPosition, ConnectorCommittedPartitioning, ConnectorCommittedVersion,
     ConnectorDataType, ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorInstanceIncarnation, ConnectorMutationFailure,
-    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorMvMetadataOnlyProvenance,
-    ConnectorPartitionTransform, ConnectorPropertyAuthority, ConnectorPropertyChange,
-    ConnectorRefAction, ConnectorSchemaChange, ConnectorTableIdentity, ConnectorTableKey,
-    ConnectorTableKeyKind, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorMutationOperationId, ConnectorMvMetadataOnlyProvenance, ConnectorPartitionTransform,
+    ConnectorPropertyAuthority, ConnectorPropertyChange, ConnectorRefAction, ConnectorSchemaChange,
+    ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind, CreateOrReplacePolicy,
+    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ProviderBindingEpoch,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -68,7 +68,7 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         self.descriptor()
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation()
     }
 
@@ -3078,10 +3078,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceId,
-        ConnectorMetadata, ConnectorProviderId, ConnectorRequestContext,
-        ConnectorTableObjectBindingFailure, ConnectorTableObjectCaptureRequest,
-        ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorMetadata, ConnectorProviderBindingKey,
+        ConnectorProviderId, ConnectorRequestContext, ConnectorTableObjectBindingFailure,
+        ConnectorTableObjectCaptureRequest, ConnectorTableObjectRebindRequest,
+        ConnectorTableObjectSelector, ConnectorTableResolution,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -3139,7 +3139,7 @@ mod tests {
                 provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
                 instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
             },
-            ConnectorInstanceIncarnation::from_bytes([6; 16]),
+            ProviderBindingEpoch::from_bytes([6; 16]),
             runtime,
         );
         (executor, warehouse, provider)
@@ -3251,7 +3251,7 @@ mod tests {
     ) -> Result<ExternalMutationEffect, ConnectorError> {
         let request = ConnectorCatalogMutationRequest {
             operation_id: ConnectorMutationOperationId::new(),
-            target: ConnectorExecutionBindingKey {
+            target: ConnectorProviderBindingKey {
                 instance_id: provider.descriptor().instance_id.clone(),
                 incarnation: provider.incarnation(),
             },
@@ -3293,7 +3293,7 @@ mod tests {
     ) -> ConnectorCatalogMutationRequest {
         ConnectorCatalogMutationRequest {
             operation_id,
-            target: ConnectorExecutionBindingKey {
+            target: ConnectorProviderBindingKey {
                 instance_id: provider.descriptor().instance_id.clone(),
                 incarnation: provider.incarnation(),
             },
@@ -3451,7 +3451,7 @@ mod tests {
         let success = provider
             .execute(ConnectorCatalogMutationRequest {
                 operation_id: ConnectorMutationOperationId::new(),
-                target: ConnectorExecutionBindingKey {
+                target: ConnectorProviderBindingKey {
                     instance_id: provider.descriptor().instance_id.clone(),
                     incarnation: provider.incarnation(),
                 },
@@ -3475,7 +3475,7 @@ mod tests {
         let empty = provider
             .execute(ConnectorCatalogMutationRequest {
                 operation_id: ConnectorMutationOperationId::new(),
-                target: ConnectorExecutionBindingKey {
+                target: ConnectorProviderBindingKey {
                     instance_id: provider.descriptor().instance_id.clone(),
                     incarnation: provider.incarnation(),
                 },
@@ -3511,7 +3511,7 @@ mod tests {
         let mismatch = provider
             .execute(ConnectorCatalogMutationRequest {
                 operation_id: ConnectorMutationOperationId::new(),
-                target: ConnectorExecutionBindingKey {
+                target: ConnectorProviderBindingKey {
                     instance_id: provider.descriptor().instance_id.clone(),
                     incarnation: provider.incarnation(),
                 },
@@ -3842,7 +3842,7 @@ mod tests {
         let evidence = ExternalMutationEvidence::try_new(
             ICEBERG_MUTATION_EVIDENCE_VERSION,
             provider.descriptor().clone(),
-            ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            ProviderBindingEpoch::from_bytes([7; 16]),
             ConnectorMutationOperationId::new(),
             "create-table",
             Bytes::from_static(b"intentionally-not-json"),

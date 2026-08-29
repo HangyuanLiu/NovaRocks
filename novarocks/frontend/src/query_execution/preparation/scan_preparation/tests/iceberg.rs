@@ -90,7 +90,13 @@ fn a_pinned_cohort_read_freezes_the_relation_the_provider_named() {
         novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table
     );
     assert_eq!(
-        typed.prepared.table_scan.table().catalog().instance_id(),
+        typed
+            .prepared
+            .table_scan
+            .table()
+            .catalog()
+            .catalog_name()
+            .as_str(),
         "test_catalog",
         "the SPI relation remains bound to the cohort's admitted catalog"
     );
@@ -115,8 +121,14 @@ fn an_ordinary_iceberg_scan_lowers_to_a_typed_data_relation() {
         novarocks_spi::connector::read_stack::ConnectorReadRelationKind::Table
     );
     assert_eq!(
-        typed.prepared.table_scan.table().catalog().instance_id(),
-        typed.declaration.binding_key().instance_id.as_str(),
+        typed
+            .prepared
+            .table_scan
+            .table()
+            .catalog()
+            .catalog_name()
+            .as_str(),
+        typed.catalog_properties.handle().catalog_name().as_str(),
         "the frozen relation and its declaration name one generation"
     );
 }
@@ -315,16 +327,16 @@ fn a_pre_pinned_opaque_read_fails_closed() {
     );
 }
 
-/// A scan whose binding generation is not installed must fail closed: an
-/// absent typed control is never permission to reach some other generation.
+/// A scan whose exact catalog handle is not installed must fail closed: an
+/// absent typed control is never permission to reach another catalog version.
 #[test]
-fn a_scan_whose_binding_generation_does_not_resolve_fails_closed() {
+fn a_scan_whose_catalog_handle_does_not_resolve_fails_closed() {
     let plan = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
         .expect("sealed ordinary iceberg fixture");
     let connectors = registry(vec![data_file("s3://bucket/data.parquet")]);
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     let query_bindings = fixture_query_table_bindings(&plan, &controls);
-    // An empty registry stands for "this generation was never installed".
+    // An empty registry stands for "this catalog handle was never installed".
     let empty =
         Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new());
     let error = expect_preparation_error(
@@ -337,10 +349,10 @@ fn a_scan_whose_binding_generation_does_not_resolve_fails_closed() {
             &fixture_scan_preparation_options(empty),
             &[],
         ),
-        "an uninstalled generation cannot be planned",
+        "an uninstalled catalog handle cannot be planned",
     );
     assert!(
-        error.contains("no installed read control for exact binding"),
+        error.contains("no installed read control for exact catalog handle"),
         "unexpected error: {error}"
     );
 }

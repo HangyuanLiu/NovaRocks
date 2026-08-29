@@ -18,10 +18,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorControlPlanningLease, ConnectorExecutionDeclaration,
+    CatalogProperties, ConnectorBatchBudget, ConnectorControlPlanningLease,
     ConnectorFrozenRewriteGroup, ConnectorInstanceId, ConnectorPinnedFileSet,
-    ConnectorPredicateDisposition, ConnectorScan, ConnectorSplit, ConnectorSplitPlanningMetrics,
-    ConnectorStaticPredicate,
+    ConnectorPredicateDisposition, ConnectorProviderBinding, ConnectorScan, ConnectorSplit,
+    ConnectorSplitPlanningMetrics, ConnectorStaticPredicate,
 };
 
 use crate::catalog_application::query_bindings::QueryScanMaterialization;
@@ -179,6 +179,11 @@ pub(crate) fn fixture_query_scan_materialization(instance_id: &str) -> QueryScan
         .expect("fixture connector read admission");
     QueryScanMaterialization {
         table: metadata.table,
+        catalog_handle: planning_lease
+            .binding()
+            .catalog_handle()
+            .expect("fixture control binding has a catalog handle")
+            .clone(),
         schema: metadata.schema,
         selector: ConnectorReadSelector::Current,
         statistics_pin: None,
@@ -191,7 +196,7 @@ pub(crate) fn fixture_query_scan_materialization(instance_id: &str) -> QueryScan
 /// scheduling hints, and native-carrier assembly.
 #[derive(Clone)]
 pub(crate) struct PlannedConnectorRead {
-    pub(crate) declaration: ConnectorExecutionDeclaration,
+    pub(crate) declaration: ConnectorProviderBinding,
     pub(crate) scan: ConnectorScan,
     /// Stable provider field ordinals aligned 1:1 with `scan.output_schema`.
     /// These are frozen with the exact FE read and are the only authority for
@@ -224,10 +229,9 @@ pub(crate) struct PlannedConnectorRead {
 /// that used to size itself from a frozen split count must ask the live
 /// backend topology instead.
 pub(crate) struct PreparedTypedConnectorScan {
-    /// The exact control generation this scan was frozen against. Every
-    /// backend that runs the fragment installs this declaration before a
-    /// runtime split can resolve its provider.
-    pub(crate) declaration: ConnectorExecutionDeclaration,
+    /// Exact immutable BE materialization input. Query assembly de-duplicates
+    /// this into the one `CatalogSet` carried in every participant Init.
+    pub(crate) catalog_properties: CatalogProperties,
     /// The typed scan node, its lazy split manager, and the constraint the
     /// round driver must enumerate under.
     pub(crate) prepared: PreparedTypedScan,
@@ -236,8 +240,8 @@ pub(crate) struct PreparedTypedConnectorScan {
     /// declined is not here: it travels as the carrier's unenforced predicate
     /// and the backend reader applies it.
     pub(crate) residual_predicates: Vec<TypedExpr>,
-    /// Keeps the exact FE control generation alive through the BE ensure
-    /// barrier. It is never encoded into a fragment carrier.
+    /// Keeps the exact FE control generation alive through query execution.
+    /// It is never encoded into a fragment carrier.
     #[allow(
         dead_code,
         reason = "The lease is retained for its drop-time ownership release through BE admission."
@@ -249,7 +253,7 @@ impl std::fmt::Debug for PreparedTypedConnectorScan {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PreparedTypedConnectorScan")
-            .field("declaration", &self.declaration)
+            .field("catalog_handle", self.catalog_properties.handle())
             .field("prepared", &self.prepared)
             .finish_non_exhaustive()
     }
@@ -425,10 +429,9 @@ impl ScanExecutionBindings {
 
     /// Record one typed connector scan.
     ///
-    /// The owner check is the same rule the opaque carrier enforced: a scan
-    /// frozen against one control generation may never be installed under
-    /// another, so the relation's catalog identity must be exactly the
-    /// declaration's binding key.
+    /// The frozen typed relation and the immutable materialization input must
+    /// name the same exact catalog content. A name-only match would permit a
+    /// fragment to select another version after desired state changes.
     pub(crate) fn insert_typed_scan(
         &mut self,
         fragment_id: FragmentId,
@@ -440,19 +443,10 @@ impl ScanExecutionBindings {
                 "duplicate typed connector scan fragment_id={fragment_id} node_id={node_id}"
             ));
         }
-        let binding_key = scan.declaration.binding_key();
         let catalog = scan.prepared.table_scan.table().catalog();
-        if catalog.instance_id() != binding_key.instance_id.as_str() {
+        if catalog != scan.catalog_properties.handle() {
             return Err(format!(
-                "typed connector scan fragment_id={fragment_id} node_id={node_id} names catalog '{}' but its declaration binds instance '{}'",
-                catalog.instance_id(),
-                binding_key.instance_id.as_str()
-            ));
-        }
-        if catalog.incarnation() != binding_key.incarnation.to_bytes() {
-            return Err(format!(
-                "typed connector scan fragment_id={fragment_id} node_id={node_id} names another incarnation of instance '{}' than its declaration",
-                binding_key.instance_id.as_str()
+                "typed connector scan fragment_id={fragment_id} node_id={node_id} does not match its frozen catalog materialization input"
             ));
         }
         if scan.prepared.table_scan.plan_node_id() != node_id {
@@ -477,21 +471,6 @@ impl ScanExecutionBindings {
         self.typed_scans
             .iter()
             .find_map(|(&(_, candidate), scan)| (candidate == node_id).then_some(scan))
-    }
-
-    /// Every typed connector scan of one fragment.
-    ///
-    /// Backend binding installation reads this: a fragment's scan nodes decide
-    /// which instances a backend must have installed, because any admitted
-    /// task may later receive a runtime split for any of them.
-    pub(crate) fn typed_scans_for_fragment(
-        &self,
-        fragment_id: FragmentId,
-    ) -> impl Iterator<Item = (i32, &PreparedTypedConnectorScan)> + '_ {
-        self.typed_scans
-            .iter()
-            .filter(move |((candidate, _), _)| *candidate == fragment_id)
-            .map(|(&(_, node_id), scan)| (node_id, scan))
     }
 
     pub(crate) fn typed_scan_keys(&self) -> impl Iterator<Item = (FragmentId, i32)> + '_ {
@@ -525,7 +504,7 @@ impl ScanExecutionBindings {
             ));
         }
         let declaration_key =
-            novarocks_spi::connector::ConnectorExecutionBindingKey::from(&read.declaration);
+            novarocks_spi::connector::ConnectorProviderBindingKey::from(&read.declaration);
         if read.scan.handle().owner() != &declaration_key.instance_id {
             return Err(format!(
                 "connector read fragment_id={fragment_id} node_id={node_id} has a scan handle owned by another instance"

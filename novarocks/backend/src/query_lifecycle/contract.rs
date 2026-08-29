@@ -20,6 +20,7 @@
 //! These traits describe BE-owned control and fallback behavior.  The neutral
 //! values they carry are deliberately separate from this role-local surface.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ use novarocks_proto_codec::lifecycle::{
     QueryTerminalAck, QueryTerminalReportAck, QueryTerminationAck, QueryTerminationReason,
     StageDigest,
 };
+use novarocks_spi::connector::CatalogHandle;
 use novarocks_types::{BackendProcessId, UniqueId};
 
 /// Backend-local lifecycle failure categories.
@@ -154,6 +156,16 @@ pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck;
 
+    /// Reconciles retained catalog runtimes against one complete FE
+    /// reachability snapshot. The lifecycle owner keeps the only catalog
+    /// manager, so the RPC adapter cannot manufacture a parallel registry.
+    fn prune_catalogs(&self, _reachable: BTreeSet<CatalogHandle>) -> CatalogPruneOutcome {
+        CatalogPruneOutcome::Rejected {
+            safe_detail: "catalog reachability pruning is not supported by this lifecycle ingress"
+                .to_string(),
+        }
+    }
+
     /// Authorizes one native exchange frame against an active participant
     /// manifest. The data-plane never obtains authority from a receiver key.
     fn authorize_exchange(
@@ -217,6 +229,13 @@ pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
         &self,
         attach: QueryControlAttach,
     ) -> Result<QueryControlAttachment, QueryLifecycleError>;
+}
+
+/// Closed, credential-free result of reconciling catalog reachability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CatalogPruneOutcome {
+    Accepted,
+    Rejected { safe_detail: String },
 }
 
 /// BE-local failure category for reporting an already frozen terminal outcome

@@ -351,7 +351,12 @@ pub(super) struct AttemptControl {
     /// Ready evidence is accumulated while concurrent Attach calls complete.
     /// It is never itself a partially visible admitted set.
     control_ready: Mutex<BTreeSet<usize>>,
-    /// Installed exactly once after every planned participant is ControlReady.
+    /// Catalog readiness is independent from stream attachment. A warm
+    /// participant joins this set in its first ControlReady frame; a cold
+    /// participant joins only after its in-stream CatalogReady completion.
+    catalog_ready: Mutex<BTreeSet<usize>>,
+    /// Installed exactly once after every planned participant is both
+    /// ControlReady and CatalogReady.
     admitted: Mutex<Option<BTreeMap<usize, MaterializedParticipant>>>,
     sessions: Mutex<BTreeMap<usize, ActiveSession>>,
     state: AtomicU8,
@@ -387,6 +392,7 @@ impl AttemptControl {
             planned: Mutex::new(BTreeMap::new()),
             init_attempted: Mutex::new(BTreeMap::new()),
             control_ready: Mutex::new(BTreeSet::new()),
+            catalog_ready: Mutex::new(BTreeSet::new()),
             admitted: Mutex::new(None),
             sessions: Mutex::new(BTreeMap::new()),
             state: AtomicU8::new(ACTIVE),
@@ -465,6 +471,13 @@ impl AttemptControl {
             .insert(backend_idx);
     }
 
+    pub(super) fn mark_catalog_ready(&self, backend_idx: usize) {
+        self.catalog_ready
+            .lock()
+            .expect("catalog-ready participant set")
+            .insert(backend_idx);
+    }
+
     pub(super) fn freeze_admitted(&self) -> Result<(), DistributedQueryError> {
         let planned = self.planned.lock().expect("planned participant set");
         let init_attempted = self
@@ -475,15 +488,23 @@ impl AttemptControl {
             .control_ready
             .lock()
             .expect("control-ready participant set");
+        let catalog_ready = self
+            .catalog_ready
+            .lock()
+            .expect("catalog-ready participant set");
         if planned.len() != init_attempted.len()
             || !planned.keys().eq(init_attempted.keys())
             || planned.len() != control_ready.len()
             || !planned
                 .keys()
                 .all(|backend_idx| control_ready.contains(backend_idx))
+            || planned.len() != catalog_ready.len()
+            || !planned
+                .keys()
+                .all(|backend_idx| catalog_ready.contains(backend_idx))
         {
             return Err(contract_violation(
-                "cannot freeze admitted participants before every planned participant is ControlReady",
+                "cannot freeze admitted participants before every planned participant is ControlReady and CatalogReady",
             ));
         }
         let mut admitted = self.admitted.lock().expect("admitted participant set");
@@ -1732,6 +1753,19 @@ impl AttemptControl {
                     session.target.backend_idx()
                 ))
             }
+            Some(novarocks_proto_models::novarocks::query_control_response::Event::CatalogReady(_)) => {
+                Err(format!(
+                    "backend {} emitted CatalogReady before catalog lifecycle support was enabled",
+                    session.target.backend_idx()
+                ))
+            }
+            Some(novarocks_proto_models::novarocks::query_control_response::Event::CatalogLoadFailed(
+                failure,
+            )) => Err(format!(
+                "backend {} reported catalog load failure ({}): {}",
+                session.target.backend_idx(),
+                failure.reason, failure.safe_detail
+            )),
             None => Err("validated query control event is missing its oneof".to_string()),
         }
     }

@@ -29,9 +29,9 @@ use novarocks_spi::connector::{
     ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest,
     ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver,
     ConnectorCleanupOperation, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
-    ConnectorCleanupPlan, ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorRequestContext,
-    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution, PreparedBatch,
+    ConnectorCleanupPlan, ConnectorCleanupPrepareRequest, ConnectorError, ConnectorErrorKind,
+    ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution, PreparedBatch,
 };
 
 /// The durable frontend owner needs to distinguish an invalid pre-dispatch
@@ -81,8 +81,7 @@ impl CleanupMaintenanceSession {
             resolution: ConnectorTableResolution::StrictBaseTable,
             context: context.clone(),
         })?;
-        if metadata.identity != table || metadata.table.owner() != &lease.binding_key().instance_id
-        {
+        if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "cleanup metadata returned a table handle for a different exact owner",
@@ -90,13 +89,8 @@ impl CleanupMaintenanceSession {
         }
         let operation =
             ConnectorCleanupOperation::remove_unreferenced_objects(metadata.table, older_than_ms)?;
-        let request = ConnectorCleanupPlanningRequest::try_new(
-            operation_id,
-            lease.binding_key().clone(),
-            operation,
-            context.clone(),
-        )?;
-        Self::from_planning_request(lease, table, request, context)
+        let plan = lease.plan_operation(operation_id, operation, context.clone())?;
+        Self::from_plan(lease, table, plan, context)
     }
 
     /// Freeze the second cleanup plan after the frontend has durably observed
@@ -124,8 +118,7 @@ impl CleanupMaintenanceSession {
             resolution: ConnectorTableResolution::StrictBaseTable,
             context: context.clone(),
         })?;
-        if metadata.identity != table || metadata.table.owner() != &lease.binding_key().instance_id
-        {
+        if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "cleanup metadata returned a table handle for a different exact owner",
@@ -133,23 +126,17 @@ impl CleanupMaintenanceSession {
         }
         let operation =
             ConnectorCleanupOperation::remove_unreferenced_objects(metadata.table, older_than_ms)?;
-        let request = ConnectorCleanupPlanningRequest::try_new_selected_owned_refs(
-            operation_id,
-            lease.binding_key().clone(),
-            operation,
-            selection,
-            context.clone(),
-        )?;
-        Self::from_planning_request(lease, table, request, context)
+        let plan =
+            lease.plan_selected_owned_refs(operation_id, operation, selection, context.clone())?;
+        Self::from_plan(lease, table, plan, context)
     }
 
-    fn from_planning_request(
+    fn from_plan(
         lease: ConnectorCleanupMaintenanceLease,
         table: ConnectorTableIdentity,
-        request: ConnectorCleanupPlanningRequest,
+        plan: ConnectorCleanupPlan,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
-        let plan = lease.plan_cleanup(request)?;
         Ok(Self {
             lease,
             table,
@@ -167,8 +154,8 @@ impl CleanupMaintenanceSession {
         &self.plan
     }
 
-    pub fn binding_key(&self) -> &novarocks_spi::connector::ConnectorExecutionBindingKey {
-        self.lease.binding_key()
+    pub const fn control_runtime_id(&self) -> novarocks_spi::connector::ConnectorControlRuntimeId {
+        self.lease.control_runtime_id()
     }
 
     /// Build bounded durable evidence for a frozen batch. Preparing is not a

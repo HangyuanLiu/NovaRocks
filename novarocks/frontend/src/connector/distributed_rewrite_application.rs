@@ -27,10 +27,9 @@
 
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteLease, ConnectorDistributedRewriteOperation,
-    ConnectorDistributedRewritePlan, ConnectorDistributedRewritePlanningRequest,
-    ConnectorDistributedRewriteResolver, ConnectorInstanceId, ConnectorRequestContext,
-    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
-    ConnectorWriteOperationId,
+    ConnectorDistributedRewritePlan, ConnectorDistributedRewriteResolver, ConnectorInstanceId,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
+    ConnectorTableResolution, ConnectorWriteOperationId,
 };
 use sha2::{Digest, Sha256};
 
@@ -157,7 +156,7 @@ pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
             context: context.clone(),
         })
         .map_err(|error| format!("load distributed rewrite target metadata: {error}"))?;
-    if metadata.identity != table || metadata.table.owner() != &lease.binding_key().instance_id {
+    if metadata.identity != table || metadata.table.owner() != instance_id {
         return Err("distributed rewrite metadata returned a foreign table handle".to_string());
     }
     let operation = match intent {
@@ -176,15 +175,8 @@ pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
             min_input_files,
         },
     };
-    let request = ConnectorDistributedRewritePlanningRequest::try_new(
-        operation_id,
-        lease.binding_key().clone(),
-        operation,
-        context.clone(),
-    )
-    .map_err(|error| format!("build distributed rewrite request: {error}"))?;
     let plan = lease
-        .plan_rewrite(request)
+        .plan_operation(operation_id, operation, context.clone())
         .map_err(|error| format!("plan distributed rewrite: {error}"))?;
     let session = sealing.seal_distributed_rewrite(plan, lease, context.clone())?;
     Ok(DistributedRewriteApplicationSession {

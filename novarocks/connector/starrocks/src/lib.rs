@@ -62,7 +62,7 @@ pub use domain::{
     StarRocksCapabilitySnapshot, StarRocksConnectorConfig, StarRocksLocalBindingRef,
     StarRocksResolvedTable,
 };
-pub use execution::StarRocksExecutionInstaller;
+pub use execution::{StarRocksCatalogRuntimeMaterializer, StarRocksExecutionInstaller};
 pub use remote_control::{
     StarRocksHttpRequest, StarRocksHttpTransport, StarRocksRemoteControlClient,
     StarRocksRemoteControlConfig, StarRocksRemoteMetadataSource,

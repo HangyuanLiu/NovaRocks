@@ -18,14 +18,14 @@
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMutationOperationId,
-    ConnectorMvMetadataOnlyBaseFact, ConnectorMvMetadataOnlyProvenance, ConnectorProviderId,
-    ConnectorRefAction, ConnectorRefreshPublicationGuard, ConnectorRequestContext,
-    ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, ConnectorTableObjectId,
-    ExternalMutationEvidence, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, StatisticsDataVersion, StatisticsEvidenceRevision,
-    StatisticsMetric, StatisticsMetricRequest,
+    ConnectorInstanceId, ConnectorMutationOperationId, ConnectorMvMetadataOnlyBaseFact,
+    ConnectorMvMetadataOnlyProvenance, ConnectorProviderId, ConnectorRefAction,
+    ConnectorRefreshPublicationGuard, ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
+    ConnectorTableHandle, ConnectorTableObjectId, ExternalMutationEvidence, LakePublicationId,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_METRICS,
+    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ProviderBindingEpoch, StatisticsDataVersion, StatisticsEvidenceRevision, StatisticsMetric,
+    StatisticsMetricRequest,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -260,7 +260,7 @@ fn external_mutation_evidence_is_bounded_and_redacted() {
     let evidence = ExternalMutationEvidence::try_new(
         1,
         descriptor,
-        ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        ProviderBindingEpoch::from_bytes([7; 16]),
         ConnectorMutationOperationId::from_bytes([9; 16]),
         "create-table",
         Bytes::from_static(b"secret-provider-payload"),

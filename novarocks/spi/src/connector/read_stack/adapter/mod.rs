@@ -45,8 +45,8 @@ use super::{
     SystemTableDistribution, TupleDomain,
 };
 use crate::connector::{
-    ConnectorError, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorPinnedFileSet, ConnectorRequestContext,
+    CatalogHandle, ConnectorError, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
+    ConnectorRequestContext,
 };
 
 /// One concrete provider type family.  The associated values never escape the
@@ -58,7 +58,7 @@ pub trait ProviderReadRuntime: Send + Sync + 'static {
     type Split: ConnectorSplit;
 
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
-    fn incarnation(&self) -> ConnectorInstanceIncarnation;
+    fn catalog_handle(&self) -> &CatalogHandle;
 
     /// The transaction frozen with this exact provider binding.  It is copied
     /// only into an opaque relation at the provider-side creation boundary.
@@ -339,8 +339,15 @@ impl<P> Clone for ReadRuntimeAdapter<P> {
 
 impl<P: ProviderReadRuntime> ReadRuntimeAdapter<P> {
     pub fn new(provider: Arc<P>) -> Self {
-        let binding =
-            ConnectorReadBinding::new(provider.descriptor().clone(), provider.incarnation());
+        assert_eq!(
+            provider.descriptor().instance_id,
+            *provider.catalog_handle().catalog_name(),
+            "provider read runtime descriptor and catalog handle must name the same catalog"
+        );
+        let binding = ConnectorReadBinding::new(
+            provider.descriptor().clone(),
+            provider.catalog_handle().clone(),
+        );
         Self { provider, binding }
     }
 
@@ -976,6 +983,7 @@ mod tests {
 
     struct Probe {
         descriptor: ConnectorInstanceDescriptor,
+        catalog_handle: CatalogHandle,
     }
 
     impl Probe {
@@ -985,6 +993,10 @@ mod tests {
                     provider_id: ConnectorProviderId::parse("probe").expect("provider ID"),
                     instance_id: ConnectorInstanceId::parse("catalog").expect("instance ID"),
                 },
+                catalog_handle: CatalogHandle::new(
+                    ConnectorInstanceId::parse("catalog").expect("instance ID"),
+                    crate::connector::CatalogVersion::from_bytes([3; 32]),
+                ),
             }
         }
     }
@@ -999,8 +1011,8 @@ mod tests {
             &self.descriptor
         }
 
-        fn incarnation(&self) -> ConnectorInstanceIncarnation {
-            ConnectorInstanceIncarnation::from_bytes([3; 16])
+        fn catalog_handle(&self) -> &CatalogHandle {
+            &self.catalog_handle
         }
 
         fn transaction(&self) -> Self::Transaction {}

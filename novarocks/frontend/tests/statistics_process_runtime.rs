@@ -87,7 +87,7 @@ impl StatisticsAttemptExecutor for CommitUnknownExecutor {
                 instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("iceberg")
                     .unwrap(),
             },
-            novarocks_spi::connector::ConnectorInstanceIncarnation::from_bytes([1; 16]),
+            novarocks_spi::connector::ProviderBindingEpoch::from_bytes([1; 16]),
             novarocks_spi::connector::ConnectorMutationOperationId::from_bytes([2; 16]),
             "statistics",
             Bytes::from_static(b"test-evidence"),

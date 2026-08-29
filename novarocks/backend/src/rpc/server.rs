@@ -37,10 +37,11 @@ use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_native_trust::{NativeIncomingAdapter, NativeServerAdmission, NativeTrust};
+use novarocks_proto_codec::catalog::{PruneCatalogsRequest, PruneCatalogsResponse};
 use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId,
 };
-use novarocks_proto_models::{filter, novarocks as proto};
+use novarocks_proto_models::{catalog, filter, novarocks as proto};
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
@@ -50,13 +51,11 @@ use tonic::server::NamedService;
 use tower::ServiceExt;
 
 use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
-use crate::connector::binding_decode;
-use crate::fragment::ingress::NativeFragmentIngress;
-use crate::query_lifecycle::QueryLifecycleIngress;
 use crate::query_lifecycle::rpc::{
     QueryControlResponseStream, handle_abort_query, handle_init_query, handle_query_control_stream,
     handle_stage_fragments, handle_start_prepared_query, handle_task_update,
 };
+use crate::query_lifecycle::{CatalogPruneOutcome, QueryLifecycleIngress};
 use crate::rpc::runtime::BackendNativeTransport;
 use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
@@ -68,7 +67,6 @@ const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 /// ingress ports while this service composes them with `BackendDataPlane`.
 #[derive(Clone)]
 pub(crate) struct BackendRpcService {
-    native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
     query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
     query_control_shutdown: Option<watch::Receiver<bool>>,
     data_plane: BackendDataPlane,
@@ -78,14 +76,12 @@ pub(crate) struct BackendRpcService {
 
 impl BackendRpcService {
     pub(crate) fn new(
-        native_fragment_ingress: Arc<dyn NativeFragmentIngress>,
         query_lifecycle_ingress: Arc<dyn QueryLifecycleIngress>,
         runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         process_descriptor: BackendProcessDescriptor,
     ) -> Self {
         Self {
-            native_fragment_ingress,
             query_lifecycle_ingress: Arc::clone(&query_lifecycle_ingress),
             query_control_shutdown: None,
             data_plane: BackendDataPlane::with_exchange_receiver_port(
@@ -243,50 +239,31 @@ impl NovaRocksGrpc for BackendRpcService {
         Ok(tonic::Response::new(response))
     }
 
-    async fn ensure_connector_execution_binding(
+    async fn prune_catalogs(
         &self,
-        request: tonic::Request<proto::EnsureConnectorExecutionBindingRequest>,
-    ) -> Result<tonic::Response<proto::EnsureConnectorExecutionBindingResponse>, tonic::Status>
-    {
-        let ingress = Arc::clone(&self.native_fragment_ingress);
-        let result =
-            tokio::task::spawn_blocking(move || {
-                match binding_decode::decode_ensure_request(request.into_inner()) {
-                    Ok((execution_id, declaration)) => {
-                        ingress.ensure_connector_execution_binding(execution_id, declaration)
-                    }
-                    Err(rejection) => rejection,
+        request: tonic::Request<catalog::PruneCatalogsRequest>,
+    ) -> Result<tonic::Response<catalog::PruneCatalogsResponse>, tonic::Status> {
+        let request = PruneCatalogsRequest::parse(request.into_inner())
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        let reachable = request
+            .reachable_catalogs()
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?
+            .into_iter()
+            .collect();
+        let ingress = Arc::clone(&self.query_lifecycle_ingress);
+        let response =
+            tokio::task::spawn_blocking(move || match ingress.prune_catalogs(reachable) {
+                CatalogPruneOutcome::Accepted => PruneCatalogsResponse::accepted(),
+                CatalogPruneOutcome::Rejected { safe_detail } => {
+                    PruneCatalogsResponse::rejected(safe_detail)
+                        .expect("lifecycle ingress produces a bounded safe catalog-prune detail")
                 }
             })
             .await
             .map_err(|error| {
-                tonic::Status::internal(format!(
-                    "ensure_connector_execution_binding handler panicked: {error}"
-                ))
+                tonic::Status::internal(format!("prune_catalogs handler panicked: {error}"))
             })?;
-        Ok(tonic::Response::new(result.to_proto()))
-    }
-
-    async fn retire_connector_execution_binding(
-        &self,
-        request: tonic::Request<proto::RetireConnectorExecutionBindingRequest>,
-    ) -> Result<tonic::Response<proto::RetireConnectorExecutionBindingResponse>, tonic::Status>
-    {
-        let ingress = Arc::clone(&self.native_fragment_ingress);
-        let result =
-            tokio::task::spawn_blocking(move || {
-                match binding_decode::decode_retire_request(request.into_inner()) {
-                    Ok(key) => ingress.retire_connector_execution_binding(key),
-                    Err(outcome) => outcome,
-                }
-            })
-            .await
-            .map_err(|error| {
-                tonic::Status::internal(format!(
-                    "retire_connector_execution_binding handler panicked: {error}"
-                ))
-            })?;
-        Ok(tonic::Response::new(result.to_proto()))
+        Ok(tonic::Response::new(response.as_proto().clone()))
     }
 
     async fn heartbeat(

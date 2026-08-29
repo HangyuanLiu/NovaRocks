@@ -27,12 +27,12 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorMaxCompactableDataFilesRequest, ConnectorMetadataMaintenanceExecuteRequest,
     ConnectorMetadataMaintenanceLease, ConnectorMetadataMaintenanceOperation,
-    ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenancePlanningRequest,
-    ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceResolver,
-    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorMetadataMaintenancePlan, ConnectorMetadataMaintenanceReceipt,
+    ConnectorMetadataMaintenanceResolver, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorMutationOperationId, ConnectorRequestContext, ConnectorTableHandle,
+    ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 
 use crate::common::engine_error::EngineError;
@@ -265,7 +265,7 @@ pub fn read_max_compactable_data_files(
         resolution: ConnectorTableResolution::StrictBaseTable,
         context: context.clone(),
     })?;
-    if metadata.identity != table || metadata.table.owner() != &lease.binding_key().instance_id {
+    if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
         return Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
             "connector metadata returned a table handle for a different exact owner",
@@ -346,8 +346,7 @@ impl MetadataMaintenanceSession {
             .map_err(|error| ResolvedMetadataMaintenance::KnownUncommitted {
                 failure: KnownUncommittedMetadataMaintenance::Planning(error),
             })?;
-        if metadata.identity != table || metadata.table.owner() != &lease.binding_key().instance_id
-        {
+        if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
             return Err(contract_failure(
                 ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
@@ -361,20 +360,11 @@ impl MetadataMaintenanceSession {
                 failure: KnownUncommittedMetadataMaintenance::Planning(error),
             }
         })?;
-        let request = ConnectorMetadataMaintenancePlanningRequest::try_new(
-            operation_id,
-            lease.binding_key().clone(),
-            operation,
-            context.clone(),
-        )
-        .map_err(|error| ResolvedMetadataMaintenance::KnownUncommitted {
-            failure: KnownUncommittedMetadataMaintenance::Planning(error),
-        })?;
-        let plan = lease.plan_maintenance(request).map_err(|error| {
-            ResolvedMetadataMaintenance::KnownUncommitted {
+        let plan = lease
+            .plan_operation(operation_id, operation, context.clone())
+            .map_err(|error| ResolvedMetadataMaintenance::KnownUncommitted {
                 failure: KnownUncommittedMetadataMaintenance::Planning(error),
-            }
-        })?;
+            })?;
         Ok(Self {
             lease,
             table,
@@ -489,11 +479,12 @@ mod tests {
     use arrow::datatypes::Schema;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-        ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMaxCompactableDataFiles,
-        ConnectorMetadata, ConnectorMetadataMaintenance, ConnectorMetadataMaintenancePlanSummary,
-        ConnectorMetadataMaintenanceReceiptSummary, ConnectorNamespaceRequest, ConnectorProviderId,
-        ConnectorTableMetadata, ConnectorTablePlanningFacts,
+        ConnectorCancellation, ConnectorControlRuntimeId, ConnectorInstanceDescriptor,
+        ConnectorListTablesRequest, ConnectorMaxCompactableDataFiles, ConnectorMetadata,
+        ConnectorMetadataMaintenance, ConnectorMetadataMaintenancePlanSummary,
+        ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceiptSummary,
+        ConnectorNamespaceRequest, ConnectorProviderBindingKey, ConnectorProviderId,
+        ConnectorTableMetadata, ConnectorTablePlanningFacts, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -514,7 +505,7 @@ mod tests {
 
     struct FakeProvider {
         descriptor: ConnectorInstanceDescriptor,
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         mode: Mode,
         metadata_calls: AtomicUsize,
         plan_calls: AtomicUsize,
@@ -530,9 +521,9 @@ mod tests {
                     provider_id: ConnectorProviderId::parse("fake-maintenance").unwrap(),
                     instance_id: instance_id.clone(),
                 },
-                key: ConnectorExecutionBindingKey {
+                key: ConnectorProviderBindingKey {
                     instance_id,
-                    incarnation: ConnectorInstanceIncarnation::from_bytes([5; 16]),
+                    incarnation: ProviderBindingEpoch::from_bytes([5; 16]),
                 },
                 mode,
                 metadata_calls: AtomicUsize::new(0),
@@ -613,7 +604,7 @@ mod tests {
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
         }
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
         fn plan_maintenance(
@@ -673,7 +664,8 @@ mod tests {
             let releases = self.releases.clone();
             ConnectorMetadataMaintenanceLease::new(
                 self.provider.descriptor.clone(),
-                self.provider.key.clone(),
+                ConnectorControlRuntimeId::from_bytes([8; 16]),
+                self.provider.key.incarnation,
                 self.provider.clone(),
                 self.provider.clone(),
                 move || {
@@ -691,9 +683,9 @@ mod tests {
         }
         fn acquire_exact_metadata_maintenance(
             &self,
-            key: &ConnectorExecutionBindingKey,
+            control_runtime_id: ConnectorControlRuntimeId,
         ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
-            if key == &self.provider.key {
+            if control_runtime_id == ConnectorControlRuntimeId::from_bytes([8; 16]) {
                 self.lease()
             } else {
                 Err(ConnectorError::new(
@@ -834,7 +826,7 @@ mod tests {
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.inner.descriptor
         }
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.inner.key
         }
         fn plan_maintenance(
@@ -869,7 +861,8 @@ mod tests {
         ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
             ConnectorMetadataMaintenanceLease::new(
                 self.provider.inner.descriptor.clone(),
-                self.provider.inner.key.clone(),
+                ConnectorControlRuntimeId::from_bytes([9; 16]),
+                self.provider.inner.key.incarnation,
                 self.provider.clone(),
                 self.provider.clone(),
                 || {},
@@ -877,7 +870,7 @@ mod tests {
         }
         fn acquire_exact_metadata_maintenance(
             &self,
-            _: &ConnectorExecutionBindingKey,
+            _: ConnectorControlRuntimeId,
         ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
             unreachable!("observation only uses the current generation")
         }

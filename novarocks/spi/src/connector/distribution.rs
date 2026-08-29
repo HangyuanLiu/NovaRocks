@@ -17,13 +17,13 @@
 
 use uuid::Uuid;
 
-/// A monotonically generated identity for one logical connector instance
-/// generation. UUID v7 is used so a newer catalog generation cannot be
-/// overwritten by a delayed install request.
+/// A monotonically generated, provider-private epoch for one logical connector
+/// binding. UUID v7 prevents a delayed provider effect from being confused
+/// with a newer binding epoch.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConnectorInstanceIncarnation(Uuid);
+pub struct ProviderBindingEpoch(Uuid);
 
-impl ConnectorInstanceIncarnation {
+impl ProviderBindingEpoch {
     pub fn new() -> Self {
         Self(Uuid::now_v7())
     }
@@ -37,7 +37,7 @@ impl ConnectorInstanceIncarnation {
     }
 }
 
-impl Default for ConnectorInstanceIncarnation {
+impl Default for ProviderBindingEpoch {
     fn default() -> Self {
         Self::new()
     }
@@ -45,11 +45,11 @@ impl Default for ConnectorInstanceIncarnation {
 
 #[cfg(test)]
 mod tests {
-    use super::ConnectorInstanceIncarnation;
+    use super::ProviderBindingEpoch;
 
     #[test]
-    fn incarnation_round_trips_exact_bytes() {
-        let incarnation = ConnectorInstanceIncarnation::from_bytes([9; 16]);
-        assert_eq!(incarnation.to_bytes(), [9; 16]);
+    fn epoch_round_trips_exact_bytes() {
+        let epoch = ProviderBindingEpoch::from_bytes([9; 16]);
+        assert_eq!(epoch.to_bytes(), [9; 16]);
     }
 }

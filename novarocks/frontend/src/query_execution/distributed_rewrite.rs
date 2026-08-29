@@ -193,12 +193,7 @@ impl ConnectorDistributedRewriteSession {
         lease: ConnectorDistributedRewriteLease,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
-        plan.validate()?;
-        if plan.owner() != lease.binding_key() {
-            return Err(invalid(
-                "distributed rewrite plan does not belong to the exact rewrite lease",
-            ));
-        }
+        lease.validate_plan(&plan)?;
 
         let write_session = if plan.cohorts().is_empty() {
             None
@@ -492,16 +487,18 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_spi::connector::{
+        CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
         ConnectorCancellation, ConnectorControlBinding, ConnectorDistributedRewrite,
         ConnectorDistributedRewriteCohortPlan, ConnectorDistributedRewritePlanSummary,
-        ConnectorDistributedRewritePlanningRequest, ConnectorExecutionBindingKey,
-        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorMetadata, ConnectorProviderId,
+        ConnectorDistributedRewritePlanningRequest, ConnectorExecutionDistribution,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata,
+        ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderId,
         ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteActivationIntent,
         ConnectorWriteActivationRequest, ConnectorWriteActivationSource, ConnectorWriteBaseVersion,
         ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
         ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
         ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
+        ProviderBindingEpoch,
     };
 
     use super::*;
@@ -524,8 +521,21 @@ mod tests {
         .unwrap()
     }
 
+    fn catalog_properties(instance: ConnectorInstanceId) -> CatalogProperties {
+        CatalogProperties::new(
+            CatalogHandle::new(instance, CatalogVersion::from_bytes([3; 32])),
+            CatalogProviderKind::Iceberg,
+            1,
+            vec![
+                CatalogProperty::new("warehouse", "s3://rewrite-session").expect("valid warehouse"),
+            ],
+            Vec::new(),
+        )
+        .expect("valid catalog properties")
+    }
+
     fn preparation(
-        owner: ConnectorExecutionBindingKey,
+        owner: ConnectorProviderBindingKey,
         table: ConnectorTableHandle,
         schema: &arrow::datatypes::SchemaRef,
     ) -> ConnectorWritePreparation {
@@ -615,14 +625,14 @@ mod tests {
 
     struct TestRewrite {
         descriptor: ConnectorInstanceDescriptor,
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
     }
 
     impl ConnectorDistributedRewrite for TestRewrite {
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
         }
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
         fn plan_rewrite(
@@ -681,10 +691,10 @@ mod tests {
     }
 
     struct TestWrite {
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
     }
     impl ConnectorWriteControl for TestWrite {
-        fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
         }
         fn plan_write(
@@ -715,14 +725,14 @@ mod tests {
 
     struct TestDistribution {
         descriptor: ConnectorInstanceDescriptor,
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
     }
     impl ConnectorExecutionDistribution for TestDistribution {
         fn declaration(
             &self,
             _context: &ConnectorRequestContext,
-        ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-            ConnectorExecutionDeclaration::iceberg(
+        ) -> Result<ConnectorProviderBinding, ConnectorError> {
+            ConnectorProviderBinding::iceberg(
                 self.descriptor.instance_id.as_str(),
                 self.key.incarnation.to_bytes(),
                 "test",
@@ -745,9 +755,9 @@ mod tests {
             provider_id: provider,
             instance_id: instance.clone(),
         };
-        let key = ConnectorExecutionBindingKey {
+        let key = ConnectorProviderBindingKey {
             instance_id: instance.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         };
         let operation_id = ConnectorWriteOperationId::new();
         let table =
@@ -807,7 +817,8 @@ mod tests {
         });
         let lease = ConnectorDistributedRewriteLease::new(
             descriptor.clone(),
-            key.clone(),
+            novarocks_spi::connector::ConnectorControlRuntimeId::from_bytes([7; 16]),
+            key.incarnation,
             novarocks_spi::connector::ConnectorControlPlanningLease::new(
                 Arc::new(
                     ConnectorControlBinding::try_new(
@@ -825,7 +836,9 @@ mod tests {
                         }),
                         None,
                     )
-                    .unwrap(),
+                    .unwrap()
+                    .with_catalog_properties(catalog_properties(instance.clone()))
+                    .expect("control binding has catalog execution properties"),
                 ),
                 || {},
             ),

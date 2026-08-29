@@ -27,8 +27,8 @@
 use std::collections::BTreeSet;
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey,
-    ConnectorExecutionDeclaration, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
+    CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
+    ConnectorProviderBindingKey, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
     ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlan,
     ConnectorWritePlanningRequest, ConnectorWriterIdentity,
 };
@@ -44,7 +44,7 @@ use novarocks_types::UniqueId;
 /// carry more than one connector sink.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorWriteManifest {
-    owner: ConnectorExecutionBindingKey,
+    owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     cohort_id: ConnectorWriteCohortId,
     execution_id: novarocks_spi::connector::ConnectorWriteExecutionId,
@@ -58,7 +58,8 @@ impl ConnectorWriteManifest {
         terminal_write_fragment_ids: &BTreeSet<FragmentId>,
         operation_id: ConnectorWriteOperationId,
         cohort_id: ConnectorWriteCohortId,
-        owner: ConnectorExecutionBindingKey,
+        catalog_handle: CatalogHandle,
+        owner: ConnectorProviderBindingKey,
         execution_id: QueryExecutionId,
     ) -> Result<Self, ConnectorError> {
         if terminal_write_fragment_ids.is_empty() {
@@ -87,7 +88,7 @@ impl ConnectorWriteManifest {
                     fragment_id,
                     backend_num,
                     0,
-                    owner.clone(),
+                    catalog_handle.clone(),
                 ));
             }
         }
@@ -113,7 +114,7 @@ impl ConnectorWriteManifest {
         })
     }
 
-    pub fn owner(&self) -> &ConnectorExecutionBindingKey {
+    pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
     }
 
@@ -145,7 +146,7 @@ impl ConnectorWriteManifest {
         lease: ConnectorWriteLease,
         mut request: ConnectorWritePlanningRequest,
     ) -> Result<ConnectorWritePlanAttachment, ConnectorError> {
-        if lease.binding_key() != &self.owner {
+        if !lease.matches_provider_binding_key(&self.owner) {
             return Err(invalid(
                 "connector write lease does not match the frozen writer manifest generation",
             ));
@@ -171,14 +172,14 @@ impl ConnectorWriteManifest {
         // extend a write past its planning deadline or swap cancellation
         // state while retaining an otherwise exact generation lease.
         let context = request.context.clone();
-        let execution_declaration = lease.execution_declaration(&context)?;
-        let plan = lease.control().plan_write(request)?;
+        let catalog_properties = lease.catalog_properties().cloned();
+        let plan = lease.plan_write(request)?;
         validate_returned_plan(self, &plan)?;
         Ok(ConnectorWritePlanAttachment {
             manifest: self.clone(),
             plan,
             context,
-            execution_declaration,
+            catalog_properties,
             descriptor,
             _lease: lease,
         })
@@ -227,7 +228,7 @@ pub struct ConnectorWritePlanAttachment {
     manifest: ConnectorWriteManifest,
     plan: ConnectorWritePlan,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    execution_declaration: ConnectorExecutionDeclaration,
+    catalog_properties: Option<CatalogProperties>,
     descriptor: ConnectorWriteCohortDescriptor,
     _lease: ConnectorWriteLease,
 }
@@ -247,21 +248,14 @@ impl ConnectorWritePlanAttachment {
         &self.context
     }
 
-    /// Bounded exact-generation declaration to install on each BE that owns a
-    /// writer in this placement-frozen manifest.
-    pub fn execution_declaration(&self) -> &ConnectorExecutionDeclaration {
-        &self.execution_declaration
+    /// The exact catalog runtime contribution for this write, when the source
+    /// lease came from a desired-state-admitted FE control binding.
+    pub fn catalog_properties(&self) -> Option<&CatalogProperties> {
+        self.catalog_properties.as_ref()
     }
 
     pub fn descriptor(&self) -> &ConnectorWriteCohortDescriptor {
         &self.descriptor
-    }
-
-    /// The exact FE control capability retained from placement through the
-    /// terminal commit/abort decision. This intentionally exposes no registry
-    /// lookup, so a newer incarnation cannot take over the operation.
-    pub fn control(&self) -> &std::sync::Arc<dyn novarocks_spi::connector::ConnectorWriteControl> {
-        self._lease.control()
     }
 }
 
@@ -303,7 +297,7 @@ fn connector_execution_id(
 }
 
 fn writer_manifest_digest(
-    owner: &ConnectorExecutionBindingKey,
+    owner: &ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     cohort_id: ConnectorWriteCohortId,
     execution_id: novarocks_spi::connector::ConnectorWriteExecutionId,
@@ -324,6 +318,9 @@ fn writer_manifest_digest(
         hasher.update(writer.fragment_id().to_be_bytes());
         hasher.update(writer.backend_num().to_be_bytes());
         hasher.update(writer.sink_ordinal().to_be_bytes());
+        hasher.update((writer.catalog_handle().catalog_name().as_str().len() as u64).to_be_bytes());
+        hasher.update(writer.catalog_handle().catalog_name().as_str().as_bytes());
+        hasher.update(writer.catalog_handle().version().as_bytes());
     }
     hasher.finalize().into()
 }
@@ -346,7 +343,7 @@ mod tests {
     use super::*;
     use crate::query_execution::schedule::FragmentInstancePlacement;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-    use novarocks_spi::connector::{ConnectorInstanceId, ConnectorInstanceIncarnation};
+    use novarocks_spi::connector::{ConnectorInstanceId, ProviderBindingEpoch};
 
     fn placement(
         fragment_id: FragmentId,
@@ -367,11 +364,18 @@ mod tests {
         }
     }
 
-    fn owner() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn owner() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("iceberg").expect("valid instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([9; 16]),
         }
+    }
+
+    fn catalog_handle() -> CatalogHandle {
+        CatalogHandle::new(
+            owner().instance_id,
+            novarocks_spi::connector::CatalogVersion::from_bytes([1; 32]),
+        )
     }
 
     fn execution() -> QueryExecutionId {
@@ -406,6 +410,7 @@ mod tests {
             &terminal,
             operation_id,
             ConnectorWriteCohortId::primary(operation_id),
+            catalog_handle(),
             owner(),
             execution(),
         )
@@ -437,6 +442,7 @@ mod tests {
             &terminal,
             operation_id,
             other_cohort,
+            catalog_handle(),
             owner(),
             execution(),
         )
@@ -458,6 +464,7 @@ mod tests {
             &BTreeSet::from([3]),
             operation_id,
             ConnectorWriteCohortId::primary(operation_id),
+            catalog_handle(),
             owner(),
             execution(),
         )

@@ -97,7 +97,7 @@ mod tests {
             "--only".to_string(),
             "query-lifecycle/mysql-disconnect".to_string(),
             "--only".to_string(),
-            "connector/generation-replacement".to_string(),
+            "connector/catalog-version-drain".to_string(),
         ])
         .expect("parse repeated selectors");
         assert_eq!(cli.only.len(), 2);

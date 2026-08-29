@@ -35,27 +35,27 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::{
-    ConnectorCommittedPartitionField, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorManagedDescriptorProperties, ConnectorManagedPartitionField,
-    ConnectorManagedPartitionSpecObservation, ConnectorManagedPartitionSpecPreview,
-    ConnectorManagedPartitionSpecPreviewRequest, ConnectorManagedPartitionSpecReplacement,
-    ConnectorManagedPartitionTransform, ConnectorManagedPublicationEmptyInputDisposition,
-    ConnectorManagedPublicationTechnique, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorPreReadyWritePlanningProof,
-    ConnectorPreReadyWritePlanningRequest, ConnectorRequestContext,
-    ConnectorRowMutationActivationRequest, ConnectorRowMutationCohortRecipeBody,
-    ConnectorRowMutationExecutionPlan, ConnectorRowMutationPreparationOutcome,
-    ConnectorRowMutationPreparationRequest, ConnectorTableObjectId, ConnectorWriteAbortOutcome,
-    ConnectorWriteAbortRequest, ConnectorWriteActivation, ConnectorWriteActivationIntent,
-    ConnectorWriteActivationRequest, ConnectorWriteActivationSource, ConnectorWriteCohortId,
-    ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWriteExecutionId,
-    ConnectorWriteInputShape, ConnectorWriteOperationCompletion, ConnectorWriteOperationId,
-    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparationOutcome,
+    CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCommittedPartitionField, ConnectorError,
+    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorManagedDescriptorProperties,
+    ConnectorManagedPartitionField, ConnectorManagedPartitionSpecObservation,
+    ConnectorManagedPartitionSpecPreview, ConnectorManagedPartitionSpecPreviewRequest,
+    ConnectorManagedPartitionSpecReplacement, ConnectorManagedPartitionTransform,
+    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
+    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
+    ConnectorPreReadyWritePlanningProof, ConnectorPreReadyWritePlanningRequest,
+    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorRowMutationActivationRequest,
+    ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationExecutionPlan,
+    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
+    ConnectorTableObjectId, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
+    ConnectorWriteActivation, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
+    ConnectorWriteActivationSource, ConnectorWriteCohortId, ConnectorWriteCommitRequest,
+    ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteInputShape,
+    ConnectorWriteOperationCompletion, ConnectorWriteOperationId, ConnectorWritePlan,
+    ConnectorWritePlanningRequest, ConnectorWritePreparationOutcome,
     ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
     ConnectorWriterHandle, ExternalMutationEffect, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome, LakePublicationFamily,
-    LakePublicationId, LakePublicationMarkerHeader,
+    LakePublicationId, LakePublicationMarkerHeader, ProviderBindingEpoch,
 };
 
 use crate::commit::data_writer::parquet_row_group_size_bytes;
@@ -97,7 +97,7 @@ const MAX_ICEBERG_WRITE_TERMINAL_TOMBSTONES: usize = 16_384;
 /// Iceberg control generation.
 #[derive(Clone)]
 pub struct IcebergWriteControl {
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
     provider: IcebergMetadata,
     runtime: Arc<IcebergMetadataContext>,
@@ -347,10 +347,10 @@ impl IcebergWriteControl {
     /// one owned by `runtime`; callers cannot inject an independent registry.
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
         runtime: Arc<IcebergMetadataContext>,
     ) -> Self {
-        let key = ConnectorExecutionBindingKey {
+        let key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
             incarnation,
         };
@@ -366,7 +366,7 @@ impl IcebergWriteControl {
         }
     }
 
-    fn ensure_owner(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
+    fn ensure_owner(&self, owner: &ConnectorProviderBindingKey) -> Result<(), ConnectorError> {
         if owner != &self.key {
             return Err(invalid(
                 "Iceberg write request does not match the exact connector generation",
@@ -1707,7 +1707,7 @@ impl IcebergWriteControl {
 }
 
 impl ConnectorWriteControl for IcebergWriteControl {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -1889,12 +1889,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
             .cloned()
             .zip(writer_payloads)
             .map(|(writer, payload)| {
-                ConnectorWriterHandle::try_new(
-                    self.key.clone(),
-                    writer,
-                    ICEBERG_WRITE_PAYLOAD_VERSION,
-                    payload,
-                )
+                ConnectorWriterHandle::try_new(writer, CONNECTOR_WRITE_CONTRACT_VERSION, payload)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let plan = ConnectorWritePlan::try_new(
@@ -3784,8 +3779,8 @@ fn planning_attempt_digest(request: &ConnectorWritePlanningRequest) -> [u8; 32] 
         hasher.update(writer.fragment_id().to_be_bytes());
         hasher.update(writer.backend_num().to_be_bytes());
         hasher.update(writer.sink_ordinal().to_be_bytes());
-        hasher.update(writer.binding_key().instance_id.as_str().as_bytes());
-        hasher.update(writer.binding_key().incarnation.to_bytes());
+        hasher.update(writer.catalog_handle().catalog_name().as_str().as_bytes());
+        hasher.update(writer.catalog_handle().version().as_bytes());
     }
     hasher.finalize().into()
 }
@@ -3897,15 +3892,16 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
-        CONNECTOR_WRITE_CONTRACT_VERSION, ConnectorCancellation, ConnectorInstanceId,
-        ConnectorManagedDescriptorProperties, ConnectorManagedPublicationIntent,
-        ConnectorManagedPublicationTarget, ConnectorPreReadyWritePlanningRequest,
-        ConnectorProviderId, ConnectorSealedWriteCohortSet, ConnectorStagedPublicationBaseFact,
-        ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorTableHandle,
-        ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion, ConnectorWriteCohortCompletion,
-        ConnectorWriteCohortDescriptor, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
-        ConnectorWriteIntent, ConnectorWriteOperationCompletion, ConnectorWritePreparation,
-        ConnectorWriteTargetRef, ConnectorWriterIdentity, ConnectorWriterTerminalState,
+        CONNECTOR_WRITE_CONTRACT_VERSION, CatalogHandle, CatalogVersion, ConnectorCancellation,
+        ConnectorInstanceId, ConnectorManagedDescriptorProperties,
+        ConnectorManagedPublicationIntent, ConnectorManagedPublicationTarget,
+        ConnectorPreReadyWritePlanningRequest, ConnectorProviderId, ConnectorSealedWriteCohortSet,
+        ConnectorStagedPublicationBaseFact, ConnectorStagedReport, ConnectorStagedReportSummary,
+        ConnectorTableHandle, ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion,
+        ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteFieldBinding,
+        ConnectorWriteFieldToken, ConnectorWriteIntent, ConnectorWriteOperationCompletion,
+        ConnectorWritePreparation, ConnectorWriteTargetRef, ConnectorWriterIdentity,
+        ConnectorWriterTerminalState,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -3940,6 +3936,13 @@ mod tests {
         .expect("context")
     }
 
+    fn catalog_handle(owner: &ConnectorProviderBindingKey) -> CatalogHandle {
+        CatalogHandle::new(
+            owner.instance_id.clone(),
+            CatalogVersion::from_bytes([1; 32]),
+        )
+    }
+
     fn control() -> (tokio::runtime::Runtime, IcebergWriteControl) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
@@ -3971,7 +3974,7 @@ mod tests {
         };
         let control = IcebergWriteControl::new(
             descriptor,
-            ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            ProviderBindingEpoch::from_bytes([7; 16]),
             runtime,
         );
         (executor, control)
@@ -4013,7 +4016,7 @@ mod tests {
         };
         let control = IcebergWriteControl::new(
             descriptor,
-            ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            ProviderBindingEpoch::from_bytes([7; 16]),
             Arc::clone(&runtime),
         );
         let catalog = runtime.novarocks_catalog().vendored_client();
@@ -4044,7 +4047,7 @@ mod tests {
         (executor, warehouse, control, table)
     }
 
-    fn preparation(owner: &ConnectorExecutionBindingKey, marker: u8) -> ConnectorWritePreparation {
+    fn preparation(owner: &ConnectorProviderBindingKey, marker: u8) -> ConnectorWritePreparation {
         let schema = Schema::builder()
             .with_fields(vec![
                 NestedField::optional(1, "value", Type::Primitive(PrimitiveType::Long)).into(),
@@ -4067,7 +4070,7 @@ mod tests {
     }
 
     fn preparation_for_metadata(
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         metadata: &crate::iceberg::spec::TableMetadata,
         intent: ConnectorWriteIntent,
         marker: u8,
@@ -4121,7 +4124,7 @@ mod tests {
     }
 
     fn activation_request(
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
         marker: u8,
     ) -> ConnectorWriteActivationRequest {
@@ -4320,7 +4323,7 @@ mod tests {
             5,
             6,
             0,
-            owner.clone(),
+            catalog_handle(&owner),
         );
         let request = ConnectorWritePlanningRequest {
             operation_id,
@@ -4382,7 +4385,7 @@ mod tests {
                 fragment_id,
                 backend_num,
                 0,
-                owner.clone(),
+                catalog_handle(&owner),
             )
         };
         let writers = vec![writer(9, 0, 1), writer(3, 0, 2), writer(3, 1, 3)];
@@ -4420,7 +4423,7 @@ mod tests {
             5,
             6,
             0,
-            owner.clone(),
+            catalog_handle(&owner),
         );
         let planning = ConnectorWritePlanningRequest {
             operation_id,
@@ -4851,7 +4854,7 @@ mod tests {
             1,
             1,
             0,
-            owner.clone(),
+            catalog_handle(&owner),
         );
         let planning = ConnectorWritePlanningRequest {
             operation_id,
@@ -5169,7 +5172,7 @@ mod tests {
             1,
             2,
             0,
-            owner.clone(),
+            catalog_handle(&owner),
         );
         let planning = ConnectorWritePlanningRequest {
             operation_id,

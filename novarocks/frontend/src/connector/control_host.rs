@@ -19,15 +19,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver,
+    CatalogHandle, ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver,
     ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver, ConnectorControlBinding,
     ConnectorControlFactory, ConnectorControlFactoryRequest, ConnectorControlFactoryResolver,
     ConnectorControlPlanningLease, ConnectorControlRegistry, ConnectorControlResolver,
-    ConnectorDataMutationLease, ConnectorDataMutationResolver, ConnectorDistributedRewriteLease,
-    ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorMetadataMaintenanceLease,
-    ConnectorMetadataMaintenanceResolver, ConnectorProviderId, ConnectorStatisticsLease,
-    ConnectorStatisticsResolver, ConnectorWriteLease,
+    ConnectorControlRuntimeId, ConnectorDataMutationLease, ConnectorDataMutationResolver,
+    ConnectorDistributedRewriteLease, ConnectorDistributedRewriteResolver, ConnectorError,
+    ConnectorErrorKind, ConnectorInstanceId, ConnectorMetadataMaintenanceLease,
+    ConnectorMetadataMaintenanceResolver, ConnectorProviderBindingKey, ConnectorProviderId,
+    ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorWriteLease,
 };
 
 /// FE process owner of logical Connector control generations. It contains no
@@ -35,22 +35,68 @@ use novarocks_spi::connector::{
 #[derive(Clone, Default)]
 pub struct ConnectorControlHost {
     state: Arc<Mutex<ControlHostState>>,
-    retirement_sink: Arc<Mutex<Option<Arc<dyn ConnectorControlRetirementSink>>>>,
     factories: Arc<BTreeMap<ConnectorProviderId, Arc<dyn ConnectorControlFactory>>>,
 }
 
 #[derive(Default)]
 struct ControlHostState {
-    active: BTreeMap<ConnectorInstanceId, ConnectorExecutionBindingKey>,
-    generations: BTreeMap<ConnectorExecutionBindingKey, ControlGeneration>,
-    retired: BTreeSet<ConnectorExecutionBindingKey>,
-    installed_backends: BTreeMap<ConnectorExecutionBindingKey, BTreeSet<String>>,
+    active: BTreeMap<ConnectorInstanceId, ConnectorControlRuntimeId>,
+    generations: BTreeMap<ConnectorControlRuntimeId, ControlGeneration>,
+    retired: BTreeSet<ConnectorControlRuntimeId>,
+    /// Temporary bridge for the legacy FE effect contract.
+    /// It is not a control-generation owner and is removed with that contract.
+    legacy_execution_index: BTreeMap<ConnectorProviderBindingKey, ConnectorControlRuntimeId>,
+    /// Compatibility-only evidence retained until the FE effect contract stops
+    /// carrying legacy execution keys. It never drives BE retirement.
+    installed_backends: BTreeMap<ConnectorProviderBindingKey, BTreeSet<String>>,
     ready_retires: Vec<ConnectorControlRetirement>,
+}
+
+impl ControlHostState {
+    fn runtime_for_legacy_effect(
+        &self,
+        key: &ConnectorProviderBindingKey,
+    ) -> Result<ConnectorControlRuntimeId, ConnectorError> {
+        self.legacy_execution_index
+            .get(key)
+            .copied()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    "connector legacy effect generation is not registered",
+                )
+            })
+    }
+
+    fn active_legacy_effect(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorProviderBindingKey, ConnectorError> {
+        let runtime_id = self.active.get(instance_id).copied().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                format!(
+                    "connector control instance `{}` is not active",
+                    instance_id.as_str()
+                ),
+            )
+        })?;
+        self.generations
+            .get(&runtime_id)
+            .map(|generation| generation.legacy_execution_key.clone())
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    "active connector control generation is missing",
+                )
+            })
+    }
 }
 
 // Design: ADR-0017 (docs/adr/ADR-0017-connector-catalog-mutation-outcomes.md)
 struct ControlGeneration {
     binding: Arc<ConnectorControlBinding>,
+    legacy_execution_key: ConnectorProviderBindingKey,
     state: ControlGenerationState,
     planning_leases: usize,
     mutation_leases: usize,
@@ -81,19 +127,13 @@ enum ControlGenerationState {
     Retiring,
 }
 
-/// A retiring generation plus the BE endpoints that successfully ensured it.
-/// The frontend dispatcher owns the best-effort remote retirement dispatch.
+/// Compatibility-only retirement evidence for the remaining FE effect bridge.
+/// It is local bookkeeping; BE catalog eviction is driven only by complete
+/// reachability snapshots and `PruneCatalogs`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorControlRetirement {
-    pub key: ConnectorExecutionBindingKey,
+    pub key: ConnectorProviderBindingKey,
     pub installed_backends: Vec<String>,
-}
-
-/// Frontend-composed best-effort transport for a retired execution binding.
-/// It deliberately receives only an exact binding key and previously ACKed
-/// endpoints; no connector control or execution object crosses this seam.
-pub trait ConnectorControlRetirementSink: Send + Sync + 'static {
-    fn retire(&self, retirement: ConnectorControlRetirement);
 }
 
 #[allow(
@@ -123,45 +163,41 @@ impl ConnectorControlHost {
         }
         Ok(Self {
             state: Arc::new(Mutex::new(ControlHostState::default())),
-            retirement_sink: Arc::new(Mutex::new(None)),
             factories: Arc::new(factory_map),
         })
     }
 
-    pub fn set_retirement_sink(&self, sink: Arc<dyn ConnectorControlRetirementSink>) {
-        let Ok(mut slot) = self.retirement_sink.lock() else {
-            return;
-        };
-        *slot = Some(Arc::clone(&sink));
-        // Keep the sink lock while taking the fallback queue. A concurrent
-        // retirement either observes this sink or queues itself before this
-        // drain; it cannot be stranded between the two operations.
-        let ready = match self.lock_state() {
-            Ok(mut state) => std::mem::take(&mut state.ready_retires),
-            Err(error) => {
-                tracing::warn!(%error, "connector control retirement sink was not installed");
-                return;
-            }
-        };
-        drop(slot);
-        for retirement in ready {
-            sink.retire(retirement);
-        }
+    /// Every exact catalog handle still protected by this FE process.
+    ///
+    /// Retiring generations remain present until their last planning or effect
+    /// lease drains. Callers combine this with one complete desired-state
+    /// snapshot before issuing a best-effort BE prune.
+    pub(crate) fn reachable_catalog_handles(
+        &self,
+    ) -> Result<BTreeSet<CatalogHandle>, ConnectorError> {
+        let state = self.lock_state()?;
+        Ok(state
+            .generations
+            .values()
+            .filter_map(|generation| generation.binding.catalog_handle().ok().cloned())
+            .collect())
     }
 
     pub fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError> {
         let binding = Arc::new(binding);
-        let key = ConnectorExecutionBindingKey {
+        let legacy_execution_key = ConnectorProviderBindingKey {
             instance_id: binding.descriptor().instance_id.clone(),
             incarnation: binding.incarnation(),
         };
+        let control_runtime_id = binding.control_runtime_id();
+        let instance_id = binding.descriptor().instance_id.clone();
         let mut state = self.lock_state()?;
-        if state.retired.contains(&key) {
+        if state.retired.contains(&control_runtime_id) {
             return Err(invalid(
                 "retired connector control generation cannot be registered again",
             ));
         }
-        if let Some(existing) = state.generations.get(&key) {
+        if let Some(existing) = state.generations.get(&control_runtime_id) {
             if existing.state == ControlGenerationState::Active {
                 return Ok(());
             }
@@ -169,17 +205,29 @@ impl ConnectorControlHost {
                 "retiring connector control generation cannot be registered again",
             ));
         }
-        if state.active.contains_key(&key.instance_id) {
+        if state
+            .legacy_execution_index
+            .contains_key(&legacy_execution_key)
+        {
+            return Err(invalid(
+                "connector legacy effect generation is already registered",
+            ));
+        }
+        if state.active.contains_key(&instance_id) {
             return Err(invalid(format!(
                 "connector control instance `{}` already has an active generation",
-                key.instance_id.as_str()
+                instance_id.as_str()
             )));
         }
-        state.active.insert(key.instance_id.clone(), key.clone());
+        state.active.insert(instance_id, control_runtime_id);
+        state
+            .legacy_execution_index
+            .insert(legacy_execution_key.clone(), control_runtime_id);
         state.generations.insert(
-            key,
+            control_runtime_id,
             ControlGeneration {
                 binding,
+                legacy_execution_key,
                 state: ControlGenerationState::Active,
                 planning_leases: 0,
                 mutation_leases: 0,
@@ -195,8 +243,9 @@ impl ConnectorControlHost {
     }
 
     /// Prevents new planning immediately. Existing leases retain their exact
-    /// binding through the ensure barrier; once the last lease drops, callers
-    /// may dispatch the returned best-effort BE retire work.
+    /// effect owner until their final local release, after which the control
+    /// generation is removed. BE catalog eviction is independently driven by
+    /// the complete desired-state snapshot.
     pub fn retire_current(&self, instance_id: &ConnectorInstanceId) -> Result<(), ConnectorError> {
         let mut state = self.lock_state()?;
         let key = state.active.remove(instance_id).ok_or_else(|| {
@@ -215,30 +264,24 @@ impl ConnectorControlHost {
             )
         })?;
         generation.state = ControlGenerationState::Retiring;
-        let retirement = generation
-            .all_leases_released()
-            .then(|| queue_retirement(&mut state, key))
-            .flatten();
-        drop(state);
-        self.dispatch_retirement(retirement);
+        let should_retire = generation.all_leases_released();
+        if should_retire {
+            if let Some(retirement) = queue_retirement(&mut state, key) {
+                state.ready_retires.push(retirement);
+            }
+        }
         Ok(())
     }
 
-    /// Records a successful BE ensure acknowledgement. This is accepted for a
-    /// retiring generation because the planning lease that caused it is allowed
-    /// to finish its barrier before best-effort retirement is dispatched.
+    /// Records compatibility evidence from the retired FE effect bridge. This
+    /// data is not used to manage BE catalog lifetime.
     pub fn record_installed_backend(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        key: &ConnectorProviderBindingKey,
         endpoint: impl Into<String>,
     ) -> Result<(), ConnectorError> {
         let mut state = self.lock_state()?;
-        if !state.generations.contains_key(key) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::NotFound,
-                "connector control generation is not registered",
-            ));
-        }
+        state.runtime_for_legacy_effect(key)?;
         state
             .installed_backends
             .entry(key.clone())
@@ -247,6 +290,8 @@ impl ConnectorControlHost {
         Ok(())
     }
 
+    /// Returns compatibility retirement evidence. There is deliberately no
+    /// production dispatch sink for it.
     pub fn take_ready_retires(&self) -> Result<Vec<ConnectorControlRetirement>, ConnectorError> {
         let mut state = self.lock_state()?;
         Ok(std::mem::take(&mut state.ready_retires))
@@ -283,9 +328,8 @@ impl ConnectorControlHost {
             (Arc::clone(&generation.binding), key)
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
         Ok(ConnectorControlPlanningLease::new(binding, move || {
-            release_lease(&state, &retirement_sink, key, LeaseKind::Planning);
+            release_lease(&state, key, LeaseKind::Planning);
         }))
     }
 
@@ -293,9 +337,9 @@ impl ConnectorControlHost {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
-        let (descriptor, incarnation, mutation, key) = {
-            let mut state = self.lock_state()?;
-            let key = state.active.get(instance_id).cloned().ok_or_else(|| {
+        let control_runtime_id = {
+            let state = self.lock_state()?;
+            state.active.get(instance_id).copied().ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     format!(
@@ -303,14 +347,28 @@ impl ConnectorControlHost {
                         instance_id.as_str()
                     ),
                 )
-            })?;
-            let generation = state.generations.get_mut(&key).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "active connector control generation is missing",
-                )
-            })?;
-            if generation.state != ControlGenerationState::Active {
+            })?
+        };
+        self.acquire_exact_mutation(control_runtime_id, true)
+    }
+
+    fn acquire_exact_mutation(
+        &self,
+        control_runtime_id: ConnectorControlRuntimeId,
+        require_active: bool,
+    ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
+        let (descriptor, provider_incarnation, mutation) = {
+            let mut state = self.lock_state()?;
+            let generation = state
+                .generations
+                .get_mut(&control_runtime_id)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "connector control runtime is not registered",
+                    )
+                })?;
+            if require_active && generation.state != ControlGenerationState::Active {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Unavailable,
                     "connector control generation is retiring",
@@ -327,23 +385,25 @@ impl ConnectorControlHost {
                 generation.binding.descriptor().clone(),
                 generation.binding.incarnation(),
                 mutation,
-                key,
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
-        ConnectorCatalogMutationLease::new(descriptor, incarnation, mutation, move || {
-            release_lease(&state, &retirement_sink, key, LeaseKind::Mutation);
-        })
+        ConnectorCatalogMutationLease::new(
+            descriptor,
+            control_runtime_id,
+            provider_incarnation,
+            mutation,
+            move || release_lease(&state, control_runtime_id, LeaseKind::Mutation),
+        )
     }
 
     fn acquire_current_data_mutation(
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorDataMutationLease, ConnectorError> {
-        let key = {
+        let control_runtime_id = {
             let state = self.lock_state()?;
-            state.active.get(instance_id).cloned().ok_or_else(|| {
+            state.active.get(instance_id).copied().ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     format!(
@@ -353,29 +413,32 @@ impl ConnectorControlHost {
                 )
             })?
         };
-        self.acquire_data_mutation(&key, true)
+        self.acquire_data_mutation(control_runtime_id, true)
     }
 
     fn acquire_exact_data_mutation(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorDataMutationLease, ConnectorError> {
-        self.acquire_data_mutation(key, false)
+        self.acquire_data_mutation(control_runtime_id, false)
     }
 
     fn acquire_data_mutation(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
         require_active: bool,
     ) -> Result<ConnectorDataMutationLease, ConnectorError> {
-        let (descriptor, metadata, mutation) = {
+        let (descriptor, provider_incarnation, metadata, mutation) = {
             let mut state = self.lock_state()?;
-            let generation = state.generations.get_mut(key).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::NotFound,
-                    "connector control generation is not registered",
-                )
-            })?;
+            let generation = state
+                .generations
+                .get_mut(&control_runtime_id)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "connector control runtime is not registered",
+                    )
+                })?;
             if require_active && generation.state != ControlGenerationState::Active {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Unavailable,
@@ -391,25 +454,29 @@ impl ConnectorControlHost {
             generation.data_mutation_leases = generation.data_mutation_leases.saturating_add(1);
             (
                 generation.binding.descriptor().clone(),
+                generation.binding.incarnation(),
                 Arc::clone(generation.binding.metadata()),
                 mutation,
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
-        let lease_key = key.clone();
-        ConnectorDataMutationLease::new(descriptor, key.clone(), metadata, mutation, move || {
-            release_lease(&state, &retirement_sink, lease_key, LeaseKind::DataMutation);
-        })
+        ConnectorDataMutationLease::new(
+            descriptor,
+            control_runtime_id,
+            provider_incarnation,
+            metadata,
+            mutation,
+            move || release_lease(&state, control_runtime_id, LeaseKind::DataMutation),
+        )
     }
 
     fn acquire_current_metadata_maintenance(
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
-        let key = {
+        let control_runtime_id = {
             let state = self.lock_state()?;
-            state.active.get(instance_id).cloned().ok_or_else(|| {
+            state.active.get(instance_id).copied().ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     format!(
@@ -419,29 +486,32 @@ impl ConnectorControlHost {
                 )
             })?
         };
-        self.acquire_metadata_maintenance(&key, true)
+        self.acquire_metadata_maintenance(control_runtime_id, true)
     }
 
     fn acquire_exact_metadata_maintenance(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
-        self.acquire_metadata_maintenance(key, false)
+        self.acquire_metadata_maintenance(control_runtime_id, false)
     }
 
     fn acquire_metadata_maintenance(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
         require_active: bool,
     ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
-        let (descriptor, metadata, maintenance) = {
+        let (descriptor, provider_incarnation, metadata, maintenance) = {
             let mut state = self.lock_state()?;
-            let generation = state.generations.get_mut(key).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::NotFound,
-                    "connector control generation is not registered",
-                )
-            })?;
+            let generation = state
+                .generations
+                .get_mut(&control_runtime_id)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "connector control runtime is not registered",
+                    )
+                })?;
             if require_active && generation.state != ControlGenerationState::Active {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Unavailable,
@@ -462,26 +532,19 @@ impl ConnectorControlHost {
                 generation.metadata_maintenance_leases.saturating_add(1);
             (
                 generation.binding.descriptor().clone(),
+                generation.binding.incarnation(),
                 Arc::clone(generation.binding.metadata()),
                 maintenance,
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
-        let lease_key = key.clone();
         ConnectorMetadataMaintenanceLease::new(
             descriptor,
-            key.clone(),
+            control_runtime_id,
+            provider_incarnation,
             metadata,
             maintenance,
-            move || {
-                release_lease(
-                    &state,
-                    &retirement_sink,
-                    lease_key,
-                    LeaseKind::MetadataMaintenance,
-                );
-            },
+            move || release_lease(&state, control_runtime_id, LeaseKind::MetadataMaintenance),
         )
     }
 
@@ -489,9 +552,9 @@ impl ConnectorControlHost {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
-        let key = {
+        let control_runtime_id = {
             let state = self.lock_state()?;
-            state.active.get(instance_id).cloned().ok_or_else(|| {
+            state.active.get(instance_id).copied().ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     format!(
@@ -501,14 +564,14 @@ impl ConnectorControlHost {
                 )
             })?
         };
-        self.acquire_cleanup_maintenance(&key, true)
+        self.acquire_cleanup_maintenance(control_runtime_id, true)
     }
 
     fn acquire_exact_cleanup_maintenance(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
-        self.acquire_cleanup_maintenance(key, false)
+        self.acquire_cleanup_maintenance(control_runtime_id, false)
     }
 
     /// Acquires metadata and cleanup from one exact control generation. Cleanup
@@ -516,17 +579,20 @@ impl ConnectorControlHost {
     /// immutable prepared evidence; it never substitutes a current generation.
     fn acquire_cleanup_maintenance(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
         require_active: bool,
     ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
-        let (descriptor, metadata, cleanup) = {
+        let (descriptor, provider_incarnation, metadata, cleanup) = {
             let mut state = self.lock_state()?;
-            let generation = state.generations.get_mut(key).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::NotFound,
-                    "connector control generation is not registered",
-                )
-            })?;
+            let generation = state
+                .generations
+                .get_mut(&control_runtime_id)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "connector control runtime is not registered",
+                    )
+                })?;
             if require_active && generation.state != ControlGenerationState::Active {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Unavailable,
@@ -547,26 +613,19 @@ impl ConnectorControlHost {
                 generation.cleanup_maintenance_leases.saturating_add(1);
             (
                 generation.binding.descriptor().clone(),
+                generation.binding.incarnation(),
                 Arc::clone(generation.binding.metadata()),
                 cleanup,
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
-        let lease_key = key.clone();
         ConnectorCleanupMaintenanceLease::new(
             descriptor,
-            key.clone(),
+            control_runtime_id,
+            provider_incarnation,
             metadata,
             cleanup,
-            move || {
-                release_lease(
-                    &state,
-                    &retirement_sink,
-                    lease_key,
-                    LeaseKind::CleanupMaintenance,
-                );
-            },
+            move || release_lease(&state, control_runtime_id, LeaseKind::CleanupMaintenance),
         )
     }
 
@@ -574,9 +633,9 @@ impl ConnectorControlHost {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
-        let key = {
+        let control_runtime_id = {
             let state = self.lock_state()?;
-            state.active.get(instance_id).cloned().ok_or_else(|| {
+            state.active.get(instance_id).copied().ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     format!(
@@ -586,14 +645,14 @@ impl ConnectorControlHost {
                 )
             })?
         };
-        self.acquire_distributed_rewrite(&key, true)
+        self.acquire_distributed_rewrite(control_runtime_id, true)
     }
 
     fn acquire_exact_distributed_rewrite(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
-        self.acquire_distributed_rewrite(key, false)
+        self.acquire_distributed_rewrite(control_runtime_id, false)
     }
 
     /// Acquire the metadata, rewrite planning, write-control, and execution
@@ -603,17 +662,29 @@ impl ConnectorControlHost {
     /// separate current write generation.
     fn acquire_distributed_rewrite(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
         require_active: bool,
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
-        let (binding, descriptor, metadata, planning, rewrite, write, distribution) = {
+        let (
+            binding,
+            descriptor,
+            provider_incarnation,
+            metadata,
+            planning,
+            rewrite,
+            write,
+            distribution,
+        ) = {
             let mut state = self.lock_state()?;
-            let generation = state.generations.get_mut(key).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::NotFound,
-                    "connector control generation is not registered",
-                )
-            })?;
+            let generation = state
+                .generations
+                .get_mut(&control_runtime_id)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "connector control runtime is not registered",
+                    )
+                })?;
             if require_active && generation.state != ControlGenerationState::Active {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Unavailable,
@@ -642,6 +713,7 @@ impl ConnectorControlHost {
             (
                 Arc::clone(&generation.binding),
                 generation.binding.descriptor().clone(),
+                generation.binding.incarnation(),
                 Arc::clone(generation.binding.metadata()),
                 Arc::clone(generation.binding.planning()),
                 rewrite,
@@ -650,22 +722,15 @@ impl ConnectorControlHost {
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
-        let lease_key = key.clone();
         let planning_state = Arc::downgrade(&self.state);
-        let planning_retirement_sink = Arc::downgrade(&self.retirement_sink);
-        let planning_key = key.clone();
+        let planning_runtime_id = control_runtime_id;
         let planning_lease = ConnectorControlPlanningLease::new(binding, move || {
-            release_lease(
-                &planning_state,
-                &planning_retirement_sink,
-                planning_key,
-                LeaseKind::Planning,
-            );
+            release_lease(&planning_state, planning_runtime_id, LeaseKind::Planning);
         });
         ConnectorDistributedRewriteLease::new(
             descriptor,
-            key.clone(),
+            control_runtime_id,
+            provider_incarnation,
             planning_lease,
             metadata,
             planning,
@@ -673,12 +738,7 @@ impl ConnectorControlHost {
             write,
             distribution,
             move || {
-                release_lease(
-                    &state,
-                    &retirement_sink,
-                    lease_key,
-                    LeaseKind::DistributedRewrite,
-                );
+                release_lease(&state, control_runtime_id, LeaseKind::DistributedRewrite);
             },
         )
     }
@@ -687,9 +747,9 @@ impl ConnectorControlHost {
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorWriteLease, ConnectorError> {
-        let (write, provider_id, distribution, key) = {
+        let (write, provider_id, distribution, catalog_properties, legacy_key, runtime_id) = {
             let mut state = self.lock_state()?;
-            let key = state.active.get(instance_id).cloned().ok_or_else(|| {
+            let runtime_id = state.active.get(instance_id).copied().ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     format!(
@@ -698,7 +758,7 @@ impl ConnectorControlHost {
                     ),
                 )
             })?;
-            let generation = state.generations.get_mut(&key).ok_or_else(|| {
+            let generation = state.generations.get_mut(&runtime_id).ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::Internal,
                     "active connector control generation is missing",
@@ -718,27 +778,36 @@ impl ConnectorControlHost {
             })?;
             let provider_id = generation.binding.descriptor().provider_id.clone();
             let distribution = generation.binding.execution_distribution().clone();
+            let catalog_properties = generation.binding.catalog_properties()?.clone();
             generation.write_leases = generation.write_leases.saturating_add(1);
-            (write, provider_id, distribution, key)
+            (
+                write,
+                provider_id,
+                distribution,
+                catalog_properties,
+                generation.legacy_execution_key.clone(),
+                runtime_id,
+            )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
         ConnectorWriteLease::new_with_execution_distribution(
-            key.clone(),
+            runtime_id,
+            legacy_key,
             write,
             provider_id,
             distribution,
-            move || release_lease(&state, &retirement_sink, key, LeaseKind::Write),
+            move || release_lease(&state, runtime_id, LeaseKind::Write),
         )
+        .and_then(|lease| lease.with_catalog_properties(catalog_properties))
     }
 
     fn acquire_statistics(
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorStatisticsLease, ConnectorError> {
-        let (descriptor, incarnation, statistics, key) = {
+        let (descriptor, incarnation, statistics, runtime_id) = {
             let mut state = self.lock_state()?;
-            let key = state.active.get(instance_id).cloned().ok_or_else(|| {
+            let runtime_id = state.active.get(instance_id).copied().ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     format!(
@@ -747,7 +816,7 @@ impl ConnectorControlHost {
                     ),
                 )
             })?;
-            let generation = state.generations.get_mut(&key).ok_or_else(|| {
+            let generation = state.generations.get_mut(&runtime_id).ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::Internal,
                     "active connector control generation is missing",
@@ -770,13 +839,12 @@ impl ConnectorControlHost {
                 generation.binding.descriptor().clone(),
                 generation.binding.incarnation(),
                 statistics,
-                key,
+                runtime_id,
             )
         };
         let state = Arc::downgrade(&self.state);
-        let retirement_sink = Arc::downgrade(&self.retirement_sink);
         ConnectorStatisticsLease::new(descriptor, incarnation, statistics, move || {
-            release_lease(&state, &retirement_sink, key, LeaseKind::Statistics);
+            release_lease(&state, runtime_id, LeaseKind::Statistics);
         })
     }
 
@@ -788,31 +856,14 @@ impl ConnectorControlHost {
             )
         })
     }
-
-    fn dispatch_retirement(&self, retirement: Option<ConnectorControlRetirement>) {
-        let Some(retirement) = retirement else { return };
-        let Ok(slot) = self.retirement_sink.lock() else {
-            return;
-        };
-        let sink = slot.clone();
-        if let Some(sink) = sink {
-            drop(slot);
-            sink.retire(retirement);
-        } else if let Ok(mut state) = self.lock_state() {
-            // Keep the sink lock while publishing the fallback so a sink
-            // installation cannot drain the queue before this push.
-            state.ready_retires.push(retirement);
-        }
-    }
 }
-
 impl ConnectorControlResolver for ConnectorControlHost {
     fn observe_current_binding(
         &self,
         instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorExecutionBindingKey, ConnectorError> {
+    ) -> Result<ConnectorProviderBindingKey, ConnectorError> {
         let state = self.lock_state()?;
-        let key = state.active.get(instance_id).cloned().ok_or_else(|| {
+        let runtime_id = state.active.get(instance_id).copied().ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::NotFound,
                 format!(
@@ -821,7 +872,7 @@ impl ConnectorControlResolver for ConnectorControlHost {
                 ),
             )
         })?;
-        let generation = state.generations.get(&key).ok_or_else(|| {
+        let generation = state.generations.get(&runtime_id).ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::Internal,
                 "active connector control generation is missing",
@@ -833,7 +884,36 @@ impl ConnectorControlResolver for ConnectorControlHost {
                 "connector control generation is retiring",
             ));
         }
-        Ok(key)
+        Ok(generation.legacy_execution_key.clone())
+    }
+
+    fn observe_current_control_runtime(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorControlRuntimeId, ConnectorError> {
+        let state = self.lock_state()?;
+        let runtime_id = state.active.get(instance_id).copied().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                format!(
+                    "connector control instance `{}` is not active",
+                    instance_id.as_str()
+                ),
+            )
+        })?;
+        let generation = state.generations.get(&runtime_id).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "active connector control generation is missing",
+            )
+        })?;
+        if generation.state != ControlGenerationState::Active {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "connector control generation is retiring",
+            ));
+        }
+        Ok(runtime_id)
     }
 
     fn acquire_current(
@@ -881,6 +961,13 @@ impl ConnectorCatalogMutationResolver for ConnectorControlHost {
     ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
         self.acquire_mutation(instance_id)
     }
+
+    fn acquire_exact_mutation(
+        &self,
+        control_runtime_id: ConnectorControlRuntimeId,
+    ) -> Result<ConnectorCatalogMutationLease, ConnectorError> {
+        Self::acquire_exact_mutation(self, control_runtime_id, false)
+    }
 }
 
 impl ConnectorDataMutationResolver for ConnectorControlHost {
@@ -893,9 +980,9 @@ impl ConnectorDataMutationResolver for ConnectorControlHost {
 
     fn acquire_exact_data_mutation(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorDataMutationLease, ConnectorError> {
-        Self::acquire_exact_data_mutation(self, key)
+        Self::acquire_exact_data_mutation(self, control_runtime_id)
     }
 }
 
@@ -909,9 +996,9 @@ impl ConnectorMetadataMaintenanceResolver for ConnectorControlHost {
 
     fn acquire_exact_metadata_maintenance(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorMetadataMaintenanceLease, ConnectorError> {
-        Self::acquire_exact_metadata_maintenance(self, key)
+        Self::acquire_exact_metadata_maintenance(self, control_runtime_id)
     }
 }
 
@@ -925,9 +1012,9 @@ impl ConnectorCleanupMaintenanceResolver for ConnectorControlHost {
 
     fn acquire_exact_cleanup_maintenance(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorCleanupMaintenanceLease, ConnectorError> {
-        Self::acquire_exact_cleanup_maintenance(self, key)
+        Self::acquire_exact_cleanup_maintenance(self, control_runtime_id)
     }
 }
 
@@ -941,9 +1028,9 @@ impl ConnectorDistributedRewriteResolver for ConnectorControlHost {
 
     fn acquire_exact_distributed_rewrite(
         &self,
-        key: &ConnectorExecutionBindingKey,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorDistributedRewriteLease, ConnectorError> {
-        Self::acquire_exact_distributed_rewrite(self, key)
+        Self::acquire_exact_distributed_rewrite(self, control_runtime_id)
     }
 }
 
@@ -984,8 +1071,7 @@ enum LeaseKind {
 
 fn release_lease(
     state: &Weak<Mutex<ControlHostState>>,
-    retirement_sink: &Weak<Mutex<Option<Arc<dyn ConnectorControlRetirementSink>>>>,
-    key: ConnectorExecutionBindingKey,
+    runtime_id: ConnectorControlRuntimeId,
     kind: LeaseKind,
 ) {
     let Some(host_state) = state.upgrade() else {
@@ -994,7 +1080,7 @@ fn release_lease(
     let Ok(mut state) = host_state.lock() else {
         return;
     };
-    let Some(generation) = state.generations.get_mut(&key) else {
+    let Some(generation) = state.generations.get_mut(&runtime_id) else {
         return;
     };
     match kind {
@@ -1026,46 +1112,33 @@ fn release_lease(
             generation.statistics_leases = generation.statistics_leases.saturating_sub(1);
         }
     }
-    let retirement = (generation.state == ControlGenerationState::Retiring
-        && generation.all_leases_released())
-    .then(|| queue_retirement(&mut state, key))
-    .flatten();
-    drop(state);
-    let Some(retirement) = retirement else {
-        return;
-    };
-    let Some(slot) = retirement_sink.upgrade() else {
-        return;
-    };
-    let Ok(slot) = slot.lock() else {
-        return;
-    };
-    let sink = slot.clone();
-    if let Some(sink) = sink {
-        drop(slot);
-        sink.retire(retirement);
-    } else if let Ok(mut state) = host_state.lock() {
-        // See ConnectorControlHost::dispatch_retirement: keep the sink lock
-        // while publishing the fallback queue entry.
-        state.ready_retires.push(retirement);
+    if generation.state == ControlGenerationState::Retiring && generation.all_leases_released() {
+        if let Some(retirement) = queue_retirement(&mut state, runtime_id) {
+            state.ready_retires.push(retirement);
+        }
     }
 }
 
 fn queue_retirement(
     state: &mut ControlHostState,
-    key: ConnectorExecutionBindingKey,
+    runtime_id: ConnectorControlRuntimeId,
 ) -> Option<ConnectorControlRetirement> {
-    let generation = state.generations.remove(&key)?;
+    let Some(generation) = state.generations.remove(&runtime_id) else {
+        return None;
+    };
     debug_assert_eq!(generation.state, ControlGenerationState::Retiring);
-    state.retired.insert(key.clone());
+    state.retired.insert(runtime_id);
+    state
+        .legacy_execution_index
+        .remove(&generation.legacy_execution_key);
     let installed_backends = state
         .installed_backends
-        .remove(&key)
+        .remove(&generation.legacy_execution_key)
         .unwrap_or_default()
         .into_iter()
         .collect();
     Some(ConnectorControlRetirement {
-        key,
+        key: generation.legacy_execution_key,
         installed_backends,
     })
 }
@@ -1088,11 +1161,11 @@ pub(crate) mod tests {
     use novarocks_spi::connector::{
         ConnectorBeginScanRequest, ConnectorControlCreation, ConnectorControlFactory,
         ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorError,
-        ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-        ConnectorInstanceIncarnation, ConnectorListTablesRequest, ConnectorMetadata,
-        ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
-        ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorTableHandle,
-        ConnectorTableMetadata, ConnectorTableRequest,
+        ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorListTablesRequest,
+        ConnectorMetadata, ConnectorNamespaceRequest, ConnectorProviderBinding,
+        ConnectorProviderId, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+        ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorTableMetadata,
+        ConnectorTableRequest, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -1300,7 +1373,7 @@ pub(crate) mod tests {
 
     struct TestControl {
         instance_id: ConnectorInstanceId,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
     }
 
     impl ConnectorMetadata for TestControl {
@@ -1361,8 +1434,8 @@ pub(crate) mod tests {
         fn declaration(
             &self,
             _context: &novarocks_spi::connector::ConnectorRequestContext,
-        ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-            ConnectorExecutionDeclaration::iceberg(
+        ) -> Result<ConnectorProviderBinding, ConnectorError> {
+            ConnectorProviderBinding::iceberg(
                 self.instance_id.as_str(),
                 self.incarnation.to_bytes(),
                 "default",
@@ -1392,7 +1465,7 @@ pub(crate) mod tests {
     ) -> ConnectorControlBinding {
         let provider = Arc::new(TestControl {
             instance_id,
-            incarnation: ConnectorInstanceIncarnation::from_bytes([incarnation; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([incarnation; 16]),
         });
         ConnectorControlBinding::try_new(
             ConnectorInstanceDescriptor {
@@ -1412,7 +1485,9 @@ pub(crate) mod tests {
     fn observing_current_binding_does_not_require_a_planning_lease() {
         let host = ConnectorControlHost::new();
         let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-        host.register(binding(7)).expect("register generation");
+        let binding = binding(7);
+        let control_runtime_id = binding.control_runtime_id();
+        host.register(binding).expect("register generation");
 
         assert_eq!(
             host.observe_current_binding(&instance_id)
@@ -1421,6 +1496,14 @@ pub(crate) mod tests {
                 .to_bytes(),
             [7; 16]
         );
+        assert_eq!(
+            host.observe_current_control_runtime(&instance_id)
+                .expect("observe active control runtime"),
+            control_runtime_id
+        );
+        let planning_lease = host.acquire_current(&instance_id).expect("planning lease");
+        assert_eq!(planning_lease.control_runtime_id(), control_runtime_id);
+        drop(planning_lease);
         host.retire_current(&instance_id)
             .expect("retire unleased generation");
         assert!(
@@ -1435,9 +1518,9 @@ pub(crate) mod tests {
         let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
         host.register(binding(7)).expect("register old generation");
         let lease = host.acquire_current(&instance_id).expect("planning lease");
-        let old_key = ConnectorExecutionBindingKey {
+        let old_key = ConnectorProviderBindingKey {
             instance_id: instance_id.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         };
         host.record_installed_backend(&old_key, "be-1")
             .expect("record ensure ack");
@@ -1464,45 +1547,6 @@ pub(crate) mod tests {
         );
     }
 
-    #[derive(Default)]
-    struct RecordingRetirementSink(Mutex<Vec<ConnectorControlRetirement>>);
-
-    impl ConnectorControlRetirementSink for RecordingRetirementSink {
-        fn retire(&self, retirement: ConnectorControlRetirement) {
-            self.0.lock().expect("retirement sink").push(retirement);
-        }
-    }
-
-    #[test]
-    fn retiring_generation_dispatches_when_the_last_planning_lease_drains() {
-        let host = ConnectorControlHost::new();
-        let sink = Arc::new(RecordingRetirementSink::default());
-        host.set_retirement_sink(sink.clone());
-        let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-        host.register(binding(7)).expect("register old generation");
-        let lease = host.acquire_current(&instance_id).expect("planning lease");
-        let old_key = ConnectorExecutionBindingKey {
-            instance_id: instance_id.clone(),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
-        };
-        host.record_installed_backend(&old_key, "127.0.0.1:18080")
-            .expect("record ensure ack");
-        host.retire_current(&instance_id)
-            .expect("retire old generation");
-        assert!(sink.0.lock().expect("retirement sink").is_empty());
-
-        drop(lease);
-
-        let dispatched = sink.0.lock().expect("retirement sink");
-        assert_eq!(dispatched.len(), 1);
-        assert_eq!(dispatched[0].key, old_key);
-        assert_eq!(
-            dispatched[0].installed_backends,
-            vec![String::from("127.0.0.1:18080")]
-        );
-        assert!(host.take_ready_retires().expect("retire queue").is_empty());
-    }
-
     #[test]
     fn starrocks_control_host_keeps_the_retiring_generation_leased_and_accepts_its_replacement() {
         let host = ConnectorControlHost::new();
@@ -1516,7 +1560,7 @@ pub(crate) mod tests {
             .expect("acquire first lease");
         let declaration = lease
             .binding()
-            .execution_declaration(&starrocks_context())
+            .provider_binding(&starrocks_context())
             .expect("declaration");
         assert_eq!(
             declaration.binding_key().incarnation(),

@@ -105,7 +105,7 @@ code-anchors:
 - ADR-0028 — metadata maintenance 为何由 FE 以 exact lease、durable plan 与 marker reconcile 执行（active）
 - ADR-0029 — distributed rewrite 为何以 frozen groups、C1 cohorts 与 FE aggregate commit 实现单 snapshot（active）
 - ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（active）
-- ADR-0120 — Frontend restart 后为何仅由 Backend 回收无 query lease 的旧 connector generation（active）
+- ADR-0125 — Backend catalog runtime、Frontend effect owner 与 provider-private proof 为何使用三种不互换 identity（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0051 — distributed write 为何在 preparation 与 planning 之间强制 exact-generation Provider activation（active）
 - ADR-0052 — SHOW CREATE 为何以 exact lease 的有界 table-definition facts 取代 concrete table decode（active）
@@ -140,6 +140,7 @@ code-anchors:
 - ADR-0119 — Connector read 内部 runtime SPI 与 wire codec 为何分离（superseded → ADR-0123）
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
 - ADR-0104 — Connector execution binding 为何使用 SPI domain declaration、sealed Host 与可重放失败状态机（superseded → ADR-0120）
+- ADR-0120 — Frontend restart 后为何仅由 Backend 回收无 query lease 的旧 connector generation（superseded → ADR-0125）
 ### distributed-query-lifecycle
 
 领域哲学：FE coordinator 拥有全局编排，BE query lifecycle 拥有本地执行与资源；两者是独立进程、故障域与状态机，

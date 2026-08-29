@@ -28,18 +28,18 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorCtasUnanchoredProvenance, ConnectorError,
-    ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
-    ConnectorInstanceIncarnation, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorPartitionTransform, ConnectorRequestContext, ConnectorStagedCreate,
-    ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
-    ConnectorStagedCreateOperationId, ConnectorStagedCreatePrepareOutcome,
-    ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublicationAdjudicationOutcome,
+    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorMutationFailure,
+    ConnectorMutationFailureKind, ConnectorPartitionTransform, ConnectorProviderBindingKey,
+    ConnectorRequestContext, ConnectorStagedCreate, ConnectorStagedCreateAbortOutcome,
+    ConnectorStagedCreateAbortRequest, ConnectorStagedCreateOperationId,
+    ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
+    ConnectorStagedCreatePublicationAdjudicationOutcome,
     ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublishOutcome,
     ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
     ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
     ConnectorWriteControl, ConnectorWriteOperationCompletion, CreatePolicy, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationEvidence, ExternalMutationFinalization, ProviderBindingEpoch,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -396,7 +396,7 @@ fn write_unanchored_ctas_provenance(
 #[derive(Clone)]
 pub struct IcebergStagedCreateAdapter {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     provider: Arc<IcebergMetadata>,
     write_control: Arc<IcebergWriteControl>,
     runtime: Arc<IcebergMetadataContext>,
@@ -456,7 +456,7 @@ impl IcebergStagedCreateAdapter {
         provider: Arc<IcebergMetadata>,
         write_control: Arc<IcebergWriteControl>,
     ) -> Result<Self, ConnectorError> {
-        let owner = ConnectorExecutionBindingKey {
+        let owner = ConnectorProviderBindingKey {
             instance_id: provider.descriptor().instance_id.clone(),
             incarnation: provider.incarnation(),
         };
@@ -475,8 +475,8 @@ impl IcebergStagedCreateAdapter {
         })
     }
 
-    fn owner(&self) -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn owner(&self) -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: self.descriptor.instance_id.clone(),
             incarnation: self.incarnation,
         }
@@ -835,7 +835,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         &self.descriptor
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
 
@@ -1753,7 +1753,7 @@ mod tests {
         };
         let provider = Arc::new(IcebergMetadata::new(
             descriptor.clone(),
-            ConnectorInstanceIncarnation::new(),
+            ProviderBindingEpoch::new(),
             Arc::clone(&runtime),
         ));
         let write = Arc::new(IcebergWriteControl::new(
@@ -1973,7 +1973,7 @@ mod tests {
         };
         let provider = Arc::new(IcebergMetadata::new(
             descriptor.clone(),
-            ConnectorInstanceIncarnation::new(),
+            ProviderBindingEpoch::new(),
             Arc::clone(&runtime),
         ));
         let write = Arc::new(IcebergWriteControl::new(

@@ -18,9 +18,8 @@
 use std::sync::Arc;
 
 use super::{
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceIncarnation,
-    ConnectorNamespaceIdentity, ConnectorRequestContext, ConnectorViewDefinition,
-    ConnectorViewIdentity,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorNamespaceIdentity,
+    ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewIdentity, ProviderBindingEpoch,
 };
 
 #[derive(Clone)]
@@ -115,7 +114,7 @@ impl ConnectorViewMetadataValue {
 pub trait ConnectorViewMetadata: Send + Sync {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation;
+    fn incarnation(&self) -> ProviderBindingEpoch;
 
     fn view_exists(&self, request: ConnectorViewRequest) -> Result<bool, ConnectorError>;
 
@@ -132,7 +131,7 @@ pub trait ConnectorViewMetadata: Send + Sync {
 
 pub(crate) fn validate_view_metadata_owner(
     descriptor: &ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
     capability: &dyn ConnectorViewMetadata,
 ) -> Result<(), ConnectorError> {
     if capability.descriptor() != descriptor || capability.incarnation() != incarnation {
@@ -165,7 +164,7 @@ mod tests {
 
     struct ViewCapability {
         descriptor: ConnectorInstanceDescriptor,
-        incarnation: ConnectorInstanceIncarnation,
+        incarnation: ProviderBindingEpoch,
     }
 
     impl ConnectorViewMetadata for ViewCapability {
@@ -173,7 +172,7 @@ mod tests {
             &self.descriptor
         }
 
-        fn incarnation(&self) -> ConnectorInstanceIncarnation {
+        fn incarnation(&self) -> ProviderBindingEpoch {
             self.incarnation
         }
 
@@ -291,10 +290,10 @@ mod tests {
     #[test]
     fn spi5b_view_metadata_rejects_a_different_generation_owner() {
         let descriptor = descriptor();
-        let expected_incarnation = ConnectorInstanceIncarnation::new();
+        let expected_incarnation = ProviderBindingEpoch::new();
         let capability = ViewCapability {
             descriptor: descriptor.clone(),
-            incarnation: ConnectorInstanceIncarnation::new(),
+            incarnation: ProviderBindingEpoch::new(),
         };
 
         let error = validate_view_metadata_owner(&descriptor, expected_incarnation, &capability)

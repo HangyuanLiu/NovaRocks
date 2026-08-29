@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorWriteActivation,
+    ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorWriteActivation,
     ConnectorWriteActivationRequest, ConnectorWriteActivationSource, ConnectorWriteCohortId,
     ConnectorWriteOperationId, MAX_CONNECTOR_WRITE_ACTIVATIONS,
 };
@@ -42,7 +42,7 @@ impl IcebergWriteActivationReservations {
     /// operation cannot replace the original reservation.
     pub fn activate(
         &self,
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         request: &ConnectorWriteActivationRequest,
     ) -> Result<ConnectorWriteActivation, ConnectorError> {
         request.validate(owner)?;
@@ -68,7 +68,7 @@ impl IcebergWriteActivationReservations {
     /// cohort set into the resulting activation digest.
     pub(crate) fn activate_cohorts(
         &self,
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         request: &ConnectorWriteActivationRequest,
         cohorts: Vec<(
             ConnectorWriteCohortId,
@@ -136,10 +136,10 @@ mod tests {
     use arrow::datatypes::{DataType, Field};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorRequestContext,
-        ConnectorTableHandle, ConnectorWriteActivationIntent, ConnectorWriteBaseVersion,
-        ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-        ConnectorWriteIntent, ConnectorWritePreparation, ConnectorWriteTargetRef,
+        ConnectorInstanceId, ConnectorRequestContext, ConnectorTableHandle,
+        ConnectorWriteActivationIntent, ConnectorWriteBaseVersion, ConnectorWriteFieldBinding,
+        ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
+        ConnectorWritePreparation, ConnectorWriteTargetRef, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -153,15 +153,15 @@ mod tests {
         }
     }
 
-    fn key() -> ConnectorExecutionBindingKey {
-        ConnectorExecutionBindingKey {
+    fn key() -> ConnectorProviderBindingKey {
+        ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
-            incarnation: ConnectorInstanceIncarnation::new(),
+            incarnation: ProviderBindingEpoch::new(),
         }
     }
 
     fn request(
-        owner: &ConnectorExecutionBindingKey,
+        owner: &ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
         marker: &[u8],
     ) -> ConnectorWriteActivationRequest {

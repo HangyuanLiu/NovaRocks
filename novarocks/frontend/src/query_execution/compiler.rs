@@ -257,7 +257,7 @@ impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControl
         &self,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> Result<
-        novarocks_spi::connector::ConnectorExecutionBindingKey,
+        novarocks_spi::connector::ConnectorProviderBindingKey,
         novarocks_spi::connector::ConnectorError,
     > {
         let binding = self
@@ -280,10 +280,40 @@ impl novarocks_spi::connector::ConnectorControlResolver for TestConnectorControl
                     ),
                 )
             })?;
-        Ok(novarocks_spi::connector::ConnectorExecutionBindingKey {
+        Ok(novarocks_spi::connector::ConnectorProviderBindingKey {
             instance_id: binding.descriptor().instance_id.clone(),
             incarnation: binding.incarnation(),
         })
+    }
+
+    fn observe_current_control_runtime(
+        &self,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorControlRuntimeId,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .get(instance_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
+                )
+            })?;
+        Ok(binding.control_runtime_id())
     }
 
     fn acquire_current(
@@ -354,6 +384,47 @@ impl novarocks_spi::connector::ConnectorCatalogMutationResolver for TestConnecto
         })?;
         novarocks_spi::connector::ConnectorCatalogMutationLease::new(
             binding.descriptor().clone(),
+            binding.control_runtime_id(),
+            binding.incarnation(),
+            mutation,
+            || {},
+        )
+    }
+
+    fn acquire_exact_mutation(
+        &self,
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
+    ) -> Result<
+        novarocks_spi::connector::ConnectorCatalogMutationLease,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        let binding = self
+            .active
+            .lock()
+            .map_err(|_| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Internal,
+                    "test connector control registry lock poisoned",
+                )
+            })?
+            .values()
+            .find(|binding| binding.control_runtime_id() == control_runtime_id)
+            .cloned()
+            .ok_or_else(|| {
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::NotFound,
+                    "exact connector control runtime is unavailable",
+                )
+            })?;
+        let mutation = binding.mutation().cloned().ok_or_else(|| {
+            novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "test connector control binding has no mutation capability",
+            )
+        })?;
+        novarocks_spi::connector::ConnectorCatalogMutationLease::new(
+            binding.descriptor().clone(),
+            binding.control_runtime_id(),
             binding.incarnation(),
             mutation,
             || {},
@@ -395,7 +466,7 @@ impl novarocks_spi::connector::ConnectorDataMutationResolver for TestConnectorCo
 
     fn acquire_exact_data_mutation(
         &self,
-        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     ) -> Result<
         novarocks_spi::connector::ConnectorDataMutationLease,
         novarocks_spi::connector::ConnectorError,
@@ -409,8 +480,8 @@ impl novarocks_spi::connector::ConnectorDataMutationResolver for TestConnectorCo
                     "test connector control registry lock poisoned",
                 )
             })?
-            .get(&key.instance_id)
-            .filter(|binding| binding.incarnation() == key.incarnation)
+            .values()
+            .find(|binding| binding.control_runtime_id() == control_runtime_id)
             .cloned()
             .ok_or_else(|| {
                 novarocks_spi::connector::ConnectorError::new(
@@ -435,13 +506,14 @@ fn test_data_mutation_lease(
             "test connector control binding has no data mutation capability",
         )
     })?;
-    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+    let key = novarocks_spi::connector::ConnectorProviderBindingKey {
         instance_id: binding.descriptor().instance_id.clone(),
         incarnation: binding.incarnation(),
     };
     novarocks_spi::connector::ConnectorDataMutationLease::new(
         binding.descriptor().clone(),
-        key,
+        binding.control_runtime_id(),
+        key.incarnation,
         Arc::clone(binding.metadata()),
         mutation,
         || {},
@@ -484,7 +556,7 @@ impl novarocks_spi::connector::ConnectorMetadataMaintenanceResolver
 
     fn acquire_exact_metadata_maintenance(
         &self,
-        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     ) -> Result<
         novarocks_spi::connector::ConnectorMetadataMaintenanceLease,
         novarocks_spi::connector::ConnectorError,
@@ -498,8 +570,8 @@ impl novarocks_spi::connector::ConnectorMetadataMaintenanceResolver
                     "test connector control registry lock poisoned",
                 )
             })?
-            .get(&key.instance_id)
-            .filter(|binding| binding.incarnation() == key.incarnation)
+            .values()
+            .find(|binding| binding.control_runtime_id() == control_runtime_id)
             .cloned()
             .ok_or_else(|| {
                 novarocks_spi::connector::ConnectorError::new(
@@ -544,7 +616,7 @@ impl novarocks_spi::connector::ConnectorCleanupMaintenanceResolver
 
     fn acquire_exact_cleanup_maintenance(
         &self,
-        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     ) -> Result<
         novarocks_spi::connector::ConnectorCleanupMaintenanceLease,
         novarocks_spi::connector::ConnectorError,
@@ -558,8 +630,8 @@ impl novarocks_spi::connector::ConnectorCleanupMaintenanceResolver
                     "test connector control registry lock poisoned",
                 )
             })?
-            .get(&key.instance_id)
-            .filter(|binding| binding.incarnation() == key.incarnation)
+            .values()
+            .find(|binding| binding.control_runtime_id() == control_runtime_id)
             .cloned()
             .ok_or_else(|| {
                 novarocks_spi::connector::ConnectorError::new(
@@ -584,13 +656,14 @@ fn test_cleanup_maintenance_lease(
             "test connector control binding has no cleanup maintenance capability",
         )
     })?;
-    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+    let key = novarocks_spi::connector::ConnectorProviderBindingKey {
         instance_id: binding.descriptor().instance_id.clone(),
         incarnation: binding.incarnation(),
     };
     novarocks_spi::connector::ConnectorCleanupMaintenanceLease::new(
         binding.descriptor().clone(),
-        key,
+        binding.control_runtime_id(),
+        key.incarnation,
         Arc::clone(binding.metadata()),
         cleanup,
         || {},
@@ -610,13 +683,14 @@ fn test_metadata_maintenance_lease(
             "test connector control binding has no metadata maintenance capability",
         )
     })?;
-    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
+    let key = novarocks_spi::connector::ConnectorProviderBindingKey {
         instance_id: binding.descriptor().instance_id.clone(),
         incarnation: binding.incarnation(),
     };
     novarocks_spi::connector::ConnectorMetadataMaintenanceLease::new(
         binding.descriptor().clone(),
-        key,
+        binding.control_runtime_id(),
+        key.incarnation,
         Arc::clone(binding.metadata()),
         maintenance,
         || {},
@@ -659,7 +733,7 @@ impl novarocks_spi::connector::ConnectorDistributedRewriteResolver
 
     fn acquire_exact_distributed_rewrite(
         &self,
-        key: &novarocks_spi::connector::ConnectorExecutionBindingKey,
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
     ) -> Result<
         novarocks_spi::connector::ConnectorDistributedRewriteLease,
         novarocks_spi::connector::ConnectorError,
@@ -673,8 +747,8 @@ impl novarocks_spi::connector::ConnectorDistributedRewriteResolver
                     "test connector control registry lock poisoned",
                 )
             })?
-            .get(&key.instance_id)
-            .filter(|binding| binding.incarnation() == key.incarnation)
+            .values()
+            .find(|binding| binding.control_runtime_id() == control_runtime_id)
             .cloned()
             .ok_or_else(|| {
                 novarocks_spi::connector::ConnectorError::new(
@@ -705,13 +779,10 @@ fn test_distributed_rewrite_lease(
             "test connector control binding has no distributed write capability",
         )
     })?;
-    let key = novarocks_spi::connector::ConnectorExecutionBindingKey {
-        instance_id: binding.descriptor().instance_id.clone(),
-        incarnation: binding.incarnation(),
-    };
     novarocks_spi::connector::ConnectorDistributedRewriteLease::new(
         binding.descriptor().clone(),
-        key,
+        binding.control_runtime_id(),
+        binding.incarnation(),
         novarocks_spi::connector::ConnectorControlPlanningLease::new(binding.clone(), || {}),
         Arc::clone(binding.metadata()),
         Arc::clone(binding.planning()),

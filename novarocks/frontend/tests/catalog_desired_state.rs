@@ -58,11 +58,11 @@ use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorControlCreation,
     ConnectorControlFactory, ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionDeclaration, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorInstanceIncarnation, ConnectorListTablesRequest,
-    ConnectorMetadata, ConnectorNamespaceRequest, ConnectorProviderId, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest,
-    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+    ConnectorProviderBinding, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorTableHandle,
+    ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
 };
 use novarocks_spi::state_store::{
     ChangePage, ChangePollRequest, CommitResolution, Key, RangePage, RangeRequest, ReadTransaction,
@@ -84,7 +84,7 @@ fn unsupported() -> ConnectorError {
 
 struct TestControl {
     instance_id: ConnectorInstanceId,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
 }
 
 impl ConnectorMetadata for TestControl {
@@ -144,8 +144,8 @@ impl ConnectorExecutionDistribution for TestControl {
     fn declaration(
         &self,
         _context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-        ConnectorExecutionDeclaration::iceberg(
+    ) -> Result<ConnectorProviderBinding, ConnectorError> {
+        ConnectorProviderBinding::iceberg(
             self.instance_id.as_str(),
             self.incarnation.to_bytes(),
             "default",
@@ -157,7 +157,7 @@ impl ConnectorExecutionDistribution for TestControl {
 fn binding(instance_id: ConnectorInstanceId, incarnation: u8) -> ConnectorControlBinding {
     let provider = Arc::new(TestControl {
         instance_id,
-        incarnation: ConnectorInstanceIncarnation::from_bytes([incarnation; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([incarnation; 16]),
     });
     ConnectorControlBinding::try_new(
         ConnectorInstanceDescriptor {

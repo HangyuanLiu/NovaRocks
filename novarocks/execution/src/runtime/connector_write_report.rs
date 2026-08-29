@@ -119,9 +119,9 @@ impl ConnectorStagedReportCollector {
 mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorStagedReportSummary, ConnectorWriteCohortId, ConnectorWriteExecutionId,
-        ConnectorWriteOperationId, ConnectorWriterIdentity, ConnectorWriterTerminalState,
+        CatalogHandle, CatalogVersion, ConnectorInstanceId, ConnectorStagedReportSummary,
+        ConnectorWriteCohortId, ConnectorWriteExecutionId, ConnectorWriteOperationId,
+        ConnectorWriterIdentity, ConnectorWriterTerminalState,
     };
 
     use super::*;
@@ -136,10 +136,10 @@ mod tests {
             5,
             6,
             7,
-            ConnectorExecutionBindingKey {
-                instance_id: ConnectorInstanceId::parse("test-connector").expect("instance"),
-                incarnation: ConnectorInstanceIncarnation::from_bytes([8; 16]),
-            },
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("test-connector").expect("instance"),
+                CatalogVersion::from_bytes([9; 32]),
+            ),
         )
     }
 
@@ -148,7 +148,7 @@ mod tests {
         let collector = ConnectorStagedReportCollector::default();
         let report = ConnectorStagedReport::try_new(
             writer(),
-            1,
+            novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
             ConnectorWriterTerminalState::Staged,
             ConnectorStagedReportSummary::default(),
             Bytes::from_static(b"opaque"),
@@ -172,7 +172,7 @@ mod tests {
             .expect("bind ledger");
         let report = ConnectorStagedReport::try_new(
             writer(),
-            1,
+            novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
             ConnectorWriterTerminalState::Staged,
             ConnectorStagedReportSummary::default(),
             Bytes::from_static(b"four"),

@@ -30,15 +30,15 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionBindingKey, ConnectorInstanceDescriptor,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorMaxCompactableDataFiles, ConnectorMaxCompactableDataFilesRequest,
     ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceExecuteRequest,
     ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
     ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReceiptSummary,
     ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ConnectorProviderBindingKey, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use crate::commit::snapshot_lifecycle_helpers::expire_snapshots::{
@@ -123,7 +123,7 @@ struct TerminalRecord {
 /// FE-only Iceberg adapter.  The registry contains process-local catalog
 /// clients and credentials; none cross the SPI payload boundary.
 pub(crate) struct IcebergMetadataMaintenanceAdapter {
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
     runtime: Arc<IcebergMetadataContext>,
     plans: Mutex<HashMap<ConnectorMutationOperationId, CachedPlan>>,
@@ -132,7 +132,7 @@ pub(crate) struct IcebergMetadataMaintenanceAdapter {
 
 impl IcebergMetadataMaintenanceAdapter {
     pub(crate) fn new(
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         runtime: Arc<IcebergMetadataContext>,
     ) -> Result<Self, ConnectorError> {
         let descriptor = ConnectorInstanceDescriptor {
@@ -148,7 +148,7 @@ impl IcebergMetadataMaintenanceAdapter {
         })
     }
 
-    fn ensure_owner(&self, owner: &ConnectorExecutionBindingKey) -> Result<(), ConnectorError> {
+    fn ensure_owner(&self, owner: &ConnectorProviderBindingKey) -> Result<(), ConnectorError> {
         if owner != &self.key {
             return Err(invalid(
                 "Iceberg metadata maintenance does not match the exact connector generation",
@@ -493,7 +493,7 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -770,7 +770,7 @@ fn metadata_location_digest(value: Option<&str>) -> [u8; 32] {
 
 fn identity_digest(
     descriptor: &ConnectorInstanceDescriptor,
-    key: &ConnectorExecutionBindingKey,
+    key: &ConnectorProviderBindingKey,
     plan: &ConnectorMetadataMaintenancePlan,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -908,9 +908,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenanceOperation,
-        ConnectorMetadataMaintenancePlanningRequest, ConnectorProviderId, ConnectorTableHandle,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorMetadataMaintenanceExecuteRequest,
+        ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlanningRequest,
+        ConnectorProviderId, ConnectorTableHandle, ProviderBindingEpoch,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -939,7 +939,7 @@ mod tests {
         tokio::runtime::Runtime,
         tempfile::TempDir,
         IcebergMetadataMaintenanceAdapter,
-        ConnectorExecutionBindingKey,
+        ConnectorProviderBindingKey,
     ) {
         let executor = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
@@ -968,9 +968,9 @@ mod tests {
             )
             .expect("control runtime"),
         );
-        let key = ConnectorExecutionBindingKey {
+        let key = ConnectorProviderBindingKey {
             instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
-            incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
         };
         let adapter =
             IcebergMetadataMaintenanceAdapter::new(key.clone(), runtime).expect("adapter");
@@ -978,7 +978,7 @@ mod tests {
     }
 
     fn plan(
-        key: ConnectorExecutionBindingKey,
+        key: ConnectorProviderBindingKey,
         operation_id: ConnectorMutationOperationId,
         table_payload: &'static [u8],
     ) -> ConnectorMetadataMaintenancePlan {
@@ -1145,9 +1145,9 @@ mod tests {
     #[test]
     fn foreign_generation_is_rejected_before_catalog_access() {
         let (_executor, _warehouse, adapter, key) = adapter();
-        let foreign_key = ConnectorExecutionBindingKey {
+        let foreign_key = ConnectorProviderBindingKey {
             instance_id: key.instance_id,
-            incarnation: ConnectorInstanceIncarnation::from_bytes([8; 16]),
+            incarnation: ProviderBindingEpoch::from_bytes([8; 16]),
         };
         let foreign = plan(
             foreign_key,

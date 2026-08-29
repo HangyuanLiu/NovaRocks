@@ -117,15 +117,15 @@ mod tests {
         reason = "The fixture keeps explicit defaulted proto fields for wire-contract readability."
     )]
     #[test]
-    fn classifies_connector_read_as_file_assignment() {
+    fn classifies_typed_connector_read_as_file_assignment() {
         let root = plan::DistributedNode {
             node_id: 17,
             payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
                 kind: Some(plan::plan_node::Kind::Scan(plan::ScanNode {
                     table: Some(plan::TableDef {
                         source: Some(plan::ScanSource {
-                            kind: Some(plan::scan_source::Kind::ConnectorRead(
-                                plan::ConnectorReadSource::default(),
+                            kind: Some(plan::scan_source::Kind::TypedConnectorRead(
+                                Default::default(),
                             )),
                             ..Default::default()
                         }),

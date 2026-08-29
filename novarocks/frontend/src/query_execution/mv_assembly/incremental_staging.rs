@@ -74,7 +74,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
 ) -> Result<PreparedMvNativeWriteAssembly, String> {
     let (request, facts, mode, evidence, execution_artifact, publication_intent) =
         prepared.into_parts();
-    if request.observed_binding != *exact_lease.binding_key() {
+    if !exact_lease.matches_provider_binding_key(&request.observed_binding) {
         return Err("MV incremental write lease drifted from prepared binding".to_string());
     }
     let connector_context =

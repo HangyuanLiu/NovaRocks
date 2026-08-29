@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Barrier, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,7 @@ use crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot;
 use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
+use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::{
     AttemptId, ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,
     ParticipantTerminalOutcome as ProtocolParticipantTerminalOutcome, QueryAbortRequest,
@@ -31,6 +33,10 @@ use novarocks_proto_codec::lifecycle::{
     RuntimeFilterContribution, StageDigest, StageDigestVersion, StageFragment,
 };
 use novarocks_proto_models::{common, filter, novarocks as proto_novarocks, plan};
+use novarocks_spi::connector::{
+    CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogRuntime,
+    CatalogRuntimeMaterializer, CatalogVersion, ConnectorError, ConnectorInstanceId,
+};
 use novarocks_types::UniqueId;
 use novarocks_types::{BackendProcessId, QueryId};
 use prost::Message;
@@ -41,8 +47,8 @@ use super::registry::{
     QueryLifecycleRegistryConfig, StageBuildDecision, capture_terminal_profile_contribution,
 };
 use super::{
-    QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
+    CatalogPruneOutcome, QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
+    QueryLifecycleIngress, QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
 };
 use crate::rpc::runtime::test_backend_data_runtime;
 use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
@@ -253,6 +259,110 @@ impl QueryLifecycleMetricsSink for RecordingMetricsSink {
 struct InstallGate {
     block: bool,
     entered: bool,
+}
+
+#[derive(Clone)]
+struct BlockingCatalogMaterializer {
+    state: Arc<BlockingCatalogMaterializerState>,
+}
+
+struct BlockingCatalogMaterializerState {
+    gate: Mutex<BlockingCatalogMaterializerGate>,
+    changed: Condvar,
+}
+
+struct BlockingCatalogMaterializerGate {
+    blocked: bool,
+    entered: bool,
+    completed: bool,
+}
+
+struct TestCatalogRuntime {
+    handle: CatalogHandle,
+    provider_kind: CatalogProviderKind,
+}
+
+impl BlockingCatalogMaterializer {
+    fn blocked() -> Self {
+        Self {
+            state: Arc::new(BlockingCatalogMaterializerState {
+                gate: Mutex::new(BlockingCatalogMaterializerGate {
+                    blocked: true,
+                    entered: false,
+                    completed: false,
+                }),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    fn wait_until_materialization_enters(&self) {
+        let mut gate = self.state.gate.lock().expect("catalog materializer gate");
+        while !gate.entered {
+            gate = self
+                .state
+                .changed
+                .wait(gate)
+                .expect("catalog materializer gate wait");
+        }
+    }
+
+    fn release_materialization(&self) {
+        let mut gate = self.state.gate.lock().expect("catalog materializer gate");
+        gate.blocked = false;
+        self.state.changed.notify_all();
+    }
+
+    fn wait_until_materialization_completes(&self) {
+        let mut gate = self.state.gate.lock().expect("catalog materializer gate");
+        while !gate.completed {
+            gate = self
+                .state
+                .changed
+                .wait(gate)
+                .expect("catalog materializer completion wait");
+        }
+    }
+}
+
+impl CatalogRuntime for TestCatalogRuntime {
+    fn handle(&self) -> &CatalogHandle {
+        &self.handle
+    }
+
+    fn provider_kind(&self) -> CatalogProviderKind {
+        self.provider_kind
+    }
+}
+
+impl CatalogRuntimeMaterializer for BlockingCatalogMaterializer {
+    fn provider_kind(&self) -> CatalogProviderKind {
+        CatalogProviderKind::Iceberg
+    }
+
+    fn materialize(
+        &self,
+        properties: &CatalogProperties,
+    ) -> Result<Arc<dyn CatalogRuntime>, ConnectorError> {
+        {
+            let mut gate = self.state.gate.lock().expect("catalog materializer gate");
+            gate.entered = true;
+            self.state.changed.notify_all();
+            while gate.blocked {
+                gate = self
+                    .state
+                    .changed
+                    .wait(gate)
+                    .expect("catalog materializer gate wait");
+            }
+            gate.completed = true;
+            self.state.changed.notify_all();
+        }
+        Ok(Arc::new(TestCatalogRuntime {
+            handle: properties.handle().clone(),
+            provider_kind: properties.provider_kind(),
+        }))
+    }
 }
 
 impl RecordingLocalRuntime {
@@ -603,6 +713,23 @@ fn registry_with_clock(
     )
 }
 
+fn registry_with_blocking_catalog_materializer(
+    runtime: RecordingLocalRuntime,
+    materializer: BlockingCatalogMaterializer,
+) -> Arc<QueryLifecycleRegistry> {
+    let materializers = crate::connector::catalog_manager::CatalogRuntimeMaterializerSet::try_new(
+        [Arc::new(materializer) as Arc<dyn CatalogRuntimeMaterializer>],
+    )
+    .expect("test catalog materializer set");
+    QueryLifecycleRegistry::new_with_runtime_and_catalog_materializers(
+        test_backend_data_runtime(),
+        Arc::new(runtime),
+        registry_config(8),
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+        Arc::new(materializers),
+    )
+}
+
 #[test]
 fn init_requires_exact_backend_process_identity() {
     let runtime = RecordingLocalRuntime::default();
@@ -872,6 +999,53 @@ fn init_request_fixture_for_process(
     QueryInitRequest::from_manifest(manifest)
 }
 
+fn catalog_set_fixture() -> CatalogSet {
+    CatalogSet::new([CatalogProperties::new(
+        CatalogHandle::new(
+            ConnectorInstanceId::try_from_canonical("catalog.lifecycle")
+                .expect("canonical catalog name"),
+            CatalogVersion::from_bytes([0x55; 32]),
+        ),
+        CatalogProviderKind::Iceberg,
+        1,
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("catalog properties")])
+    .expect("catalog set")
+}
+
+fn catalog_init_request_fixture(query_low: i64) -> QueryInitRequest {
+    catalog_init_request_fixture_for_process(query_low, local_process_id())
+}
+
+fn catalog_init_request_fixture_for_process(
+    query_low: i64,
+    process_id: BackendProcessId,
+) -> QueryInitRequest {
+    let execution_id = execution_id(query_low, ATTEMPT_1);
+    let expected = UniqueId::new(query_low, 1);
+    let manifest = ParticipantManifest::new_with_catalog_set(
+        execution_id,
+        ParticipantBackendIdentity::new(
+            process_id,
+            QueryControlEndpoint::new("127.0.0.1", 9030).expect("valid endpoint"),
+        )
+        .expect("valid backend identity"),
+        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+        [protocol_unique_id(expected)],
+        default_query_options(),
+        10_000,
+        [],
+        None,
+        Duration::from_secs(30),
+        QueryControlEndpoint::new("127.0.0.1", 9031).expect("valid report endpoint"),
+        catalog_set_fixture(),
+    )
+    .expect("valid catalog participant manifest");
+    QueryInitRequest::from_manifest(manifest)
+}
+
 fn fragment_init_request_fixture(query_low: i64, expected: &[UniqueId]) -> QueryInitRequest {
     let execution_id = execution_id(query_low, ATTEMPT_1);
     let manifest = ParticipantManifest::new(
@@ -958,6 +1132,51 @@ fn assert_control_ready(attachment: &mut QueryControlAttachment) {
             event: Some(proto_novarocks::query_control_response::Event::ControlReady(_)),
         })
     ));
+}
+
+fn assert_control_ready_loading_catalogs(attachment: &mut QueryControlAttachment) {
+    let event = try_recv_event(attachment).expect("ControlReady is delivered");
+    let Some(proto_novarocks::query_control_response::Event::ControlReady(ready)) = event.event
+    else {
+        panic!("control stream must begin with ControlReady");
+    };
+    assert!(matches!(
+        ready.catalog_load_state.and_then(|state| state.state),
+        Some(novarocks_proto_models::catalog::catalog_load_state::State::Loading(_))
+    ));
+}
+
+fn wait_for_catalog_ready(attachment: &mut QueryControlAttachment) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match try_recv_event(attachment) {
+            Ok(proto_novarocks::QueryControlResponse {
+                event: Some(proto_novarocks::query_control_response::Event::CatalogReady(_)),
+            }) => return,
+            Ok(_) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("CatalogReady was not delivered: {error}"),
+        }
+    }
+}
+
+fn assert_no_catalog_ready(attachment: &mut QueryControlAttachment) {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match try_recv_event(attachment) {
+            Ok(proto_novarocks::QueryControlResponse {
+                event: Some(proto_novarocks::query_control_response::Event::CatalogReady(_)),
+            }) => panic!("terminated query must not announce CatalogReady"),
+            Ok(_) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return,
+            Err(error) => panic!("control stream closed while checking CatalogReady: {error}"),
+        }
+    }
 }
 
 fn terminal_ack_from_outcome(
@@ -1115,6 +1334,123 @@ fn stage_and_start_are_idempotent_after_control_ready() {
         registry.start_prepared_query(start).outcome(),
         QueryStartOutcome::AlreadyStarted
     );
+}
+
+#[test]
+fn nonempty_catalog_set_never_admits_stage_before_catalog_ready() {
+    let registry = registry_with(RecordingLocalRuntime::default(), 8);
+    let request = catalog_init_request_fixture(1_801_001);
+    assert_eq!(
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
+        QueryInitOutcome::QueryInitApplied
+    );
+    let mut attachment = attach_control(&registry, &request);
+    let first = try_recv_event(&mut attachment).expect("ControlReady is delivered");
+    assert!(matches!(
+        first.event,
+        Some(proto_novarocks::query_control_response::Event::ControlReady(_))
+    ));
+
+    // The default test composition intentionally has no provider materializer.
+    // It may already report Failed or still be Loading, but neither state can
+    // cross the Stage admission boundary.
+    let expected = [UniqueId::new(1_801_001, 1)];
+    let stage = stage_request(&request, 1, &expected);
+    assert_eq!(
+        registry.stage_fragments(stage).outcome(),
+        QueryStageOutcome::RejectedInvalidState
+    );
+}
+
+#[test]
+fn cold_catalog_set_announces_ready_once_and_then_admits_stage() {
+    let materializer = BlockingCatalogMaterializer::blocked();
+    let registry = registry_with_blocking_catalog_materializer(
+        RecordingLocalRuntime::default(),
+        materializer.clone(),
+    );
+    let request = catalog_init_request_fixture_for_process(1_801_002, registry.local_process_id());
+    let expected = [UniqueId::new(1_801_002, 1)];
+
+    assert_eq!(
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
+        QueryInitOutcome::QueryInitApplied
+    );
+    materializer.wait_until_materialization_enters();
+
+    let mut attachment = attach_control(&registry, &request);
+    assert_control_ready_loading_catalogs(&mut attachment);
+    assert_eq!(
+        registry
+            .stage_fragments(stage_request(&request, 1, &expected))
+            .outcome(),
+        QueryStageOutcome::RejectedInvalidState
+    );
+
+    materializer.release_materialization();
+    materializer.wait_until_materialization_completes();
+    wait_for_catalog_ready(&mut attachment);
+    assert!(matches!(
+        try_recv_event(&mut attachment),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        registry
+            .stage_fragments(stage_request(&request, 1, &expected))
+            .outcome(),
+        QueryStageOutcome::Applied
+    );
+}
+
+#[test]
+fn abort_during_catalog_loading_releases_leases_and_suppresses_ready() {
+    let materializer = BlockingCatalogMaterializer::blocked();
+    let registry = registry_with_blocking_catalog_materializer(
+        RecordingLocalRuntime::default(),
+        materializer.clone(),
+    );
+    let request = catalog_init_request_fixture_for_process(1_801_003, registry.local_process_id());
+
+    assert_eq!(
+        registry
+            .init_query(request.clone())
+            .outcome()
+            .expect("validated lifecycle acknowledgement"),
+        QueryInitOutcome::QueryInitApplied
+    );
+    materializer.wait_until_materialization_enters();
+    let mut attachment = attach_control(&registry, &request);
+    assert_control_ready_loading_catalogs(&mut attachment);
+
+    registry
+        .abort_query(
+            QueryAbortRequest::new(
+                request.manifest().execution_id(),
+                request
+                    .manifest()
+                    .expect("validated init manifest")
+                    .digest()
+                    .expect("validated init digest"),
+                "abort while catalog materialization is loading",
+            )
+            .expect("valid abort"),
+        )
+        .expect("abort is accepted");
+    assert_eq!(
+        registry.prune_catalogs(BTreeSet::new()),
+        CatalogPruneOutcome::Accepted,
+        "the aborted query must no longer hold a catalog lease"
+    );
+
+    materializer.release_materialization();
+    materializer.wait_until_materialization_completes();
+    assert_no_catalog_ready(&mut attachment);
 }
 
 #[test]

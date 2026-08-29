@@ -15,46 +15,44 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
-use novarocks_frontend::connector::{
-    ConnectorControlHost, ConnectorControlRetirement, ConnectorControlRetirementSink,
-};
+use novarocks_frontend::connector::ConnectorControlHost;
 use novarocks_spi::connector::{
+    CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
     ConnectorBeginScanRequest, ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
     ConnectorCatalogMutationResolver, ConnectorCleanupCandidatePageRequest,
     ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
     ConnectorCleanupMaintenanceResolver, ConnectorCleanupPlan, ConnectorCleanupPlanningRequest,
     ConnectorCleanupPrepareRequest, ConnectorControlBinding, ConnectorControlResolver,
-    ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
-    ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
+    ConnectorControlRuntimeId, ConnectorDataMutation, ConnectorDataMutationExecuteRequest,
+    ConnectorDataMutationPlan, ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
     ConnectorDistributedRewrite, ConnectorDistributedRewriteAttemptCheckpoint,
     ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewritePlan,
     ConnectorDistributedRewritePlanningRequest, ConnectorDistributedRewriteReceipt,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBindingKey, ConnectorExecutionDeclaration, ConnectorExecutionDistribution,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
+    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorMetadataMaintenance,
     ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
-    ConnectorMetadataMaintenanceResolver, ConnectorNamespaceRequest, ConnectorProviderId,
-    ConnectorRequestContext, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorSplitPlanningRequest, ConnectorStatistics, ConnectorStatisticsResolver,
-    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest,
-    ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest, ConnectorWriteActivation,
-    ConnectorWriteAttemptCompletion, ConnectorWriteCommitRequest, ConnectorWriteControl,
-    ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWriteReceipt,
-    ConnectorWriteReconcileRequest, ExternalMutationOutcome, StatisticsDataVersion,
-    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsReadRequest, StatisticsReader,
-    StatisticsRowCoverage,
+    ConnectorMetadataMaintenanceResolver, ConnectorNamespaceRequest, ConnectorProviderBinding,
+    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorStatistics,
+    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
+    ConnectorTableRequest, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
+    ConnectorWriteActivation, ConnectorWriteAttemptCompletion, ConnectorWriteCommitRequest,
+    ConnectorWriteControl, ConnectorWritePlan, ConnectorWritePlanningRequest,
+    ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ExternalMutationOutcome,
+    ProviderBindingEpoch, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
+    StatisticsReadRequest, StatisticsReader, StatisticsRowCoverage,
 };
 
 struct TestControl {
     instance_id: ConnectorInstanceId,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
 }
 
 impl ConnectorMetadata for TestControl {
@@ -114,8 +112,8 @@ impl ConnectorExecutionDistribution for TestControl {
     fn declaration(
         &self,
         _context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionDeclaration, ConnectorError> {
-        ConnectorExecutionDeclaration::iceberg(
+    ) -> Result<ConnectorProviderBinding, ConnectorError> {
+        ConnectorProviderBinding::iceberg(
             self.instance_id.as_str(),
             self.incarnation.to_bytes(),
             "default",
@@ -127,7 +125,7 @@ impl ConnectorExecutionDistribution for TestControl {
 fn binding(incarnation: u8) -> ConnectorControlBinding {
     let provider = Arc::new(TestControl {
         instance_id: ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([incarnation; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([incarnation; 16]),
     });
     ConnectorControlBinding::try_new(
         ConnectorInstanceDescriptor {
@@ -143,9 +141,20 @@ fn binding(incarnation: u8) -> ConnectorControlBinding {
     .expect("control binding")
 }
 
+fn catalog_properties(instance: ConnectorInstanceId) -> CatalogProperties {
+    CatalogProperties::new(
+        CatalogHandle::new(instance, CatalogVersion::from_bytes([3; 32])),
+        CatalogProviderKind::Iceberg,
+        1,
+        vec![CatalogProperty::new("warehouse", "s3://rewrite-session").expect("valid warehouse")],
+        Vec::new(),
+    )
+    .expect("valid catalog properties")
+}
+
 struct TestMutation {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
 }
 
 impl ConnectorCatalogMutation for TestMutation {
@@ -153,7 +162,7 @@ impl ConnectorCatalogMutation for TestMutation {
         &self.descriptor
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
 
@@ -196,7 +205,7 @@ fn binding_with_mutation(incarnation: u8) -> ConnectorControlBinding {
 
 struct TestDataMutation {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl ConnectorDataMutation for TestDataMutation {
@@ -204,7 +213,7 @@ impl ConnectorDataMutation for TestDataMutation {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -234,7 +243,7 @@ fn binding_with_data_mutation(incarnation_byte: u8) -> ConnectorControlBinding {
     let binding = binding(incarnation_byte);
     let descriptor = binding.descriptor().clone();
     let incarnation = binding.incarnation();
-    let key = ConnectorExecutionBindingKey {
+    let key = ConnectorProviderBindingKey {
         instance_id: descriptor.instance_id.clone(),
         incarnation,
     };
@@ -256,7 +265,7 @@ fn binding_with_data_mutation(incarnation_byte: u8) -> ConnectorControlBinding {
 
 struct TestCleanupMaintenance {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl ConnectorCleanupMaintenance for TestCleanupMaintenance {
@@ -264,7 +273,7 @@ impl ConnectorCleanupMaintenance for TestCleanupMaintenance {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -308,7 +317,7 @@ fn binding_with_cleanup_maintenance(incarnation_byte: u8) -> ConnectorControlBin
     let binding = binding(incarnation_byte);
     let descriptor = binding.descriptor().clone();
     let incarnation = binding.incarnation();
-    let key = ConnectorExecutionBindingKey {
+    let key = ConnectorProviderBindingKey {
         instance_id: descriptor.instance_id.clone(),
         incarnation,
     };
@@ -336,7 +345,7 @@ fn binding_with_cleanup_maintenance(incarnation_byte: u8) -> ConnectorControlBin
 
 struct TestMetadataMaintenance {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl ConnectorMetadataMaintenance for TestMetadataMaintenance {
@@ -344,7 +353,7 @@ impl ConnectorMetadataMaintenance for TestMetadataMaintenance {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -367,7 +376,7 @@ fn binding_with_metadata_maintenance(incarnation_byte: u8) -> ConnectorControlBi
     let binding = binding(incarnation_byte);
     let descriptor = binding.descriptor().clone();
     let incarnation = binding.incarnation();
-    let key = ConnectorExecutionBindingKey {
+    let key = ConnectorProviderBindingKey {
         instance_id: descriptor.instance_id.clone(),
         incarnation,
     };
@@ -392,7 +401,7 @@ fn binding_with_metadata_maintenance(incarnation_byte: u8) -> ConnectorControlBi
 
 struct TestDistributedRewrite {
     descriptor: ConnectorInstanceDescriptor,
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl ConnectorDistributedRewrite for TestDistributedRewrite {
@@ -400,7 +409,7 @@ impl ConnectorDistributedRewrite for TestDistributedRewrite {
         &self.descriptor
     }
 
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -446,11 +455,11 @@ impl ConnectorDistributedRewrite for TestDistributedRewrite {
 }
 
 struct TestWrite {
-    key: ConnectorExecutionBindingKey,
+    key: ConnectorProviderBindingKey,
 }
 
 impl ConnectorWriteControl for TestWrite {
-    fn binding_key(&self) -> &ConnectorExecutionBindingKey {
+    fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
     }
 
@@ -490,7 +499,7 @@ fn binding_with_distributed_rewrite(
     let binding = binding(incarnation_byte);
     let descriptor = binding.descriptor().clone();
     let incarnation = binding.incarnation();
-    let key = ConnectorExecutionBindingKey {
+    let key = ConnectorProviderBindingKey {
         instance_id: descriptor.instance_id.clone(),
         incarnation,
     };
@@ -518,11 +527,13 @@ fn binding_with_distributed_rewrite(
         None,
     )
     .expect("control binding with distributed rewrite")
+    .with_catalog_properties(catalog_properties(key.instance_id))
+    .expect("control binding has catalog execution properties")
 }
 
 struct TestStatistics {
     descriptor: ConnectorInstanceDescriptor,
-    incarnation: ConnectorInstanceIncarnation,
+    incarnation: ProviderBindingEpoch,
 }
 
 impl StatisticsReader for TestStatistics {
@@ -530,7 +541,7 @@ impl StatisticsReader for TestStatistics {
         &self.descriptor
     }
 
-    fn incarnation(&self) -> ConnectorInstanceIncarnation {
+    fn incarnation(&self) -> ProviderBindingEpoch {
         self.incarnation
     }
 
@@ -572,45 +583,6 @@ fn binding_with_statistics(incarnation: u8) -> ConnectorControlBinding {
     .expect("control binding with statistics")
 }
 
-#[derive(Default)]
-struct RecordingRetirementSink(Mutex<Vec<ConnectorControlRetirement>>);
-
-impl ConnectorControlRetirementSink for RecordingRetirementSink {
-    fn retire(&self, retirement: ConnectorControlRetirement) {
-        self.0.lock().expect("retirement sink").push(retirement);
-    }
-}
-
-#[test]
-fn lease_drain_dispatches_retirement_to_installed_backends() {
-    let host = ConnectorControlHost::new();
-    let sink = Arc::new(RecordingRetirementSink::default());
-    host.set_retirement_sink(sink.clone());
-    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-    host.register(binding(7)).expect("register old generation");
-    let lease = host.acquire_current(&instance_id).expect("planning lease");
-    let old_key = ConnectorExecutionBindingKey {
-        instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
-    };
-    host.record_installed_backend(&old_key, "127.0.0.1:18080")
-        .expect("record ensure acknowledgement");
-    host.retire_current(&instance_id)
-        .expect("retire old generation");
-    assert!(sink.0.lock().expect("retirement sink").is_empty());
-
-    drop(lease);
-
-    let dispatched = sink.0.lock().expect("retirement sink");
-    assert_eq!(dispatched.len(), 1);
-    assert_eq!(dispatched[0].key, old_key);
-    assert_eq!(
-        dispatched[0].installed_backends,
-        vec![String::from("127.0.0.1:18080")]
-    );
-    assert!(host.take_ready_retires().expect("retire queue").is_empty());
-}
-
 #[test]
 fn mutation_lease_fences_retirement_and_missing_capability_is_unsupported() {
     let host = ConnectorControlHost::new();
@@ -641,6 +613,60 @@ fn mutation_lease_fences_retirement_and_missing_capability_is_unsupported() {
 }
 
 #[test]
+fn exact_mutation_lease_never_uses_a_replacement_runtime() {
+    let host = ConnectorControlHost::new();
+    let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
+    let old_key = ConnectorProviderBindingKey {
+        instance_id: instance_id.clone(),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+    };
+    let old_binding = binding_with_mutation(7);
+    let old_control_runtime_id = old_binding.control_runtime_id();
+    host.register(old_binding)
+        .expect("register old mutation generation");
+    let planning = host.acquire_current(&instance_id).expect("planning lease");
+    host.retire_current(&instance_id)
+        .expect("retire old generation");
+
+    let replacement_binding = binding_with_mutation(8);
+    let replacement_control_runtime_id = replacement_binding.control_runtime_id();
+    host.register(replacement_binding)
+        .expect("register replacement generation");
+    let replacement = host
+        .acquire_current_mutation(&instance_id)
+        .expect("replacement mutation lease");
+    assert_eq!(
+        replacement.control_runtime_id(),
+        replacement_control_runtime_id
+    );
+
+    let exact_old = host
+        .acquire_exact_mutation(old_control_runtime_id)
+        .expect("exact retiring mutation lease");
+    assert_eq!(exact_old.control_runtime_id(), old_control_runtime_id);
+
+    let error = match host.acquire_exact_mutation(ConnectorControlRuntimeId::from_bytes([9; 16])) {
+        Ok(_) => panic!("unknown control runtime must not use the replacement"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+
+    drop(planning);
+    assert!(host.take_ready_retires().expect("retire queue").is_empty());
+    drop(exact_old);
+    let ready = host.take_ready_retires().expect("retire queue");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].key, old_key);
+
+    let error = match host.acquire_exact_mutation(old_control_runtime_id) {
+        Ok(_) => panic!("retired control runtime must not be recreated"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
+    drop(replacement);
+}
+
+#[test]
 fn data_mutation_lease_requires_the_capability_and_fences_retirement() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
@@ -655,12 +681,14 @@ fn data_mutation_lease_requires_the_capability_and_fences_retirement() {
         .expect("retire no-data-mutation generation");
     assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
 
-    host.register(binding_with_data_mutation(8))
+    let binding = binding_with_data_mutation(8);
+    let control_runtime_id = binding.control_runtime_id();
+    host.register(binding)
         .expect("register data-mutation generation");
     let lease = host
         .acquire_current_data_mutation(&instance_id)
         .expect("data-mutation lease");
-    assert_eq!(lease.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(lease.control_runtime_id(), control_runtime_id);
     assert_eq!(lease.metadata().instance_id(), &instance_id);
     host.retire_current(&instance_id)
         .expect("retire data-mutation generation");
@@ -670,15 +698,16 @@ fn data_mutation_lease_requires_the_capability_and_fences_retirement() {
 }
 
 #[test]
-fn exact_data_mutation_lease_never_uses_a_replacement_incarnation() {
+fn exact_data_mutation_lease_never_uses_a_replacement_runtime() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-    let old_key = ConnectorExecutionBindingKey {
+    let old_key = ConnectorProviderBindingKey {
         instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
     };
-    host.register(binding_with_data_mutation(7))
-        .expect("register old generation");
+    let old_binding = binding_with_data_mutation(7);
+    let old_control_runtime_id = old_binding.control_runtime_id();
+    host.register(old_binding).expect("register old generation");
     let planning = host.acquire_current(&instance_id).expect("planning lease");
     host.retire_current(&instance_id)
         .expect("retire old generation");
@@ -689,24 +718,26 @@ fn exact_data_mutation_lease_never_uses_a_replacement_incarnation() {
     };
     assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
 
-    host.register(binding_with_data_mutation(8))
+    let replacement_binding = binding_with_data_mutation(8);
+    let replacement_control_runtime_id = replacement_binding.control_runtime_id();
+    host.register(replacement_binding)
         .expect("register replacement generation");
     let replacement = host
         .acquire_current_data_mutation(&instance_id)
         .expect("replacement data-mutation lease");
-    assert_eq!(replacement.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(
+        replacement.control_runtime_id(),
+        replacement_control_runtime_id
+    );
 
     let exact_old = host
-        .acquire_exact_data_mutation(&old_key)
+        .acquire_exact_data_mutation(old_control_runtime_id)
         .expect("exact retiring generation lease");
-    assert_eq!(exact_old.binding_key(), &old_key);
+    assert_eq!(exact_old.control_runtime_id(), old_control_runtime_id);
 
-    let unknown_key = ConnectorExecutionBindingKey {
-        instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
-    };
-    let error = match host.acquire_exact_data_mutation(&unknown_key) {
-        Ok(_) => panic!("unknown incarnation must not use the replacement"),
+    let unknown_runtime_id = ConnectorControlRuntimeId::from_bytes([9; 16]);
+    let error = match host.acquire_exact_data_mutation(unknown_runtime_id) {
+        Ok(_) => panic!("unknown control runtime must not use the replacement"),
         Err(error) => error,
     };
     assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
@@ -718,7 +749,7 @@ fn exact_data_mutation_lease_never_uses_a_replacement_incarnation() {
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].key, old_key);
 
-    let error = match host.acquire_exact_data_mutation(&old_key) {
+    let error = match host.acquire_exact_data_mutation(old_control_runtime_id) {
         Ok(_) => panic!("retired generation must not be recreated"),
         Err(error) => error,
     };
@@ -741,12 +772,14 @@ fn metadata_maintenance_lease_requires_the_capability_and_fences_retirement() {
         .expect("retire no-metadata-maintenance generation");
     assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
 
-    host.register(binding_with_metadata_maintenance(8))
+    let binding = binding_with_metadata_maintenance(8);
+    let control_runtime_id = binding.control_runtime_id();
+    host.register(binding)
         .expect("register metadata-maintenance generation");
     let lease = host
         .acquire_current_metadata_maintenance(&instance_id)
         .expect("metadata-maintenance lease");
-    assert_eq!(lease.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(lease.control_runtime_id(), control_runtime_id);
     assert_eq!(lease.metadata().instance_id(), &instance_id);
     host.retire_current(&instance_id)
         .expect("retire metadata-maintenance generation");
@@ -756,15 +789,16 @@ fn metadata_maintenance_lease_requires_the_capability_and_fences_retirement() {
 }
 
 #[test]
-fn exact_metadata_maintenance_lease_never_uses_a_replacement_incarnation() {
+fn exact_metadata_maintenance_lease_never_uses_a_replacement_runtime() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-    let old_key = ConnectorExecutionBindingKey {
+    let old_key = ConnectorProviderBindingKey {
         instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
     };
-    host.register(binding_with_metadata_maintenance(7))
-        .expect("register old generation");
+    let old_binding = binding_with_metadata_maintenance(7);
+    let old_control_runtime_id = old_binding.control_runtime_id();
+    host.register(old_binding).expect("register old generation");
     let planning = host.acquire_current(&instance_id).expect("planning lease");
     host.retire_current(&instance_id)
         .expect("retire old generation");
@@ -775,24 +809,27 @@ fn exact_metadata_maintenance_lease_never_uses_a_replacement_incarnation() {
     };
     assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
 
-    host.register(binding_with_metadata_maintenance(8))
+    let replacement_binding = binding_with_metadata_maintenance(8);
+    let replacement_control_runtime_id = replacement_binding.control_runtime_id();
+    host.register(replacement_binding)
         .expect("register replacement generation");
     let replacement = host
         .acquire_current_metadata_maintenance(&instance_id)
         .expect("replacement metadata-maintenance lease");
-    assert_eq!(replacement.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(
+        replacement.control_runtime_id(),
+        replacement_control_runtime_id
+    );
 
     let exact_old = host
-        .acquire_exact_metadata_maintenance(&old_key)
+        .acquire_exact_metadata_maintenance(old_control_runtime_id)
         .expect("exact retiring generation lease");
-    assert_eq!(exact_old.binding_key(), &old_key);
+    assert_eq!(exact_old.control_runtime_id(), old_control_runtime_id);
 
-    let unknown_key = ConnectorExecutionBindingKey {
-        instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
-    };
-    let error = match host.acquire_exact_metadata_maintenance(&unknown_key) {
-        Ok(_) => panic!("unknown incarnation must not use the replacement"),
+    let error = match host
+        .acquire_exact_metadata_maintenance(ConnectorControlRuntimeId::from_bytes([9; 16]))
+    {
+        Ok(_) => panic!("unknown control runtime must not use the replacement"),
         Err(error) => error,
     };
     assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
@@ -804,7 +841,7 @@ fn exact_metadata_maintenance_lease_never_uses_a_replacement_incarnation() {
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].key, old_key);
 
-    let error = match host.acquire_exact_metadata_maintenance(&old_key) {
+    let error = match host.acquire_exact_metadata_maintenance(old_control_runtime_id) {
         Ok(_) => panic!("retired generation must not be recreated"),
         Err(error) => error,
     };
@@ -827,12 +864,14 @@ fn cleanup_maintenance_lease_requires_the_capability_and_fences_retirement() {
         .expect("retire no-cleanup-maintenance generation");
     assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
 
-    host.register(binding_with_cleanup_maintenance(8))
+    let binding = binding_with_cleanup_maintenance(8);
+    let control_runtime_id = binding.control_runtime_id();
+    host.register(binding)
         .expect("register cleanup-maintenance generation");
     let lease = host
         .acquire_current_cleanup_maintenance(&instance_id)
         .expect("cleanup-maintenance lease");
-    assert_eq!(lease.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(lease.control_runtime_id(), control_runtime_id);
     assert_eq!(lease.metadata().instance_id(), &instance_id);
     host.retire_current(&instance_id)
         .expect("retire cleanup-maintenance generation");
@@ -842,15 +881,16 @@ fn cleanup_maintenance_lease_requires_the_capability_and_fences_retirement() {
 }
 
 #[test]
-fn exact_cleanup_maintenance_lease_never_uses_a_replacement_incarnation() {
+fn exact_cleanup_maintenance_lease_never_uses_a_replacement_runtime() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-    let old_key = ConnectorExecutionBindingKey {
+    let old_key = ConnectorProviderBindingKey {
         instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
     };
-    host.register(binding_with_cleanup_maintenance(7))
-        .expect("register old generation");
+    let old_binding = binding_with_cleanup_maintenance(7);
+    let old_control_runtime_id = old_binding.control_runtime_id();
+    host.register(old_binding).expect("register old generation");
     let planning = host.acquire_current(&instance_id).expect("planning lease");
     host.retire_current(&instance_id)
         .expect("retire old generation");
@@ -861,24 +901,27 @@ fn exact_cleanup_maintenance_lease_never_uses_a_replacement_incarnation() {
     };
     assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
 
-    host.register(binding_with_cleanup_maintenance(8))
+    let replacement_binding = binding_with_cleanup_maintenance(8);
+    let replacement_control_runtime_id = replacement_binding.control_runtime_id();
+    host.register(replacement_binding)
         .expect("register replacement generation");
     let replacement = host
         .acquire_current_cleanup_maintenance(&instance_id)
         .expect("replacement cleanup-maintenance lease");
-    assert_eq!(replacement.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(
+        replacement.control_runtime_id(),
+        replacement_control_runtime_id
+    );
 
     let exact_old = host
-        .acquire_exact_cleanup_maintenance(&old_key)
+        .acquire_exact_cleanup_maintenance(old_control_runtime_id)
         .expect("exact retiring generation lease");
-    assert_eq!(exact_old.binding_key(), &old_key);
+    assert_eq!(exact_old.control_runtime_id(), old_control_runtime_id);
 
-    let unknown_key = ConnectorExecutionBindingKey {
-        instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
-    };
-    let error = match host.acquire_exact_cleanup_maintenance(&unknown_key) {
-        Ok(_) => panic!("unknown incarnation must not use the replacement"),
+    let error = match host
+        .acquire_exact_cleanup_maintenance(ConnectorControlRuntimeId::from_bytes([9; 16]))
+    {
+        Ok(_) => panic!("unknown control runtime must not use the replacement"),
         Err(error) => error,
     };
     assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
@@ -890,7 +933,7 @@ fn exact_cleanup_maintenance_lease_never_uses_a_replacement_incarnation() {
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].key, old_key);
 
-    let error = match host.acquire_exact_cleanup_maintenance(&old_key) {
+    let error = match host.acquire_exact_cleanup_maintenance(old_control_runtime_id) {
         Ok(_) => panic!("retired generation must not be recreated"),
         Err(error) => error,
     };
@@ -924,12 +967,14 @@ fn distributed_rewrite_lease_requires_both_capabilities_and_fences_retirement() 
         .expect("retire rewrite-only generation");
     assert_eq!(host.take_ready_retires().expect("retire queue").len(), 1);
 
-    host.register(binding_with_distributed_rewrite(9, true))
+    let complete = binding_with_distributed_rewrite(9, true);
+    let complete_control_runtime_id = complete.control_runtime_id();
+    host.register(complete)
         .expect("register complete generation");
     let lease = host
         .acquire_current_distributed_rewrite(&instance_id)
         .expect("distributed rewrite lease");
-    assert_eq!(lease.binding_key().incarnation.to_bytes(), [9; 16]);
+    assert_eq!(lease.control_runtime_id(), complete_control_runtime_id);
     assert_eq!(lease.metadata().instance_id(), &instance_id);
     let writer = lease.derive_write_lease().expect("derived write lease");
 
@@ -946,12 +991,13 @@ fn distributed_rewrite_lease_requires_both_capabilities_and_fences_retirement() 
 fn exact_distributed_rewrite_lease_never_uses_a_replacement_incarnation() {
     let host = ConnectorControlHost::new();
     let instance_id = ConnectorInstanceId::parse("catalog.analytics").expect("instance ID");
-    let old_key = ConnectorExecutionBindingKey {
+    let old_key = ConnectorProviderBindingKey {
         instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([7; 16]),
+        incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
     };
-    host.register(binding_with_distributed_rewrite(7, true))
-        .expect("register old generation");
+    let old = binding_with_distributed_rewrite(7, true);
+    let old_control_runtime_id = old.control_runtime_id();
+    host.register(old).expect("register old generation");
     let planning = host.acquire_current(&instance_id).expect("planning lease");
     host.retire_current(&instance_id)
         .expect("retire old generation");
@@ -962,24 +1008,27 @@ fn exact_distributed_rewrite_lease_never_uses_a_replacement_incarnation() {
     };
     assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
 
-    host.register(binding_with_distributed_rewrite(8, true))
+    let replacement_binding = binding_with_distributed_rewrite(8, true);
+    let replacement_control_runtime_id = replacement_binding.control_runtime_id();
+    host.register(replacement_binding)
         .expect("register replacement generation");
     let replacement = host
         .acquire_current_distributed_rewrite(&instance_id)
         .expect("replacement distributed rewrite lease");
-    assert_eq!(replacement.binding_key().incarnation.to_bytes(), [8; 16]);
+    assert_eq!(
+        replacement.control_runtime_id(),
+        replacement_control_runtime_id
+    );
 
     let exact_old = host
-        .acquire_exact_distributed_rewrite(&old_key)
+        .acquire_exact_distributed_rewrite(old_control_runtime_id)
         .expect("exact retiring generation lease");
-    assert_eq!(exact_old.binding_key(), &old_key);
+    assert_eq!(exact_old.control_runtime_id(), old_control_runtime_id);
 
-    let unknown_key = ConnectorExecutionBindingKey {
-        instance_id: instance_id.clone(),
-        incarnation: ConnectorInstanceIncarnation::from_bytes([9; 16]),
-    };
-    let error = match host.acquire_exact_distributed_rewrite(&unknown_key) {
-        Ok(_) => panic!("unknown incarnation must not use the replacement"),
+    let error = match host
+        .acquire_exact_distributed_rewrite(ConnectorControlRuntimeId::from_bytes([9; 16]))
+    {
+        Ok(_) => panic!("unknown control runtime must not use the replacement"),
         Err(error) => error,
     };
     assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
@@ -991,7 +1040,7 @@ fn exact_distributed_rewrite_lease_never_uses_a_replacement_incarnation() {
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].key, old_key);
 
-    let error = match host.acquire_exact_distributed_rewrite(&old_key) {
+    let error = match host.acquire_exact_distributed_rewrite(old_control_runtime_id) {
         Ok(_) => panic!("retired generation must not be recreated"),
         Err(error) => error,
     };

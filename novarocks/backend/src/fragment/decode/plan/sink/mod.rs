@@ -36,7 +36,6 @@ use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::novarocks as native_proto;
 use novarocks_proto_models::{common, expr, plan};
 use novarocks_spi::connector::{
-    ConnectorExecutionBindingKey, ConnectorInstanceId, ConnectorInstanceIncarnation,
     ConnectorOpenWriterRequest, ConnectorRequestContext, ConnectorRowMutationEffect,
     ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriterHandle,
     ConnectorWriterIdentity, StatisticsMetric, StatisticsMetricRequest,
@@ -239,6 +238,18 @@ fn decode_connector_write_sink_program(
         )
         .append_field("writer")
     })?;
+    if envelope.contract_version != novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION {
+        return Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "handle",
+            format!(
+                "native connector writer contract version {} is unsupported; expected {}",
+                envelope.contract_version,
+                novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
+            ),
+        )
+        .append_field("contract_version"));
+    }
     let operation_id = ConnectorWriteOperationId::from_bytes(required_uuid_bytes(
         &wire_writer.operation_id,
         "operation_id",
@@ -292,23 +303,33 @@ fn decode_connector_write_sink_program(
         .append_field("writer")
         .append_field("execution_query_id"));
     }
-    let binding_key = ConnectorExecutionBindingKey {
-        instance_id: ConnectorInstanceId::parse(&wire_writer.connector_instance_id).map_err(
-            |error| {
-                NativeFragmentLeafDecodeError::at_field(
-                    ProtocolErrorKind::InvalidValue,
-                    "handle",
-                    error.to_string(),
-                )
-                .append_field("writer")
-                .append_field("connector_instance_id")
-            },
-        )?,
-        incarnation: ConnectorInstanceIncarnation::from_bytes(required_uuid_bytes(
-            &wire_writer.connector_incarnation,
-            "connector_incarnation",
-        )?),
-    };
+    let catalog_handle = wire_writer.catalog_handle.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "handle",
+            "connector writer identity requires an exact catalog handle",
+        )
+        .append_field("writer")
+        .append_field("catalog_handle")
+    })?;
+    let catalog_handle = novarocks_proto_codec::catalog::decode_catalog_handle(
+        catalog_handle.clone(),
+        FieldPath::root("plan_fragment")
+            .field("sink")
+            .field("connector_write")
+            .field("handle")
+            .field("writer")
+            .field("catalog_handle"),
+    )
+    .map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "handle",
+            error.to_string(),
+        )
+        .append_field("writer")
+        .append_field("catalog_handle")
+    })?;
     let writer = ConnectorWriterIdentity::new(
         operation_id,
         novarocks_spi::connector::ConnectorWriteCohortId::from_bytes(required_digest_bytes(
@@ -320,10 +341,10 @@ fn decode_connector_write_sink_program(
         wire_writer.fragment_id,
         wire_writer.backend_num,
         wire_writer.sink_ordinal,
-        binding_key.clone(),
+        catalog_handle,
     );
+    let writer_catalog_handle = writer.catalog_handle().clone();
     let handle = ConnectorWriterHandle::try_new(
-        binding_key.clone(),
         writer,
         envelope.contract_version,
         Bytes::copy_from_slice(&envelope.payload),
@@ -343,23 +364,25 @@ fn decode_connector_write_sink_program(
         )
         .append_field("payload_sha256"));
     }
-    let binding = context
-        .execution_resolver()?
-        .resolve(&binding_key)
+    let runtime = context.typed_scan_runtime().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "handle",
+            "connector writer requires a query-leased catalog runtime",
+        )
+    })?;
+    let write_execution = runtime
+        .catalog_write_execution(&writer_catalog_handle)
         .map_err(|error| {
             NativeFragmentLeafDecodeError::at_field(
                 ProtocolErrorKind::InvalidValue,
                 "handle",
-                format!("resolve connector writer execution binding: {error}"),
+                format!("resolve query-leased connector writer runtime: {error}"),
             )
+            .append_field("writer")
+            .append_field("catalog_handle")
         })?;
-    if binding.key() != &binding_key || binding.write().is_none() {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InvalidValue,
-            "handle",
-            "connector writer requires its exact BE write execution binding",
-        ));
-    }
+    let execution = write_execution.execution();
     let root_schema = context
         .decode_output_layout(
             &fragment.output_columns,
@@ -406,7 +429,7 @@ fn decode_connector_write_sink_program(
     };
     match expression_projection {
         Some((arena, exprs)) => ConnectorWriteSinkProgram::try_new_with_expression_projection(
-            binding,
+            execution,
             request,
             root_input_width,
             arena,
@@ -414,7 +437,7 @@ fn decode_connector_write_sink_program(
             expected_schema,
         ),
         None => {
-            ConnectorWriteSinkProgram::try_new(binding, request, root_input_width, input_ordinals)
+            ConnectorWriteSinkProgram::try_new(execution, request, root_input_width, input_ordinals)
         }
     }
     .map_err(|error| {

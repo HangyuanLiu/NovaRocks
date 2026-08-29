@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,7 @@ use novarocks_proto_codec::lifecycle::{
     AttemptId as CoreAttemptId, AttemptId as ProtocolAttemptId, QueryControlAttach,
     QueryExecutionId, QueryInitOutcome, QueryStageAck, QueryStartAck, QueryStartRequest,
 };
-use novarocks_proto_models::novarocks as protocol_wire;
+use novarocks_proto_models::{catalog as catalog_wire, novarocks as protocol_wire};
 
 use super::QueryLifecycleTransport;
 use super::lease::{
@@ -46,6 +47,8 @@ use crate::coordinator::query_registry::{
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::install_encoder::FrontendRuntimeFilterFeedbackDeclaration;
 
+pub(crate) const DEFAULT_PARTICIPANT_FANOUT_MAX_INFLIGHT: usize = 32;
+
 #[derive(Clone, Copy)]
 pub(crate) struct FrontendQueryLifecycleConfig {
     heartbeat_interval: Duration,
@@ -56,6 +59,7 @@ pub(crate) struct FrontendQueryLifecycleConfig {
     start_rpc_timeout: Duration,
     terminal_drain_timeout: Duration,
     terminal_ack_timeout: Duration,
+    participant_fanout_max_inflight: NonZeroUsize,
 }
 
 impl FrontendQueryLifecycleConfig {
@@ -91,6 +95,10 @@ impl FrontendQueryLifecycleConfig {
             start_rpc_timeout: Duration::from_secs(2),
             terminal_drain_timeout: attach_timeout,
             terminal_ack_timeout: attach_timeout,
+            participant_fanout_max_inflight: NonZeroUsize::new(
+                DEFAULT_PARTICIPANT_FANOUT_MAX_INFLIGHT,
+            )
+            .expect("default participant fanout is nonzero"),
         })
     }
 
@@ -122,6 +130,20 @@ impl FrontendQueryLifecycleConfig {
         self.terminal_drain_timeout = terminal_drain_timeout;
         self.terminal_ack_timeout = terminal_ack_timeout;
         Ok(self)
+    }
+
+    pub(crate) fn with_participant_fanout_max_inflight(
+        mut self,
+        participant_fanout_max_inflight: usize,
+    ) -> Result<Self, DistributedQueryError> {
+        self.participant_fanout_max_inflight =
+            NonZeroUsize::new(participant_fanout_max_inflight)
+                .ok_or_else(|| contract_error("frontend participant fanout must be nonzero"))?;
+        Ok(self)
+    }
+
+    pub(super) const fn participant_fanout_max_inflight(self) -> NonZeroUsize {
+        self.participant_fanout_max_inflight
     }
 
     pub(super) const fn heartbeat_interval(self) -> Duration {
@@ -737,62 +759,67 @@ fn init_all(
     config: FrontendQueryLifecycleConfig,
     metrics: &FrontendLifecycleMetrics,
 ) -> Vec<InitFailure> {
-    std::thread::scope(|scope| {
-        let handles = participants
-            .iter()
-            .map(|participant| {
-                scope.spawn(move || {
-                    let started = Instant::now();
-                    let result = init_one(transport, participant, config.init_rpc_timeout());
-                    let latency = started.elapsed();
-                    match &result {
-                        Ok(QueryInitOutcome::QueryInitApplied) => {
-                            metrics.observe_init(true, false, false, false, latency)
+    let mut failures = Vec::new();
+    for participant_wave in participants.chunks(config.participant_fanout_max_inflight().get()) {
+        let wave_failures: Vec<InitFailure> = std::thread::scope(|scope| {
+            let handles = participant_wave
+                .iter()
+                .map(|participant| {
+                    scope.spawn(move || {
+                        let started = Instant::now();
+                        let result = init_one(transport, participant, config.init_rpc_timeout());
+                        let latency = started.elapsed();
+                        match &result {
+                            Ok(QueryInitOutcome::QueryInitApplied) => {
+                                metrics.observe_init(true, false, false, false, latency)
+                            }
+                            Ok(QueryInitOutcome::QueryInitAlreadyApplied) => {
+                                metrics.observe_init(false, true, false, false, latency)
+                            }
+                            Ok(_) => metrics.observe_init(false, false, false, false, latency),
+                            Err(error) => metrics.observe_init(
+                                false,
+                                false,
+                                error.uncertain_cleanup,
+                                error.manifest_conflict,
+                                latency,
+                            ),
                         }
-                        Ok(QueryInitOutcome::QueryInitAlreadyApplied) => {
-                            metrics.observe_init(false, true, false, false, latency)
+                        if result
+                            .as_ref()
+                            .is_err_and(|error| error.backend_epoch_mismatch)
+                        {
+                            metrics.backend_epoch_mismatch();
                         }
-                        Ok(_) => metrics.observe_init(false, false, false, false, latency),
-                        Err(error) => metrics.observe_init(
-                            false,
-                            false,
-                            error.uncertain_cleanup,
-                            error.manifest_conflict,
-                            latency,
-                        ),
-                    }
-                    if result
-                        .as_ref()
-                        .is_err_and(|error| error.backend_epoch_mismatch)
-                    {
-                        metrics.backend_epoch_mismatch();
-                    }
-                    tracing::info!(
-                        query_id_high = participant_execution_id(participant).query_id().high(),
-                        query_id_low = participant_execution_id(participant).query_id().low(),
-                        attempt_id = participant_execution_id(participant).attempt_id().get(),
-                        backend_idx = participant.target.backend_idx(),
-                        backend_process_id = %participant.target.process_id(),
-                        participant_digest = %hex::encode(participant.digest.as_bytes()),
-                        outcome = ?result,
-                        latency_micros = latency.as_micros() as u64,
-                        "frontend query lifecycle InitQuery completed"
-                    );
-                    result.map(|_| ())
+                        tracing::info!(
+                            query_id_high = participant_execution_id(participant).query_id().high(),
+                            query_id_low = participant_execution_id(participant).query_id().low(),
+                            attempt_id = participant_execution_id(participant).attempt_id().get(),
+                            backend_idx = participant.target.backend_idx(),
+                            backend_process_id = %participant.target.process_id(),
+                            participant_digest = %hex::encode(participant.digest.as_bytes()),
+                            outcome = ?result,
+                            latency_micros = latency.as_micros() as u64,
+                            "frontend query lifecycle InitQuery completed"
+                        );
+                        result.map(|_| ())
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .filter_map(|handle| match handle.join() {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error),
-                Err(_) => Some(InitFailure::failed(
-                    "query lifecycle InitQuery worker panicked",
-                )),
-            })
-            .collect()
-    })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .filter_map(|handle| match handle.join() {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error),
+                    Err(_) => Some(InitFailure::failed(
+                        "query lifecycle InitQuery worker panicked",
+                    )),
+                })
+                .collect()
+        });
+        failures.extend(wave_failures);
+    }
+    failures
 }
 
 #[derive(Debug)]
@@ -997,50 +1024,59 @@ pub(super) fn attach_all(
     metrics: &FrontendLifecycleMetrics,
     control: &Arc<AttemptControl>,
 ) -> Vec<String> {
-    let outcomes = std::thread::scope(|scope| {
-        let handles = participants
-            .iter()
-            .map(|participant| {
-                scope.spawn(move || {
-                    let started = Instant::now();
-                    let outcome = attach_one(transport, participant, frontend_owner_epoch, config);
-                    let latency = started.elapsed();
-                    metrics.observe_attach(outcome.is_ok(), latency);
-                    tracing::info!(
-                        query_id_high = participant_execution_id(participant).query_id().high(),
-                        query_id_low = participant_execution_id(participant).query_id().low(),
-                        attempt_id = participant_execution_id(participant).attempt_id().get(),
-                        backend_idx = participant.target.backend_idx(),
-                        backend_process_id = %participant.target.process_id(),
-                        participant_digest = %hex::encode(participant.digest.as_bytes()),
-                        ready = outcome.is_ok(),
-                        latency_micros = latency.as_micros() as u64,
-                        "frontend query lifecycle control attach completed"
-                    );
-                    match &outcome {
-                        Ok(session) => {
-                            control.add_session(session.clone());
-                            control.mark_control_ready(participant.target.backend_idx());
+    let mut outcomes = Vec::new();
+    for participant_wave in participants.chunks(config.participant_fanout_max_inflight().get()) {
+        let wave_outcomes: Vec<Result<(ActiveSession, bool), (Option<ActiveSession>, String)>> =
+            std::thread::scope(|scope| {
+                let handles = participant_wave
+                    .iter()
+                    .map(|participant| {
+                        scope.spawn(move || {
+                        let started = Instant::now();
+                        let outcome =
+                            attach_one(transport, participant, frontend_owner_epoch, config);
+                        let latency = started.elapsed();
+                        metrics.observe_attach(outcome.is_ok(), latency);
+                        tracing::info!(
+                            query_id_high = participant_execution_id(participant).query_id().high(),
+                            query_id_low = participant_execution_id(participant).query_id().low(),
+                            attempt_id = participant_execution_id(participant).attempt_id().get(),
+                            backend_idx = participant.target.backend_idx(),
+                            backend_process_id = %participant.target.process_id(),
+                            participant_digest = %hex::encode(participant.digest.as_bytes()),
+                            ready = outcome.is_ok(),
+                            latency_micros = latency.as_micros() as u64,
+                            "frontend query lifecycle control attach completed"
+                        );
+                        match &outcome {
+                            Ok((session, catalog_ready)) => {
+                                control.add_session(session.clone());
+                                control.mark_control_ready(participant.target.backend_idx());
+                                if *catalog_ready {
+                                    control.mark_catalog_ready(participant.target.backend_idx());
+                                }
+                            }
+                            Err((Some(session), _)) => control.add_session(session.clone()),
+                            Err((None, _)) => {}
                         }
-                        Err((Some(session), _)) => control.add_session(session.clone()),
-                        Err((None, _)) => {}
-                    }
-                    outcome
-                })
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle.join().unwrap_or_else(|_| {
-                    Err((
-                        None,
-                        "query lifecycle control attach worker panicked".to_string(),
-                    ))
-                })
-            })
-            .collect::<Vec<_>>()
-    });
+                        outcome
+                    })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            Err((
+                                None,
+                                "query lifecycle control attach worker panicked".to_string(),
+                            ))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+        outcomes.extend(wave_outcomes);
+    }
 
     let mut errors = Vec::new();
     for outcome in outcomes {
@@ -1060,7 +1096,7 @@ fn attach_one(
     participant: &MaterializedParticipant,
     frontend_owner_epoch: u64,
     config: FrontendQueryLifecycleConfig,
-) -> Result<ActiveSession, (Option<ActiveSession>, String)> {
+) -> Result<(ActiveSession, bool), (Option<ActiveSession>, String)> {
     let attach = QueryControlAttach::parse(protocol_wire::QueryControlAttach {
         execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
             participant_execution_id(participant),
@@ -1090,10 +1126,45 @@ fn attach_one(
                 ))
             ) =>
         {
+            let Some(protocol_wire::query_control_response::Event::ControlReady(ready)) =
+                event.as_proto().event.as_ref()
+            else {
+                unreachable!("matches guard retains ControlReady");
+            };
+            let catalog_ready = match ready
+                .catalog_load_state
+                .as_ref()
+                .and_then(|state| state.state.as_ref())
+            {
+                Some(catalog_wire::catalog_load_state::State::Ready(_)) => true,
+                Some(catalog_wire::catalog_load_state::State::Loading(_)) => {
+                    wait_for_catalog_ready(&active, participant, config.attach_timeout())?
+                }
+                Some(catalog_wire::catalog_load_state::State::Failed(failure)) => {
+                    return Err((
+                        Some(active),
+                        format!(
+                            "backend {} reported catalog load failure in ControlReady ({}): {}",
+                            participant.target.backend_idx(),
+                            failure.reason,
+                            failure.safe_detail
+                        ),
+                    ));
+                }
+                None => {
+                    return Err((
+                        Some(active),
+                        format!(
+                            "backend {} ControlReady omitted catalog load state",
+                            participant.target.backend_idx()
+                        ),
+                    ));
+                }
+            };
             if let Err(error) = record_control_ready_marker(participant) {
                 return Err((Some(active), error));
             }
-            Ok(active)
+            Ok((active, catalog_ready))
         }
         Ok(event) => Err((
             Some(active),
@@ -1106,6 +1177,43 @@ fn attach_one(
             Some(active),
             format!(
                 "backend {} ControlReady failed: {error}",
+                participant.target.backend_idx()
+            ),
+        )),
+    }
+}
+
+fn wait_for_catalog_ready(
+    active: &ActiveSession,
+    participant: &MaterializedParticipant,
+    timeout: Duration,
+) -> Result<bool, (Option<ActiveSession>, String)> {
+    match active.recv(timeout) {
+        Ok(event) => match event.as_proto().event.as_ref() {
+            Some(protocol_wire::query_control_response::Event::CatalogReady(_)) => Ok(true),
+            Some(protocol_wire::query_control_response::Event::CatalogLoadFailed(failure)) => {
+                Err((
+                    Some(active.clone()),
+                    format!(
+                        "backend {} reported catalog load failure ({}): {}",
+                        participant.target.backend_idx(),
+                        failure.reason,
+                        failure.safe_detail
+                    ),
+                ))
+            }
+            _ => Err((
+                Some(active.clone()),
+                format!(
+                    "backend {} returned a non-catalog event while catalog loading",
+                    participant.target.backend_idx()
+                ),
+            )),
+        },
+        Err(error) => Err((
+            Some(active.clone()),
+            format!(
+                "backend {} CatalogReady failed: {error}",
                 participant.target.backend_idx()
             ),
         )),

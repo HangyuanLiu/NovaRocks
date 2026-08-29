@@ -24,8 +24,9 @@ pub(crate) mod stage;
 pub(crate) mod task_update;
 
 pub(crate) use contract::{
-    BackendQueryControl, QueryControlAttachment, QueryLifecycleError, QueryLifecycleErrorCode,
-    QueryLifecycleIngress, QueryTerminalFallbackTransport, QueryTerminalFallbackTransportError,
+    BackendQueryControl, CatalogPruneOutcome, QueryControlAttachment, QueryLifecycleError,
+    QueryLifecycleErrorCode, QueryLifecycleIngress, QueryTerminalFallbackTransport,
+    QueryTerminalFallbackTransportError,
 };
 pub(crate) use local_runtime::NativeQueryLifecycleLocalRuntime;
 pub use registry::QueryLifecycleRegistryConfig;

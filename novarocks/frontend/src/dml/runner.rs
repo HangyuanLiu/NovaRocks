@@ -309,10 +309,10 @@ mod tests {
 
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorInstanceIncarnation,
-        ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-        ConnectorProviderId, ExternalMutationEffect, ExternalMutationFinalization,
-        LakePublicationDisposition,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationFailure,
+        ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorProviderId,
+        ExternalMutationEffect, ExternalMutationFinalization, LakePublicationDisposition,
+        ProviderBindingEpoch,
     };
 
     use super::*;
@@ -337,7 +337,7 @@ mod tests {
                     provider_id: ConnectorProviderId::parse("iceberg-test").expect("provider"),
                     instance_id: ConnectorInstanceId::parse("iceberg-test").expect("instance"),
                 },
-                ConnectorInstanceIncarnation::default(),
+                ProviderBindingEpoch::default(),
                 ConnectorMutationOperationId::from_bytes([9; 16]),
                 "write",
                 Bytes::from_static(b"exact-same-session-evidence"),
