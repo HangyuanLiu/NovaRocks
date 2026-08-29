@@ -2,10 +2,15 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail};
 use mysql::prelude::Queryable;
+use novarocks_cluster_harness::loopback_s3::{
+    LoopbackS3Config, LoopbackS3Fixture, LoopbackS3Request,
+};
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, QueryExecutionResourceSnapshot,
     ServerHandle,
 };
+use std::path::Path;
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -25,6 +30,8 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(CatalogReadyLifecycle),
         Box::new(CatalogReadWriteRuntime),
         Box::new(CatalogVersionDrain),
+        Box::new(GenerationReplacement),
+        Box::new(StaticCredentialGeneration::default()),
         Box::new(PredicatePageIndexPruning),
         Box::new(TypedReadData),
     ]
@@ -814,6 +821,140 @@ impl Scenario for CatalogFeRestartCache {
     }
 }
 
+/// A static-file catalog source with two simultaneously active, role-local
+/// object-store credential generations. The two fixtures deliberately accept
+/// different key IDs, so a successful read plus their request logs proves that
+/// each catalog stayed on its exact declared credential generation.
+#[derive(Default)]
+struct StaticCredentialGeneration {
+    fixtures: Mutex<Option<StaticCredentialFixtures>>,
+}
+
+struct StaticCredentialFixtures {
+    blue: LoopbackS3Fixture,
+    green: LoopbackS3Fixture,
+}
+
+const STATIC_BLUE_CATALOG: &str = "cca_static_blue";
+const STATIC_GREEN_CATALOG: &str = "cca_static_green";
+const STATIC_BLUE_CREDENTIAL_NAME: &str = "cca-static-blue";
+const STATIC_GREEN_CREDENTIAL_NAME: &str = "cca-static-green";
+const STATIC_BLUE_CREDENTIAL_GENERATION: &str = "v1";
+const STATIC_GREEN_CREDENTIAL_GENERATION: &str = "v2";
+const STATIC_BLUE_KEY_ID: &str = "cca-static-blue-key";
+const STATIC_GREEN_KEY_ID: &str = "cca-static-green-key";
+const STATIC_BLUE_KEY_SECRET: &str = "cca-static-blue-secret";
+const STATIC_GREEN_KEY_SECRET: &str = "cca-static-green-secret";
+
+impl Scenario for StaticCredentialGeneration {
+    fn name(&self) -> &'static str {
+        "connector/static-credential-generation"
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let blue = LoopbackS3Fixture::start(LoopbackS3Config::for_access_key(STATIC_BLUE_KEY_ID))
+            .context("start blue loopback S3 fixture")?;
+        let green = LoopbackS3Fixture::start(LoopbackS3Config::for_access_key(STATIC_GREEN_KEY_ID))
+            .context("start green loopback S3 fixture")?;
+        let snapshot = scenario_root.join("static-credential-catalogs.toml");
+        write_static_credential_snapshot(&snapshot, blue.endpoint(), green.endpoint())?;
+        let mut fixtures = self
+            .fixtures
+            .lock()
+            .map_err(|_| anyhow::anyhow!("static credential fixture lock poisoned"))?;
+        if fixtures.is_some() {
+            bail!("static credential fixtures were initialized more than once");
+        }
+        *fixtures = Some(StaticCredentialFixtures { blue, green });
+
+        Ok(ScenarioLaunchConfig {
+            child_environment: connector_reader_environment(),
+            config_overlay: static_credential_launch_overlay(&snapshot),
+            ..Default::default()
+        })
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect static credential control session")?,
+        )?;
+
+        context.action(
+            "write three blue and three green S3 Iceberg files through StaticFile catalogs",
+        );
+        create_static_catalog_table_and_data(
+            &mut control,
+            STATIC_BLUE_CATALOG,
+            "static_blue_db",
+            "static_blue_data",
+        )?;
+        create_static_catalog_table_and_data(
+            &mut control,
+            STATIC_GREEN_CATALOG,
+            "static_green_db",
+            "static_green_data",
+        )?;
+
+        context
+            .action("read blue and green StaticFile catalogs through the 1FE+3BE connector path");
+        assert_static_catalog_count(
+            &mut control,
+            STATIC_BLUE_CATALOG,
+            "static_blue_db",
+            "static_blue_data",
+        )?;
+        let blue_logs = wait_for_open_reader_on_every_backend(
+            context,
+            STATIC_BLUE_CATALOG,
+            "observe every BE read the blue static credential generation",
+        )?;
+        assert_static_reader_opened_on_every_backend(&blue_logs, STATIC_BLUE_CATALOG)?;
+        assert_static_catalog_count(
+            &mut control,
+            STATIC_GREEN_CATALOG,
+            "static_green_db",
+            "static_green_data",
+        )?;
+        let green_logs = wait_for_open_reader_on_every_backend(
+            context,
+            STATIC_GREEN_CATALOG,
+            "observe every BE read the green static credential generation",
+        )?;
+        assert_static_reader_opened_on_every_backend(&green_logs, STATIC_GREEN_CATALOG)?;
+
+        let fixtures = self
+            .fixtures
+            .lock()
+            .map_err(|_| anyhow::anyhow!("static credential fixture lock poisoned"))?;
+        let fixtures = fixtures
+            .as_ref()
+            .context("static credential fixtures were not retained through scenario execution")?;
+        assert_fixture_used_only_expected_key(
+            "blue",
+            &fixtures.blue.request_log(),
+            STATIC_BLUE_KEY_ID,
+        )?;
+        assert_fixture_used_only_expected_key(
+            "green",
+            &fixtures.green.request_log(),
+            STATIC_GREEN_KEY_ID,
+        )?;
+        context.action("proved blue/v1 and green/v2 reads used distinct exact role-local S3 keys");
+
+        await_resource_convergence(context, &baseline, "static credential generation reads")?;
+        Ok(())
+    }
+}
+
 struct PredicatePageIndexPruning;
 
 impl Scenario for PredicatePageIndexPruning {
@@ -1050,6 +1191,88 @@ query_control_terminal_drain_timeout_ms = 1000
     }
 }
 
+fn static_credential_launch_overlay(snapshot: &Path) -> CrossProcessConfigOverlay {
+    let credentials = static_credential_registry_overlay();
+    CrossProcessConfigOverlay {
+        fe: Some(format!(
+            "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n{credentials}",
+            snapshot.display()
+        )),
+        be: Some(credentials),
+        ..Default::default()
+    }
+}
+
+fn static_credential_registry_overlay() -> String {
+    format!(
+        r#"
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "{STATIC_BLUE_CREDENTIAL_NAME}"
+generation = "{STATIC_BLUE_CREDENTIAL_GENERATION}"
+kind = "s3"
+access_key_id = "{STATIC_BLUE_KEY_ID}"
+access_key_secret = "{STATIC_BLUE_KEY_SECRET}"
+
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "{STATIC_GREEN_CREDENTIAL_NAME}"
+generation = "{STATIC_GREEN_CREDENTIAL_GENERATION}"
+kind = "s3"
+access_key_id = "{STATIC_GREEN_KEY_ID}"
+access_key_secret = "{STATIC_GREEN_KEY_SECRET}"
+"#
+    )
+}
+
+fn write_static_credential_snapshot(
+    snapshot: &Path,
+    blue_endpoint: &str,
+    green_endpoint: &str,
+) -> Result<()> {
+    std::fs::write(
+        snapshot,
+        format!(
+            "format_version = 3\n\
+             [[catalogs]]\n\
+             instance_id = \"{STATIC_BLUE_CATALOG}\"\n\
+             provider_id = \"iceberg\"\n\
+             display_name = \"{STATIC_BLUE_CATALOG}\"\n\
+             config_format_version = 3\n\
+             [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-data\"\n\
+             consumer_role = \"frontend-and-backend\"\n\
+             mode = \"static\"\n\
+             name = \"{STATIC_BLUE_CREDENTIAL_NAME}\"\n\
+             generation = \"{STATIC_BLUE_CREDENTIAL_GENERATION}\"\n\
+             [catalogs.properties]\n\
+             type = \"iceberg\"\n\
+             \"iceberg.catalog.type\" = \"hadoop\"\n\
+             \"iceberg.catalog.warehouse\" = \"s3://cca-static-blue/warehouse\"\n\
+             \"aws.s3.endpoint\" = \"{blue_endpoint}\"\n\
+             \"aws.s3.enable_path_style_access\" = \"true\"\n\
+             [[catalogs]]\n\
+             instance_id = \"{STATIC_GREEN_CATALOG}\"\n\
+             provider_id = \"iceberg\"\n\
+             display_name = \"{STATIC_GREEN_CATALOG}\"\n\
+             config_format_version = 3\n\
+             [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-data\"\n\
+             consumer_role = \"frontend-and-backend\"\n\
+             mode = \"static\"\n\
+             name = \"{STATIC_GREEN_CREDENTIAL_NAME}\"\n\
+             generation = \"{STATIC_GREEN_CREDENTIAL_GENERATION}\"\n\
+             [catalogs.properties]\n\
+             type = \"iceberg\"\n\
+             \"iceberg.catalog.type\" = \"hadoop\"\n\
+             \"iceberg.catalog.warehouse\" = \"s3://cca-static-green/warehouse\"\n\
+             \"aws.s3.endpoint\" = \"{green_endpoint}\"\n\
+             \"aws.s3.enable_path_style_access\" = \"true\"\n"
+        ),
+    )
+    .with_context(|| format!("write static credential snapshot {}", snapshot.display()))
+}
+
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     let count = context.handle().be_count();
     if count != 3 {
@@ -1116,6 +1339,92 @@ fn create_catalog_table_and_data(
                 "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series({range}))"
             ))
             .with_context(|| format!("write data range {range} to {catalog}.{database}.{table}"))?;
+    }
+    Ok(())
+}
+
+fn create_static_catalog_table_and_data(
+    control: &mut mysql::Conn,
+    catalog: &str,
+    database: &str,
+    table: &str,
+) -> Result<()> {
+    control
+        .query_drop(format!("CREATE DATABASE {catalog}.{database}"))
+        .with_context(|| format!("create {catalog}.{database} from StaticFile source"))?;
+    control
+        .query_drop(format!(
+            "CREATE TABLE {catalog}.{database}.{table} (v BIGINT)"
+        ))
+        .with_context(|| format!("create {catalog}.{database}.{table} from StaticFile source"))?;
+    // One committed data file per range gives the distributed 1FE+3BE query
+    // enough independent S3 work to prove every BE read the declared catalog.
+    for range in ["1, 100000", "100001, 200000", "200001, 300000"] {
+        control
+            .query_drop(format!(
+                "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series({range}))"
+            ))
+            .with_context(|| {
+                format!("write static credential range {range} to {catalog}.{database}.{table}")
+            })?;
+    }
+    Ok(())
+}
+
+fn assert_static_catalog_count(
+    control: &mut mysql::Conn,
+    catalog: &str,
+    database: &str,
+    table: &str,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rows: Vec<i64> = control
+            .query(format!("SELECT count(*) FROM {catalog}.{database}.{table}"))
+            .with_context(|| {
+                format!("read {catalog}.{database}.{table} through typed connector")
+            })?;
+        if rows == [300_000] {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "static credential catalog {catalog}.{database}.{table} returned {rows:?}, expected [300000] after bounded metadata visibility wait"
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn assert_static_reader_opened_on_every_backend(logs: &[String], catalog: &str) -> Result<()> {
+    for (index, log) in logs.iter().enumerate() {
+        if reader_open_lines(log, catalog).next().is_none() {
+            bail!("BE[{index}] did not open a typed reader for static catalog {catalog}");
+        }
+    }
+    Ok(())
+}
+
+fn assert_fixture_used_only_expected_key(
+    fixture: &str,
+    requests: &[LoopbackS3Request],
+    expected_key_id: &str,
+) -> Result<()> {
+    let reads = requests
+        .iter()
+        .filter(|request| request.method == "GET" && request.status < 400)
+        .collect::<Vec<_>>();
+    if reads.is_empty() {
+        bail!("{fixture} loopback S3 fixture recorded no successful GET request");
+    }
+    for request in reads {
+        if request.credential_key_id.as_deref() != Some(expected_key_id) {
+            bail!(
+                "{fixture} loopback S3 GET {} used credential key {:?}, expected {expected_key_id}",
+                request.path,
+                request.credential_key_id
+            );
+        }
     }
     Ok(())
 }
