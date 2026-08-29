@@ -91,6 +91,21 @@ pub fn debug_catalog_install_hold_file() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Returns the runner-owned trigger file for one injected catalog-install
+/// failure. The runner places this only in one selected Backend's environment,
+/// which lets the native control barrier exercise a real partial failure.
+#[cfg(debug_assertions)]
+pub fn debug_catalog_install_failure_file() -> Option<std::path::PathBuf> {
+    std::env::var_os("NOVAROCKS_SQL_TEST_CATALOG_INSTALL_FAILURE_FILE")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+#[cfg(not(debug_assertions))]
+pub fn debug_catalog_install_failure_file() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Returns whether the debug-only catalog lifecycle test evidence is enabled.
 ///
 /// The markers contain only query identity, backend identity, and catalog

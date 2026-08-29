@@ -1785,15 +1785,23 @@ impl QueryLifecycleRegistry {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                 }
-                let result = catalogs.into_iter().try_for_each(|properties| {
-                    let materializers = Arc::clone(&registry.catalog_materializers);
-                    registry
-                        .catalog_manager
-                        .ensure(execution_id, properties, move |properties| {
-                            materializers.materialize(properties)
-                        })
-                        .map(|_| ())
-                });
+                let result = if crate::config::debug_catalog_install_failure_file()
+                    .is_some_and(|failure_file| failure_file.exists())
+                {
+                    Err(crate::connector::catalog_manager::CatalogManagerError::materialization_failed(
+                        "runner-injected catalog install failure",
+                    ))
+                } else {
+                    catalogs.into_iter().try_for_each(|properties| {
+                        let materializers = Arc::clone(&registry.catalog_materializers);
+                        registry
+                            .catalog_manager
+                            .ensure(execution_id, properties, move |properties| {
+                                materializers.materialize(properties)
+                            })
+                            .map(|_| ())
+                    })
+                };
                 registry.publish_catalog_lease_metrics();
                 let (event, release) = {
                     let mut state = entry.state.lock().expect("query lifecycle entry lock");
@@ -1824,6 +1832,13 @@ impl QueryLifecycleRegistry {
                                 state.catalog_load = QueryCatalogLoadState::Failed {
                                     safe_detail: safe_detail.clone(),
                                 };
+                                if crate::config::debug_emit_catalog_lifecycle_marker() {
+                                    println!(
+                                        "NOVAROCKS_CATALOG_FAILED execution_id={} process_id={}",
+                                        format_execution_id(execution_id),
+                                        registry.local_process_id,
+                                    );
+                                }
                                 (Some(catalog_load_failed_event(safe_detail)), false)
                             }
                         }

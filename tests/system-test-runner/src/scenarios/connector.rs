@@ -371,6 +371,18 @@ impl Scenario for CatalogReadyLifecycle {
             "NOVAROCKS_SQL_TEST_EMIT_CATALOG_LIFECYCLE_MARKER".to_string(),
             "1".to_string(),
         );
+        config
+            .child_environment
+            .be_by_index
+            .entry(1)
+            .or_default()
+            .insert(
+                "NOVAROCKS_SQL_TEST_CATALOG_INSTALL_FAILURE_FILE".to_string(),
+                scenario_root
+                    .join("catalog-install-failure")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         Ok(config)
     }
 
@@ -433,7 +445,62 @@ impl Scenario for CatalogReadyLifecycle {
 
         control
             .query_drop(format!("DROP CATALOG {CATALOG}"))
-            .context("replace cancelled catalog before cold ready path")?;
+            .context("replace cancelled catalog before injected install failure")?;
+        create_catalog(&mut control, CATALOG, &warehouse)?;
+        let failure_file = context.scenario_root().join("catalog-install-failure");
+        let before_failure = backend_log_snapshots(context)?;
+        std::fs::write(&failure_file, "fail\n").with_context(|| {
+            format!(
+                "create catalog-install failure trigger {}",
+                failure_file.display()
+            )
+        })?;
+        context
+            .action("fail catalog installation on one Backend and reject the query before Stage");
+        let failed_query: Result<Vec<i64>, mysql::Error> =
+            control.query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"));
+        if let Ok(rows) = failed_query {
+            bail!("catalog install failure query unexpectedly succeeded: {rows:?}");
+        }
+        wait_for_catalog_lifecycle_marker_on_backend(
+            context,
+            &before_failure,
+            1,
+            "NOVAROCKS_CATALOG_FAILED",
+            "observe the injected CatalogLoadFailed from BE[1]",
+        )?;
+        assert_no_appended_catalog_stage_admitted(context, &before_failure)?;
+        std::fs::remove_file(&failure_file).with_context(|| {
+            format!(
+                "remove catalog-install failure trigger {}",
+                failure_file.display()
+            )
+        })?;
+        let before_retry = backend_log_snapshots(context)?;
+        context.action("retry the failed catalog version after clearing the one-Backend failure");
+        let rows: Vec<i64> = control
+            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            .context("retry catalog query after clearing injected install failure")?;
+        if rows != [300_000] {
+            bail!("catalog install retry returned {rows:?}, expected [300000]");
+        }
+        wait_for_catalog_lifecycle_marker_on_backend(
+            context,
+            &before_retry,
+            1,
+            "NOVAROCKS_CATALOG_READY",
+            "observe retry CatalogReady from the formerly failing Backend",
+        )?;
+        wait_for_catalog_lifecycle_marker(
+            context,
+            &before_retry,
+            "NOVAROCKS_CATALOG_STAGE_ADMITTED",
+            "observe retry Stage after the failed catalog version becomes Ready",
+        )?;
+
+        control
+            .query_drop(format!("DROP CATALOG {CATALOG}"))
+            .context("replace retried catalog before cold ready path")?;
         create_catalog(&mut control, CATALOG, &warehouse)?;
         let before_cold = backend_log_snapshots(context)?;
         std::fs::write(&hold_file, "hold\n").with_context(|| {
@@ -497,6 +564,33 @@ impl Scenario for CatalogReadyLifecycle {
         }
         let after_warm = backend_log_snapshots(context)?;
         assert_no_new_catalog_lifecycle_markers(&before_warm, &after_warm)?;
+
+        control
+            .query_drop(format!("DROP CATALOG {CATALOG}"))
+            .context("replace warm catalog before InitAck retry coverage")?;
+        create_catalog(&mut control, CATALOG, &warehouse)?;
+        let before_init_retry = backend_log_snapshots(context)?;
+        context
+            .handle()
+            .arm_init_ack_drop(1)
+            .context("arm InitAck drop on BE[1] for cold catalog retry")?;
+        context.action("retry the exact cold Init after an Applied InitAck is dropped");
+        let rows: Vec<i64> = control
+            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            .context("execute cold catalog query with dropped InitAck")?;
+        context
+            .handle()
+            .clear_query_lifecycle_faults()
+            .context("clear catalog InitAck drop fault")?;
+        if rows != [300_000] {
+            bail!("InitAck retry catalog query returned {rows:?}, expected [300000]");
+        }
+        let after_init_retry = backend_log_snapshots(context)?;
+        assert_exactly_one_new_catalog_marker_per_backend(
+            &before_init_retry,
+            &after_init_retry,
+            "NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED",
+        )?;
         await_resource_convergence(context, &baseline, "catalog ready lifecycle")?;
         Ok(())
     }
@@ -1383,6 +1477,24 @@ fn wait_for_catalog_lifecycle_marker(
     })
 }
 
+fn wait_for_catalog_lifecycle_marker_on_backend(
+    context: &mut ScenarioContext,
+    before: &[String],
+    backend: usize,
+    marker: &str,
+    operation: &str,
+) -> Result<()> {
+    let previous = before
+        .get(backend)
+        .with_context(|| format!("missing BE[{backend}] log snapshot"))?;
+    wait_for_backend_logs(context, operation, |logs| {
+        logs.get(backend)
+            .and_then(|log| log.get(previous.len()..))
+            .is_some_and(|appended| appended.contains(marker))
+    })
+    .map(|_| ())
+}
+
 fn assert_no_appended_catalog_stage_admitted(
     context: &mut ScenarioContext,
     before: &[String],
@@ -1413,6 +1525,23 @@ fn assert_no_new_catalog_marker(before: &[String], after: &[String], marker: &st
         })?;
         if appended.contains(marker) {
             bail!("BE[{index}] emitted unexpected catalog lifecycle marker {marker}");
+        }
+    }
+    Ok(())
+}
+
+fn assert_exactly_one_new_catalog_marker_per_backend(
+    before: &[String],
+    after: &[String],
+    marker: &str,
+) -> Result<()> {
+    for (index, (previous, current)) in before.iter().zip(after).enumerate() {
+        let appended = current.get(previous.len()..).with_context(|| {
+            format!("BE[{index}] log was truncated while counting marker {marker}")
+        })?;
+        let count = appended.matches(marker).count();
+        if count != 1 {
+            bail!("BE[{index}] emitted {count} new {marker} markers, expected exactly one");
         }
     }
     Ok(())
