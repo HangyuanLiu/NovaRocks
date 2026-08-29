@@ -51,7 +51,7 @@ use novarocks_frontend::{
 use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
 use novarocks_spi::connector::{
     ConnectorControlFactory, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionInstaller, ConnectorExecutionProviderKind, ConnectorRequestContext,
+    ConnectorExecutionInstaller, ConnectorProviderBindingKind, ConnectorRequestContext,
     ConnectorTableMetadata, MvCreatedTargetObservation, MvLakeDescriptorProjection,
     MvLakePackageObservation, MvLakePublicationObservation, MvLakeTargetSnapshotObservation,
     MvMaintenanceMetadataObservation, MvObservedField, MvObservedMaintenancePolicy,
@@ -382,7 +382,7 @@ pub fn compose_backend_execution_installers(
         vec![std::sync::Arc::new(IcebergConnectorInstaller::new(
             iceberg_resources,
         ))];
-    let expected = ConnectorExecutionProviderKind::Iceberg;
+    let expected = ConnectorProviderBindingKind::Iceberg;
     let mut installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
         vec![std::sync::Arc::new(StarRocksExecutionInstaller::new())];
     for installer in &iceberg_installers {
@@ -765,7 +765,7 @@ pub fn compose_backend_read_execution_bundle_factories(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<
     Vec<(
-        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        novarocks_spi::connector::ConnectorProviderBindingKind,
         std::sync::Arc<dyn novarocks_backend::ConnectorReadExecutionBundleFactory>,
     )>,
 > {
@@ -779,7 +779,7 @@ pub fn compose_backend_read_execution_bundle_factories(
         ),
     );
     Ok(vec![(
-        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg,
+        novarocks_spi::connector::ConnectorProviderBindingKind::Iceberg,
         factory,
     )])
 }
@@ -792,7 +792,7 @@ pub fn compose_backend_write_execution_bundle_factories(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<
     Vec<(
-        novarocks_spi::connector::ConnectorExecutionProviderKind,
+        novarocks_spi::connector::ConnectorProviderBindingKind,
         std::sync::Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
     )>,
 > {
@@ -804,7 +804,7 @@ pub fn compose_backend_write_execution_bundle_factories(
         ),
     );
     Ok(vec![(
-        novarocks_spi::connector::ConnectorExecutionProviderKind::Iceberg,
+        novarocks_spi::connector::ConnectorProviderBindingKind::Iceberg,
         factory,
     )])
 }
@@ -877,7 +877,7 @@ mod tests {
         IcebergStorageLakeTargetSnapshotObservation, compose_backend_execution_installers,
         compose_frontend_control_factories, mv_lake_target_snapshot_observation,
     };
-    use novarocks_spi::connector::ConnectorExecutionProviderKind;
+    use novarocks_spi::connector::ConnectorProviderBindingKind;
 
     #[test]
     fn lake_target_snapshot_adapter_preserves_provider_metadata() {
@@ -917,7 +917,7 @@ mod tests {
             installers
                 .iter()
                 .filter(|installer| installer.provider_kind()
-                    == ConnectorExecutionProviderKind::Iceberg)
+                    == ConnectorProviderBindingKind::Iceberg)
                 .count(),
             1
         );

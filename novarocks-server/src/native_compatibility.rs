@@ -19,7 +19,7 @@
 //! Server-owned static manifest for the Native compatibility contract.
 
 use anyhow::Context;
-use novarocks_spi::connector::ConnectorExecutionProviderKind;
+use novarocks_spi::connector::ConnectorProviderBindingKind;
 use novarocks_version::{
     NativeCarrierDeclaration, NativeCompatibilityMaterial,
     derive_repository_native_compatibility_material,
@@ -55,7 +55,7 @@ pub fn resolve_native_compatibility_material() -> anyhow::Result<NativeCompatibi
 fn validate_declared_provider_kinds(
     declarations: &[NativeCarrierDeclaration],
 ) -> anyhow::Result<()> {
-    let expected = ConnectorExecutionProviderKind::ALL
+    let expected = ConnectorProviderBindingKind::ALL
         .map(|kind| kind.provider_id())
         .to_vec();
     let actual = declarations
@@ -64,7 +64,7 @@ fn validate_declared_provider_kinds(
         .collect::<Vec<_>>();
     if actual != expected {
         anyhow::bail!(
-            "server native carrier manifest does not match ConnectorExecutionProviderKind::ALL: actual={actual:?}, expected={expected:?}"
+            "server native carrier manifest does not match ConnectorProviderBindingKind::ALL: actual={actual:?}, expected={expected:?}"
         );
     }
     Ok(())
@@ -74,7 +74,7 @@ fn validate_declared_provider_kinds(
 mod tests {
     use super::{native_carrier_declarations, resolve_native_compatibility_material};
     use crate::composition::compose_backend_execution_installers;
-    use novarocks_spi::connector::ConnectorExecutionProviderKind;
+    use novarocks_spi::connector::ConnectorProviderBindingKind;
 
     #[test]
     fn static_manifest_matches_the_closed_provider_enum_and_backend_installers() {
@@ -83,7 +83,7 @@ mod tests {
             .iter()
             .map(|declaration| declaration.provider_id())
             .collect::<Vec<_>>();
-        let expected = ConnectorExecutionProviderKind::ALL
+        let expected = ConnectorProviderBindingKind::ALL
             .map(|kind| kind.provider_id())
             .to_vec();
         assert_eq!(declared, expected);
@@ -105,7 +105,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             installer_kinds,
-            ConnectorExecutionProviderKind::ALL.into_iter().collect()
+            ConnectorProviderBindingKind::ALL.into_iter().collect()
         );
     }
 
