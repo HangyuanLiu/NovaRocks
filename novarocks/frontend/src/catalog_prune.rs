@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use novarocks_proto_codec::catalog::PruneCatalogsRequest;
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
 use crate::catalog_application::FrontendCatalogApplicationPort;
@@ -50,6 +51,7 @@ pub(crate) struct FrontendCatalogPruneService {
     data_runtime: FrontendDataRuntime,
     config: CatalogPruneConfig,
     stopping: AtomicBool,
+    wake: Notify,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
@@ -66,6 +68,7 @@ impl FrontendCatalogPruneService {
             data_runtime,
             config,
             stopping: AtomicBool::new(false),
+            wake: Notify::new(),
             worker: Mutex::new(None),
         })
     }
@@ -88,6 +91,7 @@ impl FrontendCatalogPruneService {
 
     pub(crate) async fn shutdown(&self, timeout: Duration) {
         self.stopping.store(true, Ordering::Release);
+        self.wake.notify_one();
         let handle = self.worker.lock().ok().and_then(|mut worker| worker.take());
         if let Some(mut handle) = handle {
             if tokio::time::timeout(timeout, &mut handle).await.is_err() {
@@ -100,7 +104,10 @@ impl FrontendCatalogPruneService {
     async fn run(&self) {
         while !self.stopping.load(Ordering::Acquire) {
             self.dispatch_once().await;
-            tokio::time::sleep(self.config.interval).await;
+            tokio::select! {
+                () = tokio::time::sleep(self.config.interval) => {}
+                () = self.wake.notified() => {}
+            }
         }
     }
 
