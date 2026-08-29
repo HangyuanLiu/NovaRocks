@@ -1194,11 +1194,7 @@ fn profiler_for_native_fragment(root_plan_node_id: i32) -> Profiler {
 fn test_lifecycle_registry(controls: Arc<FragmentControlRegistry>) -> Arc<QueryLifecycleRegistry> {
     QueryLifecycleRegistry::new_with_process_id(
         novarocks_types::BackendProcessId::new_v7(),
-        Arc::new(
-            crate::query_lifecycle::NativeQueryLifecycleLocalRuntime::new(
-                controls,
-            ),
-        ),
+        Arc::new(crate::query_lifecycle::NativeQueryLifecycleLocalRuntime::new(controls)),
         crate::query_lifecycle::QueryLifecycleRegistryConfig::new(
             4_096,
             16_384,

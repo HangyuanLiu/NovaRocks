@@ -237,8 +237,10 @@ fn node_to_proto(node: &INode) -> plan::DistributedNode {
         nullable_tuple_ids: vec![],
         limit: -1,
         runtime_filter_binding_ids: match &node.payload {
-            IPayload::HashJoin { runtime_filter_id } => vec![u32::try_from(*runtime_filter_id)
-                .expect("runtime-filter fixture id must fit a binding id")],
+            IPayload::HashJoin { runtime_filter_id } => vec![
+                u32::try_from(*runtime_filter_id)
+                    .expect("runtime-filter fixture id must fit a binding id"),
+            ],
             _ => Vec::new(),
         },
         children: node.children.iter().map(node_to_proto).collect(),

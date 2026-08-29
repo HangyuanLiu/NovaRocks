@@ -916,8 +916,9 @@ mod tests {
         assert_eq!(
             installers
                 .iter()
-                .filter(|installer| installer.provider_kind()
-                    == ConnectorProviderBindingKind::Iceberg)
+                .filter(
+                    |installer| installer.provider_kind() == ConnectorProviderBindingKind::Iceberg
+                )
                 .count(),
             1
         );
