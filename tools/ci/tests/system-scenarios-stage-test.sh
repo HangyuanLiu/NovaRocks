@@ -86,9 +86,18 @@ reset_stage() {
   unset FAKE_RUNNER_LIST_FAILS FAKE_RUNNER_FAIL_ON FAKE_RUNNER_SCENARIOS
 }
 
+primary_binary="$tmpdir/novarocks"
+compatible_binary="$tmpdir/novarocks-compatible"
+other_island_binary="$tmpdir/novarocks-other-island"
+printf 'primary\n' >"$primary_binary"
+printf 'compatible\n' >"$compatible_binary"
+printf 'other-island\n' >"$other_island_binary"
+chmod +x "$primary_binary" "$compatible_binary" "$other_island_binary"
+
 # --- 1. every registered scenario runs, in registry order, one --only each ----
 reset_stage
-if ! ci_run_system_scenarios "$fake_runner" /bin/true "$tmpdir/base.toml" \
+if ! ci_run_system_scenarios "$fake_runner" "$primary_binary" \
+  "$compatible_binary" "$other_island_binary" "$tmpdir/base.toml" \
   "$tmpdir/artifacts" 3 300; then
   fail "all-pass run should succeed"
 fi
@@ -112,6 +121,10 @@ grep -q -- "--cluster-size 3" "$CI_RUN_DIR/system/alpha-one.log" ||
   fail "cluster size must reach the runner"
 grep -q -- "--artifact-root" "$CI_RUN_DIR/system/alpha-one.log" ||
   fail "per-scenario artifact root must reach the runner"
+grep -q -- "--compatible-binary $compatible_binary" "$CI_RUN_DIR/system/alpha-one.log" ||
+  fail "compatible binary must reach every scenario invocation"
+grep -q -- "--other-island-binary $other_island_binary" "$CI_RUN_DIR/system/alpha-one.log" ||
+  fail "other-island binary must reach every scenario invocation"
 [ -d "$tmpdir/artifacts/beta-two" ] ||
   fail "each scenario needs its own artifact directory"
 
@@ -127,7 +140,8 @@ grep -q "| beta/three | PASS |" "$CI_SUMMARY" ||
 # --- 4. first failure stops the stage; later scenarios are not faked green ---
 reset_stage
 export FAKE_RUNNER_FAIL_ON="beta/two"
-if ci_run_system_scenarios "$fake_runner" /bin/true "$tmpdir/base.toml" \
+if ci_run_system_scenarios "$fake_runner" "$primary_binary" \
+  "$compatible_binary" "$other_island_binary" "$tmpdir/base.toml" \
   "$tmpdir/artifacts" 3 300; then
   fail "a failing scenario must fail the stage"
 fi
@@ -151,14 +165,16 @@ esac
 # --- 5. a broken or empty registry fails loudly ------------------------------
 reset_stage
 export FAKE_RUNNER_LIST_FAILS=1
-if ci_run_system_scenarios "$fake_runner" /bin/true "$tmpdir/base.toml" \
+if ci_run_system_scenarios "$fake_runner" "$primary_binary" \
+  "$compatible_binary" "$other_island_binary" "$tmpdir/base.toml" \
   "$tmpdir/artifacts" 3 300; then
   fail "scenario discovery failure must fail the stage"
 fi
 
 reset_stage
 export FAKE_RUNNER_SCENARIOS=""
-if ci_run_system_scenarios "$fake_runner" /bin/true "$tmpdir/base.toml" \
+if ci_run_system_scenarios "$fake_runner" "$primary_binary" \
+  "$compatible_binary" "$other_island_binary" "$tmpdir/base.toml" \
   "$tmpdir/artifacts" 3 300; then
   fail "an empty registry must fail the stage rather than silently pass"
 fi
@@ -169,5 +185,53 @@ ci_record_system_scenario "alpha/one" "SKIP" "0" "" "-"
 ci_render_summary "PASS"
 grep -q "| alpha/one | SKIP |" "$CI_SUMMARY" ||
   fail "an explicitly skipped scenario must appear as SKIP in the summary"
+
+# --- 7. fixture builds are explicit and always restore the primary binary ---
+fake_bin="$tmpdir/bin"
+mkdir -p "$fake_bin"
+cat >"$fake_bin/cargo" <<'CARGO'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s|%s\n' "$NOVAROCKS_NATIVE_BUILD_IDENTITY" "$*" >>"$FAKE_CARGO_CALLS"
+printf '%s\n' "$NOVAROCKS_NATIVE_BUILD_IDENTITY" >"$FAKE_CARGO_BINARY"
+if [[ "$*" = *"native-compatibility-test-fixture"* ]] && [ -n "${FAKE_CARGO_FAIL_OTHER:-}" ]; then
+  exit 7
+fi
+CARGO
+chmod +x "$fake_bin/cargo"
+
+fixture_binary="$tmpdir/fixture-target/novarocks"
+fixture_root="$tmpdir/fixtures"
+fixture_log="$tmpdir/fixture-build.log"
+mkdir -p "$(dirname "$fixture_binary")"
+printf 'primary-fixture\n' >"$fixture_binary"
+chmod +x "$fixture_binary"
+export FAKE_CARGO_BINARY="$fixture_binary"
+export FAKE_CARGO_CALLS="$tmpdir/cargo-calls"
+: >"$FAKE_CARGO_CALLS"
+
+PATH="$fake_bin:$PATH" ci_prepare_system_scenario_binaries \
+  "$fixture_binary" dev-opt "$fixture_root" deadbeef1234 "$fixture_log" ||
+  fail "fixture preparation should succeed"
+[ "$(cat "$fixture_binary")" = "primary-fixture" ] ||
+  fail "fixture preparation must restore the primary binary"
+[ "$(cat "$SYSTEM_SCENARIO_PRIMARY_BINARY")" = "primary-fixture" ] ||
+  fail "fixture preparation must retain the primary binary"
+[ "$(cat "$SYSTEM_SCENARIO_COMPATIBLE_BINARY")" = "ci-compatible-deadbeef1234" ] ||
+  fail "compatible fixture needs a distinct build identity"
+[ "$(cat "$SYSTEM_SCENARIO_OTHER_ISLAND_BINARY")" = "ci-other-island-deadbeef1234" ] ||
+  fail "other-island fixture needs its explicit compatibility epoch build"
+grep -q -- "--features native-compatibility-test-fixture" "$FAKE_CARGO_CALLS" ||
+  fail "other-island fixture must enable the compatibility test feature"
+
+printf 'primary-after-failure\n' >"$fixture_binary"
+export FAKE_CARGO_FAIL_OTHER=1
+if PATH="$fake_bin:$PATH" ci_prepare_system_scenario_binaries \
+  "$fixture_binary" dev-opt "$fixture_root" deadbeef1234 "$fixture_log"; then
+  fail "a failed other-island fixture build must fail preparation"
+fi
+[ "$(cat "$fixture_binary")" = "primary-after-failure" ] ||
+  fail "a failed fixture build must still restore the primary binary"
+unset FAKE_CARGO_FAIL_OTHER
 
 echo "PASS: system scenario stage behaviour"
