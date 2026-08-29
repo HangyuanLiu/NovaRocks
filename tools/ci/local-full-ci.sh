@@ -424,6 +424,8 @@ run_cargo_gates() {
     tools/ci/check-legacy-branding.sh
   run_fail_fast_stage "legacy branding tests" "legacy-branding-test.log" \
     tools/ci/tests/legacy-branding-test.sh
+  run_fail_fast_stage "system scenario stage tests" "system-scenarios-stage-test.log" \
+    tools/ci/tests/system-scenarios-stage-test.sh
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
   # `--workspace` is load-bearing. Without it Cargo falls back to
   # `default-members = ["novarocks-server"]`, so the lint/build/test gates
@@ -459,6 +461,41 @@ run_cargo_gates() {
     --profile "$NOVA_CI_CARGO_PROFILE" -- --test-threads=1
 }
 
+run_system_scenario_fixture_stage() {
+  if [ "$SKIP_SYSTEM_SCENARIOS" = "true" ]; then
+    ci_record_stage "system scenario fixtures" "SKIP" "0" ""
+    ci_render_summary "RUNNING"
+    return 0
+  fi
+
+  local binary="target/$NOVA_CI_CARGO_PROFILE/novarocks"
+  local fixture_root="$CI_RUN_DIR/system/fixtures"
+  local log_path="$CI_RUN_DIR/system-scenario-fixtures.log"
+  local start
+  local code
+  local duration
+
+  start="$(ci_epoch)"
+  ci_prepare_system_scenario_binaries \
+    "$binary" \
+    "$NOVA_CI_CARGO_PROFILE" \
+    "$fixture_root" \
+    "${CI_COMMIT_SHA:0:12}" \
+    "$log_path"
+  code=$?
+  duration=$(($(ci_epoch) - start))
+
+  if [ "$code" -ne 0 ]; then
+    ci_record_stage "system scenario fixtures" "FAIL" "$duration" "$log_path"
+    ci_mark_failure_tail "system scenario fixture build failed" "$log_path"
+    ci_render_summary "FAIL"
+    exit "$code"
+  fi
+
+  ci_record_stage "system scenario fixtures" "PASS" "$duration" "$log_path"
+  ci_render_summary "RUNNING"
+}
+
 run_system_scenarios_stage() {
   if [ "$SKIP_SYSTEM_SCENARIOS" = "true" ]; then
     ci_record_stage "system scenarios" "SKIP" "0" ""
@@ -468,24 +505,29 @@ run_system_scenarios_stage() {
   fi
 
   local runner="target/$NOVA_CI_CARGO_PROFILE/novarocks-system-tests"
-  local binary="target/$NOVA_CI_CARGO_PROFILE/novarocks"
   local start
   local code
   local duration
 
-  # The workspace build above already produced both binaries; failing loudly
-  # here beats silently skipping the production-topology layer.
-  if [ ! -x "$runner" ] || [ ! -x "$binary" ]; then
+  # The workspace build and fixture stage above produced every binary required
+  # by the registry. Failing loudly here beats silently skipping the
+  # production-topology layer.
+  if [ ! -x "$runner" ] || \
+    [ ! -x "$SYSTEM_SCENARIO_PRIMARY_BINARY" ] || \
+    [ ! -x "$SYSTEM_SCENARIO_COMPATIBLE_BINARY" ] || \
+    [ ! -x "$SYSTEM_SCENARIO_OTHER_ISLAND_BINARY" ]; then
     ci_record_stage "system scenarios" "FAIL" "0" ""
     ci_render_summary "FAIL"
-    echo "error: system scenario stage needs $runner and $binary" >&2
+    echo "error: system scenario stage needs its runner and all binary fixtures" >&2
     exit 1
   fi
 
   start="$(ci_epoch)"
   ci_run_system_scenarios \
     "$runner" \
-    "$binary" \
+    "$SYSTEM_SCENARIO_PRIMARY_BINARY" \
+    "$SYSTEM_SCENARIO_COMPATIBLE_BINARY" \
+    "$SYSTEM_SCENARIO_OTHER_ISLAND_BINARY" \
     "$SYSTEM_SCENARIO_BASE_CONFIG" \
     "$CI_RUN_DIR/system/artifacts" \
     "$SYSTEM_SCENARIO_CLUSTER_SIZE" \
@@ -1145,6 +1187,7 @@ main() {
   # restart, fault or cleanup break surfaces before the much longer SQL tier.
   # The stage needs no Docker fixture: every registered scenario builds its
   # Iceberg warehouse on the local filesystem.
+  run_system_scenario_fixture_stage
   run_system_scenarios_stage
   reset_frontend_state_store_stage
   if [ "$SQL_CLUSTER_MODE" = "all-in-one" ]; then
