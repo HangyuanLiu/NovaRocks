@@ -305,6 +305,36 @@ fn protocol_event_control_ready() -> protocol_lifecycle::QueryControlEvent {
     ))
 }
 
+fn protocol_event_control_ready_loading() -> protocol_lifecycle::QueryControlEvent {
+    protocol_event(proto::query_control_response::Event::ControlReady(
+        proto::QueryControlReady {
+            catalog_load_state: Some(catalog::CatalogLoadState {
+                state: Some(catalog::catalog_load_state::State::Loading(
+                    catalog::CatalogLoading {},
+                )),
+            }),
+        },
+    ))
+}
+
+fn protocol_event_catalog_ready() -> protocol_lifecycle::QueryControlEvent {
+    protocol_event(proto::query_control_response::Event::CatalogReady(
+        catalog::CatalogReady {},
+    ))
+}
+
+fn protocol_event_catalog_load_failed(
+    safe_detail: impl Into<String>,
+) -> protocol_lifecycle::QueryControlEvent {
+    protocol_event(proto::query_control_response::Event::CatalogLoadFailed(
+        catalog::CatalogLoadFailed {
+            reason: catalog::CatalogLoadFailureReason::InstallFailed as i32,
+            safe_detail: safe_detail.into(),
+            safe_field_path: None,
+        },
+    ))
+}
+
 fn protocol_event_local_drained() -> protocol_lifecycle::QueryControlEvent {
     protocol_event(proto::query_control_response::Event::LocalDrained(
         proto::QueryControlLocalDrained {},
@@ -1422,6 +1452,84 @@ fn query_control_barrier_initializes_every_participant() {
     assert_eq!(sorted(transport.attach_targets()), vec![0, 1, 2]);
     assert_eq!(transport.init_calls().len(), 3);
     lease.finalize().expect("finalize lifecycle fixture");
+}
+
+#[test]
+fn catalog_loading_control_ready_waits_for_in_stream_catalog_ready_before_freezing() {
+    let plan = query_init_plan(None);
+    let (transport, sessions) = RecordingTransport::ready(&plan);
+    for session in sessions.values() {
+        session
+            .state
+            .0
+            .lock()
+            .expect("recording session lock")
+            .events = VecDeque::from([
+            Ok(protocol_event_control_ready_loading()),
+            Ok(protocol_event_catalog_ready()),
+            Ok(protocol_event_local_drained()),
+        ]);
+    }
+    let (registry, _query) = registry_for(&plan);
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config());
+
+    barrier
+        .initialize_all(plan)
+        .expect("every Loading ControlReady must wait for its CatalogReady completion")
+        .finalize()
+        .expect("catalog-ready participants form the finalized admitted lifecycle");
+
+    assert_eq!(sorted(transport.attach_targets()), vec![0, 1, 2]);
+    for session in sessions.values() {
+        assert!(
+            session
+                .commands()
+                .iter()
+                .any(|command| matches!(command, QueryControlCommand::Finalize)),
+            "a lease can finalize only after every Loading participant becomes CatalogReady"
+        );
+    }
+}
+
+#[test]
+fn catalog_load_failed_before_ready_aborts_without_freezing_an_admitted_lifecycle() {
+    let plan = query_init_plan(None);
+    let (transport, sessions) = RecordingTransport::ready(&plan);
+    sessions
+        .get(&1)
+        .expect("fixture session")
+        .state
+        .0
+        .lock()
+        .expect("recording session lock")
+        .events = VecDeque::from([
+        Ok(protocol_event_control_ready_loading()),
+        Ok(protocol_event_catalog_load_failed("catalog install failed")),
+    ]);
+    let (registry, _query) = registry_for(&plan);
+    let barrier =
+        FrontendQueryLifecycleBarrier::new(Arc::new(transport.clone()), registry, config());
+
+    let error = match barrier.initialize_all(plan) {
+        Ok(_) => panic!("CatalogLoadFailed must reject the query lifecycle before admission"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error.message().contains("catalog load failure"),
+        "unexpected lifecycle error: {error}"
+    );
+    assert_eq!(sorted(transport.abort_targets()), vec![0, 1, 2]);
+    for session in sessions.values() {
+        let commands = session.commands();
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, QueryControlCommand::Finalize)),
+            "CatalogLoadFailed must not leave a finalized admitted lifecycle: {commands:?}"
+        );
+    }
 }
 
 #[test]

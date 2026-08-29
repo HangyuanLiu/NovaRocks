@@ -65,6 +65,14 @@ pub fn debug_emit_connector_reader_marker() -> bool {
     debug_env_flag("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER")
 }
 
+/// Returns whether catalog runtime materialization emits a test-only marker.
+///
+/// The marker carries only the immutable catalog handle and is compiled out of
+/// release builds, so it cannot expose configuration material in production.
+pub fn debug_emit_catalog_materialization_marker() -> bool {
+    debug_env_flag("NOVAROCKS_SQL_TEST_EMIT_CATALOG_MATERIALIZATION_MARKER")
+}
+
 pub(crate) fn sql_test_fragment_failure_harness_enabled() -> bool {
     std::env::var_os("NOVAROCKS_SQL_TEST_FRAGMENT_FAILURE_TRIGGER_FILE").is_some()
 }

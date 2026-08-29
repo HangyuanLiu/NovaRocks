@@ -201,6 +201,12 @@ impl CatalogRuntimeMaterializerSet {
                 "catalog runtime materializer returned an incompatible runtime",
             ));
         }
+        if crate::config::debug_emit_catalog_materialization_marker() {
+            println!(
+                "NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED catalog={:?}",
+                properties.handle()
+            );
+        }
         let read_execution = self
             .read_bundle_factories
             .get(&properties.provider_kind())

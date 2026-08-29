@@ -21,6 +21,8 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(DistributedReaderCancel),
         Box::new(DistributedReaderKillConnection),
+        Box::new(CatalogFeRestartCache),
+        Box::new(CatalogReadWriteRuntime),
         Box::new(CatalogVersionDrain),
         Box::new(PredicatePageIndexPruning),
         Box::new(TypedReadData),
@@ -348,6 +350,226 @@ impl Scenario for DistributedReaderKillConnection {
 
 struct CatalogVersionDrain;
 
+/// Exercises distributed writes and reads through one exact catalog runtime,
+/// then proves a replacement Backend can rebuild that runtime from the frozen
+/// catalog properties.
+struct CatalogReadWriteRuntime;
+
+impl Scenario for CatalogReadWriteRuntime {
+    fn name(&self) -> &'static str {
+        "connector/catalog-read-write-runtime"
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        Ok(connector_launch_config())
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect catalog read-write control session")?,
+        )?;
+
+        const CATALOG: &str = "catalog_read_write_runtime";
+        const DATABASE: &str = "catalog_read_write_db";
+        const TABLE: &str = "catalog_read_write_data";
+        let warehouse = create_warehouse(context, "catalog-read-write-runtime")?;
+        create_catalog(&mut control, CATALOG, &warehouse)?;
+        control
+            .query_drop(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
+            .context("create catalog read-write database")?;
+        control
+            .query_drop(format!(
+                "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT)"
+            ))
+            .context("create catalog read-write table")?;
+
+        context.action("write and read through the catalog runtime on every Backend");
+        for range in ["1, 1000", "1001, 2000", "2001, 3000"] {
+            control
+                .query_drop(format!(
+                    "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"
+                ))
+                .with_context(|| format!("distributed insert range {range} through catalog writer runtime"))?;
+        }
+        assert_catalog_read_summary(&mut control, CATALOG, DATABASE, TABLE, 3_000, 4_501_500)?;
+        let before_restart_logs = wait_for_open_reader_on_every_backend(
+            context,
+            CATALOG,
+            "observe catalog readers after distributed write",
+        )?;
+        let before_restart_versions = reader_catalog_versions(&before_restart_logs, CATALOG)?;
+        let before_restart_materializations = catalog_materialization_counts(&before_restart_logs);
+
+        context
+            .action("replace one Backend and rebuild its catalog runtime from CatalogProperties");
+        let original_process = context.handle().backend_process_id(0)?;
+        let deadline = context.deadline();
+        context
+            .handle()
+            .restart_be_until(0, deadline)
+            .context("restart BE[0] for catalog runtime reconstruction")?;
+        let replacement_process = context.handle().backend_process_id(0)?;
+        if replacement_process == original_process {
+            bail!("replacement BE[0] retained its previous process identity");
+        }
+
+        control
+            .query_drop(format!(
+                "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} VALUES (1001)"
+            ))
+            .context("distributed insert after BE replacement")?;
+        assert_catalog_read_summary(&mut control, CATALOG, DATABASE, TABLE, 3_001, 4_502_501)?;
+        let after_restart_logs = wait_for_backend_logs(
+            context,
+            "observe rebuilt catalog runtime after BE replacement",
+            |logs| {
+                let counts = catalog_materialization_counts(logs);
+                counts[0] > 0
+                    && counts[1] == before_restart_materializations[1]
+                    && counts[2] == before_restart_materializations[2]
+            },
+        )?;
+        let after_restart_versions = reader_catalog_versions(&after_restart_logs, CATALOG)?;
+        if after_restart_versions != before_restart_versions {
+            bail!(
+                "BE replacement changed catalog versions: before={before_restart_versions:?}, after={after_restart_versions:?}"
+            );
+        }
+
+        await_resource_convergence(context, &baseline, "catalog read-write runtime")?;
+        Ok(())
+    }
+}
+
+/// Proves a Frontend restart reconstructs its durable catalog projection
+/// without invalidating catalog runtimes retained by the live Backends.
+struct CatalogFeRestartCache;
+
+impl Scenario for CatalogFeRestartCache {
+    fn name(&self) -> &'static str {
+        "connector/catalog-fe-restart-cache"
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        Ok(connector_launch_config())
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect FE restart cache control session")?,
+        )?;
+
+        const CATALOG: &str = "catalog_fe_restart_cache";
+        const DATABASE: &str = "catalog_fe_restart_db";
+        const TABLE: &str = "catalog_fe_restart_data";
+        let warehouse = create_warehouse(context, "catalog-fe-restart-cache")?;
+        create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
+
+        context.action("warm the exact catalog runtime on every Backend");
+        let warm_rows: Vec<i64> = control
+            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            .context("warm catalog runtime before FE restart")?;
+        if warm_rows != [300_000] {
+            bail!("warm catalog read returned {warm_rows:?}, expected [300000]");
+        }
+        let warm_logs = wait_for_open_reader_on_every_backend(
+            context,
+            CATALOG,
+            "observe warm catalog readers on every Backend",
+        )?;
+        let warm_versions = reader_catalog_versions(&warm_logs, CATALOG)?;
+        let materializations_before = catalog_materialization_counts(&warm_logs);
+
+        context.action("start an in-flight query before the Frontend restart");
+        let target = start_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
+        target
+            .ready
+            .recv_timeout(context.remaining("receive in-flight reader connection id")?)
+            .context("in-flight reader terminated before FE restart")?;
+        wait_for_open_reader_on_every_backend(
+            context,
+            CATALOG,
+            "observe in-flight readers before FE restart",
+        )?;
+
+        context.action("restart the Frontend and require its in-flight client query to fail");
+        let deadline = context.deadline();
+        context
+            .handle()
+            .restart_fe_until(deadline)
+            .context("restart FE while catalog reader is in flight")?;
+        assert_connection_killed_query(
+            &target.done,
+            context.remaining("await in-flight query failure after FE restart")?,
+        )?;
+        assert_target_connection_is_closed(
+            &target,
+            context.remaining("verify FE restart closed in-flight client connection")?,
+        )?;
+        release_connector_read(&target)?;
+        target
+            .thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("FE restart reader thread panicked"))??;
+
+        context.action("read through the restored Frontend catalog projection");
+        let mut restored = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect restored FE catalog control session")?,
+        )?;
+        let restored_rows: Vec<i64> = restored
+            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            .context("read catalog after FE restart")?;
+        if restored_rows != [300_000] {
+            bail!("restored catalog read returned {restored_rows:?}, expected [300000]");
+        }
+        let restored_logs = wait_for_backend_logs(
+            context,
+            "observe post-restart readers on every Backend",
+            |logs| {
+                logs.iter().zip(&warm_logs).all(|(current, previous)| {
+                    reader_open_lines(current, CATALOG).count()
+                        > reader_open_lines(previous, CATALOG).count()
+                })
+            },
+        )?;
+        let restored_versions = reader_catalog_versions_after(&restored_logs, &warm_logs, CATALOG)?;
+        if restored_versions != warm_versions {
+            bail!(
+                "FE restart changed retained catalog versions: before={warm_versions:?}, after={restored_versions:?}"
+            );
+        }
+        let materializations_after = catalog_materialization_counts(&restored_logs);
+        if materializations_after != materializations_before {
+            bail!(
+                "FE restart rematerialized retained catalog runtimes: before={materializations_before:?}, after={materializations_after:?}"
+            );
+        }
+
+        await_resource_convergence(context, &baseline, "FE restart catalog cache")?;
+        Ok(())
+    }
+}
+
 struct PredicatePageIndexPruning;
 
 impl Scenario for PredicatePageIndexPruning {
@@ -557,6 +779,10 @@ fn connector_reader_environment() -> CrossProcessChildEnvironment {
         "1".to_string(),
     );
     environment.be.insert(
+        "NOVAROCKS_SQL_TEST_EMIT_CATALOG_MATERIALIZATION_MARKER".to_string(),
+        "1".to_string(),
+    );
+    environment.be.insert(
         "NOVAROCKS_SQL_TEST_EMIT_CANCEL_MARKER".to_string(),
         "1".to_string(),
     );
@@ -692,6 +918,27 @@ fn create_catalog(
             "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{warehouse}\")"
         ))
         .with_context(|| format!("create Hadoop Iceberg catalog {catalog}"))
+}
+
+fn assert_catalog_read_summary(
+    control: &mut mysql::Conn,
+    catalog: &str,
+    database: &str,
+    table: &str,
+    expected_count: i64,
+    expected_sum: i64,
+) -> Result<()> {
+    let rows: Vec<(i64, i64)> = control
+        .query(format!(
+            "SELECT count(*), sum(v) FROM {catalog}.{database}.{table}"
+        ))
+        .context("read catalog table after distributed write")?;
+    if rows != [(expected_count, expected_sum)] {
+        bail!(
+            "catalog read-write summary returned {rows:?}, expected [({expected_count}, {expected_sum})]"
+        );
+    }
+    Ok(())
 }
 
 fn assert_positive_profile_counter(profile: &str, name: &str) -> Result<()> {
@@ -1001,6 +1248,30 @@ fn reader_catalog_versions(logs: &[String], catalog: &str) -> Result<Vec<String>
         .collect()
 }
 
+fn reader_catalog_versions_after(
+    logs: &[String],
+    previous_logs: &[String],
+    catalog: &str,
+) -> Result<Vec<String>> {
+    logs.iter()
+        .zip(previous_logs)
+        .enumerate()
+        .map(|(index, (log, previous))| {
+            let appended = log.get(previous.len()..).with_context(|| {
+                format!("BE[{index}] log was truncated while checking FE restart catalog version")
+            })?;
+            reader_open_lines(appended, catalog)
+                .find_map(reader_catalog_version)
+                .map(ToOwned::to_owned)
+                .with_context(|| {
+                    format!(
+                        "BE[{index}] post-restart reader marker did not include catalog version"
+                    )
+                })
+        })
+        .collect()
+}
+
 fn reader_open_lines<'a>(log: &'a str, catalog: &str) -> impl Iterator<Item = &'a str> {
     log.lines().filter(move |line| {
         line.contains(CONNECTOR_READER_OPEN)
@@ -1019,6 +1290,15 @@ fn reader_counts(log: &str) -> (usize, usize) {
         log.match_indices(CONNECTOR_READER_OPEN).count(),
         log.match_indices(CONNECTOR_READER_CLOSE).count(),
     )
+}
+
+fn catalog_materialization_counts(logs: &[String]) -> Vec<usize> {
+    logs.iter()
+        .map(|log| {
+            log.matches("NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED")
+                .count()
+        })
+        .collect()
 }
 
 fn reader_counts_for_catalog_version(log: &str, catalog: &str, version: &str) -> (usize, usize) {
