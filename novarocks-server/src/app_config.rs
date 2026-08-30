@@ -18,12 +18,18 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer};
 use std::path::{Path, PathBuf};
 
+use crate::catalog_credential_registry::{
+    CatalogCredentialMaterial, CatalogCredentialRegistry, CatalogCredentialRegistryEntry,
+    IcebergRestBearerCredentialMaterial, IcebergRestOauth2CredentialMaterial,
+    MAX_ROLE_LOCAL_CREDENTIAL_ENTRIES, S3CredentialMaterial,
+};
 use crate::catalog_source_config::{CatalogSourceConfig, preflight_catalog_source};
 use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_secret::SecretValue;
+use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
 use novarocks_state_store_sqlite::SqliteHistoryRetentionConfig;
 use novarocks_types::{ClusterRole, NativeEndpoint};
 
@@ -378,21 +384,6 @@ pub fn load_from_env_or_default() -> Result<NovaRocksConfig> {
     Ok(NovaRocksConfig::default())
 }
 
-/// Load only the resolved object-store input needed by offline tooling.
-pub fn load_object_store_config(
-    explicit: Option<&Path>,
-) -> Result<novarocks_fs::ObjectStoreConfig> {
-    let config = match explicit {
-        Some(path) => load_from_path(path)?,
-        None => load_from_env_or_default()?,
-    };
-    config
-        .connector
-        .object_store_config(&config.runtime.object_storage.retry_settings())
-        .map_err(anyhow::Error::msg)?
-        .context("missing [connector.object_store] config")
-}
-
 #[derive(Clone, Deserialize)]
 pub struct NovaRocksConfig {
     #[serde(default = "default_log_level")]
@@ -595,6 +586,7 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
         .try_into()
         .with_context(|| format!("deserialize config TOML: {}", path.display()))?;
     validate_state_store_configuration(&cfg)?;
+    validate_connector_credential_configuration(&cfg)?;
     validate_query_control_config(&cfg.runtime)?;
     validate_lake_publication_runtime_policy(&cfg.runtime)?;
     #[cfg(not(debug_assertions))]
@@ -663,6 +655,15 @@ fn validate_state_store_configuration(config: &NovaRocksConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_connector_credential_configuration(config: &NovaRocksConfig) -> Result<()> {
+    config
+        .connector
+        .credential_registry(config.cluster.role)
+        .map(|_| ())
+        .map_err(anyhow::Error::msg)
+        .context("validate role-local connector credentials")
+}
+
 #[derive(Clone, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_server_host")]
@@ -708,87 +709,140 @@ impl Default for ServerConfig {
     }
 }
 
-/// Shared object-store credentials loaded independently by every backend at
-/// startup. Native plans may reference this binding but must never carry its
-/// values.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ConnectorObjectStoreConfig {
-    pub endpoint: Option<String>,
-    pub access_key_id: Option<SecretValue>,
-    pub access_key_secret: Option<SecretValue>,
-    pub region: Option<String>,
-    pub enable_path_style_access: Option<bool>,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConnectorConfig {
-    pub object_store: Option<ConnectorObjectStoreConfig>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct ConnectorObjectStoreConfigWire {
-    endpoint: Option<String>,
-    access_key_id: Option<String>,
-    access_key_secret: Option<String>,
-    region: Option<String>,
-    enable_path_style_access: Option<bool>,
+    pub credentials: Vec<CatalogCredentialRegistryEntry>,
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct ConnectorConfigWire {
-    object_store: Option<ConnectorObjectStoreConfigWire>,
+    credentials: Vec<ConnectorCredentialEntryWire>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum CatalogCredentialPurposeWire {
+    CatalogControl,
+    ObjectStoreData,
+}
+
+impl From<CatalogCredentialPurposeWire> for CatalogCredentialPurpose {
+    fn from(value: CatalogCredentialPurposeWire) -> Self {
+        match value {
+            CatalogCredentialPurposeWire::CatalogControl => Self::CatalogControl,
+            CatalogCredentialPurposeWire::ObjectStoreData => Self::ObjectStoreData,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+enum ConnectorCredentialEntryWire {
+    S3 {
+        purpose: CatalogCredentialPurposeWire,
+        name: String,
+        generation: String,
+        access_key_id: String,
+        access_key_secret: String,
+        session_token: Option<String>,
+    },
+    IcebergRestOauth2 {
+        purpose: CatalogCredentialPurposeWire,
+        name: String,
+        generation: String,
+        client_id: String,
+        client_secret: String,
+    },
+    IcebergRestBearer {
+        purpose: CatalogCredentialPurposeWire,
+        name: String,
+        generation: String,
+        token: String,
+    },
+}
+
+impl ConnectorCredentialEntryWire {
+    fn into_entry(self) -> std::result::Result<CatalogCredentialRegistryEntry, String> {
+        let (purpose, name, generation, material) = match self {
+            Self::S3 {
+                purpose,
+                name,
+                generation,
+                access_key_id,
+                access_key_secret,
+                session_token,
+            } => (
+                purpose.into(),
+                name,
+                generation,
+                CatalogCredentialMaterial::S3(S3CredentialMaterial::new(
+                    SecretValue::new(access_key_id),
+                    SecretValue::new(access_key_secret),
+                    session_token.map(SecretValue::new),
+                )?),
+            ),
+            Self::IcebergRestOauth2 {
+                purpose,
+                name,
+                generation,
+                client_id,
+                client_secret,
+            } => (
+                purpose.into(),
+                name,
+                generation,
+                CatalogCredentialMaterial::IcebergRestOauth2(
+                    IcebergRestOauth2CredentialMaterial::new(
+                        client_id,
+                        SecretValue::new(client_secret),
+                    )?,
+                ),
+            ),
+            Self::IcebergRestBearer {
+                purpose,
+                name,
+                generation,
+                token,
+            } => (
+                purpose.into(),
+                name,
+                generation,
+                CatalogCredentialMaterial::IcebergRestBearer(
+                    IcebergRestBearerCredentialMaterial::new(SecretValue::new(token))?,
+                ),
+            ),
+        };
+        let reference = StaticCredentialReference::try_new(&name, &generation)
+            .map_err(|error| error.to_string())?;
+        CatalogCredentialRegistryEntry::try_new(purpose, reference, material)
+    }
 }
 
 fn deserialize_connector_config<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<ConnectorConfig, D::Error> {
     let wire = ConnectorConfigWire::deserialize(deserializer)?;
-    Ok(ConnectorConfig {
-        object_store: wire
-            .object_store
-            .map(|object_store| ConnectorObjectStoreConfig {
-                endpoint: object_store.endpoint,
-                access_key_id: object_store.access_key_id.map(SecretValue::new),
-                access_key_secret: object_store.access_key_secret.map(SecretValue::new),
-                region: object_store.region,
-                enable_path_style_access: object_store.enable_path_style_access,
-            }),
-    })
+    if wire.credentials.len() > MAX_ROLE_LOCAL_CREDENTIAL_ENTRIES {
+        return Err(serde::de::Error::custom(format!(
+            "connector credential registry exceeds {MAX_ROLE_LOCAL_CREDENTIAL_ENTRIES} entries"
+        )));
+    }
+    let credentials = wire
+        .credentials
+        .into_iter()
+        .map(ConnectorCredentialEntryWire::into_entry)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(serde::de::Error::custom)?;
+    Ok(ConnectorConfig { credentials })
 }
 
 impl ConnectorConfig {
-    /// Project the `[connector.object_store]` credentials onto a neutral
-    /// filesystem config, filling unset retry knobs from `retry`.
-    ///
-    /// The retry defaults arrive as an argument rather than being read from a
-    /// process-global config, so that `novarocks-fs` owns no configuration
-    /// source of its own.
-    pub fn object_store_config(
+    pub fn credential_registry(
         &self,
-        retry: &novarocks_fs::ObjectStoreRetrySettings,
-    ) -> std::result::Result<Option<novarocks_fs::ObjectStoreConfig>, String> {
-        let Some(object_store) = self.object_store.as_ref() else {
-            return Ok(None);
-        };
-        let credentials = novarocks_fs::ObjectStoreCredentials::from_parts(
-            novarocks_fs::ObjectStoreCredentialsSource::ConnectorStartupConfig,
-            object_store.endpoint.as_deref().unwrap_or_default(),
-            object_store
-                .access_key_id
-                .clone()
-                .unwrap_or_else(|| SecretValue::new("")),
-            object_store
-                .access_key_secret
-                .clone()
-                .unwrap_or_else(|| SecretValue::new("")),
-            object_store.region.as_deref(),
-            object_store.enable_path_style_access,
-        )?;
-        let mut config = credentials.to_object_store_config();
-        retry.apply_if_absent(&mut config);
-        Ok(Some(config))
+        role: ClusterRole,
+    ) -> std::result::Result<CatalogCredentialRegistry, String> {
+        CatalogCredentialRegistry::try_new(role, self.credentials.clone())
     }
 }
 
@@ -2081,6 +2135,144 @@ mod tests {
         DEFAULT_MEM_LIMIT_SPEC, NovaRocksConfig, RuntimeConfig, StandaloneServerConfig,
         validate_query_control_config,
     };
+    use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
+    use novarocks_types::ClusterRole;
+
+    #[test]
+    fn connector_credentials_parse_closed_s3_entries_and_resolve_exact_generation() {
+        let config: NovaRocksConfig = toml::from_str(
+            r#"
+[cluster]
+role = "be"
+frontend_endpoint = "127.0.0.1:9070"
+
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "warehouse"
+generation = "blue"
+kind = "s3"
+access_key_id = "access"
+access_key_secret = "secret"
+session_token = "token"
+"#,
+        )
+        .expect("parse credential registry");
+        let registry = config
+            .connector
+            .credential_registry(ClusterRole::Be)
+            .expect("BE registry");
+        assert!(
+            registry
+                .resolve(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    &StaticCredentialReference::try_new("warehouse", "blue").unwrap(),
+                )
+                .and_then(|material| material.as_s3())
+                .is_some()
+        );
+        assert!(
+            registry
+                .resolve(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    &StaticCredentialReference::try_new("warehouse", "green").unwrap(),
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn connector_credentials_reject_legacy_and_invalid_role_local_startup_config() {
+        let cases = [
+            (
+                "legacy-object-store",
+                r#"
+[connector.object_store]
+endpoint = "http://minio:9000"
+access_key_id = "access"
+access_key_secret = "secret"
+"#,
+                "deserialize config TOML",
+            ),
+            (
+                "backend-catalog-control",
+                r#"
+[cluster]
+role = "be"
+frontend_endpoint = "127.0.0.1:9070"
+
+[[connector.credentials]]
+purpose = "catalog-control"
+name = "rest"
+generation = "blue"
+kind = "iceberg-rest-bearer"
+token = "token"
+"#,
+                "role Be cannot own CatalogControl",
+            ),
+            (
+                "duplicate-static-reference",
+                r#"
+[cluster]
+role = "be"
+frontend_endpoint = "127.0.0.1:9070"
+
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "warehouse"
+generation = "blue"
+kind = "s3"
+access_key_id = "access"
+access_key_secret = "secret"
+
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "warehouse"
+generation = "blue"
+kind = "s3"
+access_key_id = "access-2"
+access_key_secret = "secret-2"
+"#,
+                "duplicate ObjectStoreData credential",
+            ),
+            (
+                "wrong-kind",
+                r#"
+[[connector.credentials]]
+purpose = "catalog-control"
+name = "rest"
+generation = "blue"
+kind = "s3"
+access_key_id = "access"
+access_key_secret = "secret"
+"#,
+                "does not accept material kind S3",
+            ),
+            (
+                "empty-secret",
+                r#"
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "warehouse"
+generation = "blue"
+kind = "s3"
+access_key_id = "access"
+access_key_secret = ""
+"#,
+                "S3 access key secret must not be empty",
+            ),
+        ];
+
+        for (name, document, expected) in cases {
+            let config = tempfile::NamedTempFile::new().expect("temporary config");
+            std::fs::write(config.path(), document).expect("write config");
+            let error = NovaRocksConfig::load_from_file(config.path())
+                .expect_err("invalid credential configuration must fail startup");
+            assert!(
+                error.to_string().contains(expected),
+                "{name}: expected {expected:?}, got {error:#}"
+            );
+        }
+    }
 
     #[test]
     fn query_control_config_defaults_are_fixed() {
