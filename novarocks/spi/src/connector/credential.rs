@@ -477,9 +477,22 @@ fn is_property_key(value: &str) -> bool {
 }
 
 fn is_sensitive_property_key(value: &str) -> bool {
-    ["secret", "password", "token", "credential", "access_key"]
-        .iter()
-        .any(|marker| value.contains(marker))
+    let compact = value
+        .bytes()
+        .filter(u8::is_ascii_alphanumeric)
+        .map(char::from)
+        .collect::<String>();
+    [
+        "secret",
+        "password",
+        "token",
+        "credential",
+        "accesskey",
+        "apikey",
+        "privatekey",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
 }
 
 fn parse_storage_authority(value: &str) -> Result<Arc<str>, ConnectorError> {
@@ -737,6 +750,9 @@ mod tests {
     #[test]
     fn secret_like_property_keys_and_unnormalized_prefixes_are_rejected() {
         assert!(CatalogNonSecretProperty::try_new("access_key_id", "not-allowed").is_err());
+        assert!(CatalogNonSecretProperty::try_new("aws.s3.access.key", "not-allowed").is_err());
+        assert!(CatalogNonSecretProperty::try_new("aws.s3.accesskeyid", "not-allowed").is_err());
+        assert!(CatalogNonSecretProperty::try_new("aws.s3.secret.key", "not-allowed").is_err());
         assert!(CatalogNonSecretProperty::try_new("session_token", "not-allowed").is_err());
         assert!(
             CatalogNonSecretProperty::try_new(

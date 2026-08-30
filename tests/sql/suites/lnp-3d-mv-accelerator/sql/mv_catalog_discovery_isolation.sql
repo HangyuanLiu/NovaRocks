@@ -24,8 +24,10 @@ PROPERTIES (
   "iceberg.catalog.type" = "rest",
   "uri" = "${iceberg_rest_uri}",
   "warehouse" = "${iceberg_rest_warehouse}",
-  "aws.s3.access_key" = "${oss_ak}",
-  "aws.s3.secret_key" = "${oss_sk}",
+  "credential.object-store-data.consumer-role" = "frontend-and-backend",
+  "credential.object-store-data.mode" = "static",
+  "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
   "aws.s3.endpoint" = "${oss_endpoint}",
   "aws.s3.region" = "us-east-1",
   "aws.s3.enable_path_style_access" = "true"

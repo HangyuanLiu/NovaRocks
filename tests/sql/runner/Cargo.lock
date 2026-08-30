@@ -2332,6 +2332,7 @@ dependencies = [
  "bytes",
  "serde",
  "sha2",
+ "url",
  "uuid",
 ]
 

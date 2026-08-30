@@ -483,6 +483,8 @@ iceberg_catalog_warehouse = $toml_iceberg_catalog_warehouse
 iceberg_test_warehouse = $toml_iceberg_test_warehouse
 iceberg_rest_uri = $toml_iceberg_rest_uri
 iceberg_rest_warehouse = $toml_iceberg_rest_warehouse
+iceberg_object_store_credential_name = "iceberg-test-data"
+iceberg_object_store_credential_generation = "v1"
 EOF
 
 cat > "$runtime_dir/ice-rest-catalog.sql" <<EOF
