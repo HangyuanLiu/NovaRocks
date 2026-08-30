@@ -144,7 +144,7 @@ impl ParticipantBackendIdentity {
 ///
 /// This value intentionally excludes endpoint and backend ordinal: both are
 /// routing facts and cannot identify a BE process incarnation.
-// Design: ADR-0127 (docs/adr/ADR-0127-participant-attempt-stage-fence.md)
+// Design: ADR-0128 (docs/adr/ADR-0128-lifecycle-canonical-engine-private-typed-digests.md)
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParticipantAttemptRef {
     raw: novarocks::ParticipantAttemptRef,
@@ -652,6 +652,7 @@ impl ParticipantManifest {
     /// Computes the descriptor-driven digest of the complete generated
     /// manifest, so new schema fields enter the fence without a hand-written
     /// projection update.
+    // Design: ADR-0128 (docs/adr/ADR-0128-lifecycle-canonical-engine-private-typed-digests.md)
     pub fn digest(&self) -> Result<ParticipantManifestDigest, ProtocolError> {
         canonical::digest_message(
             PARTICIPANT_MANIFEST_V1_DOMAIN,

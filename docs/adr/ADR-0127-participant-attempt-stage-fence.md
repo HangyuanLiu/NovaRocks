@@ -2,9 +2,9 @@
 id: ADR-0127
 title: "Participant attempt identity fences immutable stage admission"
 domain: [distributed-query-lifecycle, runtime-filter, crate-boundary]
-status: active
+status: superseded
 supersedes: [ADR-0126]
-superseded-by: null
+superseded-by: ADR-0128
 date: 2026-08-30
 provenance:
   - "mechanism: participant attempt and immutable Stage fence convergence"

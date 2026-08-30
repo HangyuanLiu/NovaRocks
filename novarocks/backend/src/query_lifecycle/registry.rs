@@ -2340,7 +2340,7 @@ impl QueryLifecycleRegistry {
             self.publish_fragment_observation(execution_id, fragment_instance_id, 0, 0, 0, None);
     }
 
-    // Design: ADR-0127 (docs/adr/ADR-0127-participant-attempt-stage-fence.md)
+    // Design: ADR-0128 (docs/adr/ADR-0128-lifecycle-canonical-engine-private-typed-digests.md)
     pub(crate) fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
         match self.begin_stage(request) {
             StageBuildDecision::Build(permit) => permit.commit(),

@@ -4,6 +4,7 @@
 //! decoded DTO into a deterministic semantic byte stream for the Manifest and
 //! Stage digest consumers: fields are ordered by tag, maps by key, and
 //! ordinary repeated fields retain their sequence order.
+// Design: ADR-0128 (docs/adr/ADR-0128-lifecycle-canonical-engine-private-typed-digests.md)
 
 use std::fmt;
 

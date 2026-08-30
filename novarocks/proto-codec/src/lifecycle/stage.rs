@@ -49,7 +49,7 @@ impl StageDigest {
     /// descriptor-driven projection orders fields by number, sorts maps, and
     /// preserves ordinary repeated-field order. The outer
     /// `StageFragmentsRequest` framing is intentionally excluded.
-    // Design: ADR-0127 (docs/adr/ADR-0127-participant-attempt-stage-fence.md)
+    // Design: ADR-0128 (docs/adr/ADR-0128-lifecycle-canonical-engine-private-typed-digests.md)
     pub fn compute(
         participant: ParticipantAttemptRef,
         fragments: &[StageFragment],
