@@ -44,6 +44,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(CatalogVersionDrain),
         Box::new(GenerationReplacement),
         Box::new(StaticCredentialGeneration::default()),
+        Box::new(AccessDomainCacheIsolation::default()),
         Box::new(PredicatePageIndexPruning),
         Box::new(TypedReadData),
     ]
@@ -858,6 +859,13 @@ struct StaticCredentialGeneration {
     fixtures: Mutex<Option<StaticCredentialFixtures>>,
 }
 
+/// Exercises the cache key boundary on the same native topology as static
+/// credentials, but is independently selectable by the M1 acceptance gate.
+#[derive(Default)]
+struct AccessDomainCacheIsolation {
+    fixtures: Mutex<Option<StaticCredentialFixtures>>,
+}
+
 struct StaticCredentialFixtures {
     blue: LoopbackS3Fixture,
     green: LoopbackS3Fixture,
@@ -884,26 +892,7 @@ impl Scenario for StaticCredentialGeneration {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let blue = LoopbackS3Fixture::start(LoopbackS3Config::for_access_key(STATIC_BLUE_KEY_ID))
-            .context("start blue loopback S3 fixture")?;
-        let green = LoopbackS3Fixture::start(LoopbackS3Config::for_access_key(STATIC_GREEN_KEY_ID))
-            .context("start green loopback S3 fixture")?;
-        let snapshot = scenario_root.join("static-credential-catalogs.toml");
-        write_static_credential_snapshot(&snapshot, blue.endpoint(), green.endpoint())?;
-        let mut fixtures = self
-            .fixtures
-            .lock()
-            .map_err(|_| anyhow::anyhow!("static credential fixture lock poisoned"))?;
-        if fixtures.is_some() {
-            bail!("static credential fixtures were initialized more than once");
-        }
-        *fixtures = Some(StaticCredentialFixtures { blue, green });
-
-        Ok(ScenarioLaunchConfig {
-            child_environment: connector_reader_environment(),
-            config_overlay: static_credential_launch_overlay(&snapshot),
-            ..Default::default()
-        })
+        static_credential_launch_config(&self.fixtures, scenario_root)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -916,99 +905,157 @@ impl Scenario for StaticCredentialGeneration {
             context.remaining("connect static credential control session")?,
         )?;
 
-        context.action(
-            "write three blue and three green S3 Iceberg files through StaticFile catalogs",
-        );
-        create_static_catalog_table_and_data(
-            &mut control,
-            STATIC_BLUE_CATALOG,
-            "static_blue_db",
-            "static_blue_data",
-            ["1, 100000", "100001, 200000", "200001, 300000"],
-        )?;
-        create_static_catalog_table_and_data(
-            &mut control,
-            STATIC_GREEN_CATALOG,
-            "static_green_db",
-            "static_green_data",
-            ["300001, 400000", "400001, 500000", "500001, 600000"],
-        )?;
-
-        context.action("warm the blue static credential access domain");
-        let blue_profile = static_catalog_profile(
-            &mut control,
-            STATIC_BLUE_CATALOG,
-            "static_blue_db",
-            "static_blue_data",
-        )?;
-        assert_positive_profile_counter(&blue_profile, "ConnectorFileCacheMisses")?;
-        context.action("repeat the blue StaticFile read from its role-local cache");
-        let blue_cached_profile = static_catalog_profile(
-            &mut control,
-            STATIC_BLUE_CATALOG,
-            "static_blue_db",
-            "static_blue_data",
-        )?;
-        assert_positive_profile_counter(&blue_cached_profile, "ConnectorFileCacheHits")?;
-        assert_static_catalog_sum(
-            &mut control,
-            STATIC_BLUE_CATALOG,
-            "static_blue_db",
-            "static_blue_data",
-            45_000_150_000,
-        )?;
-        let blue_logs = wait_for_open_reader_on_every_backend(
-            context,
-            STATIC_BLUE_CATALOG,
-            "observe every BE read the blue static credential generation",
-        )?;
-        assert_static_reader_opened_on_every_backend(&blue_logs, STATIC_BLUE_CATALOG)?;
-
-        context
-            .action("read the distinct green endpoint and access domain without blue cache reuse");
-        let green_profile = static_catalog_profile(
-            &mut control,
-            STATIC_GREEN_CATALOG,
-            "static_green_db",
-            "static_green_data",
-        )?;
-        assert_positive_profile_counter(&green_profile, "ConnectorFileCacheMisses")?;
-        assert_static_catalog_sum(
-            &mut control,
-            STATIC_GREEN_CATALOG,
-            "static_green_db",
-            "static_green_data",
-            135_000_150_000,
-        )?;
-        let green_logs = wait_for_open_reader_on_every_backend(
-            context,
-            STATIC_GREEN_CATALOG,
-            "observe every BE read the green static credential generation",
-        )?;
-        assert_static_reader_opened_on_every_backend(&green_logs, STATIC_GREEN_CATALOG)?;
-
-        let fixtures = self
-            .fixtures
-            .lock()
-            .map_err(|_| anyhow::anyhow!("static credential fixture lock poisoned"))?;
-        let fixtures = fixtures
-            .as_ref()
-            .context("static credential fixtures were not retained through scenario execution")?;
-        assert_fixture_used_only_expected_key(
-            "blue",
-            &fixtures.blue.request_log(),
-            STATIC_BLUE_KEY_ID,
-        )?;
-        assert_fixture_used_only_expected_key(
-            "green",
-            &fixtures.green.request_log(),
-            STATIC_GREEN_KEY_ID,
-        )?;
-        context.action("proved blue/v1 and green/v2 reads used distinct exact role-local S3 keys");
-
+        run_access_domain_cache_isolation(context, &mut control, &self.fixtures)?;
         await_resource_convergence(context, &baseline, "static credential generation reads")?;
         Ok(())
     }
+}
+
+impl Scenario for AccessDomainCacheIsolation {
+    fn name(&self) -> &'static str {
+        "connector/access-domain-cache-isolation"
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        static_credential_launch_config(&self.fixtures, scenario_root)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect access-domain cache control session")?,
+        )?;
+
+        run_access_domain_cache_isolation(context, &mut control, &self.fixtures)?;
+        await_resource_convergence(context, &baseline, "access-domain cache isolation")?;
+        Ok(())
+    }
+}
+
+fn static_credential_launch_config(
+    fixtures: &Mutex<Option<StaticCredentialFixtures>>,
+    scenario_root: &Path,
+) -> Result<ScenarioLaunchConfig> {
+    let blue = LoopbackS3Fixture::start(LoopbackS3Config::for_access_key(STATIC_BLUE_KEY_ID))
+        .context("start blue loopback S3 fixture")?;
+    let green = LoopbackS3Fixture::start(LoopbackS3Config::for_access_key(STATIC_GREEN_KEY_ID))
+        .context("start green loopback S3 fixture")?;
+    let snapshot = scenario_root.join("static-credential-catalogs.toml");
+    write_static_credential_snapshot(&snapshot, blue.endpoint(), green.endpoint())?;
+    let mut fixtures = fixtures
+        .lock()
+        .map_err(|_| anyhow::anyhow!("static credential fixture lock poisoned"))?;
+    if fixtures.is_some() {
+        bail!("static credential fixtures were initialized more than once");
+    }
+    *fixtures = Some(StaticCredentialFixtures { blue, green });
+
+    Ok(ScenarioLaunchConfig {
+        child_environment: connector_reader_environment(),
+        config_overlay: static_credential_launch_overlay(&snapshot),
+        ..Default::default()
+    })
+}
+
+fn run_access_domain_cache_isolation(
+    context: &mut ScenarioContext,
+    control: &mut mysql::Conn,
+    fixtures: &Mutex<Option<StaticCredentialFixtures>>,
+) -> Result<()> {
+    context.action("write three blue and three green S3 Iceberg files through StaticFile catalogs");
+    create_static_catalog_table_and_data(
+        control,
+        STATIC_BLUE_CATALOG,
+        "static_blue_db",
+        "static_blue_data",
+        ["1, 100000", "100001, 200000", "200001, 300000"],
+    )?;
+    create_static_catalog_table_and_data(
+        control,
+        STATIC_GREEN_CATALOG,
+        "static_green_db",
+        "static_green_data",
+        ["300001, 400000", "400001, 500000", "500001, 600000"],
+    )?;
+
+    context.action("warm the blue static credential access domain");
+    let blue_profile = static_catalog_profile(
+        control,
+        STATIC_BLUE_CATALOG,
+        "static_blue_db",
+        "static_blue_data",
+    )?;
+    assert_positive_profile_counter(&blue_profile, "ConnectorFileCacheMisses")?;
+    context.action("repeat the blue StaticFile read from its role-local cache");
+    let blue_cached_profile = static_catalog_profile(
+        control,
+        STATIC_BLUE_CATALOG,
+        "static_blue_db",
+        "static_blue_data",
+    )?;
+    assert_positive_profile_counter(&blue_cached_profile, "ConnectorFileCacheHits")?;
+    assert_static_catalog_sum(
+        control,
+        STATIC_BLUE_CATALOG,
+        "static_blue_db",
+        "static_blue_data",
+        45_000_150_000,
+    )?;
+    let blue_logs = wait_for_open_reader_on_every_backend(
+        context,
+        STATIC_BLUE_CATALOG,
+        "observe every BE read the blue static credential generation",
+    )?;
+    assert_static_reader_opened_on_every_backend(&blue_logs, STATIC_BLUE_CATALOG)?;
+
+    context.action("read the distinct green endpoint and access domain without blue cache reuse");
+    let green_profile = static_catalog_profile(
+        control,
+        STATIC_GREEN_CATALOG,
+        "static_green_db",
+        "static_green_data",
+    )?;
+    assert_positive_profile_counter(&green_profile, "ConnectorFileCacheMisses")?;
+    assert_static_catalog_sum(
+        control,
+        STATIC_GREEN_CATALOG,
+        "static_green_db",
+        "static_green_data",
+        135_000_150_000,
+    )?;
+    let green_logs = wait_for_open_reader_on_every_backend(
+        context,
+        STATIC_GREEN_CATALOG,
+        "observe every BE read the green static credential generation",
+    )?;
+    assert_static_reader_opened_on_every_backend(&green_logs, STATIC_GREEN_CATALOG)?;
+
+    let fixtures = fixtures
+        .lock()
+        .map_err(|_| anyhow::anyhow!("static credential fixture lock poisoned"))?;
+    let fixtures = fixtures
+        .as_ref()
+        .context("static credential fixtures were not retained through scenario execution")?;
+    assert_fixture_used_only_expected_key(
+        "blue",
+        &fixtures.blue.request_log(),
+        STATIC_BLUE_KEY_ID,
+    )?;
+    assert_fixture_used_only_expected_key(
+        "green",
+        &fixtures.green.request_log(),
+        STATIC_GREEN_KEY_ID,
+    )?;
+    context.action("proved blue/v1 and green/v2 reads used distinct exact role-local S3 keys");
+    Ok(())
 }
 
 struct PredicatePageIndexPruning;
