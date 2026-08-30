@@ -29,7 +29,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use novarocks_fs::{FsAccessHandle, FsAccessResolver, FsScheme, ObjectStoreConfig};
+use novarocks_fs::{FsAccessHandle, FsAccessResolver, FsScheme};
+
+use crate::access_binding::IcebergReadBinding;
 
 #[derive(Clone, Debug)]
 pub struct IcebergFsAccess {
@@ -78,13 +80,13 @@ impl IcebergFsAccess {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IcebergFileSystemFactory {
     #[serde(skip, default)]
-    object_store_config: Option<ObjectStoreConfig>,
+    binding: Option<IcebergReadBinding>,
 }
 
 impl IcebergFileSystemFactory {
-    pub fn new(object_store_config: Option<ObjectStoreConfig>) -> Self {
+    pub fn new(binding: IcebergReadBinding) -> Self {
         Self {
-            object_store_config,
+            binding: Some(binding),
         }
     }
 }
@@ -92,33 +94,42 @@ impl IcebergFileSystemFactory {
 #[typetag::serde]
 impl StorageFactory for IcebergFileSystemFactory {
     fn build(&self, _config: &StorageConfig) -> Result<Arc<dyn Storage>> {
-        Ok(Arc::new(IcebergFsStorage::new(
-            self.object_store_config.clone(),
-        )))
+        let binding = self.binding.clone().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Iceberg filesystem factory has no admitted storage capability",
+            )
+        })?;
+        Ok(Arc::new(IcebergFsStorage::new(binding)))
     }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IcebergFsStorage {
     #[serde(skip, default)]
-    object_store_config: Option<ObjectStoreConfig>,
+    binding: Option<IcebergReadBinding>,
 }
 
 impl IcebergFsStorage {
-    pub fn new(object_store_config: Option<ObjectStoreConfig>) -> Self {
+    pub fn new(binding: IcebergReadBinding) -> Self {
         Self {
-            object_store_config,
+            binding: Some(binding),
         }
     }
 
     fn resolve_path(&self, operation: &str, path: &str) -> Result<(IcebergFsAccess, String)> {
-        let access =
-            resolve_access_for_location(path, self.object_store_config.as_ref()).map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("fs {operation}({path}) resolve path: {e}"),
-                )
-            })?;
+        let binding = self.binding.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Iceberg filesystem storage has no admitted storage capability",
+            )
+        })?;
+        let access = IcebergFsAccess::new(binding.resolve_access(path).map_err(|error| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("fs {operation}({path}) resolve path: {error}"),
+            )
+        })?);
         let relative_path = access.single_relative_path().map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -364,47 +375,41 @@ impl FileWrite for IcebergFsFileWrite {
     }
 }
 
-pub fn build_file_io_for_location(
-    location: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
-) -> FileIO {
+pub fn build_file_io_for_location(location: &str, binding: IcebergReadBinding) -> FileIO {
     // FileIO construction is lazy: the SDK asks the storage to resolve paths
     // only when actual IO starts, so this helper stores credentials here and
     // leaves location validation to the per-operation FsAccessResolver call.
     let _ = location;
-    FileIOBuilder::new(Arc::new(IcebergFileSystemFactory::new(
-        object_store_config.cloned(),
-    )))
-    .build()
+    FileIOBuilder::new(Arc::new(IcebergFileSystemFactory::new(binding))).build()
 }
 
 pub fn build_storage_factory_for_location(
     location: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: IcebergReadBinding,
 ) -> Arc<dyn StorageFactory> {
     // StorageFactory construction is lazy for the same reason FileIO is: keep
     // credentials here and resolve concrete operators per IO call.
     let _ = location;
-    Arc::new(IcebergFileSystemFactory::new(object_store_config.cloned()))
+    Arc::new(IcebergFileSystemFactory::new(binding))
 }
 
 pub fn resolve_access_for_location(
     location: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
 ) -> std::result::Result<IcebergFsAccess, String> {
-    resolve_access_for_locations(std::iter::once(location), object_store_config)
+    resolve_access_for_locations(std::iter::once(location), binding)
 }
 
 pub fn resolve_access_for_locations<I, S>(
     locations: I,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
 ) -> std::result::Result<IcebergFsAccess, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let handle = FsAccessResolver::new()
-        .resolve_locations(locations, object_store_config)
+    let handle = binding
+        .resolve_access_for_locations(locations)
         .map_err(|error| error.to_string())?;
     Ok(IcebergFsAccess::new(handle))
 }
@@ -449,14 +454,10 @@ pub fn format_resolved_location(
 
 pub fn reader_factory_for_table_location(
     location: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
 ) -> std::result::Result<FsAccessHandle, String> {
-    let resolver = FsAccessResolver::new();
-    let parsed = resolver
-        .parse_location(location)
-        .map_err(|e| format!("parse table fs location {location}: {e}"))?;
-    resolver
-        .resolve_location(parsed.original(), object_store_config)
+    binding
+        .resolve_access(location)
         .map_err(|error| error.to_string())
 }
 

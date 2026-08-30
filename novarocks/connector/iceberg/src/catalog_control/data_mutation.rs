@@ -1105,14 +1105,14 @@ fn build_abort_cleanup(
 ) -> Result<(crate::opendal::Operator, Option<CleanupPathMapper>), ConnectorError> {
     let state = runtime.control_state();
     let warehouse_uri = &state.configuration().warehouse_uri;
-    if let Some(s3_config) = state.object_store_config() {
-        let access = fs_io::resolve_access_for_location(warehouse_uri, Some(s3_config)).map_err(
-            |error| {
-                internal(format!(
-                    "resolve Iceberg warehouse for data mutation cleanup: {error}"
-                ))
-            },
-        )?;
+    let access =
+        fs_io::resolve_access_for_location(warehouse_uri, runtime.resources().planning_binding())
+            .map_err(|error| {
+            internal(format!(
+                "resolve Iceberg warehouse for data mutation cleanup: {error}"
+            ))
+        })?;
+    if access.handle().scheme() == novarocks_fs::FsScheme::ObjectStore {
         let bucket = access
             .handle()
             .authority()
@@ -1126,13 +1126,17 @@ fn build_abort_cleanup(
         });
         return Ok((access.operator(), Some(mapper)));
     }
-    let fs = novarocks_fs::FsAccessResolver::new()
-        .resolve_location("/__novarocks_local_root__", None)
-        .map_err(|error| internal(format!("build local cleanup operator: {error}")))?
-        .operator();
-    let mapper: CleanupPathMapper =
-        Arc::new(|path: &str| path.strip_prefix("file://").unwrap_or(path).to_string());
-    Ok((fs, Some(mapper)))
+    let mapper: CleanupPathMapper = Arc::new(|path: &str| {
+        if let Some(path) = path.strip_prefix("file://") {
+            return path.to_string();
+        }
+        novarocks_fs::FsLocation::parse(path)
+            .ok()
+            .filter(|location| location.scheme() == novarocks_fs::FsScheme::Hdfs)
+            .map(|location| location.path().trim_start_matches('/').to_string())
+            .unwrap_or_else(|| path.to_string())
+    });
+    Ok((access.operator(), Some(mapper)))
 }
 
 /// Make a committed write reachable through this generation's catalog.

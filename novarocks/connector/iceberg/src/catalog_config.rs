@@ -26,8 +26,8 @@ use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 
 use novarocks_fs::{
-    ObjectStoreConfig, is_object_store_location_parse_only, normalize_aws_s3_catalog_properties,
-    object_store_config_from_aws_s3_catalog_properties,
+    ObjectStoreConfig, ObjectStoreEndpointConfig, is_object_store_location_parse_only,
+    normalize_aws_s3_catalog_properties, object_store_config_from_aws_s3_catalog_properties,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,9 +143,9 @@ fn parse_hadoop_configuration(
             "object-store iceberg catalog requires aws.s3.endpoint, aws.s3.access_key, aws.s3.secret_key"
                 .to_string()
         })?;
-        novarocks_fs::FsAccessResolver::new()
-            .resolve_location(&raw_warehouse, Some(&object_store_config))
-            .map_err(|error| format!("parse warehouse URI: {error}"))?;
+        // Authorization belongs to the role-local Iceberg access capability.
+        // Configuration parsing must not construct an unscoped filesystem
+        // operator from catalog properties.
         let cache_dir = std::env::temp_dir()
             .join("novarocks_iceberg_cache")
             .join(catalog_name);
@@ -363,6 +363,78 @@ fn resolve_object_store_config(
         (None, Some(injected)) => Ok(Some(injected.clone())),
         (None, None) => Ok(None),
     }
+}
+
+/// Decode only the non-secret object-store endpoint settings carried by an
+/// immutable catalog definition. Static credential material is deliberately
+/// resolved by the role-local credential registry, never from these
+/// properties.
+pub fn object_store_endpoint_config_from_catalog_properties(
+    properties: &[(String, String)],
+) -> Result<Option<ObjectStoreEndpointConfig>, String> {
+    let properties = normalized_properties(properties);
+    let endpoint = ["aws.s3.endpoint", "aws.s3.endpoint_url"]
+        .into_iter()
+        .find_map(|key| properties.get(key).map(String::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let Some(endpoint) = endpoint else {
+        return Ok(None);
+    };
+
+    let optional = |key: &str| {
+        properties
+            .get(key)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let parse_bool = |key: &str| -> Result<Option<bool>, String> {
+        optional(key)
+            .map(|value| match value.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => Ok(true),
+                "false" | "0" | "no" => Ok(false),
+                _ => Err(format!("invalid {key} boolean value")),
+            })
+            .transpose()
+    };
+    let parse_number = |key: &str| -> Result<Option<u64>, String> {
+        optional(key)
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid {key} value"))
+            })
+            .transpose()
+    };
+
+    let retry_max_times = optional("aws.s3.max_retries")
+        .or_else(|| optional("aws.s3.retry_max_times"))
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| "invalid aws.s3.max_retries value".to_string())
+        })
+        .transpose()?;
+    let timeout_ms = optional("aws.s3.request_timeout_ms")
+        .or_else(|| optional("aws.s3.timeout_ms"))
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| "invalid aws.s3.request_timeout_ms value".to_string())
+        })
+        .transpose()?;
+
+    Ok(Some(ObjectStoreEndpointConfig {
+        endpoint: endpoint.to_string(),
+        enable_path_style_access: parse_bool("aws.s3.enable_path_style_access")?,
+        region: optional("aws.s3.region").map(str::to_string),
+        retry_max_times,
+        retry_min_delay_ms: parse_number("aws.s3.retry_min_delay_ms")?,
+        retry_max_delay_ms: parse_number("aws.s3.retry_max_delay_ms")?,
+        timeout_ms,
+        io_timeout_ms: parse_number("aws.s3.io_timeout_ms")?,
+    }))
 }
 
 fn sorted_properties(properties: &HashMap<String, String>) -> Vec<(String, String)> {

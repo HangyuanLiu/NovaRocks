@@ -25,16 +25,48 @@ use std::sync::Arc;
 
 use novarocks_fs::{
     FileError, FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
-    FsAccessResolver, FsAccessResources,
+    FsAccessResolver, FsAccessResources, FsScheme, ObjectStoreAccessContext,
+    ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig, ObjectStoreSecretMaterial,
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_spi::connector::{
+    CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
+    CatalogProviderKind, CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind,
+    ConnectorError, ConnectorErrorKind, ConnectorProviderId, StaticCredentialReference,
+    StorageAccessDomainId,
+};
 
-const DEFAULT_ACCESS_BINDING: &str = "default";
+/// Role-local resolver for one exact static object-store credential reference.
+///
+/// The composition root owns the immutable registry. This connector only
+/// receives a sealed resolver and never reads configuration or discovers
+/// another role's credentials.
+pub trait IcebergStaticCredentialResolver: Send + Sync {
+    fn resolve_object_store_static(
+        &self,
+        reference: &StaticCredentialReference,
+    ) -> Result<ObjectStoreSecretMaterial, ConnectorError>;
+}
+
+#[derive(Clone)]
+enum IcebergStorageAccess {
+    ObjectStore {
+        access_domain: StorageAccessDomainId,
+        endpoint_config: ObjectStoreEndpointConfig,
+        credential_reference: StaticCredentialReference,
+    },
+    Uncredentialed {
+        provider_id: ConnectorProviderId,
+        catalog_name: novarocks_spi::connector::ConnectorInstanceId,
+        config_format_version: u32,
+        non_secret_properties: Vec<CatalogNonSecretProperty>,
+    },
+}
 
 #[derive(Clone)]
 pub struct IcebergReadBinding {
-    access_binding: String,
     resources: FsAccessResources,
+    credential_resolver: Option<Arc<dyn IcebergStaticCredentialResolver>>,
+    storage_access: Option<IcebergStorageAccess>,
 }
 
 /// Provider-local credentials selected for one Iceberg object-store location.
@@ -60,10 +92,9 @@ impl std::fmt::Debug for IcebergReadBinding {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("IcebergReadBinding")
-            .field("access_binding", &self.access_binding)
             .field(
-                "object_store_config",
-                &self.resources.object_store_config().map(|_| "<redacted>"),
+                "storage_access",
+                &self.storage_access.as_ref().map(|_| "<bound>"),
             )
             .finish_non_exhaustive()
     }
@@ -74,9 +105,86 @@ impl IcebergReadBinding {
     /// process composition root.
     pub fn from_resources(resources: FsAccessResources) -> Self {
         Self {
-            access_binding: DEFAULT_ACCESS_BINDING.to_string(),
             resources,
+            credential_resolver: None,
+            storage_access: None,
         }
+    }
+
+    /// Bind a catalog definition to its exact, role-local static credential
+    /// resolver. The catalog carrier contains only non-secret facts. Vended
+    /// credentials are intentionally rejected until their query-attempt lease
+    /// protocol exists.
+    pub fn from_catalog_properties(
+        resources: FsAccessResources,
+        credential_resolver: Arc<dyn IcebergStaticCredentialResolver>,
+        properties: &CatalogProperties,
+    ) -> Result<Self, ConnectorError> {
+        if properties.provider_kind() != CatalogProviderKind::Iceberg {
+            return Err(invalid(
+                "Iceberg access binding received another provider kind",
+            ));
+        }
+        let provider_id = ConnectorProviderId::parse("iceberg").map_err(|error| {
+            ConnectorError::new(ConnectorErrorKind::Internal, error.to_string())
+        })?;
+        let non_secret_properties = properties
+            .execution_properties()
+            .iter()
+            .map(|property| CatalogNonSecretProperty::try_new(property.key(), property.value()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let object_store_binding = properties
+            .credential_bindings()
+            .iter()
+            .find(|binding| binding.purpose() == CatalogCredentialPurpose::ObjectStoreData);
+
+        let storage_access = match object_store_binding {
+            Some(binding) => {
+                let CatalogCredentialMode::Static(reference) = binding.mode() else {
+                    return Err(invalid(
+                        "Iceberg vended object-store credentials require M2 query leases",
+                    ));
+                };
+                let endpoint_config =
+                    crate::catalog_config::object_store_endpoint_config_from_catalog_properties(
+                        &properties
+                            .execution_properties()
+                            .iter()
+                            .map(|property| {
+                                (property.key().to_string(), property.value().to_string())
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(invalid)?
+                    .ok_or_else(|| {
+                        invalid("static Iceberg object-store binding missing endpoint config")
+                    })?;
+                let domain_input = CatalogStorageAccessDomainInput::try_new(
+                    provider_id,
+                    properties.handle().catalog_name().clone(),
+                    properties.config_format_version(),
+                    non_secret_properties,
+                    binding.clone(),
+                    vec![],
+                )?;
+                IcebergStorageAccess::ObjectStore {
+                    access_domain: domain_input.derive_access_domain(),
+                    endpoint_config,
+                    credential_reference: reference.clone(),
+                }
+            }
+            None => IcebergStorageAccess::Uncredentialed {
+                provider_id,
+                catalog_name: properties.handle().catalog_name().clone(),
+                config_format_version: properties.config_format_version(),
+                non_secret_properties,
+            },
+        };
+        Ok(Self {
+            resources,
+            credential_resolver: Some(credential_resolver),
+            storage_access: Some(storage_access),
+        })
     }
 
     /// Explicit convenience constructor for composition roots that do not
@@ -87,30 +195,44 @@ impl IcebergReadBinding {
         file_runtime: Arc<dyn FileIoRuntime>,
         file_task_spawner: Arc<dyn FileTaskSpawner>,
     ) -> Self {
-        Self::from_resources(FsAccessResources::new(
+        let pool = Arc::new(
+            novarocks_fs::ObjectStoreProviderPool::new(
+                novarocks_fs::ObjectStoreProviderPoolOptions::default(),
+            )
+            .expect("build test object-store provider pool"),
+        );
+        let resources =
+            FsAccessResources::new(pool, access_resolver, file_runtime, file_task_spawner);
+        let access_domain = StorageAccessDomainId::from_bytes([0x54; 32]);
+        let storage_access = match object_store_config.as_ref() {
+            Some(config) => IcebergStorageAccess::ObjectStore {
+                access_domain,
+                endpoint_config: config.endpoint_config(),
+                credential_reference: StaticCredentialReference::try_new(
+                    "iceberg-test-object-store",
+                    "test",
+                )
+                .expect("build test static credential reference"),
+            },
+            None => IcebergStorageAccess::Uncredentialed {
+                provider_id: ConnectorProviderId::parse("iceberg")
+                    .expect("static Iceberg provider id"),
+                catalog_name: novarocks_spi::connector::ConnectorInstanceId::try_from_canonical(
+                    "iceberg-test",
+                )
+                .expect("build test catalog name"),
+                config_format_version: 1,
+                non_secret_properties: vec![],
+            },
+        };
+        let resolver = Arc::new(TestCredentialResolver {
             object_store_config,
-            access_resolver,
-            file_runtime,
-            file_task_spawner,
-        ))
-    }
-
-    pub fn with_access_binding(
-        access_binding: impl Into<String>,
-        resources: FsAccessResources,
-    ) -> Self {
+        });
         Self {
-            access_binding: access_binding.into(),
             resources,
+            credential_resolver: Some(resolver),
+            storage_access: Some(storage_access),
         }
-    }
-
-    pub fn access_binding(&self) -> &str {
-        &self.access_binding
-    }
-
-    pub fn object_store_config(&self) -> Option<&novarocks_fs::ObjectStoreConfig> {
-        self.resources.object_store_config()
     }
 
     /// Resolve the startup-composed object-store credentials for an Iceberg
@@ -135,11 +257,22 @@ impl IcebergReadBinding {
                 location.original()
             )
         })?;
-        let config = self.object_store_config().cloned().ok_or_else(|| {
-            format!(
-                "Iceberg connector writer needs a startup object-store binding for bucket {bucket}"
-            )
-        })?;
+        let (endpoint_config, secret_material) = self
+            .object_store_access_context()
+            .map_err(|error| error.to_string())?;
+        let config = novarocks_fs::ObjectStoreConfig {
+            endpoint: endpoint_config.endpoint,
+            access_key_id: secret_material.access_key_id,
+            access_key_secret: secret_material.access_key_secret,
+            session_token: secret_material.session_token,
+            enable_path_style_access: endpoint_config.enable_path_style_access,
+            region: endpoint_config.region,
+            retry_max_times: endpoint_config.retry_max_times,
+            retry_min_delay_ms: endpoint_config.retry_min_delay_ms,
+            retry_max_delay_ms: endpoint_config.retry_max_delay_ms,
+            timeout_ms: endpoint_config.timeout_ms,
+            io_timeout_ms: endpoint_config.io_timeout_ms,
+        };
         Ok(Some(IcebergObjectStoreBinding {
             bucket: bucket.to_string(),
             config,
@@ -147,12 +280,17 @@ impl IcebergReadBinding {
     }
 
     pub fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
+        let parsed = self
+            .resources
+            .access_resolver()
+            .parse_location(location)
+            .map_err(file_error)?;
+        let access_domain = self.access_domain_for_location(&parsed)?;
+        let object_store_access = self.object_store_access_context_for_scheme(parsed.scheme())?;
         self.resources
             .access_resolver()
-            .resolve_location(location, self.object_store_config())
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-            })
+            .resolve_location(access_domain, location, object_store_access)
+            .map_err(file_error)
     }
 
     pub fn resolve_access_for_locations<I, S>(
@@ -163,12 +301,119 @@ impl IcebergReadBinding {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        let locations = locations
+            .into_iter()
+            .map(|location| location.as_ref().to_string())
+            .collect::<Vec<_>>();
+        let first = locations
+            .first()
+            .ok_or_else(|| invalid("Iceberg filesystem locations are empty"))?;
+        let parsed = self
+            .resources
+            .access_resolver()
+            .parse_location(first)
+            .map_err(file_error)?;
+        let access_domain = self.access_domain_for_location(&parsed)?;
+        let object_store_access = self.object_store_access_context_for_scheme(parsed.scheme())?;
         self.resources
             .access_resolver()
-            .resolve_locations(locations, self.object_store_config())
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-            })
+            .resolve_locations(access_domain, locations, object_store_access)
+            .map_err(file_error)
+    }
+
+    fn access_domain_for_location(
+        &self,
+        location: &novarocks_fs::FsLocation,
+    ) -> Result<StorageAccessDomainId, ConnectorError> {
+        match self.storage_access.as_ref().ok_or_else(|| {
+            invalid("Iceberg filesystem operation has no admitted storage capability")
+        })? {
+            IcebergStorageAccess::ObjectStore { access_domain, .. } => {
+                if location.scheme() != FsScheme::ObjectStore {
+                    return Err(invalid(
+                        "Iceberg object-store capability cannot resolve an uncredentialed location",
+                    ));
+                }
+                Ok(*access_domain)
+            }
+            IcebergStorageAccess::Uncredentialed {
+                provider_id,
+                catalog_name,
+                config_format_version,
+                non_secret_properties,
+            } => {
+                let (kind, authority) = match location.scheme() {
+                    FsScheme::Local => (CatalogUncredentialedStorageKind::Local, None),
+                    FsScheme::Hdfs => {
+                        (CatalogUncredentialedStorageKind::Hdfs, location.authority())
+                    }
+                    FsScheme::ObjectStore => {
+                        return Err(invalid(
+                            "Iceberg object-store location has no admitted exact credential binding",
+                        ));
+                    }
+                };
+                CatalogStorageAccessDomainInput::try_new_uncredentialed(
+                    provider_id.clone(),
+                    catalog_name.clone(),
+                    *config_format_version,
+                    non_secret_properties.clone(),
+                    kind,
+                    authority,
+                )
+                .map(|input| input.derive_access_domain())
+            }
+        }
+    }
+
+    fn object_store_access_context_for_scheme(
+        &self,
+        scheme: FsScheme,
+    ) -> Result<Option<ObjectStoreAccessContext<'_>>, ConnectorError> {
+        if scheme == FsScheme::ObjectStore {
+            let (endpoint_config, secret_material) = self.object_store_access_context()?;
+            let IcebergStorageAccess::ObjectStore {
+                credential_reference,
+                ..
+            } = self
+                .storage_access
+                .as_ref()
+                .expect("checked by object-store access context")
+            else {
+                return Err(invalid(
+                    "Iceberg object-store operation lacks an exact binding",
+                ));
+            };
+            return Ok(Some(ObjectStoreAccessContext::new(
+                endpoint_config,
+                ObjectStoreCredentialProviderIdentity::Static(credential_reference.clone()),
+                secret_material,
+                self.resources.object_store_provider_pool(),
+            )));
+        }
+        Ok(None)
+    }
+
+    fn object_store_access_context(
+        &self,
+    ) -> Result<(ObjectStoreEndpointConfig, ObjectStoreSecretMaterial), ConnectorError> {
+        let IcebergStorageAccess::ObjectStore {
+            endpoint_config,
+            credential_reference,
+            ..
+        } = self.storage_access.as_ref().ok_or_else(|| {
+            invalid("Iceberg filesystem operation has no admitted storage capability")
+        })?
+        else {
+            return Err(invalid(
+                "Iceberg object-store operation lacks an exact binding",
+            ));
+        };
+        let resolver = self.credential_resolver.as_ref().ok_or_else(|| {
+            invalid("Iceberg object-store operation has no role-local credential resolver")
+        })?;
+        let secret_material = resolver.resolve_object_store_static(credential_reference)?;
+        Ok((endpoint_config.clone(), secret_material))
     }
 
     pub fn file_read_context(
@@ -176,6 +421,9 @@ impl IcebergReadBinding {
         cancellation: novarocks_fs::FileCancellation,
         deadline: std::time::Instant,
     ) -> Result<FileReadContext, ConnectorError> {
+        self.storage_access.as_ref().ok_or_else(|| {
+            invalid("Iceberg filesystem operation has no admitted storage capability")
+        })?;
         Ok(FileReadContext {
             cancellation,
             deadline: Some(deadline),
@@ -203,6 +451,37 @@ impl IcebergReadBinding {
                 ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string())
                     .with_retryable_before_progress()
             })
+    }
+}
+
+fn invalid(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
+}
+
+fn file_error(error: novarocks_fs::FileError) -> ConnectorError {
+    invalid(error.to_string())
+}
+
+struct TestCredentialResolver {
+    object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+}
+
+impl IcebergStaticCredentialResolver for TestCredentialResolver {
+    fn resolve_object_store_static(
+        &self,
+        reference: &StaticCredentialReference,
+    ) -> Result<ObjectStoreSecretMaterial, ConnectorError> {
+        let expected = StaticCredentialReference::try_new("iceberg-test-object-store", "test")
+            .expect("static test credential reference");
+        if reference != &expected {
+            return Err(invalid(
+                "test credential resolver received an unexpected reference",
+            ));
+        }
+        self.object_store_config
+            .as_ref()
+            .map(novarocks_fs::ObjectStoreConfig::secret_material)
+            .ok_or_else(|| invalid("test credential resolver has no object-store material"))
     }
 }
 
