@@ -21,7 +21,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::common::backend_topology::LiveBackendTarget;
+use crate::common::backend_topology::{
+    BackendTopologyError, BackendTopologyPort, BackendTopologySnapshot,
+    BackendTopologyValidationError, LiveBackendTarget,
+};
 use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::fragment_transport::{
@@ -975,6 +978,43 @@ fn live_backend(backend_idx: usize, endpoint: std::net::SocketAddr) -> LiveBacke
     LiveBackendTarget::new(backend_idx, fixture_descriptor(endpoint))
 }
 
+struct FixedTopology(BackendTopologySnapshot);
+
+impl BackendTopologyPort for FixedTopology {
+    fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+        Ok(self.0.clone())
+    }
+
+    fn validate_snapshot(
+        &self,
+        expected: &BackendTopologySnapshot,
+    ) -> Result<(), BackendTopologyValidationError> {
+        if &self.0 == expected {
+            Ok(())
+        } else {
+            Err(
+                BackendTopologyValidationError::ContentChangedWithoutRevision {
+                    revision: expected.revision(),
+                },
+            )
+        }
+    }
+
+    fn wait_for_eligible_after(
+        &self,
+        _revision: u64,
+        _deadline: Instant,
+    ) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+        self.snapshot()
+    }
+
+    fn record_successful_stage(&self, _backend_idx: usize, _fragment_count: usize) {}
+
+    fn show_backends(&self) -> Result<crate::runtime::query_result::QueryResult, String> {
+        unreachable!("terminal convergence test does not render backends")
+    }
+}
+
 fn lifecycle_target(backend: &LiveBackendTarget) -> QueryLifecycleTarget {
     QueryLifecycleTarget::new(
         backend.backend_idx(),
@@ -1470,6 +1510,28 @@ fn frontend_terminal_receipt_rejects_outcome_from_a_foreign_control_process() {
         .expect_err("a stream cannot deliver another process's terminal outcome");
     assert!(error.contains("participant process differs"));
     assert!(control.terminal_outcomes_for_test().is_empty());
+}
+
+#[test]
+fn frontend_terminal_ack_allows_a_closed_command_stream_after_snapshot_storage() {
+    let (control, _fixture_session, participant) = observation_control(0);
+    let recorder = RecordingSession::with_events([]);
+    recorder.fail_next_send(transport_error(
+        QueryLifecycleTransportErrorKind::StreamClosed,
+        "backend closed after emitting its terminal outcome",
+    ));
+    let session = ActiveSession::new(participant.target, participant.digest, Arc::new(recorder));
+    let manifest = participant.request.manifest().expect("fixture manifest");
+    let outcome = terminal_outcome(terminal_snapshot(
+        manifest.execution_id().expect("fixture execution id"),
+        manifest.backend().expect("fixture backend"),
+        participant.digest,
+    ));
+
+    control
+        .handle_control_event(&session, protocol_terminal_outcome_event(outcome))
+        .expect("stored terminal outcome survives a closed ACK command stream");
+    assert_eq!(control.terminal_outcomes_for_test().len(), 1);
 }
 
 #[test]
@@ -2588,6 +2650,50 @@ fn frontend_query_lifecycle_finalization_reports_stable_no_outcome_participants(
 }
 
 #[test]
+fn frontend_query_lifecycle_terminal_replacement_is_frontend_liveness() {
+    let plan = query_init_plan(None);
+    let execution_id = plan.execution_id();
+    let (transport, sessions) = RecordingTransport::ready(&plan);
+    let (registry, _query) = registry_for(&plan);
+    let replacement = live_backend(1, "127.0.0.1:18001".parse().unwrap());
+    let topology = BackendTopologySnapshot::try_new(2, vec![replacement])
+        .expect("replacement topology snapshot");
+    let finalize_config = config()
+        .with_terminal_timeouts(Duration::from_millis(20), Duration::from_millis(20))
+        .expect("terminal timeouts");
+    let barrier = FrontendQueryLifecycleBarrier::new(
+        Arc::new(transport),
+        Arc::clone(&registry),
+        finalize_config,
+    )
+    .with_backend_topology(Arc::new(FixedTopology(topology)), 1);
+    let lease = barrier
+        .initialize_all(plan)
+        .expect("all participants ready");
+    for session in sessions.values() {
+        session.suppress_terminal_snapshot_on_finalize();
+    }
+
+    let error = lease
+        .finalize()
+        .expect_err("exact replacement must classify terminal delivery as liveness");
+    assert!(
+        error
+            .message()
+            .contains("terminal ACK failed for backend 1")
+    );
+    assert!(error.message().contains("was replaced by"));
+    let snapshot = registry
+        .retained_convergence_snapshot(execution_id)
+        .expect("terminal failure retains convergence evidence");
+    assert_eq!(
+        snapshot.error_source,
+        Some(QueryLifecycleConvergenceErrorSource::FrontendLiveness)
+    );
+    assert_eq!(barrier.metrics_snapshot().heartbeat_timeouts, 0);
+}
+
+#[test]
 fn frontend_query_lifecycle_lease_duplicate_abort_is_idempotent() {
     let plan = query_init_plan(None);
     let query_id = plan.execution_id().query_id();
@@ -2666,7 +2772,10 @@ fn frontend_query_lifecycle_lease_local_failure_aborts_other_participants() {
         .initialize_all(plan)
         .expect("all participants ready");
 
-    wait_until(Duration::from_secs(1), || {
+    // The abort fanout is scheduled on background control tasks. Allow the
+    // single-threaded workspace CI enough scheduling budget under compilation
+    // pressure without changing the lifecycle contract being asserted.
+    wait_until(Duration::from_secs(5), || {
         registry
             .first_failure(query_id)
             .is_some_and(|failure| failure.contains("backend 0 scan failed"))
@@ -3469,13 +3578,20 @@ async fn frontend_query_lifecycle_live_transport_post_submission_timeout_is_unkn
             Duration::from_secs(2),
         )
         .expect("warm the channel before the delayed request");
-    *ingress.init_delay.lock().expect("init delay") = Some(Duration::from_millis(100));
-    let error = transport
-        .init_query(
-            target,
-            live_init_request(&backend, 808),
-            Duration::from_millis(20),
-        )
+    let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+    *ingress.init_delay.lock().expect("init delay") = Some(Duration::from_secs(2));
+    *ingress.init_started.lock().expect("init started") = Some(entered_tx);
+    let delayed_transport = Arc::clone(&transport);
+    let delayed_request = live_init_request(&backend, 808);
+    let request = std::thread::spawn(move || {
+        delayed_transport.init_query(target, delayed_request, Duration::from_secs(1))
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("submitted InitQuery must enter the server handler before its deadline");
+    let error = request
+        .join()
+        .expect("join delayed InitQuery caller")
         .expect_err("submitted InitQuery must time out while the server is handling it");
     assert!(matches!(
         error.kind(),
@@ -3765,6 +3881,7 @@ struct LiveLifecycleIngress {
     manual_heartbeat_acks: bool,
     manual_terminal_acks: bool,
     init_delay: Mutex<Option<Duration>>,
+    init_started: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
     control_events: Mutex<Option<tokio::sync::mpsc::Sender<protocol_lifecycle::QueryControlEvent>>>,
 }
 
@@ -3785,6 +3902,9 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
         &self,
         request: protocol_lifecycle::QueryInitRequest,
     ) -> protocol_lifecycle::QueryInitAck {
+        if let Some(started) = self.init_started.lock().expect("init started").take() {
+            let _ = started.send(());
+        }
         if let Some(delay) = *self.init_delay.lock().expect("init delay") {
             std::thread::sleep(delay);
         }

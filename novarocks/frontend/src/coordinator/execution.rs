@@ -991,6 +991,10 @@ impl FrontendDistributedQueryCoordinator {
             self.lifecycle_config,
         )
         .with_cancellation(parts.cancellation.clone())
+        .with_backend_topology(
+            Arc::clone(&self.backend_topology),
+            parts.topology.revision(),
+        )
         .with_runtime_filter_feedback(feedback_declaration)
         .with_runtime_filter_feedback_state(feedback_state);
         let init_options = QueryInitOptions::new(

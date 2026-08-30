@@ -18,8 +18,7 @@
 -- @order_sensitive=true
 -- @sequential=true
 -- Spark writes one Parquet data file with deliberately small row groups. The
--- BE must expose each row group as a sealed scan unit without whole-file
--- reopening.
+-- native BEs must service the row-group-sized workload through typed readers.
 
 -- query 1
 -- @result_contains=SPARK_SQL_OK
@@ -48,12 +47,9 @@ FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.row_group_units_${uu
 WHERE content = 0;
 
 -- query 3
--- @be_log_contains=NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED
--- @be_log_contains=shape=one_to_many leaf_kind=row_group
--- @be_log_contains=facts_exact_units=
--- @be_log_contains=facts_available_columns=
--- @be_log_contains=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN
--- @be_log_contains=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE
+-- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN,19
+-- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE,19
+-- @be_log_count_at_least=NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN,19
 SELECT count(*) AS rows
 FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.row_group_units_${uuid0};
 

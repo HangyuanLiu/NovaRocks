@@ -21,6 +21,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::common::backend_topology::BackendTopologyService;
 use crate::metrics::FrontendQueryLifecycleMetricsSnapshot;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::{
@@ -365,6 +366,10 @@ pub(super) struct AttemptControl {
     terminal: (Mutex<TerminalState>, Condvar),
     observations: Mutex<FragmentObservationState>,
     feedback: Mutex<Arc<RuntimeFilterFeedbackState>>,
+    /// Read-only current topology. The attempt's participant manifest stays
+    /// immutable; this projection only proves an exact process replacement
+    /// after bounded terminal delivery fails.
+    backend_topology: Mutex<Option<(BackendTopologyService, u64)>>,
     readers: Mutex<Vec<JoinHandle<()>>>,
     metrics: Arc<FrontendLifecycleMetrics>,
 }
@@ -400,6 +405,7 @@ impl AttemptControl {
                 RuntimeFilterFeedbackState::new(execution_id, Default::default())
                     .expect("empty runtime filter feedback declaration is valid"),
             )),
+            backend_topology: Mutex::new(None),
             readers: Mutex::new(Vec::new()),
             metrics,
         })
@@ -432,6 +438,17 @@ impl AttemptControl {
         let mut current = self.feedback.lock().expect("runtime filter feedback state");
         current.close();
         *current = state;
+    }
+
+    pub(crate) fn install_backend_topology(
+        &self,
+        topology: BackendTopologyService,
+        admission_revision: u64,
+    ) {
+        *self
+            .backend_topology
+            .lock()
+            .expect("query lifecycle backend topology") = Some((topology, admission_revision));
     }
 
     pub(super) fn set_planned(&self, participants: &[MaterializedParticipant]) {
@@ -1304,10 +1321,86 @@ impl AttemptControl {
             }))
         });
         result.unwrap_or_else(|| {
-            Err(TerminalConvergenceFailure::NoOutcome(
-                self.no_outcome_error(),
-            ))
+            if let Some(error) = self.exact_replacement_error() {
+                Err(TerminalConvergenceFailure::FrontendLiveness(error))
+            } else {
+                Err(TerminalConvergenceFailure::NoOutcome(
+                    self.no_outcome_error(),
+                ))
+            }
         })
+    }
+
+    fn exact_replacement_error(&self) -> Option<String> {
+        let (topology, admission_revision) = self
+            .backend_topology
+            .lock()
+            .expect("query lifecycle backend topology")
+            .clone()?;
+        let admitted = self
+            .admitted
+            .lock()
+            .expect("admitted participant set")
+            .clone()?;
+        let terminal = self.terminal.0.lock().expect("query terminal state");
+        let missing = admitted
+            .iter()
+            .filter(|(backend_idx, _)| !terminal.outcomes.contains_key(backend_idx))
+            .map(|(backend_idx, participant)| (*backend_idx, participant.clone()))
+            .collect::<Vec<_>>();
+        drop(terminal);
+
+        let replacement_error =
+            |snapshot: &crate::common::backend_topology::BackendTopologySnapshot| {
+                missing.iter().find_map(|(backend_idx, participant)| {
+                let frozen_process_id = participant.target.process_id();
+                // `backend_idx` is a snapshot-local scheduling ordinal, not a
+                // durable member identity. A replacement keeps the frozen
+                // endpoint but mints a new process id, so compare current
+                // eligible targets by endpoint and require the old identity
+                // to be absent before classifying the missing terminal record.
+                let current_process_ids = snapshot
+                    .targets()
+                    .iter()
+                    .filter_map(|target| {
+                        (target.endpoint().ok().as_ref() == Some(participant.target.endpoint()))
+                            .then(|| target.process_id().ok())
+                            .flatten()
+                    })
+                    .collect::<BTreeSet<_>>();
+                (!current_process_ids.is_empty()
+                    && !current_process_ids.contains(&frozen_process_id))
+                .then(|| {
+                    let current_process_id = current_process_ids
+                        .iter()
+                        .next()
+                        .expect("non-empty replacement process ids");
+                    format!(
+                        "query lifecycle terminal ACK failed for backend {backend_idx}: frozen process {frozen_process_id} was replaced by {current_process_id}"
+                    )
+                })
+            })
+            };
+
+        if let Some(error) = topology
+            .snapshot()
+            .ok()
+            .and_then(|snapshot| replacement_error(&snapshot))
+        {
+            return Some(error);
+        }
+
+        // A restarted BE first announces and then proves its fresh identity
+        // through the FE heartbeat. The terminal stream can close in between;
+        // wait one bounded heartbeat window for that exact replacement event
+        // before preserving a NoOutcome result.
+        topology
+            .wait_for_eligible_after(
+                admission_revision,
+                Instant::now() + self.config.heartbeat_timeout(),
+            )
+            .ok()
+            .and_then(|snapshot| replacement_error(&snapshot))
     }
 
     fn no_outcome_error(&self) -> String {
@@ -1765,15 +1858,23 @@ impl AttemptControl {
                 if claim_terminal_ack_drop(session, &outcome)? {
                     return Ok(());
                 }
-                session
-                    .session
-                    .send(terminal_ack_command(&outcome)?)
-                    .map_err(|error| {
-                        format!(
-                            "query lifecycle terminal ACK failed for backend {}: {error}",
-                            session.target.backend_idx()
-                        )
-                    })
+                match session.session.send(terminal_ack_command(&outcome)?)
+                {
+                    Ok(()) => Ok(()),
+                    Err(error)
+                        if matches!(error.kind(), QueryLifecycleTransportErrorKind::StreamClosed) =>
+                    {
+                        // The terminal outcome is already durably retained.
+                        // A backend may close the command side immediately after
+                        // emitting it, so an ACK send cannot revoke that completed
+                        // terminal set.
+                        Ok(())
+                    }
+                    Err(error) => Err(format!(
+                        "query lifecycle terminal ACK failed for backend {}: {error}",
+                        session.target.backend_idx()
+                    )),
+                }
             }
             Some(novarocks_proto_models::novarocks::query_control_response::Event::LocalFailure(
                 failure,

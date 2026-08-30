@@ -96,7 +96,7 @@ pub(super) fn lower_typed_connector_scan(
     // refused on its own terms rather than as a side effect of which providers
     // happen to be installed. Moving any of it below `typed_scan_runtime_inputs`
     // would let "no provider is installed" mask "this plan is not executable".
-    let read_slot_ids = connector_read_slot_ids(output_columns, variant_path_plan);
+    let read_slot_ids = connector_read_slot_ids(scan, output_columns, variant_path_plan);
     check_assignments_match_read_columns(&scan_source, &read_slot_ids)?;
     let layout = output_columns.layout();
     let output_schema = output_columns.output_schema();
@@ -291,14 +291,32 @@ fn typed_scan_runtime_inputs(
 /// pseudo-columns no data file holds. The synthetic columns are then removed,
 /// because the engine builds those above the connector.
 fn connector_read_slot_ids(
+    scan: &plan::ScanNode,
     output_columns: &DecodedScanOutputColumns,
     variant_path_plan: &NativeVariantPathPlan,
 ) -> Vec<SlotId> {
-    output_columns
+    let output_slot_ids = output_columns
         .columns()
         .iter()
         .map(|column| SlotId::new(column.column_id))
         .filter(|slot_id| !variant_path_plan.output_slot_ids.contains(slot_id))
+        .collect::<std::collections::HashSet<_>>();
+    let variant_source_slot_ids = variant_path_plan
+        .specs
+        .iter()
+        .map(|spec| spec.source_read_slot_id)
+        .collect::<std::collections::HashSet<_>>();
+    // A query can project a regular column beside a derived VARIANT path while
+    // omitting the physical VARIANT source from its output. The source still
+    // needs a page channel so the transform can materialize the derived slot.
+    // Keep every selected physical column in the scan's declared order: that
+    // is the same order in which the producer assigned page channels.
+    scan.columns
+        .iter()
+        .map(|column| SlotId::new(column.column_id))
+        .filter(|slot_id| {
+            output_slot_ids.contains(slot_id) || variant_source_slot_ids.contains(slot_id)
+        })
         .collect()
 }
 
@@ -444,6 +462,18 @@ mod tests {
             panic!("fixture node carries a physical payload");
         };
         let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
+            panic!("fixture node carries a scan");
+        };
+        scan
+    }
+
+    /// Mutably borrow the scan out of a fixture node.
+    fn scan_of_mut(node: &mut plan::DistributedNode) -> &mut plan::ScanNode {
+        let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_mut()
+        else {
+            panic!("fixture node carries a physical payload");
+        };
+        let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_mut() else {
             panic!("fixture node carries a scan");
         };
         scan
@@ -850,7 +880,7 @@ mod tests {
         // is not among them.
         assert_eq!(test_support::scan_source_proto().assignments.len(), 1);
         assert_eq!(
-            connector_read_slot_ids(&output_columns, &variant_path_plan),
+            connector_read_slot_ids(scan, &output_columns, &variant_path_plan),
             vec![SlotId::new(1)]
         );
 
@@ -863,6 +893,32 @@ mod tests {
             decoded.output_schema.slot_ids(),
             [SlotId::new(1), SlotId::new(2)],
             "the node must still declare the synthetic column it materializes"
+        );
+    }
+
+    /// A derived VARIANT path can require a physical source that is not part
+    /// of the output projection. The source still precedes later regular
+    /// columns in the connector's page-channel order.
+    #[test]
+    fn typed_scan_decode_keeps_an_unprojected_variant_source_in_channel_order() {
+        let mut node = typed_variant_scan_node(scan_source_with_two_assignments(), &["id"]);
+        let scan = scan_of_mut(&mut node);
+        scan.required_columns = vec!["__nr_var_v_0".to_string(), "id".to_string()];
+        let table = scan.table.as_ref().expect("fixture table");
+        let output_columns =
+            super::super::common::decode_scan_output_columns(scan, FieldPath::root("scan"))
+                .expect("decode narrowed output columns");
+        let variant_path_plan = super::super::variant_path::parse_native_scan_variant_path_columns(
+            scan,
+            table,
+            output_columns.columns(),
+        )
+        .expect("parse variant path columns");
+
+        assert_eq!(
+            connector_read_slot_ids(scan, &output_columns, &variant_path_plan),
+            vec![SlotId::new(1), SlotId::new(3)],
+            "the connector must read the hidden VARIANT source before the later regular column"
         );
     }
 

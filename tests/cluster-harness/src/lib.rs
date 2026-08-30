@@ -1480,7 +1480,11 @@ impl QueryExecutionResourceSnapshot {
             }
             for (resource, before_value) in &before.resources {
                 let current_value = current.resources.get(resource).copied().unwrap_or(f64::NAN);
-                if current_value != *before_value {
+                // The baseline can overlap a preceding healthy query's asynchronous
+                // cleanup. A faulted query must not grow any heavy resource above that
+                // baseline, but it is valid for the preceding query to finish releasing
+                // resources while this query runs.
+                if !current_value.is_finite() || current_value > *before_value {
                     deltas.push(format!(
                         "BE[{}] {resource}: before={before_value} current={current_value} delta={}",
                         current.index,
@@ -6379,6 +6383,38 @@ static_file_path = "catalogs.toml"
                 .expect("live leak must be reported")
                 .contains("native_query_contexts_active")
         );
+    }
+
+    #[test]
+    fn resource_convergence_allows_preexisting_healthy_work_to_finish_releasing() {
+        let baseline = QueryExecutionResourceSnapshot {
+            fe_running: true,
+            frontend_control_ready: 0.0,
+            backends: vec![BackendResourceSnapshot {
+                index: 0,
+                process_running: true,
+                resources: BTreeMap::from([("catalog_query_leases".to_string(), 1.0)]),
+                terminal_retained: 0.0,
+                terminal_retained_bytes: 0.0,
+                terminal_retained_capacity: 4_096.0,
+                terminal_max_retained_bytes: 268_435_456.0,
+            }],
+        };
+        let released = QueryExecutionResourceSnapshot {
+            fe_running: true,
+            frontend_control_ready: 0.0,
+            backends: vec![BackendResourceSnapshot {
+                index: 0,
+                process_running: true,
+                resources: BTreeMap::from([("catalog_query_leases".to_string(), 0.0)]),
+                terminal_retained: 0.0,
+                terminal_retained_bytes: 0.0,
+                terminal_retained_capacity: 4_096.0,
+                terminal_max_retained_bytes: 268_435_456.0,
+            }],
+        };
+
+        assert!(released.convergence_failure(&baseline, false).is_none());
     }
 
     #[test]

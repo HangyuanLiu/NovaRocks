@@ -1076,8 +1076,9 @@ fn descriptor_runtime_endpoint(
 }
 fn live_targets(state: &TopologyState) -> Vec<LiveBackendTarget> {
     state
-        .processes
+        .endpoint_owners
         .values()
+        .filter_map(|process_id| state.processes.get(process_id))
         .filter(|facts| facts.eligible())
         .enumerate()
         .map(|(membership_ordinal, facts)| {
@@ -1297,6 +1298,65 @@ mod tests {
                 .process_id()
                 .unwrap(),
             new.process_id().unwrap()
+        );
+    }
+
+    #[test]
+    fn live_backend_ordinals_follow_verified_endpoints_across_replacement() {
+        let service = ClusterBackendService::new_transient_for_test(1);
+        let higher_endpoint = descriptor("127.0.0.1:9071".parse().unwrap());
+        let lower_endpoint = descriptor("127.0.0.1:9070".parse().unwrap());
+        service
+            .record_announce(higher_endpoint.clone(), BackendReportedState::Running)
+            .expect("announce higher endpoint");
+        service
+            .record_announce(lower_endpoint.clone(), BackendReportedState::Running)
+            .expect("announce lower endpoint");
+        verify(&service, &higher_endpoint);
+        verify(&service, &lower_endpoint);
+
+        let before = service
+            .snapshot()
+            .expect("initial endpoint-ordered snapshot");
+        assert_eq!(
+            before.targets()[0]
+                .process_id()
+                .expect("lower endpoint process"),
+            lower_endpoint
+                .process_id()
+                .expect("lower endpoint descriptor")
+        );
+        assert_eq!(
+            before.targets()[1]
+                .process_id()
+                .expect("higher endpoint process"),
+            higher_endpoint
+                .process_id()
+                .expect("higher endpoint descriptor")
+        );
+
+        let replacement = descriptor("127.0.0.1:9071".parse().unwrap());
+        service
+            .record_announce(replacement.clone(), BackendReportedState::Running)
+            .expect("announce endpoint replacement");
+        verify(&service, &replacement);
+
+        let after = service
+            .snapshot()
+            .expect("replacement endpoint-ordered snapshot");
+        assert_eq!(
+            after.targets()[0]
+                .process_id()
+                .expect("lower endpoint process"),
+            lower_endpoint
+                .process_id()
+                .expect("lower endpoint descriptor")
+        );
+        assert_eq!(
+            after.targets()[1]
+                .process_id()
+                .expect("replacement process"),
+            replacement.process_id().expect("replacement descriptor")
         );
     }
 

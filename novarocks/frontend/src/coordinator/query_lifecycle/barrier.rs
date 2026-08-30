@@ -20,6 +20,7 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::common::backend_topology::BackendTopologyService;
 use crate::common::query_cancellation::QueryCancellationView;
 use crate::native::query_lifecycle::QueryLifecycleTransportErrorKind;
 use crate::query_execution::contract::{
@@ -199,6 +200,7 @@ pub(crate) struct FrontendQueryLifecycleBarrier {
     cancellation: Option<QueryCancellationView>,
     feedback_declaration: FrontendRuntimeFilterFeedbackDeclaration,
     feedback_state: Option<Arc<RuntimeFilterFeedbackState>>,
+    backend_topology: Option<(BackendTopologyService, u64)>,
 }
 
 pub(super) struct PreReadyAttemptGuard {
@@ -281,6 +283,7 @@ impl FrontendQueryLifecycleBarrier {
             cancellation: None,
             feedback_declaration: FrontendRuntimeFilterFeedbackDeclaration::default(),
             feedback_state: None,
+            backend_topology: None,
         }
     }
 
@@ -302,6 +305,19 @@ impl FrontendQueryLifecycleBarrier {
         state: Arc<RuntimeFilterFeedbackState>,
     ) -> Self {
         self.feedback_state = Some(state);
+        self
+    }
+
+    /// Supplies the frontend-owned, read-only backend topology projection for
+    /// terminal convergence.  It is consulted only after terminal delivery
+    /// times out, so ordinary admission and lifecycle sequencing remain bound
+    /// to the manifest frozen before InitQuery.
+    pub(crate) fn with_backend_topology(
+        mut self,
+        topology: BackendTopologyService,
+        admission_revision: u64,
+    ) -> Self {
+        self.backend_topology = Some((topology, admission_revision));
         self
     }
 
@@ -352,6 +368,9 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             control.install_runtime_filter_feedback_state(Arc::clone(state));
         } else {
             control.configure_runtime_filter_feedback(self.feedback_declaration.clone())?;
+        }
+        if let Some((topology, admission_revision)) = &self.backend_topology {
+            control.install_backend_topology(Arc::clone(topology), *admission_revision);
         }
         let ownership = materialized
             .participants

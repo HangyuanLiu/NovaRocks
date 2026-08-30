@@ -883,38 +883,25 @@ impl ChangeWindowContext<'_> {
 
         let from_closure = self.closure_of(from_file)?;
         let to_closure = self.closure_of(to_file)?;
-        for path in from_closure.keys() {
-            if !to_closure.contains_key(path) {
-                // A delete that applied at `from` and no longer applies at `to`
-                // has two possible meanings, and nothing here can tell them
-                // apart: either its rows became visible again -- a forward-side
-                // row set of a file that was never added, which none of the
-                // four typed variants can express -- or a rewrite replaced it
-                // with an artifact that already covers those same rows, as a
-                // deletion vector does when it is rewritten. Proving the second
-                // would mean opening both artifacts and comparing their
-                // positions, which planning does not do, so the window fails
-                // closed rather than emitting rows it cannot justify.
-                //
-                // The cost is real: a v3 table whose deletion vector is
-                // rewritten inside the window is rejected today even though its
-                // difference is expressible as `newly = [new DV]`,
-                // `previously = [old DV]`. Lifting that needs a proof that the
-                // replacement subsumes what it replaced, not a weaker check
-                // here.
-                return Err(unsupported(format!(
-                    "iceberg delete file {path} stopped applying to data file {} inside the change window",
-                    to_file.read_file.path
-                )));
-            }
-        }
-
         let newly = to_closure
             .iter()
             .filter(|(path, _)| !from_closure.contains_key(*path))
             .map(|(_, delete)| delete.clone())
             .collect::<Vec<_>>();
         if newly.is_empty() {
+            if from_closure
+                .keys()
+                .any(|path| !to_closure.contains_key(path))
+            {
+                // With no replacement delete closure, a row previously hidden
+                // at `from` may have become visible at `to`. The typed change
+                // relation has no forward variant for rows from an otherwise
+                // surviving file, so keep this case fail-closed.
+                return Err(unsupported(format!(
+                    "iceberg delete files stopped applying to data file {} inside the change window without a replacement closure",
+                    to_file.read_file.path
+                )));
+            }
             // Present at both endpoints with the same closure: the file's
             // visible rows did not change, so the difference owns none of them.
             return Ok(());
@@ -2223,7 +2210,27 @@ mod tests {
     }
 
     #[test]
-    fn a_delete_that_stopped_applying_inside_the_window_fails_closed() {
+    fn a_replaced_delete_closure_subtracts_its_previous_dv() {
+        let plan = window_plan(
+            vec![endpoint_file(
+                "kept.parquet",
+                vec![position_delete_of("d4.parquet", "kept.parquet", 12)],
+            )],
+            vec![endpoint_file(
+                "kept.parquet",
+                vec![position_delete_of("d5.parquet", "kept.parquet", 13)],
+            )],
+        )
+        .expect("replacement deletion vector");
+        let IcebergChangeSplit::PositionDeletedRows(rows) = &plan.splits()[0] else {
+            panic!("replacement closure emits a position-delete split");
+        };
+        assert_eq!(rows.newly_applied_deletes()[0].path(), "d5.parquet");
+        assert_eq!(rows.previously_applied_deletes()[0].path(), "d4.parquet");
+    }
+
+    #[test]
+    fn a_delete_that_stopped_applying_without_replacement_fails_closed() {
         // Rows of a surviving file becoming visible again is a forward-side row
         // set of a file that was never added. None of the four typed variants
         // can express it, so it is rejected rather than dropped.
@@ -2234,7 +2241,7 @@ mod tests {
             )],
             vec![endpoint_file("kept.parquet", Vec::new())],
         )
-        .expect_err("a delete stopped applying");
+        .expect_err("a delete stopped applying without replacement");
         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
     }
 

@@ -456,10 +456,9 @@ impl ValidatedConnectorTableHandle {
 // Table function handles
 // ---------------------------------------------------------------------------
 
-/// Both endpoints name real snapshots, and a window whose endpoints are the
-/// same snapshot describes no rows: accepting it would silently turn an empty
-/// window into a full rescan.
-fn validate_snapshot_endpoints(
+/// Validate the two named snapshot ids of a relation that requires a non-empty
+/// interval.
+fn validate_distinct_snapshot_endpoints(
     lower: i64,
     upper: i64,
     lower_path: FieldPath,
@@ -471,6 +470,20 @@ fn validate_snapshot_endpoints(
     if lower == upper {
         return Err(inconsistent(upper_path, detail));
     }
+    Ok(())
+}
+
+/// A change window can have equal endpoints. Its visible-row difference is
+/// then exactly empty, and its split source emits no work rather than widening
+/// to a table scan.
+fn validate_snapshot_endpoint_ids(
+    lower: i64,
+    upper: i64,
+    lower_path: FieldPath,
+    upper_path: FieldPath,
+) -> Result<(), ProtocolError> {
+    nonnegative_i64(lower, lower_path, "snapshot id")?;
+    nonnegative_i64(upper, upper_path, "snapshot id")?;
     Ok(())
 }
 
@@ -499,7 +512,7 @@ fn validate_table_changes_function_handle(
         false,
         "table changes function handle requires at least one output column",
     )?;
-    validate_snapshot_endpoints(
+    validate_distinct_snapshot_endpoints(
         raw.start_snapshot_id,
         raw.end_snapshot_id,
         path.field("start_snapshot_id"),
@@ -595,12 +608,11 @@ fn validate_iceberg_change_window_handle(
         false,
         "iceberg change window handle requires at least one output column",
     )?;
-    validate_snapshot_endpoints(
+    validate_snapshot_endpoint_ids(
         raw.from_snapshot_id_exclusive,
         raw.to_snapshot_id_inclusive,
         path.field("from_snapshot_id_exclusive"),
         path.field("to_snapshot_id_inclusive"),
-        "change window endpoints must name two different snapshots",
     )?;
     // No single selected spec: a window's splits each name their own, so there
     // is nothing here for a `spec_id` to point at.
@@ -2150,21 +2162,17 @@ mod tests {
             "connector_change_window_handle.iceberg.from_snapshot_id_exclusive"
         );
 
-        let mut identical_window = change_window_handle();
+        let mut empty_window = change_window_handle();
         if let Some(dto::connector_change_window_handle::Handle::Iceberg(iceberg)) =
-            identical_window.handle.as_mut()
+            empty_window.handle.as_mut()
         {
             iceberg.to_snapshot_id_inclusive = iceberg.from_snapshot_id_exclusive;
         }
-        assert_eq!(
-            ValidatedConnectorChangeWindowHandle::parse(
-                identical_window,
-                FieldPath::root("connector_change_window_handle")
-            )
-            .expect_err("identical window endpoints")
-            .kind(),
-            ProtocolErrorKind::InconsistentFields
-        );
+        ValidatedConnectorChangeWindowHandle::parse(
+            empty_window,
+            FieldPath::root("connector_change_window_handle"),
+        )
+        .expect("equal change-window endpoints encode an empty row difference");
     }
 
     #[test]

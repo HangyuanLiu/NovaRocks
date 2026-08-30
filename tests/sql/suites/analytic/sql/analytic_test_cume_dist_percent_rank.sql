@@ -173,11 +173,11 @@ SELECT *, PERCENT_RANK() OVER (ORDER BY k1 DESC, k2 ASC) AS percent_rank_k1_desc
 
 -- query 22
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (PARTITION BY v1 ORDER BY v2) AS cume_dist_v1_partition_v2 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (PARTITION BY v1 ORDER BY v2) AS cume_dist_v1_partition_v2 FROM ${case_db}.cume_test ORDER BY k1, k2, v1;
 
 -- query 23
 -- @order_sensitive=true
-SELECT *, CUME_DIST() OVER (PARTITION BY v3 ORDER BY v4) AS cume_dist_v3_partition_v4 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, CUME_DIST() OVER (PARTITION BY v3 ORDER BY v4) AS cume_dist_v3_partition_v4 FROM ${case_db}.cume_test ORDER BY k1, k2, v1, v2, v3, v4;
 
 -- query 24
 -- @order_sensitive=true
@@ -189,7 +189,7 @@ SELECT *, CUME_DIST() OVER (PARTITION BY v4 ORDER BY v3) AS cume_dist_v4_partiti
 
 -- query 26
 -- @order_sensitive=true
-SELECT *, PERCENT_RANK() OVER (PARTITION BY v1 ORDER BY v3) AS percent_rank_v1_partition_v3 FROM ${case_db}.cume_test ORDER BY k1, k2;
+SELECT *, PERCENT_RANK() OVER (PARTITION BY v1 ORDER BY v3) AS percent_rank_v1_partition_v3 FROM ${case_db}.cume_test ORDER BY k1, k2, v1, v2, v3, v4;
 
 -- query 27
 -- @order_sensitive=true
