@@ -1001,15 +1001,17 @@ mod tests {
             }),
         })
         .expect("backend identity");
-        let attestation = NegativeAttestation::parse(proto::NegativeAttestation {
+        let participant = proto::ParticipantAttemptRef {
             execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                 execution_id,
             )),
-            backend: Some(backend.as_proto().clone()),
-            init_digest: vec![3; 32],
+            backend_process_id: backend.as_proto().process_id.clone(),
+        };
+        let attestation = NegativeAttestation::parse(proto::NegativeAttestation {
             reason: proto::NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted as i32,
             detail: "test terminal report".to_string(),
             detail_truncated: false,
+            participant: Some(participant),
         })
         .expect("negative attestation");
         ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {

@@ -5,7 +5,10 @@
 //! profile interpretation remain with their application owners.
 
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
-use super::manifest::{ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest};
+use super::manifest::{
+    ParticipantAttemptRef, ParticipantBackendIdentity, ParticipantManifest,
+    ParticipantManifestDigest,
+};
 use super::terminal::ParticipantTerminalOutcome;
 use crate::catalog::{validate_catalog_load_failed, validate_catalog_load_state};
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
@@ -438,12 +441,13 @@ pub struct QueryTerminalAck {
 
 impl QueryTerminalAck {
     pub fn parse(raw: novarocks::QueryControlTerminalAck) -> Result<Self, ProtocolError> {
-        required_execution_id(&raw.execution_id, "query execution id is required")?;
-        manifest_digest(&raw.init_digest)?;
-        digest_array(
-            &raw.snapshot_digest,
-            "query terminal snapshot digest must be 32 bytes",
-        )?;
+        let participant = raw.participant.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("query_control_terminal_ack").field("participant"),
+                "query terminal acknowledgement participant reference is required",
+            )
+        })?;
+        ParticipantAttemptRef::parse(participant)?;
         Ok(Self { raw })
     }
 
@@ -451,23 +455,14 @@ impl QueryTerminalAck {
         &self.raw
     }
 
-    pub fn execution_id(&self) -> Result<QueryExecutionId, ProtocolError> {
-        required_execution_id(&self.raw.execution_id, "query execution id is required")
-    }
-
-    pub fn init_digest(&self) -> Result<ParticipantManifestDigest, ProtocolError> {
-        manifest_digest(&self.raw.init_digest)
-    }
-
-    pub const fn version(&self) -> u32 {
-        self.raw.snapshot_version
-    }
-
-    pub fn digest(&self) -> Result<[u8; 32], ProtocolError> {
-        digest_array(
-            &self.raw.snapshot_digest,
-            "query terminal snapshot digest must be 32 bytes",
-        )
+    pub fn participant(&self) -> Result<ParticipantAttemptRef, ProtocolError> {
+        let participant = self.raw.participant.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("query_control_terminal_ack").field("participant"),
+                "query terminal acknowledgement participant reference is required",
+            )
+        })?;
+        ParticipantAttemptRef::parse(participant)
     }
 }
 
@@ -947,13 +942,22 @@ mod tests {
     #[test]
     fn validates_terminal_ack_report_ack_and_fragment_observation() {
         let terminal_ack = QueryTerminalAck::parse(novarocks::QueryControlTerminalAck {
-            execution_id: Some(execution_id()),
-            init_digest: manifest_digest(),
-            snapshot_digest: vec![4; 32],
-            ..Default::default()
+            participant: Some(novarocks::ParticipantAttemptRef {
+                execution_id: Some(execution_id()),
+                backend_process_id: manifest().backend.and_then(|backend| backend.process_id),
+            }),
         })
         .expect("valid terminal ack");
-        assert_eq!(terminal_ack.digest().expect("digest"), [4; 32]);
+        assert_eq!(
+            terminal_ack
+                .participant()
+                .expect("participant")
+                .execution_id()
+                .expect("execution id")
+                .query_id()
+                .high(),
+            5
+        );
 
         let report_ack = QueryTerminalReportAck::parse(novarocks::ReportQueryTerminalResponse {
             outcome: QueryTerminalReportOutcome::Accepted as i32,

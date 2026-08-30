@@ -4,12 +4,12 @@
 //! The Backend encodes runtime profiles and sink facts into those messages;
 //! this module never depends on their runtime representations.
 
-use crate::{FieldPath, ProtocolError, ProtocolErrorKind, canonical};
+use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, novarocks};
 
 use super::{
-    identity::{QueryExecutionId, decode_query_execution_id},
-    manifest::{ParticipantBackendIdentity, ParticipantManifestDigest},
+    identity::QueryExecutionId,
+    manifest::{ParticipantAttemptRef, ParticipantBackendIdentity},
 };
 
 pub const QUERY_TERMINAL_SNAPSHOT_VERSION_V1: u32 = 1;
@@ -20,44 +20,7 @@ pub const QUERY_TERMINAL_FRAGMENT_OUTCOME_DETAIL_MAX_BYTES: usize = 4096;
 pub const QUERY_TERMINAL_PROFILE_SECTION_MAX_ENTRIES: usize = 16_384;
 pub const QUERY_TERMINAL_STATISTICS_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
 
-const PARTICIPANT_TERMINAL_OUTCOME_CONTENT_ID_DOMAIN: &[u8] =
-    b"novarocks.query-lifecycle.participant-terminal-outcome.v1\0";
 const TERMINALIZATION_PROOF_VERSION_V1: u32 = 1;
-
-/// Fixed-width canonical content identity of one validated participant terminal
-/// outcome.
-///
-/// This value is derived from the complete generated outcome DTO. It is not
-/// carried by that DTO: FE and BE compute it once at their respective
-/// admission/retention boundaries and retain it with their local state.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TerminalOutcomeContentId([u8; 32]);
-
-impl TerminalOutcomeContentId {
-    pub const fn new(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
-    pub fn compute(outcome: &ParticipantTerminalOutcome) -> Result<Self, ProtocolError> {
-        canonical::digest_message(
-            PARTICIPANT_TERMINAL_OUTCOME_CONTENT_ID_DOMAIN,
-            "novarocks.ParticipantTerminalOutcome",
-            outcome.as_proto(),
-        )
-        .map(Self::new)
-        .map_err(|error| {
-            ProtocolError::new(
-                FieldPath::root("participant_terminal_outcome"),
-                ProtocolErrorKind::InvalidValue,
-                format!("cannot compute participant terminal outcome content id: {error}"),
-            )
-        })
-    }
-}
 
 /// A validated P1/P2 participant terminal snapshot.
 #[derive(Clone, Debug, PartialEq)]
@@ -79,27 +42,19 @@ impl QueryTerminalSnapshot {
         self.raw.version
     }
 
+    pub fn participant(&self) -> ParticipantAttemptRef {
+        required_participant_attempt_ref(
+            self.raw.participant.as_ref(),
+            FieldPath::root("query_terminal_snapshot").field("participant"),
+            "terminal participant reference is required",
+        )
+        .expect("validated QueryTerminalSnapshot always has a participant reference")
+    }
+
     pub fn execution_id(&self) -> QueryExecutionId {
-        required_execution_id(
-            self.raw.execution_id.as_ref(),
-            FieldPath::root("query_terminal_snapshot").field("execution_id"),
-            "terminal execution id is required",
-        )
-        .expect("validated QueryTerminalSnapshot always has an execution id")
-    }
-
-    pub fn backend(&self) -> ParticipantBackendIdentity {
-        required_backend(
-            self.raw.backend.as_ref(),
-            FieldPath::root("query_terminal_snapshot").field("backend"),
-            "terminal backend identity is required",
-        )
-        .expect("validated QueryTerminalSnapshot always has a backend identity")
-    }
-
-    pub fn init_digest(&self) -> ParticipantManifestDigest {
-        ParticipantManifestDigest::try_from_slice(&self.raw.init_digest)
-            .expect("validated QueryTerminalSnapshot always has an init digest")
+        self.participant()
+            .execution_id()
+            .expect("validated QueryTerminalSnapshot participant reference has execution id")
     }
 
     pub fn fragments(&self) -> Vec<FragmentTerminalSnapshot> {
@@ -143,27 +98,19 @@ impl TerminalizationProof {
         self.raw.version
     }
 
+    pub fn participant(&self) -> ParticipantAttemptRef {
+        required_participant_attempt_ref(
+            self.raw.participant.as_ref(),
+            FieldPath::root("terminalization_proof").field("participant"),
+            "terminalization proof participant reference is required",
+        )
+        .expect("validated TerminalizationProof always has a participant reference")
+    }
+
     pub fn execution_id(&self) -> QueryExecutionId {
-        required_execution_id(
-            self.raw.execution_id.as_ref(),
-            FieldPath::root("terminalization_proof").field("execution_id"),
-            "terminalization proof execution id is required",
-        )
-        .expect("validated TerminalizationProof always has an execution id")
-    }
-
-    pub fn backend(&self) -> ParticipantBackendIdentity {
-        required_backend(
-            self.raw.backend.as_ref(),
-            FieldPath::root("terminalization_proof").field("backend"),
-            "terminalization proof backend is required",
-        )
-        .expect("validated TerminalizationProof always has a backend identity")
-    }
-
-    pub fn init_digest(&self) -> ParticipantManifestDigest {
-        ParticipantManifestDigest::try_from_slice(&self.raw.init_digest)
-            .expect("validated TerminalizationProof always has an init digest")
+        self.participant()
+            .execution_id()
+            .expect("validated TerminalizationProof participant reference has execution id")
     }
 
     pub fn fragments(&self) -> &[novarocks::TerminalizationProofFragment] {
@@ -187,27 +134,19 @@ impl NegativeAttestation {
         &self.raw
     }
 
+    pub fn participant(&self) -> ParticipantAttemptRef {
+        required_participant_attempt_ref(
+            self.raw.participant.as_ref(),
+            FieldPath::root("negative_attestation").field("participant"),
+            "negative attestation participant reference is required",
+        )
+        .expect("validated NegativeAttestation always has a participant reference")
+    }
+
     pub fn execution_id(&self) -> QueryExecutionId {
-        required_execution_id(
-            self.raw.execution_id.as_ref(),
-            FieldPath::root("negative_attestation").field("execution_id"),
-            "negative attestation execution id is required",
-        )
-        .expect("validated NegativeAttestation always has an execution id")
-    }
-
-    pub fn backend(&self) -> ParticipantBackendIdentity {
-        required_backend(
-            self.raw.backend.as_ref(),
-            FieldPath::root("negative_attestation").field("backend"),
-            "negative attestation backend is required",
-        )
-        .expect("validated NegativeAttestation always has a backend identity")
-    }
-
-    pub fn init_digest(&self) -> ParticipantManifestDigest {
-        ParticipantManifestDigest::try_from_slice(&self.raw.init_digest)
-            .expect("validated NegativeAttestation always has an init digest")
+        self.participant()
+            .execution_id()
+            .expect("validated NegativeAttestation participant reference has execution id")
     }
 
     pub fn reason(&self) -> novarocks::NegativeAttestationReason {
@@ -335,12 +274,12 @@ impl ParticipantTerminalOutcome {
         }
     }
 
-    pub fn backend(&self) -> ParticipantBackendIdentity {
+    pub fn participant(&self) -> ParticipantAttemptRef {
         match self.raw.outcome.as_ref() {
             Some(novarocks::participant_terminal_outcome::Outcome::Proof(proof)) => {
                 TerminalizationProof::parse(proof.clone())
                     .expect("validated ParticipantTerminalOutcome always has a valid proof")
-                    .backend()
+                    .participant()
             }
             Some(novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(
                 attestation,
@@ -348,36 +287,9 @@ impl ParticipantTerminalOutcome {
                 .expect(
                     "validated ParticipantTerminalOutcome always has a valid negative attestation",
                 )
-                .backend(),
+                .participant(),
             None => unreachable!("validated ParticipantTerminalOutcome always has an outcome"),
         }
-    }
-
-    pub fn init_digest(&self) -> ParticipantManifestDigest {
-        match self.raw.outcome.as_ref() {
-            Some(novarocks::participant_terminal_outcome::Outcome::Proof(proof)) => {
-                TerminalizationProof::parse(proof.clone())
-                    .expect("validated ParticipantTerminalOutcome always has a valid proof")
-                    .init_digest()
-            }
-            Some(novarocks::participant_terminal_outcome::Outcome::NegativeAttestation(
-                attestation,
-            )) => NegativeAttestation::parse(attestation.clone())
-                .expect(
-                    "validated ParticipantTerminalOutcome always has a valid negative attestation",
-                )
-                .init_digest(),
-            None => unreachable!("validated ParticipantTerminalOutcome always has an outcome"),
-        }
-    }
-
-    /// Computes the canonical content ID of the complete terminal outcome.
-    ///
-    /// Callers that need idempotency or conflict comparisons must compute this
-    /// once at their admission boundary and retain the returned value; this
-    /// codec deliberately does not cache role-local state.
-    pub fn content_id(&self) -> Result<TerminalOutcomeContentId, ProtocolError> {
-        TerminalOutcomeContentId::compute(self)
     }
 }
 
@@ -744,23 +656,10 @@ fn validate_snapshot(
             "unsupported query terminal snapshot version",
         ));
     }
-    validate_execution(
-        raw.execution_id.as_ref(),
-        path.field("execution_id"),
-        "terminal execution id is required",
-    )?;
-    validate_backend(
-        required_ref(
-            raw.backend.as_ref(),
-            path.field("backend"),
-            "terminal backend identity is required",
-        )?,
-        path.field("backend"),
-    )?;
-    require_digest_len(
-        &raw.init_digest,
-        path.field("init_digest"),
-        "participant manifest digest must be 32 bytes",
+    required_participant_attempt_ref(
+        raw.participant.as_ref(),
+        path.field("participant"),
+        "terminal participant reference is required",
     )?;
     validate_sorted_unique_ids(
         &raw.fragments,
@@ -792,23 +691,10 @@ fn validate_proof(
             "unsupported terminalization proof version",
         ));
     }
-    validate_execution(
-        raw.execution_id.as_ref(),
-        path.field("execution_id"),
-        "terminalization proof execution id is required",
-    )?;
-    validate_backend(
-        required_ref(
-            raw.backend.as_ref(),
-            path.field("backend"),
-            "terminalization proof backend is required",
-        )?,
-        path.field("backend"),
-    )?;
-    require_digest_len(
-        &raw.init_digest,
-        path.field("init_digest"),
-        "participant manifest digest must be 32 bytes",
+    required_participant_attempt_ref(
+        raw.participant.as_ref(),
+        path.field("participant"),
+        "terminalization proof participant reference is required",
     )?;
     validate_sorted_unique_ids(
         &raw.fragments,
@@ -826,23 +712,10 @@ fn validate_attestation(
     raw: &novarocks::NegativeAttestation,
     path: FieldPath,
 ) -> Result<(), ProtocolError> {
-    validate_execution(
-        raw.execution_id.as_ref(),
-        path.field("execution_id"),
-        "negative attestation execution id is required",
-    )?;
-    validate_backend(
-        required_ref(
-            raw.backend.as_ref(),
-            path.field("backend"),
-            "negative attestation backend is required",
-        )?,
-        path.field("backend"),
-    )?;
-    require_digest_len(
-        &raw.init_digest,
-        path.field("init_digest"),
-        "participant manifest digest must be 32 bytes",
+    required_participant_attempt_ref(
+        raw.participant.as_ref(),
+        path.field("participant"),
+        "negative attestation participant reference is required",
     )?;
     validate_attestation_reason(raw.reason, path.field("reason"))?;
     validate_bounded_string(
@@ -1282,10 +1155,7 @@ fn verify_proof_matches_snapshot(
     snapshot: &novarocks::QueryTerminalSnapshot,
     path: FieldPath,
 ) -> Result<(), ProtocolError> {
-    if proof.execution_id != snapshot.execution_id
-        || proof.backend != snapshot.backend
-        || proof.init_digest != snapshot.init_digest
-    {
+    if proof.participant != snapshot.participant {
         return Err(error(
             path.field("outcome").field("proof"),
             ProtocolErrorKind::InconsistentFields,
@@ -1322,29 +1192,6 @@ fn verify_proof_matches_snapshot(
     Ok(())
 }
 
-fn validate_execution(
-    raw: Option<&novarocks::QueryExecutionId>,
-    path: FieldPath,
-    required: &'static str,
-) -> Result<(), ProtocolError> {
-    required_execution_id(raw, path, required).map(|_| ())
-}
-
-fn required_execution_id(
-    raw: Option<&novarocks::QueryExecutionId>,
-    path: FieldPath,
-    required: &'static str,
-) -> Result<QueryExecutionId, ProtocolError> {
-    let raw = required_ref(raw, path.clone(), required)?;
-    decode_query_execution_id(raw).map_err(|error| {
-        ProtocolError::new(
-            path.append_segments(error.path().segments().iter().skip(1).cloned()),
-            error.kind(),
-            error.detail(),
-        )
-    })
-}
-
 fn validate_backend(
     raw: &novarocks::ParticipantBackendIdentity,
     path: FieldPath,
@@ -1360,13 +1207,13 @@ fn validate_backend(
         })
 }
 
-fn required_backend(
-    raw: Option<&novarocks::ParticipantBackendIdentity>,
+fn required_participant_attempt_ref(
+    raw: Option<&novarocks::ParticipantAttemptRef>,
     path: FieldPath,
     required: &'static str,
-) -> Result<ParticipantBackendIdentity, ProtocolError> {
+) -> Result<ParticipantAttemptRef, ProtocolError> {
     let raw = required_ref(raw, path, required)?;
-    ParticipantBackendIdentity::parse(raw.clone())
+    ParticipantAttemptRef::parse(raw.clone())
 }
 
 fn validate_attestation_reason(value: i32, path: FieldPath) -> Result<(), ProtocolError> {
@@ -1497,18 +1344,6 @@ fn validate_bounded_string(
     }
 }
 
-fn require_digest_len(
-    value: &[u8],
-    path: FieldPath,
-    detail: &'static str,
-) -> Result<(), ProtocolError> {
-    if value.len() == 32 {
-        Ok(())
-    } else {
-        Err(error(path, ProtocolErrorKind::InvalidValue, detail))
-    }
-}
-
 fn required_ref<'a, T>(
     raw: Option<&'a T>,
     path: FieldPath,
@@ -1572,6 +1407,13 @@ mod tests {
         }
     }
 
+    fn participant_ref() -> novarocks::ParticipantAttemptRef {
+        novarocks::ParticipantAttemptRef {
+            execution_id: Some(execution()),
+            backend_process_id: backend().process_id,
+        }
+    }
+
     fn profile() -> novarocks::FragmentTerminalProfileTelemetry {
         novarocks::FragmentTerminalProfileTelemetry {
             telemetry: Some(
@@ -1598,8 +1440,7 @@ mod tests {
 
     fn snapshot_raw() -> novarocks::QueryTerminalSnapshot {
         novarocks::QueryTerminalSnapshot {
-            version: QUERY_TERMINAL_SNAPSHOT_VERSION_V1, execution_id: Some(execution()), backend: Some(backend()),
-            init_digest: vec![7; 32], fragments: vec![fragment(1)],
+            version: QUERY_TERMINAL_SNAPSHOT_VERSION_V1, participant: Some(participant_ref()), fragments: vec![fragment(1)],
             profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry { telemetry: Some(novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(novarocks::TerminalTelemetryUnavailable { stage: "observation".into(), code: "BUDGET_EXHAUSTED".into() })) }),
         }
     }
@@ -1700,9 +1541,7 @@ mod tests {
         let snapshot = QueryTerminalSnapshot::parse(snapshot_raw()).expect("snapshot");
         let raw = novarocks::TerminalizationProof {
             version: TERMINALIZATION_PROOF_VERSION_V1,
-            execution_id: Some(execution()),
-            backend: Some(backend()),
-            init_digest: vec![7; 32],
+            participant: Some(participant_ref()),
             fragments: vec![novarocks::TerminalizationProofFragment {
                 fragment_instance_id: Some(common::UniqueId { hi: 0, lo: 1 }),
                 backend_num: 0,
@@ -1712,8 +1551,7 @@ mod tests {
         };
         let proof = TerminalizationProof::parse(raw).expect("P0 proof");
         assert_eq!(snapshot.execution_id().query_id().high(), 1);
-        assert!(snapshot.backend().process_id().is_ok());
-        assert_eq!(snapshot.init_digest().as_bytes(), &[7; 32]);
+        assert!(snapshot.participant().backend_process_id().is_ok());
         assert_eq!(snapshot.fragments()[0].fragment_instance_id().lo, 1);
         assert_eq!(snapshot.fragments()[0].backend_num(), 0);
         assert_eq!(
@@ -1722,8 +1560,7 @@ mod tests {
         );
 
         assert_eq!(proof.execution_id(), snapshot.execution_id());
-        assert_eq!(proof.backend(), snapshot.backend());
-        assert_eq!(proof.init_digest(), snapshot.init_digest());
+        assert_eq!(proof.participant(), snapshot.participant());
         assert_eq!(proof.fragments().len(), 1);
 
         let outcome = ParticipantTerminalOutcome::parse(novarocks::ParticipantTerminalOutcome {
@@ -1737,12 +1574,7 @@ mod tests {
         assert!(outcome.snapshot().is_some());
         assert!(outcome.negative_attestation().is_none());
         assert_eq!(outcome.execution_id(), snapshot.execution_id());
-        assert_eq!(outcome.backend(), snapshot.backend());
-        assert_eq!(outcome.init_digest(), snapshot.init_digest());
-        assert_eq!(
-            outcome.content_id().expect("canonical content id"),
-            TerminalOutcomeContentId::compute(&outcome).expect("same canonical content id")
-        );
+        assert_eq!(outcome.participant(), snapshot.participant());
         let decoded = ParticipantTerminalOutcome::parse(
             novarocks::ParticipantTerminalOutcome::decode(
                 outcome.as_proto().encode_to_vec().as_slice(),
@@ -1750,10 +1582,7 @@ mod tests {
             .expect("generated outcome round trip"),
         )
         .expect("redecoded outcome");
-        assert_eq!(
-            outcome.content_id().expect("original content id"),
-            decoded.content_id().expect("redecoded content id")
-        );
+        assert_eq!(outcome, decoded);
 
         let mut changed_raw = outcome.as_proto().clone();
         let snapshot = changed_raw
@@ -1772,19 +1601,14 @@ mod tests {
         };
         unavailable.code.push('X');
         let changed = ParticipantTerminalOutcome::parse(changed_raw).expect("changed outcome");
-        assert_ne!(
-            outcome.content_id().expect("original content id"),
-            changed.content_id().expect("changed content id")
-        );
+        assert_ne!(outcome, changed);
     }
 
     #[test]
     fn p0_p1_and_p2_negative_fixtures_fail_closed() {
         let invalid_p0 = novarocks::TerminalizationProof {
             version: TERMINALIZATION_PROOF_VERSION_V1,
-            execution_id: Some(execution()),
-            backend: Some(backend()),
-            init_digest: vec![7; 32],
+            participant: Some(participant_ref()),
             fragments: vec![novarocks::TerminalizationProofFragment {
                 fragment_instance_id: Some(common::UniqueId { hi: 0, lo: 1 }),
                 backend_num: 0,
@@ -1799,17 +1623,14 @@ mod tests {
         assert!(QueryTerminalSnapshot::parse(missing_p2).is_err());
 
         let attestation = NegativeAttestation::parse(novarocks::NegativeAttestation {
-            execution_id: Some(execution()),
-            backend: Some(backend()),
-            init_digest: vec![7; 32],
+            participant: Some(participant_ref()),
             reason: novarocks::NegativeAttestationReason::AttemptAborted as i32,
             detail: "aborted".into(),
             ..Default::default()
         })
         .expect("negative attestation");
         assert_eq!(attestation.execution_id().query_id().low(), 2);
-        assert!(attestation.backend().process_id().is_ok());
-        assert_eq!(attestation.init_digest().as_bytes(), &[7; 32]);
+        assert!(attestation.participant().backend_process_id().is_ok());
         assert_eq!(
             attestation.reason(),
             novarocks::NegativeAttestationReason::AttemptAborted

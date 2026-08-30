@@ -290,33 +290,94 @@ fn retired_terminal_self_attestation_fields_remain_reserved() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
 
-    for (message_name, field_number) in [
-        ("novarocks.QueryTerminalSnapshot", 5),
-        ("novarocks.TerminalizationProof", 5),
-        ("novarocks.NegativeAttestation", 7),
+    for (message_name, field_numbers, field_names, participant_field) in [
+        (
+            "novarocks.QueryTerminalSnapshot",
+            &[2, 3, 4, 5][..],
+            &["execution_id", "backend", "init_digest", "digest"][..],
+            8,
+        ),
+        (
+            "novarocks.TerminalizationProof",
+            &[2, 3, 4, 5][..],
+            &["execution_id", "backend", "init_digest", "digest"][..],
+            7,
+        ),
+        (
+            "novarocks.NegativeAttestation",
+            &[1, 2, 3, 7][..],
+            &["execution_id", "backend", "init_digest", "digest"][..],
+            8,
+        ),
+        (
+            "novarocks.QueryControlTerminalAck",
+            &[1, 2, 3, 4][..],
+            &[
+                "execution_id",
+                "init_digest",
+                "snapshot_version",
+                "snapshot_digest",
+            ][..],
+            5,
+        ),
     ] {
         let message = pool
             .get_message_by_name(message_name)
             .unwrap_or_else(|| panic!("{message_name} descriptor"));
-        assert!(
-            message
-                .reserved_ranges()
-                .any(|range| range.contains(&field_number)),
-            "{message_name} field {field_number} must remain reserved"
-        );
-        assert!(
-            message.reserved_names().any(|name| name == "digest"),
-            "{message_name} digest name must remain reserved"
-        );
-        assert!(
-            message.fields().all(|field| field.number() != field_number),
-            "{message_name} must not reuse retired digest tag {field_number}"
-        );
-        assert!(
-            message.fields().all(|field| field.name() != "digest"),
-            "{message_name} must not reuse retired digest name"
+        for field_number in field_numbers {
+            assert!(
+                message
+                    .reserved_ranges()
+                    .any(|range| range.contains(field_number)),
+                "{message_name} field {field_number} must remain reserved"
+            );
+            assert!(
+                message
+                    .fields()
+                    .all(|field| field.number() != *field_number),
+                "{message_name} must not reuse retired tag {field_number}"
+            );
+        }
+        for field_name in field_names {
+            assert!(
+                message.reserved_names().any(|name| name == *field_name),
+                "{message_name} field name {field_name} must remain reserved"
+            );
+            assert!(
+                message.fields().all(|field| field.name() != *field_name),
+                "{message_name} must not reuse retired name {field_name}"
+            );
+        }
+        let participant = message
+            .get_field(participant_field)
+            .unwrap_or_else(|| panic!("{message_name} participant field"));
+        assert_eq!(participant.name(), "participant");
+        assert_eq!(
+            participant
+                .kind()
+                .as_message()
+                .map(|message| message.full_name()),
+            Some("novarocks.ParticipantAttemptRef".into())
         );
     }
+}
+
+#[test]
+fn participant_attempt_ref_has_only_allocated_identity_leaves() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let message = pool
+        .get_message_by_name("novarocks.ParticipantAttemptRef")
+        .expect("ParticipantAttemptRef descriptor");
+    assert_eq!(message.fields().count(), 2);
+    assert_eq!(
+        message.get_field(1).expect("execution field").name(),
+        "execution_id"
+    );
+    assert_eq!(
+        message.get_field(2).expect("process field").name(),
+        "backend_process_id"
+    );
 }
 
 #[test]

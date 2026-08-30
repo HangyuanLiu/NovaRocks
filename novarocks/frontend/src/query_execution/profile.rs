@@ -381,13 +381,15 @@ fn runtime_filter_profile_tree(
     totals: RuntimeFilterProfileTotals,
 ) -> Result<RuntimeProfileTree, DistributedQueryError> {
     let execution_id = snapshot.execution_id();
-    let backend = snapshot.backend();
-    let process_id = backend.process_id().map_err(|error| {
-        DistributedQueryError::new(
-            DistributedQueryErrorKind::ContractViolation,
-            error.to_string(),
-        )
-    })?;
+    let process_id = snapshot
+        .participant()
+        .backend_process_id()
+        .map_err(|error| {
+            DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                error.to_string(),
+            )
+        })?;
     let participant = RuntimeProfile::new(format!(
         "RuntimeFilterParticipant (process_id={process_id})"
     ));
@@ -1144,17 +1146,10 @@ mod tests {
                 .expect("execution id");
         QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id)),
-            backend: Some(novarocks::ParticipantBackendIdentity {
-                endpoint: Some(novarocks::QueryControlEndpoint {
-                    host: "127.0.0.1".to_string(),
-                    port: 19_000_u16
-                        .checked_add(participant_seed as u16)
-                        .expect("test port") as u32,
-                }),
-                process_id: Some(test_backend_process_id(participant_seed)),
+            participant: Some(novarocks::ParticipantAttemptRef {
+                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id)),
+                backend_process_id: Some(test_backend_process_id(participant_seed)),
             }),
-            init_digest: vec![participant_seed as u8; 32],
             fragments: Vec::new(),
             profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
@@ -1267,18 +1262,16 @@ mod tests {
     fn profile_terminal_builder_ignores_canonical_empty_contribution() {
         let snapshot = QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-                QueryExecutionId::new(QueryId::new(10, 20), AttemptId::new(1).expect("attempt id"))
+            participant: Some(novarocks::ParticipantAttemptRef {
+                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
+                    QueryExecutionId::new(
+                        QueryId::new(10, 20),
+                        AttemptId::new(1).expect("attempt id"),
+                    )
                     .expect("execution id"),
-            )),
-            backend: Some(novarocks::ParticipantBackendIdentity {
-                endpoint: Some(novarocks::QueryControlEndpoint {
-                    host: "127.0.0.1".to_string(),
-                    port: 19_001,
-                }),
-                process_id: Some(test_backend_process_id(1)),
+                )),
+                backend_process_id: Some(test_backend_process_id(1)),
             }),
-            init_digest: vec![1; 32],
             profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
                     novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(

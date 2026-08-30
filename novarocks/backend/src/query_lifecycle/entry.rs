@@ -22,7 +22,7 @@ use std::time::Instant;
 use novarocks_proto_codec::lifecycle::{
     FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifest,
     ParticipantManifestDigest, ParticipantTerminalOutcome, QueryControlEvent, QueryInitOutcome,
-    QueryTerminalSnapshot, QueryTerminationReason, StageDigest, TerminalOutcomeContentId,
+    QueryTerminalSnapshot, QueryTerminationReason, StageDigest,
 };
 use novarocks_spi::connector::CatalogProperties;
 use novarocks_types::UniqueId;
@@ -142,10 +142,6 @@ pub(crate) struct QueryLifecycleEntryState {
     /// The immutable delivery carrier is always retained, including when P1
     /// snapshot formation failed and only a negative attestation is available.
     pub(crate) terminal_outcome: Option<ParticipantTerminalOutcome>,
-    /// Computed exactly once when the immutable delivery carrier is admitted.
-    /// Retransmission, conflict checks, and acknowledgement release read this
-    /// retained canonical content identity rather than hashing the outcome.
-    pub(crate) terminal_content_id: Option<TerminalOutcomeContentId>,
     pub(crate) pre_start_deadline: Option<Instant>,
     pub(crate) last_heartbeat: Option<Instant>,
     pub(crate) frontend_owner_epoch: Option<u64>,
@@ -210,7 +206,6 @@ impl QueryLifecycleEntry {
                 terminal_freeze_in_flight: false,
                 terminal_record: None,
                 terminal_outcome: None,
-                terminal_content_id: None,
                 pre_start_deadline: None,
                 last_heartbeat: None,
                 frontend_owner_epoch: None,

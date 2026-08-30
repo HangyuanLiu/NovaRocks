@@ -150,6 +150,13 @@ message ParticipantBackendIdentity {
   BackendProcessId process_id = 4;
 }
 
+// The immutable identity of one admitted query participant. Endpoint and
+// scheduler ordinal are routing facts, not participant identity.
+message ParticipantAttemptRef {
+  QueryExecutionId execution_id = 1;
+  BackendProcessId backend_process_id = 2;
+}
+
 message ExchangeRouteManifest {
   novarocks.common.UniqueId source_fragment_instance_id = 1;
   novarocks.common.UniqueId destination_fragment_instance_id = 2;
@@ -310,10 +317,9 @@ message QueryControlAbort {
 message QueryControlFinalize {}
 
 message QueryControlTerminalAck {
-  QueryExecutionId execution_id = 1;
-  bytes init_digest = 2;
-  uint32 snapshot_version = 3;
-  bytes snapshot_digest = 4;
+  reserved 1, 2, 3, 4;
+  reserved "execution_id", "init_digest", "snapshot_version", "snapshot_digest";
+  ParticipantAttemptRef participant = 5;
 }
 
 message QueryControlRequest {
@@ -587,13 +593,11 @@ message QueryTerminalProfileContributionTelemetry {
 
 message QueryTerminalSnapshot {
   uint32 version = 1;
-  QueryExecutionId execution_id = 2;
-  ParticipantBackendIdentity backend = 3;
-  bytes init_digest = 4;
-  reserved 5;
-  reserved "digest";
+  reserved 2, 3, 4, 5;
+  reserved "execution_id", "backend", "init_digest", "digest";
   repeated QueryTerminalFragmentSnapshot fragments = 6;
   QueryTerminalProfileContributionTelemetry profile_contribution = 7;
+  ParticipantAttemptRef participant = 8;
 }
 
 message TerminalizationProofFragment {
@@ -609,12 +613,10 @@ message TerminalizationProofFragment {
 // P1 evidence or P2 telemetry cannot be retained.
 message TerminalizationProof {
   uint32 version = 1;
-  QueryExecutionId execution_id = 2;
-  ParticipantBackendIdentity backend = 3;
-  bytes init_digest = 4;
-  reserved 5;
-  reserved "digest";
+  reserved 2, 3, 4, 5;
+  reserved "execution_id", "backend", "init_digest", "digest";
   repeated TerminalizationProofFragment fragments = 6;
+  ParticipantAttemptRef participant = 7;
 }
 
 enum NegativeAttestationReason {
@@ -627,14 +629,12 @@ enum NegativeAttestationReason {
 }
 
 message NegativeAttestation {
-  QueryExecutionId execution_id = 1;
-  ParticipantBackendIdentity backend = 2;
-  bytes init_digest = 3;
+  reserved 1, 2, 3, 7;
+  reserved "execution_id", "backend", "init_digest", "digest";
   NegativeAttestationReason reason = 4;
   string detail = 5;
   bool detail_truncated = 6;
-  reserved 7;
-  reserved "digest";
+  ParticipantAttemptRef participant = 8;
 }
 
 message ParticipantTerminalOutcome {

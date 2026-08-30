@@ -959,19 +959,14 @@ mod tests {
     ) -> QueryTerminalSnapshot {
         QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-                execution_id(),
-            )),
-            backend: Some(novarocks::ParticipantBackendIdentity {
-                endpoint: Some(novarocks::QueryControlEndpoint {
-                    host: "127.0.0.1".to_string(),
-                    port: 9030,
-                }),
-                process_id: Some(novarocks::BackendProcessId {
+            participant: Some(novarocks::ParticipantAttemptRef {
+                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
+                    execution_id(),
+                )),
+                backend_process_id: Some(novarocks::BackendProcessId {
                     value: BackendProcessId::new_v7().to_bytes().to_vec(),
                 }),
             }),
-            init_digest: vec![9; 32],
             fragments: vec![writer_terminal_fragment()],
             profile_contribution: Some(profile_contribution),
         })

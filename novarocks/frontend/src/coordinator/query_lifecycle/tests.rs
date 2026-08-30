@@ -68,17 +68,10 @@ use crate::coordinator::query_registry::{
 fn terminal_outcome(
     snapshot: protocol_lifecycle::QueryTerminalSnapshot,
 ) -> protocol_lifecycle::ParticipantTerminalOutcome {
-    let execution_id = snapshot.execution_id();
-    let backend = snapshot.backend();
-    let init_digest = snapshot.init_digest().as_bytes().to_vec();
     let proof = protocol_lifecycle::TerminalizationProof::parse(proto::TerminalizationProof {
         version: 1,
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            execution_id,
-        )),
-        backend: Some(backend.as_proto().clone()),
-        init_digest,
         fragments: Vec::new(),
+        participant: Some(snapshot.participant().as_proto().clone()),
     })
     .expect("protocol terminal proof");
     protocol_lifecycle::ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {
@@ -93,15 +86,15 @@ fn terminal_outcome(
 fn terminal_snapshot(
     execution_id: QueryExecutionId,
     backend: ParticipantBackendIdentity,
-    digest: protocol_lifecycle::ParticipantManifestDigest,
+    _digest: protocol_lifecycle::ParticipantManifestDigest,
 ) -> protocol_lifecycle::QueryTerminalSnapshot {
+    let participant = protocol_lifecycle::ParticipantAttemptRef::new(
+        execution_id,
+        backend.process_id().expect("fixture backend process id"),
+    )
+    .expect("fixture participant attempt reference");
     protocol_lifecycle::QueryTerminalSnapshot::parse(proto::QueryTerminalSnapshot {
         version: 1,
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            execution_id,
-        )),
-        backend: Some(backend.as_proto().clone()),
-        init_digest: digest.as_bytes().to_vec(),
         fragments: Vec::new(),
         profile_contribution: Some(proto::QueryTerminalProfileContributionTelemetry {
             telemetry: Some(
@@ -113,6 +106,7 @@ fn terminal_snapshot(
                 ),
             ),
         }),
+        participant: Some(participant.as_proto().clone()),
     })
     .expect("protocol terminal snapshot")
 }
@@ -120,17 +114,18 @@ fn terminal_snapshot(
 fn negative_attestation_outcome(
     execution_id: QueryExecutionId,
     backend: ParticipantBackendIdentity,
-    digest: protocol_lifecycle::ParticipantManifestDigest,
+    _digest: protocol_lifecycle::ParticipantManifestDigest,
 ) -> protocol_lifecycle::ParticipantTerminalOutcome {
+    let participant = protocol_lifecycle::ParticipantAttemptRef::new(
+        execution_id,
+        backend.process_id().expect("fixture backend process id"),
+    )
+    .expect("fixture participant attempt reference");
     let attestation = protocol_lifecycle::NegativeAttestation::parse(proto::NegativeAttestation {
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            execution_id,
-        )),
-        backend: Some(backend.as_proto().clone()),
-        init_digest: digest.as_bytes().to_vec(),
         reason: proto::NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted as i32,
         detail: "terminal evidence retention exhausted".to_string(),
         detail_truncated: false,
+        participant: Some(participant.as_proto().clone()),
     })
     .expect("protocol negative attestation");
     protocol_lifecycle::ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {
@@ -244,18 +239,8 @@ fn protocol_abort_command(reason: impl Into<String>) -> protocol_lifecycle::Quer
 fn protocol_terminal_ack_command(
     outcome: &protocol_lifecycle::ParticipantTerminalOutcome,
 ) -> protocol_lifecycle::QueryControlCommand {
-    let snapshot = outcome.snapshot().expect("fixture terminal snapshot");
     let ack = protocol_lifecycle::QueryTerminalAck::parse(proto::QueryControlTerminalAck {
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            outcome.execution_id(),
-        )),
-        init_digest: outcome.init_digest().as_bytes().to_vec(),
-        snapshot_version: snapshot.version(),
-        snapshot_digest: outcome
-            .content_id()
-            .expect("fixture terminal outcome content id")
-            .as_bytes()
-            .to_vec(),
+        participant: Some(outcome.participant().as_proto().clone()),
     })
     .expect("protocol terminal acknowledgement");
     protocol_command(proto::query_control_request::Command::TerminalAck(
@@ -521,7 +506,7 @@ struct RecordingSession {
 #[derive(Default)]
 struct RecordingSessionState {
     commands: Vec<QueryControlCommand>,
-    terminal_ack_digests: Vec<Vec<u8>>,
+    terminal_ack_participants: Vec<proto::ParticipantAttemptRef>,
     events: VecDeque<Result<protocol_lifecycle::QueryControlEvent, QueryLifecycleTransportError>>,
     send_errors: VecDeque<QueryLifecycleTransportError>,
     terminal_snapshot: Option<protocol_lifecycle::QueryTerminalSnapshot>,
@@ -569,12 +554,12 @@ impl RecordingSession {
             .clone()
     }
 
-    fn terminal_ack_digests(&self) -> Vec<Vec<u8>> {
+    fn terminal_ack_participants(&self) -> Vec<proto::ParticipantAttemptRef> {
         self.state
             .0
             .lock()
             .expect("recording session lock")
-            .terminal_ack_digests
+            .terminal_ack_participants
             .clone()
     }
 
@@ -654,7 +639,11 @@ impl QueryControlSession for RecordingSession {
         if let Some(proto::query_control_request::Command::TerminalAck(ack)) =
             command.as_proto().command.as_ref()
         {
-            state.terminal_ack_digests.push(ack.snapshot_digest.clone());
+            state.terminal_ack_participants.push(
+                ack.participant
+                    .clone()
+                    .expect("validated terminal receipt has participant reference"),
+            );
         }
         let terminal = match command.as_proto().command.as_ref() {
             Some(proto::query_control_request::Command::Abort(_)) => {
@@ -1330,26 +1319,17 @@ fn frontend_negative_attestation_is_deduplicated_and_surfaces_as_terminal_input(
         participant.digest,
     );
 
-    let expected_content_id = outcome
-        .content_id()
-        .expect("fixture terminal outcome content id");
     let first = control
         .store_terminal_outcome(outcome.clone())
         .expect("attestation is stored");
-    assert!(matches!(first, TerminalOutcomeStoreOutcome::Accepted(_)));
-    assert_eq!(first.content_id(), expected_content_id);
+    assert!(matches!(first, TerminalOutcomeStoreOutcome::Accepted));
     let retry = control
         .store_terminal_outcome(outcome)
         .expect("same attestation retry is idempotent");
     assert!(matches!(
         retry,
-        TerminalOutcomeStoreOutcome::AlreadyAccepted(_)
+        TerminalOutcomeStoreOutcome::AlreadyAccepted
     ));
-    assert_eq!(
-        retry.content_id(),
-        expected_content_id,
-        "retries must use the original retained terminal content id"
-    );
     let outcomes = control.terminal_outcomes_for_test();
     assert_eq!(outcomes.len(), 1);
     assert_eq!(
@@ -1374,7 +1354,28 @@ fn frontend_negative_attestation_is_deduplicated_and_surfaces_as_terminal_input(
 }
 
 #[test]
-fn frontend_terminal_ack_reuses_the_retained_content_id_for_retries() {
+fn frontend_unary_terminal_ingress_reuses_the_stream_first_wins_store() {
+    let (control, _session, participant) = observation_control(0);
+    let manifest = participant.request.manifest().expect("fixture manifest");
+    let outcome = terminal_outcome(terminal_snapshot(
+        manifest.execution_id().expect("fixture execution id"),
+        manifest.backend().expect("fixture backend"),
+        participant.digest,
+    ));
+
+    assert!(
+        ActiveQueryAttemptControl::report_terminal_outcome(control.as_ref(), outcome.clone())
+            .expect("unary terminal outcome is admitted")
+    );
+    assert!(
+        !ActiveQueryAttemptControl::report_terminal_outcome(control.as_ref(), outcome)
+            .expect("exact unary retry is idempotent")
+    );
+    assert_eq!(control.terminal_outcomes_for_test().len(), 1);
+}
+
+#[test]
+fn frontend_terminal_receipt_reuses_the_participant_attempt_ref_for_retries() {
     let (control, _fixture_session, participant) = observation_control(0);
     let recorder = RecordingSession::with_events([]);
     let session = ActiveSession::new(
@@ -1388,11 +1389,7 @@ fn frontend_terminal_ack_reuses_the_retained_content_id_for_retries() {
         manifest.backend().expect("fixture backend"),
         participant.digest,
     ));
-    let expected_content_id = outcome
-        .content_id()
-        .expect("fixture terminal outcome content id")
-        .as_bytes()
-        .to_vec();
+    let expected_participant = outcome.participant().as_proto().clone();
     let event = protocol_terminal_outcome_event(outcome);
 
     control
@@ -1403,10 +1400,60 @@ fn frontend_terminal_ack_reuses_the_retained_content_id_for_retries() {
         .expect("duplicate terminal outcome is acknowledged");
 
     assert_eq!(
-        recorder.terminal_ack_digests(),
-        vec![expected_content_id.clone(), expected_content_id],
-        "terminal ACKs must use the content id retained by the first admission"
+        recorder.terminal_ack_participants(),
+        vec![expected_participant.clone(), expected_participant],
+        "terminal receipts must identify the participant admitted by the first outcome"
     );
+}
+
+#[test]
+fn frontend_negative_attestation_uses_the_same_identity_receipt() {
+    let (control, _fixture_session, participant) = observation_control(0);
+    let recorder = RecordingSession::with_events([]);
+    let session = ActiveSession::new(
+        participant.target,
+        participant.digest,
+        Arc::new(recorder.clone()),
+    );
+    let manifest = participant.request.manifest().expect("fixture manifest");
+    let outcome = negative_attestation_outcome(
+        manifest.execution_id().expect("fixture execution id"),
+        manifest.backend().expect("fixture backend"),
+        participant.digest,
+    );
+    let expected_participant = outcome.participant().as_proto().clone();
+
+    control
+        .handle_control_event(&session, protocol_terminal_outcome_event(outcome))
+        .expect("negative attestation is stored before the same receipt is sent");
+
+    assert_eq!(
+        recorder.terminal_ack_participants(),
+        vec![expected_participant],
+        "negative attestations must not require a snapshot-specific acknowledgement"
+    );
+}
+
+#[test]
+fn frontend_terminal_receipt_rejects_outcome_from_a_foreign_control_process() {
+    let (control, session, participant) = observation_control(0);
+    let manifest = participant.request.manifest().expect("fixture manifest");
+    let foreign_backend = ParticipantBackendIdentity::new(
+        BackendProcessId::new_v7(),
+        QueryControlEndpoint::new("127.0.0.1", 9910).expect("fixture endpoint"),
+    )
+    .expect("foreign backend identity");
+    let foreign = negative_attestation_outcome(
+        manifest.execution_id().expect("fixture execution id"),
+        foreign_backend,
+        participant.digest,
+    );
+
+    let error = control
+        .handle_control_event(&session, protocol_terminal_outcome_event(foreign))
+        .expect_err("a stream cannot deliver another process's terminal outcome");
+    assert!(error.contains("participant process differs"));
+    assert!(control.terminal_outcomes_for_test().is_empty());
 }
 
 #[test]

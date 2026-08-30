@@ -1256,16 +1256,7 @@ fn terminal_ack_from_outcome(
         .expect("registry emitted a Protocol-valid terminal outcome");
     novarocks_proto_codec::lifecycle::QueryTerminalAck::parse(
         proto_novarocks::QueryControlTerminalAck {
-            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-                outcome.execution_id(),
-            )),
-            init_digest: outcome.init_digest().as_bytes().to_vec(),
-            snapshot_version: 1,
-            snapshot_digest: outcome
-                .content_id()
-                .expect("validated terminal outcome has a content ID")
-                .as_bytes()
-                .to_vec(),
+            participant: Some(outcome.participant().as_proto().clone()),
         },
     )
     .expect("terminal outcome forms a valid acknowledgement")
@@ -1996,6 +1987,37 @@ fn query_lifecycle_drain_and_snapshot_survive_saturated_heartbeat_queue() {
             }
         }
     };
+    let mut foreign_outcome = outcome.clone();
+    let foreign_process_id = proto_novarocks::BackendProcessId {
+        value: BackendProcessId::new_v7().to_bytes().to_vec(),
+    };
+    foreign_outcome
+        .snapshot
+        .as_mut()
+        .expect("proof retains snapshot")
+        .participant
+        .as_mut()
+        .expect("snapshot retains participant")
+        .backend_process_id = Some(foreign_process_id.clone());
+    let Some(proto_novarocks::participant_terminal_outcome::Outcome::Proof(proof)) =
+        foreign_outcome.outcome.as_mut()
+    else {
+        panic!("expected proof terminal outcome");
+    };
+    proof
+        .participant
+        .as_mut()
+        .expect("proof retains participant")
+        .backend_process_id = Some(foreign_process_id);
+    assert_eq!(
+        attachment
+            .control
+            .terminal_ack(terminal_ack_from_outcome(foreign_outcome))
+            .expect_err("foreign participant ACK must not release terminal evidence")
+            .code(),
+        QueryLifecycleErrorCode::StaleBackend
+    );
+    assert_eq!(registry.metrics_snapshot().terminal_retained, 1);
     attachment
         .control
         .terminal_ack(terminal_ack_from_outcome(outcome))
@@ -2512,8 +2534,10 @@ fn running_fragment_failure_drains_and_freezes_a_failed_terminal_snapshot() {
     };
     assert_eq!(
         snapshot
+            .participant
+            .expect("snapshot participant")
             .execution_id
-            .expect("snapshot execution id")
+            .expect("participant execution id")
             .query_id
             .expect("query id")
             .lo,
