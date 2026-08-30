@@ -964,7 +964,7 @@ fn freeze_iceberg_cow_base(
     })?;
     let file_io = crate::fs_io::build_file_io_for_location(
         metadata.location(),
-        runtime.resources().planning_binding().object_store_config(),
+        runtime.resources().planning_binding().clone(),
     );
     let table = crate::iceberg::table::Table::builder()
         .identifier(identifier)

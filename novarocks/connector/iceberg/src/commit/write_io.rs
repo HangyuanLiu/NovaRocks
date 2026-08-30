@@ -70,10 +70,12 @@ pub fn build_staged_file_io(
     binding: &IcebergReadBinding,
     data_location: &str,
 ) -> Result<crate::iceberg::io::FileIO, String> {
-    let object_store = binding.object_store_binding_for_location(data_location)?;
+    binding
+        .resolve_access(data_location)
+        .map_err(|error| format!("resolve Iceberg staged output {data_location}: {error}"))?;
     Ok(crate::fs_io::build_file_io_for_location(
         data_location,
-        object_store.as_ref().map(|selected| selected.config()),
+        binding.clone(),
     ))
 }
 

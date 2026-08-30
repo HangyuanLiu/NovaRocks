@@ -40,7 +40,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(test)]
 use novarocks_fs::FileError;
-use novarocks_fs::{ConditionalCreateOutcome, FileCancellation, FileErrorKind, ObjectStoreConfig};
+use novarocks_fs::{ConditionalCreateOutcome, FileCancellation, FileErrorKind};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
@@ -133,7 +133,9 @@ enum HadoopCatalogTestFault {
 pub struct HadoopFileSystemCatalog {
     file_io: FileIO,
     warehouse_location: String,
-    object_store_config: Option<ObjectStoreConfig>,
+    /// The exact provider-owned storage capability admitted for this catalog.
+    /// It is process local and never serialized with the catalog client.
+    binding: Option<crate::access_binding::IcebergReadBinding>,
     /// Maps `"namespace/table"` to the current metadata file location.
     tables: Mutex<HashMap<String, String>>,
     #[cfg(test)]
@@ -141,20 +143,31 @@ pub struct HadoopFileSystemCatalog {
 }
 
 impl HadoopFileSystemCatalog {
-    /// Create a new catalog backed by `file_io` writing under `warehouse_location`.
+    /// Compatibility constructor for storage-free tests. Production callers
+    /// must use [`Self::new_with_binding`]. Any operation requiring a
+    /// provider filesystem capability fails closed when constructed here.
     pub fn new(file_io: FileIO, warehouse_location: String) -> Self {
-        Self::new_with_object_store_config(file_io, warehouse_location, None)
+        Self {
+            file_io,
+            warehouse_location: warehouse_location.trim_end_matches('/').to_string(),
+            binding: None,
+            tables: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_faults: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
-    pub(crate) fn new_with_object_store_config(
+    /// Create a catalog whose filesystem operations are bound to one admitted
+    /// catalog capability. This is the only production constructor.
+    pub fn new_with_binding(
         file_io: FileIO,
         warehouse_location: String,
-        object_store_config: Option<ObjectStoreConfig>,
+        binding: crate::access_binding::IcebergReadBinding,
     ) -> Self {
         Self {
             file_io,
             warehouse_location: warehouse_location.trim_end_matches('/').to_string(),
-            object_store_config,
+            binding: Some(binding),
             tables: Mutex::new(HashMap::new()),
             #[cfg(test)]
             test_faults: std::sync::Mutex::new(Vec::new()),
@@ -442,15 +455,18 @@ impl HadoopFileSystemCatalog {
         &self,
         attempt: HadoopCreateAttempt,
     ) -> std::result::Result<HadoopCreateResult, HadoopCreateFailure> {
-        let access = crate::fs_io::resolve_access_for_location(
-            &attempt.facts.metadata_location,
-            self.object_store_config.as_ref(),
-        )
-        .map_err(|message| HadoopCreateFailure {
+        let binding = self.binding.as_ref().ok_or_else(|| HadoopCreateFailure {
             kind: HadoopCreateFailureKind::Invalid,
             facts: Some(attempt.facts.clone()),
-            message: format!("resolve Hadoop metadata fence: {message}"),
+            message: "Hadoop catalog has no admitted filesystem capability".to_string(),
         })?;
+        let access =
+            crate::fs_io::resolve_access_for_location(&attempt.facts.metadata_location, binding)
+                .map_err(|message| HadoopCreateFailure {
+                    kind: HadoopCreateFailureKind::Invalid,
+                    facts: Some(attempt.facts.clone()),
+                    message: format!("resolve Hadoop metadata fence: {message}"),
+                })?;
 
         // Capability validation precedes directory creation so an unsupported
         // binding fails before any metadata-side storage mutation.
@@ -954,8 +970,25 @@ impl Catalog for HadoopFileSystemCatalog {
 #[cfg(test)]
 mod tests {
     use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 
     use super::*;
+
+    fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
+        let runtime = tokio::runtime::Runtime::new().expect("build local test runtime");
+        crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        )
+    }
+
+    fn test_catalog(location: &str) -> HadoopFileSystemCatalog {
+        let binding = local_test_binding();
+        let file_io = crate::fs_io::build_file_io_for_location(location, binding.clone());
+        HadoopFileSystemCatalog::new_with_binding(file_io, location.to_string(), binding)
+    }
 
     fn test_creation(name: &str) -> TableCreation {
         let schema = Schema::builder()
@@ -995,8 +1028,7 @@ mod tests {
 
     #[test]
     fn test_table_location() {
-        let file_io = crate::fs_io::build_file_io_for_location("oss://bucket/warehouse", None);
-        let catalog = HadoopFileSystemCatalog::new(file_io, "oss://bucket/warehouse".to_string());
+        let catalog = test_catalog("oss://bucket/warehouse");
         let ident = TableIdent::from_strs(["ns1", "my_table"]).unwrap();
         assert_eq!(
             catalog.table_location(&ident),
@@ -1010,10 +1042,7 @@ mod tests {
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
 
-        let catalog = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location.clone(),
-        );
+        let catalog = test_catalog(&location);
         assert!(!catalog.namespace_exists(&namespace).await.unwrap());
         catalog
             .create_namespace(&namespace, HashMap::new())
@@ -1025,10 +1054,7 @@ mod tests {
             vec![namespace.clone()]
         );
 
-        let restored = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location,
-        );
+        let restored = test_catalog(&location);
         assert!(restored.namespace_exists(&namespace).await.unwrap());
         assert_eq!(
             restored.list_namespaces(None).await.unwrap(),
@@ -1052,10 +1078,7 @@ mod tests {
         std::fs::write(metadata_dir.join("version-hint.text"), b"1\n")
             .expect("write Spark-style version hint");
 
-        let catalog = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location,
-        );
+        let catalog = test_catalog(&location);
         assert!(catalog.namespace_exists(&namespace).await.unwrap());
         assert_eq!(
             catalog.list_namespaces(None).await.unwrap(),
@@ -1072,14 +1095,8 @@ mod tests {
         let warehouse = tempfile::tempdir().expect("warehouse");
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
-        let first = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location.clone(),
-        );
-        let second = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location,
-        );
+        let first = test_catalog(&location);
+        let second = test_catalog(&location);
 
         let (left, right) = tokio::join!(
             first.create_table_fenced(
@@ -1128,10 +1145,7 @@ mod tests {
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
         let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location.clone(),
-        );
+        let catalog = test_catalog(&location);
         catalog
             .create_table_fenced(
                 &namespace,
@@ -1159,10 +1173,7 @@ mod tests {
             "the catalog entry is gone"
         );
         // A fresh client must agree: the pointer, not just the cache, was removed.
-        let restored = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location.clone(),
-        );
+        let restored = test_catalog(&location);
         assert!(!restored.table_exists(&ident).await.expect("existence"));
 
         assert!(
@@ -1177,14 +1188,8 @@ mod tests {
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
         let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let server_catalog = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location.clone(),
-        );
-        let external_catalog = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location,
-        );
+        let server_catalog = test_catalog(&location);
+        let external_catalog = test_catalog(&location);
 
         server_catalog
             .create_table_fenced(
@@ -1224,10 +1229,7 @@ mod tests {
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
         let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location.clone(),
-        );
+        let catalog = test_catalog(&location);
         let created = catalog
             .create_table_fenced(
                 &namespace,
@@ -1239,10 +1241,7 @@ mod tests {
         let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
         catalog.file_io.delete(&hint).await.expect("remove hint");
 
-        let restored = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location,
-        );
+        let restored = test_catalog(&location);
         assert!(restored.table_exists(&ident).await.expect("table exists"));
         let loaded = restored.load_table(&ident).await.expect("load from v1");
         assert_eq!(created.table.metadata().uuid(), loaded.metadata().uuid());
@@ -1255,10 +1254,7 @@ mod tests {
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
         let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location,
-        );
+        let catalog = test_catalog(&location);
         let v1 = HadoopFileSystemCatalog::metadata_path(&catalog.table_location(&ident), 1);
         let hint = HadoopFileSystemCatalog::version_hint_path(&catalog.table_location(&ident));
         catalog.inject_test_fault(HadoopCatalogTestFault::BeforeConditionalRequest);
@@ -1282,10 +1278,7 @@ mod tests {
         let warehouse = tempfile::tempdir().expect("warehouse");
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
-        let catalog = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location,
-        );
+        let catalog = test_catalog(&location);
         catalog.inject_test_fault(HadoopCatalogTestFault::AfterConditionalResponseLoss);
 
         let created = catalog
@@ -1319,10 +1312,7 @@ mod tests {
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
         let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location.clone(),
-        );
+        let catalog = test_catalog(&location);
         catalog.inject_test_fault(HadoopCatalogTestFault::BeforeHintWrite);
 
         let created = catalog
@@ -1345,10 +1335,7 @@ mod tests {
         );
         assert!(!catalog.file_io.exists(&hint).await.expect("probe hint"));
 
-        let restored = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location,
-        );
+        let restored = test_catalog(&location);
         let loaded = restored
             .load_table(&ident)
             .await
@@ -1366,10 +1353,7 @@ mod tests {
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
         let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location.clone(),
-        );
+        let catalog = test_catalog(&location);
         catalog.inject_test_fault(HadoopCatalogTestFault::AfterHintWriteResponseLoss);
 
         let created = catalog
@@ -1385,10 +1369,7 @@ mod tests {
         assert!(created.finalization_failure.is_some());
         assert!(catalog.file_io.exists(&hint).await.expect("durable hint"));
 
-        let restored = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location,
-        );
+        let restored = test_catalog(&location);
         let loaded = restored
             .load_table(&ident)
             .await
@@ -1405,10 +1386,7 @@ mod tests {
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
         let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let catalog = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location,
-        );
+        let catalog = test_catalog(&location);
         let attempt = catalog
             .prepare_create_attempt(
                 &namespace,
@@ -1442,10 +1420,7 @@ mod tests {
         let location = warehouse.path().to_string_lossy().to_string();
         let namespace = NamespaceIdent::new("analytics".to_string());
         let ident = TableIdent::new(namespace.clone(), "events".to_string());
-        let creator = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location.clone(),
-        );
+        let creator = test_catalog(&location);
         creator.inject_test_fault(HadoopCatalogTestFault::BeforeHintWrite);
         let created = creator
             .create_table_fenced(
@@ -1463,10 +1438,7 @@ mod tests {
             .await
             .expect("read committed v1");
 
-        let restored = HadoopFileSystemCatalog::new(
-            crate::fs_io::build_file_io_for_location(&location, None),
-            location,
-        );
+        let restored = test_catalog(&location);
         restored.inject_test_fault(HadoopCatalogTestFault::BeforeHintWrite);
         assert!(
             restored
