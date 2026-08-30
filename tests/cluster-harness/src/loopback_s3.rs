@@ -32,6 +32,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+// Keep the request framing buffer bounded even when a client uses HTTP/1.1
+// chunked transfer encoding. The decoded object remains subject to the
+// per-fixture object-size limit below.
+const MAX_CHUNKED_FRAMING_OVERHEAD_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_OBJECTS: usize = 128;
 const DEFAULT_MAX_OBJECT_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_REQUESTS: usize = 4_096;
@@ -103,6 +107,15 @@ pub struct LoopbackS3Request {
     pub status: u16,
 }
 
+/// A bounded fixture object snapshot used only to prepare a cross-endpoint
+/// cache-isolation corpus before the system scenario starts reading it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoopbackS3Object {
+    pub bucket: String,
+    pub key: String,
+    pub bytes: Vec<u8>,
+}
+
 /// A bounded in-memory, HTTP-only S3 fixture bound exclusively to `127.0.0.1`.
 pub struct LoopbackS3Fixture {
     endpoint: String,
@@ -165,6 +178,53 @@ impl LoopbackS3Fixture {
     pub fn request_count(&self) -> u64 {
         self.state.accepted_requests.load(Ordering::Relaxed)
     }
+
+    pub fn object_snapshot_for_test(&self) -> Vec<LoopbackS3Object> {
+        self.state
+            .objects
+            .lock()
+            .expect("loopback S3 fixture object lock poisoned")
+            .iter()
+            .filter_map(|(id, object)| {
+                let (bucket, key) = id.split_once('/')?;
+                Some(LoopbackS3Object {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    bytes: object.bytes.clone(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn replace_object_for_test(&self, object: LoopbackS3Object) -> Result<()> {
+        ensure!(
+            !object.bucket.trim().is_empty() && !object.key.trim().is_empty(),
+            "loopback S3 test object bucket and key must not be empty"
+        );
+        ensure!(
+            object.bytes.len() <= self.state.config.max_object_bytes,
+            "loopback S3 test object exceeds configured object limit"
+        );
+        let mut objects = self
+            .state
+            .objects
+            .lock()
+            .expect("loopback S3 fixture object lock poisoned");
+        let id = object_id(&object.bucket, &object.key);
+        ensure!(
+            objects.contains_key(&id) || objects.len() < self.state.config.max_objects,
+            "loopback S3 test object exceeds configured object count"
+        );
+        let etag = format!("loopback-test-{:016x}", object.bytes.len());
+        objects.insert(
+            id,
+            StoredObject {
+                bytes: object.bytes,
+                etag,
+            },
+        );
+        Ok(())
+    }
 }
 
 impl Drop for LoopbackS3Fixture {
@@ -220,6 +280,12 @@ fn serve(listener: TcpListener, state: Arc<SharedState>, shutdown: Arc<AtomicBoo
 }
 
 fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> Result<()> {
+    // Accepted sockets inherit the nonblocking listener mode on the supported
+    // platforms. This fixture performs bounded blocking reads below, so make
+    // the per-connection mode explicit before installing timeouts.
+    stream
+        .set_nonblocking(false)
+        .context("set loopback S3 connection blocking mode")?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .context("set loopback S3 fixture read timeout")?;
@@ -228,7 +294,12 @@ fn handle_connection(mut stream: TcpStream, state: Arc<SharedState>) -> Result<(
         .context("set loopback S3 fixture write timeout")?;
     let request = match read_request(&mut stream, state.config.max_object_bytes) {
         Ok(request) => request,
-        Err(_) => {
+        Err(error) => {
+            // The parser never includes raw headers, bodies, query strings, or
+            // signatures in its errors. Keep this test-only marker so a system
+            // scenario can distinguish fixture framing rejection from an S3
+            // authorization or storage failure without exposing credentials.
+            eprintln!("NOVAROCKS_LOOPBACK_S3_REJECTED_REQUEST reason={error:#}");
             write_response(stream, 400, &[], &[])?;
             return Ok(());
         }
@@ -353,33 +424,28 @@ fn read_request(stream: &mut TcpStream, max_object_bytes: usize) -> Result<Parse
             .context("loopback S3 malformed request header")?;
         headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
     }
-    let content_length = headers
-        .get("content-length")
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .context("loopback S3 invalid content length")
-        })
-        .transpose()?
-        .unwrap_or(0);
-    ensure!(
-        content_length <= max_object_bytes,
-        "loopback S3 request body exceeds configured object limit"
-    );
-    let mut body = bytes[(header_end + 4)..].to_vec();
-    while body.len() < content_length {
-        let remaining = content_length - body.len();
-        let read_len = remaining.min(buffer.len());
-        let read = stream
-            .read(&mut buffer[..read_len])
-            .context("read loopback S3 request body")?;
-        ensure!(read > 0, "loopback S3 request closed before body completed");
-        body.extend_from_slice(&buffer[..read]);
-    }
-    ensure!(
-        body.len() == content_length,
-        "loopback S3 request contains pipelined body bytes"
-    );
+    let mut request_bytes = bytes[(header_end + 4)..].to_vec();
+    let body = if headers
+        .get("transfer-encoding")
+        .is_some_and(|value| transfer_encoding_is_chunked(value))
+    {
+        read_chunked_body(stream, &mut request_bytes, max_object_bytes)?
+    } else {
+        let content_length = headers
+            .get("content-length")
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .context("loopback S3 invalid content length")
+            })
+            .transpose()?
+            .unwrap_or(0);
+        ensure!(
+            content_length <= max_object_bytes,
+            "loopback S3 request body exceeds configured object limit"
+        );
+        read_content_length_body(stream, &mut request_bytes, content_length)?
+    };
     Ok(ParsedRequest {
         method,
         path,
@@ -387,6 +453,127 @@ fn read_request(stream: &mut TcpStream, max_object_bytes: usize) -> Result<Parse
         headers,
         body,
     })
+}
+
+fn transfer_encoding_is_chunked(value: &str) -> bool {
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|encoding| encoding.eq_ignore_ascii_case("chunked"))
+}
+
+fn read_content_length_body(
+    stream: &mut TcpStream,
+    request_bytes: &mut Vec<u8>,
+    content_length: usize,
+) -> Result<Vec<u8>> {
+    while request_bytes.len() < content_length {
+        let remaining = content_length - request_bytes.len();
+        read_request_bytes(stream, request_bytes, remaining)?;
+    }
+    ensure!(
+        request_bytes.len() == content_length,
+        "loopback S3 request contains pipelined body bytes"
+    );
+    Ok(std::mem::take(request_bytes))
+}
+
+fn read_chunked_body(
+    stream: &mut TcpStream,
+    request_bytes: &mut Vec<u8>,
+    max_object_bytes: usize,
+) -> Result<Vec<u8>> {
+    let max_framed_bytes = max_object_bytes.saturating_add(MAX_CHUNKED_FRAMING_OVERHEAD_BYTES);
+    let mut offset = 0;
+    let mut body = Vec::new();
+    loop {
+        let chunk_size_line = read_crlf_line(stream, request_bytes, &mut offset, max_framed_bytes)?;
+        let chunk_size = std::str::from_utf8(chunk_size_line)
+            .context("decode loopback S3 chunk size")?
+            .split(';')
+            .next()
+            .expect("split always yields at least one segment")
+            .trim();
+        let chunk_size =
+            usize::from_str_radix(chunk_size, 16).context("loopback S3 invalid chunk size")?;
+        if chunk_size == 0 {
+            loop {
+                let trailer = read_crlf_line(stream, request_bytes, &mut offset, max_framed_bytes)?;
+                if trailer.is_empty() {
+                    ensure!(
+                        offset == request_bytes.len(),
+                        "loopback S3 request contains pipelined body bytes"
+                    );
+                    return Ok(body);
+                }
+                let trailer =
+                    std::str::from_utf8(trailer).context("decode loopback S3 chunk trailer")?;
+                ensure!(trailer.contains(':'), "loopback S3 malformed chunk trailer");
+            }
+        }
+        ensure!(
+            chunk_size <= max_object_bytes.saturating_sub(body.len()),
+            "loopback S3 request body exceeds configured object limit"
+        );
+        let required = offset
+            .checked_add(chunk_size)
+            .and_then(|value| value.checked_add(2))
+            .context("loopback S3 chunk size overflows request framing")?;
+        while request_bytes.len() < required {
+            read_request_bytes(stream, request_bytes, required - request_bytes.len())?;
+            ensure!(
+                request_bytes.len() <= max_framed_bytes,
+                "loopback S3 chunked request framing exceeds limit"
+            );
+        }
+        body.extend_from_slice(&request_bytes[offset..offset + chunk_size]);
+        offset += chunk_size;
+        ensure!(
+            request_bytes[offset..offset + 2] == *b"\r\n",
+            "loopback S3 chunk data is missing its terminator"
+        );
+        offset += 2;
+    }
+}
+
+fn read_crlf_line<'a>(
+    stream: &mut TcpStream,
+    request_bytes: &'a mut Vec<u8>,
+    offset: &mut usize,
+    max_framed_bytes: usize,
+) -> Result<&'a [u8]> {
+    loop {
+        if let Some(line_end) = request_bytes[*offset..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+        {
+            let start = *offset;
+            let end = start + line_end;
+            *offset = end + 2;
+            return Ok(&request_bytes[start..end]);
+        }
+        ensure!(
+            request_bytes.len() < max_framed_bytes,
+            "loopback S3 chunked request framing exceeds limit"
+        );
+        let remaining = max_framed_bytes - request_bytes.len();
+        read_request_bytes(stream, request_bytes, remaining)?;
+    }
+}
+
+fn read_request_bytes(
+    stream: &mut TcpStream,
+    request_bytes: &mut Vec<u8>,
+    remaining: usize,
+) -> Result<()> {
+    let mut buffer = [0_u8; 4096];
+    let read_len = remaining.min(buffer.len());
+    let read = stream
+        .read(&mut buffer[..read_len])
+        .context("read loopback S3 request body")?;
+    ensure!(read > 0, "loopback S3 request closed before body completed");
+    request_bytes.extend_from_slice(&buffer[..read]);
+    Ok(())
 }
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
@@ -863,6 +1050,17 @@ mod tests {
         assert_eq!(status, 204);
         let (status, _, _) = request(&fixture, &signed("GET", "/bucket/data/file", ""));
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn accepts_chunked_puts_sent_with_headers_and_body_in_one_write() {
+        let fixture = fixture();
+        let request_text = "PUT /bucket/data/chunked HTTP/1.1\r\nHost: loopback\r\nAuthorization: AWS4-HMAC-SHA256 Credential=test-key/20260829/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=must-not-log\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n3;extension=value\r\ndef\r\n0\r\n\r\n";
+        let (status, _, _) = request(&fixture, request_text);
+        assert_eq!(status, 200);
+        let (status, _, body) = request(&fixture, &signed("GET", "/bucket/data/chunked", ""));
+        assert_eq!(status, 200);
+        assert_eq!(body, b"abcdef");
     }
 
     #[test]

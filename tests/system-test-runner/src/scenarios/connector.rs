@@ -3,12 +3,13 @@ use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::loopback_s3::{
-    LoopbackS3Config, LoopbackS3Fixture, LoopbackS3Request,
+    LoopbackS3Config, LoopbackS3Fixture, LoopbackS3Object, LoopbackS3Request,
 };
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, QueryExecutionResourceSnapshot,
     ServerHandle,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::mpsc;
@@ -881,6 +882,11 @@ const STATIC_BLUE_KEY_ID: &str = "cca-static-blue-key";
 const STATIC_GREEN_KEY_ID: &str = "cca-static-green-key";
 const STATIC_BLUE_KEY_SECRET: &str = "cca-static-blue-secret";
 const STATIC_GREEN_KEY_SECRET: &str = "cca-static-green-secret";
+const COLLISION_BLUE_CATALOG: &str = "cca_cache_domain_blue";
+const COLLISION_GREEN_CATALOG: &str = "cca_cache_domain_green";
+const COLLISION_DATABASE: &str = "cache_domain_db";
+const COLLISION_TABLE: &str = "cache_domain_data";
+const COLLISION_WAREHOUSE: &str = "s3://cca-cache-domain-collision/warehouse";
 
 impl Scenario for StaticCredentialGeneration {
     fn name(&self) -> &'static str {
@@ -905,7 +911,7 @@ impl Scenario for StaticCredentialGeneration {
             context.remaining("connect static credential control session")?,
         )?;
 
-        run_access_domain_cache_isolation(context, &mut control, &self.fixtures)?;
+        run_static_credential_generation(context, &mut control, &self.fixtures)?;
         await_resource_convergence(context, &baseline, "static credential generation reads")?;
         Ok(())
     }
@@ -921,7 +927,7 @@ impl Scenario for AccessDomainCacheIsolation {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        static_credential_launch_config(&self.fixtures, scenario_root)
+        access_domain_collision_launch_config(&self.fixtures, scenario_root)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -965,7 +971,41 @@ fn static_credential_launch_config(
     })
 }
 
-fn run_access_domain_cache_isolation(
+fn access_domain_collision_launch_config(
+    fixtures: &Mutex<Option<StaticCredentialFixtures>>,
+    scenario_root: &Path,
+) -> Result<ScenarioLaunchConfig> {
+    let blue = LoopbackS3Fixture::start(collision_loopback_s3_config(STATIC_BLUE_KEY_ID))
+        .context("start blue collision loopback S3 fixture")?;
+    let green = LoopbackS3Fixture::start(collision_loopback_s3_config(STATIC_GREEN_KEY_ID))
+        .context("start green collision loopback S3 fixture")?;
+    let snapshot = scenario_root.join("access-domain-collision-catalogs.toml");
+    write_access_domain_collision_snapshot(&snapshot, blue.endpoint(), green.endpoint())?;
+    let mut fixtures = fixtures
+        .lock()
+        .map_err(|_| anyhow::anyhow!("access-domain collision fixture lock poisoned"))?;
+    if fixtures.is_some() {
+        bail!("access-domain collision fixtures were initialized more than once");
+    }
+    *fixtures = Some(StaticCredentialFixtures { blue, green });
+
+    Ok(ScenarioLaunchConfig {
+        child_environment: connector_reader_environment(),
+        config_overlay: static_credential_launch_overlay(&snapshot),
+        ..Default::default()
+    })
+}
+
+fn collision_loopback_s3_config(access_key_id: &str) -> LoopbackS3Config {
+    let mut config = LoopbackS3Config::for_access_key(access_key_id);
+    // The source corpus and its same-length canonical copies are both kept
+    // only for this bounded collision setup. The default 128-object ceiling
+    // cannot retain both graphs after three Iceberg commits.
+    config.max_objects = 256;
+    config
+}
+
+fn run_static_credential_generation(
     context: &mut ScenarioContext,
     control: &mut mysql::Conn,
     fixtures: &Mutex<Option<StaticCredentialFixtures>>,
@@ -986,22 +1026,13 @@ fn run_access_domain_cache_isolation(
         ["300001, 400000", "400001, 500000", "500001, 600000"],
     )?;
 
-    context.action("warm the blue static credential access domain");
-    let blue_profile = static_catalog_profile(
+    context.action("read the blue static credential catalog through every backend");
+    let _blue_profile = static_catalog_profile(
         control,
         STATIC_BLUE_CATALOG,
         "static_blue_db",
         "static_blue_data",
     )?;
-    assert_positive_profile_counter(&blue_profile, "ConnectorFileCacheMisses")?;
-    context.action("repeat the blue StaticFile read from its role-local cache");
-    let blue_cached_profile = static_catalog_profile(
-        control,
-        STATIC_BLUE_CATALOG,
-        "static_blue_db",
-        "static_blue_data",
-    )?;
-    assert_positive_profile_counter(&blue_cached_profile, "ConnectorFileCacheHits")?;
     assert_static_catalog_sum(
         control,
         STATIC_BLUE_CATALOG,
@@ -1016,14 +1047,13 @@ fn run_access_domain_cache_isolation(
     )?;
     assert_static_reader_opened_on_every_backend(&blue_logs, STATIC_BLUE_CATALOG)?;
 
-    context.action("read the distinct green endpoint and access domain without blue cache reuse");
-    let green_profile = static_catalog_profile(
+    context.action("read the green static credential catalog through every backend");
+    let _green_profile = static_catalog_profile(
         control,
         STATIC_GREEN_CATALOG,
         "static_green_db",
         "static_green_data",
     )?;
-    assert_positive_profile_counter(&green_profile, "ConnectorFileCacheMisses")?;
     assert_static_catalog_sum(
         control,
         STATIC_GREEN_CATALOG,
@@ -1056,6 +1086,278 @@ fn run_access_domain_cache_isolation(
     )?;
     context.action("proved blue/v1 and green/v2 reads used distinct exact role-local S3 keys");
     Ok(())
+}
+
+fn run_access_domain_cache_isolation(
+    context: &mut ScenarioContext,
+    control: &mut mysql::Conn,
+    fixtures: &Mutex<Option<StaticCredentialFixtures>>,
+) -> Result<()> {
+    context.action("write colliding blue and green Iceberg corpora at one S3 URI");
+    create_static_catalog_table_and_data(
+        control,
+        COLLISION_BLUE_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+        ["100001, 200000", "200001, 300000", "300001, 400000"],
+    )?;
+    create_static_catalog_table_and_data(
+        control,
+        COLLISION_GREEN_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+        ["100002, 200001", "200002, 300001", "300002, 400001"],
+    )?;
+
+    let fixtures = fixtures
+        .lock()
+        .map_err(|_| anyhow::anyhow!("static credential fixture lock poisoned"))?;
+    let fixtures = fixtures
+        .as_ref()
+        .context("static credential fixtures were not retained through scenario execution")?;
+    let canonical_data_paths = canonicalize_collision_corpus(&fixtures.blue, &fixtures.green)?;
+
+    context.action("warm the blue access domain for the colliding S3 files");
+    let blue_profile = static_catalog_profile(
+        control,
+        COLLISION_BLUE_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+    )?;
+    assert_positive_profile_counter(&blue_profile, "ConnectorFileCacheMisses")?;
+    assert_static_catalog_sum(
+        control,
+        COLLISION_BLUE_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+        75_000_150_000,
+    )?;
+    let blue_logs = wait_for_open_reader_on_every_backend(
+        context,
+        COLLISION_BLUE_CATALOG,
+        "observe every BE read the blue collision access domain",
+    )?;
+    assert_static_reader_opened_on_every_backend(&blue_logs, COLLISION_BLUE_CATALOG)?;
+
+    context.action("repeat the blue collision read from its role-local cache");
+    let blue_cached_profile = static_catalog_profile(
+        control,
+        COLLISION_BLUE_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+    )?;
+    assert_positive_profile_counter(&blue_cached_profile, "ConnectorFileCacheHits")?;
+
+    let green_data_reads_before =
+        successful_gets_for_paths(&fixtures.green.request_log(), &canonical_data_paths);
+    context.action("read the same S3 URI through the green endpoint and access domain");
+    let green_profile = static_catalog_profile(
+        control,
+        COLLISION_GREEN_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+    )?;
+    assert_positive_profile_counter(&green_profile, "ConnectorFileCacheMisses")?;
+    assert_static_catalog_sum(
+        control,
+        COLLISION_GREEN_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+        75_000_450_000,
+    )?;
+    let green_data_reads_after =
+        successful_gets_for_paths(&fixtures.green.request_log(), &canonical_data_paths);
+    if green_data_reads_after <= green_data_reads_before {
+        bail!(
+            "green collision endpoint received no canonical Parquet GET after blue cache warm: before={green_data_reads_before}, after={green_data_reads_after}"
+        );
+    }
+    let green_logs = wait_for_open_reader_on_every_backend(
+        context,
+        COLLISION_GREEN_CATALOG,
+        "observe every BE read the green collision access domain",
+    )?;
+    assert_static_reader_opened_on_every_backend(&green_logs, COLLISION_GREEN_CATALOG)?;
+    assert_fixture_used_only_expected_key(
+        "blue collision",
+        &fixtures.blue.request_log(),
+        STATIC_BLUE_KEY_ID,
+    )?;
+    assert_fixture_used_only_expected_key(
+        "green collision",
+        &fixtures.green.request_log(),
+        STATIC_GREEN_KEY_ID,
+    )?;
+    context.action(
+        "proved a same-URI, same-size, same-mtime cross-endpoint corpus did not reuse blue cache data",
+    );
+    Ok(())
+}
+
+fn canonicalize_collision_corpus(
+    blue: &LoopbackS3Fixture,
+    green: &LoopbackS3Fixture,
+) -> Result<BTreeSet<String>> {
+    let blue_objects = blue.object_snapshot_for_test();
+    let green_objects = green.object_snapshot_for_test();
+    let mappings = collision_data_path_mapping(&blue_objects, &green_objects)?;
+    for blue_object in blue_objects
+        .iter()
+        .filter(|object| object.key.ends_with(".avro"))
+    {
+        let bytes = rewrite_fixed_width_paths(&blue_object.bytes, &mappings.replacements)?;
+        blue.replace_object_for_test(LoopbackS3Object {
+            bucket: blue_object.bucket.clone(),
+            key: blue_object.key.clone(),
+            bytes,
+        })?;
+    }
+    for blue_object in blue_objects
+        .iter()
+        .filter(|object| object.key.ends_with(".parquet"))
+    {
+        let target_key = mappings
+            .replacements
+            .get(&blue_object.key)
+            .context("blue collision data object has no green canonical path")?;
+        blue.replace_object_for_test(LoopbackS3Object {
+            bucket: blue_object.bucket.clone(),
+            key: target_key.clone(),
+            bytes: blue_object.bytes.clone(),
+        })?;
+    }
+    Ok(mappings.canonical_paths)
+}
+
+struct CollisionDataPathMapping {
+    replacements: BTreeMap<String, String>,
+    canonical_paths: BTreeSet<String>,
+}
+
+fn collision_data_path_mapping(
+    blue_objects: &[LoopbackS3Object],
+    green_objects: &[LoopbackS3Object],
+) -> Result<CollisionDataPathMapping> {
+    let blue_data = parquet_objects_by_bucket_and_length(blue_objects);
+    let green_data = parquet_objects_by_bucket_and_length(green_objects);
+    let blue_count = blue_data.values().map(Vec::len).sum::<usize>();
+    let green_count = green_data.values().map(Vec::len).sum::<usize>();
+    if blue_data.is_empty() || blue_count != green_count {
+        bail!(
+            "collision corpus must contain equal non-empty blue and green Parquet data files, got {} and {}",
+            blue_count,
+            green_count
+        );
+    }
+    if blue_data.keys().collect::<Vec<_>>() != green_data.keys().collect::<Vec<_>>() {
+        bail!(
+            "collision Parquet `(bucket, byte_length)` multisets differ: blue={:?}, green={:?}",
+            parquet_length_multiset(&blue_data),
+            parquet_length_multiset(&green_data)
+        );
+    }
+
+    let mut replacements = BTreeMap::new();
+    let mut canonical_paths = BTreeSet::new();
+    let mut distinct_payloads = 0;
+    for ((bucket, byte_length), mut blue_group) in blue_data {
+        let mut green_group = green_data
+            .get(&(bucket.clone(), byte_length))
+            .cloned()
+            .expect("validated collision Parquet multiset has green group");
+        // UUID suffixes are fixed-width. Sorting within equal-length groups makes
+        // the fixture-only rewriting deterministic without changing any bytes.
+        blue_group.sort_by_key(|object| &object.key);
+        green_group.sort_by_key(|object| &object.key);
+        if blue_group.len() != green_group.len() {
+            bail!(
+                "collision Parquet `(bucket, byte_length)` multiplicity differs for {bucket}/{byte_length}: blue={}, green={}",
+                blue_group.len(),
+                green_group.len()
+            );
+        }
+        for (blue_object, green_object) in blue_group.into_iter().zip(green_group) {
+            if blue_object.key.len() != green_object.key.len() {
+                bail!(
+                    "collision data file paths must have equal width: {}/{} vs {}/{}",
+                    blue_object.bucket,
+                    blue_object.key,
+                    green_object.bucket,
+                    green_object.key
+                );
+            }
+            if blue_object.bytes != green_object.bytes {
+                distinct_payloads += 1;
+            }
+            replacements.insert(blue_object.key.clone(), green_object.key.clone());
+            canonical_paths.insert(format!("/{}/{}", green_object.bucket, green_object.key));
+        }
+    }
+    if distinct_payloads == 0 {
+        bail!("collision Parquet corpora have no distinct blue and green payloads");
+    }
+    Ok(CollisionDataPathMapping {
+        replacements,
+        canonical_paths,
+    })
+}
+
+fn parquet_objects_by_bucket_and_length(
+    objects: &[LoopbackS3Object],
+) -> BTreeMap<(String, usize), Vec<&LoopbackS3Object>> {
+    let mut groups = BTreeMap::new();
+    for object in objects
+        .iter()
+        .filter(|object| object.key.ends_with(".parquet"))
+    {
+        groups
+            .entry((object.bucket.clone(), object.bytes.len()))
+            .or_insert_with(Vec::new)
+            .push(object);
+    }
+    groups
+}
+
+fn parquet_length_multiset(
+    groups: &BTreeMap<(String, usize), Vec<&LoopbackS3Object>>,
+) -> Vec<((String, usize), usize)> {
+    groups
+        .iter()
+        .map(|(group, objects)| (group.clone(), objects.len()))
+        .collect()
+}
+
+fn successful_gets_for_paths(requests: &[LoopbackS3Request], paths: &BTreeSet<String>) -> usize {
+    requests
+        .iter()
+        .filter(|request| {
+            request.method == "GET" && request.status < 400 && paths.contains(&request.path)
+        })
+        .count()
+}
+
+fn rewrite_fixed_width_paths(
+    input: &[u8],
+    mappings: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<u8>> {
+    let mut output = input.to_vec();
+    for (source, target) in mappings {
+        if source.len() != target.len() {
+            bail!("collision path replacement changes byte width: {source} -> {target}");
+        }
+        let source = source.as_bytes();
+        let target = target.as_bytes();
+        let mut offset = 0;
+        while let Some(relative) = output[offset..]
+            .windows(source.len())
+            .position(|window| window == source)
+        {
+            let start = offset + relative;
+            output[start..start + source.len()].copy_from_slice(target);
+            offset = start + source.len();
+        }
+    }
+    Ok(output)
 }
 
 struct PredicatePageIndexPruning;
@@ -1375,6 +1677,59 @@ fn write_static_credential_snapshot(
         ),
     )
     .with_context(|| format!("write static credential snapshot {}", snapshot.display()))
+}
+
+fn write_access_domain_collision_snapshot(
+    snapshot: &Path,
+    blue_endpoint: &str,
+    green_endpoint: &str,
+) -> Result<()> {
+    std::fs::write(
+        snapshot,
+        format!(
+            "format_version = 3\n\
+             [[catalogs]]\n\
+             instance_id = \"{COLLISION_BLUE_CATALOG}\"\n\
+             provider_id = \"iceberg\"\n\
+             display_name = \"{COLLISION_BLUE_CATALOG}\"\n\
+             config_format_version = 3\n\
+             [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-data\"\n\
+             consumer_role = \"frontend-and-backend\"\n\
+             mode = \"static\"\n\
+             name = \"{STATIC_BLUE_CREDENTIAL_NAME}\"\n\
+             generation = \"{STATIC_BLUE_CREDENTIAL_GENERATION}\"\n\
+             [catalogs.properties]\n\
+             type = \"iceberg\"\n\
+             \"iceberg.catalog.type\" = \"hadoop\"\n\
+             \"iceberg.catalog.warehouse\" = \"{COLLISION_WAREHOUSE}\"\n\
+             \"aws.s3.endpoint\" = \"{blue_endpoint}\"\n\
+             \"aws.s3.enable_path_style_access\" = \"true\"\n\
+             [[catalogs]]\n\
+             instance_id = \"{COLLISION_GREEN_CATALOG}\"\n\
+             provider_id = \"iceberg\"\n\
+             display_name = \"{COLLISION_GREEN_CATALOG}\"\n\
+             config_format_version = 3\n\
+             [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-data\"\n\
+             consumer_role = \"frontend-and-backend\"\n\
+             mode = \"static\"\n\
+             name = \"{STATIC_GREEN_CREDENTIAL_NAME}\"\n\
+             generation = \"{STATIC_GREEN_CREDENTIAL_GENERATION}\"\n\
+             [catalogs.properties]\n\
+             type = \"iceberg\"\n\
+             \"iceberg.catalog.type\" = \"hadoop\"\n\
+             \"iceberg.catalog.warehouse\" = \"{COLLISION_WAREHOUSE}\"\n\
+             \"aws.s3.endpoint\" = \"{green_endpoint}\"\n\
+             \"aws.s3.enable_path_style_access\" = \"true\"\n"
+        ),
+    )
+    .with_context(|| {
+        format!(
+            "write access-domain collision snapshot {}",
+            snapshot.display()
+        )
+    })
 }
 
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
