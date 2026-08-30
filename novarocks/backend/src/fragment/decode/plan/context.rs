@@ -66,6 +66,7 @@ pub(crate) struct TypedScanRuntime {
     /// session without one, so resolving here would always answer `None`.
     runtime_filter: RuntimeFilterSessionResolver,
     read_context: Arc<crate::fragment::ingress::TypedReadAttemptContext>,
+    storage_resolver: Arc<dyn novarocks_spi::connector::ConnectorStorageResolver>,
 }
 
 /// Looks up the attempt's runtime-filter session at the moment it is needed.
@@ -108,6 +109,7 @@ impl TypedScanRuntime {
         session: novarocks_spi::connector::read_stack::ConnectorSession,
         runtime_filter: RuntimeFilterSessionResolver,
         read_context: Arc<crate::fragment::ingress::TypedReadAttemptContext>,
+        storage_resolver: Arc<dyn novarocks_spi::connector::ConnectorStorageResolver>,
     ) -> Self {
         Self {
             catalog_read_execution,
@@ -116,6 +118,7 @@ impl TypedScanRuntime {
             session,
             runtime_filter,
             read_context,
+            storage_resolver,
         }
     }
 
@@ -149,6 +152,14 @@ impl TypedScanRuntime {
 
     pub(crate) fn runtime_filter(&self) -> RuntimeFilterSessionResolver {
         Arc::clone(&self.runtime_filter)
+    }
+
+    /// The process-local credential capability is captured at fragment
+    /// admission and is deliberately absent from all native plan carriers.
+    pub(crate) fn storage_resolver(
+        &self,
+    ) -> Arc<dyn novarocks_spi::connector::ConnectorStorageResolver> {
+        Arc::clone(&self.storage_resolver)
     }
 
     pub(crate) fn register_read_execution(

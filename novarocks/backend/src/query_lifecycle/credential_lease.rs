@@ -27,7 +27,10 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use novarocks_proto_codec::lifecycle::{CredentialLeaseSecretEnvelope, QueryInitRequest};
-use novarocks_spi::connector::{CredentialLeaseDescriptor, CredentialLeaseId};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, CredentialLeaseDescriptor, CredentialLeaseId,
+    CredentialLeaseProvider, ResolvedVendedS3Access, StorageAccessRequest,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CredentialLeaseError {
@@ -216,6 +219,50 @@ impl QueryCredentialLeases {
         self.slots.clear();
     }
 
+    /// Resolve one process-local vended storage target against this exact
+    /// query's committed lease epoch. Prepared refresh values remain invisible
+    /// until commit, and every absence/mismatch is a typed refusal rather than
+    /// a fallback to a startup credential.
+    pub(crate) fn resolve_vended_s3(
+        &self,
+        request: &StorageAccessRequest,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        let now = unix_ms();
+        let mut selected: Option<(
+            &LeaseSlot,
+            &novarocks_spi::connector::StorageCredentialScopePrefix,
+        )> = None;
+        for slot in self.slots.values() {
+            if slot.descriptor.provider() != CredentialLeaseProvider::S3
+                || slot.descriptor.owner() != request.owner()
+                || slot.committed.session_token_expires_at_unix_ms() <= now
+            {
+                continue;
+            }
+            for prefix in slot.descriptor.prefixes() {
+                if !request.location().starts_with(prefix.as_str()) {
+                    continue;
+                }
+                if selected
+                    .is_none_or(|(_, current)| prefix.as_str().len() > current.as_str().len())
+                {
+                    selected = Some((slot, prefix));
+                }
+            }
+        }
+        let (slot, matched_prefix) = selected.ok_or_else(vended_storage_access_denied)?;
+        Ok(ResolvedVendedS3Access::new(
+            slot.descriptor.storage_access_domain_id(),
+            slot.descriptor.lease_id(),
+            slot.committed.epoch(),
+            matched_prefix.clone(),
+            slot.committed.session_token_expires_at_unix_ms(),
+            slot.committed.access_key_id().clone(),
+            slot.committed.secret_access_key().clone(),
+            slot.committed.session_token().clone(),
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn committed_epoch(&self, lease_id: CredentialLeaseId) -> Option<u64> {
         self.slots.get(&lease_id).map(|slot| slot.committed.epoch())
@@ -229,6 +276,13 @@ fn unix_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+fn vended_storage_access_denied() -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::InvalidRequest,
+        "vended storage access is unavailable for this query attempt",
+    )
 }
 
 fn descriptor_eq(left: &CredentialLeaseDescriptor, right: &CredentialLeaseDescriptor) -> bool {
@@ -275,7 +329,7 @@ mod tests {
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, CredentialLeaseProvider,
-        StorageAccessDomainId, StorageCredentialScopePrefix,
+        StorageAccessDomainId, StorageAccessRequest, StorageCredentialScopePrefix,
     };
 
     fn descriptor(epoch: u64, expiration: u64) -> CredentialLeaseDescriptor {
@@ -357,5 +411,90 @@ mod tests {
         let rendered = format!("{leases:?}");
         assert!(!rendered.contains("committed-canary"));
         assert!(!rendered.contains("prepared-canary"));
+    }
+
+    #[test]
+    fn resolve_uses_committed_longest_prefix_and_rejects_owner_mismatch() {
+        let expiration = unix_ms() + 60_000;
+        let descriptor = CredentialLeaseDescriptor::try_new(
+            CredentialLeaseId::try_from_bytes([9; 16]).expect("id"),
+            1,
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("lease-test").expect("connector"),
+                CatalogVersion::from_bytes([4; 32]),
+            ),
+            CredentialLeaseProvider::S3,
+            vec![
+                StorageCredentialScopePrefix::try_from_normalized("s3://bucket/").expect("root"),
+                StorageCredentialScopePrefix::try_from_normalized("s3://bucket/a").expect("nested"),
+            ],
+            expiration,
+            true,
+            StorageAccessDomainId::from_bytes([3; 32]),
+        )
+        .expect("descriptor");
+        let owner = descriptor.owner().clone();
+        let mut leases = QueryCredentialLeases::from_descriptor_envelopes(
+            vec![descriptor],
+            vec![envelope(1, expiration, "first")],
+        )
+        .expect("initial lease");
+        let request = StorageAccessRequest::try_new(owner.clone(), "s3://bucket/a/data.parquet")
+            .expect("route");
+        assert_eq!(
+            leases
+                .resolve_vended_s3(&request)
+                .expect("resolve")
+                .matched_prefix()
+                .as_str(),
+            "s3://bucket/a"
+        );
+
+        leases
+            .prepare(envelope(2, expiration + 1, "second"))
+            .expect("prepare");
+        assert_eq!(
+            leases
+                .resolve_vended_s3(&request)
+                .expect("committed")
+                .epoch(),
+            1
+        );
+        leases
+            .commit(CredentialLeaseId::try_from_bytes([9; 16]).expect("id"), 2)
+            .expect("commit");
+        assert_eq!(
+            leases
+                .resolve_vended_s3(&request)
+                .expect("committed")
+                .epoch(),
+            2
+        );
+
+        let wrong_owner = StorageAccessRequest::try_new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("wrong-owner").expect("catalog"),
+                CatalogVersion::from_bytes([4; 32]),
+            ),
+            "s3://bucket/a/data.parquet",
+        )
+        .expect("request");
+        assert!(leases.resolve_vended_s3(&wrong_owner).is_err());
+
+        let unmatched_prefix =
+            StorageAccessRequest::try_new(owner, "s3://other-bucket/data.parquet").expect("route");
+        assert!(leases.resolve_vended_s3(&unmatched_prefix).is_err());
+    }
+
+    #[test]
+    fn expired_initial_lease_is_refused_before_storage_resolution() {
+        let expired = unix_ms().saturating_sub(1);
+        assert!(
+            QueryCredentialLeases::from_descriptor_envelopes(
+                vec![descriptor(1, expired)],
+                vec![envelope(1, expired, "expired")],
+            )
+            .is_err()
+        );
     }
 }

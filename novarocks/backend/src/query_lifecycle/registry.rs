@@ -34,7 +34,10 @@ use novarocks_proto_codec::lifecycle::{
     QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationAck,
     QueryTerminationReason, StageDigest,
 };
-use novarocks_spi::connector::CatalogProperties;
+use novarocks_spi::connector::{
+    CatalogProperties, ConnectorError, ConnectorErrorKind, ConnectorStorageResolver,
+    ResolvedVendedS3Access, StorageAccessRequest,
+};
 use novarocks_types::{
     BackendProcessId, LocalQuerySequence, NativeCompatibilityId, QueryIdAttribution,
     QueryProcessNamespace, UniqueId,
@@ -1170,6 +1173,54 @@ pub(crate) struct QueryLifecycleRegistry {
     self_weak: Weak<QueryLifecycleRegistry>,
 }
 
+/// A context-local view of one query attempt's confidential lease state.  The
+/// captured execution id is the only lookup key; it never exposes a registry
+/// operation that could enumerate or resolve another attempt's values.
+struct QueryCredentialStorageResolver {
+    registry: Weak<QueryLifecycleRegistry>,
+    execution_id: QueryExecutionId,
+}
+
+impl ConnectorStorageResolver for QueryCredentialStorageResolver {
+    fn resolve_vended_s3(
+        &self,
+        request: &StorageAccessRequest,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        let registry = self.registry.upgrade().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "vended storage query attempt is no longer available",
+            )
+        })?;
+        let entry = registry
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&self.execution_id)
+            .cloned()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "vended storage query attempt is unavailable",
+                )
+            })?;
+        let state = entry.state.lock().expect("query lifecycle entry lock");
+        if matches!(
+            state.phase,
+            QueryLifecyclePhase::TerminalRetained
+                | QueryLifecyclePhase::Terminating
+                | QueryLifecyclePhase::Tombstone
+        ) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "vended storage query attempt is no longer active",
+            ));
+        }
+        state.credential_leases.resolve_vended_s3(request)
+    }
+}
+
 struct GrpcQueryTerminalFallbackTransport {
     runtime: BackendDataRuntime,
 }
@@ -1652,6 +1703,19 @@ impl QueryLifecycleRegistry {
                 handle.catalog_name().as_str(),
                 handle.version().short_hex()
             )
+        })
+    }
+
+    /// Creates a process-local resolver locked to one exact query attempt.
+    /// The returned object is injected only into a connector request context;
+    /// it is neither a registry facade nor a native-wire value.
+    pub(crate) fn storage_resolver_for_query(
+        &self,
+        execution_id: QueryExecutionId,
+    ) -> Arc<dyn ConnectorStorageResolver> {
+        Arc::new(QueryCredentialStorageResolver {
+            registry: self.self_weak.clone(),
+            execution_id,
         })
     }
 

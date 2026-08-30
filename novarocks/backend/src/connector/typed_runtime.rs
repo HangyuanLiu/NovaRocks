@@ -1408,6 +1408,23 @@ pub(crate) mod test_support {
     /// The runtime bundle a typed decode needs, wired to the same binding
     /// generation `catalog_table_handle` names.
     pub(crate) fn typed_scan_runtime() -> crate::fragment::decode::plan::context::TypedScanRuntime {
+        struct NoVendedStorageResolver;
+
+        impl novarocks_spi::connector::ConnectorStorageResolver for NoVendedStorageResolver {
+            fn resolve_vended_s3(
+                &self,
+                _: &novarocks_spi::connector::StorageAccessRequest,
+            ) -> Result<
+                novarocks_spi::connector::ResolvedVendedS3Access,
+                novarocks_spi::connector::ConnectorError,
+            > {
+                Err(novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    "test fixture has no vended storage lease",
+                ))
+            }
+        }
+
         use novarocks_types::{AttemptId, QueryId};
         let catalog_handle = novarocks_spi::connector::CatalogHandle::new(
             novarocks_spi::connector::ConnectorInstanceId::try_from_canonical("test.typed")
@@ -1448,6 +1465,7 @@ pub(crate) mod test_support {
             session,
             std::sync::Arc::new(|| Ok(None)),
             std::sync::Arc::new(crate::fragment::ingress::TypedReadAttemptContext::new()),
+            std::sync::Arc::new(NoVendedStorageResolver),
         )
     }
 

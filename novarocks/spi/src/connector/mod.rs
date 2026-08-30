@@ -72,7 +72,10 @@ pub use cleanup_maintenance::{
     MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS, MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES,
     PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
 };
-pub use context::{ConnectorCancellation, ConnectorRequestContext};
+pub use context::{
+    ConnectorCancellation, ConnectorRequestContext, ConnectorStorageResolver,
+    ResolvedVendedS3Access, StorageAccessRequest,
+};
 pub use control::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
     ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlPlanningLease,
@@ -83,9 +86,9 @@ pub use credential::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
     CatalogNonSecretProperty, CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind,
     CredentialConsumerRole, MAX_CATALOG_CREDENTIAL_BINDINGS, MAX_CATALOG_NON_SECRET_PROPERTIES,
-    MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES, StaticCredentialReference, StorageAccessDomainId,
-    StorageCredentialScopePrefix, canonical_catalog_credential_binding_bytes,
-    canonicalize_catalog_credential_bindings,
+    MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES,
+    StaticCredentialReference, StorageAccessDomainId, StorageCredentialScopePrefix,
+    canonical_catalog_credential_binding_bytes, canonicalize_catalog_credential_bindings,
 };
 pub use credential_lease::{
     CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,

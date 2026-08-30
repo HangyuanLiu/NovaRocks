@@ -251,6 +251,7 @@ fn typed_scan_runtime_inputs(
         novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
+    .map(|request| request.with_storage_resolver(runtime.storage_resolver()))
     .map_err(|error| {
         NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InvalidValue,

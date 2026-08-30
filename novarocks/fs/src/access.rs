@@ -24,7 +24,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
+use novarocks_spi::connector::{
+    CredentialLeaseId, StaticCredentialReference, StorageAccessDomainId,
+};
 use opendal::Operator;
 use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer, RetryLayer, TimeoutLayer};
 use url::{Host, Url};
@@ -727,6 +729,7 @@ pub struct ObjectStoreProviderPoolMetrics {
     pub high_water_entries: usize,
     pub capacity_evictions: u64,
     pub idle_expirations: u64,
+    pub credential_expirations: u64,
 }
 
 /// Explicit, bounded owner for credential-bound object-store operators.
@@ -783,24 +786,7 @@ impl ObjectStoreProviderPool {
         Ok(inner.metrics())
     }
 
-    fn acquire(
-        &self,
-        access_domain: StorageAccessDomainId,
-        bucket: &str,
-        endpoint_config: &ObjectStoreEndpointConfig,
-        credential_identity: &ObjectStoreCredentialProviderIdentity,
-        secret_material: &ObjectStoreSecretMaterial,
-    ) -> FileResult<Operator> {
-        self.acquire_with_builder(
-            access_domain,
-            bucket,
-            endpoint_config,
-            credential_identity,
-            secret_material,
-            build_object_store_operator,
-        )
-    }
-
+    #[cfg(test)]
     fn acquire_with_builder<F>(
         &self,
         access_domain: StorageAccessDomainId,
@@ -813,6 +799,30 @@ impl ObjectStoreProviderPool {
     where
         F: FnOnce(&ObjectStoreEndpointIdentity, &ObjectStoreSecretMaterial) -> FileResult<Operator>,
     {
+        self.acquire_with_expiration(
+            access_domain,
+            bucket,
+            endpoint_config,
+            credential_identity,
+            secret_material,
+            None,
+            builder,
+        )
+    }
+
+    fn acquire_with_expiration<F>(
+        &self,
+        access_domain: StorageAccessDomainId,
+        bucket: &str,
+        endpoint_config: &ObjectStoreEndpointConfig,
+        credential_identity: &ObjectStoreCredentialProviderIdentity,
+        secret_material: &ObjectStoreSecretMaterial,
+        credential_expires_at: Option<Instant>,
+        builder: F,
+    ) -> FileResult<Operator>
+    where
+        F: FnOnce(&ObjectStoreEndpointIdentity, &ObjectStoreSecretMaterial) -> FileResult<Operator>,
+    {
         let endpoint = ObjectStoreEndpointIdentity::try_new(bucket, endpoint_config)?;
         let key = ObjectStoreProviderKey {
             endpoint: endpoint.clone(),
@@ -820,10 +830,20 @@ impl ObjectStoreProviderPool {
             credential_identity: credential_identity.clone(),
         };
         let now = Instant::now();
+        if credential_expires_at.is_some_and(|expires_at| expires_at <= now) {
+            return Err(FileError::invalid(
+                "object-store vended credential has expired",
+            ));
+        }
         let acquisition = {
             let mut inner = self.state.lock_inner()?;
             inner.expire_due(now);
-            if let Some(operator) = inner.touch(&key, now, self.state.options.idle_ttl) {
+            if let Some(operator) = inner.touch(
+                &key,
+                now,
+                self.state.options.idle_ttl,
+                credential_expires_at,
+            ) {
                 inner.cache_hits = inner.cache_hits.saturating_add(1);
                 self.state.wake.notify_one();
                 return Ok(operator);
@@ -870,13 +890,21 @@ impl ObjectStoreProviderPool {
                         inner.evict_oldest();
                     }
                     inner.operator_constructions = inner.operator_constructions.saturating_add(1);
-                    inner.insert(
-                        key,
-                        operator.clone(),
-                        Instant::now(),
-                        self.state.options.idle_ttl,
-                    );
-                    Ok(operator)
+                    let insert_now = Instant::now();
+                    if credential_expires_at.is_some_and(|expires_at| expires_at <= insert_now) {
+                        Err(FileError::invalid(
+                            "object-store vended credential expired during provider construction",
+                        ))
+                    } else {
+                        inner.insert(
+                            key,
+                            operator.clone(),
+                            insert_now,
+                            self.state.options.idle_ttl,
+                            credential_expires_at,
+                        );
+                        Ok(operator)
+                    }
                 }
                 Err(error) => {
                     inner.operator_construction_failures =
@@ -1012,6 +1040,7 @@ struct ObjectStoreProviderKey {
 struct ObjectStoreProviderEntry {
     operator: Operator,
     expiration_key: (Instant, u64),
+    credential_expires_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -1028,6 +1057,7 @@ struct ObjectStoreProviderPoolInner {
     high_water_entries: usize,
     capacity_evictions: u64,
     idle_expirations: u64,
+    credential_expirations: u64,
     shutting_down: bool,
 }
 
@@ -1037,11 +1067,18 @@ impl ObjectStoreProviderPoolInner {
         key: &ObjectStoreProviderKey,
         now: Instant,
         idle_ttl: Duration,
+        credential_expires_at: Option<Instant>,
     ) -> Option<Operator> {
         let entry = self.entries.remove(key)?;
         self.expiration_index.remove(&entry.expiration_key);
         let operator = entry.operator.clone();
-        self.insert(key.clone(), entry.operator, now, idle_ttl);
+        self.insert(
+            key.clone(),
+            entry.operator,
+            now,
+            idle_ttl,
+            earlier_deadline(entry.credential_expires_at, credential_expires_at),
+        );
         Some(operator)
     }
 
@@ -1051,15 +1088,20 @@ impl ObjectStoreProviderPoolInner {
         operator: Operator,
         now: Instant,
         idle_ttl: Duration,
+        credential_expires_at: Option<Instant>,
     ) {
         self.next_sequence = self.next_sequence.wrapping_add(1);
-        let expiration_key = (now.checked_add(idle_ttl).unwrap_or(now), self.next_sequence);
+        let idle_expires_at = now.checked_add(idle_ttl).unwrap_or(now);
+        let expires_at = earlier_deadline(Some(idle_expires_at), credential_expires_at)
+            .expect("idle expiration is always present");
+        let expiration_key = (expires_at, self.next_sequence);
         self.expiration_index.insert(expiration_key, key.clone());
         self.entries.insert(
             key,
             ObjectStoreProviderEntry {
                 operator,
                 expiration_key,
+                credential_expires_at,
             },
         );
         self.high_water_entries = self.high_water_entries.max(self.entries.len());
@@ -1076,8 +1118,15 @@ impl ObjectStoreProviderPoolInner {
                 return;
             };
             self.expiration_index.remove(&expiration);
-            if self.entries.remove(&key).is_some() {
-                self.idle_expirations = self.idle_expirations.saturating_add(1);
+            if let Some(entry) = self.entries.remove(&key) {
+                if entry
+                    .credential_expires_at
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    self.credential_expirations = self.credential_expirations.saturating_add(1);
+                } else {
+                    self.idle_expirations = self.idle_expirations.saturating_add(1);
+                }
             }
         }
     }
@@ -1106,7 +1155,16 @@ impl ObjectStoreProviderPoolInner {
             high_water_entries: self.high_water_entries,
             capacity_evictions: self.capacity_evictions,
             idle_expirations: self.idle_expirations,
+            credential_expirations: self.credential_expirations,
         }
+    }
+}
+
+fn earlier_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
     }
 }
 
@@ -1187,6 +1245,10 @@ impl ObjectStoreBuildReservation {
 #[non_exhaustive]
 pub enum ObjectStoreCredentialProviderIdentity {
     Static(StaticCredentialReference),
+    Vended {
+        lease_id: CredentialLeaseId,
+        epoch: u64,
+    },
 }
 
 pub struct ObjectStoreAccessContext<'a> {
@@ -1194,6 +1256,7 @@ pub struct ObjectStoreAccessContext<'a> {
     credential_identity: ObjectStoreCredentialProviderIdentity,
     secret_material: ObjectStoreSecretMaterial,
     provider_pool: &'a ObjectStoreProviderPool,
+    credential_expires_at: Option<Instant>,
 }
 
 impl<'a> ObjectStoreAccessContext<'a> {
@@ -1208,7 +1271,15 @@ impl<'a> ObjectStoreAccessContext<'a> {
             credential_identity,
             secret_material,
             provider_pool,
+            credential_expires_at: None,
         }
+    }
+
+    /// Bounds one query-scoped credential to its local lease expiration.
+    /// Pool entries retain no secret material and cannot outlive this deadline.
+    pub fn with_credential_expiration(mut self, credential_expires_at: Instant) -> Self {
+        self.credential_expires_at = Some(credential_expires_at);
+        self
     }
 }
 
@@ -1418,12 +1489,14 @@ fn resolve_object_store_locations(
             "mixed object-store buckets are not allowed",
         ));
     }
-    let operator = object_store_access.provider_pool.acquire(
+    let operator = object_store_access.provider_pool.acquire_with_expiration(
         access_domain,
         &bucket,
         &object_store_access.endpoint_config,
         &object_store_access.credential_identity,
         &object_store_access.secret_material,
+        object_store_access.credential_expires_at,
+        build_object_store_operator,
     )?;
     let paths = locations
         .into_iter()
@@ -1812,6 +1885,13 @@ mod tests {
         )
     }
 
+    fn vended_identity(epoch: u64) -> ObjectStoreCredentialProviderIdentity {
+        ObjectStoreCredentialProviderIdentity::Vended {
+            lease_id: CredentialLeaseId::try_from_bytes([0x5A; 16]).unwrap(),
+            epoch,
+        }
+    }
+
     fn endpoint_config(endpoint: &str) -> ObjectStoreEndpointConfig {
         ObjectStoreEndpointConfig {
             endpoint: endpoint.to_string(),
@@ -1910,6 +1990,75 @@ mod tests {
         assert_eq!(metrics.cache_misses, 1);
         assert_eq!(metrics.resident_entries, 1);
         assert_eq!(metrics.high_water_entries, 1);
+    }
+
+    #[test]
+    fn provider_pool_reuses_vended_epoch_without_secret_keys_but_rotates_on_epoch() {
+        let pool = ObjectStoreProviderPool::new_for_test(4, Duration::from_secs(1)).unwrap();
+        let endpoint = endpoint_config("http://localhost:9000");
+        pool.acquire_with_builder(
+            domain(1),
+            "warehouse",
+            &endpoint,
+            &vended_identity(7),
+            &secret_material("first"),
+            |_, _| memory_operator(),
+        )
+        .unwrap();
+        pool.acquire_with_builder(
+            domain(1),
+            "warehouse",
+            &endpoint,
+            &vended_identity(7),
+            &secret_material("different-value-same-lease"),
+            |_, _| -> FileResult<Operator> {
+                panic!("vended secret material must not participate in the provider key")
+            },
+        )
+        .unwrap();
+        pool.acquire_with_builder(
+            domain(1),
+            "warehouse",
+            &endpoint,
+            &vended_identity(8),
+            &secret_material("rotated-epoch"),
+            |_, _| memory_operator(),
+        )
+        .unwrap();
+
+        let metrics = pool.metrics_snapshot().unwrap();
+        assert_eq!(metrics.operator_constructions, 2);
+        assert_eq!(metrics.cache_hits, 1);
+        assert_eq!(metrics.resident_entries, 2);
+    }
+
+    #[test]
+    fn provider_pool_evicts_vended_provider_at_credential_expiration() {
+        let pool = ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(1)).unwrap();
+        pool.acquire_with_expiration(
+            domain(1),
+            "warehouse",
+            &endpoint_config("http://localhost:9000"),
+            &vended_identity(7),
+            &secret_material("ephemeral"),
+            Some(Instant::now() + Duration::from_millis(30)),
+            |_, _| memory_operator(),
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let metrics = pool.metrics_snapshot().unwrap();
+            if metrics.resident_entries == 0 {
+                assert_eq!(metrics.credential_expirations, 1);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "janitor did not evict expired vended provider"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

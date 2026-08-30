@@ -3474,6 +3474,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "novarocks-secret",
  "serde",
  "serde_json",
  "sha2",
