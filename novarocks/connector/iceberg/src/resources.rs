@@ -79,6 +79,14 @@ impl IcebergMetadataResources {
         &self.planning_binding
     }
 
+    /// Replaces the unbound composition template with the exact catalog
+    /// binding selected during FE admission. The credential resolver remains
+    /// role-local; no resolved secret is copied into catalog state.
+    pub fn with_planning_binding(mut self, planning_binding: IcebergReadBinding) -> Self {
+        self.planning_binding = planning_binding;
+        self
+    }
+
     pub fn catalog_runtime(&self) -> &IcebergCatalogRuntime {
         &self.catalog_runtime
     }

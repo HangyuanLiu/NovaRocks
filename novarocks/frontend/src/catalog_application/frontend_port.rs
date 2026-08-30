@@ -532,11 +532,13 @@ impl FrontendCatalogApplicationPort {
             "catalog desired-state runtime is being materialized",
         );
         let installed = (|| {
+            let catalog_properties = entry.catalog_properties(mode)?;
             let request = ConnectorControlFactoryRequest::try_new(
                 provider_id.clone(),
                 instance_id.clone(),
                 entry.config().durable_properties().to_vec(),
             )
+            .and_then(|request| request.with_catalog_properties(catalog_properties.clone()))
             .map_err(connector_error)?;
             let creation = self
                 .control
@@ -544,7 +546,7 @@ impl FrontendCatalogApplicationPort {
                 .map_err(connector_error)?;
             let (binding, _) = creation.into_parts();
             let binding = binding
-                .with_catalog_properties(entry.catalog_properties(mode)?)
+                .with_catalog_properties(catalog_properties)
                 .map_err(connector_error)?;
             self.install_created(&entry, binding).map(|_| ())
         })();
@@ -668,11 +670,26 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
         }
 
         let provider_id = provider_id_from_properties(&provider_properties)?;
+        let mut durable_properties = provider_properties;
+        durable_properties.sort_by(|left, right| left.0.cmp(&right.0));
+        let attachment = CatalogAttachment {
+            attachment_id: Uuid::now_v7(),
+            instance_id: command.instance_id,
+            provider_id: provider_id.clone(),
+            display_name: command.display_name,
+            durable_properties,
+            credential_bindings,
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let candidate_entry = CatalogDesiredStateEntry::from_attachment(&attachment)?;
+        let candidate_properties =
+            candidate_entry.catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)?;
         let request = ConnectorControlFactoryRequest::try_new(
             provider_id.clone(),
-            command.instance_id.clone(),
-            provider_properties,
+            attachment.instance_id.clone(),
+            attachment.durable_properties.clone(),
         )
+        .and_then(|request| request.with_catalog_properties(candidate_properties))
         .map_err(connector_error)?;
         // The factory may validate provider configuration, but it does not
         // become live until after the attachment CAS succeeds below.
@@ -680,17 +697,14 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
             .control
             .create_control(request)
             .map_err(connector_error)?;
-        let (binding, mut durable_properties) = creation.into_parts();
-        durable_properties.sort_by(|left, right| left.0.cmp(&right.0));
-        let attachment = CatalogAttachment {
-            attachment_id: Uuid::now_v7(),
-            instance_id: command.instance_id,
-            provider_id,
-            display_name: command.display_name,
-            durable_properties,
-            credential_bindings,
-            created_at_ms: chrono::Utc::now().timestamp_millis(),
-        };
+        let (binding, mut returned_durable_properties) = creation.into_parts();
+        returned_durable_properties.sort_by(|left, right| left.0.cmp(&right.0));
+        if returned_durable_properties != attachment.durable_properties {
+            return Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::InvalidRequest,
+                "connector control factory changed the catalog execution properties after typed binding",
+            ));
+        }
         let created = self.block_on(repository.create(attachment))?;
         // CREATE materializes through the same located-entry type a reconcile
         // uses, so a freshly created catalog and a rediscovered one install

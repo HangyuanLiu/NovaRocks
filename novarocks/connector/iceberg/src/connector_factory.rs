@@ -109,31 +109,50 @@ impl IcebergConnectorFactory {
                 "Iceberg control factory received a request for another provider",
             ));
         }
-        let configuration = parse_catalog_configuration_with_object_store_binding(
-            request.instance_id().as_str(),
-            request.properties(),
-            self.control_resources
-                .planning_binding()
-                .object_store_config(),
-        )
-        .map_err(invalid)?;
-        if configuration.object_store_config.is_some()
-            && self
-                .control_resources
-                .planning_binding()
-                .object_store_config()
-                .is_none()
+        let catalog_properties = request.catalog_properties().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg control factory requires typed catalog properties before construction",
+            )
+        })?;
+        if catalog_properties.provider_kind()
+            != novarocks_spi::connector::CatalogProviderKind::Iceberg
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "Iceberg object-store catalog requires a server-composed credential binding",
+                "Iceberg control factory received catalog properties for another provider",
             ));
         }
+        let planning_binding = self
+            .control_resources
+            .planning_binding()
+            .bind_catalog(catalog_properties)?;
+        let control_resources = self
+            .control_resources
+            .clone()
+            .with_planning_binding(planning_binding.clone());
+        let properties = catalog_properties
+            .execution_properties()
+            .iter()
+            .map(|property| (property.key().to_string(), property.value().to_string()))
+            .collect::<Vec<_>>();
+        let object_store_config = properties
+            .iter()
+            .find(|(key, _)| key == "iceberg.catalog.warehouse" || key == "warehouse")
+            .map(|(_, location)| planning_binding.object_store_binding_for_location(location))
+            .transpose()
+            .map_err(invalid)?;
+        let configuration = parse_catalog_configuration_with_object_store_binding(
+            request.instance_id().as_str(),
+            &properties,
+            object_store_config.as_ref().map(|binding| binding.config()),
+        )
+        .map_err(invalid)?;
         let durable_properties = sanitize_durable_properties(&configuration.properties);
         let runtime = Arc::new(
             IcebergMetadataContext::try_new(
                 IcebergCatalogControlState::new(configuration),
-                self.control_resources.clone(),
+                control_resources,
             )
             .map_err(unavailable)?,
         );

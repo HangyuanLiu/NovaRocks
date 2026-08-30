@@ -69,6 +69,7 @@ pub struct ConnectorControlFactoryRequest {
     provider_id: ConnectorProviderId,
     instance_id: ConnectorInstanceId,
     properties: Vec<(String, String)>,
+    catalog_properties: Option<CatalogProperties>,
 }
 
 impl ConnectorControlFactoryRequest {
@@ -96,6 +97,7 @@ impl ConnectorControlFactoryRequest {
             provider_id,
             instance_id,
             properties,
+            catalog_properties: None,
         })
     }
 
@@ -113,6 +115,29 @@ impl ConnectorControlFactoryRequest {
 
     pub fn into_properties(self) -> Vec<(String, String)> {
         self.properties
+    }
+
+    /// Supplies the immutable desired-state definition that authorizes this
+    /// process-local control construction. Provider factories which require
+    /// filesystem or credential access must require this value before opening
+    /// a client; the untyped request properties are only their durable input
+    /// representation.
+    pub fn with_catalog_properties(
+        mut self,
+        catalog_properties: CatalogProperties,
+    ) -> Result<Self, ConnectorError> {
+        if catalog_properties.handle().catalog_name() != &self.instance_id {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "catalog properties owner does not match connector control factory request",
+            ));
+        }
+        self.catalog_properties = Some(catalog_properties);
+        Ok(self)
+    }
+
+    pub fn catalog_properties(&self) -> Option<&CatalogProperties> {
+        self.catalog_properties.as_ref()
     }
 }
 
