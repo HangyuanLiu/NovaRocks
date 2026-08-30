@@ -9,10 +9,11 @@ use sha2::{Digest, Sha256};
 
 use novarocks_types::UniqueId;
 
-use crate::{FieldPath, ProtocolError, ProtocolErrorKind, canonical};
+use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{novarocks, plan};
 
 use super::{
+    canonical,
     identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id},
     manifest::ParticipantAttemptRef,
 };

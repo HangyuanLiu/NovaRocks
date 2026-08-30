@@ -2,6 +2,7 @@
 //!
 //! Modules are added incrementally as the Core parallel models are retired.
 
+mod canonical;
 pub mod control;
 pub mod identity;
 pub mod manifest;

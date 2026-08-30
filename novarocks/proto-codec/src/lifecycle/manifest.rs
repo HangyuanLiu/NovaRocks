@@ -7,9 +7,9 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use super::canonical;
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
 use super::query_options::QueryOptions;
-use crate::canonical;
 use crate::catalog::CatalogSet;
 use crate::membership::{BackendProcessId, required_native_compatibility_id};
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};

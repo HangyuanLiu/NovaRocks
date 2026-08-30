@@ -8,9 +8,6 @@
 pub mod error;
 pub use error::{FieldPath, FieldPathSegment, ProtocolError, ProtocolErrorKind};
 
-/// Canonical descriptor-driven projection and digest utilities.
-pub mod canonical;
-
 /// Validated catalog identity, materialization, and reachability carriers.
 pub mod catalog;
 
