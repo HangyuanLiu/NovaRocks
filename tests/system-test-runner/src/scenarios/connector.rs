@@ -21,6 +21,18 @@ const TYPED_SPLIT_NO_MORE: &str = "NOVAROCKS_TASK_SPLIT_NO_MORE";
 const TYPED_PAGE_SOURCE_OPEN: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN";
 const TYPED_PAGE_SOURCE_CLOSE: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE";
 const CONNECTOR_READER_CLOSE: &str = "NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE";
+const READER_CACHE_OVERLAY: &str = r#"
+[runtime.cache]
+page_cache_enable = true
+# This fixture writes several real Parquet files. Capacity is bytes at the
+# filesystem boundary, so retain enough ranges to make a repeated typed read
+# a meaningful same-process cache hit check.
+page_cache_capacity = 67108864
+page_cache_evict_probability = 100
+parquet_meta_cache_enable = true
+parquet_meta_cache_ttl_seconds = 3600
+parquet_page_cache_enable = true
+"#;
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -78,9 +90,25 @@ impl Scenario for TypedReadData {
         context.action("create three independent Iceberg data files");
         create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
 
+        let counted_query = format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}");
+        context.action("warm the enabled role-local cache through a typed connector read");
+        let warm_profile: Vec<String> =
+            control
+                .query(format!("EXPLAIN ANALYZE {counted_query}"))
+                .context("collect cache-warming typed connector EXPLAIN ANALYZE profile")?;
+        let warm_profile = warm_profile.join("\n");
+        assert_positive_profile_counter(&warm_profile, "ConnectorFileCacheMisses")?;
+
+        context.action("repeat the same typed connector read from the role-local cache");
+        let cached_profile: Vec<String> = control
+            .query(format!("EXPLAIN ANALYZE {counted_query}"))
+            .context("collect cached typed connector EXPLAIN ANALYZE profile")?;
+        let cached_profile = cached_profile.join("\n");
+        assert_positive_profile_counter(&cached_profile, "ConnectorFileCacheHits")?;
+
         context.action("read every row through the typed connector stack");
         let counted: Vec<i64> = control
-            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            .query(&counted_query)
             .context("count rows through the typed connector read")?;
         if counted != [300_000] {
             bail!("typed connector read returned {counted:?} rows, expected [300000]");
@@ -896,21 +924,38 @@ impl Scenario for StaticCredentialGeneration {
             STATIC_BLUE_CATALOG,
             "static_blue_db",
             "static_blue_data",
+            ["1, 100000", "100001, 200000", "200001, 300000"],
         )?;
         create_static_catalog_table_and_data(
             &mut control,
             STATIC_GREEN_CATALOG,
             "static_green_db",
             "static_green_data",
+            ["300001, 400000", "400001, 500000", "500001, 600000"],
         )?;
 
-        context
-            .action("read blue and green StaticFile catalogs through the 1FE+3BE connector path");
-        assert_static_catalog_count(
+        context.action("warm the blue static credential access domain");
+        let blue_profile = static_catalog_profile(
             &mut control,
             STATIC_BLUE_CATALOG,
             "static_blue_db",
             "static_blue_data",
+        )?;
+        assert_positive_profile_counter(&blue_profile, "ConnectorFileCacheMisses")?;
+        context.action("repeat the blue StaticFile read from its role-local cache");
+        let blue_cached_profile = static_catalog_profile(
+            &mut control,
+            STATIC_BLUE_CATALOG,
+            "static_blue_db",
+            "static_blue_data",
+        )?;
+        assert_positive_profile_counter(&blue_cached_profile, "ConnectorFileCacheHits")?;
+        assert_static_catalog_sum(
+            &mut control,
+            STATIC_BLUE_CATALOG,
+            "static_blue_db",
+            "static_blue_data",
+            45_000_150_000,
         )?;
         let blue_logs = wait_for_open_reader_on_every_backend(
             context,
@@ -918,11 +963,22 @@ impl Scenario for StaticCredentialGeneration {
             "observe every BE read the blue static credential generation",
         )?;
         assert_static_reader_opened_on_every_backend(&blue_logs, STATIC_BLUE_CATALOG)?;
-        assert_static_catalog_count(
+
+        context
+            .action("read the distinct green endpoint and access domain without blue cache reuse");
+        let green_profile = static_catalog_profile(
             &mut control,
             STATIC_GREEN_CATALOG,
             "static_green_db",
             "static_green_data",
+        )?;
+        assert_positive_profile_counter(&green_profile, "ConnectorFileCacheMisses")?;
+        assert_static_catalog_sum(
+            &mut control,
+            STATIC_GREEN_CATALOG,
+            "static_green_db",
+            "static_green_data",
+            135_000_150_000,
         )?;
         let green_logs = wait_for_open_reader_on_every_backend(
             context,
@@ -1177,14 +1233,15 @@ fn connector_launch_config() -> ScenarioLaunchConfig {
     ScenarioLaunchConfig {
         child_environment: connector_reader_environment(),
         config_overlay: CrossProcessConfigOverlay {
-            be: Some(
+            fe: Some(READER_CACHE_OVERLAY.to_string()),
+            be: Some(format!(
                 r#"
 [runtime]
 operator_buffer_chunks = 1
 query_control_terminal_drain_timeout_ms = 1000
+{READER_CACHE_OVERLAY}
 "#
-                .to_string(),
-            ),
+            )),
             ..Default::default()
         },
         ..Default::default()
@@ -1195,10 +1252,10 @@ fn static_credential_launch_overlay(snapshot: &Path) -> CrossProcessConfigOverla
     let credentials = static_credential_registry_overlay();
     CrossProcessConfigOverlay {
         fe: Some(format!(
-            "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n{credentials}",
+            "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n{credentials}\n{READER_CACHE_OVERLAY}",
             snapshot.display()
         )),
-        be: Some(credentials),
+        be: Some(format!("{credentials}\n{READER_CACHE_OVERLAY}")),
         ..Default::default()
     }
 }
@@ -1348,6 +1405,7 @@ fn create_static_catalog_table_and_data(
     catalog: &str,
     database: &str,
     table: &str,
+    ranges: [&str; 3],
 ) -> Result<()> {
     control
         .query_drop(format!("CREATE DATABASE {catalog}.{database}"))
@@ -1359,7 +1417,7 @@ fn create_static_catalog_table_and_data(
         .with_context(|| format!("create {catalog}.{database}.{table} from StaticFile source"))?;
     // One committed data file per range gives the distributed 1FE+3BE query
     // enough independent S3 work to prove every BE read the declared catalog.
-    for range in ["1, 100000", "100001, 200000", "200001, 300000"] {
+    for range in ranges {
         control
             .query_drop(format!(
                 "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series({range}))"
@@ -1371,29 +1429,50 @@ fn create_static_catalog_table_and_data(
     Ok(())
 }
 
-fn assert_static_catalog_count(
+fn static_catalog_profile(
     control: &mut mysql::Conn,
     catalog: &str,
     database: &str,
     table: &str,
-) -> Result<()> {
+) -> Result<String> {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let rows: Vec<i64> = control
-            .query(format!("SELECT count(*) FROM {catalog}.{database}.{table}"))
+        let rows: Vec<String> = control
+            .query(format!(
+                "EXPLAIN ANALYZE SELECT count(*) FROM {catalog}.{database}.{table}"
+            ))
             .with_context(|| {
-                format!("read {catalog}.{database}.{table} through typed connector")
+                format!("profile {catalog}.{database}.{table} through typed connector")
             })?;
-        if rows == [300_000] {
-            return Ok(());
+        let profile = rows.join("\n");
+        if profile.contains("TypedConnectorMetrics:") {
+            return Ok(profile);
         }
         if std::time::Instant::now() >= deadline {
             bail!(
-                "static credential catalog {catalog}.{database}.{table} returned {rows:?}, expected [300000] after bounded metadata visibility wait"
+                "static credential catalog {catalog}.{database}.{table} EXPLAIN ANALYZE has no typed connector metrics after bounded metadata visibility wait; profile={profile}"
             );
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn assert_static_catalog_sum(
+    control: &mut mysql::Conn,
+    catalog: &str,
+    database: &str,
+    table: &str,
+    expected: i64,
+) -> Result<()> {
+    let rows: Vec<i64> = control
+        .query(format!("SELECT sum(v) FROM {catalog}.{database}.{table}"))
+        .with_context(|| format!("sum {catalog}.{database}.{table} through typed connector"))?;
+    if rows != [expected] {
+        bail!(
+            "static credential catalog {catalog}.{database}.{table} returned sum {rows:?}, expected [{expected}]"
+        );
+    }
+    Ok(())
 }
 
 fn assert_static_reader_opened_on_every_backend(logs: &[String], catalog: &str) -> Result<()> {
