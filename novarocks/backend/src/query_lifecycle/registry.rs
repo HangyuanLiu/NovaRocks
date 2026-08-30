@@ -42,6 +42,7 @@ use novarocks_types::{
 use prost::Message;
 use tracing::{info, warn};
 
+use super::credential_lease::{CredentialLeaseError, QueryCredentialLeases};
 use super::entry::{
     ImmutableQueryTerminalRecord, QueryCatalogLoadState, QueryLifecycleEntry, QueryLifecyclePhase,
 };
@@ -342,6 +343,63 @@ fn catalog_ready_event() -> QueryControlEvent {
     protocol_control_event(wire::query_control_response::Event::CatalogReady(
         catalog::CatalogReady {},
     ))
+}
+
+fn credential_lease_prepared_event(
+    epoch: u64,
+    lease_id: novarocks_spi::connector::CredentialLeaseId,
+) -> QueryControlEvent {
+    use novarocks_proto_models::novarocks as wire;
+    protocol_control_event(
+        wire::query_control_response::Event::CredentialLeasePrepared(
+            wire::CredentialLeasePrepared {
+                lease_id: lease_id.as_bytes().to_vec(),
+                epoch,
+            },
+        ),
+    )
+}
+
+fn credential_lease_committed_event(
+    epoch: u64,
+    lease_id: novarocks_spi::connector::CredentialLeaseId,
+) -> QueryControlEvent {
+    use novarocks_proto_models::novarocks as wire;
+    protocol_control_event(
+        wire::query_control_response::Event::CredentialLeaseCommitted(
+            wire::CredentialLeaseCommitted {
+                lease_id: lease_id.as_bytes().to_vec(),
+                epoch,
+            },
+        ),
+    )
+}
+
+fn credential_lease_error(error: CredentialLeaseError) -> QueryLifecycleError {
+    let code = match error {
+        CredentialLeaseError::Invalid => QueryLifecycleErrorCode::InvalidManifest,
+        CredentialLeaseError::Conflict => QueryLifecycleErrorCode::Conflict,
+        CredentialLeaseError::Terminated => QueryLifecycleErrorCode::Terminated,
+    };
+    QueryLifecycleError::new(code, error.detail())
+}
+
+fn send_credential_lease_event(
+    events: Option<tokio::sync::mpsc::Sender<QueryControlEvent>>,
+    event: QueryControlEvent,
+) -> Result<(), QueryLifecycleError> {
+    let Some(events) = events else {
+        return Err(QueryLifecycleError::new(
+            QueryLifecycleErrorCode::Terminated,
+            "query control stream is unavailable for credential lease acknowledgement",
+        ));
+    };
+    events.try_send(event).map_err(|_| {
+        QueryLifecycleError::new(
+            QueryLifecycleErrorCode::Internal,
+            "credential lease acknowledgement queue is unavailable",
+        )
+    })
 }
 
 fn catalog_load_failed_event(safe_detail: String) -> QueryControlEvent {
@@ -1641,6 +1699,21 @@ impl QueryLifecycleRegistry {
     /// before their delivery.  The manager retains a warm runtime according
     /// to its own bounded policy, but this attempt no longer protects it.
     fn release_query_resources(&self, execution_id: QueryExecutionId) {
+        if let Some(entry) = self
+            .state
+            .lock()
+            .expect("query lifecycle registry lock")
+            .entries
+            .get(&execution_id)
+            .cloned()
+        {
+            entry
+                .state
+                .lock()
+                .expect("query lifecycle entry lock")
+                .credential_leases
+                .clear();
+        }
         self.catalog_manager.release_query(execution_id);
         self.publish_catalog_lease_metrics();
         self.local_runtime.release_query_resources(execution_id);
@@ -1700,15 +1773,44 @@ impl QueryLifecycleRegistry {
     }
 
     pub(crate) fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
+        self.init_query_inner(request, false)
+    }
+
+    /// Reached only after the BE native RPC listener has verified a concrete
+    /// TLS connection. The ordinary Init entrypoint cannot accept envelopes.
+    pub(crate) fn init_query_tls(&self, request: QueryInitRequest) -> QueryInitAck {
+        self.init_query_inner(request, true)
+    }
+
+    fn init_query_inner(&self, request: QueryInitRequest, tls_verified: bool) -> QueryInitAck {
         let manifest = validated(request.manifest());
         let execution_id = validated(manifest.execution_id());
+        let digest = validated(manifest.digest());
+        let credential_leases = match QueryCredentialLeases::from_tls_init(&request) {
+            Ok(leases)
+                if tls_verified
+                    || request
+                        .credential_lease_envelopes()
+                        .is_ok_and(|values| values.is_empty()) =>
+            {
+                leases
+            }
+            Ok(_) | Err(_) => {
+                let ack = QueryInitAck::new(
+                    execution_id,
+                    digest,
+                    QueryInitOutcome::QueryInitRejectedInvalidManifest,
+                );
+                self.log_init(&ack);
+                return ack;
+            }
+        };
         // Decode the exact frozen set before any local lifecycle entry or
         // provider side effect exists.  The validated manifest owns the
         // conflict fence for Init retries.
         let catalog_set = validated(manifest.catalog_set());
         let _catalogs = validated(catalog_set.catalogs());
         if validated(manifest.native_compatibility_id()) != self.native_compatibility_id {
-            let digest = validated(manifest.digest());
             let ack = QueryInitAck::new(
                 execution_id,
                 digest,
@@ -1719,7 +1821,6 @@ impl QueryLifecycleRegistry {
         }
         // The admission boundary derives the manifest identity exactly once and
         // retains it on the entry; later comparisons read the retained value.
-        let digest = validated(manifest.digest());
         let manifest_backend = validated(manifest.backend());
         if validated(manifest_backend.process_id()) != self.local_process_id {
             let ack = QueryInitAck::new(
@@ -1774,6 +1875,40 @@ impl QueryLifecycleRegistry {
                     return ack;
                 }
                 drop(state);
+                let (terminal, matches) = {
+                    let state = entry.state.lock().expect("query lifecycle entry lock");
+                    (
+                        state.termination_reason.is_some()
+                            || matches!(
+                                state.phase,
+                                QueryLifecyclePhase::Terminating
+                                    | QueryLifecyclePhase::TerminalRetained
+                                    | QueryLifecyclePhase::Tombstone
+                            ),
+                        state
+                            .credential_leases
+                            .same_initial_values(&credential_leases),
+                    )
+                };
+                if terminal {
+                    let ack = self.wait_for_existing_init(entry, execution_id, digest);
+                    self.log_init(&ack);
+                    return ack;
+                }
+                if !matches {
+                    self.request_termination(
+                        entry,
+                        QueryTerminationReason::QueryTerminationLocalFailure,
+                    );
+                    let ack = QueryInitAck::new(
+                        execution_id,
+                        digest,
+                        QueryInitOutcome::QueryInitRejectedConflict,
+                    );
+                    self.log_init(&ack);
+                    self.publish_metrics();
+                    return ack;
+                }
                 let ack = self.wait_for_existing_init(entry, execution_id, digest);
                 self.log_init(&ack);
                 return ack;
@@ -1788,7 +1923,11 @@ impl QueryLifecycleRegistry {
                 self.log_init(&ack);
                 return ack;
             }
-            let entry = Arc::new(QueryLifecycleEntry::initializing(manifest, digest));
+            let entry = Arc::new(QueryLifecycleEntry::initializing(
+                manifest,
+                digest,
+                credential_leases,
+            ));
             state.entries.insert(execution_id, Arc::clone(&entry));
             state.active_entries += 1;
             entry
@@ -4609,6 +4748,70 @@ impl QueryLifecycleRegistry {
         Ok(())
     }
 
+    fn prepare_credential_lease(
+        &self,
+        execution_id: QueryExecutionId,
+        envelope: novarocks_proto_codec::lifecycle::CredentialLeaseSecretEnvelope,
+    ) -> Result<(), QueryLifecycleError> {
+        let lease_id = envelope.lease_id();
+        let entry = self.active_entry(execution_id)?;
+        let (epoch, events) = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            if state.termination_reason.is_some()
+                || !matches!(
+                    state.phase,
+                    QueryLifecyclePhase::ControlAttached
+                        | QueryLifecyclePhase::Staging
+                        | QueryLifecyclePhase::Staged
+                        | QueryLifecyclePhase::Running
+                )
+            {
+                return Err(QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Terminated,
+                    CredentialLeaseError::Terminated.detail(),
+                ));
+            }
+            let epoch = state
+                .credential_leases
+                .prepare(envelope)
+                .map_err(credential_lease_error)?;
+            (epoch, state.events.clone())
+        };
+        send_credential_lease_event(events, credential_lease_prepared_event(epoch, lease_id))
+    }
+
+    fn commit_credential_lease(
+        &self,
+        execution_id: QueryExecutionId,
+        lease_id: novarocks_spi::connector::CredentialLeaseId,
+        epoch: u64,
+    ) -> Result<(), QueryLifecycleError> {
+        let entry = self.active_entry(execution_id)?;
+        let events = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            if state.termination_reason.is_some()
+                || !matches!(
+                    state.phase,
+                    QueryLifecyclePhase::ControlAttached
+                        | QueryLifecyclePhase::Staging
+                        | QueryLifecyclePhase::Staged
+                        | QueryLifecyclePhase::Running
+                )
+            {
+                return Err(QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::Terminated,
+                    CredentialLeaseError::Terminated.detail(),
+                ));
+            }
+            state
+                .credential_leases
+                .commit(lease_id, epoch)
+                .map_err(credential_lease_error)?;
+            state.events.clone()
+        };
+        send_credential_lease_event(events, credential_lease_committed_event(epoch, lease_id))
+    }
+
     fn terminate_from_control(
         &self,
         execution_id: QueryExecutionId,
@@ -5171,6 +5374,27 @@ impl BackendQueryControl for RegistryQueryControl {
             .terminal_ack_from_control(ack)
     }
 
+    fn credential_lease_prepare(
+        &self,
+        envelope: novarocks_proto_codec::lifecycle::CredentialLeaseSecretEnvelope,
+    ) -> Result<(), QueryLifecycleError> {
+        self.registry
+            .upgrade()
+            .ok_or_else(|| internal_error("query lifecycle registry was dropped"))?
+            .prepare_credential_lease(self.execution_id, envelope)
+    }
+
+    fn credential_lease_commit(
+        &self,
+        lease_id: novarocks_spi::connector::CredentialLeaseId,
+        epoch: u64,
+    ) -> Result<(), QueryLifecycleError> {
+        self.registry
+            .upgrade()
+            .ok_or_else(|| internal_error("query lifecycle registry was dropped"))?
+            .commit_credential_lease(self.execution_id, lease_id, epoch)
+    }
+
     fn coordinator_lost(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError> {
         if query_lifecycle_test_markers_enabled() {
             let process_id = self
@@ -5275,6 +5499,10 @@ impl QueryLifecycleIngress for QueryLifecycleRegistry {
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck {
         QueryLifecycleRegistry::init_query(self, request)
+    }
+
+    fn init_query_tls(&self, request: QueryInitRequest) -> QueryInitAck {
+        QueryLifecycleRegistry::init_query_tls(self, request)
     }
 
     fn prune_catalogs(

@@ -28,6 +28,7 @@ use novarocks_spi::connector::CatalogProperties;
 use novarocks_types::UniqueId;
 use prost::Message;
 
+use super::credential_lease::QueryCredentialLeases;
 use super::stage::StartGate;
 use super::{QueryLifecycleError, QueryLifecycleErrorCode};
 use crate::runtime_filter::domain::BackendFrontendFeedbackSink;
@@ -117,6 +118,9 @@ pub(crate) struct QueryLifecycleEntryState {
     pub(crate) init_outcome: Option<QueryInitOutcome>,
     pub(crate) termination_reason: Option<QueryTerminationReason>,
     pub(crate) catalog_load: QueryCatalogLoadState,
+    /// The sole BE-side owner of confidential query-attempt credential values.
+    /// Terminal cleanup clears this before the entry can become a tombstone.
+    pub(crate) credential_leases: QueryCredentialLeases,
     /// Published with a successful Init and owned by this full execution
     /// attempt. No process-global context owns a second Service.
     pub(crate) runtime_filter: Option<Arc<RuntimeFilterParticipant>>,
@@ -179,6 +183,7 @@ impl QueryLifecycleEntry {
     pub(crate) fn initializing(
         manifest: ParticipantManifest,
         digest: ParticipantManifestDigest,
+        credential_leases: QueryCredentialLeases,
     ) -> Self {
         let participant = ParticipantAttemptRef::new(
             manifest
@@ -206,6 +211,7 @@ impl QueryLifecycleEntry {
                 init_outcome: None,
                 termination_reason: None,
                 catalog_load: QueryCatalogLoadState::Ready,
+                credential_leases,
                 runtime_filter: None,
                 runtime_filter_installed: false,
                 runtime_filter_close_in_flight: false,

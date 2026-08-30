@@ -359,6 +359,30 @@ impl QueryControlSession for ReadyLifecycleSessionForTest {
                 })
             }
             Some(Command::TerminalAck(_)) => return Ok(()),
+            Some(Command::CredentialLeasePrepare(prepare)) => {
+                let envelope = prepare
+                    .envelope
+                    .as_ref()
+                    .expect("validated credential lease prepare envelope");
+                QueryControlEvent::parse(protocol::QueryControlResponse {
+                    event: Some(Event::CredentialLeasePrepared(
+                        protocol::CredentialLeasePrepared {
+                            lease_id: envelope.lease_id.clone(),
+                            epoch: envelope.epoch,
+                        },
+                    )),
+                })
+            }
+            Some(Command::CredentialLeaseCommit(commit)) => {
+                QueryControlEvent::parse(protocol::QueryControlResponse {
+                    event: Some(Event::CredentialLeaseCommitted(
+                        protocol::CredentialLeaseCommitted {
+                            lease_id: commit.lease_id.clone(),
+                            epoch: commit.epoch,
+                        },
+                    )),
+                })
+            }
             Some(Command::Attach(_)) | None => unreachable!("validated control command"),
         };
         let event = event.map_err(protocol_contract_error)?;

@@ -25,13 +25,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_proto_codec::lifecycle::{
-    FragmentLiveObservation, ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach,
-    QueryControlEndpoint, QueryControlEvent, QueryInitAck, QueryInitRequest, QueryStageAck,
-    QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome, QueryStartRequest,
-    QueryTerminalAck, QueryTerminalReportAck, QueryTerminationAck, QueryTerminationReason,
-    StageDigest,
+    CredentialLeaseSecretEnvelope, FragmentLiveObservation, ParticipantTerminalOutcome,
+    QueryAbortRequest, QueryControlAttach, QueryControlEndpoint, QueryControlEvent, QueryInitAck,
+    QueryInitRequest, QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck,
+    QueryStartOutcome, QueryStartRequest, QueryTerminalAck, QueryTerminalReportAck,
+    QueryTerminationAck, QueryTerminationReason, StageDigest,
 };
-use novarocks_spi::connector::CatalogHandle;
+use novarocks_spi::connector::{CatalogHandle, CredentialLeaseId};
 use novarocks_types::{BackendProcessId, UniqueId};
 
 /// Backend-local lifecycle failure categories.
@@ -113,6 +113,27 @@ pub(crate) trait BackendQueryControl: Send + Sync + 'static {
         ))
     }
 
+    fn credential_lease_prepare(
+        &self,
+        _envelope: CredentialLeaseSecretEnvelope,
+    ) -> Result<(), QueryLifecycleError> {
+        Err(QueryLifecycleError::new(
+            QueryLifecycleErrorCode::Terminated,
+            "credential lease prepare is not supported by this lifecycle owner",
+        ))
+    }
+
+    fn credential_lease_commit(
+        &self,
+        _lease_id: CredentialLeaseId,
+        _epoch: u64,
+    ) -> Result<(), QueryLifecycleError> {
+        Err(QueryLifecycleError::new(
+            QueryLifecycleErrorCode::Terminated,
+            "credential lease commit is not supported by this lifecycle owner",
+        ))
+    }
+
     fn coordinator_lost(&self, reason: QueryTerminationReason) -> Result<(), QueryLifecycleError>;
 }
 
@@ -151,6 +172,13 @@ pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
     }
 
     fn init_query(&self, request: QueryInitRequest) -> QueryInitAck;
+
+    /// Invoked only by the BE listener after a concrete TLS connection has
+    /// completed its handshake. Production overrides this to accept lease
+    /// material; ordinary ingress implementations remain fail-closed.
+    fn init_query_tls(&self, request: QueryInitRequest) -> QueryInitAck {
+        self.init_query(request)
+    }
 
     /// Reconciles retained catalog runtimes against one complete FE
     /// reachability snapshot. The lifecycle owner keeps the only catalog

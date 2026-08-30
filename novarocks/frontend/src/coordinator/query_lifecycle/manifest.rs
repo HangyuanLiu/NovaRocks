@@ -16,17 +16,17 @@
 // under the License.
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use crate::query_execution::lifecycle_plan::QueryInitPlan;
+use crate::query_execution::lifecycle_plan::{QueryCredentialLeases, QueryInitPlan};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_proto_codec::lifecycle::{ParticipantManifestDigest, QueryInitRequest};
-use novarocks_proto_models::novarocks as protocol_wire;
 
 use super::QueryLifecycleTarget;
 
 pub(super) struct MaterializedQueryInit {
     pub execution_id: QueryExecutionId,
     pub participants: Vec<MaterializedParticipant>,
+    pub credential_leases: QueryCredentialLeases,
 }
 
 #[derive(Clone)]
@@ -37,12 +37,31 @@ pub(super) struct MaterializedParticipant {
     pub fragment_participant: bool,
 }
 
+impl MaterializedParticipant {
+    /// Erases the confidential Init side channel after all Init retries have
+    /// finished. The manifest remains available for normal lifecycle and
+    /// terminal validation, but no retained FE participant copy owns a
+    /// credential value after admission.
+    pub(super) fn clear_confidential_lease_material(
+        &mut self,
+    ) -> Result<(), DistributedQueryError> {
+        let manifest = self.request.manifest().map_err(|error| {
+            contract_error(format!(
+                "materialized participant manifest is unavailable while clearing credential leases: {error}"
+            ))
+        })?;
+        self.request = QueryInitRequest::from_manifest(manifest);
+        Ok(())
+    }
+}
+
 pub(super) fn materialize(
     plan: QueryInitPlan,
 ) -> Result<MaterializedQueryInit, DistributedQueryError> {
     let execution_id = plan.execution_id();
     let mut participants = Vec::with_capacity(plan.participant_count());
-    for participant in plan.into_participants() {
+    let (plan_participants, credential_leases) = plan.into_parts();
+    for participant in plan_participants {
         let (backend_idx, backend, manifest, digest) = participant.into_parts();
         let endpoint = backend.endpoint().map_err(|error| {
             contract_error(format!(
@@ -63,10 +82,13 @@ pub(super) fn materialize(
         // carries at least one expected fragment instance. The declared role
         // set is a redundant projection of the same fact.
         let fragment_participant = !manifest.expected_fragment_instance_ids().is_empty();
-        let request = QueryInitRequest::parse(protocol_wire::InitQueryRequest {
-            manifest: Some(manifest.as_proto().clone()),
-            credential_lease_envelopes: vec![],
-        })
+        let request = QueryInitRequest::from_manifest_with_credential_lease_envelopes(
+            manifest,
+            credential_leases
+                .leases()
+                .iter()
+                .map(|lease| lease.envelope().clone()),
+        )
         .map_err(|error| {
             contract_error(format!(
                 "query lifecycle backend {backend_idx} request is invalid: {error}"
@@ -82,6 +104,7 @@ pub(super) fn materialize(
     Ok(MaterializedQueryInit {
         execution_id: core_execution_id(execution_id)?,
         participants,
+        credential_leases,
     })
 }
 

@@ -16,6 +16,7 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
@@ -27,13 +28,15 @@ use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::{
-    ParticipantAttemptRef, ParticipantBackendIdentity, ParticipantManifest,
-    ParticipantManifestDigest, QueryControlEndpoint, QueryExecutionId,
+    CredentialLeaseSecretEnvelope, ParticipantAttemptRef, ParticipantBackendIdentity,
+    ParticipantManifest, ParticipantManifestDigest, QueryControlEndpoint, QueryExecutionId,
     QueryOptions as ProtocolQueryOptions, RuntimeFilterContribution,
 };
 use novarocks_proto_models::common;
 use novarocks_proto_models::novarocks;
-use novarocks_spi::connector::ConnectorControlPlanningLease;
+use novarocks_spi::connector::{
+    ConnectorControlPlanningLease, CredentialLeaseDescriptor, CredentialLeaseId,
+};
 use novarocks_types::BackendProcessId;
 use novarocks_types::NativeCompatibilityId;
 
@@ -140,6 +143,186 @@ pub(crate) struct QueryInitPlanHeader {
     query_deadline_unix_ms: u64,
 }
 
+/// FE-owned source for one already-admitted vended credential refresh.
+///
+/// The source is intentionally attempt-local and is never represented on the
+/// native wire.  In particular, a Backend cannot recover it after a stream
+/// loss and cannot use it to mint a credential independently.
+pub(crate) trait QueryCredentialLeaseRefresher: Send + Sync + 'static {
+    fn refresh(
+        &self,
+        current: &CredentialLeaseDescriptor,
+    ) -> Result<QueryCredentialLeaseRefresh, String>;
+}
+
+/// A next epoch obtained by the FE from the provider-private refresh source.
+/// The secret envelope has a redacted Debug implementation in the codec and
+/// therefore must not be exposed by this type either.
+pub(crate) struct QueryCredentialLeaseRefresh {
+    descriptor: CredentialLeaseDescriptor,
+    envelope: CredentialLeaseSecretEnvelope,
+}
+
+impl QueryCredentialLeaseRefresh {
+    pub(crate) fn try_new(
+        descriptor: CredentialLeaseDescriptor,
+        envelope: CredentialLeaseSecretEnvelope,
+    ) -> Result<Self, DistributedQueryError> {
+        if !envelope.matches_descriptor(&descriptor) {
+            return Err(contract_error(
+                "query credential lease refresh envelope does not match descriptor",
+            ));
+        }
+        Ok(Self {
+            descriptor,
+            envelope,
+        })
+    }
+
+    pub(crate) const fn descriptor(&self) -> &CredentialLeaseDescriptor {
+        &self.descriptor
+    }
+
+    pub(crate) const fn envelope(&self) -> &CredentialLeaseSecretEnvelope {
+        &self.envelope
+    }
+}
+
+/// One query-attempt lease frozen before any participant Init is dispatched.
+/// Values remain FE-local until `materialize` forms the TLS-only Init side
+/// channel; manifests receive only the descriptor.
+pub(crate) struct QueryCredentialLease {
+    descriptor: CredentialLeaseDescriptor,
+    envelope: CredentialLeaseSecretEnvelope,
+    refresher: Option<Arc<dyn QueryCredentialLeaseRefresher>>,
+}
+
+impl QueryCredentialLease {
+    pub(crate) fn try_new(
+        descriptor: CredentialLeaseDescriptor,
+        envelope: CredentialLeaseSecretEnvelope,
+        refresher: Option<Arc<dyn QueryCredentialLeaseRefresher>>,
+    ) -> Result<Self, DistributedQueryError> {
+        if !envelope.matches_descriptor(&descriptor) {
+            return Err(contract_error(
+                "query credential lease initial envelope does not match descriptor",
+            ));
+        }
+        if descriptor.refresh_capable() != refresher.is_some() {
+            return Err(contract_error(
+                "query credential lease refresh capability and FE refresher differ",
+            ));
+        }
+        Ok(Self {
+            descriptor,
+            envelope,
+            refresher,
+        })
+    }
+
+    pub(crate) const fn descriptor(&self) -> &CredentialLeaseDescriptor {
+        &self.descriptor
+    }
+
+    pub(crate) const fn envelope(&self) -> &CredentialLeaseSecretEnvelope {
+        &self.envelope
+    }
+
+    pub(crate) fn refresher(&self) -> Option<&Arc<dyn QueryCredentialLeaseRefresher>> {
+        self.refresher.as_ref()
+    }
+}
+
+/// Canonical secret-bearing lease contribution retained by the FE attempt.
+/// It is deliberately not `Debug` or `Clone`: retries reuse this exact
+/// in-memory material and code outside the lifecycle owner cannot copy it.
+pub(crate) struct QueryCredentialLeases {
+    leases: Vec<QueryCredentialLease>,
+}
+
+impl QueryCredentialLeases {
+    pub(crate) fn empty() -> Self {
+        Self { leases: Vec::new() }
+    }
+
+    pub(crate) fn try_new(
+        mut leases: Vec<QueryCredentialLease>,
+    ) -> Result<Self, DistributedQueryError> {
+        leases.sort_by_key(|lease| lease.descriptor().lease_id());
+        if leases
+            .windows(2)
+            .any(|pair| pair[0].descriptor().lease_id() == pair[1].descriptor().lease_id())
+        {
+            return Err(contract_error(
+                "query credential lease contribution repeats a lease id",
+            ));
+        }
+        Ok(Self { leases })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.leases.is_empty()
+    }
+
+    pub(crate) fn descriptors(&self) -> impl Iterator<Item = &CredentialLeaseDescriptor> {
+        self.leases.iter().map(QueryCredentialLease::descriptor)
+    }
+
+    pub(crate) fn leases(&self) -> &[QueryCredentialLease] {
+        &self.leases
+    }
+
+    pub(crate) fn lease(&self, id: CredentialLeaseId) -> Option<&QueryCredentialLease> {
+        self.leases
+            .binary_search_by_key(&id, |lease| lease.descriptor().lease_id())
+            .ok()
+            .map(|index| &self.leases[index])
+    }
+
+    pub(crate) fn refreshable(&self) -> Vec<(CredentialLeaseId, u64)> {
+        self.leases
+            .iter()
+            .filter(|lease| lease.refresher().is_some())
+            .map(|lease| {
+                (
+                    lease.descriptor().lease_id(),
+                    lease.descriptor().not_after_unix_ms(),
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn replace(
+        &mut self,
+        descriptor: CredentialLeaseDescriptor,
+        envelope: CredentialLeaseSecretEnvelope,
+    ) -> Result<(), DistributedQueryError> {
+        let id = descriptor.lease_id();
+        let index = self
+            .leases
+            .binary_search_by_key(&id, |lease| lease.descriptor().lease_id())
+            .map_err(|_| {
+                contract_error("query credential lease refresh references an unknown lease")
+            })?;
+        let lease = &mut self.leases[index];
+        if !lease.descriptor.has_same_refresh_scope(&descriptor)
+            || descriptor.epoch() <= lease.descriptor.epoch()
+            || !envelope.matches_descriptor(&descriptor)
+        {
+            return Err(contract_error(
+                "query credential lease refresh changed immutable scope or epoch",
+            ));
+        }
+        lease.descriptor = descriptor;
+        lease.envelope = envelope;
+        Ok(())
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.leases.clear();
+    }
+}
+
 impl QueryInitPlanHeader {
     const fn new(execution_id: QueryExecutionId, query_deadline_unix_ms: u64) -> Self {
         Self {
@@ -165,6 +348,7 @@ pub struct QueryInitOptions {
     pre_start_timeout: Duration,
     report_endpoint: QueryControlEndpoint,
     catalog_set: CatalogSet,
+    credential_leases: QueryCredentialLeases,
 }
 
 impl QueryInitOptions {
@@ -237,6 +421,7 @@ impl QueryInitOptions {
             pre_start_timeout,
             report_endpoint,
             catalog_set: CatalogSet::new([]).expect("the empty catalog set is valid"),
+            credential_leases: QueryCredentialLeases::empty(),
         })
     }
 
@@ -276,6 +461,18 @@ impl QueryInitOptions {
     pub fn catalog_set(&self) -> &CatalogSet {
         &self.catalog_set
     }
+
+    /// Attaches exact FE-owned confidential material after planning has
+    /// collected every table-operation requirement. The material is consumed
+    /// once by Init materialization and never becomes part of the manifest.
+    pub(crate) fn with_credential_leases(mut self, leases: QueryCredentialLeases) -> Self {
+        self.credential_leases = leases;
+        self
+    }
+
+    pub(crate) fn credential_leases(&self) -> &QueryCredentialLeases {
+        &self.credential_leases
+    }
 }
 
 pub struct QueryInitPlan {
@@ -286,6 +483,7 @@ pub struct QueryInitPlan {
     )]
     query_deadline_unix_ms: u64,
     participants: Vec<QueryInitParticipant>,
+    credential_leases: QueryCredentialLeases,
 }
 
 impl QueryInitPlan {
@@ -320,6 +518,10 @@ impl QueryInitPlan {
 
     pub fn into_participants(self) -> Vec<QueryInitParticipant> {
         self.participants
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<QueryInitParticipant>, QueryCredentialLeases) {
+        (self.participants, self.credential_leases)
     }
 
     /// Captures participant facts that must outlive consumption of the Init
@@ -412,6 +614,7 @@ impl QueryInitPlan {
             execution_id,
             query_deadline_unix_ms: participants[0].manifest().query_deadline_unix_ms(),
             participants,
+            credential_leases: QueryCredentialLeases::empty(),
         })
     }
 }
@@ -679,7 +882,11 @@ pub(crate) fn compile_query_init_plan(
             pre_start_timeout_ms: duration_millis(options.pre_start_timeout)?,
             report_endpoint: Some(options.report_endpoint.as_proto().clone()),
             catalog_set: Some(options.catalog_set.as_proto().clone()),
-            credential_lease_descriptors: vec![],
+            credential_lease_descriptors: options
+                .credential_leases
+                .descriptors()
+                .map(novarocks_proto_codec::lifecycle::encode_credential_lease_descriptor)
+                .collect(),
         })
         .map_err(|error| {
             contract_error(format!(
@@ -700,6 +907,20 @@ pub(crate) fn compile_query_init_plan(
         execution_id: options.execution_id,
         query_deadline_unix_ms: header.query_deadline_unix_ms,
         participants,
+        credential_leases: QueryCredentialLeases::try_new(
+            options
+                .credential_leases
+                .leases
+                .iter()
+                .map(|lease| {
+                    QueryCredentialLease::try_new(
+                        lease.descriptor.clone(),
+                        lease.envelope.clone(),
+                        lease.refresher.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?,
     })
 }
 
