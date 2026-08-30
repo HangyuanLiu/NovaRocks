@@ -95,6 +95,14 @@ printf 'other-island\n' >"$other_island_binary"
 chmod +x "$primary_binary" "$compatible_binary" "$other_island_binary"
 
 # --- 1. every registered scenario runs, in registry order, one --only each ----
+primary_binary="$tmpdir/novarocks"
+compatible_binary="$tmpdir/novarocks-compatible"
+other_island_binary="$tmpdir/novarocks-other-island"
+printf 'primary\n' >"$primary_binary"
+printf 'compatible\n' >"$compatible_binary"
+printf 'other-island\n' >"$other_island_binary"
+chmod +x "$primary_binary" "$compatible_binary" "$other_island_binary"
+
 reset_stage
 if ! ci_run_system_scenarios "$fake_runner" "$primary_binary" \
   "$compatible_binary" "$other_island_binary" "$tmpdir/base.toml" \
