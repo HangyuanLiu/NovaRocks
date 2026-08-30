@@ -27,9 +27,9 @@ use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::{
-    ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest,
-    QueryControlEndpoint, QueryExecutionId, QueryOptions as ProtocolQueryOptions,
-    RuntimeFilterContribution,
+    ParticipantAttemptRef, ParticipantBackendIdentity, ParticipantManifest,
+    ParticipantManifestDigest, QueryControlEndpoint, QueryExecutionId,
+    QueryOptions as ProtocolQueryOptions, RuntimeFilterContribution,
 };
 use novarocks_proto_models::common;
 use novarocks_proto_models::novarocks;
@@ -335,17 +335,19 @@ impl QueryInitPlan {
                     .backend()
                     .endpoint()
                     .map_err(protocol_contract_error)?;
+                let process_id = participant
+                    .backend()
+                    .process_id()
+                    .map_err(protocol_contract_error)?;
                 StageParticipantBinding::new(
                     QueryLifecycleTarget::new(
                         participant.backend_idx(),
                         RuntimeEndpoint::new(endpoint.host(), i32::from(endpoint.port()))
                             .map_err(|error| contract_error(error.to_string()))?,
-                        participant
-                            .backend()
-                            .process_id()
-                            .map_err(protocol_contract_error)?,
+                        process_id,
                     ),
-                    participant.digest(),
+                    ParticipantAttemptRef::new(self.execution_id, process_id)
+                        .map_err(protocol_contract_error)?,
                     participant
                         .manifest()
                         .expected_fragment_instance_ids()

@@ -5,7 +5,7 @@
 //! profile interpretation remain with their application owners.
 
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
-use super::manifest::{ParticipantBackendIdentity, ParticipantManifest, ParticipantManifestDigest};
+use super::manifest::{ParticipantAttemptRef, ParticipantManifest, ParticipantManifestDigest};
 use super::terminal::ParticipantTerminalOutcome;
 use crate::catalog::{validate_catalog_load_failed, validate_catalog_load_state};
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
@@ -102,27 +102,18 @@ pub struct QueryControlAttach {
 }
 
 impl QueryControlAttach {
-    pub fn new(
-        execution_id: QueryExecutionId,
-        digest: ParticipantManifestDigest,
-        frontend_owner_epoch: u64,
-    ) -> Result<Self, ProtocolError> {
+    pub fn new(participant: ParticipantAttemptRef) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::QueryControlAttach {
-            execution_id: Some(encode_query_execution_id(execution_id)),
-            init_digest: digest.as_bytes().to_vec(),
-            frontend_owner_epoch,
+            participant: Some(participant.as_proto().clone()),
         })
     }
 
     pub fn parse(raw: novarocks::QueryControlAttach) -> Result<Self, ProtocolError> {
-        required_execution_id(&raw.execution_id, "query execution id is required")?;
-        manifest_digest(&raw.init_digest)?;
-        if raw.frontend_owner_epoch == 0 {
-            return Err(invalid(
-                FieldPath::root("query_control_attach").field("frontend_owner_epoch"),
-                "frontend owner epoch must be nonzero",
-            ));
-        }
+        required_participant(
+            &raw.participant,
+            FieldPath::root("query_control_attach").field("participant"),
+            "query control attach participant reference is required",
+        )?;
         Ok(Self { raw })
     }
 
@@ -130,16 +121,16 @@ impl QueryControlAttach {
         &self.raw
     }
 
+    pub fn participant(&self) -> Result<ParticipantAttemptRef, ProtocolError> {
+        required_participant(
+            &self.raw.participant,
+            FieldPath::root("query_control_attach").field("participant"),
+            "query control attach participant reference is required",
+        )
+    }
+
     pub fn execution_id(&self) -> Result<QueryExecutionId, ProtocolError> {
-        required_execution_id(&self.raw.execution_id, "query execution id is required")
-    }
-
-    pub fn digest(&self) -> Result<ParticipantManifestDigest, ProtocolError> {
-        manifest_digest(&self.raw.init_digest)
-    }
-
-    pub const fn frontend_owner_epoch(&self) -> u64 {
-        self.raw.frontend_owner_epoch
+        self.participant()?.execution_id()
     }
 }
 
@@ -280,9 +271,11 @@ impl RuntimeFilterFeedbackEvent {
     pub fn parse(raw: novarocks::RuntimeFilterFeedbackEvent) -> Result<Self, ProtocolError> {
         use novarocks::runtime_filter_feedback_event::TerminalOutcome;
 
-        required_execution_id(&raw.execution_id, "query execution id is required")?;
-        manifest_digest(&raw.init_digest)?;
-        required_backend(&raw.backend, "feedback backend identity is required")?;
+        required_participant(
+            &raw.participant_attempt,
+            FieldPath::root("runtime_filter_feedback_event").field("participant_attempt"),
+            "feedback participant reference is required",
+        )?;
         if raw.participant_id == 0 {
             return Err(invalid(
                 FieldPath::root("runtime_filter_feedback_event").field("participant_id"),
@@ -347,6 +340,14 @@ impl RuntimeFilterFeedbackEvent {
     pub const fn as_proto(&self) -> &novarocks::RuntimeFilterFeedbackEvent {
         &self.raw
     }
+
+    pub fn participant(&self) -> Result<ParticipantAttemptRef, ProtocolError> {
+        required_participant(
+            &self.raw.participant_attempt,
+            FieldPath::root("runtime_filter_feedback_event").field("participant_attempt"),
+            "feedback participant reference is required",
+        )
+    }
 }
 
 /// A validated unary abort request.
@@ -357,19 +358,23 @@ pub struct QueryAbortRequest {
 
 impl QueryAbortRequest {
     pub fn new(
-        execution_id: QueryExecutionId,
+        participant: ParticipantAttemptRef,
         digest: ParticipantManifestDigest,
         reason: impl Into<String>,
     ) -> Self {
         Self::parse(novarocks::AbortQueryRequest {
-            execution_id: Some(encode_query_execution_id(execution_id)),
             init_digest: digest.as_bytes().to_vec(),
             reason: reason.into(),
+            participant: Some(participant.as_proto().clone()),
         })
         .expect("caller must provide a nonempty abort reason")
     }
     pub fn parse(raw: novarocks::AbortQueryRequest) -> Result<Self, ProtocolError> {
-        required_execution_id(&raw.execution_id, "query execution id is required")?;
+        required_participant(
+            &raw.participant,
+            FieldPath::root("abort_query_request").field("participant"),
+            "abort participant reference is required",
+        )?;
         manifest_digest(&raw.init_digest)?;
         if raw.reason.trim().is_empty() {
             return Err(invalid(
@@ -385,7 +390,15 @@ impl QueryAbortRequest {
     }
 
     pub fn execution_id(&self) -> Result<QueryExecutionId, ProtocolError> {
-        required_execution_id(&self.raw.execution_id, "query execution id is required")
+        self.participant()?.execution_id()
+    }
+
+    pub fn participant(&self) -> Result<ParticipantAttemptRef, ProtocolError> {
+        required_participant(
+            &self.raw.participant,
+            FieldPath::root("abort_query_request").field("participant"),
+            "abort participant reference is required",
+        )
     }
 
     pub fn digest(&self) -> Result<ParticipantManifestDigest, ProtocolError> {
@@ -438,12 +451,13 @@ pub struct QueryTerminalAck {
 
 impl QueryTerminalAck {
     pub fn parse(raw: novarocks::QueryControlTerminalAck) -> Result<Self, ProtocolError> {
-        required_execution_id(&raw.execution_id, "query execution id is required")?;
-        manifest_digest(&raw.init_digest)?;
-        digest_array(
-            &raw.snapshot_digest,
-            "query terminal snapshot digest must be 32 bytes",
-        )?;
+        let participant = raw.participant.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("query_control_terminal_ack").field("participant"),
+                "query terminal acknowledgement participant reference is required",
+            )
+        })?;
+        ParticipantAttemptRef::parse(participant)?;
         Ok(Self { raw })
     }
 
@@ -451,23 +465,14 @@ impl QueryTerminalAck {
         &self.raw
     }
 
-    pub fn execution_id(&self) -> Result<QueryExecutionId, ProtocolError> {
-        required_execution_id(&self.raw.execution_id, "query execution id is required")
-    }
-
-    pub fn init_digest(&self) -> Result<ParticipantManifestDigest, ProtocolError> {
-        manifest_digest(&self.raw.init_digest)
-    }
-
-    pub const fn version(&self) -> u32 {
-        self.raw.snapshot_version
-    }
-
-    pub fn digest(&self) -> Result<[u8; 32], ProtocolError> {
-        digest_array(
-            &self.raw.snapshot_digest,
-            "query terminal snapshot digest must be 32 bytes",
-        )
+    pub fn participant(&self) -> Result<ParticipantAttemptRef, ProtocolError> {
+        let participant = self.raw.participant.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("query_control_terminal_ack").field("participant"),
+                "query terminal acknowledgement participant reference is required",
+            )
+        })?;
+        ParticipantAttemptRef::parse(participant)
     }
 }
 
@@ -516,11 +521,10 @@ pub struct FragmentLiveObservation {
 
 impl FragmentLiveObservation {
     pub fn parse(raw: novarocks::FragmentLiveObservation) -> Result<Self, ProtocolError> {
-        required_execution_id(&raw.execution_id, "query execution id is required")?;
-        manifest_digest(&raw.init_digest)?;
-        required_backend(
-            &raw.backend,
-            "fragment observation backend identity is required",
+        required_participant(
+            &raw.participant,
+            FieldPath::root("fragment_live_observation").field("participant"),
+            "fragment observation participant reference is required",
         )?;
         let fragment_id = raw.fragment_instance_id.ok_or_else(|| {
             missing(
@@ -547,18 +551,11 @@ impl FragmentLiveObservation {
         &self.raw
     }
 
-    pub fn execution_id(&self) -> Result<QueryExecutionId, ProtocolError> {
-        required_execution_id(&self.raw.execution_id, "query execution id is required")
-    }
-
-    pub fn init_digest(&self) -> Result<ParticipantManifestDigest, ProtocolError> {
-        manifest_digest(&self.raw.init_digest)
-    }
-
-    pub fn backend(&self) -> Result<ParticipantBackendIdentity, ProtocolError> {
-        required_backend(
-            &self.raw.backend,
-            "fragment observation backend identity is required",
+    pub fn participant(&self) -> Result<ParticipantAttemptRef, ProtocolError> {
+        required_participant(
+            &self.raw.participant,
+            FieldPath::root("fragment_live_observation").field("participant"),
+            "fragment observation participant reference is required",
         )
     }
 
@@ -614,17 +611,13 @@ fn required_execution_id(
     decode_query_execution_id(raw)
 }
 
-fn required_backend(
-    raw: &Option<novarocks::ParticipantBackendIdentity>,
+fn required_participant(
+    raw: &Option<novarocks::ParticipantAttemptRef>,
+    path: FieldPath,
     missing_detail: &'static str,
-) -> Result<ParticipantBackendIdentity, ProtocolError> {
-    let raw = raw.clone().ok_or_else(|| {
-        missing(
-            FieldPath::root("participant_backend_identity"),
-            missing_detail,
-        )
-    })?;
-    ParticipantBackendIdentity::parse(raw)
+) -> Result<ParticipantAttemptRef, ProtocolError> {
+    let raw = raw.clone().ok_or_else(|| missing(path, missing_detail))?;
+    ParticipantAttemptRef::parse(raw)
 }
 
 fn manifest_digest(raw: &[u8]) -> Result<ParticipantManifestDigest, ProtocolError> {
@@ -758,6 +751,13 @@ mod tests {
         }
     }
 
+    fn participant() -> novarocks::ParticipantAttemptRef {
+        novarocks::ParticipantAttemptRef {
+            execution_id: Some(execution_id()),
+            backend_process_id: manifest().backend.and_then(|backend| backend.process_id),
+        }
+    }
+
     fn manifest_digest() -> Vec<u8> {
         ParticipantManifest::parse(manifest())
             .expect("valid manifest")
@@ -813,17 +813,22 @@ mod tests {
         assert_eq!(error.detail(), "unknown query init outcome 99");
 
         let attach = QueryControlAttach::parse(novarocks::QueryControlAttach {
-            execution_id: Some(execution_id()),
-            init_digest: manifest_digest(),
-            frontend_owner_epoch: 1,
+            participant: Some(participant()),
         })
         .expect("valid attach");
-        assert_eq!(attach.frontend_owner_epoch(), 1);
+        assert_eq!(
+            attach
+                .participant()
+                .expect("participant")
+                .execution_id()
+                .expect("execution id"),
+            super::decode_query_execution_id(&execution_id()).expect("execution id")
+        );
 
         let error = QueryAbortRequest::parse(novarocks::AbortQueryRequest {
-            execution_id: Some(execution_id()),
             init_digest: manifest_digest(),
             reason: " ".into(),
+            participant: Some(participant()),
         })
         .expect_err("empty abort reason");
         assert_eq!(error.detail(), "abort reason must not be empty");
@@ -900,9 +905,6 @@ mod tests {
             event: Some(
                 novarocks::query_control_response::Event::RuntimeFilterFeedback(
                     novarocks::RuntimeFilterFeedbackEvent {
-                        execution_id: Some(execution_id()),
-                        init_digest: manifest_digest(),
-                        backend: manifest().backend,
                         participant_id: 1,
                         deployment_epoch: 1,
                         channel_id: 1,
@@ -912,6 +914,7 @@ mod tests {
                                 b"NRFF\x01\x03".to_vec(),
                             ),
                         ),
+                        participant_attempt: Some(participant()),
                     },
                 ),
             ),
@@ -926,9 +929,6 @@ mod tests {
             event: Some(
                 novarocks::query_control_response::Event::RuntimeFilterFeedback(
                     novarocks::RuntimeFilterFeedbackEvent {
-                        execution_id: Some(execution_id()),
-                        init_digest: manifest_digest(),
-                        backend: manifest().backend,
                         participant_id: 1,
                         deployment_epoch: 1,
                         channel_id: 1,
@@ -936,6 +936,7 @@ mod tests {
                         terminal_outcome: Some(
                             novarocks::runtime_filter_feedback_event::TerminalOutcome::UnavailableReason(0),
                         ),
+                        participant_attempt: Some(participant()),
                     },
                 ),
             ),
@@ -947,13 +948,22 @@ mod tests {
     #[test]
     fn validates_terminal_ack_report_ack_and_fragment_observation() {
         let terminal_ack = QueryTerminalAck::parse(novarocks::QueryControlTerminalAck {
-            execution_id: Some(execution_id()),
-            init_digest: manifest_digest(),
-            snapshot_digest: vec![4; 32],
-            ..Default::default()
+            participant: Some(novarocks::ParticipantAttemptRef {
+                execution_id: Some(execution_id()),
+                backend_process_id: manifest().backend.and_then(|backend| backend.process_id),
+            }),
         })
         .expect("valid terminal ack");
-        assert_eq!(terminal_ack.digest().expect("digest"), [4; 32]);
+        assert_eq!(
+            terminal_ack
+                .participant()
+                .expect("participant")
+                .execution_id()
+                .expect("execution id")
+                .query_id()
+                .high(),
+            5
+        );
 
         let report_ack = QueryTerminalReportAck::parse(novarocks::ReportQueryTerminalResponse {
             outcome: QueryTerminalReportOutcome::Accepted as i32,
@@ -970,22 +980,18 @@ mod tests {
         assert_eq!(error.detail(), "unknown query terminal report outcome 0");
 
         let observation = FragmentLiveObservation::parse(novarocks::FragmentLiveObservation {
-            execution_id: Some(execution_id()),
-            init_digest: manifest_digest(),
-            backend: manifest().backend,
             fragment_instance_id: Some(id(11, 12)),
             sequence: 1,
+            participant: Some(participant()),
             ..Default::default()
         })
         .expect("valid observation");
         assert_eq!(observation.sequence(), 1);
 
         let error = FragmentLiveObservation::parse(novarocks::FragmentLiveObservation {
-            execution_id: Some(execution_id()),
-            init_digest: manifest_digest(),
-            backend: manifest().backend,
             fragment_instance_id: Some(id(0, 0)),
             sequence: 1,
+            participant: Some(participant()),
             ..Default::default()
         })
         .expect_err("zero fragment id");

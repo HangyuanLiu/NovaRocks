@@ -66,14 +66,14 @@ fn catalog_lifecycle_contract_is_carried_by_init_and_the_existing_control_stream
             .get_field_by_name("catalog_ready")
             .expect("cold completion")
             .number(),
-        8
+        9
     );
     assert_eq!(
         response
             .get_field_by_name("catalog_load_failed")
             .expect("cold failure")
             .number(),
-        9
+        10
     );
 
     let service = pool
@@ -290,33 +290,189 @@ fn retired_terminal_self_attestation_fields_remain_reserved() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
 
-    for (message_name, field_number) in [
-        ("novarocks.QueryTerminalSnapshot", 5),
-        ("novarocks.TerminalizationProof", 5),
-        ("novarocks.NegativeAttestation", 7),
+    for (message_name, field_numbers, field_names, participant_field) in [
+        (
+            "novarocks.QueryTerminalSnapshot",
+            &[2, 3, 4, 5][..],
+            &["execution_id", "backend", "init_digest", "digest"][..],
+            8,
+        ),
+        (
+            "novarocks.TerminalizationProof",
+            &[2, 3, 4, 5][..],
+            &["execution_id", "backend", "init_digest", "digest"][..],
+            7,
+        ),
+        (
+            "novarocks.NegativeAttestation",
+            &[1, 2, 3, 7][..],
+            &["execution_id", "backend", "init_digest", "digest"][..],
+            8,
+        ),
+        (
+            "novarocks.QueryControlTerminalAck",
+            &[1, 2, 3, 4][..],
+            &[
+                "execution_id",
+                "init_digest",
+                "snapshot_version",
+                "snapshot_digest",
+            ][..],
+            5,
+        ),
     ] {
         let message = pool
             .get_message_by_name(message_name)
             .unwrap_or_else(|| panic!("{message_name} descriptor"));
-        assert!(
-            message
-                .reserved_ranges()
-                .any(|range| range.contains(&field_number)),
-            "{message_name} field {field_number} must remain reserved"
-        );
-        assert!(
-            message.reserved_names().any(|name| name == "digest"),
-            "{message_name} digest name must remain reserved"
-        );
-        assert!(
-            message.fields().all(|field| field.number() != field_number),
-            "{message_name} must not reuse retired digest tag {field_number}"
-        );
-        assert!(
-            message.fields().all(|field| field.name() != "digest"),
-            "{message_name} must not reuse retired digest name"
+        for field_number in field_numbers {
+            assert!(
+                message
+                    .reserved_ranges()
+                    .any(|range| range.contains(field_number)),
+                "{message_name} field {field_number} must remain reserved"
+            );
+            assert!(
+                message
+                    .fields()
+                    .all(|field| field.number() != *field_number),
+                "{message_name} must not reuse retired tag {field_number}"
+            );
+        }
+        for field_name in field_names {
+            assert!(
+                message.reserved_names().any(|name| name == *field_name),
+                "{message_name} field name {field_name} must remain reserved"
+            );
+            assert!(
+                message.fields().all(|field| field.name() != *field_name),
+                "{message_name} must not reuse retired name {field_name}"
+            );
+        }
+        let participant = message
+            .get_field(participant_field)
+            .unwrap_or_else(|| panic!("{message_name} participant field"));
+        assert_eq!(participant.name(), "participant");
+        assert_eq!(
+            participant
+                .kind()
+                .as_message()
+                .map(|message| message.full_name()),
+            Some("novarocks.ParticipantAttemptRef".into())
         );
     }
+}
+
+#[test]
+fn participant_attempt_ref_has_only_allocated_identity_leaves() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let message = pool
+        .get_message_by_name("novarocks.ParticipantAttemptRef")
+        .expect("ParticipantAttemptRef descriptor");
+    assert_eq!(message.fields().count(), 2);
+    assert_eq!(
+        message.get_field(1).expect("execution field").name(),
+        "execution_id"
+    );
+    assert_eq!(
+        message.get_field(2).expect("process field").name(),
+        "backend_process_id"
+    );
+}
+
+#[test]
+fn nonterminal_lifecycle_carriers_reserve_retired_fences_and_use_participant_refs() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let exact_ref = |message_name: &str, field_name: &str, field_number: u32| {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        let field = message
+            .get_field(field_number)
+            .unwrap_or_else(|| panic!("{message_name}.{field_name} field"));
+        assert_eq!(field.name(), field_name);
+        assert_eq!(
+            field.kind().as_message().map(|message| message.full_name()),
+            Some("novarocks.ParticipantAttemptRef".into())
+        );
+    };
+    let reserved = |message_name: &str, field_numbers: &[u32], field_names: &[&str]| {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        for field_number in field_numbers {
+            assert!(
+                message
+                    .reserved_ranges()
+                    .any(|range| range.contains(field_number)),
+                "{message_name} retired tag {field_number} must remain reserved"
+            );
+            assert!(
+                message
+                    .fields()
+                    .all(|field| field.number() != *field_number)
+            );
+        }
+        for field_name in field_names {
+            assert!(
+                message.reserved_names().any(|name| name == *field_name),
+                "{message_name} retired field {field_name} must remain reserved"
+            );
+            assert!(message.fields().all(|field| field.name() != *field_name));
+        }
+    };
+
+    reserved(
+        "novarocks.StageFragmentsRequest",
+        &[1, 2, 3, 4],
+        &[
+            "execution_id",
+            "init_digest",
+            "stage_digest_version",
+            "stage_digest",
+        ],
+    );
+    exact_ref("novarocks.StageFragmentsRequest", "participant", 6);
+    reserved(
+        "novarocks.StageFragmentsResponse",
+        &[2],
+        &["stage_digest_version"],
+    );
+    reserved(
+        "novarocks.StartPreparedQueryRequest",
+        &[2],
+        &["stage_digest_version"],
+    );
+    reserved(
+        "novarocks.StartPreparedQueryResponse",
+        &[2],
+        &["stage_digest_version"],
+    );
+    reserved("novarocks.AbortQueryRequest", &[1], &["execution_id"]);
+    exact_ref("novarocks.AbortQueryRequest", "participant", 4);
+    reserved(
+        "novarocks.QueryControlAttach",
+        &[1, 2, 3],
+        &["execution_id", "init_digest", "frontend_owner_epoch"],
+    );
+    exact_ref("novarocks.QueryControlAttach", "participant", 4);
+    reserved(
+        "novarocks.FragmentLiveObservation",
+        &[1, 2, 3],
+        &["execution_id", "init_digest", "backend"],
+    );
+    exact_ref("novarocks.FragmentLiveObservation", "participant", 10);
+    reserved(
+        "novarocks.RuntimeFilterFeedbackEvent",
+        &[1, 2, 3],
+        &["execution_id", "init_digest", "backend"],
+    );
+    exact_ref(
+        "novarocks.RuntimeFilterFeedbackEvent",
+        "participant_attempt",
+        10,
+    );
 }
 
 #[test]

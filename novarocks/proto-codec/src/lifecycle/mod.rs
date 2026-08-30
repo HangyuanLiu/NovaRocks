@@ -20,18 +20,18 @@ pub use identity::{
     AttemptId, QueryExecutionId, decode_query_execution_id, encode_query_execution_id,
 };
 pub use manifest::{
-    ExchangeRouteManifest, ParticipantBackendIdentity, ParticipantManifest,
+    ExchangeRouteManifest, ParticipantAttemptRef, ParticipantBackendIdentity, ParticipantManifest,
     ParticipantManifestDigest, QueryControlEndpoint, RuntimeFilterContribution,
 };
 pub use query_options::QueryOptions;
 pub use scan_range::{FileScanRange, ScanRange, ScanRangeParams};
 pub use stage::{
     QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
-    QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
+    QueryStartRequest, StageDigest, StageFragment,
 };
 pub use terminal::{
     FragmentTerminalOutcome, FragmentTerminalProfileTelemetry, FragmentTerminalSnapshot,
     NegativeAttestation, ParticipantTerminalOutcome, QueryTerminalProfileContributionTelemetry,
-    QueryTerminalProfileContributionV1, QueryTerminalSnapshot, TerminalOutcomeContentId,
-    TerminalTelemetryUnavailable, TerminalizationProof,
+    QueryTerminalProfileContributionV1, QueryTerminalSnapshot, TerminalTelemetryUnavailable,
+    TerminalizationProof,
 };

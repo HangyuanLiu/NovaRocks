@@ -43,6 +43,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(CancelWithTerminalAckReplay),
         Box::new(Ncp5FeedbackContractDigestCorrupt),
         Box::new(Ncp5FeedbackUnavailable),
+        Box::new(Nid2ParticipantRefRejection),
         Box::new(Ncp5PartitionedFeedbackPruning),
     ]
 }
@@ -125,6 +126,18 @@ impl Scenario for Ncp5FeedbackUnavailable {
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         run_ncp5_feedback_unavailable(context)
+    }
+}
+
+struct Nid2ParticipantRefRejection;
+
+impl Scenario for Nid2ParticipantRefRejection {
+    fn name(&self) -> &'static str {
+        "runtime-filter/nid-2-participant-ref-rejection"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_nid2_participant_ref_rejection(context)
     }
 }
 
@@ -386,6 +399,51 @@ fn run_ncp5_feedback_unavailable(context: &mut ScenarioContext) -> Result<()> {
         .context("clear feedback unavailable fault tokens")?;
     context.action(
         "typed unavailable feedback preserved correctness and disabled FE whole-file pruning",
+    );
+    Ok(())
+}
+
+fn run_nid2_participant_ref_rejection(context: &mut ScenarioContext) -> Result<()> {
+    require_three_backends(context)?;
+    let mut control = connect_control(context, "connect NID-2 foreign-ref control session")?;
+    let tables = create_ncp5_pruning_tables(context, &mut control)?;
+    configure_broadcast_runtime_filter(&mut control)?;
+    for backend_index in 0..REQUIRED_BACKENDS {
+        context
+            .handle()
+            .arm_query_lifecycle_fault(backend_index, "runtime-filter-feedback-foreign-participant")
+            .with_context(|| {
+                format!("arm foreign Runtime Filter participant ref for BE[{backend_index}]")
+            })?;
+    }
+    let profile: Vec<String> = control
+        .query(format!(
+            "EXPLAIN ANALYZE {}",
+            runtime_filter_count_query(&tables)
+        ))
+        .context("foreign Runtime Filter participant ref must preserve query correctness")?;
+    let profile = profile.join("\n");
+    assert_positive_profile_counter(&profile, "ConnectorFilesConsidered")?;
+    ensure!(
+        profile.contains("ConnectorWholeFilesPruned=0"),
+        "foreign Runtime Filter feedback must be rejected before mutating the pruning winner; profile={profile}"
+    );
+    let marker = "NOVAROCKS_RUNTIME_FILTER_FEEDBACK_FOREIGN_PARTICIPANT";
+    let observed = (0..REQUIRED_BACKENDS)
+        .map(|backend_index| context.handle().be_log_count(backend_index, marker))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .sum::<usize>();
+    ensure!(
+        observed > 0,
+        "runner fault did not emit any foreign Runtime Filter participant marker"
+    );
+    context
+        .handle()
+        .clear_query_lifecycle_faults()
+        .context("clear foreign Runtime Filter participant fault tokens")?;
+    context.action(
+        "foreign Runtime Filter participant refs were rejected and pruning conservatively failed open",
     );
     Ok(())
 }

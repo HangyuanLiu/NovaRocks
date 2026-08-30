@@ -360,6 +360,10 @@ fn bind_query_lifecycle_fault_scopes(
             QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
             QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
             QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
+            QueryLifecycleFaultKind::StageConflictAfterApply,
+            QueryLifecycleFaultKind::StartDigestCorrupt,
+            QueryLifecycleFaultKind::ObservationForeignParticipant,
+            QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignParticipant,
         ] {
             if let Some(scope) = bind_armed_fault(
                 &root,

@@ -815,13 +815,14 @@ mod tests {
             }),
             ..Default::default()
         };
-        let snapshot = QueryTerminalSnapshot::parse(proto::QueryTerminalSnapshot {
-            version: 1,
+        let participant = proto::ParticipantAttemptRef {
             execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
                 execution_id,
             )),
-            backend: Some(backend.clone()),
-            init_digest: vec![3; 32],
+            backend_process_id: backend.process_id.clone(),
+        };
+        let snapshot = QueryTerminalSnapshot::parse(proto::QueryTerminalSnapshot {
+            version: 1,
             fragments: vec![fragment],
             profile_contribution: Some(proto::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
@@ -833,21 +834,18 @@ mod tests {
                     ),
                 ),
             }),
+            participant: Some(participant.clone()),
         })
         .expect("terminal snapshot");
         let proof = TerminalizationProof::parse(proto::TerminalizationProof {
             version: 1,
-            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-                execution_id,
-            )),
-            backend: Some(backend),
-            init_digest: vec![3; 32],
             fragments: vec![proto::TerminalizationProofFragment {
                 fragment_instance_id: Some(common::UniqueId { hi: 1, lo: 2 }),
                 backend_num: 7,
                 outcome: proto::QueryTerminalFragmentOutcome::Succeeded as i32,
                 ..Default::default()
             }],
+            participant: Some(participant),
         })
         .expect("terminal proof");
         ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {

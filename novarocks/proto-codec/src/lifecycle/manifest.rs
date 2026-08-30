@@ -140,6 +140,72 @@ impl ParticipantBackendIdentity {
     }
 }
 
+/// Validated allocated identity of one admitted query participant.
+///
+/// This value intentionally excludes endpoint and backend ordinal: both are
+/// routing facts and cannot identify a BE process incarnation.
+// Design: ADR-0127 (docs/adr/ADR-0127-participant-attempt-stage-fence.md)
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParticipantAttemptRef {
+    raw: novarocks::ParticipantAttemptRef,
+}
+
+impl ParticipantAttemptRef {
+    pub fn new(
+        execution_id: QueryExecutionId,
+        backend_process_id: DomainBackendProcessId,
+    ) -> Result<Self, ProtocolError> {
+        Self::parse(novarocks::ParticipantAttemptRef {
+            execution_id: Some(encode_query_execution_id(execution_id)),
+            backend_process_id: Some(
+                BackendProcessId::from_domain(backend_process_id)
+                    .as_proto()
+                    .clone(),
+            ),
+        })
+    }
+
+    pub fn parse(raw: novarocks::ParticipantAttemptRef) -> Result<Self, ProtocolError> {
+        required_execution_id(&raw.execution_id).map_err(|error| {
+            prefix_path(
+                FieldPath::root("participant_attempt_ref").field("execution_id"),
+                error,
+            )
+        })?;
+        let process_id = raw.backend_process_id.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("participant_attempt_ref").field("backend_process_id"),
+                "participant backend process id is required",
+            )
+        })?;
+        BackendProcessId::parse(process_id).map_err(|error| {
+            prefix_path(
+                FieldPath::root("participant_attempt_ref").field("backend_process_id"),
+                error,
+            )
+        })?;
+        Ok(Self { raw })
+    }
+
+    pub const fn as_proto(&self) -> &novarocks::ParticipantAttemptRef {
+        &self.raw
+    }
+
+    pub fn execution_id(&self) -> Result<QueryExecutionId, ProtocolError> {
+        required_execution_id(&self.raw.execution_id)
+    }
+
+    pub fn backend_process_id(&self) -> Result<DomainBackendProcessId, ProtocolError> {
+        let raw = self.raw.backend_process_id.clone().ok_or_else(|| {
+            missing(
+                FieldPath::root("participant_attempt_ref").field("backend_process_id"),
+                "participant backend process id is required",
+            )
+        })?;
+        BackendProcessId::parse(raw)?.domain()
+    }
+}
+
 /// Validated generated exchange route.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExchangeRouteManifest {

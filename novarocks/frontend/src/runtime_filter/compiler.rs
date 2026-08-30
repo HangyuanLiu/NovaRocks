@@ -109,6 +109,7 @@ pub(crate) fn compile_scheduled_runtime_filter_deployment(
 struct ChannelSpec {
     channel_id: u32,
     logical_domain: filter::RuntimeFilterLogicalDomain,
+    membership_schema_digest: Option<[u8; 32]>,
     lifecycle: i32,
     availability_coverage: filter::RuntimeFilterCoverage,
     terminal_coverage: filter::RuntimeFilterCoverage,
@@ -435,6 +436,7 @@ fn materialize_channels(
         let spec = ChannelSpec {
             channel_id,
             logical_domain,
+            membership_schema_digest: encoded_domain.membership_schema_digest(),
             lifecycle,
             availability_coverage,
             terminal_coverage,
@@ -942,7 +944,7 @@ fn compile_feedback_declaration(
 fn membership_feedback_contract_digest(
     channel: &ChannelSpec,
 ) -> Result<Option<[u8; 32]>, DistributedQueryError> {
-    let Some(plan::runtime_filter_contract::Kind::Membership(contract)) = channel
+    let Some(plan::runtime_filter_contract::Kind::Membership(_)) = channel
         .logical_domain
         .contract
         .as_ref()
@@ -950,17 +952,12 @@ fn membership_feedback_contract_digest(
     else {
         return Ok(None);
     };
-    contract
-        .schema_digest
-        .clone()
-        .try_into()
-        .map(Some)
-        .map_err(|_| {
-            compilation_error(format!(
-                "runtime filter channel {} membership schema digest must be 32 bytes",
-                channel.channel_id
-            ))
-        })
+    channel.membership_schema_digest.ok_or_else(|| {
+        compilation_error(format!(
+            "runtime filter channel {} membership schema digest is missing from semantic encoding",
+            channel.channel_id
+        ))
+    }).map(Some)
 }
 
 fn feedback_publishers(

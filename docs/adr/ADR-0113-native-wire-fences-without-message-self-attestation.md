@@ -2,9 +2,9 @@
 id: ADR-0113
 title: "Native wire fences without message self-attestation"
 domain: [distributed-query-lifecycle, crate-boundary, runtime-filter, provider-spi]
-status: active
+status: superseded
 supersedes: [ADR-0106]
-superseded-by: null
+superseded-by: ADR-0126
 date: 2026-08-26
 provenance:
   - "mechanism: native lifecycle self-attesting digest removal with retained cross-message echo fences"

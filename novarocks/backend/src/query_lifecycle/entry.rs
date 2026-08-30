@@ -20,9 +20,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use novarocks_proto_codec::lifecycle::{
-    FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifest,
+    FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantAttemptRef, ParticipantManifest,
     ParticipantManifestDigest, ParticipantTerminalOutcome, QueryControlEvent, QueryInitOutcome,
-    QueryTerminalSnapshot, QueryTerminationReason, StageDigest, TerminalOutcomeContentId,
+    QueryTerminalSnapshot, QueryTerminationReason, StageDigest,
 };
 use novarocks_spi::connector::CatalogProperties;
 use novarocks_types::UniqueId;
@@ -58,6 +58,9 @@ pub(crate) enum QueryCatalogLoadState {
 }
 
 pub(crate) struct QueryLifecycleEntry {
+    /// Allocated identity of this one admitted backend participant. All
+    /// post-Init carriers must match it before they touch local state.
+    pub(crate) participant: ParticipantAttemptRef,
     pub(crate) digest: ParticipantManifestDigest,
     pub(crate) manifest: ParticipantManifest,
     /// Backend-local execution routing IDs.  The manifest remains the
@@ -142,13 +145,8 @@ pub(crate) struct QueryLifecycleEntryState {
     /// The immutable delivery carrier is always retained, including when P1
     /// snapshot formation failed and only a negative attestation is available.
     pub(crate) terminal_outcome: Option<ParticipantTerminalOutcome>,
-    /// Computed exactly once when the immutable delivery carrier is admitted.
-    /// Retransmission, conflict checks, and acknowledgement release read this
-    /// retained canonical content identity rather than hashing the outcome.
-    pub(crate) terminal_content_id: Option<TerminalOutcomeContentId>,
     pub(crate) pre_start_deadline: Option<Instant>,
     pub(crate) last_heartbeat: Option<Instant>,
-    pub(crate) frontend_owner_epoch: Option<u64>,
     pub(crate) events: Option<tokio::sync::mpsc::Sender<QueryControlEvent>>,
     /// Best-effort terminal runtime-filter feedback has its own bounded queue
     /// and is retained only by the attached attempt, never by the participant.
@@ -182,12 +180,24 @@ impl QueryLifecycleEntry {
         manifest: ParticipantManifest,
         digest: ParticipantManifestDigest,
     ) -> Self {
+        let participant = ParticipantAttemptRef::new(
+            manifest
+                .execution_id()
+                .expect("validated manifest execution"),
+            manifest
+                .backend()
+                .expect("validated manifest backend")
+                .process_id()
+                .expect("validated manifest process"),
+        )
+        .expect("validated manifest creates participant attempt ref");
         let expected_fragment_instance_ids = manifest
             .expected_fragment_instance_ids()
             .into_iter()
             .map(|value| UniqueId::new(value.hi, value.lo))
             .collect();
         Self {
+            participant,
             digest,
             manifest,
             expected_fragment_instance_ids,
@@ -210,10 +220,8 @@ impl QueryLifecycleEntry {
                 terminal_freeze_in_flight: false,
                 terminal_record: None,
                 terminal_outcome: None,
-                terminal_content_id: None,
                 pre_start_deadline: None,
                 last_heartbeat: None,
-                frontend_owner_epoch: None,
                 events: None,
                 frontend_feedback_sink: None,
                 observations: None,

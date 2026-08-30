@@ -15,12 +15,19 @@ const REQUIRED_BACKENDS: usize = 3;
 const IO_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
+/// Unlike the coordinator-local baseline, this must create BE fragment work so
+/// StageFragments and StartPreparedQuery cross the native lifecycle boundary.
+const NID2_STARTUP_FENCE_QUERY: &str =
+    "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(DistributedBaseline),
         Box::new(MysqlDisconnect),
         Box::new(QueryTimeout),
+        Box::new(Nid2StageConflict),
+        Box::new(Nid2StartDigestConflict),
+        Box::new(Nid2PostInitForeignRef),
     ]
 }
 
@@ -139,6 +146,119 @@ impl Scenario for QueryTimeout {
 
         await_resource_convergence(context, &baseline, true)
     }
+}
+
+struct Nid2StageConflict;
+
+impl Scenario for Nid2StageConflict {
+    fn name(&self) -> &'static str {
+        "query-lifecycle/nid-2-stage-conflict"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_nid2_startup_rejection(
+            context,
+            "stage-conflict-after-apply",
+            "NOVAROCKS_STAGE_CONFLICT_AFTER_APPLY",
+        )
+    }
+}
+
+struct Nid2StartDigestConflict;
+
+impl Scenario for Nid2StartDigestConflict {
+    fn name(&self) -> &'static str {
+        "query-lifecycle/nid-2-start-digest-conflict"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        run_nid2_startup_rejection(
+            context,
+            "start-digest-corrupt",
+            "NOVAROCKS_START_DIGEST_CORRUPTED",
+        )
+    }
+}
+
+struct Nid2PostInitForeignRef;
+
+impl Scenario for Nid2PostInitForeignRef {
+    fn name(&self) -> &'static str {
+        "query-lifecycle/nid-2-post-init-foreign-ref"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_snapshot(context)?;
+        let connect_timeout = bounded_io_timeout(context, "connect foreign-observation client")?;
+        let mut connection =
+            mysql_actor::connect(context.mysql_user(), context.mysql_port(), connect_timeout)?;
+        for backend_index in 0..REQUIRED_BACKENDS {
+            context
+                .handle()
+                .arm_query_lifecycle_fault(backend_index, "observation-foreign-participant")
+                .with_context(|| format!("arm foreign observation ref for BE[{backend_index}]"))?;
+        }
+        execute_baseline_query(&mut connection, "foreign-observation")?;
+        let marker = "NOVAROCKS_FRAGMENT_OBSERVATION_FOREIGN_PARTICIPANT";
+        let observed = (0..REQUIRED_BACKENDS)
+            .map(|backend_index| context.handle().be_log_count(backend_index, marker))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sum::<usize>();
+        ensure!(
+            observed > 0,
+            "runner fault did not emit any foreign participant observation marker"
+        );
+        context
+            .handle()
+            .clear_query_lifecycle_faults()
+            .context("clear foreign observation participant fault tokens")?;
+        await_resource_convergence(context, &baseline, true)?;
+        context.action(
+            "foreign post-Init observation refs were emitted only by the runner fault and rejected before frontend mutable telemetry state",
+        );
+        Ok(())
+    }
+}
+
+fn run_nid2_startup_rejection(
+    context: &mut ScenarioContext,
+    fault: &'static str,
+    marker: &'static str,
+) -> Result<()> {
+    require_three_backends(context)?;
+    let baseline = resource_snapshot(context)?;
+    let connect_timeout = bounded_io_timeout(context, "connect NID-2 lifecycle client")?;
+    let mut connection =
+        mysql_actor::connect(context.mysql_user(), context.mysql_port(), connect_timeout)?;
+    for backend_index in 0..REQUIRED_BACKENDS {
+        context
+            .handle()
+            .arm_query_lifecycle_fault(backend_index, fault)
+            .with_context(|| format!("arm {fault} for BE[{backend_index}]"))?;
+    }
+    context.action(format!(
+        "armed NID-2 {fault} across every Backend participant"
+    ));
+    let error = connection
+        .query::<i64, _>(NID2_STARTUP_FENCE_QUERY)
+        .expect_err("NID-2 startup fault must reject the public query");
+    context.action(format!("public query rejected by {fault}: {error}"));
+    let observed = (0..REQUIRED_BACKENDS)
+        .map(|backend_index| context.handle().be_log_count(backend_index, marker))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .sum::<usize>();
+    ensure!(
+        observed > 0,
+        "runner fault {fault} did not emit any {marker} marker"
+    );
+    context
+        .handle()
+        .clear_query_lifecycle_faults()
+        .with_context(|| format!("clear {fault} tokens"))?;
+    await_resource_convergence(context, &baseline, true)
 }
 
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {

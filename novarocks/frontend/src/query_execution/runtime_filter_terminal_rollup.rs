@@ -166,10 +166,10 @@ pub(crate) fn rollup(set: &QueryTerminalSet) -> RuntimeFilterTerminalRollup {
     let mut totals_unavailable = None;
 
     for snapshot in set.snapshots() {
-        let backend = snapshot.backend();
         let participant = RuntimeFilterTerminalParticipant {
-            process_id: backend
-                .process_id()
+            process_id: snapshot
+                .participant()
+                .backend_process_id()
                 .expect("validated terminal snapshot always has a backend process id"),
         };
         let telemetry = snapshot.profile_contribution_telemetry();
@@ -402,15 +402,10 @@ mod tests {
     ) -> QueryTerminalSnapshot {
         QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id())),
-            backend: Some(novarocks::ParticipantBackendIdentity {
-                endpoint: Some(novarocks::QueryControlEndpoint {
-                    host: "127.0.0.1".to_string(),
-                    port: 19_000 + participant_seed as u32,
-                }),
-                process_id: Some(test_backend_process_id(participant_seed)),
+            participant: Some(novarocks::ParticipantAttemptRef {
+                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id())),
+                backend_process_id: Some(test_backend_process_id(participant_seed)),
             }),
-            init_digest: vec![participant_seed as u8; 32],
             profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
                     novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(
@@ -490,15 +485,10 @@ mod tests {
     fn unavailable_snapshot(participant_seed: u64) -> QueryTerminalSnapshot {
         QueryTerminalSnapshot::parse(novarocks::QueryTerminalSnapshot {
             version: 1,
-            execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id())),
-            backend: Some(novarocks::ParticipantBackendIdentity {
-                endpoint: Some(novarocks::QueryControlEndpoint {
-                    host: "127.0.0.1".to_string(),
-                    port: 19_000 + participant_seed as u32,
-                }),
-                process_id: Some(test_backend_process_id(participant_seed)),
+            participant: Some(novarocks::ParticipantAttemptRef {
+                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id())),
+                backend_process_id: Some(test_backend_process_id(participant_seed)),
             }),
-            init_digest: vec![participant_seed as u8; 32],
             profile_contribution: Some(novarocks::QueryTerminalProfileContributionTelemetry {
                 telemetry: Some(
                     novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(

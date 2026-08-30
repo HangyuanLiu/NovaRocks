@@ -6,7 +6,7 @@ use std::sync::{Condvar, Mutex};
 use novarocks_execution::runtime_filter::contribution::MembershipValues;
 use novarocks_execution::runtime_filter::feedback_domain::RuntimeFilterFeedbackDomain;
 use novarocks_proto_codec::lifecycle::{
-    QueryControlEvent, QueryExecutionId, encode_query_execution_id,
+    ParticipantAttemptRef, QueryControlEvent, QueryExecutionId,
 };
 use novarocks_spi::connector::read_stack::{
     Bound, ConnectorReadColumnHandle, ConnectorReadDynamicFilterSnapshot, ConnectorValue, Domain,
@@ -41,6 +41,16 @@ struct ChannelState {
 pub(crate) struct RuntimeFilterFeedbackState {
     execution_id: QueryExecutionId,
     state: (Mutex<FeedbackState>, Condvar),
+}
+
+/// Admission dispositions that preserve the distinction between an accepted
+/// feedback update and an untrusted nonterminal carrier that was fenced before
+/// it could alter any query-local state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeFilterFeedbackAdmission {
+    Applied,
+    IgnoredRetiredAttempt,
+    RejectedForeignParticipant,
 }
 
 impl RuntimeFilterFeedbackState {
@@ -211,72 +221,75 @@ impl RuntimeFilterFeedbackState {
         pending
     }
 
-    /// Validates and admits one active-stream event. A foreign/retired event
-    /// is ignored only when its execution identity is different; every event
-    /// claiming this active attempt must match the frozen slot and contract.
+    /// Validates and admits one active-stream event. A retired attempt is
+    /// ignored and a foreign participant is rejected before it can mutate
+    /// query-local state. The control-stream owner decides how to observe
+    /// that nonterminal rejection without treating it as a terminal outcome.
     pub(crate) fn admit(
         &self,
         event: &QueryControlEvent,
-        backend_process: novarocks_types::BackendProcessId,
-        init_digest: &[u8; 32],
-    ) -> Result<(), String> {
+        participant: &ParticipantAttemptRef,
+    ) -> Result<RuntimeFilterFeedbackAdmission, String> {
         use novarocks_proto_models::novarocks::query_control_response::Event;
         use novarocks_proto_models::novarocks::runtime_filter_feedback_event::TerminalOutcome;
 
         let Some(Event::RuntimeFilterFeedback(feedback)) = event.as_proto().event.as_ref() else {
             return Err("runtime filter feedback admission received a non-feedback event".into());
         };
-        if feedback.execution_id.as_ref() != Some(&encode_query_execution_id(self.execution_id)) {
-            return Ok(());
+        let feedback =
+            novarocks_proto_codec::lifecycle::RuntimeFilterFeedbackEvent::parse(feedback.clone())
+                .map_err(|error| error.to_string())?;
+        let feedback_participant = feedback.participant().map_err(|error| error.to_string())?;
+        if feedback_participant
+            .execution_id()
+            .map_err(|error| error.to_string())?
+            != self.execution_id
+        {
+            return Ok(RuntimeFilterFeedbackAdmission::IgnoredRetiredAttempt);
         }
-        if feedback.init_digest.as_slice() != init_digest {
-            return Err("runtime filter feedback init digest differs from active session".into());
+        if feedback_participant != *participant {
+            return Ok(RuntimeFilterFeedbackAdmission::RejectedForeignParticipant);
         }
-        if feedback.deployment_epoch != self.execution_id.attempt_id().get() {
+        if feedback.as_proto().deployment_epoch != self.execution_id.attempt_id().get() {
             return Err(
                 "runtime filter feedback deployment epoch differs from active attempt".into(),
             );
         }
-        let process_matches = feedback
-            .backend
-            .as_ref()
-            .and_then(|backend| backend.process_id.as_ref())
-            .is_some_and(|process| process.value.as_slice() == backend_process.to_bytes());
-        if !process_matches {
-            return Err(
-                "runtime filter feedback backend process differs from active session".into(),
-            );
-        }
+        let participant_process = participant
+            .backend_process_id()
+            .map_err(|error| error.to_string())?;
         let mut state = self.state.0.lock().expect("runtime filter feedback state");
         if state.closed {
-            return Ok(());
+            return Ok(RuntimeFilterFeedbackAdmission::Applied);
         }
         let channel = state
             .channels
-            .get_mut(&feedback.channel_id)
+            .get_mut(&feedback.as_proto().channel_id)
             .ok_or("runtime filter feedback channel is not declared for this attempt")?;
-        if feedback.contract_digest.as_slice() != channel.contract_digest {
+        if feedback.as_proto().contract_digest.as_slice() != channel.contract_digest {
             return Err("runtime filter feedback contract digest differs from declaration".into());
         }
         let slot = channel
             .publishers
-            .get(&feedback.participant_id)
+            .get(&feedback.as_proto().participant_id)
             .ok_or("runtime filter feedback publisher is not authorized")?;
-        if slot.backend_process_id != backend_process {
+        if slot.backend_process_id != participant_process {
             return Err(
                 "runtime filter feedback publisher process differs from declaration".into(),
             );
         }
-        match feedback.terminal_outcome.as_ref() {
+        match feedback.as_proto().terminal_outcome.as_ref() {
             Some(TerminalOutcome::CanonicalDomain(encoded)) => {
                 RuntimeFilterFeedbackDomain::decode(
-                    encoded,
+                    encoded.as_slice(),
                     &channel.data_type,
                     channel.max_encoded_domain_bytes,
                 )
                 .map_err(|error| error.to_string())?;
                 match &channel.winner {
-                    Some(existing) if existing == encoded => Ok(()),
+                    Some(existing) if existing == encoded => {
+                        Ok(RuntimeFilterFeedbackAdmission::Applied)
+                    }
                     Some(_) => Err(
                         "runtime filter feedback terminal domain conflicts with first winner"
                             .into(),
@@ -285,17 +298,19 @@ impl RuntimeFilterFeedbackState {
                         channel.winner = Some(encoded.clone());
                         state.generation = state.generation.saturating_add(1);
                         self.state.1.notify_all();
-                        Ok(())
+                        Ok(RuntimeFilterFeedbackAdmission::Applied)
                     }
                 }
             }
             Some(TerminalOutcome::UnavailableReason(reason)) => {
                 if channel.winner.is_none() {
-                    channel.unavailable.insert(feedback.participant_id, *reason);
+                    channel
+                        .unavailable
+                        .insert(feedback.as_proto().participant_id, *reason);
                     state.generation = state.generation.saturating_add(1);
                     self.state.1.notify_all();
                 }
-                Ok(())
+                Ok(RuntimeFilterFeedbackAdmission::Applied)
             }
             None => Err("runtime filter feedback terminal outcome is absent".into()),
         }
@@ -509,7 +524,7 @@ fn connector_values(
 mod tests {
     use arrow::datatypes::DataType;
     use novarocks_execution::runtime_filter::contribution::ValueDomainDelta;
-    use novarocks_proto_codec::lifecycle::{AttemptId, encode_query_execution_id};
+    use novarocks_proto_codec::lifecycle::AttemptId;
     use novarocks_proto_models::novarocks;
     use novarocks_types::{BackendProcessId, QueryId};
 
@@ -549,6 +564,13 @@ mod tests {
         .expect("valid declaration")
     }
 
+    fn participant(
+        execution_id: QueryExecutionId,
+        process: BackendProcessId,
+    ) -> ParticipantAttemptRef {
+        ParticipantAttemptRef::new(execution_id, process).expect("valid participant attempt")
+    }
+
     fn event(
         execution_id: QueryExecutionId,
         process: BackendProcessId,
@@ -558,17 +580,7 @@ mod tests {
             event: Some(
                 novarocks::query_control_response::Event::RuntimeFilterFeedback(
                     novarocks::RuntimeFilterFeedbackEvent {
-                        execution_id: Some(encode_query_execution_id(execution_id)),
-                        init_digest: vec![4; 32],
-                        backend: Some(novarocks::ParticipantBackendIdentity {
-                            endpoint: Some(novarocks::QueryControlEndpoint {
-                                host: "127.0.0.1".into(),
-                                port: 9030,
-                            }),
-                            process_id: Some(novarocks::BackendProcessId {
-                                value: process.to_bytes().to_vec(),
-                            }),
-                        }),
+                        participant_attempt: Some(participant(execution_id, process).as_proto().clone()),
                         participant_id: 5,
                         deployment_epoch: execution_id.attempt_id().get(),
                         channel_id: 7,
@@ -594,17 +606,7 @@ mod tests {
             event: Some(
                 novarocks::query_control_response::Event::RuntimeFilterFeedback(
                     novarocks::RuntimeFilterFeedbackEvent {
-                        execution_id: Some(encode_query_execution_id(execution_id)),
-                        init_digest: vec![4; 32],
-                        backend: Some(novarocks::ParticipantBackendIdentity {
-                            endpoint: Some(novarocks::QueryControlEndpoint {
-                                host: "127.0.0.1".into(),
-                                port: 9030,
-                            }),
-                            process_id: Some(novarocks::BackendProcessId {
-                                value: process.to_bytes().to_vec(),
-                            }),
-                        }),
+                        participant_attempt: Some(participant(execution_id, process).as_proto().clone()),
                         participant_id,
                         deployment_epoch: execution_id.attempt_id().get(),
                         channel_id: 7,
@@ -642,19 +644,20 @@ mod tests {
         state
             .admit(
                 &event(execution_id, process, first.clone()),
-                process,
-                &[4; 32],
+                &participant(execution_id, process),
             )
             .expect("first terminal domain is admitted");
         state
             .admit(
                 &event(execution_id, process, first.clone()),
-                process,
-                &[4; 32],
+                &participant(execution_id, process),
             )
             .expect("identical duplicate is idempotent");
         let conflict = state
-            .admit(&event(execution_id, process, exact(42)), process, &[4; 32])
+            .admit(
+                &event(execution_id, process, exact(42)),
+                &participant(execution_id, process),
+            )
             .expect_err("a distinct terminal domain cannot replace the winner");
         assert!(conflict.contains("conflicts with first winner"));
 
@@ -676,10 +679,37 @@ mod tests {
         .expect("valid execution id");
 
         state
-            .admit(&event(retired, process, exact(41)), process, &[4; 32])
+            .admit(
+                &event(retired, process, exact(41)),
+                &participant(execution_id, process),
+            )
             .expect("retired event is ignored");
         let state = state.state.0.lock().expect("feedback state");
         assert!(state.channels[&7].winner.is_none());
+    }
+
+    #[test]
+    fn rejects_a_foreign_participant_for_the_active_attempt() {
+        let execution_id = execution_id();
+        let process = BackendProcessId::new_v7();
+        let state = RuntimeFilterFeedbackState::new(execution_id, declaration(process))
+            .expect("feedback state");
+
+        let outcome = state
+            .admit(
+                &event(execution_id, BackendProcessId::new_v7(), exact(41)),
+                &participant(execution_id, process),
+            )
+            .expect("active-attempt feedback is fenced without mutating query state");
+        assert_eq!(
+            outcome,
+            RuntimeFilterFeedbackAdmission::RejectedForeignParticipant
+        );
+        assert!(
+            state.state.0.lock().expect("feedback state").channels[&7]
+                .winner
+                .is_none()
+        );
     }
 
     #[test]
@@ -717,14 +747,16 @@ mod tests {
         let state = RuntimeFilterFeedbackState::new(execution_id, declaration).expect("state");
 
         state
-            .admit(&unavailable_event(execution_id, first, 5), first, &[4; 32])
+            .admit(
+                &unavailable_event(execution_id, first, 5),
+                &participant(execution_id, first),
+            )
             .expect("first unavailable is admitted");
         assert!(!state.state.0.lock().expect("state").channels[&7].is_terminal());
         state
             .admit(
                 &unavailable_event(execution_id, second, 6),
-                second,
-                &[4; 32],
+                &participant(execution_id, second),
             )
             .expect("second unavailable is admitted");
         let state = state.state.0.lock().expect("state");
@@ -740,7 +772,10 @@ mod tests {
             .expect("feedback state");
         state.close();
         state
-            .admit(&event(execution_id, process, exact(41)), process, &[4; 32])
+            .admit(
+                &event(execution_id, process, exact(41)),
+                &participant(execution_id, process),
+            )
             .expect("closed state drops late feedback");
         let state = state.state.0.lock().expect("feedback state");
         assert!(state.closed);
@@ -794,7 +829,10 @@ mod tests {
         let state = RuntimeFilterFeedbackState::new(execution_id, declaration).expect("state");
         assert!(state.is_initial_wait_blocked(17, [7, 8]));
         state
-            .admit(&event(execution_id, first, exact(41)), first, &[4; 32])
+            .admit(
+                &event(execution_id, first, exact(41)),
+                &participant(execution_id, first),
+            )
             .expect("usable domain");
         assert!(
             !state.is_initial_wait_blocked(17, [7, 8]),

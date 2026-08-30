@@ -68,17 +68,10 @@ use crate::coordinator::query_registry::{
 fn terminal_outcome(
     snapshot: protocol_lifecycle::QueryTerminalSnapshot,
 ) -> protocol_lifecycle::ParticipantTerminalOutcome {
-    let execution_id = snapshot.execution_id();
-    let backend = snapshot.backend();
-    let init_digest = snapshot.init_digest().as_bytes().to_vec();
     let proof = protocol_lifecycle::TerminalizationProof::parse(proto::TerminalizationProof {
         version: 1,
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            execution_id,
-        )),
-        backend: Some(backend.as_proto().clone()),
-        init_digest,
         fragments: Vec::new(),
+        participant: Some(snapshot.participant().as_proto().clone()),
     })
     .expect("protocol terminal proof");
     protocol_lifecycle::ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {
@@ -93,15 +86,15 @@ fn terminal_outcome(
 fn terminal_snapshot(
     execution_id: QueryExecutionId,
     backend: ParticipantBackendIdentity,
-    digest: protocol_lifecycle::ParticipantManifestDigest,
+    _digest: protocol_lifecycle::ParticipantManifestDigest,
 ) -> protocol_lifecycle::QueryTerminalSnapshot {
+    let participant = protocol_lifecycle::ParticipantAttemptRef::new(
+        execution_id,
+        backend.process_id().expect("fixture backend process id"),
+    )
+    .expect("fixture participant attempt reference");
     protocol_lifecycle::QueryTerminalSnapshot::parse(proto::QueryTerminalSnapshot {
         version: 1,
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            execution_id,
-        )),
-        backend: Some(backend.as_proto().clone()),
-        init_digest: digest.as_bytes().to_vec(),
         fragments: Vec::new(),
         profile_contribution: Some(proto::QueryTerminalProfileContributionTelemetry {
             telemetry: Some(
@@ -113,6 +106,7 @@ fn terminal_snapshot(
                 ),
             ),
         }),
+        participant: Some(participant.as_proto().clone()),
     })
     .expect("protocol terminal snapshot")
 }
@@ -120,17 +114,18 @@ fn terminal_snapshot(
 fn negative_attestation_outcome(
     execution_id: QueryExecutionId,
     backend: ParticipantBackendIdentity,
-    digest: protocol_lifecycle::ParticipantManifestDigest,
+    _digest: protocol_lifecycle::ParticipantManifestDigest,
 ) -> protocol_lifecycle::ParticipantTerminalOutcome {
+    let participant = protocol_lifecycle::ParticipantAttemptRef::new(
+        execution_id,
+        backend.process_id().expect("fixture backend process id"),
+    )
+    .expect("fixture participant attempt reference");
     let attestation = protocol_lifecycle::NegativeAttestation::parse(proto::NegativeAttestation {
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            execution_id,
-        )),
-        backend: Some(backend.as_proto().clone()),
-        init_digest: digest.as_bytes().to_vec(),
         reason: proto::NegativeAttestationReason::CorrectnessEvidenceRetentionExhausted as i32,
         detail: "terminal evidence retention exhausted".to_string(),
         detail_truncated: false,
+        participant: Some(participant.as_proto().clone()),
     })
     .expect("protocol negative attestation");
     protocol_lifecycle::ParticipantTerminalOutcome::parse(proto::ParticipantTerminalOutcome {
@@ -244,18 +239,8 @@ fn protocol_abort_command(reason: impl Into<String>) -> protocol_lifecycle::Quer
 fn protocol_terminal_ack_command(
     outcome: &protocol_lifecycle::ParticipantTerminalOutcome,
 ) -> protocol_lifecycle::QueryControlCommand {
-    let snapshot = outcome.snapshot().expect("fixture terminal snapshot");
     let ack = protocol_lifecycle::QueryTerminalAck::parse(proto::QueryControlTerminalAck {
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            outcome.execution_id(),
-        )),
-        init_digest: outcome.init_digest().as_bytes().to_vec(),
-        snapshot_version: snapshot.version(),
-        snapshot_digest: outcome
-            .content_id()
-            .expect("fixture terminal outcome content id")
-            .as_bytes()
-            .to_vec(),
+        participant: Some(outcome.participant().as_proto().clone()),
     })
     .expect("protocol terminal acknowledgement");
     protocol_command(proto::query_control_request::Command::TerminalAck(
@@ -265,32 +250,29 @@ fn protocol_terminal_ack_command(
 
 fn protocol_attach_for(
     execution_id: protocol_lifecycle::QueryExecutionId,
-    digest: protocol_lifecycle::ParticipantManifestDigest,
-    epoch: u64,
+    _digest: protocol_lifecycle::ParticipantManifestDigest,
+    _epoch: u64,
+    backend_process_id: BackendProcessId,
 ) -> protocol_lifecycle::QueryControlAttach {
-    protocol_lifecycle::QueryControlAttach::parse(proto::QueryControlAttach {
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            execution_id,
-        )),
-        init_digest: digest.as_bytes().to_vec(),
-        frontend_owner_epoch: epoch,
-    })
+    protocol_lifecycle::QueryControlAttach::new(
+        protocol_lifecycle::ParticipantAttemptRef::new(execution_id, backend_process_id)
+            .expect("fixture participant attempt reference"),
+    )
     .expect("protocol control attach")
 }
 
 fn protocol_abort_for(
     execution_id: protocol_lifecycle::QueryExecutionId,
     digest: protocol_lifecycle::ParticipantManifestDigest,
+    backend_process_id: BackendProcessId,
     reason: impl Into<String>,
 ) -> protocol_lifecycle::QueryAbortRequest {
-    protocol_lifecycle::QueryAbortRequest::parse(proto::AbortQueryRequest {
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            execution_id,
-        )),
-        init_digest: digest.as_bytes().to_vec(),
-        reason: reason.into(),
-    })
-    .expect("protocol abort request")
+    protocol_lifecycle::QueryAbortRequest::new(
+        protocol_lifecycle::ParticipantAttemptRef::new(execution_id, backend_process_id)
+            .expect("fixture participant attempt reference"),
+        digest,
+        reason,
+    )
 }
 
 fn protocol_event_control_ready() -> protocol_lifecycle::QueryControlEvent {
@@ -382,9 +364,7 @@ fn protocol_terminal_outcome_event(
     reason = "The wire fixture keeps each fragment observation field explicit."
 )]
 fn protocol_fragment_observation(
-    execution_id: QueryExecutionId,
-    digest: protocol_lifecycle::ParticipantManifestDigest,
-    backend: ParticipantBackendIdentity,
+    participant: protocol_lifecycle::ParticipantAttemptRef,
     fragment_instance_id: proto_common::UniqueId,
     sequence: u64,
     input_rows: u64,
@@ -392,11 +372,7 @@ fn protocol_fragment_observation(
     elapsed_ms: u64,
 ) -> protocol_lifecycle::FragmentLiveObservation {
     protocol_lifecycle::FragmentLiveObservation::parse(proto::FragmentLiveObservation {
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            execution_id,
-        )),
-        init_digest: digest.as_bytes().to_vec(),
-        backend: Some(backend.as_proto().clone()),
+        participant: Some(participant.as_proto().clone()),
         fragment_instance_id: Some(fragment_instance_id),
         sequence,
         input_rows,
@@ -421,14 +397,12 @@ trait QueryLifecycleIngress: Send + Sync + 'static {
         request: protocol_lifecycle::QueryStageRequest,
     ) -> protocol_lifecycle::QueryStageAck {
         protocol_lifecycle::QueryStageAck::new(
-            request.execution_id(),
-            request.digest_version(),
-            protocol_lifecycle::StageDigest::compute_v1(
-                request.execution_id(),
-                request.init_digest(),
-                &request.fragments(),
-            )
-            .expect("validated stage request derives a digest"),
+            request
+                .participant()
+                .execution_id()
+                .expect("validated stage participant execution id"),
+            protocol_lifecycle::StageDigest::compute(request.participant(), &request.fragments())
+                .expect("validated stage request derives a digest"),
             protocol_lifecycle::QueryStageOutcome::RejectedInvalidState,
             "StageFragments is not supported by this lifecycle ingress",
         )
@@ -441,7 +415,6 @@ trait QueryLifecycleIngress: Send + Sync + 'static {
     ) -> protocol_lifecycle::QueryStartAck {
         protocol_lifecycle::QueryStartAck::new(
             request.execution_id(),
-            request.digest_version(),
             request.digest(),
             protocol_lifecycle::QueryStartOutcome::RejectedNotStaged,
             "StartPreparedQuery is not supported by this lifecycle ingress",
@@ -521,7 +494,7 @@ struct RecordingSession {
 #[derive(Default)]
 struct RecordingSessionState {
     commands: Vec<QueryControlCommand>,
-    terminal_ack_digests: Vec<Vec<u8>>,
+    terminal_ack_participants: Vec<proto::ParticipantAttemptRef>,
     events: VecDeque<Result<protocol_lifecycle::QueryControlEvent, QueryLifecycleTransportError>>,
     send_errors: VecDeque<QueryLifecycleTransportError>,
     terminal_snapshot: Option<protocol_lifecycle::QueryTerminalSnapshot>,
@@ -569,12 +542,12 @@ impl RecordingSession {
             .clone()
     }
 
-    fn terminal_ack_digests(&self) -> Vec<Vec<u8>> {
+    fn terminal_ack_participants(&self) -> Vec<proto::ParticipantAttemptRef> {
         self.state
             .0
             .lock()
             .expect("recording session lock")
-            .terminal_ack_digests
+            .terminal_ack_participants
             .clone()
     }
 
@@ -654,7 +627,11 @@ impl QueryControlSession for RecordingSession {
         if let Some(proto::query_control_request::Command::TerminalAck(ack)) =
             command.as_proto().command.as_ref()
         {
-            state.terminal_ack_digests.push(ack.snapshot_digest.clone());
+            state.terminal_ack_participants.push(
+                ack.participant
+                    .clone()
+                    .expect("validated terminal receipt has participant reference"),
+            );
         }
         let terminal = match command.as_proto().command.as_ref() {
             Some(proto::query_control_request::Command::Abort(_)) => {
@@ -1167,15 +1144,18 @@ fn fragment_observation(
     let manifest = participant.request.manifest().expect("fixture manifest");
     let execution_id = manifest.execution_id().expect("fixture execution id");
     let backend = manifest.backend().expect("fixture backend");
+    let participant = protocol_lifecycle::ParticipantAttemptRef::new(
+        execution_id,
+        backend.process_id().expect("fixture backend process id"),
+    )
+    .expect("fixture participant attempt reference");
     let fragment = manifest
         .expected_fragment_instance_ids()
         .first()
         .copied()
         .expect("fragment participant has an expected instance");
     protocol_fragment_observation(
-        execution_id,
-        participant.digest,
-        backend,
+        participant,
         fragment,
         sequence,
         input_rows,
@@ -1238,10 +1218,15 @@ fn frontend_fragment_observation_rejects_conflicts_and_wrong_participants() {
     let manifest = participant.request.manifest().expect("fixture manifest");
     let manifest_execution_id = manifest.execution_id().expect("fixture execution id");
     let manifest_backend = manifest.backend().expect("fixture backend");
-    let unknown = protocol_fragment_observation(
+    let participant_ref = protocol_lifecycle::ParticipantAttemptRef::new(
         manifest_execution_id,
-        participant.digest,
-        manifest_backend.clone(),
+        manifest_backend
+            .process_id()
+            .expect("fixture backend process id"),
+    )
+    .expect("fixture participant attempt reference");
+    let unknown = protocol_fragment_observation(
+        participant_ref.clone(),
         proto_id(UniqueId::new(999, 999)),
         2,
         0,
@@ -1253,13 +1238,17 @@ fn frontend_fragment_observation_rejects_conflicts_and_wrong_participants() {
         FragmentObservationStoreOutcome::Rejected
     );
     let old_attempt = protocol_fragment_observation(
-        QueryExecutionId::new(
-            manifest_execution_id.query_id(),
-            AttemptId::new(2).expect("fixture attempt id"),
+        protocol_lifecycle::ParticipantAttemptRef::new(
+            QueryExecutionId::new(
+                manifest_execution_id.query_id(),
+                AttemptId::new(2).expect("fixture attempt id"),
+            )
+            .expect("fixture old attempt execution id"),
+            manifest_backend
+                .process_id()
+                .expect("fixture backend process id"),
         )
-        .expect("fixture old attempt execution id"),
-        participant.digest,
-        manifest_backend,
+        .expect("fixture old participant attempt reference"),
         first.fragment_instance_id().expect("fixture fragment id"),
         2,
         0,
@@ -1270,10 +1259,26 @@ fn frontend_fragment_observation_rejects_conflicts_and_wrong_participants() {
         control.store_fragment_observation(&session, old_attempt),
         FragmentObservationStoreOutcome::Rejected
     );
+    let foreign_process = protocol_fragment_observation(
+        protocol_lifecycle::ParticipantAttemptRef::new(
+            manifest_execution_id,
+            BackendProcessId::new_v7(),
+        )
+        .expect("fixture foreign participant attempt reference"),
+        first.fragment_instance_id().expect("fixture fragment id"),
+        3,
+        0,
+        0,
+        0,
+    );
+    assert_eq!(
+        control.store_fragment_observation(&session, foreign_process),
+        FragmentObservationStoreOutcome::Rejected
+    );
 
     let snapshot = control.fragment_observation_snapshot();
     assert_eq!(snapshot.conflict, 1);
-    assert_eq!(snapshot.rejected, 2);
+    assert_eq!(snapshot.rejected, 3);
     assert_eq!(
         snapshot.latest.get(&(0, {
             let id = first.fragment_instance_id().expect("fixture fragment id");
@@ -1330,26 +1335,17 @@ fn frontend_negative_attestation_is_deduplicated_and_surfaces_as_terminal_input(
         participant.digest,
     );
 
-    let expected_content_id = outcome
-        .content_id()
-        .expect("fixture terminal outcome content id");
     let first = control
         .store_terminal_outcome(outcome.clone())
         .expect("attestation is stored");
-    assert!(matches!(first, TerminalOutcomeStoreOutcome::Accepted(_)));
-    assert_eq!(first.content_id(), expected_content_id);
+    assert!(matches!(first, TerminalOutcomeStoreOutcome::Accepted));
     let retry = control
         .store_terminal_outcome(outcome)
         .expect("same attestation retry is idempotent");
     assert!(matches!(
         retry,
-        TerminalOutcomeStoreOutcome::AlreadyAccepted(_)
+        TerminalOutcomeStoreOutcome::AlreadyAccepted
     ));
-    assert_eq!(
-        retry.content_id(),
-        expected_content_id,
-        "retries must use the original retained terminal content id"
-    );
     let outcomes = control.terminal_outcomes_for_test();
     assert_eq!(outcomes.len(), 1);
     assert_eq!(
@@ -1374,7 +1370,28 @@ fn frontend_negative_attestation_is_deduplicated_and_surfaces_as_terminal_input(
 }
 
 #[test]
-fn frontend_terminal_ack_reuses_the_retained_content_id_for_retries() {
+fn frontend_unary_terminal_ingress_reuses_the_stream_first_wins_store() {
+    let (control, _session, participant) = observation_control(0);
+    let manifest = participant.request.manifest().expect("fixture manifest");
+    let outcome = terminal_outcome(terminal_snapshot(
+        manifest.execution_id().expect("fixture execution id"),
+        manifest.backend().expect("fixture backend"),
+        participant.digest,
+    ));
+
+    assert!(
+        ActiveQueryAttemptControl::report_terminal_outcome(control.as_ref(), outcome.clone())
+            .expect("unary terminal outcome is admitted")
+    );
+    assert!(
+        !ActiveQueryAttemptControl::report_terminal_outcome(control.as_ref(), outcome)
+            .expect("exact unary retry is idempotent")
+    );
+    assert_eq!(control.terminal_outcomes_for_test().len(), 1);
+}
+
+#[test]
+fn frontend_terminal_receipt_reuses_the_participant_attempt_ref_for_retries() {
     let (control, _fixture_session, participant) = observation_control(0);
     let recorder = RecordingSession::with_events([]);
     let session = ActiveSession::new(
@@ -1388,11 +1405,7 @@ fn frontend_terminal_ack_reuses_the_retained_content_id_for_retries() {
         manifest.backend().expect("fixture backend"),
         participant.digest,
     ));
-    let expected_content_id = outcome
-        .content_id()
-        .expect("fixture terminal outcome content id")
-        .as_bytes()
-        .to_vec();
+    let expected_participant = outcome.participant().as_proto().clone();
     let event = protocol_terminal_outcome_event(outcome);
 
     control
@@ -1403,10 +1416,60 @@ fn frontend_terminal_ack_reuses_the_retained_content_id_for_retries() {
         .expect("duplicate terminal outcome is acknowledged");
 
     assert_eq!(
-        recorder.terminal_ack_digests(),
-        vec![expected_content_id.clone(), expected_content_id],
-        "terminal ACKs must use the content id retained by the first admission"
+        recorder.terminal_ack_participants(),
+        vec![expected_participant.clone(), expected_participant],
+        "terminal receipts must identify the participant admitted by the first outcome"
     );
+}
+
+#[test]
+fn frontend_negative_attestation_uses_the_same_identity_receipt() {
+    let (control, _fixture_session, participant) = observation_control(0);
+    let recorder = RecordingSession::with_events([]);
+    let session = ActiveSession::new(
+        participant.target,
+        participant.digest,
+        Arc::new(recorder.clone()),
+    );
+    let manifest = participant.request.manifest().expect("fixture manifest");
+    let outcome = negative_attestation_outcome(
+        manifest.execution_id().expect("fixture execution id"),
+        manifest.backend().expect("fixture backend"),
+        participant.digest,
+    );
+    let expected_participant = outcome.participant().as_proto().clone();
+
+    control
+        .handle_control_event(&session, protocol_terminal_outcome_event(outcome))
+        .expect("negative attestation is stored before the same receipt is sent");
+
+    assert_eq!(
+        recorder.terminal_ack_participants(),
+        vec![expected_participant],
+        "negative attestations must not require a snapshot-specific acknowledgement"
+    );
+}
+
+#[test]
+fn frontend_terminal_receipt_rejects_outcome_from_a_foreign_control_process() {
+    let (control, session, participant) = observation_control(0);
+    let manifest = participant.request.manifest().expect("fixture manifest");
+    let foreign_backend = ParticipantBackendIdentity::new(
+        BackendProcessId::new_v7(),
+        QueryControlEndpoint::new("127.0.0.1", 9910).expect("fixture endpoint"),
+    )
+    .expect("foreign backend identity");
+    let foreign = negative_attestation_outcome(
+        manifest.execution_id().expect("fixture execution id"),
+        foreign_backend,
+        participant.digest,
+    );
+
+    let error = control
+        .handle_control_event(&session, protocol_terminal_outcome_event(foreign))
+        .expect_err("a stream cannot deliver another process's terminal outcome");
+    assert!(error.contains("participant process differs"));
+    assert!(control.terminal_outcomes_for_test().is_empty());
 }
 
 #[test]
@@ -1940,7 +2003,6 @@ fn control_ready_then_peer_attach_failure_never_freezes_admitted_participants() 
     let errors = super::barrier::attach_all(
         &transport,
         &materialized.participants,
-        execution_id.attempt_id().get(),
         config(),
         &FrontendLifecycleMetrics::default(),
         &control,
@@ -2959,7 +3021,14 @@ async fn frontend_query_lifecycle_live_transport_crosses_generated_grpc_service(
     let abort_ack = transport
         .abort_query(
             lifecycle_target(&backend),
-            protocol_abort_for(execution_id, digest, "idempotent cleanup"),
+            protocol_abort_for(
+                execution_id,
+                digest,
+                backend
+                    .process_id()
+                    .expect("validated live backend process id"),
+                "idempotent cleanup",
+            ),
             Duration::from_secs(2),
         )
         .expect("AbortQuery crosses the generated gRPC service");
@@ -3012,7 +3081,12 @@ async fn frontend_query_lifecycle_live_transport_backpressures_and_surfaces_stre
     let session = transport
         .attach_control(
             target.clone(),
-            protocol_attach_for(execution_id, digest, 9),
+            protocol_attach_for(
+                execution_id,
+                digest,
+                9,
+                backend.process_id().expect("validated backend process id"),
+            ),
             Duration::from_secs(2),
         )
         .expect("attach");
@@ -3072,7 +3146,12 @@ async fn frontend_query_lifecycle_live_transport_closes_commands_before_terminal
     let session = transport
         .attach_control(
             target,
-            protocol_attach_for(execution_id, digest, 11),
+            protocol_attach_for(
+                execution_id,
+                digest,
+                11,
+                backend.process_id().expect("validated backend process id"),
+            ),
             Duration::from_secs(2),
         )
         .expect("attach");
@@ -3147,7 +3226,12 @@ async fn frontend_query_lifecycle_live_transport_ack_releases_only_its_pending_c
     let session = transport
         .attach_control(
             target,
-            protocol_attach_for(execution_id, digest, 12),
+            protocol_attach_for(
+                execution_id,
+                digest,
+                12,
+                backend.process_id().expect("validated backend process id"),
+            ),
             Duration::from_secs(2),
         )
         .expect("attach");
@@ -3238,7 +3322,12 @@ async fn frontend_query_lifecycle_live_transport_rejects_mismatched_terminal_ack
     let session = transport
         .attach_control(
             target,
-            protocol_attach_for(execution_id, digest, 13),
+            protocol_attach_for(
+                execution_id,
+                digest,
+                13,
+                backend.process_id().expect("validated backend process id"),
+            ),
             Duration::from_secs(2),
         )
         .expect("attach");
@@ -3294,7 +3383,12 @@ async fn frontend_query_lifecycle_live_transport_accepts_finalized_abort_replay_
     let session = transport
         .attach_control(
             target.clone(),
-            protocol_attach_for(execution_id, digest, 14),
+            protocol_attach_for(
+                execution_id,
+                digest,
+                14,
+                backend.process_id().expect("validated backend process id"),
+            ),
             Duration::from_secs(2),
         )
         .expect("attach");
@@ -3731,16 +3825,39 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
         &self,
         attach: protocol_lifecycle::QueryControlAttach,
     ) -> Result<QueryControlAttachment, QueryLifecycleError> {
-        let execution_id = attach.execution_id().map_err(|error| {
+        let participant = attach.participant().map_err(|error| {
             QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
         })?;
-        let digest = attach.digest().map_err(|error| {
+        let execution_id = participant.execution_id().map_err(|error| {
             QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())
         })?;
-        if *self.initialized.lock().expect("initialized") != Some((execution_id, digest)) {
+        let backend = self
+            .initialized_backend
+            .lock()
+            .expect("initialized backend")
+            .clone()
+            .expect("InitQuery precedes attach");
+        let (initialized_execution_id, digest) = self
+            .initialized
+            .lock()
+            .expect("initialized")
+            .expect("InitQuery precedes attach");
+        if execution_id != initialized_execution_id
+            || participant.backend_process_id().map_err(|error| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::InvalidManifest,
+                    error.to_string(),
+                )
+            })? != backend.process_id().map_err(|error| {
+                QueryLifecycleError::new(
+                    QueryLifecycleErrorCode::InvalidManifest,
+                    error.to_string(),
+                )
+            })?
+        {
             return Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::Conflict,
-                "attach identity or digest mismatch",
+                "attach participant reference mismatch",
             ));
         }
         let (events, receiver) = tokio::sync::mpsc::channel(32);
@@ -3757,12 +3874,7 @@ impl QueryLifecycleIngress for LiveLifecycleIngress {
                 manual_heartbeat_acks: self.manual_heartbeat_acks,
                 manual_terminal_acks: self.manual_terminal_acks,
                 execution_id,
-                backend: self
-                    .initialized_backend
-                    .lock()
-                    .expect("initialized backend")
-                    .clone()
-                    .expect("InitQuery precedes attach"),
+                backend,
                 digest,
             }),
             events: receiver,

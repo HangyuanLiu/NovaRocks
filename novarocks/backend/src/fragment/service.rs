@@ -1431,12 +1431,16 @@ mod tests {
             .lifecycle
             .attach_control(
                 QueryControlAttach::new(
-                    execution_id,
-                    init.manifest()
-                        .expect("validated init manifest")
-                        .digest()
-                        .expect("valid init digest"),
-                    1,
+                    novarocks_proto_codec::lifecycle::ParticipantAttemptRef::new(
+                        execution_id,
+                        init.manifest()
+                            .expect("validated init manifest")
+                            .backend()
+                            .expect("validated init backend")
+                            .process_id()
+                            .expect("validated init backend process"),
+                    )
+                    .expect("valid participant attempt ref"),
                 )
                 .expect("control attachment"),
             )

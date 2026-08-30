@@ -26,13 +26,13 @@ use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_failpoint::QueryLifecycleFaultKind;
 use novarocks_proto_codec::lifecycle::terminal::p0_max_encoded_len;
 use novarocks_proto_codec::lifecycle::{
-    FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantManifestDigest,
-    ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach, QueryControlEndpoint,
-    QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitOutcome, QueryInitRequest,
-    QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
-    QueryStartRequest, QueryTerminalAck, QueryTerminalProfileContributionV1,
+    FragmentLiveObservation, FragmentTerminalSnapshot, ParticipantAttemptRef,
+    ParticipantManifestDigest, ParticipantTerminalOutcome, QueryAbortRequest, QueryControlAttach,
+    QueryControlEndpoint, QueryControlEvent, QueryExecutionId, QueryInitAck, QueryInitOutcome,
+    QueryInitRequest, QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck,
+    QueryStartOutcome, QueryStartRequest, QueryTerminalAck, QueryTerminalProfileContributionV1,
     QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminalSnapshot, QueryTerminationAck,
-    QueryTerminationReason, StageDigest, StageDigestVersion, TerminalOutcomeContentId,
+    QueryTerminationReason, StageDigest,
 };
 use novarocks_spi::connector::CatalogProperties;
 use novarocks_types::{
@@ -82,9 +82,7 @@ const RUNTIME_FILTER_FEEDBACK_BUFFER_CAPACITY: usize = 64;
 /// feedback. The participant retains this only weakly, and `try_send` makes a
 /// congested or detached Frontend fail open without delaying execution.
 struct RuntimeFilterFeedbackEgress {
-    execution_id: QueryExecutionId,
-    init_digest: ParticipantManifestDigest,
-    backend: novarocks_proto_codec::lifecycle::ParticipantBackendIdentity,
+    participant: ParticipantAttemptRef,
     participant_id: u32,
     events: tokio::sync::mpsc::Sender<QueryControlEvent>,
 }
@@ -100,7 +98,8 @@ impl BackendFrontendFeedbackSink for RuntimeFilterFeedbackEgress {
         use novarocks_proto_models::novarocks as wire;
 
         #[cfg(debug_assertions)]
-        let outcome = force_feedback_unavailable(self.execution_id).unwrap_or(outcome);
+        let outcome = force_feedback_unavailable(validated(self.participant.execution_id()))
+            .unwrap_or(outcome);
 
         let terminal_outcome = match outcome {
             BackendFrontendFeedbackOutcome::CanonicalDomain(domain) => {
@@ -131,19 +130,17 @@ impl BackendFrontendFeedbackSink for RuntimeFilterFeedbackEgress {
         };
         let mut contract_digest = publication.contract_digest().to_vec();
         #[cfg(debug_assertions)]
-        if corrupt_feedback_contract_digest(self.execution_id) {
+        if corrupt_feedback_contract_digest(validated(self.participant.execution_id())) {
             contract_digest[0] ^= 1;
         }
         let event =
             protocol_control_event(wire::query_control_response::Event::RuntimeFilterFeedback(
                 wire::RuntimeFilterFeedbackEvent {
-                    execution_id: Some(
-                        novarocks_proto_codec::lifecycle::encode_query_execution_id(
-                            self.execution_id,
-                        ),
+                    participant_attempt: Some(
+                        feedback_participant_ref(&self.participant)
+                            .as_proto()
+                            .clone(),
                     ),
-                    init_digest: self.init_digest.as_bytes().to_vec(),
-                    backend: Some(protocol_backend(self.backend.clone())),
                     participant_id: self.participant_id,
                     deployment_epoch,
                     channel_id: channel_id.get(),
@@ -184,6 +181,72 @@ fn force_feedback_unavailable(
         Ok(Some(_))
     )
     .then_some(BackendFrontendFeedbackOutcome::ProducerUnavailable)
+}
+
+#[cfg(debug_assertions)]
+fn feedback_participant_ref(participant: &ParticipantAttemptRef) -> ParticipantAttemptRef {
+    let execution_id = validated(participant.execution_id());
+    let Some(root) = novarocks_failpoint::configured_root() else {
+        return participant.clone();
+    };
+    match novarocks_failpoint::claim_matching_fault_for_process(
+        &root,
+        QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignParticipant,
+        execution_id,
+        validated(participant.backend_process_id()),
+    ) {
+        Ok(Some(scope)) => {
+            eprintln!(
+                "NOVAROCKS_RUNTIME_FILTER_FEEDBACK_FOREIGN_PARTICIPANT execution_id={}:{}:{} backend_index={} token={}",
+                execution_id.query_id().high(),
+                execution_id.query_id().low(),
+                execution_id.attempt_id().get(),
+                scope.backend_index,
+                scope.token
+            );
+            ParticipantAttemptRef::new(execution_id, BackendProcessId::new_v7())
+                .expect("valid generated process creates a foreign participant ref")
+        }
+        Ok(None) | Err(_) => participant.clone(),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn feedback_participant_ref(participant: &ParticipantAttemptRef) -> ParticipantAttemptRef {
+    participant.clone()
+}
+
+#[cfg(debug_assertions)]
+fn observation_participant_ref(participant: &ParticipantAttemptRef) -> ParticipantAttemptRef {
+    let execution_id = validated(participant.execution_id());
+    let Some(root) = novarocks_failpoint::configured_root() else {
+        return participant.clone();
+    };
+    match novarocks_failpoint::claim_matching_fault_for_process(
+        &root,
+        QueryLifecycleFaultKind::ObservationForeignParticipant,
+        execution_id,
+        validated(participant.backend_process_id()),
+    ) {
+        Ok(Some(scope)) => {
+            eprintln!(
+                "NOVAROCKS_FRAGMENT_OBSERVATION_FOREIGN_PARTICIPANT execution_id={}:{}:{} backend_index={} token={}",
+                execution_id.query_id().high(),
+                execution_id.query_id().low(),
+                execution_id.attempt_id().get(),
+                scope.backend_index,
+                scope.token
+            );
+            ParticipantAttemptRef::new(execution_id, BackendProcessId::new_v7())
+                .expect("valid generated process creates a foreign participant ref")
+        }
+        Ok(None) | Err(_) => participant.clone(),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn observation_participant_ref(participant: &ParticipantAttemptRef) -> ParticipantAttemptRef {
+    participant.clone()
 }
 
 fn empty_catalog_runtime_materializers()
@@ -329,10 +392,11 @@ fn terminal_outcome_event(outcome: &ParticipantTerminalOutcome) -> QueryControlE
     ))
 }
 
-fn terminal_outcome_content_id(
-    outcome: &ParticipantTerminalOutcome,
-) -> Result<TerminalOutcomeContentId, QueryLifecycleError> {
-    outcome.content_id().map_err(protocol_contract_error)
+fn terminal_outcome_matches(
+    outcome: Option<&ParticipantTerminalOutcome>,
+    participant: &ParticipantAttemptRef,
+) -> bool {
+    outcome.is_some_and(|outcome| outcome.participant() == *participant)
 }
 
 fn protocol_unique_id(value: UniqueId) -> novarocks_proto_models::common::UniqueId {
@@ -342,20 +406,16 @@ fn protocol_unique_id(value: UniqueId) -> novarocks_proto_models::common::Unique
     }
 }
 
-fn protocol_backend(
-    backend: novarocks_proto_codec::lifecycle::ParticipantBackendIdentity,
-) -> novarocks_proto_models::novarocks::ParticipantBackendIdentity {
-    let endpoint = validated(backend.endpoint());
-    let process_id = validated(backend.process_id());
-    novarocks_proto_models::novarocks::ParticipantBackendIdentity {
-        endpoint: Some(novarocks_proto_models::novarocks::QueryControlEndpoint {
-            host: endpoint.host().to_owned(),
-            port: u32::from(endpoint.port()),
-        }),
-        process_id: Some(novarocks_proto_models::novarocks::BackendProcessId {
-            value: process_id.to_bytes().to_vec(),
-        }),
-    }
+fn participant_attempt_ref(
+    execution_id: QueryExecutionId,
+    manifest: &novarocks_proto_codec::lifecycle::ParticipantManifest,
+) -> Result<ParticipantAttemptRef, QueryLifecycleError> {
+    let backend = manifest.backend().map_err(protocol_contract_error)?;
+    ParticipantAttemptRef::new(
+        execution_id,
+        backend.process_id().map_err(protocol_contract_error)?,
+    )
+    .map_err(protocol_contract_error)
 }
 
 fn protocol_connector_staged_report_frame(
@@ -472,9 +532,7 @@ fn fragment_outcome(
 }
 
 fn terminal_outcome_from_snapshot(
-    execution_id: QueryExecutionId,
-    backend: novarocks_proto_codec::lifecycle::ParticipantBackendIdentity,
-    init_digest: ParticipantManifestDigest,
+    participant: ParticipantAttemptRef,
     facts: Vec<FragmentTerminalSnapshot>,
     profile_contribution: novarocks_proto_models::novarocks::QueryTerminalProfileContributionTelemetry,
 ) -> Result<(QueryTerminalSnapshot, ParticipantTerminalOutcome), QueryLifecycleError> {
@@ -483,14 +541,9 @@ fn terminal_outcome_from_snapshot(
     };
     use novarocks_proto_models::novarocks as wire;
     use wire::participant_terminal_outcome::Outcome;
-    let backend = protocol_backend(backend);
     let snapshot = ProtocolSnapshot::parse(wire::QueryTerminalSnapshot {
         version: novarocks_proto_codec::lifecycle::terminal::QUERY_TERMINAL_SNAPSHOT_VERSION_V1,
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            execution_id,
-        )),
-        backend: Some(backend.clone()),
-        init_digest: init_digest.as_bytes().to_vec(),
+        participant: Some(participant.as_proto().clone()),
         fragments: facts
             .into_iter()
             .map(|value| value.as_proto().clone())
@@ -500,11 +553,7 @@ fn terminal_outcome_from_snapshot(
     .map_err(protocol_contract_error)?;
     let proof = ProtocolProof::parse(wire::TerminalizationProof {
         version: 1,
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            execution_id,
-        )),
-        backend: Some(backend),
-        init_digest: init_digest.as_bytes().to_vec(),
+        participant: Some(participant.as_proto().clone()),
         fragments: snapshot
             .fragments()
             .into_iter()
@@ -531,9 +580,7 @@ fn terminal_outcome_from_snapshot(
 }
 
 fn negative_terminal_outcome(
-    execution_id: QueryExecutionId,
-    backend: novarocks_proto_codec::lifecycle::ParticipantBackendIdentity,
-    init_digest: ParticipantManifestDigest,
+    participant: ParticipantAttemptRef,
     reason: novarocks_proto_models::novarocks::NegativeAttestationReason,
     detail: String,
 ) -> ParticipantTerminalOutcome {
@@ -541,11 +588,7 @@ fn negative_terminal_outcome(
     use novarocks_proto_models::novarocks as wire;
     use wire::participant_terminal_outcome::Outcome;
     let attestation = ProtocolAttestation::parse(wire::NegativeAttestation {
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-            execution_id,
-        )),
-        backend: Some(protocol_backend(backend)),
-        init_digest: init_digest.as_bytes().to_vec(),
+        participant: Some(participant.as_proto().clone()),
         reason: reason as i32,
         detail,
         detail_truncated: false,
@@ -1142,6 +1185,7 @@ struct QueryLifecycleRegistryState {
 }
 
 struct PreInitTombstone {
+    participant: ParticipantAttemptRef,
     digest: ParticipantManifestDigest,
     reason: QueryTerminationReason,
     terminated_at: Instant,
@@ -1686,6 +1730,8 @@ impl QueryLifecycleRegistry {
             self.log_init(&ack);
             return ack;
         }
+        let participant = ParticipantAttemptRef::new(execution_id, self.local_process_id)
+            .expect("validated manifest identity creates a participant ref");
 
         let entry = {
             let mut state = self.state.lock().expect("query lifecycle registry lock");
@@ -1701,7 +1747,8 @@ impl QueryLifecycleRegistry {
                 return ack;
             }
             if let Some(tombstone) = state.pre_init_tombstones.get(&execution_id) {
-                let outcome = if tombstone.digest == digest {
+                let outcome = if tombstone.participant == participant && tombstone.digest == digest
+                {
                     QueryInitOutcome::QueryInitRejectedTerminated
                 } else {
                     state.init_conflicts = state.init_conflicts.saturating_add(1);
@@ -1903,14 +1950,29 @@ impl QueryLifecycleRegistry {
         &self,
         request: QueryAbortRequest,
     ) -> Result<QueryTerminationAck, QueryLifecycleError> {
+        let participant = validated(request.participant());
         let execution_id = validated(request.execution_id());
         let digest = validated(request.digest());
+        if validated(participant.backend_process_id()) != self.local_process_id {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Conflict,
+                "abort participant process does not match this backend",
+            ));
+        }
         let entry = {
             let mut state = self.state.lock().expect("query lifecycle registry lock");
             self.clean_tombstones_locked(&mut state, self.clock.now(), 64);
             if let Some(entry) = state.entries.get(&execution_id).cloned() {
                 Some(entry)
             } else {
+                if let Some(tombstone) = state.pre_init_tombstones.get(&execution_id)
+                    && (tombstone.participant != participant || tombstone.digest != digest)
+                {
+                    return Err(QueryLifecycleError::new(
+                        QueryLifecycleErrorCode::Conflict,
+                        "abort conflicts with an existing pre-init tombstone",
+                    ));
+                }
                 let reason = state
                     .pre_init_tombstones
                     .get(&execution_id)
@@ -1920,6 +1982,7 @@ impl QueryLifecycleRegistry {
                     state.pre_init_tombstones.entry(execution_id)
                 {
                     e.insert(PreInitTombstone {
+                        participant,
                         digest,
                         reason,
                         terminated_at: self.clock.now(),
@@ -1951,6 +2014,12 @@ impl QueryLifecycleRegistry {
             }
         };
         let entry = entry.expect("existing entry");
+        if entry.participant != participant {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::Conflict,
+                "abort participant conflicts with initialized entry",
+            ));
+        }
         if entry.digest != digest {
             return Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::Conflict,
@@ -1971,7 +2040,7 @@ impl QueryLifecycleRegistry {
         attach: QueryControlAttach,
     ) -> Result<QueryControlAttachment, QueryLifecycleError> {
         let execution_id = validated(attach.execution_id());
-        let digest = validated(attach.digest());
+        let participant = validated(attach.participant());
         let entry = self
             .state
             .lock()
@@ -1987,12 +2056,12 @@ impl QueryLifecycleRegistry {
                 "missing",
             ));
         };
-        if entry.digest != digest {
+        if entry.participant != participant {
             return Err(self.attach_error(
                 &attach,
                 QueryLifecycleErrorCode::Conflict,
-                "query control digest conflicts with initialized manifest",
-                "digest_mismatch",
+                "query control participant conflicts with initialized entry",
+                "participant_mismatch",
             ));
         }
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(
@@ -2085,7 +2154,6 @@ impl QueryLifecycleRegistry {
                 }
             }
             state.phase = QueryLifecyclePhase::ControlAttached;
-            state.frontend_owner_epoch = Some(attach.frontend_owner_epoch());
             state.last_heartbeat = Some(self.clock.now());
             state.events = Some(events_tx.clone());
             state.observations = Some(observations_tx);
@@ -2095,9 +2163,7 @@ impl QueryLifecycleRegistry {
             if let Some(participant) = state.runtime_filter.as_ref() {
                 let feedback_sink: Arc<dyn BackendFrontendFeedbackSink> =
                     Arc::new(RuntimeFilterFeedbackEgress {
-                        execution_id,
-                        init_digest: entry.digest,
-                        backend: validated(entry.manifest.backend()),
+                        participant: entry.participant.clone(),
                         participant_id: participant.local_participant_id(),
                         events: runtime_filter_feedback_tx.clone(),
                     });
@@ -2117,7 +2183,6 @@ impl QueryLifecycleRegistry {
         if let Err(error) = events_tx.try_send(control_ready_event(&catalog_load)) {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             state.phase = QueryLifecyclePhase::Initialized;
-            state.frontend_owner_epoch = None;
             state.last_heartbeat = None;
             state.events = None;
             state.observations = None;
@@ -2141,7 +2206,7 @@ impl QueryLifecycleRegistry {
             query_attempt_id = diagnostic.attempt_id(),
             attempt_id = execution_id.attempt_id().get(),
             process_id = %self.local_process_id,
-            digest = %format_digest(digest),
+            digest = %format_digest(entry.digest),
             outcome = "control_attached",
             reason = "none",
             "backend query lifecycle control attached"
@@ -2216,27 +2281,12 @@ impl QueryLifecycleRegistry {
             let Some(sender) = state.observations.clone() else {
                 return false;
             };
-            let backend = validated(entry.manifest.backend());
-            let endpoint = validated(backend.endpoint());
-            let process_id = validated(backend.process_id());
             let observation = FragmentLiveObservation::parse(
                 novarocks_proto_models::novarocks::FragmentLiveObservation {
-                    execution_id: Some(
-                        novarocks_proto_codec::lifecycle::encode_query_execution_id(execution_id),
-                    ),
-                    init_digest: entry.digest.as_bytes().to_vec(),
-                    backend: Some(
-                        novarocks_proto_models::novarocks::ParticipantBackendIdentity {
-                            endpoint: Some(
-                                novarocks_proto_models::novarocks::QueryControlEndpoint {
-                                    host: endpoint.host().to_owned(),
-                                    port: u32::from(endpoint.port()),
-                                },
-                            ),
-                            process_id: Some(novarocks_proto_models::novarocks::BackendProcessId {
-                                value: process_id.to_bytes().to_vec(),
-                            }),
-                        },
+                    participant: Some(
+                        observation_participant_ref(&entry.participant)
+                            .as_proto()
+                            .clone(),
                     ),
                     fragment_instance_id: Some(protocol_unique_id(fragment_instance_id)),
                     sequence,
@@ -2256,6 +2306,41 @@ impl QueryLifecycleRegistry {
         true
     }
 
+    /// The runner-owned NID-2 fault needs one real control-stream observation
+    /// even when a public query has profiling disabled. It is unreachable in
+    /// release builds and emits only after the exact participant has started.
+    #[cfg(debug_assertions)]
+    fn publish_runner_owned_foreign_observation_if_armed(
+        &self,
+        execution_id: QueryExecutionId,
+        entry: &Arc<QueryLifecycleEntry>,
+    ) {
+        let Some(root) = novarocks_failpoint::configured_root() else {
+            return;
+        };
+        let Some(backend_index) = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            return;
+        };
+        let trigger = novarocks_failpoint::trigger_path(
+            &root,
+            backend_index,
+            QueryLifecycleFaultKind::ObservationForeignParticipant,
+        );
+        if !trigger.is_file() {
+            return;
+        }
+        let Some(fragment_instance_id) = entry.expected_fragment_instance_ids.first().copied()
+        else {
+            return;
+        };
+        let _ =
+            self.publish_fragment_observation(execution_id, fragment_instance_id, 0, 0, 0, None);
+    }
+
+    // Design: ADR-0127 (docs/adr/ADR-0127-participant-attempt-stage-fence.md)
     pub(crate) fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
         match self.begin_stage(request) {
             StageBuildDecision::Build(permit) => permit.commit(),
@@ -2268,20 +2353,19 @@ impl QueryLifecycleRegistry {
     /// the returned permit.
     pub(crate) fn begin_stage(&self, request: QueryStageRequest) -> StageBuildDecision {
         let execution_id = request.execution_id();
-        let digest_version = request.digest_version();
+        let participant = request.participant();
         // Derive the stage identity exactly once. Every acknowledgement echoes
         // it, including the capacity rejection below, so this must precede the
         // backend-local fragment budget check. Protocol already bounded the
         // fragment count and encoded size before this carrier was validated.
         let fragments = request.fragments();
-        let stage_digest = StageDigest::compute_v1(execution_id, request.init_digest(), &fragments)
+        let stage_digest = StageDigest::compute(participant.clone(), &fragments)
             .expect("validated QueryStageRequest always derives a stage digest");
         let fragment_count = fragments.len();
         if fragment_count > self.config.stage_max_fragments {
             return StageBuildDecision::Complete(
                 QueryStageAck::new(
                     execution_id,
-                    digest_version,
                     stage_digest,
                     QueryStageOutcome::RejectedCapacity,
                     "stage fragment count exceeds the backend Stage limit",
@@ -2294,7 +2378,6 @@ impl QueryLifecycleRegistry {
             return StageBuildDecision::Complete(
                 QueryStageAck::new(
                     execution_id,
-                    digest_version,
                     stage_digest,
                     QueryStageOutcome::RejectedCapacity,
                     "stage request encoded bytes exceed the backend Stage limit",
@@ -2313,7 +2396,6 @@ impl QueryLifecycleRegistry {
             return StageBuildDecision::Complete(
                 QueryStageAck::new(
                     execution_id,
-                    digest_version,
                     stage_digest,
                     QueryStageOutcome::RejectedTerminated,
                     "query lifecycle entry is not active",
@@ -2321,14 +2403,13 @@ impl QueryLifecycleRegistry {
                 .expect("validated Stage rejection has a valid Protocol acknowledgement"),
             );
         };
-        if entry.digest.as_bytes() != request.init_digest().as_bytes() {
+        if entry.participant != participant {
             return StageBuildDecision::Complete(
                 QueryStageAck::new(
                     execution_id,
-                    digest_version,
                     stage_digest,
                     QueryStageOutcome::RejectedConflict,
-                    "stage init digest conflicts with initialized manifest",
+                    "stage participant conflicts with initialized entry",
                 )
                 .expect("validated Stage rejection has a valid Protocol acknowledgement"),
             );
@@ -2467,7 +2548,6 @@ impl QueryLifecycleRegistry {
                             }
                             return StageBuildDecision::Complete(QueryStageAck::new(
                             execution_id,
-                            digest_version,
                             stage_digest,
                             QueryStageOutcome::RejectedCapacity,
                             detail,
@@ -2489,7 +2569,7 @@ impl QueryLifecycleRegistry {
                 })
             }
             None => StageBuildDecision::Complete(
-                QueryStageAck::new(execution_id, digest_version, stage_digest, outcome, detail)
+                QueryStageAck::new(execution_id, stage_digest, outcome, detail)
                     .expect("validated Stage acknowledgement has a valid Protocol projection"),
             ),
         }
@@ -2500,7 +2580,6 @@ impl QueryLifecycleRegistry {
     /// staged workers one atomic lifecycle event.
     pub(crate) fn start_prepared_query(&self, request: QueryStartRequest) -> QueryStartAck {
         let execution_id = request.execution_id();
-        let digest_version = request.digest_version();
         let stage_digest = request.digest();
         let entry = self
             .state
@@ -2512,7 +2591,6 @@ impl QueryLifecycleRegistry {
         let Some(entry) = entry else {
             return QueryStartAck::new(
                 execution_id,
-                digest_version,
                 stage_digest,
                 QueryStartOutcome::RejectedTerminated,
                 "query lifecycle entry is not active",
@@ -2584,11 +2662,15 @@ impl QueryLifecycleRegistry {
         if let Some((permit, events)) = local_drained_ready {
             send_reserved_control_event(permit, events, local_drained_event());
         }
+        #[cfg(debug_assertions)]
+        if outcome == QueryStartOutcome::Applied {
+            self.publish_runner_owned_foreign_observation_if_armed(execution_id, &entry);
+        }
         // The gate has been released under the entry lock.  Once Running is
         // visible there can be no dormant workers or retained stage payload,
         // so return the Stage reservation outside lifecycle locks.
         drop(released_stage_resources);
-        QueryStartAck::new(execution_id, digest_version, stage_digest, outcome, detail)
+        QueryStartAck::new(execution_id, stage_digest, outcome, detail)
             .expect("validated Start acknowledgement has a valid Protocol projection")
     }
 
@@ -2600,7 +2682,7 @@ impl QueryLifecycleRegistry {
         phase: &'static str,
     ) -> QueryLifecycleError {
         let execution_id = validated(attach.execution_id());
-        let digest = validated(attach.digest());
+        let participant = validated(attach.participant());
         let diagnostic = QueryExecutionDiagnostic::from(execution_id);
         warn!(
             target: "novarocks::query_lifecycle",
@@ -2610,7 +2692,7 @@ impl QueryLifecycleRegistry {
             query_attempt_id = diagnostic.attempt_id(),
             attempt_id = execution_id.attempt_id().get(),
             process_id = %self.local_process_id,
-            digest = %format_digest(digest),
+            participant_process_id = %validated(participant.backend_process_id()),
             outcome = "attach_rejected",
             reason = detail,
             phase,
@@ -3011,7 +3093,6 @@ impl QueryLifecycleRegistry {
                         .unwrap_or(QueryTerminationReason::QueryTerminationCoordinatorFinalize);
                     state.terminal_record = None;
                     state.terminal_outcome = None;
-                    state.terminal_content_id = None;
                     reason
                 };
                 entry.terminal_delivery_completed.notify_all();
@@ -3472,26 +3553,21 @@ impl QueryLifecycleRegistry {
                 return;
             }
         };
-        let (snapshot, outcome) = match terminal_outcome_from_snapshot(
-            execution_id,
-            validated(entry.manifest.backend()),
-            entry.digest,
-            facts,
-            contribution,
-        ) {
-            Ok(value) => value,
+        let participant = match participant_attempt_ref(execution_id, &entry.manifest) {
+            Ok(participant) => participant,
             Err(error) => {
                 self.fail_terminal_freeze(&entry, execution_id, &error);
                 return;
             }
         };
-        let content_id = match terminal_outcome_content_id(&outcome) {
-            Ok(content_id) => content_id,
-            Err(error) => {
-                self.fail_terminal_freeze(&entry, execution_id, &error);
-                return;
-            }
-        };
+        let (snapshot, outcome) =
+            match terminal_outcome_from_snapshot(participant, facts, contribution) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.fail_terminal_freeze(&entry, execution_id, &error);
+                    return;
+                }
+            };
         if let Err(error) = self.fail_if_terminal_p1_encode_fault(execution_id) {
             self.fail_terminal_freeze(&entry, execution_id, &error);
             return;
@@ -3527,7 +3603,6 @@ impl QueryLifecycleRegistry {
             state.terminal_freeze_in_flight = false;
             state.terminal_record = Some(record.clone());
             state.terminal_outcome = Some(outcome.clone());
-            state.terminal_content_id = Some(content_id);
             state.phase = QueryLifecyclePhase::TerminalRetained;
             state.terminated_at = Some(self.clock.now());
             (
@@ -3537,12 +3612,11 @@ impl QueryLifecycleRegistry {
         };
         self.release_query_resources(execution_id);
         let _ = self.try_complete_runtime_filter_cleanup(&entry, execution_id);
-        self.emit_terminal_retained_marker(record.snapshot(), content_id, record.encoded_len());
+        self.emit_terminal_retained_marker(record.snapshot(), record.encoded_len());
         self.deliver_terminal_outcome(
             entry,
             execution_id,
             outcome,
-            content_id,
             terminal_delivery.0,
             terminal_delivery.1,
         );
@@ -3576,15 +3650,15 @@ impl QueryLifecycleRegistry {
                 novarocks_proto_models::novarocks::NegativeAttestationReason::CorrectnessEvidenceEncodingFailed
             }
         };
-        let outcome = negative_terminal_outcome(
-            execution_id,
-            validated(entry.manifest.backend()),
-            entry.digest,
-            attestation_reason,
-            error.detail().to_string(),
-        );
-        let content_id = terminal_outcome_content_id(&outcome)
-            .expect("Backend-generated negative terminal outcome has a canonical content ID");
+        let participant = match participant_attempt_ref(execution_id, &entry.manifest) {
+            Ok(participant) => participant,
+            Err(participant_error) => {
+                warn!(target: "novarocks::query_lifecycle", error = %participant_error, "failed to construct terminal participant reference");
+                return;
+            }
+        };
+        let outcome =
+            negative_terminal_outcome(participant, attestation_reason, error.detail().to_string());
         let terminal_delivery = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             if state.terminal_outcome.is_some() {
@@ -3595,7 +3669,6 @@ impl QueryLifecycleRegistry {
             state.failure_drain_scheduled = false;
             state.terminal_record = None;
             state.terminal_outcome = Some(outcome.clone());
-            state.terminal_content_id = Some(content_id);
             state.phase = QueryLifecyclePhase::TerminalRetained;
             state.terminated_at = Some(self.clock.now());
             (
@@ -3609,7 +3682,6 @@ impl QueryLifecycleRegistry {
             Arc::clone(entry),
             execution_id,
             outcome,
-            content_id,
             terminal_delivery.0,
             terminal_delivery.1,
         );
@@ -3635,7 +3707,7 @@ impl QueryLifecycleRegistry {
                     "query lifecycle entry is not active",
                 )
             })?;
-        let (backend, facts, expected, participant, runtime_filter_installed) = {
+        let (facts, expected, participant, runtime_filter_installed) = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
             if state.phase != QueryLifecyclePhase::Running || !state.local_drained_emitted {
                 return Err(QueryLifecycleError::new(
@@ -3657,9 +3729,7 @@ impl QueryLifecycleRegistry {
                 ));
             }
             state.terminal_freeze_in_flight = true;
-            let backend = validated(entry.manifest.backend());
             (
-                backend,
                 state.terminal_facts.values().cloned().collect::<Vec<_>>(),
                 expected.to_vec(),
                 state.runtime_filter.clone(),
@@ -3688,16 +3758,11 @@ impl QueryLifecycleRegistry {
                 runtime_filter_installed,
             )
             .inspect_err(|error| self.fail_terminal_freeze(&entry, execution_id, error))?;
-        let (snapshot, outcome) = terminal_outcome_from_snapshot(
-            execution_id,
-            backend,
-            entry.digest,
-            facts,
-            contribution,
-        )
-        .inspect_err(|error| self.fail_terminal_freeze(&entry, execution_id, error))?;
-        let content_id = terminal_outcome_content_id(&outcome)
+        let participant_ref = participant_attempt_ref(execution_id, &entry.manifest)
             .inspect_err(|error| self.fail_terminal_freeze(&entry, execution_id, error))?;
+        let (snapshot, outcome) =
+            terminal_outcome_from_snapshot(participant_ref, facts, contribution)
+                .inspect_err(|error| self.fail_terminal_freeze(&entry, execution_id, error))?;
         self.fail_if_terminal_p1_encode_fault(execution_id)
             .inspect_err(|error| self.fail_terminal_freeze(&entry, execution_id, error))?;
         let record =
@@ -3723,7 +3788,6 @@ impl QueryLifecycleRegistry {
             state.terminal_freeze_in_flight = false;
             state.terminal_record = Some(record.clone());
             state.terminal_outcome = Some(outcome.clone());
-            state.terminal_content_id = Some(content_id);
             state.phase = QueryLifecyclePhase::TerminalRetained;
             state.termination_reason =
                 Some(QueryTerminationReason::QueryTerminationCoordinatorFinalize);
@@ -3737,13 +3801,12 @@ impl QueryLifecycleRegistry {
         // contribution is retained and before it is delivered.
         self.release_query_resources(execution_id);
         let _ = self.try_complete_runtime_filter_cleanup(&entry, execution_id);
-        self.emit_terminal_retained_marker(record.snapshot(), content_id, record.encoded_len());
+        self.emit_terminal_retained_marker(record.snapshot(), record.encoded_len());
         let terminal_events = terminal_delivery.1.clone();
         self.deliver_terminal_outcome(
             Arc::clone(&entry),
             execution_id,
             outcome,
-            content_id,
             terminal_delivery.0,
             terminal_delivery.1,
         );
@@ -3863,7 +3926,6 @@ impl QueryLifecycleRegistry {
         entry: Arc<QueryLifecycleEntry>,
         execution_id: QueryExecutionId,
         outcome: ParticipantTerminalOutcome,
-        content_id: TerminalOutcomeContentId,
         permit: Option<tokio::sync::mpsc::OwnedPermit<QueryControlEvent>>,
         events: Option<tokio::sync::mpsc::Sender<QueryControlEvent>>,
     ) {
@@ -3887,7 +3949,7 @@ impl QueryLifecycleRegistry {
                 // Deliberately leave the retained P0/P1 outcome intact and
                 // skip only the attached control stream. The ordinary unary
                 // fallback owns eventual delivery from the immutable record.
-                self.schedule_terminal_fallback(entry, outcome, content_id);
+                self.schedule_terminal_fallback(entry, outcome);
                 return;
             }
             Ok(false) => {}
@@ -3901,7 +3963,7 @@ impl QueryLifecycleRegistry {
             }
         }
         send_reserved_control_event(permit, events, terminal_outcome_event(&outcome));
-        self.schedule_terminal_fallback(entry, outcome, content_id);
+        self.schedule_terminal_fallback(entry, outcome);
     }
 
     #[cfg(debug_assertions)]
@@ -4054,18 +4116,12 @@ impl QueryLifecycleRegistry {
         }
     }
 
-    fn emit_terminal_retained_marker(
-        &self,
-        snapshot: &QueryTerminalSnapshot,
-        content_id: TerminalOutcomeContentId,
-        bytes: usize,
-    ) {
+    fn emit_terminal_retained_marker(&self, snapshot: &QueryTerminalSnapshot, bytes: usize) {
         if query_lifecycle_test_markers_enabled() {
             eprintln!(
-                "NOVAROCKS_QUERY_TERMINAL_RETAINED execution_id={} process_id={} digest={:?} bytes={}",
+                "NOVAROCKS_QUERY_TERMINAL_RETAINED execution_id={} process_id={} bytes={}",
                 format_execution_id(snapshot.execution_id()),
                 self.local_process_id,
-                content_id.as_bytes(),
                 bytes,
             );
         }
@@ -4075,8 +4131,8 @@ impl QueryLifecycleRegistry {
         &self,
         entry: Arc<QueryLifecycleEntry>,
         outcome: ParticipantTerminalOutcome,
-        content_id: TerminalOutcomeContentId,
     ) {
+        let participant = outcome.participant();
         let endpoint = validated(entry.manifest.report_endpoint());
         let weak = self.self_weak.clone();
         let transport = Arc::clone(&self.terminal_fallback);
@@ -4089,14 +4145,13 @@ impl QueryLifecycleRegistry {
                     .wait_timeout_while(
                         entry.state.lock().expect("query lifecycle entry lock"),
                         config.terminal_ack_timeout,
-                        |state| {
-                            state.terminal_content_id == Some(content_id)
-                        },
+                        |state| terminal_outcome_matches(state.terminal_outcome.as_ref(), &participant),
                     )
                     .expect("query lifecycle terminal fallback wait")
                     .0
-                    .terminal_content_id
-                    .is_some_and(|retained| retained == content_id);
+                    .terminal_outcome
+                    .as_ref()
+                    .is_some_and(|retained| terminal_outcome_matches(Some(retained), &participant));
                 if !retained {
                     return;
                 }
@@ -4109,8 +4164,9 @@ impl QueryLifecycleRegistry {
                         .state
                         .lock()
                         .expect("query lifecycle entry lock")
-                        .terminal_content_id
-                        .is_some_and(|retained| retained == content_id);
+                        .terminal_outcome
+                        .as_ref()
+                        .is_some_and(|retained| terminal_outcome_matches(Some(retained), &participant));
                     if !retained {
                         return;
                     }
@@ -4140,12 +4196,10 @@ impl QueryLifecycleRegistry {
                                     ack.outcome().expect("validated terminal fallback acknowledgement"),
                                 );
                             }
-                            let _ = registry.terminal_ack_from_control(
-                                QueryTerminalAck::parse(novarocks_proto_models::novarocks::QueryControlTerminalAck {
-                                    execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(outcome.execution_id())),
-                                    init_digest: outcome.init_digest().as_bytes().to_vec(),
-                                    snapshot_version: 1, snapshot_digest: content_id.as_bytes().to_vec(),
-                                }).expect("retained Protocol terminal outcome has a valid acknowledgement identity"),
+                            registry.complete_terminal_delivery(
+                                &entry,
+                                outcome.execution_id(),
+                                &participant,
                             );
                             return;
                         }
@@ -4180,7 +4234,7 @@ impl QueryLifecycleRegistry {
                                 registry.discard_terminal_record(
                                     &entry,
                                     outcome.execution_id(),
-                                    content_id,
+                                    &participant,
                                 );
                                 return;
                             }
@@ -4220,8 +4274,22 @@ impl QueryLifecycleRegistry {
             .expect("spawn query terminal fallback delivery");
     }
 
+    // Design: ADR-0126 (docs/adr/ADR-0126-terminal-delivery-participant-attempt-ref.md)
     fn terminal_ack_from_control(&self, ack: QueryTerminalAck) -> Result<(), QueryLifecycleError> {
-        let execution_id = ack.execution_id().map_err(protocol_contract_error)?;
+        let participant = ack.participant().map_err(protocol_contract_error)?;
+        let execution_id = participant
+            .execution_id()
+            .map_err(protocol_contract_error)?;
+        if participant
+            .backend_process_id()
+            .map_err(protocol_contract_error)?
+            != self.local_process_id
+        {
+            return Err(QueryLifecycleError::new(
+                QueryLifecycleErrorCode::StaleBackend,
+                "query terminal ACK names a different backend process",
+            ));
+        }
         let entry = self
             .state
             .lock()
@@ -4242,17 +4310,7 @@ impl QueryLifecycleRegistry {
                 "query terminal record is not retained",
             )
         })?;
-        let content_id = state.terminal_content_id.ok_or_else(|| {
-            QueryLifecycleError::new(
-                QueryLifecycleErrorCode::Internal,
-                "retained query terminal outcome is missing its content ID",
-            )
-        })?;
-        if ack.execution_id().map_err(protocol_contract_error)? != outcome.execution_id()
-            || ack.init_digest().map_err(protocol_contract_error)? != outcome.init_digest()
-            || ack.version() != 1
-            || ack.digest().map_err(protocol_contract_error)? != *content_id.as_bytes()
-        {
+        if outcome.participant() != participant {
             return Err(QueryLifecycleError::new(
                 QueryLifecycleErrorCode::Conflict,
                 "query terminal ACK identity conflicts with retained snapshot",
@@ -4274,7 +4332,6 @@ impl QueryLifecycleRegistry {
             .unwrap_or(QueryTerminationReason::QueryTerminationCoordinatorFinalize);
         state.terminal_record = None;
         state.terminal_outcome = None;
-        state.terminal_content_id = None;
         drop(state);
         entry.terminal_delivery_completed.notify_all();
         self.increment_terminal_metric(|metrics| {
@@ -4285,6 +4342,31 @@ impl QueryLifecycleRegistry {
         Ok(())
     }
 
+    fn complete_terminal_delivery(
+        &self,
+        entry: &Arc<QueryLifecycleEntry>,
+        execution_id: QueryExecutionId,
+        participant: &ParticipantAttemptRef,
+    ) {
+        let reason = {
+            let mut state = entry.state.lock().expect("query lifecycle entry lock");
+            if !terminal_outcome_matches(state.terminal_outcome.as_ref(), participant) {
+                return;
+            }
+            state.terminal_record = None;
+            state.terminal_outcome = None;
+            state
+                .termination_reason
+                .unwrap_or(QueryTerminationReason::QueryTerminationCoordinatorFinalize)
+        };
+        entry.terminal_delivery_completed.notify_all();
+        self.increment_terminal_metric(|metrics| {
+            metrics.terminal_acknowledged = metrics.terminal_acknowledged.saturating_add(1);
+        });
+        self.release_terminal_record(execution_id);
+        self.publish_tombstone(entry, execution_id, reason);
+    }
+
     /// A conflict is a terminal answer from a live FE: retrying the immutable
     /// snapshot cannot change the rejected identity. Drop only this bounded
     /// delivery record; execution resources were detached before it existed.
@@ -4292,17 +4374,16 @@ impl QueryLifecycleRegistry {
         &self,
         entry: &Arc<QueryLifecycleEntry>,
         execution_id: QueryExecutionId,
-        content_id: TerminalOutcomeContentId,
+        participant: &ParticipantAttemptRef,
     ) {
         let reason = {
             let mut state = entry.state.lock().expect("query lifecycle entry lock");
-            let retained = state.terminal_content_id == Some(content_id);
+            let retained = terminal_outcome_matches(state.terminal_outcome.as_ref(), participant);
             if !retained {
                 return;
             }
             state.terminal_record = None;
             state.terminal_outcome = None;
-            state.terminal_content_id = None;
             state
                 .termination_reason
                 .unwrap_or(QueryTerminationReason::QueryTerminationCoordinatorFinalize)
@@ -4914,14 +4995,8 @@ impl StageBuildPermit {
                 self.registry.local_process_id,
             );
         }
-        QueryStageAck::new(
-            self.execution_id,
-            StageDigestVersion::V1,
-            self.digest,
-            outcome,
-            detail,
-        )
-        .expect("validated Stage acknowledgement has a valid Protocol projection")
+        QueryStageAck::new(self.execution_id, self.digest, outcome, detail)
+            .expect("validated Stage acknowledgement has a valid Protocol projection")
     }
 }
 

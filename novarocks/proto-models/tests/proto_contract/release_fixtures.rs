@@ -23,7 +23,7 @@ use novarocks_proto_models::{common, expr, filter, novarocks, plan};
 
 const FETCH_RESULT_RESPONSE_FIXTURE_HEX: &str =
     "0801120572656164791a0c4e5258312d6669787475726520092801";
-const REPORT_QUERY_TERMINAL_REQUEST_FIXTURE_HEX: &str = "0a8f020a60080112080a040801100210011a24120e0a093132372e302e302e3110903f22120a107777777777777777777777777777777722201111111111111111111111111111111111111111111111111111111111111111320a0a0408031004100918011aaa01080112080a040801100210011a24120e0a093132372e302e302e3110903f22120a107777777777777777777777777777777722201111111111111111111111111111111111111111111111111111111111111111324e0a0408031004100918013a04086410094a060809105a180152340a320a300a105465726d696e616c467261676d656e741009221a0a06736f7572636512107465726d696e616c2d666978747572653a040a020801";
+const REPORT_QUERY_TERMINAL_REQUEST_FIXTURE_HEX: &str = "0aaa010a2e0801320a0a0408031004100918013a1e0a080a0408011002100112120a10777777777777777777777777777777771a780801324e0a0408031004100918013a04086410094a060809105a180152340a320a300a105465726d696e616c467261676d656e741009221a0a06736f7572636512107465726d696e616c2d666978747572653a040a020801421e0a080a0408011002100112120a1077777777777777777777777777777777";
 const LOOKUP_REQUEST_FIXTURE_HEX: &str = "0a04080110021021182c220a083710041a0400010203";
 const LOOKUP_RESPONSE_FIXTURE_HEX: &str = "0a0412024f4b120a083710041a0403020100";
 const PLAN_FRAGMENT_FIXTURE_HEX: &str = "0801128b03080a10011a010a28ffffffffffffffffff01426c080b10011a010b28ffffffffffffffffff0152580a0c0801120269641a040a02080552480a047470636812160a086c696e656974656d120a0a02696412040a0208051a086c696e656974656d220c0801120269641a040a0208052a0c0a040a0208015a040a021001320269644256080c10011a010c28ffffffffffffffffff015a42080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791802220c0801120269641a040a0208052a0672656d6f74653202080152b0010a0c0801120269641a040a020805c2019e01080112480a220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b657912220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657920022802324c084d12220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65791a220a040a02080510015218080212086c696e656974656d1a0a6f5f6f726465726b657928021a26080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792226080312220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65792a02080132220a040a02080510015218080112086c696e656974656d1a0a6c5f6f726465726b65793a0c0801120269641a040a020805";
@@ -329,12 +329,15 @@ fn release_plan_fragment() -> plan::PlanFragment {
 
 fn release_stage_fragments_request() -> novarocks::StageFragmentsRequest {
     novarocks::StageFragmentsRequest {
-        execution_id: Some(novarocks::QueryExecutionId {
-            query_id: Some(id(1, 2)),
-            attempt_id: 1,
+        participant: Some(novarocks::ParticipantAttemptRef {
+            execution_id: Some(novarocks::QueryExecutionId {
+                query_id: Some(id(1, 2)),
+                attempt_id: 1,
+            }),
+            backend_process_id: Some(novarocks::BackendProcessId {
+                value: vec![0x77; 16],
+            }),
         }),
-        init_digest: vec![0x11; 32],
-        stage_digest_version: 1,
         fragments: vec![novarocks::StageFragment {
             plan: Some(release_plan_fragment()),
             instance_params: Some(novarocks::InstanceParams {
@@ -369,20 +372,15 @@ fn release_fetch_result_response() -> novarocks::FetchResultResponse {
 fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequest {
     let snapshot = novarocks::QueryTerminalSnapshot {
         version: 1,
-        execution_id: Some(novarocks::QueryExecutionId {
-            query_id: Some(id(1, 2)),
-            attempt_id: 1,
-        }),
-        backend: Some(novarocks::ParticipantBackendIdentity {
-            endpoint: Some(novarocks::QueryControlEndpoint {
-                host: "127.0.0.1".to_string(),
-                port: 8080,
+        participant: Some(novarocks::ParticipantAttemptRef {
+            execution_id: Some(novarocks::QueryExecutionId {
+                query_id: Some(id(1, 2)),
+                attempt_id: 1,
             }),
-            process_id: Some(novarocks::BackendProcessId {
+            backend_process_id: Some(novarocks::BackendProcessId {
                 value: vec![0x77; 16],
             }),
         }),
-        init_digest: vec![0x11; 32],
         fragments: vec![novarocks::QueryTerminalFragmentSnapshot {
             fragment_instance_id: Some(id(3, 4)),
             backend_num: 9,
@@ -440,9 +438,7 @@ fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequ
             outcome: Some(novarocks::participant_terminal_outcome::Outcome::Proof(
                 novarocks::TerminalizationProof {
                     version: 1,
-                    execution_id: snapshot.execution_id,
-                    backend: snapshot.backend.clone(),
-                    init_digest: snapshot.init_digest.clone(),
+                    participant: snapshot.participant.clone(),
                     fragments: vec![novarocks::TerminalizationProofFragment {
                         fragment_instance_id: Some(id(3, 4)),
                         backend_num: 9,
@@ -537,7 +533,7 @@ fn release_stage_fragments_request_fixture_decodes() {
     let bytes = request.encode_to_vec();
     let request = novarocks::StageFragmentsRequest::decode(bytes.as_slice())
         .expect("StageFragmentsRequest fixture decodes");
-    assert_eq!(request.stage_digest_version, 1);
+    assert!(request.participant.is_some());
     assert_eq!(request.fragments.len(), 1);
     let fragment = request
         .fragments
@@ -706,8 +702,9 @@ fn release_report_query_terminal_request_fixture_decodes() {
     assert_eq!(snapshot.version, 1);
     assert_eq!(
         snapshot
-            .execution_id
+            .participant
             .as_ref()
+            .and_then(|participant| participant.execution_id.as_ref())
             .and_then(|execution_id| execution_id.query_id.as_ref())
             .expect("ReportQueryTerminalRequest fixture query id")
             .hi,
@@ -715,14 +712,13 @@ fn release_report_query_terminal_request_fixture_decodes() {
     );
     assert_eq!(
         snapshot
-            .backend
+            .participant
             .as_ref()
-            .and_then(|backend| backend.process_id.as_ref())
+            .and_then(|participant| participant.backend_process_id.as_ref())
             .expect("ReportQueryTerminalRequest fixture backend process identity")
             .value,
         vec![0x77; 16]
     );
-    assert_eq!(snapshot.init_digest, vec![0x11; 32]);
     assert_eq!(snapshot.fragments.len(), 1);
     let profile_contribution = snapshot
         .profile_contribution

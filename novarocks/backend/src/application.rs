@@ -348,7 +348,6 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
                     Ok(()) => permit.commit(),
                     Err(error) => QueryStageAck::new(
                         request.execution_id(),
-                        request.digest_version(),
                         stage_digest,
                         QueryStageOutcome::RejectedLocalFailure,
                         error.to_string(),
@@ -1180,21 +1179,23 @@ mod tests {
 
     fn protocol_control_attach(
         init: &protocol_lifecycle::QueryInitRequest,
-        frontend_owner_epoch: u64,
     ) -> ProtoQueryControlRequest {
         let manifest = init.manifest().expect("validated InitQuery has manifest");
+        let participant = protocol_lifecycle::ParticipantAttemptRef::new(
+            manifest
+                .execution_id()
+                .expect("validated InitQuery has execution"),
+            manifest
+                .backend()
+                .expect("validated InitQuery has backend")
+                .process_id()
+                .expect("validated InitQuery has backend process"),
+        )
+        .expect("validated InitQuery creates participant attempt ref");
         ProtoQueryControlRequest {
             command: Some(protocol::query_control_request::Command::Attach(
                 ProtoQueryControlAttach {
-                    execution_id: manifest.as_proto().execution_id,
-                    init_digest: init
-                        .manifest()
-                        .expect("validated init manifest")
-                        .digest()
-                        .expect("validated InitQuery has digest")
-                        .as_bytes()
-                        .to_vec(),
-                    frontend_owner_epoch,
+                    participant: Some(participant.as_proto().clone()),
                 },
             )),
         }
@@ -1206,8 +1207,19 @@ mod tests {
         reason: impl Into<String>,
     ) -> ProtoAbortQueryRequest {
         let manifest = init.manifest().expect("validated InitQuery has manifest");
+        let participant = protocol_lifecycle::ParticipantAttemptRef::new(
+            manifest
+                .execution_id()
+                .expect("validated InitQuery has execution"),
+            manifest
+                .backend()
+                .expect("validated InitQuery has backend")
+                .process_id()
+                .expect("validated InitQuery has backend process"),
+        )
+        .expect("validated InitQuery creates participant attempt ref");
         ProtoAbortQueryRequest {
-            execution_id: manifest.as_proto().execution_id,
+            participant: Some(participant.as_proto().clone()),
             init_digest: digest.to_vec(),
             reason: reason.into(),
         }
@@ -1307,7 +1319,7 @@ mod tests {
 
         let (commands, command_rx) = tokio::sync::mpsc::channel(4);
         commands
-            .send(protocol_control_attach(&protocol_init, 9))
+            .send(protocol_control_attach(&protocol_init))
             .await
             .expect("send Attach");
         let mut events = client
@@ -1397,7 +1409,7 @@ mod tests {
             .expect("InitQuery succeeds");
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         commands
-            .send(protocol_control_attach(&protocol_init, 9))
+            .send(protocol_control_attach(&protocol_init))
             .await
             .expect("send Attach");
         let mut events = client
@@ -1477,7 +1489,7 @@ mod tests {
             .expect("InitQuery succeeds");
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         commands
-            .send(protocol_control_attach(&protocol_init, 9))
+            .send(protocol_control_attach(&protocol_init))
             .await
             .expect("send Attach");
         let mut events = client
@@ -1524,10 +1536,14 @@ mod tests {
 
         let termination = registry
             .abort_query(QueryAbortRequest::new(
-                init.manifest()
-                    .expect("validated init manifest")
-                    .execution_id()
-                    .expect("validated manifest execution id"),
+                protocol_lifecycle::ParticipantAttemptRef::new(
+                    init.manifest()
+                        .expect("validated init manifest")
+                        .execution_id()
+                        .expect("validated manifest execution id"),
+                    process_id,
+                )
+                .expect("validated manifest creates participant attempt ref"),
                 ParticipantManifestDigest::new(
                     *protocol_init
                         .manifest()
@@ -1709,7 +1725,7 @@ mod tests {
 
         let (commands, command_rx) = tokio::sync::mpsc::channel(1);
         commands
-            .send(protocol_control_attach(&protocol_init, 9))
+            .send(protocol_control_attach(&protocol_init))
             .await
             .expect("send Attach");
         let mut events = client

@@ -136,12 +136,8 @@ pub(crate) struct QueryControlAttachment {
 /// request outright. The request carries the fragments, so the identity is
 /// recoverable without the sender restating it.
 fn stage_digest_of(request: &QueryStageRequest) -> StageDigest {
-    StageDigest::compute_v1(
-        request.execution_id(),
-        request.init_digest(),
-        &request.fragments(),
-    )
-    .expect("validated QueryStageRequest always derives a stage digest")
+    StageDigest::compute(request.participant(), &request.fragments())
+        .expect("validated QueryStageRequest always derives a stage digest")
 }
 
 pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
@@ -185,7 +181,6 @@ pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
     fn stage_fragments(&self, request: QueryStageRequest) -> QueryStageAck {
         QueryStageAck::new(
             request.execution_id(),
-            request.digest_version(),
             stage_digest_of(&request),
             QueryStageOutcome::RejectedInvalidState,
             "StageFragments is not supported by this lifecycle ingress",
@@ -198,7 +193,6 @@ pub(crate) trait QueryLifecycleIngress: Send + Sync + 'static {
     fn start_prepared_query(&self, request: QueryStartRequest) -> QueryStartAck {
         QueryStartAck::new(
             request.execution_id(),
-            request.digest_version(),
             request.digest(),
             QueryStartOutcome::RejectedNotStaged,
             "StartPreparedQuery is not supported by this lifecycle ingress",

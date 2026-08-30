@@ -40,8 +40,8 @@ impl QueryTerminalSet {
             (
                 snapshot.execution_id(),
                 snapshot
-                    .backend()
-                    .process_id()
+                    .participant()
+                    .backend_process_id()
                     .expect("validated terminal snapshot always has a backend process id"),
             )
         });
@@ -50,8 +50,8 @@ impl QueryTerminalSet {
             let identity = (
                 snapshot.execution_id(),
                 snapshot
-                    .backend()
-                    .process_id()
+                    .participant()
+                    .backend_process_id()
                     .expect("validated terminal snapshot always has a backend process id"),
             );
             if !identities.insert(identity) {

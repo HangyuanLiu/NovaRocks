@@ -267,12 +267,15 @@ fn instance_params_survives_proto_roundtrip() {
 #[test]
 fn stage_fragment_request_carries_native_fields_only() {
     let request = novarocks::StageFragmentsRequest {
-        execution_id: Some(novarocks::QueryExecutionId {
-            query_id: Some(id(1, 2)),
-            attempt_id: 1,
+        participant: Some(novarocks::ParticipantAttemptRef {
+            execution_id: Some(novarocks::QueryExecutionId {
+                query_id: Some(id(1, 2)),
+                attempt_id: 1,
+            }),
+            backend_process_id: Some(novarocks::BackendProcessId {
+                value: vec![0x77; 16],
+            }),
         }),
-        init_digest: vec![1; 32],
-        stage_digest_version: 1,
         fragments: vec![novarocks::StageFragment {
             plan: Some(plan::PlanFragment::default()),
             instance_params: Some(novarocks::InstanceParams {
@@ -290,8 +293,8 @@ fn stage_fragment_request_carries_native_fields_only() {
     let fields = encoded_field_numbers(&request);
 
     assert!(
-        fields.contains(&1),
-        "execution_id must use StageFragmentsRequest tag 1"
+        fields.contains(&6),
+        "participant must use StageFragmentsRequest tag 6"
     );
     assert!(
         fields.contains(&5),
