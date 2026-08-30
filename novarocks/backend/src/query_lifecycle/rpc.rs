@@ -549,6 +549,17 @@ async fn run_attached_control_stream(
                         }
                         result
                     }
+                    Some(proto::query_control_request::Command::CredentialLeasePrepare(_))
+                    | Some(proto::query_control_request::Command::CredentialLeaseCommit(_)) => {
+                        // M2-T24 owns the TLS-verified registry installation and
+                        // two-phase epoch transition. Keeping this pre-registry
+                        // stream fail-closed prevents a future parser switch from
+                        // accidentally accepting confidential lease material.
+                        Err(QueryLifecycleError::new(
+                            QueryLifecycleErrorCode::Transport,
+                            "credential lease control requires TLS-aware lifecycle registry",
+                        ))
+                    }
                     Some(proto::query_control_request::Command::Attach(_)) | None => unreachable!(
                         "validated Protocol command excludes Attach and empty control frames"
                     ),

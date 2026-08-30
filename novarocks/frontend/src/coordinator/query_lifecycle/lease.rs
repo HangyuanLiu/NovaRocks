@@ -1903,6 +1903,13 @@ impl AttemptControl {
                 session.target.backend_idx(),
                 failure.reason, failure.safe_detail
             )),
+            Some(
+                novarocks_proto_models::novarocks::query_control_response::Event::CredentialLeasePrepared(_)
+                | novarocks_proto_models::novarocks::query_control_response::Event::CredentialLeaseCommitted(_),
+            ) => Err(
+                "credential lease control acknowledgement arrived before the M2 refresh coordinator was installed"
+                    .to_string(),
+            ),
             None => Err("validated query control event is missing its oneof".to_string()),
         }
     }

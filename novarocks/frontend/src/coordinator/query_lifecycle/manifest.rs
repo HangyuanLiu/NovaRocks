@@ -65,6 +65,7 @@ pub(super) fn materialize(
         let fragment_participant = !manifest.expected_fragment_instance_ids().is_empty();
         let request = QueryInitRequest::parse(protocol_wire::InitQueryRequest {
             manifest: Some(manifest.as_proto().clone()),
+            credential_lease_envelopes: vec![],
         })
         .map_err(|error| {
             contract_error(format!(

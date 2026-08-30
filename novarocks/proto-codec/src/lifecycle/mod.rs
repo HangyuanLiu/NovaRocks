@@ -4,6 +4,7 @@
 
 mod canonical;
 pub mod control;
+pub mod credential_lease;
 pub mod identity;
 pub mod manifest;
 pub mod query_options;
@@ -16,6 +17,11 @@ pub use control::{
     QueryControlEvent, QueryInitAck, QueryInitOutcome, QueryInitRequest, QueryTerminalAck,
     QueryTerminalReportAck, QueryTerminalReportOutcome, QueryTerminationAck,
     QueryTerminationReason, RuntimeFilterFeedbackEvent,
+};
+pub use credential_lease::{
+    CredentialLeaseSecretEnvelope, decode_credential_lease_descriptor,
+    encode_credential_lease_descriptor, validate_credential_lease_descriptors,
+    validate_initial_credential_lease_envelopes,
 };
 pub use identity::{
     AttemptId, QueryExecutionId, decode_query_execution_id, encode_query_execution_id,

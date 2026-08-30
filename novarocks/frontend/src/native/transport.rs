@@ -740,6 +740,14 @@ impl QueryControlSession for ControlSession {
             Some(
                 novarocks_proto_models::novarocks::query_control_request::Command::TerminalAck(_),
             ) => {}
+            Some(
+                novarocks_proto_models::novarocks::query_control_request::Command::CredentialLeasePrepare(_)
+                | novarocks_proto_models::novarocks::query_control_request::Command::CredentialLeaseCommit(_),
+            ) => {
+                return Err(invalid(
+                    "credential lease control requires the M2 TLS refresh coordinator",
+                ));
+            }
             Some(novarocks_proto_models::novarocks::query_control_request::Command::Attach(_))
             | None => {
                 return Err(invalid(

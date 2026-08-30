@@ -173,6 +173,46 @@ message RuntimeFilterContribution {
   reserved "contribution_digest";
 }
 
+// Secret-free, immutable metadata for one query-attempt credential lease.
+// It participates in the participant-manifest digest. The credential value is
+// deliberately carried only by CredentialLeaseSecretEnvelope on a TLS native
+// lifecycle RPC; it must never be copied into a plan, fragment, or catalog
+// definition.
+enum CredentialLeaseProvider {
+  CREDENTIAL_LEASE_PROVIDER_UNSPECIFIED = 0;
+  CREDENTIAL_LEASE_PROVIDER_S3 = 1;
+}
+
+message CredentialLeaseDescriptor {
+  bytes lease_id = 1;  // exactly 16 nonzero bytes
+  uint64 epoch = 2;  // nonzero
+  novarocks.catalog.CatalogHandle owner = 3;
+  CredentialLeaseProvider provider = 4;
+  // Canonical absolute s3:// prefixes, strictly sorted and unique.
+  repeated string prefixes = 5;
+  uint64 not_after_unix_ms = 6;  // nonzero wall-clock expiry
+  bool refresh_capable = 7;
+  bytes storage_access_domain_id = 8;  // exactly 32 bytes
+}
+
+// This message is confidential native wire content. Its values are accepted
+// only over an authenticated TLS native transport and must be projected into
+// redacted SecretValue instances by the codec before any observable use.
+// It is intentionally closed: no opaque/generic bytes credential payload is
+// permitted in M2 v1.
+message CredentialLeaseS3SecretMaterial {
+  string access_key_id = 1;
+  string secret_access_key = 2;
+  string session_token = 3;
+  uint64 session_token_expires_at_unix_ms = 4;
+}
+
+message CredentialLeaseSecretEnvelope {
+  bytes lease_id = 1;  // exactly 16 nonzero bytes
+  uint64 epoch = 2;  // nonzero
+  CredentialLeaseS3SecretMaterial s3 = 3;
+}
+
 message ParticipantManifest {
   QueryExecutionId execution_id = 1;
   ParticipantBackendIdentity backend = 2;
@@ -187,6 +227,7 @@ message ParticipantManifest {
   QueryControlEndpoint report_endpoint = 10;
   NativeCompatibilityId native_compatibility_id = 11;
   novarocks.catalog.CatalogSet catalog_set = 12;
+  repeated CredentialLeaseDescriptor credential_lease_descriptors = 13;
 }
 
 enum QueryInitOutcome {
@@ -217,6 +258,10 @@ message InitQueryRequest {
   ParticipantManifest manifest = 1;
   reserved 2;
   reserved "init_digest";
+  // Confidential lease values corresponding exactly to descriptors in manifest.
+  // They are legal only on a TLS native transport and excluded from the
+  // participant-manifest/init digest.
+  repeated CredentialLeaseSecretEnvelope credential_lease_envelopes = 3;
 }
 
 message InitQueryResponse {
@@ -318,6 +363,30 @@ message QueryControlAbort {
 
 message QueryControlFinalize {}
 
+// FE -> BE: stage an otherwise-invisible next credential epoch. BE must not
+// expose this value to new I/O until the matching commit arrives.
+message CredentialLeasePrepare {
+  CredentialLeaseSecretEnvelope envelope = 1;
+}
+
+// FE -> BE: atomically make a previously prepared epoch visible.
+message CredentialLeaseCommit {
+  bytes lease_id = 1;  // exactly 16 nonzero bytes
+  uint64 epoch = 2;  // nonzero
+}
+
+// BE -> FE acknowledgements for the two phase lease update. They carry no
+// material and are safe to retain in lifecycle diagnostics.
+message CredentialLeasePrepared {
+  bytes lease_id = 1;  // exactly 16 nonzero bytes
+  uint64 epoch = 2;  // nonzero
+}
+
+message CredentialLeaseCommitted {
+  bytes lease_id = 1;  // exactly 16 nonzero bytes
+  uint64 epoch = 2;  // nonzero
+}
+
 message QueryControlTerminalAck {
   reserved 1, 2, 3, 4;
   reserved "execution_id", "init_digest", "snapshot_version", "snapshot_digest";
@@ -331,6 +400,8 @@ message QueryControlRequest {
     QueryControlAbort abort = 3;
     QueryControlFinalize finalize = 4;
     QueryControlTerminalAck terminal_ack = 5;
+    CredentialLeasePrepare credential_lease_prepare = 6;
+    CredentialLeaseCommit credential_lease_commit = 7;
   }
 }
 
@@ -409,6 +480,8 @@ message QueryControlResponse {
     // of these on the same active stream.
     novarocks.catalog.CatalogReady catalog_ready = 9;
     novarocks.catalog.CatalogLoadFailed catalog_load_failed = 10;
+    CredentialLeasePrepared credential_lease_prepared = 11;
+    CredentialLeaseCommitted credential_lease_committed = 12;
   }
 }
 

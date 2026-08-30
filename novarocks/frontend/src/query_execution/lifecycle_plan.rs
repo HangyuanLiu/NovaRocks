@@ -679,6 +679,7 @@ pub(crate) fn compile_query_init_plan(
             pre_start_timeout_ms: duration_millis(options.pre_start_timeout)?,
             report_endpoint: Some(options.report_endpoint.as_proto().clone()),
             catalog_set: Some(options.catalog_set.as_proto().clone()),
+            credential_lease_descriptors: vec![],
         })
         .map_err(|error| {
             contract_error(format!(

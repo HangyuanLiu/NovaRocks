@@ -21,6 +21,7 @@ mod cleanup_maintenance;
 mod context;
 mod control;
 mod credential;
+mod credential_lease;
 mod data_mutation;
 mod distributed_rewrite;
 mod distribution;
@@ -85,6 +86,12 @@ pub use credential::{
     MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES, StaticCredentialReference, StorageAccessDomainId,
     StorageCredentialScopePrefix, canonical_catalog_credential_binding_bytes,
     canonicalize_catalog_credential_bindings,
+};
+pub use credential_lease::{
+    CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
+    MAX_CREDENTIAL_LEASE_ID_BYTES, MAX_CREDENTIAL_LEASE_PREFIXES,
+    MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES, MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES,
+    MAX_CREDENTIAL_LEASES_PER_QUERY,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,
