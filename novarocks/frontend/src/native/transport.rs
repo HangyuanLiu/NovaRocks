@@ -563,9 +563,7 @@ impl QueryLifecycleTransport for LifecycleTransport {
             request.as_proto().clone(),
         )?;
         let ack = QueryStageAck::parse(response).map_err(invalid)?;
-        if ack.execution_id() != request.execution_id()
-            || ack.digest_version() != request.digest_version()
-        {
+        if ack.execution_id() != request.participant().execution_id().map_err(invalid)? {
             return Err(invalid("StageFragments acknowledgement identity mismatch"));
         }
         // The acknowledged stage identity is compared by the coordinator
@@ -586,10 +584,7 @@ impl QueryLifecycleTransport for LifecycleTransport {
             request.as_proto().clone(),
         )?;
         let ack = QueryStartAck::parse(response).map_err(invalid)?;
-        if ack.execution_id() != request.execution_id()
-            || ack.digest_version() != request.digest_version()
-            || ack.digest() != request.digest()
-        {
+        if ack.execution_id() != request.execution_id() || ack.digest() != request.digest() {
             return Err(invalid(
                 "StartPreparedQuery acknowledgement identity or digest mismatch",
             ));

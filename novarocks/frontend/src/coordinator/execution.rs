@@ -442,14 +442,12 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
         _timeout: Duration,
     ) -> Result<QueryStageAck, QueryLifecycleTransportError> {
         QueryStageAck::new(
-            request.execution_id(),
-            request.digest_version(),
-            StageDigest::compute_v1(
-                request.execution_id(),
-                request.init_digest(),
-                &request.fragments(),
-            )
-            .map_err(protocol_contract_error)?,
+            request
+                .participant()
+                .execution_id()
+                .map_err(protocol_contract_error)?,
+            StageDigest::compute(request.participant(), &request.fragments())
+                .map_err(protocol_contract_error)?,
             QueryStageOutcome::Applied,
             "test participant staged",
         )
@@ -464,7 +462,6 @@ impl QueryLifecycleTransport for ReadyLifecycleTransportForTest {
     ) -> Result<QueryStartAck, QueryLifecycleTransportError> {
         QueryStartAck::new(
             request.execution_id(),
-            request.digest_version(),
             request.digest(),
             QueryStartOutcome::Applied,
             "test participant started",

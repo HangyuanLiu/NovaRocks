@@ -158,6 +158,26 @@ pub(crate) fn handle_stage_fragments(
             "runner-owned StageAck response dropped after staging",
         ));
     }
+    if response.outcome().is_staged()
+        && let Some(scope) = claim_backend_fault(
+            QueryLifecycleFaultKind::StageConflictAfterApply,
+            execution_id,
+            ingress.backend_process_id(),
+        )?
+    {
+        eprintln!(
+            "NOVAROCKS_STAGE_CONFLICT_AFTER_APPLY execution_id={}:{}:{} backend_index={} token={}",
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+            execution_id.attempt_id().get(),
+            scope.backend_index,
+            scope.token
+        );
+        let mut response = response.as_proto().clone();
+        response.outcome = proto::StageFragmentsOutcome::StageFragmentsRejectedConflict as i32;
+        response.detail = "runner-owned Stage conflict after apply".to_owned();
+        return Ok(response);
+    }
     Ok(response.as_proto().clone())
 }
 
@@ -220,6 +240,25 @@ pub(crate) fn handle_start_prepared_query(
 ) -> Result<proto::StartPreparedQueryResponse, tonic::Status> {
     let request = QueryStartRequest::parse(request).map_err(status_from_contract_error)?;
     let execution_id = request.execution_id();
+    let request = if let Some(scope) = claim_backend_fault(
+        QueryLifecycleFaultKind::StartDigestCorrupt,
+        execution_id,
+        ingress.backend_process_id(),
+    )? {
+        eprintln!(
+            "NOVAROCKS_START_DIGEST_CORRUPTED execution_id={}:{}:{} backend_index={} token={}",
+            execution_id.query_id().high(),
+            execution_id.query_id().low(),
+            execution_id.attempt_id().get(),
+            scope.backend_index,
+            scope.token
+        );
+        let mut raw = request.as_proto().clone();
+        raw.stage_digest[0] ^= 1;
+        QueryStartRequest::parse(raw).map_err(status_from_contract_error)?
+    } else {
+        request
+    };
     let response = ingress.start_prepared_query(request);
     if response.outcome().is_running()
         && let Some(scope) = claim_backend_fault(

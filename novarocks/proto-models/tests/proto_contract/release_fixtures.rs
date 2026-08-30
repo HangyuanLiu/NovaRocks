@@ -329,12 +329,15 @@ fn release_plan_fragment() -> plan::PlanFragment {
 
 fn release_stage_fragments_request() -> novarocks::StageFragmentsRequest {
     novarocks::StageFragmentsRequest {
-        execution_id: Some(novarocks::QueryExecutionId {
-            query_id: Some(id(1, 2)),
-            attempt_id: 1,
+        participant: Some(novarocks::ParticipantAttemptRef {
+            execution_id: Some(novarocks::QueryExecutionId {
+                query_id: Some(id(1, 2)),
+                attempt_id: 1,
+            }),
+            backend_process_id: Some(novarocks::BackendProcessId {
+                value: vec![0x77; 16],
+            }),
         }),
-        init_digest: vec![0x11; 32],
-        stage_digest_version: 1,
         fragments: vec![novarocks::StageFragment {
             plan: Some(release_plan_fragment()),
             instance_params: Some(novarocks::InstanceParams {
@@ -530,7 +533,7 @@ fn release_stage_fragments_request_fixture_decodes() {
     let bytes = request.encode_to_vec();
     let request = novarocks::StageFragmentsRequest::decode(bytes.as_slice())
         .expect("StageFragmentsRequest fixture decodes");
-    assert_eq!(request.stage_digest_version, 1);
+    assert!(request.participant.is_some());
     assert_eq!(request.fragments.len(), 1);
     let fragment = request
         .fragments

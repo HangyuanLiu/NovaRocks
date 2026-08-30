@@ -25,8 +25,7 @@
 use std::collections::BTreeSet;
 
 use novarocks_proto_codec::lifecycle::{
-    ParticipantManifestDigest, QueryStageRequest, QueryStartRequest, StageDigest,
-    StageDigestVersion, StageFragment,
+    ParticipantAttemptRef, QueryStageRequest, QueryStartRequest, StageDigest, StageFragment,
 };
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_types::{QueryExecutionId, UniqueId};
@@ -40,22 +39,29 @@ pub const DEFAULT_STAGE_MAX_FRAGMENTS: usize =
 
 /// Frozen Stage ownership for one Init participant. It is captured before the
 /// Init plan is consumed and never re-reads live backend topology.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StageParticipantBinding {
     target: QueryLifecycleTarget,
-    init_digest: ParticipantManifestDigest,
+    participant: ParticipantAttemptRef,
     expected_fragment_instance_ids: BTreeSet<UniqueId>,
 }
 
 impl StageParticipantBinding {
     pub fn new(
         target: QueryLifecycleTarget,
-        init_digest: ParticipantManifestDigest,
+        participant: ParticipantAttemptRef,
         expected_fragment_instance_ids: impl IntoIterator<Item = UniqueId>,
     ) -> Result<Self, ProtocolError> {
+        if participant.backend_process_id()? != target.process_id() {
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_participant_binding").field("participant"),
+                ProtocolErrorKind::InvalidValue,
+                "stage participant backend process id differs from the frozen target",
+            ));
+        }
         Ok(Self {
             target,
-            init_digest,
+            participant,
             expected_fragment_instance_ids: expected_fragment_instance_ids.into_iter().collect(),
         })
     }
@@ -64,8 +70,8 @@ impl StageParticipantBinding {
         &self.target
     }
 
-    pub const fn init_digest(&self) -> ParticipantManifestDigest {
-        self.init_digest
+    pub const fn participant(&self) -> &ParticipantAttemptRef {
+        &self.participant
     }
 
     pub fn expected_fragment_instance_ids(&self) -> &BTreeSet<UniqueId> {
@@ -117,13 +123,22 @@ impl StageBatch {
                 ),
             ));
         }
-        let digest = StageDigest::compute_v1(execution_id, binding.init_digest(), &fragments)?;
-        let request = QueryStageRequest::new(
-            execution_id,
-            binding.init_digest(),
-            StageDigestVersion::V1,
-            fragments,
-        )?;
+        if binding.participant().execution_id().map_err(|error| {
+            ProtocolError::new(
+                FieldPath::root("stage_batch").field("participant"),
+                ProtocolErrorKind::InvalidValue,
+                error.to_string(),
+            )
+        })? != execution_id
+        {
+            return Err(ProtocolError::new(
+                FieldPath::root("stage_batch").field("participant"),
+                ProtocolErrorKind::InvalidValue,
+                "stage participant execution id differs from the frozen execution id",
+            ));
+        }
+        let digest = StageDigest::compute(binding.participant().clone(), &fragments)?;
+        let request = QueryStageRequest::new(binding.participant().clone(), fragments)?;
         Ok(Self {
             binding,
             request,
@@ -145,8 +160,10 @@ impl StageBatch {
 
     pub fn start_request(&self) -> QueryStartRequest {
         QueryStartRequest::new(
-            self.request.execution_id(),
-            self.request.digest_version(),
+            self.request
+                .participant()
+                .execution_id()
+                .expect("validated Stage participant retains its execution id"),
             self.digest,
         )
         .expect("validated Stage request contains a valid Start fence")
@@ -180,13 +197,15 @@ mod tests {
     }
 
     fn binding(expected: impl IntoIterator<Item = UniqueId>) -> StageParticipantBinding {
+        let process_id = BackendProcessId::new_v7();
         StageParticipantBinding::new(
             QueryLifecycleTarget::new(
                 4,
                 RuntimeEndpoint::parse("127.0.0.1:19040").expect("test endpoint"),
-                BackendProcessId::new_v7(),
+                process_id,
             ),
-            ParticipantManifestDigest::new([3; 32]),
+            ParticipantAttemptRef::new(execution_id(), process_id)
+                .expect("valid participant attempt"),
             expected,
         )
         .expect("valid Stage participant binding")
@@ -233,6 +252,23 @@ mod tests {
             vec![fragment(3)],
         )
         .expect_err("unbound fragment must not reach Protocol Stage");
+        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+    }
+
+    #[test]
+    fn binding_rejects_a_participant_from_another_backend_process() {
+        let target = QueryLifecycleTarget::new(
+            4,
+            RuntimeEndpoint::parse("127.0.0.1:19040").expect("test endpoint"),
+            BackendProcessId::new_v7(),
+        );
+        let error = StageParticipantBinding::new(
+            target,
+            ParticipantAttemptRef::new(execution_id(), BackendProcessId::new_v7())
+                .expect("valid participant attempt"),
+            [],
+        )
+        .expect_err("stage participant must name the frozen backend process");
         assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
     }
 }

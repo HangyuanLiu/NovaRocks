@@ -10,6 +10,10 @@ use crate::query_execution::{
     RuntimeFilterReductionFacts, RuntimeFilterSortDirection,
 };
 use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, TimeUnit};
+use novarocks_execution::runtime_filter::{
+    RuntimeFilterMembershipSchema,
+    RuntimeFilterNullSemantics as ExecutionRuntimeFilterNullSemantics,
+};
 use novarocks_proto_models::{common, plan};
 use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
 use sha2::{Digest, Sha256};
@@ -22,6 +26,7 @@ pub(crate) struct EncodedRuntimeFilterDomain {
     value_type: common::TypeDesc,
     contract: plan::RuntimeFilterContract,
     order_contract_digest: Option<[u8; 32]>,
+    membership_schema_digest: Option<[u8; 32]>,
 }
 
 impl EncodedRuntimeFilterDomain {
@@ -31,6 +36,14 @@ impl EncodedRuntimeFilterDomain {
 
     pub(crate) fn contract(&self) -> plan::RuntimeFilterContract {
         self.contract.clone()
+    }
+
+    /// Execution derives the same digest from the sealed value type and
+    /// null-comparison semantics when it installs the participant contract.
+    /// Retaining it here lets Frontend bind feedback to that exact contract
+    /// without reviving a redundant digest field on the carrier.
+    pub(crate) const fn membership_schema_digest(&self) -> Option<[u8; 32]> {
+        self.membership_schema_digest
     }
 
     pub(crate) fn encode_reduction(
@@ -89,6 +102,22 @@ pub(crate) fn encode_logical_domain(
             null_semantics,
         } => {
             let value_type_wire = encode_type(&value_type)?;
+            let execution_null_semantics = match null_semantics {
+                RuntimeFilterNullSemantics::NeverMatches => {
+                    ExecutionRuntimeFilterNullSemantics::NeverMatches
+                }
+                RuntimeFilterNullSemantics::NullSafeEqual => {
+                    ExecutionRuntimeFilterNullSemantics::NullSafeEqual
+                }
+            };
+            let membership_schema_digest =
+                RuntimeFilterMembershipSchema::new(&value_type, execution_null_semantics)
+                    .map_err(|error| {
+                        contract_error(format!(
+                            "runtime filter membership execution schema is invalid: {error}"
+                        ))
+                    })?
+                    .digest();
             Ok(EncodedRuntimeFilterDomain {
                 value_type: value_type_wire,
                 contract: plan::RuntimeFilterContract {
@@ -104,6 +133,7 @@ pub(crate) fn encode_logical_domain(
                     })),
                 },
                 order_contract_digest: None,
+                membership_schema_digest: Some(membership_schema_digest),
             })
         }
         RuntimeFilterLogicalDomainFacts::Ordered {
@@ -184,6 +214,7 @@ pub(crate) fn encode_logical_domain(
                     })),
                 },
                 order_contract_digest: Some(order_contract_digest),
+                membership_schema_digest: None,
             })
         }
     }
@@ -354,11 +385,27 @@ mod tests {
                 encode_type(&DataType::Int32).expect("type is encodable")
             );
             let Some(plan::runtime_filter_contract::Kind::Membership(contract)) =
-                encoded.contract.kind
+                encoded.contract().kind
             else {
                 panic!("membership contract")
             };
             assert_eq!(contract.null_semantics, i32::from(expected));
+            let execution_null_semantics = match null_semantics {
+                RuntimeFilterNullSemantics::NeverMatches => {
+                    ExecutionRuntimeFilterNullSemantics::NeverMatches
+                }
+                RuntimeFilterNullSemantics::NullSafeEqual => {
+                    ExecutionRuntimeFilterNullSemantics::NullSafeEqual
+                }
+            };
+            assert_eq!(
+                encoded.membership_schema_digest(),
+                Some(
+                    RuntimeFilterMembershipSchema::new(&DataType::Int32, execution_null_semantics,)
+                        .expect("execution schema is valid")
+                        .digest()
+                )
+            );
         }
     }
 

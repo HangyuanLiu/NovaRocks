@@ -420,7 +420,6 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
         let attach_errors = attach_all(
             self.transport.as_ref(),
             &materialized.participants,
-            execution_id.attempt_id().get(),
             self.config,
             self.metrics.as_ref(),
             &control,
@@ -571,8 +570,13 @@ fn validate_stage_ack(
     ack: &QueryStageAck,
 ) -> Result<(), (usize, String)> {
     let request = batch.request();
-    if ack.execution_id() != request.execution_id()
-        || ack.digest_version() != request.digest_version()
+    if ack.execution_id()
+        != request.participant().execution_id().map_err(|error| {
+            (
+                backend_idx,
+                format!("backend {backend_idx} Stage participant is invalid: {error}"),
+            )
+        })?
         || ack.digest() != batch.digest()
     {
         return Err((
@@ -598,10 +602,7 @@ fn validate_start_ack(
     request: &QueryStartRequest,
     ack: &QueryStartAck,
 ) -> Result<(), (usize, String)> {
-    if ack.execution_id() != request.execution_id()
-        || ack.digest_version() != request.digest_version()
-        || ack.digest() != request.digest()
-    {
+    if ack.execution_id() != request.execution_id() || ack.digest() != request.digest() {
         return Err((
             backend_idx,
             format!("backend {backend_idx} StartPreparedQuery ACK echo mismatch"),
@@ -1019,7 +1020,6 @@ fn init_one(
 pub(super) fn attach_all(
     transport: &dyn QueryLifecycleTransport,
     participants: &[MaterializedParticipant],
-    frontend_owner_epoch: u64,
     config: FrontendQueryLifecycleConfig,
     metrics: &FrontendLifecycleMetrics,
     control: &Arc<AttemptControl>,
@@ -1034,7 +1034,7 @@ pub(super) fn attach_all(
                         scope.spawn(move || {
                         let started = Instant::now();
                         let outcome =
-                            attach_one(transport, participant, frontend_owner_epoch, config);
+                            attach_one(transport, participant, config);
                         let latency = started.elapsed();
                         metrics.observe_attach(outcome.is_ok(), latency);
                         tracing::info!(
@@ -1094,16 +1094,15 @@ pub(super) fn attach_all(
 fn attach_one(
     transport: &dyn QueryLifecycleTransport,
     participant: &MaterializedParticipant,
-    frontend_owner_epoch: u64,
     config: FrontendQueryLifecycleConfig,
 ) -> Result<(ActiveSession, bool), (Option<ActiveSession>, String)> {
-    let attach = QueryControlAttach::parse(protocol_wire::QueryControlAttach {
-        execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
+    let attach = QueryControlAttach::new(
+        novarocks_proto_codec::lifecycle::ParticipantAttemptRef::new(
             participant_execution_id(participant),
-        )),
-        init_digest: participant.digest.as_bytes().to_vec(),
-        frontend_owner_epoch,
-    })
+            participant.target.process_id(),
+        )
+        .map_err(|error| (None, error.to_string()))?,
+    )
     .map_err(|error| (None, error.to_string()))?;
     let session = transport
         .attach_control(participant.target.clone(), attach, config.attach_timeout())

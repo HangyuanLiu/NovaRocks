@@ -14,36 +14,13 @@ use novarocks_proto_models::{novarocks, plan};
 
 use super::{
     identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id},
-    manifest::ParticipantManifestDigest,
+    manifest::ParticipantAttemptRef,
 };
 
 pub const DEFAULT_STAGE_MAX_ENCODED_BYTES: usize = 48 * 1024 * 1024;
 pub const DEFAULT_STAGE_MAX_FRAGMENTS: usize = 256;
 
-/// Version of the semantic StageFragments digest projection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StageDigestVersion(u32);
-
-impl StageDigestVersion {
-    pub const V1: Self = Self(1);
-
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-
-    pub fn try_from_wire(value: u32) -> Result<Self, ProtocolError> {
-        match value {
-            1 => Ok(Self::V1),
-            _ => Err(ProtocolError::new(
-                FieldPath::root("stage_digest_version"),
-                ProtocolErrorKind::VersionMismatch,
-                format!("unsupported stage digest version {value}"),
-            )),
-        }
-    }
-}
-
-/// Fixed-width SHA-256 output of the versioned semantic Stage projection.
+/// Fixed-width SHA-256 output of the immutable semantic Stage projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StageDigest([u8; 32]);
 
@@ -67,13 +44,13 @@ impl StageDigest {
         &self.0
     }
 
-    /// Computes the V1 digest over decoded semantic values. The shared
+    /// Computes the digest over decoded semantic values. The shared
     /// descriptor-driven projection orders fields by number, sorts maps, and
     /// preserves ordinary repeated-field order. The outer
     /// `StageFragmentsRequest` framing is intentionally excluded.
-    pub fn compute_v1(
-        execution_id: QueryExecutionId,
-        init_digest: ParticipantManifestDigest,
+    // Design: ADR-0127 (docs/adr/ADR-0127-participant-attempt-stage-fence.md)
+    pub fn compute(
+        participant: ParticipantAttemptRef,
         fragments: &[StageFragment],
     ) -> Result<Self, ProtocolError> {
         let mut ordered = fragments.iter().collect::<Vec<_>>();
@@ -89,11 +66,12 @@ impl StageDigest {
         }
 
         let mut hasher = Sha256::new();
-        hasher.update(b"novarocks.query-lifecycle.stage.v1\0");
+        hasher.update(b"novarocks.query-lifecycle.stage.v2\0");
+        let execution_id = participant.execution_id()?;
         hasher.update(execution_id.query_id().high().to_be_bytes());
         hasher.update(execution_id.query_id().low().to_be_bytes());
         hasher.update(execution_id.attempt_id().get().to_be_bytes());
-        hasher.update(init_digest.as_bytes());
+        hasher.update(participant.backend_process_id()?.as_uuid().as_bytes());
         hasher.update(
             u64::try_from(ordered.len())
                 .expect("fragment count fits u64")
@@ -203,21 +181,17 @@ pub struct QueryStageRequest {
 
 impl QueryStageRequest {
     pub fn new(
-        execution_id: QueryExecutionId,
-        init_digest: ParticipantManifestDigest,
-        digest_version: StageDigestVersion,
+        participant: ParticipantAttemptRef,
         mut fragments: Vec<StageFragment>,
     ) -> Result<Self, ProtocolError> {
         fragments.sort_by_key(StageFragment::fragment_instance_id);
         validate_stage_fragment_ids(&fragments)?;
         Self::parse(novarocks::StageFragmentsRequest {
-            execution_id: Some(encode_query_execution_id(execution_id)),
-            init_digest: init_digest.as_bytes().to_vec(),
-            stage_digest_version: digest_version.get(),
             fragments: fragments
                 .into_iter()
                 .map(StageFragment::into_proto)
                 .collect(),
+            participant: Some(participant.as_proto().clone()),
         })
     }
 
@@ -242,9 +216,7 @@ impl QueryStageRequest {
             ));
         }
 
-        required_execution_id(wire.execution_id.as_ref())?;
-        ParticipantManifestDigest::try_from_slice(&wire.init_digest)?;
-        StageDigestVersion::try_from_wire(wire.stage_digest_version)?;
+        required_participant(&wire.participant)?;
         let fragments = wire
             .fragments
             .iter()
@@ -263,19 +235,15 @@ impl QueryStageRequest {
         self.wire
     }
 
+    pub fn participant(&self) -> ParticipantAttemptRef {
+        required_participant(&self.wire.participant)
+            .expect("validated QueryStageRequest always has a participant")
+    }
+
     pub fn execution_id(&self) -> QueryExecutionId {
-        required_execution_id(self.wire.execution_id.as_ref())
+        self.participant()
+            .execution_id()
             .expect("validated QueryStageRequest always has an execution id")
-    }
-
-    pub fn init_digest(&self) -> ParticipantManifestDigest {
-        ParticipantManifestDigest::try_from_slice(&self.wire.init_digest)
-            .expect("validated QueryStageRequest always has an init digest")
-    }
-
-    pub fn digest_version(&self) -> StageDigestVersion {
-        StageDigestVersion::try_from_wire(self.wire.stage_digest_version)
-            .expect("validated QueryStageRequest always has a digest version")
     }
 
     pub fn fragments(&self) -> Vec<StageFragment> {
@@ -318,14 +286,12 @@ impl Eq for QueryStageAck {}
 impl QueryStageAck {
     pub fn new(
         execution_id: QueryExecutionId,
-        digest_version: StageDigestVersion,
         digest: StageDigest,
         outcome: QueryStageOutcome,
         detail: impl Into<String>,
     ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::StageFragmentsResponse {
             execution_id: Some(encode_query_execution_id(execution_id)),
-            stage_digest_version: digest_version.get(),
             stage_digest: digest.as_bytes().to_vec(),
             outcome: encode_stage_outcome(outcome),
             detail: detail.into(),
@@ -334,7 +300,6 @@ impl QueryStageAck {
 
     pub fn parse(wire: novarocks::StageFragmentsResponse) -> Result<Self, ProtocolError> {
         let _ = required_execution_id(wire.execution_id.as_ref())?;
-        let _ = StageDigestVersion::try_from_wire(wire.stage_digest_version)?;
         let _ = StageDigest::try_from_slice(&wire.stage_digest)?;
         let _ = decode_stage_outcome(wire.outcome)?;
         Ok(Self { wire })
@@ -351,11 +316,6 @@ impl QueryStageAck {
     pub fn execution_id(&self) -> QueryExecutionId {
         required_execution_id(self.wire.execution_id.as_ref())
             .expect("validated QueryStageAck always has an execution id")
-    }
-
-    pub fn digest_version(&self) -> StageDigestVersion {
-        StageDigestVersion::try_from_wire(self.wire.stage_digest_version)
-            .expect("validated QueryStageAck always has a digest version")
     }
 
     pub fn digest(&self) -> StageDigest {
@@ -382,21 +342,15 @@ pub struct QueryStartRequest {
 impl Eq for QueryStartRequest {}
 
 impl QueryStartRequest {
-    pub fn new(
-        execution_id: QueryExecutionId,
-        digest_version: StageDigestVersion,
-        digest: StageDigest,
-    ) -> Result<Self, ProtocolError> {
+    pub fn new(execution_id: QueryExecutionId, digest: StageDigest) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::StartPreparedQueryRequest {
             execution_id: Some(encode_query_execution_id(execution_id)),
-            stage_digest_version: digest_version.get(),
             stage_digest: digest.as_bytes().to_vec(),
         })
     }
 
     pub fn parse(wire: novarocks::StartPreparedQueryRequest) -> Result<Self, ProtocolError> {
         let _ = required_execution_id(wire.execution_id.as_ref())?;
-        let _ = StageDigestVersion::try_from_wire(wire.stage_digest_version)?;
         let _ = StageDigest::try_from_slice(&wire.stage_digest)?;
         Ok(Self { wire })
     }
@@ -412,11 +366,6 @@ impl QueryStartRequest {
     pub fn execution_id(&self) -> QueryExecutionId {
         required_execution_id(self.wire.execution_id.as_ref())
             .expect("validated QueryStartRequest always has an execution id")
-    }
-
-    pub fn digest_version(&self) -> StageDigestVersion {
-        StageDigestVersion::try_from_wire(self.wire.stage_digest_version)
-            .expect("validated QueryStartRequest always has a digest version")
     }
 
     pub fn digest(&self) -> StageDigest {
@@ -451,14 +400,12 @@ impl Eq for QueryStartAck {}
 impl QueryStartAck {
     pub fn new(
         execution_id: QueryExecutionId,
-        digest_version: StageDigestVersion,
         digest: StageDigest,
         outcome: QueryStartOutcome,
         detail: impl Into<String>,
     ) -> Result<Self, ProtocolError> {
         Self::parse(novarocks::StartPreparedQueryResponse {
             execution_id: Some(encode_query_execution_id(execution_id)),
-            stage_digest_version: digest_version.get(),
             stage_digest: digest.as_bytes().to_vec(),
             outcome: encode_start_outcome(outcome),
             detail: detail.into(),
@@ -467,7 +414,6 @@ impl QueryStartAck {
 
     pub fn parse(wire: novarocks::StartPreparedQueryResponse) -> Result<Self, ProtocolError> {
         let _ = required_execution_id(wire.execution_id.as_ref())?;
-        let _ = StageDigestVersion::try_from_wire(wire.stage_digest_version)?;
         let _ = StageDigest::try_from_slice(&wire.stage_digest)?;
         let _ = decode_start_outcome(wire.outcome)?;
         Ok(Self { wire })
@@ -484,11 +430,6 @@ impl QueryStartAck {
     pub fn execution_id(&self) -> QueryExecutionId {
         required_execution_id(self.wire.execution_id.as_ref())
             .expect("validated QueryStartAck always has an execution id")
-    }
-
-    pub fn digest_version(&self) -> StageDigestVersion {
-        StageDigestVersion::try_from_wire(self.wire.stage_digest_version)
-            .expect("validated QueryStartAck always has a digest version")
     }
 
     pub fn digest(&self) -> StageDigest {
@@ -517,6 +458,19 @@ fn required_execution_id(
         )
     })?;
     decode_query_execution_id(execution_id)
+}
+
+fn required_participant(
+    participant: &Option<novarocks::ParticipantAttemptRef>,
+) -> Result<ParticipantAttemptRef, ProtocolError> {
+    let participant = participant.clone().ok_or_else(|| {
+        ProtocolError::new(
+            FieldPath::root("stage_fragments_request").field("participant"),
+            ProtocolErrorKind::MissingField,
+            "stage participant is required",
+        )
+    })?;
+    ParticipantAttemptRef::parse(participant)
 }
 
 fn fragment_instance_id(
@@ -657,8 +611,9 @@ mod tests {
         .expect("nonzero query id")
     }
 
-    fn init_digest() -> ParticipantManifestDigest {
-        ParticipantManifestDigest::new([2; 32])
+    fn participant() -> ParticipantAttemptRef {
+        ParticipantAttemptRef::new(execution_id(), novarocks_types::BackendProcessId::new_v7())
+            .expect("valid participant")
     }
 
     fn fragment(lo: i64) -> StageFragment {
@@ -708,13 +663,8 @@ mod tests {
     fn stage_request_sorts_fragment_ids_and_preserves_valid_wire_round_trip() {
         let first = fragment(9);
         let second = fragment(3);
-        let request = QueryStageRequest::new(
-            execution_id(),
-            init_digest(),
-            StageDigestVersion::V1,
-            vec![first.clone(), second.clone()],
-        )
-        .expect("valid batch");
+        let request = QueryStageRequest::new(participant(), vec![first.clone(), second.clone()])
+            .expect("valid batch");
         assert_eq!(request.fragments()[0].fragment_instance_id().low(), 3);
         assert_eq!(request.fragments()[1].fragment_instance_id().low(), 9);
 
@@ -723,21 +673,18 @@ mod tests {
         assert_eq!(round_tripped.as_proto(), request.as_proto());
 
         // Both roles derive the same identity from the carried content.
+        let participant = request.participant();
         assert_eq!(
-            StageDigest::compute_v1(execution_id(), init_digest(), &request.fragments())
-                .expect("sender digest"),
-            StageDigest::compute_v1(execution_id(), init_digest(), &[second, first])
-                .expect("receiver digest")
+            StageDigest::compute(participant.clone(), &request.fragments()).expect("sender digest"),
+            StageDigest::compute(participant, &[second, first]).expect("receiver digest")
         );
     }
 
     #[test]
-    fn stage_request_rejects_duplicate_fragment_ids_and_unknown_digest_version() {
+    fn stage_request_rejects_duplicate_fragment_ids_and_missing_participant() {
         let raw = novarocks::StageFragmentsRequest {
-            execution_id: Some(encode_query_execution_id(execution_id())),
-            init_digest: init_digest().as_bytes().to_vec(),
-            stage_digest_version: StageDigestVersion::V1.get(),
             fragments: vec![fragment(3).into_proto(), fragment(3).into_proto()],
+            participant: Some(participant().as_proto().clone()),
         };
         let error = QueryStageRequest::parse(raw).expect_err("duplicate ids cannot be staged");
         assert_eq!(error.detail(), "stage fragment instance ids must be unique");
@@ -746,41 +693,63 @@ mod tests {
             error.path().to_string(),
             "stage_fragments_request.fragments"
         );
-        assert!(StageDigestVersion::try_from_wire(2).is_err());
-    }
-
-    #[test]
-    fn digest_v1_is_independent_of_fragment_input_order() {
-        let first = fragment(9);
-        let second = fragment(3);
-
+        let raw = novarocks::StageFragmentsRequest {
+            fragments: vec![fragment(3).into_proto()],
+            ..Default::default()
+        };
+        let error = QueryStageRequest::parse(raw).expect_err("participant is required");
         assert_eq!(
-            StageDigest::compute_v1(
-                execution_id(),
-                init_digest(),
-                &[first.clone(), second.clone()],
-            )
-            .expect("digest"),
-            StageDigest::compute_v1(execution_id(), init_digest(), &[second, first])
-                .expect("digest")
+            error.path().to_string(),
+            "stage_fragments_request.participant"
+        );
+
+        let legacy = novarocks::StageFragmentsRequest::decode(&[0x0a, 0x00][..])
+            .expect("retired execution-id field stays decodable as unknown wire data");
+        let error = QueryStageRequest::parse(legacy).expect_err("legacy request must fail closed");
+        assert_eq!(
+            error.path().to_string(),
+            "stage_fragments_request.participant"
         );
     }
 
     #[test]
-    fn digest_v1_sorts_maps_but_preserves_repeated_semantic_order() {
+    fn digest_is_independent_of_fragment_input_order() {
+        let first = fragment(9);
+        let second = fragment(3);
+        let participant = participant();
+
         assert_eq!(
-            StageDigest::compute_v1(
-                execution_id(),
-                init_digest(),
-                &[fragment_with_maps(3, false)],
-            )
-            .expect("digest"),
-            StageDigest::compute_v1(
-                execution_id(),
-                init_digest(),
-                &[fragment_with_maps(3, true)],
-            )
-            .expect("digest")
+            StageDigest::compute(participant.clone(), &[first.clone(), second.clone()])
+                .expect("digest"),
+            StageDigest::compute(participant, &[second, first]).expect("digest")
+        );
+    }
+
+    #[test]
+    fn digest_binds_the_participant_process_including_empty_stages() {
+        let first = participant();
+        let second =
+            ParticipantAttemptRef::new(execution_id(), novarocks_types::BackendProcessId::new_v7())
+                .expect("second participant");
+
+        assert_ne!(
+            StageDigest::compute(first.clone(), &[]).expect("first empty stage"),
+            StageDigest::compute(second.clone(), &[]).expect("second empty stage")
+        );
+        assert_ne!(
+            StageDigest::compute(first, &[fragment(3)]).expect("first stage"),
+            StageDigest::compute(second, &[fragment(3)]).expect("second stage")
+        );
+    }
+
+    #[test]
+    fn digest_sorts_maps_but_preserves_repeated_semantic_order() {
+        let participant = participant();
+        assert_eq!(
+            StageDigest::compute(participant.clone(), &[fragment_with_maps(3, false)])
+                .expect("digest"),
+            StageDigest::compute(participant.clone(), &[fragment_with_maps(3, true)])
+                .expect("digest")
         );
 
         let mut first = fragment(3).into_proto().instance_params.expect("params");
@@ -799,13 +768,14 @@ mod tests {
         let first = StageFragment::new(plan::PlanFragment::default(), first).expect("fragment");
         let second = StageFragment::new(plan::PlanFragment::default(), second).expect("fragment");
         assert_ne!(
-            StageDigest::compute_v1(execution_id(), init_digest(), &[first]).expect("digest"),
-            StageDigest::compute_v1(execution_id(), init_digest(), &[second]).expect("digest")
+            StageDigest::compute(participant.clone(), &[first]).expect("digest"),
+            StageDigest::compute(participant, &[second]).expect("digest")
         );
     }
 
     #[test]
-    fn digest_v1_preserves_optional_presence_and_rejects_non_finite_values() {
+    fn digest_preserves_optional_presence_and_rejects_non_finite_values() {
+        let participant = participant();
         let mut absent = fragment(3).into_proto().instance_params.expect("params");
         absent.query_options = Some(novarocks::QueryOptions::default());
         let mut present = absent.clone();
@@ -819,8 +789,8 @@ mod tests {
         let present =
             StageFragment::new(plan::PlanFragment::default(), present).expect("valid fragment");
         assert_ne!(
-            StageDigest::compute_v1(execution_id(), init_digest(), &[absent]).expect("digest"),
-            StageDigest::compute_v1(execution_id(), init_digest(), &[present]).expect("digest")
+            StageDigest::compute(participant.clone(), &[absent]).expect("digest"),
+            StageDigest::compute(participant.clone(), &[present]).expect("digest")
         );
 
         let mut non_finite = fragment(3).into_proto().instance_params.expect("params");
@@ -848,7 +818,7 @@ mod tests {
         );
         let non_finite =
             StageFragment::new(plan::PlanFragment::default(), non_finite).expect("fragment");
-        let error = StageDigest::compute_v1(execution_id(), init_digest(), &[non_finite])
+        let error = StageDigest::compute(participant, &[non_finite])
             .expect_err("NaN must not enter a Stage digest");
         assert!(error.detail().contains("non-finite"));
     }

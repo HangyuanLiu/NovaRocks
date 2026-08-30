@@ -144,7 +144,7 @@ impl ParticipantBackendIdentity {
 ///
 /// This value intentionally excludes endpoint and backend ordinal: both are
 /// routing facts and cannot identify a BE process incarnation.
-// Design: ADR-0126 (docs/adr/ADR-0126-terminal-delivery-participant-attempt-ref.md)
+// Design: ADR-0127 (docs/adr/ADR-0127-participant-attempt-stage-fence.md)
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParticipantAttemptRef {
     raw: novarocks::ParticipantAttemptRef,

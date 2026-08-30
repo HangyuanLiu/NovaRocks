@@ -253,22 +253,20 @@ message StageFragment {
 }
 
 // The immutable complete fragment set prepared by one lifecycle participant.
-// The stage identity is derived from this content by both roles rather than
-// carried here; `stage_digest_version` selects the derivation projection, and
-// the Start fence and acknowledgements reference the derived value. An empty
-// fragment list is valid for service-only participants.
+// The stage identity is derived from this content and the allocated participant
+// attempt by both roles. The Start fence and acknowledgements reference that
+// derived value. An empty fragment list is valid for service-only participants.
 message StageFragmentsRequest {
-  QueryExecutionId execution_id = 1;
-  bytes init_digest = 2;
-  uint32 stage_digest_version = 3;
-  reserved 4;
-  reserved "stage_digest";
+  reserved 1, 2, 3, 4;
+  reserved "execution_id", "init_digest", "stage_digest_version", "stage_digest";
   repeated StageFragment fragments = 5;
+  ParticipantAttemptRef participant = 6;
 }
 
 message StageFragmentsResponse {
   QueryExecutionId execution_id = 1;
-  uint32 stage_digest_version = 2;
+  reserved 2;
+  reserved "stage_digest_version";
   bytes stage_digest = 3;
   StageFragmentsOutcome outcome = 4;
   string detail = 5;
@@ -276,22 +274,26 @@ message StageFragmentsResponse {
 
 message StartPreparedQueryRequest {
   QueryExecutionId execution_id = 1;
-  uint32 stage_digest_version = 2;
+  reserved 2;
+  reserved "stage_digest_version";
   bytes stage_digest = 3;
 }
 
 message StartPreparedQueryResponse {
   QueryExecutionId execution_id = 1;
-  uint32 stage_digest_version = 2;
+  reserved 2;
+  reserved "stage_digest_version";
   bytes stage_digest = 3;
   StartPreparedQueryOutcome outcome = 4;
   string detail = 5;
 }
 
 message AbortQueryRequest {
-  QueryExecutionId execution_id = 1;
+  reserved 1;
+  reserved "execution_id";
   bytes init_digest = 2;
   string reason = 3;
+  ParticipantAttemptRef participant = 4;
 }
 
 message AbortQueryResponse {
@@ -300,9 +302,9 @@ message AbortQueryResponse {
 }
 
 message QueryControlAttach {
-  QueryExecutionId execution_id = 1;
-  bytes init_digest = 2;
-  uint64 frontend_owner_epoch = 3;
+  reserved 1, 2, 3;
+  reserved "execution_id", "init_digest", "frontend_owner_epoch";
+  ParticipantAttemptRef participant = 4;
 }
 
 message QueryControlHeartbeat {
@@ -357,15 +359,15 @@ message QueryControlLocalDrained {}
 // control stream. It is deliberately independent from terminal delivery: a
 // dropped or stale observation never changes query correctness.
 message FragmentLiveObservation {
-  QueryExecutionId execution_id = 1;
-  bytes init_digest = 2;
-  ParticipantBackendIdentity backend = 3;
+  reserved 1, 2, 3;
+  reserved "execution_id", "init_digest", "backend";
   novarocks.common.UniqueId fragment_instance_id = 4;
   uint64 sequence = 5;
   uint64 input_rows = 6;
   uint64 output_rows = 7;
   uint64 elapsed_ms = 8;
   optional RuntimeProfileTree profile = 9;
+  ParticipantAttemptRef participant = 10;
 }
 
 enum RuntimeFilterFeedbackUnavailableReason {
@@ -380,9 +382,8 @@ enum RuntimeFilterFeedbackUnavailableReason {
 // stream already authenticates the participant; the Frontend additionally
 // fences this message with the frozen execution/deployment/channel contract.
 message RuntimeFilterFeedbackEvent {
-  QueryExecutionId execution_id = 1;
-  bytes init_digest = 2;
-  ParticipantBackendIdentity backend = 3;
+  reserved 1, 2, 3;
+  reserved "execution_id", "init_digest", "backend";
   uint32 participant_id = 4;
   uint64 deployment_epoch = 5;
   uint32 channel_id = 6;
@@ -391,6 +392,7 @@ message RuntimeFilterFeedbackEvent {
     bytes canonical_domain = 8;
     RuntimeFilterFeedbackUnavailableReason unavailable_reason = 9;
   }
+  ParticipantAttemptRef participant_attempt = 10;
 }
 
 message QueryControlResponse {

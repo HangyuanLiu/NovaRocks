@@ -45,7 +45,7 @@ use crate::coordinator::query_registry::{
     QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
     RuntimeFilterTerminalRollupUnavailable,
 };
-use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
+use crate::runtime_filter::feedback::{RuntimeFilterFeedbackAdmission, RuntimeFilterFeedbackState};
 
 const ACTIVE: u8 = 0;
 const ABORTED: u8 = 1;
@@ -554,31 +554,18 @@ impl AttemptControl {
             let Ok(manifest) = participant.request.manifest() else {
                 return false;
             };
-            let Ok(manifest_execution_id) = manifest.execution_id() else {
+            let Ok(expected_participant) = self.participant_attempt_ref(&participant) else {
                 return false;
             };
-            let Ok(observation_execution_id) = observation.execution_id() else {
-                return false;
-            };
-            let Ok(observation_digest) = observation.init_digest() else {
-                return false;
-            };
-            let Ok(observation_backend) = observation.backend() else {
+            let Ok(observation_participant) = observation.participant() else {
                 return false;
             };
             let expected_fragment_instance_ids = manifest.expected_fragment_instance_ids();
             let Ok(fragment_instance_id) = observation.fragment_instance_id() else {
                 return false;
             };
-            let Ok(manifest_backend) = manifest.backend() else {
-                return false;
-            };
             participant.target == session.target
-                && participant.digest == session.digest
-                && manifest_execution_id == self.execution_id
-                && observation_execution_id == self.execution_id
-                && observation_digest == participant.digest
-                && observation_backend == manifest_backend
+                && observation_participant == expected_participant
                 && expected_fragment_instance_ids.contains(&fragment_instance_id)
         });
         if !valid {
@@ -786,6 +773,29 @@ impl AttemptControl {
             .map_err(|error| contract_violation(error.to_string()))?;
         ParticipantAttemptRef::new(execution_id, process_id)
             .map_err(|error| contract_violation(error.to_string()))
+    }
+
+    fn participant_attempt_ref_for_session(
+        &self,
+        session: &ActiveSession,
+    ) -> Result<ParticipantAttemptRef, DistributedQueryError> {
+        let participant = self
+            .init_attempted
+            .lock()
+            .expect("init-attempted participant set")
+            .get(&session.target.backend_idx())
+            .cloned()
+            .ok_or_else(|| {
+                contract_violation(
+                    "query control session is not owned by an init-attempted lifecycle participant",
+                )
+            })?;
+        if participant.target != session.target {
+            return Err(contract_violation(
+                "query control session target differs from its init-attempted lifecycle participant",
+            ));
+        }
+        self.participant_attempt_ref(&participant)
     }
 
     fn store_terminal_outcome_at(
@@ -1107,21 +1117,17 @@ impl AttemptControl {
             }
         }
 
-        let request =
-            QueryAbortRequest::parse(novarocks_proto_models::novarocks::AbortQueryRequest {
-                execution_id: Some(novarocks_proto_codec::lifecycle::encode_query_execution_id(
-                    self.execution_id,
-                )),
-                init_digest: participant.digest.as_bytes().to_vec(),
-                reason: reason.to_string(),
-            })
-            .map_err(|error| {
-                AbortCleanupFailure::new(
-                    participant,
-                    QueryLifecycleTransportErrorKind::InvalidResponse,
-                    error.to_string(),
-                )
-            })?;
+        let participant_ref = self.participant_attempt_ref(participant).map_err(|error| {
+            AbortCleanupFailure::new(
+                participant,
+                QueryLifecycleTransportErrorKind::InvalidResponse,
+                error.to_string(),
+            )
+        })?;
+        // Unary abort can arrive before the control stream is attached. Keep
+        // the Init digest exclusively as that retained cleanup fingerprint;
+        // participant identity itself is the stable process-attempt reference.
+        let request = QueryAbortRequest::new(participant_ref, participant.digest, reason);
         let ack = self
             .transport
             .abort_query(
@@ -1711,11 +1717,27 @@ impl AttemptControl {
                 novarocks_proto_models::novarocks::query_control_response::Event::RuntimeFilterFeedback(
                     _,
                 ),
-            ) => self
-                .feedback
-                .lock()
-                .expect("runtime filter feedback state")
-                .admit(&event, session.target.process_id(), session.digest.as_bytes()),
+            ) => {
+                let participant = self
+                    .participant_attempt_ref_for_session(session)
+                    .map_err(|error| error.to_string())?;
+                let outcome = self
+                    .feedback
+                    .lock()
+                    .expect("runtime filter feedback state")
+                    .admit(&event, &participant)?;
+                if outcome == RuntimeFilterFeedbackAdmission::RejectedForeignParticipant {
+                    let execution_id = participant.execution_id().map_err(|error| error.to_string())?;
+                    eprintln!(
+                        "NOVAROCKS_RUNTIME_FILTER_FEEDBACK_REJECTED_FOREIGN_PARTICIPANT backend_index={} execution_id={}:{}:{}",
+                        session.target.backend_idx(),
+                        execution_id.query_id().high(),
+                        execution_id.query_id().low(),
+                        execution_id.attempt_id().get(),
+                    );
+                }
+                Ok(())
+            }
             Some(novarocks_proto_models::novarocks::query_control_response::Event::TerminalOutcome(
                 outcome,
             )) => {

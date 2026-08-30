@@ -2,9 +2,9 @@
 id: ADR-0126
 title: "Terminal delivery uses participant attempt identity, not payload content identity"
 domain: [distributed-query-lifecycle, crate-boundary, runtime-filter, provider-spi]
-status: active
+status: superseded
 supersedes: [ADR-0113]
-superseded-by: null
+superseded-by: ADR-0127
 date: 2026-08-30
 provenance:
   - "mechanism: terminal first-wins delivery identity convergence"

@@ -27,7 +27,7 @@ pub use query_options::QueryOptions;
 pub use scan_range::{FileScanRange, ScanRange, ScanRangeParams};
 pub use stage::{
     QueryStageAck, QueryStageOutcome, QueryStageRequest, QueryStartAck, QueryStartOutcome,
-    QueryStartRequest, StageDigest, StageDigestVersion, StageFragment,
+    QueryStartRequest, StageDigest, StageFragment,
 };
 pub use terminal::{
     FragmentTerminalOutcome, FragmentTerminalProfileTelemetry, FragmentTerminalSnapshot,
